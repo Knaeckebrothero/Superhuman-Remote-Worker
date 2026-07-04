@@ -581,6 +581,74 @@ class TestChunkSplitting:
         assert _parse_chunk_array("") is None
 
 
+class TestAuxReasoningControl:
+    """The rewrite/chunk stages force the aux model's thinking OFF, but only for
+    families with a binary thinking toggle. Otherwise TTS pays a full reasoning
+    pass before the first token (the dominant time-to-first-audio cost), and a
+    non-vLLM endpoint would 400 on an unsupported ``chat_template_kwargs``."""
+
+    def test_toggle_family_disables_thinking(self):
+        from services.tts import _aux_reasoning_off_body
+
+        # gemma is a hybrid-thinking family (chat_template_kwargs.enable_thinking).
+        assert _aux_reasoning_off_body("gemma-4-moe") == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+
+    def test_non_toggle_families_send_nothing(self):
+        from services.tts import _aux_reasoning_off_body
+
+        # No binary toggle → empty body, so we never send chat_template_kwargs to
+        # a plain-OpenAI / effort-enum / no-reasoning endpoint that would reject it.
+        for model in (
+            "gpt-4o-mini",
+            "gpt-4o-mini-tts",
+            "MiniMax-M2",
+            "gpt-oss-120b",
+            "",
+        ):
+            assert _aux_reasoning_off_body(model) == {}, model
+
+    @pytest.mark.asyncio
+    async def test_plan_passes_thinking_off_for_gemma_aux(self):
+        from services.tts import plan_tts_chunks
+
+        cls, client = _mock_openai_chat('["First chunk.", "Second chunk."]')
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),  # aux=gemma
+        ):
+            await plan_tts_chunks(
+                content="some markdown **message**",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+
+    @pytest.mark.asyncio
+    async def test_plan_sends_no_toggle_for_openai_aux(self):
+        from services.tts import plan_tts_chunks
+
+        cls, client = _mock_openai_chat('["First chunk.", "Second chunk."]')
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                _caps(aux=("gpt-4o-mini", None, "sk-key")),
+            ),
+        ):
+            await plan_tts_chunks(
+                content="some markdown **message**",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"] == {}
+
+
 class TestPlanTtsChunks:
     @pytest.mark.asyncio
     async def test_none_when_no_tts_model(self):
