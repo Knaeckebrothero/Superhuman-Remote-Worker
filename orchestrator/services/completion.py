@@ -256,6 +256,25 @@ def is_job_completion_freeze(job: dict[str, Any]) -> bool:
 MEMORY_RETRY_CAP = 2
 
 
+# Freeze types whose 'paused' means "park for the AUTO-dispatcher to re-dispatch"
+# — as opposed to pauses awaiting an explicit human/sudo action
+# (vm_upgrade_required) or user feedback. For these, /complete must clear the
+# job row's freeze_data (stashing it in context.last_freeze_data): the
+# dispatcher's get_dispatchable_jobs predicate requires ``freeze_data IS NULL``
+# (partial-index contract, migration 0046), so a kept freeze blob makes the job
+# permanently invisible to auto-resume — the drain-wedge that stalled run-8's
+# iter-6 developer. A stale row-level freeze also poisons the NEXT completion
+# (``_parse_freeze_data`` prefers the DB copy over the request body).
+AUTO_REDISPATCH_FREEZE_TYPES: frozenset[str] = frozenset(
+    {
+        "version_upgrade",
+        "memory_unavailable",
+        "kb_unavailable",
+        "workspace_upgrade_required",
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # LLM-outage pause + backoff re-dispatch
 # (docs/features/llm_outage_pause_and_backoff_redispatch.md)
