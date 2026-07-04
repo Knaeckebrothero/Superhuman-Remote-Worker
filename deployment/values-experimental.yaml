@@ -47,9 +47,9 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-0b71ff3
+    tag: sha-7ae56e6
   agent:
-    tag: sha-e118375
+    tag: sha-7ae56e6
   cockpit:
     tag: sha-523ec4b
   mcp:
