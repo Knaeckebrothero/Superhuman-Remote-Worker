@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
+from src.core.workspace_backend import WorkspaceUnavailableError
 
 from src.services.image_content import (
     IMAGE_DATA_TAG_TEMPLATE,
@@ -193,6 +194,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"PDF read error for {relative_path}: {e}")
             return f"Error reading PDF: {str(e)}"
@@ -233,6 +236,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"Size: {len(image_data):,} bytes\n\n"
                     + IMAGE_DATA_TAG_TEMPLATE.format(mime=mime_type, b64=base64_image)
                 )
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 logger.error(f"Error reading image {local_path}: {e}")
                 return f"Error reading image: {str(e)}"
@@ -271,6 +276,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"[IMAGE: {name}]\n"
                     f"(Visual description not available - vision services not configured)"
                 )
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 logger.error(f"Error describing image {local_path}: {e}")
                 return f"[IMAGE: {name}]\n(Error generating description: {str(e)})"
@@ -387,6 +394,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 f"[AUDIO: {name}]\n"
                 f"(Transcription not available - audio services not configured)"
             )
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"Error transcribing audio {local_path}: {e}")
             return f"[AUDIO: {name}]\n(Error transcribing: {str(e)})"
@@ -415,6 +424,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 page_image = renderer.render_page(
                     full_path, page_num, dpi=context.get_config("pdf_render_dpi")
                 )
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 logger.warning(
                     f"Could not render page {page_num} of {full_path.name}: {e}"
@@ -459,6 +470,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         except ImportError as e:
             logger.debug(f"Vision services not available: {e}")
             return ""  # Silently skip visual content if services not available
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Error getting visual content for page {page_num}: {e}")
             return ""
@@ -525,6 +538,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     )
                 return "\n".join(parts)
 
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 logger.debug(f"Could not add visual content: {e}")
                 return text_result
@@ -589,6 +604,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         except ImportError:
             return "Error: python-pptx not installed. Install with: pip install python-pptx"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"PPTX read error for {relative_path}: {e}")
             return f"Error reading PowerPoint: {str(e)}"
@@ -651,6 +668,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
                 return "\n".join(result_parts)
 
+            except WorkspaceUnavailableError:
+                raise
             except Exception as e:
                 # If visual rendering fails, just return text
                 logger.debug(f"Could not add visual content for DOCX: {e}")
@@ -658,6 +677,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         except ImportError:
             return "Error: python-docx not installed. Install with: pip install python-docx"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"DOCX read error for {relative_path}: {e}")
             return f"Error reading Word document: {str(e)}"
@@ -828,6 +849,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             return f"Error: File not found: {path}"
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"read_file error for {path}: {e}")
             return f"Error reading file: {str(e)}"
@@ -937,6 +960,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"write_file error for {path}: {e}")
             return f"Error writing file: {str(e)}"
@@ -1058,6 +1083,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         except ValueError as e:
             return f"Error: {str(e)}"
+        except WorkspaceUnavailableError:
+            raise
         except Exception as e:
             logger.error(f"edit_file error for {path}: {e}")
             return f"Error editing file: {str(e)}"
