@@ -498,6 +498,13 @@
       "desc": "Your preferred interface language. Changes apply immediately.",
       "label": "Interface Language"
     },
+    "voice": {
+      "title": "Read-aloud voice",
+      "desc": "The voice used when you read an assistant message aloud. Applies to every Read from now on.",
+      "label": "Voice",
+      "auto": "Default (auto)",
+      "customPlaceholder": "Voice id"
+    },
     "dataVisibility": {
       "title": "Data visibility",
       "desc": "Admins see all users' data by default. Switch to \"Only my data\" to work as a regular user would. The choice is saved to your account and applies everywhere.",

@@ -22,6 +22,7 @@ import {
     McpTokenCreateResponse,
     Project
 } from '../../core/models/api.model';
+import {voicesForModelId} from '../../core/models/tts-voices';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppThemeToggleComponent} from '../../ui/theme-toggle';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -102,6 +103,32 @@ const EXPIRY_OPTIONS = [
             </app-form-field>
           </div>
         </section>
+
+        <!-- Read-aloud voice -->
+        @if (ttsConfigured()) {
+          <section class="settings-section">
+            <h2 class="section-title">{{ 'settings.voice.title' | transloco }}</h2>
+            <p class="section-desc">{{ 'settings.voice.desc' | transloco }}</p>
+            <div class="form-block">
+              <app-form-field [label]="'settings.voice.label' | transloco">
+                @if (ttsVoices().length > 0) {
+                  <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
+                    <option value="">{{ 'settings.voice.auto' | transloco }}</option>
+                    @for (v of ttsVoices(); track v) {
+                      <option [value]="v">{{ v }}</option>
+                    }
+                  </app-select>
+                } @else {
+                  <app-input
+                    [value]="ttsVoice()"
+                    [placeholder]="'settings.voice.customPlaceholder' | transloco"
+                    (changed)="setTtsVoice($event)"
+                  />
+                }
+              </app-form-field>
+            </div>
+          </section>
+        }
 
         <!-- Data Visibility Section (Admin Only) -->
         @if (userService.currentUser()?.is_admin) {
@@ -1750,6 +1777,25 @@ export class SettingsComponent implements OnInit {
 
   // Provider list for dropdown
   readonly providers = PROVIDERS;
+
+  // ── Read-aloud voice ──────────────────────────────────────────────
+  /** The TTS model in effect (user override or system default). */
+  readonly ttsModel = computed(() => {
+    const p = this.settingsService.preferences();
+    return p.default_tts_model || p._resolved?.default_tts_model || '';
+  });
+  readonly ttsConfigured = computed(() => !!this.ttsModel());
+  /** Voices offered by the configured backend ([] ⇒ show a free-text field). */
+  readonly ttsVoices = computed(() => voicesForModelId(this.ttsModel()));
+  /** The user's chosen voice ('' = follow the admin/per-language default). */
+  readonly ttsVoice = computed(
+    () => this.settingsService.preferences().default_tts_voice ?? '',
+  );
+
+  /** Persist the read-aloud voice choice (empty ⇒ clear the override). */
+  setTtsVoice(voice: string): void {
+    this.settingsService.updatePreferences({default_tts_voice: voice || null}).subscribe();
+  }
 
   // MCP token form state
   readonly newName = signal('');
