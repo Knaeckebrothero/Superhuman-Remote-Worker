@@ -34,9 +34,18 @@ from .types import Instance
 logger = logging.getLogger(__name__)
 
 
-# 'reviewing' is the verification-enabled twin of 'pending_review'; both park
-# the bound work while a critic reviews out-of-band. Kept in lockstep with
-# WorkspaceInstanceManager._IDLE_JOB_STATUSES.
+# 'reviewing' is the verification-enabled twin of 'pending_review'. By *status*
+# it is as quiescent as 'pending_review', but a critic subjob SSHes into the
+# *parent's* live VM (inherited context.vm), so reaping on status alone kills the
+# VM under the critic. The is_idle/is_reapable predicates therefore gate on
+# ``has_live_shared_child`` (a non-terminal child bound to this same VM); the
+# status set stays optimistic and the guard handles the dependency precisely.
+# Kept in lockstep with WorkspaceInstanceManager._IDLE_JOB_STATUSES. (In the
+# normal flow the guard, not the status set, is what keeps a reviewing VM alive:
+# a live critic pins it, and by the time the critic ends the parent has moved to
+# pending_review/completed — so the guard also avoids churning the VM's
+# expensive ~3-min disk re-clone, see srw_vm_dispatcher_reconciler_churn.)
+# See docs/issues/reviewing_parent_pod_reaped_under_critic.md.
 _IDLE_JOB_STATUSES = frozenset(
     {"paused", "pending_review", "reviewing", "waiting_for_reply"}
 )
@@ -137,8 +146,22 @@ class VMInstanceManager:
         instances: list[Instance] = []
         for row in rows:
             inst = self._row_to_instance(row)
-            if inst is not None:
-                instances.append(inst)
+            if inst is None:
+                continue
+            # Live-child guard: only a reapable-status *job* VM can be torn down,
+            # and only a job VM can have a critic subjob, so scope the query to
+            # that case. Threads have no critic children.
+            native_id = inst.metadata.get("vm_native_id")
+            if (
+                inst.metadata.get("scope") == "job"
+                and inst.bound_to
+                and native_id
+                and inst.metadata.get("job_status") in _REAPABLE_JOB_STATUSES
+            ):
+                inst.metadata[
+                    "has_live_shared_child"
+                ] = await self._live_shared_child_exists(inst.bound_to, native_id)
+            instances.append(inst)
         return instances
 
     async def is_healthy(self, inst: Instance) -> bool:
@@ -154,6 +177,8 @@ class VMInstanceManager:
         return True
 
     async def is_idle(self, inst: Instance) -> bool:
+        if inst.metadata.get("has_live_shared_child"):
+            return False
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
@@ -181,7 +206,14 @@ class VMInstanceManager:
         dispatcher owns bring-up; the reaper only reclaims genuinely idle VMs
         (pending_review / waiting_for_reply / a paused-but-still-frozen job) and
         terminal ones. Mirrors get_dispatchable_jobs' predicate exactly.
+
+        Guard: a VM shared by a live child job (a critic SSHed into the parent's
+        VM) is never reapable, regardless of the parent's own status. See
+        ``_live_shared_child_exists`` and
+        docs/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
+        if inst.metadata.get("has_live_shared_child"):
+            return False
         if inst.metadata.get("job_dispatchable"):
             return False
         job_status = inst.metadata.get("job_status")
@@ -467,6 +499,11 @@ class VMInstanceManager:
         version = _extract_sha(vm_ctx.get("vm_image"))
         metadata: dict[str, Any] = {
             "scope": scope,
+            # Backend-native id (None if only the synthesized fallback exists) —
+            # the live-child guard matches critic subjobs on it. A critic
+            # inherits the parent's context.vm, so its native id equals this
+            # one; a delegation child on its own VM does not.
+            "vm_native_id": vm_native_id,
             "vm_status": vm_ctx.get("status"),
             "ssh_host": vm_ctx.get("ssh_host") or vm_ctx.get("host"),
             "ssh_port": vm_ctx.get("ssh_port") or vm_ctx.get("port"),
@@ -489,3 +526,48 @@ class VMInstanceManager:
             bound_to=bound_id,
             metadata=metadata,
         )
+
+    async def _live_shared_child_exists(
+        self, parent_job_id: str, vm_native_id: str | None
+    ) -> bool:
+        """True if a non-terminal child job shares this parent's VM.
+
+        Mirrors ``WorkspaceInstanceManager._live_shared_child_exists``: a critic
+        verification subjob inherits the parent's ``context.vm`` at spawn
+        (``_trigger_verification_on_complete`` copies it) and SSHes into the
+        *parent's* VM. Match on the VM's native id — the same
+        ``vm_name / name / ssh_host`` COALESCE ``_row_to_instance`` uses for the
+        instance id — which the critic's inherited copy reproduces exactly,
+        whereas a delegation child (its own VM) does not, keeping the guard
+        narrow. Fail-safe: on a DB error, assume shared (do not reap).
+        """
+        if self._db is None or not vm_native_id:
+            return False
+        try:
+            async with self._db.acquire() as conn:
+                return bool(
+                    await conn.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM jobs
+                            WHERE parent_job_id = $1::uuid
+                              AND status NOT IN ('completed', 'failed', 'cancelled')
+                              AND COALESCE(
+                                    context->'vm'->>'vm_name',
+                                    context->'vm'->>'name',
+                                    context->'vm'->>'ssh_host'
+                                  ) = $2
+                        )
+                        """,
+                        parent_job_id,
+                        vm_native_id,
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "Failed to check live shared child for VM %s (parent %s); "
+                "assuming shared — not reaping",
+                vm_native_id,
+                parent_job_id,
+            )
+            return True

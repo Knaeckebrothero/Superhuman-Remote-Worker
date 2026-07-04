@@ -40,8 +40,13 @@ def _make_manager(
     k8s_available: bool = True,
     snapshot_available: bool = True,
     suspension_enabled: bool = True,
+    shared_child_exists: bool = False,
 ):
-    """Build a WorkspaceInstanceManager wrapping mocked dependencies."""
+    """Build a WorkspaceInstanceManager wrapping mocked dependencies.
+
+    ``shared_child_exists`` backs the ``_live_shared_child_exists`` EXISTS
+    query (``conn.fetchval``) used by the durable live-child reap guard.
+    """
     container = MagicMock()
     container._k8s_available = k8s_available
     container._namespace = "test-ns"
@@ -66,6 +71,7 @@ def _make_manager(
     db.acquire = MagicMock()
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(side_effect=lambda sql, tid: (thread_rows or {}).get(tid))
+    conn.fetchval = AsyncMock(return_value=shared_child_exists)
     ctx = AsyncMock()
     ctx.__aenter__ = AsyncMock(return_value=conn)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -215,6 +221,103 @@ class TestListInstances:
 
 
 # =============================================================================
+# Live-shared-child reap guard (durable fix)
+# =============================================================================
+
+
+class TestLiveSharedChildGuard:
+    @staticmethod
+    def _job_pod(job_id: str):
+        return _make_pod(
+            job_id if job_id.startswith("workspace-") else f"workspace-{job_id}",
+            labels={
+                "srw/job-id": job_id,
+                "srw.io/component": "agent-workspace",
+            },
+        )
+
+    @staticmethod
+    def _conn(db):
+        return db.acquire.return_value.__aenter__.return_value
+
+    @pytest.mark.asyncio
+    async def test_reviewing_pod_with_shared_child_flagged_not_reapable(self):
+        # A 'reviewing' parent whose live pod is shared by a critic: the
+        # EXISTS query returns true → has_live_shared_child → not reapable.
+        pod = self._job_pod("parent1")
+        job = {"id": "parent1", "status": "reviewing", "context": {}}
+        mgr, *_ = _make_manager(
+            pods=[pod], job_rows={"parent1": job}, shared_child_exists=True
+        )
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            (inst,) = await mgr.list_instances()
+        assert inst.metadata["has_live_shared_child"] is True
+        assert await mgr.is_reapable(inst) is False
+        assert await mgr.is_idle(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_reviewing_pod_without_shared_child_is_reapable(self):
+        pod = self._job_pod("parent1")
+        job = {"id": "parent1", "status": "reviewing", "context": {}}
+        mgr, *_ = _make_manager(
+            pods=[pod], job_rows={"parent1": job}, shared_child_exists=False
+        )
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            (inst,) = await mgr.list_instances()
+        assert inst.metadata["has_live_shared_child"] is False
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_processing_pod_skips_shared_child_query(self):
+        # Not reapable by status → the guard is moot → don't spend a query.
+        pod = self._job_pod("run1")
+        job = {"id": "run1", "status": "processing", "context": {}}
+        mgr, _, _, _, db = _make_manager(pods=[pod], job_rows={"run1": job})
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            (inst,) = await mgr.list_instances()
+        assert "has_live_shared_child" not in inst.metadata
+        self._conn(db).fetchval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_query_passes_parent_id_and_pod_name(self):
+        mgr, _, _, _, db = _make_manager(shared_child_exists=True)
+        assert (
+            await mgr._live_shared_child_exists("parent1", "workspace-parent1") is True
+        )
+        conn = self._conn(db)
+        conn.fetchval.assert_awaited_once()
+        args = conn.fetchval.await_args.args
+        assert args[1] == "parent1"
+        assert args[2] == "workspace-parent1"
+
+    @pytest.mark.asyncio
+    async def test_query_false_without_pod_name(self):
+        # No pod name → nothing to match on; don't even hit the DB.
+        mgr, _, _, _, db = _make_manager(shared_child_exists=True)
+        assert await mgr._live_shared_child_exists("parent1", None) is False
+        self._conn(db).fetchval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_query_fails_safe_on_db_error(self):
+        # A transient DB error must NOT let the reaper delete a maybe-shared pod
+        # (mirrors reap_orphans' "db error → don't delete"): assume shared.
+        mgr, _, _, _, db = _make_manager()
+        db.acquire = MagicMock(side_effect=RuntimeError("db down"))
+        assert (
+            await mgr._live_shared_child_exists("parent1", "workspace-parent1") is True
+        )
+
+
+# =============================================================================
 # is_idle / is_healthy
 # =============================================================================
 
@@ -235,13 +338,26 @@ class TestIsIdle:
         assert await mgr.is_idle(inst) is True
 
     @pytest.mark.asyncio
-    async def test_reviewing_job_is_idle(self):
-        # 'reviewing' is the verification-enabled twin of 'pending_review':
-        # the agent has frozen and a separate critic job reviews via git, so
-        # the parent workspace is quiescent and snapshot+free-able.
+    async def test_reviewing_job_without_live_child_is_idle(self):
+        # With the durable live-child guard, 'reviewing' is back in the idle
+        # set: a review-state parent with NO live critic sharing its pod is
+        # quiescent and snapshot+free-able (the pre-bug optimization).
         mgr, *_ = _make_manager()
         inst = Instance(kind="workspace", id="x", metadata={"job_status": "reviewing"})
         assert await mgr.is_idle(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_status_with_live_shared_child_is_not_idle(self):
+        # The guard: an otherwise-idle parent (here 'paused') whose live pod is
+        # shared by a non-terminal child (critic) must NOT be drained — doing so
+        # kills the child's SSH. Keyed on the real dependency, not job status.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            metadata={"job_status": "paused", "has_live_shared_child": True},
+        )
+        assert await mgr.is_idle(inst) is False
 
     @pytest.mark.asyncio
     async def test_processing_is_not_idle(self):
@@ -308,13 +424,29 @@ class TestIsReapable:
         assert await mgr.is_reapable(inst) is True
 
     @pytest.mark.asyncio
-    async def test_reviewing_job_is_reapable(self):
-        # A workspace parked in 'reviewing' (critic verifies out-of-band via
-        # git) must be snapshot+freed like 'pending_review' — otherwise the pod
-        # is pinned for the entire, possibly unbounded, review window.
+    async def test_reviewing_job_without_live_child_is_reapable(self):
+        # Durable guard restores 'reviewing' to the reapable set: once no live
+        # critic shares the pod (critic terminated), the review-state parent's
+        # pod can be snapshot+freed like 'pending_review'.
         mgr, *_ = _make_manager()
         inst = Instance(kind="workspace", id="x", metadata={"job_status": "reviewing"})
         assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_status_with_live_shared_child_is_not_reapable(self):
+        # Regression (the P0 bug): a parent whose live pod is shared by a
+        # non-terminal critic must NOT be reaped, whatever its own status.
+        # Reaping (snapshot→delete) strands the headless Service → the critic's
+        # next SSH is NXDOMAIN → the whole review fails. Keyed on the live child,
+        # not on job_status. See docs/issues/reviewing_parent_pod_reaped_under_critic.md.
+        mgr, *_ = _make_manager()
+        for status in ("reviewing", "pending_review", "paused"):
+            inst = Instance(
+                kind="workspace",
+                id="x",
+                metadata={"job_status": status, "has_live_shared_child": True},
+            )
+            assert await mgr.is_reapable(inst) is False, status
 
     @pytest.mark.asyncio
     async def test_processing_job_not_reapable(self):

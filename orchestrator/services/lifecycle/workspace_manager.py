@@ -31,10 +31,17 @@ logger = logging.getLogger(__name__)
 
 _LABEL_SELECTOR = "srw.io/component=agent-workspace"
 
-# 'reviewing' is the verification-enabled twin of 'pending_review' (set by
-# determine_job_status when a critic is involved). The agent has frozen and the
-# critic reviews out-of-band in its own git workspace, so the parent pod is just
-# as idle/suspendable as 'pending_review'. Keep the two in lockstep.
+# 'reviewing' is the verification-enabled twin of 'pending_review'
+# (determine_job_status sets it on a critic-enabled completion freeze). The
+# parent has frozen, so by *status* it is as quiescent as 'pending_review' and
+# belongs in the idle set. The catch: a critic subjob SSHes into the *parent's*
+# live workspace pod (shared by design, to read the parent's output/), so
+# reaping on status alone pulls the pod out from under a live critic → headless
+# Service with zero endpoints → the critic's next SSH fails NXDOMAIN and the
+# whole review dies. The is_idle/is_reapable predicates below therefore gate on
+# ``has_live_shared_child`` (a non-terminal child bound to this same pod); the
+# status set stays optimistic and the guard handles the dependency precisely.
+# See docs/issues/reviewing_parent_pod_reaped_under_critic.md.
 _IDLE_JOB_STATUSES = frozenset(
     {"paused", "pending_review", "reviewing", "waiting_for_reply"}
 )
@@ -167,6 +174,16 @@ class WorkspaceInstanceManager:
                     metadata["snapshot_attempts"] = ws_ctx.get("snapshot_attempts") or 0
                     snap = ctx.get("snapshot") or {}
                     metadata["snapshot_status"] = snap.get("status")
+                    # Only a reapable-status parent can be torn down, so only
+                    # then does the live-child guard matter — skip the query
+                    # otherwise. Keys the guard on the real dependency (a critic
+                    # SSHed into this pod), not on job_status alone.
+                    if metadata["job_status"] in _REAPABLE_JOB_STATUSES:
+                        metadata[
+                            "has_live_shared_child"
+                        ] = await self._live_shared_child_exists(
+                            job_id, pod.metadata.name
+                        )
 
             instances.append(
                 Instance(
@@ -192,6 +209,8 @@ class WorkspaceInstanceManager:
         no-traffic). For drift detection we want to react as soon as the
         bound work is in a quiescent state, regardless of how long.
         """
+        if inst.metadata.get("has_live_shared_child"):
+            return False
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
@@ -208,7 +227,14 @@ class WorkspaceInstanceManager:
         Superset of ``is_idle``: adds terminal job/thread states. Terminal
         instances get cleaned up; suspendable-idle ones get snapshot+freed.
         A pod with no bound row is never reapable (context may be in flight).
+
+        Guard: a workspace shared by a live child job (a critic SSHed into the
+        parent's pod) is never reapable, regardless of the parent's own status —
+        reaping would strand the child. See ``_live_shared_child_exists`` and
+        docs/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
+        if inst.metadata.get("has_live_shared_child"):
+            return False
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
@@ -616,3 +642,47 @@ class WorkspaceInstanceManager:
                 "Failed to fetch thread %s for workspace lifecycle", thread_id
             )
             return None
+
+    async def _live_shared_child_exists(
+        self, parent_job_id: str, pod_name: str | None
+    ) -> bool:
+        """True if a non-terminal child job shares this parent's workspace pod.
+
+        A critic verification subjob inherits the parent's ``workspace_container``
+        at spawn (``_trigger_verification_on_complete`` copies it) and SSHes into
+        the *parent's* pod instead of getting its own. While such a child is
+        alive, reaping the parent pod strands it (headless Service with zero
+        endpoints → NXDOMAIN), which is the P0 bug. Match on the inherited
+        ``pod_name`` — stable (unlike ``pod_ip``, which churns on restore) and
+        exact: the critic's copy equals this pod's name, whereas a delegation
+        child (which gets its own pod) does not, so the guard stays narrow.
+
+        Fail-safe: on a DB error, assume a child is present (do not reap) —
+        mirrors ``reap_orphans``' "DB error → don't delete" stance.
+        """
+        if self._db is None or not pod_name:
+            return False
+        try:
+            async with self._db.acquire() as conn:
+                return bool(
+                    await conn.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM jobs
+                            WHERE parent_job_id = $1::uuid
+                              AND status NOT IN ('completed', 'failed', 'cancelled')
+                              AND context->'workspace_container'->>'pod_name' = $2
+                        )
+                        """,
+                        parent_job_id,
+                        pod_name,
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "Failed to check live shared child for pod %s (parent %s); "
+                "assuming shared — not reaping",
+                pod_name,
+                parent_job_id,
+            )
+            return True

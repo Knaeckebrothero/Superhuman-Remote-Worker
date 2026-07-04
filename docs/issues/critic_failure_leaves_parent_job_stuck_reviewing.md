@@ -21,6 +21,14 @@ tags:
 > gap. (Line numbers in the original section have drifted; current symbols are
 > named in the new section.)
 
+> **2026-07-04 update — Bug 1 recurred on the main cluster** (batch of 3/4
+> research-loop critics failed). New wrinkles: `"reviewing"` was *added* to the
+> reapable status set (`c228ab91`, live in `sha-fe10ea6`), widening the trigger,
+> and the failure signature is now a headless-Service `NXDOMAIN`
+> (`Name or service not known`) instead of the old raw-pod-IP `No route to host`.
+> Full write-up + all five issues encountered:
+> [`reviewing_parent_pod_reaped_under_critic.md`](reviewing_parent_pod_reaped_under_critic.md).
+
 ## Symptom
 
 Jobs sit in `status='reviewing'` indefinitely, and because `reviewing`
