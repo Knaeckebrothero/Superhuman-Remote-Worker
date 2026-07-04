@@ -13,6 +13,7 @@ See docs/features/project_knowledge_base.md for full architecture.
 """
 
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
@@ -21,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
+from ...services.knowledge_graph import slugify
 from ..context import ToolContext
 from .gardener import (
     is_reserved,
@@ -31,6 +33,11 @@ from .gardener import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _content_hash(text: str) -> str:
+    """Stable content fingerprint for exact-duplicate detection."""
+    return hashlib.sha256((text or "").encode()).hexdigest()
 
 
 # Tool metadata for registry
@@ -223,7 +230,12 @@ def _render_note_md(note: Dict[str, Any]) -> str:
     fm.append("---")
     fm.append("")
 
-    body: List[str] = [f"# {note.get('title') or note_id}", "", content]
+    # Prepend the title as an H1 — unless the body already opens with its own
+    # H1, which would render the title twice (run-8 nit, docs §11.1).
+    if content.lstrip().startswith("# "):
+        body: List[str] = [content]
+    else:
+        body = [f"# {note.get('title') or note_id}", "", content]
 
     # Relationships as standard markdown links, grouped by type (§7).
     rels = note.get("relationships") or []
@@ -474,6 +486,21 @@ def create_kb_tools(
         project_id = _get_project_id(context)
         if not project_id:
             return "Error: No project_id available. Knowledge tools require a project context."
+
+        # Exact-duplicate short-circuit (Step 1 hardening, docs §11.1): a
+        # same-slug write with byte-identical content is a pure no-op for every
+        # writer — skip the gate and the create. This kills the run-8 twin-file
+        # duplication for bare loop agents the verdict gate never reaches.
+        # `read_note` returns the note dict (or None); a non-dict means no match.
+        candidate_slug = slugify(title)
+        existing = kg.read_note(project_id, candidate_slug)
+        if isinstance(existing, dict) and _content_hash(content) == _content_hash(
+            existing.get("content", "")
+        ):
+            return (
+                f"Note '{candidate_slug}' already exists with identical content "
+                f"— no change written."
+            )
 
         # Ingestion verdict gate (slice 2 PR2) — only when the curator wired a
         # service. Adjudicate the candidate against its nearest active notes

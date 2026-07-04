@@ -173,6 +173,28 @@ class TestLintKb:
         report = lint_kb([_note("knowledge/n1.md", text)])
         assert "missing-title" in _rules(report)
 
+    def test_duplicate_h1_warning(self):
+        # Run-8 nit (docs §11.1): the old serializer emitted the title twice.
+        # kb_lint flags the same defect in hand-authored / legacy notes.
+        from src.tools.knowledge.gardener import lint_kb
+
+        text = (
+            '---\nid: n1\ntype: decision\ndescription: "d"\n---\n\n'
+            "# My Note\n\n# My Note\n\nBody [n1](n1.md).\n"
+        )
+        report = lint_kb([_note("knowledge/n1.md", text)])
+        assert "duplicate-h1" in _rules(report)
+
+    def test_single_h1_no_duplicate_warning(self):
+        from src.tools.knowledge.gardener import lint_kb
+
+        text = (
+            '---\nid: n1\ntype: decision\ndescription: "d"\n---\n\n'
+            "# My Note\n\n## A subsection\n\nBody [n1](n1.md).\n"
+        )
+        report = lint_kb([_note("knowledge/n1.md", text)])
+        assert "duplicate-h1" not in _rules(report)
+
     def test_report_separates_errors_and_warnings(self):
         from src.tools.knowledge.gardener import lint_kb
 
