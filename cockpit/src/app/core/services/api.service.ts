@@ -57,6 +57,7 @@ import {
     TableInfo,
     User,
     UserCapabilities,
+    VoiceCapabilities,
     WorkspaceOverview,
 } from '../models/api.model';
 import {ThreadUploadResponse, UploadInfo, UploadResponse} from '../models/file.model';
@@ -1544,6 +1545,16 @@ export class ApiService {
   getMyCapabilities(): Observable<UserCapabilities | null> {
     return this.http
       .get<UserCapabilities>(`${this.baseUrl}/users/me/capabilities`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /** Whether the caller has a usable TTS / STT model configured. Drives the
+   * disabled-with-reason state on the read-aloud + mic buttons so they never
+   * present as a dead click that silently 204s. `null` on error ⇒ callers fail
+   * open (assume available; the 204 path still guards the actual call). */
+  getVoiceCapabilities(): Observable<VoiceCapabilities | null> {
+    return this.http
+      .get<VoiceCapabilities>(`${this.baseUrl}/voice/capabilities`)
       .pipe(catchError(() => of(null)));
   }
 

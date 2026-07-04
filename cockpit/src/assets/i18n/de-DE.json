@@ -1132,7 +1132,8 @@
       "micDenied": "Mikrofonzugriff verweigert",
       "micError": "Aufnahme konnte nicht gestartet werden",
       "transcribing": "Audio wird transkribiert…",
-      "transcribeError": "Transkription fehlgeschlagen — Audio wurde angehängt"
+      "transcribeError": "Transkription fehlgeschlagen — Audio wurde angehängt",
+      "sttNotConfigured": "Spracheingabe ist noch nicht eingerichtet"
     },
     "tts": {
       "play": "Vorlesen",
@@ -1142,7 +1143,9 @@
       "spokenVersion": "Gesprochene Fassung",
       "part": "Teil {{current}} von {{total}}",
       "preparing": "Audio wird vorbereitet…",
-      "generatingPart": "Teil {{current}} von {{total}} wird erzeugt…"
+      "generatingPart": "Teil {{current}} von {{total}} wird erzeugt…",
+      "notConfigured": "Vorlesen ist noch nicht eingerichtet",
+      "tapToPlay": "Zum Abspielen tippen"
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",

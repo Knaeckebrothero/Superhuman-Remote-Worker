@@ -1433,6 +1433,14 @@ export interface UserCapabilities {
   catalog: GrantCatalog;
 }
 
+/** GET /api/voice/capabilities — whether a usable TTS/STT model is configured
+ * for the caller, so the read-aloud + mic buttons can render disabled-with-reason
+ * instead of a dead click that silently answers 204. */
+export interface VoiceCapabilities {
+  tts: boolean;
+  stt: boolean;
+}
+
 /** One explicitly-set grant row (GET /api/admin/grants). */
 export interface Grant {
   key: string;

@@ -335,3 +335,99 @@ class TestTranscribeEndpoint:
                     thread_id="t1", request=MagicMock(), audio=big
                 )
         assert exc.value.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# Usage metering (rate-limiting v2): STT is metered per request, non-fatally.
+# ---------------------------------------------------------------------------
+
+
+def _mock_ledger(*, available=True):
+    led = MagicMock()
+    led.is_available = available
+    led.record_events = AsyncMock(return_value=1)
+    return led
+
+
+class TestTranscribeMetering:
+    @pytest.mark.asyncio
+    async def test_records_stt_request_event(self):
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("hi")
+        led = _mock_ledger()
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00\x01\x02",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        assert text == "hi"
+        led.record_events.assert_awaited_once()
+        (events,), _ = led.record_events.call_args
+        ev = events[0]
+        assert ev.category == "stt"
+        assert ev.unit == "stt-request"
+        assert ev.quantity == 1
+        assert ev.resource == "whisper-1"
+        assert ev.ref_id == "t1"
+        assert ev.details["bytes"] == 3
+
+    @pytest.mark.asyncio
+    async def test_metering_failure_does_not_drop_transcript(self):
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("hi")
+        led = _mock_ledger()
+        led.record_events = AsyncMock(side_effect=RuntimeError("audit down"))
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        # The metering write is OUTSIDE the transcribe try — a failure here must
+        # never cost the user their transcript.
+        assert text == "hi"
+
+    @pytest.mark.asyncio
+    async def test_no_write_when_ledger_unavailable(self):
+        from services.transcribe import transcribe_thread_audio
+
+        cls, _ = _mock_openai("hi")
+        led = _mock_ledger(available=False)
+        with (
+            patch("services.transcribe.AsyncOpenAI", cls),
+            patch(
+                "services.transcribe.resolve_capability_credentials",
+                AsyncMock(return_value=("whisper-1", None, "sk-key")),
+            ),
+        ):
+            text = await transcribe_thread_audio(
+                audio_bytes=b"\x00",
+                filename="voice.webm",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                ledger=led,
+                ref_id="t1",
+            )
+        assert text == "hi"
+        led.record_events.assert_not_awaited()
