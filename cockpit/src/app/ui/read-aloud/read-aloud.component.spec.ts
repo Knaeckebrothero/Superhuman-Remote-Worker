@@ -83,4 +83,19 @@ describe('AppReadAloudComponent', () => {
     c.cancel();
     expect(c.phase()).toBe('idle');
   });
+
+  it('a start-time failure surfaces an honest error box, never a silent no-op', () => {
+    const c = create();
+    (c as unknown as {failStart: (k: string) => void}).failStart('empty');
+    expect(c.phase()).toBe('error');
+    expect(c.hardError()).toBe('empty');
+  });
+
+  it('dismiss returns a non-retryable error box to the Read button', () => {
+    const c = create();
+    c.phase.set('error');
+    c.hardError.set('no-thread');
+    c.dismiss();
+    expect(c.phase()).toBe('idle');
+  });
 });
