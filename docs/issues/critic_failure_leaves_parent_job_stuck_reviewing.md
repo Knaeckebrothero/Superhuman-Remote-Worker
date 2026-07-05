@@ -192,3 +192,14 @@ Even after the critic dies, nothing un-sticks the parent. Here the critic is
    Also: workspace **recovery should re-provision the same tier**, not escalate a
    *sandbox* job to a VM — the VM jump here landed on dev's flaky VM tier and
    turned a transient container loss into a dead end.
+
+   **[2026-07-05 — IMPLEMENTED]** The `reviewing` watchdog is now Step 2 of
+   `stale_verification_sweeper`: `unstick_reviewing_parents(grace)` CAS-flips a
+   parent to `pending_review` once every critic child is terminal-failed/
+   cancelled (or none exists) and it has been reviewing past
+   `REVIEWING_STUCK_GRACE_MINUTES` (default 30). The owner is notified via
+   `NotificationService.notify_review_returned_to_manual`. The `paused`-orphan
+   case rides the existing 6h critic-cancel (a `paused` critic may be
+   recovering, so it is deliberately treated as live). Design + rejected
+   options (b)/(c): `docs/superpowers/specs/2026-07-05-reviewing-parent-unstick-watchdog-design.md`.
+   The "recovery should re-provision the same tier" note above remains open.

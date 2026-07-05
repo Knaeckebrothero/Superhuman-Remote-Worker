@@ -1,6 +1,6 @@
 # `reviewing` Parent Un-stick Watchdog — Design Spec
 
-**Status:** Designed (2026-07-05). Not yet implemented.
+**Status:** Implemented (2026-07-05) on `develop`; unit-tested (mock-connection contract + tick wiring). Behavioral predicate matrix pending dev-cluster verification.
 **Parent issue:** [`docs/issues/critic_failure_leaves_parent_job_stuck_reviewing.md`](../../issues/critic_failure_leaves_parent_job_stuck_reviewing.md) — fix item **#4** ("`reviewing` watchdog"). This is **P2** in the 2026-07-04 research-loop incident ranking (see [`docs/issues/reviewing_parent_pod_reaped_under_critic.md`](../../issues/reviewing_parent_pod_reaped_under_critic.md)). P0 (live-child guard) and P1 (fast-freeze) are handled separately.
 **Goal:** Guarantee that a parent job never stays wedged in `reviewing` forever when its critic dies by any path other than a clean `/complete`. Surface the wedge as an actionable `pending_review` + a notification instead of a silent stall.
 **Scope:** Orchestrator only. One new DB method + one new step in an existing background sweeper. **No pod/workspace-lifecycle changes** (P0 already reclaims the pod).
