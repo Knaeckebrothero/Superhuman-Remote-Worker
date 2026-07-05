@@ -383,6 +383,13 @@ ingress:
   # -- CORS middleware (Traefik CRD) for cockpit -> API cross-origin
   cors:
     enabled: true
+    # -- Extra browser origins allowed to call the API, in addition to the
+    # canonical cockpit URL (srw.cockpitUrl). Use this when the app is served
+    # from more than one domain (e.g. a domain migration where an old hostname
+    # is kept as a working alias). Each entry is a full scheme://host origin.
+    # Merged into both the orchestrator's CORS_ORIGINS env and the Traefik CORS
+    # middleware allow-list.
+    additionalOrigins: []
   # -- Layer 1 (P4b): block /api/agents/* and /api/internal/* at the public
   # API ingress so agent-internal paths can't be probed externally. Renders
   # a Traefik IPWhiteList middleware + a high-priority Ingress that 403s
