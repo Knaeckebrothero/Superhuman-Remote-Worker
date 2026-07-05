@@ -66,7 +66,12 @@ import {LLMRequest} from '../../debug/request.model';
 import {GraphChangeResponse} from '../../debug/graph.model';
 import {ChatEntry, ChatHistoryResponse} from '../models/chat.model';
 import {PendingActionCounts, ThreadDetail} from '../models/action.model';
-import {TtsVoicesResponse} from '../models/tts-voices';
+import {
+  TtsVoicesResponse,
+  TtsLibraryResponse,
+  TtsLibraryFilters,
+  TtsLibrarySetting,
+} from '../models/tts-voices';
 import {environment} from '../environment';
 
 /**
@@ -1019,6 +1024,73 @@ export class ApiService {
           return of({backend: null, voices: []} as TtsVoicesResponse);
         }),
       );
+  }
+
+  /**
+   * Search the ElevenLabs community Voice Library (server-proxied, read-only).
+   * All filters optional; `search` alone covers the "french english" case.
+   * `add_enabled` in the response mirrors the admin add-gate. Never rejects —
+   * a failure degrades to an empty list with a readable `error`.
+   */
+  searchTtsLibrary(
+    filters: TtsLibraryFilters = {},
+  ): Observable<TtsLibraryResponse> {
+    let params = new HttpParams();
+    for (const [k, v] of Object.entries(filters)) {
+      if (v !== undefined && v !== null && `${v}`.trim() !== '') {
+        params = params.set(k, `${v}`);
+      }
+    }
+    return this.http
+      .get<TtsLibraryResponse>(`${this.baseUrl}/settings/tts/library`, {params})
+      .pipe(
+        catchError((error) => {
+          console.error('Failed to search TTS voice library:', error);
+          return of({
+            backend: null,
+            voices: [],
+            has_more: false,
+            error: 'Voice library search failed.',
+            add_enabled: false,
+          } as TtsLibraryResponse);
+        }),
+      );
+  }
+
+  /**
+   * Copy a Library voice into the deployment ElevenLabs account. Behind the
+   * admin add-gate server-side. Errors propagate (unlike the resilient search)
+   * so the caller can surface the server's readable detail — most importantly
+   * the account's voice-slot limit.
+   */
+  addTtsLibraryVoice(body: {
+    public_owner_id: string;
+    voice_id: string;
+    new_name: string;
+  }): Observable<{voice_id: string; name: string}> {
+    return this.http.post<{voice_id: string; name: string}>(
+      `${this.baseUrl}/settings/tts/library/add`,
+      body,
+    );
+  }
+
+  /** Read the Voice Library add gate (admin-only). Degrades to disabled. */
+  getTtsLibrarySetting(): Observable<TtsLibrarySetting> {
+    return this.http
+      .get<TtsLibrarySetting>(`${this.baseUrl}/admin/system-settings/tts_library`)
+      .pipe(
+        catchError(() =>
+          of({enabled: false, updated_at: null, updated_by: null} as TtsLibrarySetting),
+        ),
+      );
+  }
+
+  /** Toggle the Voice Library add gate (admin-only). */
+  setTtsLibrarySetting(enabled: boolean): Observable<TtsLibrarySetting> {
+    return this.http.put<TtsLibrarySetting>(
+      `${this.baseUrl}/admin/system-settings/tts_library`,
+      {enabled},
+    );
   }
 
   /**

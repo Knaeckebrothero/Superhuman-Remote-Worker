@@ -91,6 +91,57 @@ export interface TtsVoicesResponse {
 }
 
 /**
+ * One community Voice Library result from `GET /api/settings/tts/library`
+ * (server-proxied from ElevenLabs' `/v1/shared-voices`). Unlike account voices,
+ * the library exposes accent/gender/age/language as flat fields; the pair
+ * `(public_owner_id, id)` is what "Add to deployment" needs to copy the voice
+ * into the account. `free` marks voices free-tier keys can synthesize.
+ */
+export interface TtsLibraryVoice {
+  id: string;
+  public_owner_id: string;
+  name: string;
+  accent: string | null;
+  gender: string | null;
+  age: string | null;
+  language: string | null;
+  description: string | null;
+  preview_url: string | null;
+  free: boolean;
+}
+
+/** Optional filters for a Voice Library search — all passed through to
+ * ElevenLabs. `search` alone handles the "french english" case. */
+export interface TtsLibraryFilters {
+  search?: string;
+  language?: string;
+  accent?: string;
+  gender?: string;
+  age?: string;
+  page?: number;
+}
+
+/** Response of `GET /api/settings/tts/library`. `add_enabled` mirrors the
+ * `tts.elevenlabs_library_enabled` admin flag — the browser offers "Add to
+ * deployment" only when true. `error` carries a readable failure line (the
+ * search endpoint never 5xxes). */
+export interface TtsLibraryResponse {
+  backend: TtsBackend;
+  voices: TtsLibraryVoice[];
+  has_more: boolean;
+  error: string | null;
+  add_enabled: boolean;
+}
+
+/** Response of the admin `GET|PUT /api/admin/system-settings/tts_library`
+ * endpoints — the Voice Library add gate (default off). */
+export interface TtsLibrarySetting {
+  enabled: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+/**
  * Voices offered by the backend behind `modelId`. Returns `[]` for
  * unrecognized backends — the caller then shows a free-text field instead of
  * a dropdown.
