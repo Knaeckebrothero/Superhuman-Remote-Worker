@@ -160,6 +160,23 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     }
 
 
+_kb_locks: Dict[uuid.UUID, asyncio.Lock] = {}
+
+
+def _kb_lock(kb_id: uuid.UUID) -> asyncio.Lock:
+    """Per-KB serialization for reindex runs (PR3.1).
+
+    Two post-merge triggers ~30s apart ran concurrent full rebuilds against the
+    same KB on dev (interleaved chunk delete+insert batches). All in-process
+    entry points (post-merge trigger, sweeper tick, operator endpoint) funnel
+    through :func:`reindex_kb`, so an asyncio lock suffices — the sweeper is
+    leader-gated and loop advances run on the leader. The second replica's
+    operator endpoint can still race in theory; the up-to-date short-circuit
+    under the lock makes the overlap window one HEAD read.
+    """
+    return _kb_locks.setdefault(kb_id, asyncio.Lock())
+
+
 async def reindex_kb(
     *,
     gitea_client: Any,
@@ -176,9 +193,11 @@ async def reindex_kb(
     covers it under the current pipeline version → diff the git tree's
     ``{path: blob_sha}`` map against the index's → per changed note:
     fetch @HEAD, ``parse_note_md``, chunk + embed (PR2), adopt any legacy row,
-    upsert the note row + replace its chunks (PR1) → remove deleted notes →
-    advance the watermark. Embed-before-write ordering per note: a note whose
-    embedding failed keeps its stale ``blob_sha``, so the next run retries it.
+    upsert the note row UNSTAMPED, replace its chunks (PR1), then stamp
+    ``blob_sha``/``embedding_version`` → remove deleted notes → advance the
+    watermark. Embed-before-write and stamp-after-chunks ordering per note: a
+    note whose embedding OR chunk write failed keeps a stale/NULL ``blob_sha``,
+    so the next run retries it.
 
     Full rebuild (``full=True`` in the plan) when the pipeline version changed
     (new model/dims/chunker), when there is no watermark yet (first index of a
@@ -193,10 +212,36 @@ async def reindex_kb(
     longer exists are invisible to the diff and left for the offline frontmatter
     audit (§11 migration-hygiene gate).
 
+    Runs are serialized per KB (see :func:`_kb_lock`); distinct KBs proceed
+    concurrently.
+
     Returns a summary dict: ``status`` (``no-head`` / ``up-to-date`` /
     ``tree-fetch-failed`` / ``completed`` / ``partial``), ``indexed_commit``,
     ``full``, ``upserted``, ``deleted``, ``skipped``, ``errors``.
     """
+    async with _kb_lock(kb_id):
+        return await _reindex_kb_unlocked(
+            gitea_client=gitea_client,
+            store=store,
+            embedding_service=embedding_service,
+            kb_id=kb_id,
+            repo_name=repo_name,
+            branch=branch,
+            force_full=force_full,
+        )
+
+
+async def _reindex_kb_unlocked(
+    *,
+    gitea_client: Any,
+    store: Any,
+    embedding_service: Any,
+    kb_id: uuid.UUID,
+    repo_name: str,
+    branch: str = "main",
+    force_full: bool = False,
+) -> Dict[str, Any]:
+    """The reindex cycle body — call through :func:`reindex_kb` (per-KB lock)."""
     head = await gitea_client.get_branch_head_sha(repo_name, branch)
     if not head:
         logger.warning("kb_reindex[%s]: no HEAD for %s@%s", kb_id, repo_name, branch)
@@ -277,6 +322,9 @@ async def reindex_kb(
             # Claim any pre-slice-3 row for this slug so the (kb_id, path)
             # upsert can't unique-violate on uq_knowledge_project_note.
             await store.adopt_legacy_row(kb_id, fields["note_id"], path)
+            # Upsert UNSTAMPED (blob_sha/embedding_version NULL): the stamp
+            # means "chunks durable" and lands only after replace_note_chunks,
+            # so a chunk-write failure keeps the note in the next run's diff.
             note_row = await store.upsert_kb_note(
                 kb_id=kb_id,
                 note_id=fields["note_id"],
@@ -284,8 +332,8 @@ async def reindex_kb(
                 title=fields["title"],
                 note_type=fields["note_type"],
                 content=body,
-                blob_sha=current_map[path],
-                embedding_version=current_version,
+                blob_sha=None,
+                embedding_version=None,
                 status=fields["status"],
                 confidence=fields["confidence"],
                 tags=fields["tags"],
@@ -298,6 +346,7 @@ async def reindex_kb(
                 chunks=chunk_rows,
                 embedding_version=current_version,
             )
+            await store.stamp_note_indexed(note_row, current_map[path], current_version)
             upserted += 1
         except Exception as exc:
             logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, exc)

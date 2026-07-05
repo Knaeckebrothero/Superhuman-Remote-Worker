@@ -18,6 +18,7 @@ big to fit and must be cut mid-section; clean heading boundaries need none.
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -36,6 +37,12 @@ TARGET_TOKENS = 512
 
 # Overlap fraction applied ONLY between forced mid-section pieces (10-15%).
 OVERLAP_RATIO = 0.12
+
+# Hard cap on inputs per embed_batch request. Embedding backends enforce their
+# own limits (live: the self-hosted TEI endpoint 422s above 64 inputs — a 127 KB
+# curator dump chunks into 95). 64 is the observed floor across our backends;
+# raise via env for providers with roomier limits.
+DEFAULT_MAX_EMBED_BATCH = int(os.getenv("EMBEDDING_MAX_BATCH", "64"))
 
 _HEADING_LINE_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
@@ -248,16 +255,18 @@ async def embed_note_chunks(
     chunker_version: str = CHUNKER_VERSION,
     target_tokens: int = TARGET_TOKENS,
     token_counter: Optional[Callable[[str], int]] = None,
+    max_batch: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """Chunk a note, embed every chunk in ONE bulk call, return persistable rows.
+    """Chunk a note, bulk-embed the chunks, return persistable rows.
 
     The end-to-end pipeline PR3 calls per changed note: it produces the exact dict
     shape ``KnowledgeStore.replace_note_chunks`` consumes (``chunk_ix``,
     ``heading_path``, ``content``, ``embedding``) plus the ``embedding_version``
-    stamp for the note + chunk rows. Uses the bulk ``embed_batch`` (one request for
-    the whole note) rather than the legacy one-call-per-note upsert path. An empty
-    body embeds nothing (no wasted API call) but still returns the version so the
-    caller can stamp the — now chunk-less — note row consistently.
+    stamp for the note + chunk rows. Uses the bulk ``embed_batch`` (one request per
+    ``max_batch`` chunks — most notes fit in one) rather than the legacy
+    one-call-per-note upsert path. An empty body embeds nothing (no wasted API
+    call) but still returns the version so the caller can stamp the — now
+    chunk-less — note row consistently.
     """
     version = embedding_version(
         embedding_service.model, embedding_service.expected_dimensions, chunker_version
@@ -270,7 +279,12 @@ async def embed_note_chunks(
         build_embed_text(c.content, c.heading_path, title, note_type, tags)
         for c in chunks
     ]
-    vectors = await embedding_service.embed_batch(embed_texts)
+    cap = max_batch or DEFAULT_MAX_EMBED_BATCH
+    vectors: List[Any] = []
+    for start in range(0, len(embed_texts), cap):
+        vectors.extend(
+            await embedding_service.embed_batch(embed_texts[start : start + cap])
+        )
     rows = [
         {
             "chunk_ix": c.chunk_ix,

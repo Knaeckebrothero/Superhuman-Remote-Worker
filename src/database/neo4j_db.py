@@ -13,8 +13,25 @@ Connection details come from the datasource connector system
 import logging
 from typing import List, Dict, Any, Optional
 
-from neo4j import GraphDatabase
-from neo4j.exceptions import ServiceUnavailable, AuthError
+try:
+    from neo4j import GraphDatabase
+    from neo4j.exceptions import ServiceUnavailable, AuthError
+except ImportError:  # pragma: no cover — exercised via tests/test_neo4j_import_guard.py
+    # The orchestrator image ships without the neo4j package (graph features are
+    # agent-side only), but this module sits on the import path of the eager
+    # src/tools registry — so a hard import failure here poisons EVERYTHING
+    # under src.tools for whichever import runs first in the process, then
+    # heisenbergs (retries succeed off the partially-cached package). Defer the
+    # failure to Neo4jDB construction instead, where it can raise loudly and
+    # locally. Live forensics: KB sweeper silent death, dev 2026-07-05.
+    GraphDatabase = None
+
+    class ServiceUnavailable(Exception):
+        """Stand-in so except-clauses below stay importable without neo4j."""
+
+    class AuthError(Exception):
+        """Stand-in so except-clauses below stay importable without neo4j."""
+
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +71,12 @@ class Neo4jDB:
             username: Neo4j username
             password: Neo4j password
         """
+        if GraphDatabase is None:
+            raise RuntimeError(
+                "The neo4j Python package is not installed in this image — "
+                "graph datasources are agent-side only (the orchestrator image "
+                "deliberately omits the driver)."
+            )
         self._uri = uri
         self._username = username
         self._password = password
