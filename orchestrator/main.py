@@ -18901,6 +18901,28 @@ async def upload_files_to_thread(
     }
 
 
+# Map a TTS synthesis failure code → HTTP status. Deliberately NEVER 401/403
+# for "auth": the cockpit auth interceptor redirects to login on 401, and a
+# *provider* key problem must not look like the user's own session expiring.
+# The {code, message} body is what the cockpit actually switches on.
+_TTS_ERROR_STATUS = {
+    "payment_required": 402,
+    "rate_limit": 429,
+    "auth": 502,
+    "generic": 502,
+}
+
+
+def _tts_synthesis_http_error(exc: Exception) -> HTTPException:
+    """A TTS synthesis failure → an HTTP error the cockpit can localize:
+    status by code (payment→402, rate→429, else→502), with a machine-readable
+    ``{code, message}`` body so the UI shows "this voice needs a paid plan"
+    instead of a generic "synthesis failed"."""
+    code = getattr(exc, "code", "generic") or "generic"
+    status = _TTS_ERROR_STATUS.get(code, 502)
+    return HTTPException(status_code=status, detail={"code": code, "message": str(exc)})
+
+
 @app.post("/api/persistent/threads/{thread_id}/tts")
 async def synthesize_thread_message_tts(
     thread_id: str,
@@ -18948,7 +18970,7 @@ async def synthesize_thread_message_tts(
             ref_id=thread_id,
         )
     except TtsSynthesisError as exc:
-        raise HTTPException(status_code=502, detail="Speech synthesis failed") from exc
+        raise _tts_synthesis_http_error(exc) from exc
 
     if result is None:
         # 204: TTS disabled / not configured. The cockpit treats this as a
@@ -22581,7 +22603,7 @@ async def preview_tts_voice(
             ledger=usage_ledger,
         )
     except TtsSynthesisError as exc:
-        raise HTTPException(status_code=502, detail="Voice preview failed") from exc
+        raise _tts_synthesis_http_error(exc) from exc
 
     if audio is None:
         return Response(status_code=204)

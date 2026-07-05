@@ -48,7 +48,31 @@ class TtsSynthesisError(RuntimeError):
     returns ``None``) so the endpoint can answer ``502`` for a real failure
     instead of the ``204`` "feature off" signal — i.e. the button surfaces an
     error instead of silently doing nothing.
+
+    ``code`` classifies *actionable* failures so the UI can say something useful
+    instead of a generic "synthesis failed": ``"payment_required"`` (the
+    ElevenLabs free-tier / out-of-credit 402 — "this voice needs a paid plan"),
+    ``"auth"`` (401/403 — bad provider key), ``"rate_limit"`` (429). Everything
+    else stays ``"generic"``. The endpoint maps the code to an HTTP status +
+    a machine-readable body the cockpit localizes.
     """
+
+    def __init__(self, message: str = "", *, code: str = "generic"):
+        super().__init__(message or code)
+        self.code = code
+
+
+# Upstream HTTP status → an actionable TtsSynthesisError code, or None for
+# "generic / transient" (retry-worthy, no special message). Shared by the
+# ElevenLabs and OpenAI synthesis paths so both classify failures the same way.
+def _tts_error_code(status: Optional[int]) -> Optional[str]:
+    if status == 402:
+        return "payment_required"
+    if status in (401, 403):
+        return "auth"
+    if status == 429:
+        return "rate_limit"
+    return None
 
 
 # Cache caps. ~50 MP3s × ~200 KB each ≈ 10 MB. The cache is per-process
@@ -188,6 +212,80 @@ def _aux_reasoning_off_body(model: str) -> dict:
     """The reasoning-OFF ``extra_body`` (the default read-aloud path). Thin alias
     over :func:`_aux_reasoning_body` with no requested level."""
     return _aux_reasoning_body(model, None)
+
+
+def _aux_family_extra_body(model: str) -> dict:
+    """The aux family's static ``settings.extra_body`` from the model matrix —
+    the SAME block the main agent applies via ``create_llm``. The load-bearing
+    one is MiniMax's ``reasoning_split: true``, which tells MiniMax to return
+    reasoning in a separate ``reasoning_content`` field instead of dumping
+    ``<think>…</think>`` into ``content`` (where it would otherwise be rewritten
+    and read aloud). The TTS rewrite path is a separate lane that historically
+    only sent the reasoning toggle, so this closes the "extra_body layer 2" gap.
+    Returns ``{}`` when the family declares none."""
+    if not model:
+        return {}
+    fam = detect_family(model).family
+    settings = (_model_config_matrix().get(fam) or {}).get("settings")
+    extra = settings.get("extra_body") if isinstance(settings, dict) else None
+    return dict(extra) if isinstance(extra, dict) else {}
+
+
+def _aux_extra_body(model: str, level: Optional[str] = None) -> dict:
+    """Full ``extra_body`` for a TTS aux call: the family's static anti-leak
+    ``settings.extra_body`` (e.g. ``reasoning_split``) merged with the reasoning
+    on/off toggle. The reasoning toggle wins on any key overlap (they're
+    disjoint in practice: ``reasoning_split`` vs ``chat_template_kwargs``)."""
+    return {**_aux_family_extra_body(model), **_aux_reasoning_body(model, level)}
+
+
+# Belt-and-suspenders think-tag stripping. Even with reasoning_split (above),
+# a leaky/unknown provider — or a future model — could embed its chain-of-thought
+# as ``<think>…</think>`` in the content. That text must NEVER be spoken, so the
+# rewrite path strips it structurally on top of suppressing it at the source.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = "<think>"
+
+
+def _withhold_partial_open(text: str) -> str:
+    """Trim a trailing fragment of ``text`` that is a case-insensitive prefix of
+    ``<think>`` — so a tag arriving split across stream deltas is never emitted
+    half-formed (e.g. text ending in ``<thi``)."""
+    lower = text.lower()
+    for cut in range(len(_THINK_OPEN) - 1, 0, -1):
+        if lower.endswith(_THINK_OPEN[:cut]):
+            return text[:-cut]
+    return text
+
+
+def _strip_think_tags(text: str) -> str:
+    """Remove ``<think>…</think>`` reasoning blocks from a fully-buffered string
+    (the non-streaming rewrite paths). Also drops a dangling unclosed ``<think>``
+    (reasoning cut off by a token cap) and any stray closer."""
+    if not text:
+        return text
+    text = _THINK_BLOCK_RE.sub("", text)
+    idx = text.lower().find(_THINK_OPEN)
+    if idx != -1:
+        text = text[:idx]
+    text = re.sub(r"</think>", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _strip_think_stream(text: str, *, final: bool = False) -> str:
+    """Streaming-safe strip: given the raw accumulation so far, return the prefix
+    that is SAFE to emit now. Complete ``<think>…</think>`` blocks are removed; if
+    reasoning is still open (an unclosed ``<think>``) everything from it is
+    withheld until ``</think>`` arrives; and a tail that could be a ``<think>``
+    tag mid-arrival is withheld. The caller diffs against what it already emitted
+    to feed only the new clean content to the chunker. ``final=True`` (call once
+    at end of stream) stops withholding the partial-tag tail — the stream ended,
+    so a lingering ``<th…`` is real content, not a truncated tag."""
+    text = _THINK_BLOCK_RE.sub("", text)
+    open_idx = text.lower().rfind(_THINK_OPEN)
+    if open_idx != -1:
+        return text[:open_idx]
+    return text if final else _withhold_partial_open(text)
 
 
 # Valid read-aloud reasoning levels (Settings picker + server validation). "off"
@@ -575,9 +673,9 @@ async def _formulate_for_speech(
                 {"role": "user", "content": text},
             ],
             temperature=0.3,
-            extra_body=_aux_reasoning_body(model, reasoning_level),
+            extra_body=_aux_extra_body(model, reasoning_level),
         )
-        rewritten = (response.choices[0].message.content or "").strip()
+        rewritten = _strip_think_tags(response.choices[0].message.content or "")
         if _metering_enabled(ledger):
             await _record_usage(
                 ledger,
@@ -645,8 +743,11 @@ async def _synthesize_elevenlabs(
     credential if the row carries one, else the deployment-wide
     ``ELEVENLABS_API_KEY`` (one account per deployment). Same no-retry /
     fail-in-seconds posture as :func:`_synthesize_speech` so the "Read aloud"
-    button never hangs. Returns ``None`` (not raises) on any failure — the
-    caller maps that to the same 502 as an OpenAI-path failure."""
+    button never hangs. Returns ``None`` on a generic/transient failure (the
+    caller maps that to a 502); RAISES :class:`TtsSynthesisError` with a ``code``
+    on an *actionable* upstream error (402 needs-paid-plan, 401 auth, 429 rate
+    limit) so the UI can say what actually went wrong — the exact case where a
+    free-tier account picks a Library voice it can't synthesize."""
     key = (api_key or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
     if not key:
         logger.warning(
@@ -669,16 +770,30 @@ async def _synthesize_elevenlabs(
                 headers={"xi-api-key": key, "accept": "audio/mpeg"},
                 json={"text": text, "model_id": model},
             )
-            resp.raise_for_status()
-            return resp.content
     except Exception:
         logger.exception(
-            "ElevenLabs synthesis failed (model=%s voice=%s chars=%d)",
+            "ElevenLabs synthesis request failed (model=%s voice=%s chars=%d)",
             model,
             voice,
             len(text),
         )
         return None
+
+    if resp.status_code < 400:
+        return resp.content
+
+    code = _tts_error_code(resp.status_code)
+    message = _elevenlabs_error_message(resp)
+    logger.warning(
+        "ElevenLabs synthesis rejected (status=%s code=%s voice=%s): %s",
+        resp.status_code,
+        code,
+        voice,
+        message,
+    )
+    if code:
+        raise TtsSynthesisError(message, code=code)
+    return None
 
 
 # ElevenLabs account-voice listing (Phase 5 — settings voice picker). The
@@ -1043,7 +1158,7 @@ async def _synthesize_speech(
             **extra,
         )
         return response.content
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "TTS synthesis failed (stage=synthesize model=%s base_url=%s voice=%s chars=%d)",
             model,
@@ -1051,6 +1166,11 @@ async def _synthesize_speech(
             voice,
             len(text),
         )
+        # Classify actionable upstream errors (bad key, quota/rate limit) so the
+        # UI can say what's wrong; the OpenAI SDK exposes the HTTP status.
+        code = _tts_error_code(getattr(exc, "status_code", None))
+        if code:
+            raise TtsSynthesisError(str(exc), code=code) from exc
         return None
     finally:
         await client.close()
@@ -1542,7 +1662,7 @@ async def _resplit_oversized(
                         {"role": "user", "content": chunk},
                     ],
                     temperature=0.3,
-                    extra_body=_aux_reasoning_off_body(model),
+                    extra_body=_aux_extra_body(model),
                 )
                 sub = _parse_chunk_array(response.choices[0].message.content or "")
                 result.extend(sub if sub else [chunk])
@@ -1594,7 +1714,7 @@ async def _llm_clean_and_chunk(
                 {"role": "user", "content": text},
             ],
             temperature=0.3,
-            extra_body=_aux_reasoning_body(model, reasoning_level),
+            extra_body=_aux_extra_body(model, reasoning_level),
         )
         if _metering_enabled(ledger):
             # Meter tokens even when the plan is truncated/unparseable below —
@@ -1618,7 +1738,9 @@ async def _llm_clean_and_chunk(
                 base_url,
             )
             return None
-        chunks = _parse_chunk_array(choice.message.content or "")
+        # Strip any leaked <think> before parsing — a reasoning preamble would
+        # otherwise break the JSON-array parse (→ fallback) or ride into a chunk.
+        chunks = _parse_chunk_array(_strip_think_tags(choice.message.content or ""))
     except Exception:
         logger.exception(
             "TTS chunk-planning LLM call failed (stage=chunk-plan model=%s "
@@ -1853,6 +1975,11 @@ async def stream_tts_chunks(
     got_content = False
     usage_obj: Any = None
     stalled = False
+    # Streaming <think>-strip state: `think_raw` accumulates the RAW model output;
+    # `think_emitted` is how much of the think-stripped text we've already fed to
+    # `buffer`. Only new clean (post-reasoning) content reaches the chunker.
+    think_raw = ""
+    think_emitted = 0
     try:
         custom_prompt, reasoning_level = _read_aloud_prefs(user_settings)
         stream = await client.chat.completions.create(
@@ -1869,7 +1996,7 @@ async def stream_tts_chunks(
             temperature=0.3,
             stream=True,
             stream_options={"include_usage": True},
-            extra_body=_aux_reasoning_body(aux_model, reasoning_level),
+            extra_body=_aux_extra_body(aux_model, reasoning_level),
         )
         stream_iter = stream.__aiter__()
         while True:
@@ -1907,7 +2034,14 @@ async def stream_tts_chunks(
             if not piece:
                 continue
             got_content = True
-            buffer += piece
+            # Route the raw delta through the streaming think-strip: only the
+            # newly-safe clean text (reasoning removed / withheld) hits the buffer.
+            think_raw += piece
+            clean = _strip_think_stream(think_raw)
+            if len(clean) <= think_emitted:
+                continue  # still inside reasoning, or only a partial tag arrived
+            buffer += clean[think_emitted:]
+            think_emitted = len(clean)
 
             # (1) Honour an explicit sentinel boundary if the model emitted one
             #     (bonus — most local models don't; see the module note).
@@ -1948,6 +2082,13 @@ async def stream_tts_chunks(
                         "rewritten": True,
                     }
                     index += 1
+
+        # Final think-strip flush: release any tail we were withholding as a
+        # possible partial <think> tag (the stream ended → it's real content).
+        final_clean = _strip_think_stream(think_raw, final=True)
+        if len(final_clean) > think_emitted:
+            buffer += final_clean[think_emitted:]
+            think_emitted = len(final_clean)
 
         # Flush the trailing remainder (the final chunk), unless we bailed on an
         # idle stall mid-message (the buffer is partial then).

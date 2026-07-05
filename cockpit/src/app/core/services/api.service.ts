@@ -938,12 +938,13 @@ export class ApiService {
     threadId: string,
     content: string,
     options: {reformulate?: boolean; language?: string} = {},
-  ): Observable<{text: string; audio: Blob} | 'unavailable' | null> {
+  ): Observable<{text: string; audio: Blob} | 'unavailable' | {errorCode: string} | null> {
     // The endpoint returns JSON {text, audio} where `text` is the spoken
     // (formulation-rewritten) version actually read aloud and `audio` is the
     // base64-encoded MP3. 204 → no TTS model configured ('unavailable');
-    // any error (incl. 502 synthesis failure) → null so the caller can show
-    // an error state.
+    // an *actionable* failure (paid-plan / auth / rate-limit) → {errorCode} so
+    // the caller shows a specific message and doesn't pointlessly retry; any
+    // other/transient error → null.
     return this.http
       .post<{text: string; audio: string}>(
         `${this.baseUrl}/persistent/threads/${threadId}/tts`,
@@ -964,9 +965,25 @@ export class ApiService {
         }),
         catchError((error) => {
           console.error(`Failed to generate TTS for thread ${threadId}:`, error);
-          return of(null);
+          const code = this.ttsErrorCode(error);
+          return of(code ? ({errorCode: code} as const) : null);
         }),
       );
+  }
+
+  /** Extract an actionable TTS failure code from an HTTP error. The synth
+   * endpoints return `{detail: {code, message}}`; fall back to the status for
+   * the two safe codes (402 payment, 429 rate-limit). Returns null for
+   * transient/unknown errors (the caller retries those). */
+  private ttsErrorCode(error: unknown): string | null {
+    const e = error as {status?: number; error?: {detail?: {code?: string}}};
+    const code = e?.error?.detail?.code;
+    if (code === 'payment_required' || code === 'auth' || code === 'rate_limit') {
+      return code;
+    }
+    if (e?.status === 402) return 'payment_required';
+    if (e?.status === 429) return 'rate_limit';
+    return null;
   }
 
   /**
@@ -979,10 +996,12 @@ export class ApiService {
     voice: string,
     language = 'en',
     text?: string,
-  ): Observable<Blob | 'unavailable' | null> {
+  ): Observable<Blob | 'unavailable' | {errorCode: string} | null> {
     // `text` (optional) auditions the voice on the user's own words; omitted or
     // blank falls back to the server's canned phrase. Only sent when non-empty
-    // so the request body stays identical to before when unused.
+    // so the request body stays identical to before when unused. An actionable
+    // failure (paid-plan / auth / rate-limit) → {errorCode} so the picker can
+    // say "this voice needs a paid plan"; other errors → null.
     const body: {voice: string; language: string; text?: string} = {
       voice,
       language,
@@ -1002,7 +1021,8 @@ export class ApiService {
         }),
         catchError((error) => {
           console.error('Failed to preview TTS voice:', error);
-          return of(null);
+          const code = this.ttsErrorCode(error);
+          return of(code ? ({errorCode: code} as const) : null);
         }),
       );
   }
