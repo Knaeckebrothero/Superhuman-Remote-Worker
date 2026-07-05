@@ -632,6 +632,47 @@ exactly the split-brain this design exists to kill.
      the new schema — which forces the **near-duplicate definition under chunking**
      (note-level representative embedding vs. max chunk-pair similarity): decide
      here with the runbook's self-join SQL against live data.
+     **IN PROGRESS 2026-07-05 (develop, TDD, uncommitted) — split into PR4a/b/c/d:**
+     - **PR4a DONE — chunk-RRF search.** Migration `0009_knowledge_chunk_hybrid_search.sql`
+       (`knowledge_chunk_hybrid_search(query, embedding, kb_ids[], version, …)` returning
+       SETOF knowledge_index: dense+sparse arms over `knowledge_chunks` collapsed to the
+       best chunk per note via `MIN(rank_ix) GROUP BY note_row`, recency arm over notes
+       **with an EXISTS-chunks guard so file-less ghosts stay invisible**, `status='active'`
+       preserved, `embedding_version` drift filter, rrf_k 60). `KnowledgeStore.search_chunks`
+       (over-fetch → no-op `_rerank_chunks` slot → truncate to match_count). Artifact
+       regenerated; migration verified applying against real pg15+pgvector.
+     - **PR4b DONE — kb_search cutover.** `kb_search` now calls `search_chunks` (note-level
+       `hybrid_search` is blind to reindexed notes — their embedding is NULL, vectors live
+       on chunks), passes the live `embedding_version` (`qwen3-embedding-8b:4096:c1`,
+       resolved from the query-time EmbeddingService so it matches the reindexer stamp),
+       and surfaces the watermark `indexed_commit` in the header.
+     - **PR4c-1 DONE — link table.** Migration `0010_knowledge_links.sql`
+       (`knowledge_links`: source_note_row FK CASCADE, kb_id, source_id, target_id slug,
+       rel_type default `references`; target resolved at READ time so mid-rebuild ordering
+       and dead links are non-issues). `replace_note_links` + `get_related_notes` (1-hop
+       bidirectional, active-only read-time join). Reindexer extracts body markdown links
+       (`_internal_link_targets`, same parser as the dead-link lint) and rewrites edges
+       per note BEFORE the durability stamp. Artifact regenerated.
+     - **PR4c-2 DONE — Neo4j-optional read/degrade side.** `create_kb_tools` tolerates
+       `kg is None` (only the store is required). `kb_related` degrades to
+       `get_related_notes`; `kb_contradictions`/`kb_provenance`/`kb_unanswered`/`kb_export`
+       degrade **honestly** to a "requires the Graph tier" message (CONTRADICTS/DERIVED_FROM/
+       ANSWERS have no files-canonical representation — no fabrication from generic
+       `references` edges). *Deviation from the spec's "all three degrade to 1-hop link
+       queries": only `kb_related` maps cleanly; the other two are honest degrades.*
+     - **PR4c-3 read half DONE.** `KnowledgeStore.get_note_by_slug` (status-agnostic full
+       read, kg.read_note dict shape) + `list_notes` (kg.list_notes shape, tag via
+       `ANY(tags)`); `kb_read`/`kb_list` gain `kg is None` branches over them.
+     - **PR4c-3 write half + toggle flip: NOT DONE (the remaining risky slice).** kg-less
+       `kb_write` (slug via `slugify` + collision/dup via `get_note_by_slug` + deterministic
+       hash suffix, then `upsert_note` + `_dual_write_note`, skip Neo4j) and `_update_existing`;
+       then relax `ToolContext.has_knowledge()` to store-only + registry gate message. The
+       Neo4j path stays byte-identical (additive `kg is None` branches). Hot write path —
+       deferred to a focused pass. **Until has_knowledge is relaxed, all the kg-None code
+       above is dormant (kg is never None in prod yet) — the toggle is not live.**
+     - **PR4d NOT STARTED — near-dup port.** `find_near_duplicate_pairs` still runs on the
+       note-level `embedding` (NULL for reindexed notes → increasingly blind); port to the
+       chunk schema + settle the near-dup-under-chunking definition against live data.
    **Migration-hygiene prerequisite (before PR3/PR4 land, zero-job, offline):** the
    reindex reads truth from *files* — audit the vault for historically-retired notes
    whose file frontmatter still says `active` (retired before `_update_existing`'s

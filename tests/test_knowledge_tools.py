@@ -145,13 +145,15 @@ class TestMetadataRegistry:
 class TestCreateKbTools:
     """Tests for create_kb_tools()."""
 
-    def test_raises_when_knowledge_graph_is_none(self):
+    def test_tolerates_knowledge_graph_none(self):
+        # slice-3 PR4c: Neo4j is optional. Without a graph the tools still build
+        # (the pgvector index is canonical for retrieval; files for content).
         ctx = _make_context()
         ctx.knowledge_graph = None
-        with pytest.raises(ValueError, match="knowledge_graph"):
-            with patch("src.tools.knowledge.knowledge_tools.asyncio") as ma:
-                ma.get_running_loop.side_effect = RuntimeError
-                create_kb_tools(ctx)
+        with patch("src.tools.knowledge.knowledge_tools.asyncio") as ma:
+            ma.get_running_loop.side_effect = RuntimeError
+            tools = create_kb_tools(ctx)
+        assert len(tools) == 12
 
     def test_raises_when_knowledge_store_is_none(self):
         ctx = _make_context()
@@ -498,37 +500,106 @@ class TestKbSearch:
         result = _invoke(_get_tool(tools, "kb_search"), {"query": "test"})
         assert "Error" in result
 
-    def test_calls_hybrid_search(self):
-        tools, ctx = _make_tools()
-        mock_record = MagicMock()
-        mock_record.note_id = "n1"
-        mock_record.title = "Test"
-        mock_record.note_type = "decision"
-        mock_record.confidence = "high"
-        mock_record.content = "body text"
-
-        with patch("asyncio.run", return_value=[mock_record]):
-            result = _invoke(_get_tool(tools, "kb_search"), {"query": "auth"})
+    def test_formats_result_record(self):
+        ctx = _make_context()
+        rec = _srec("n1")
+        rec.confidence = "high"
+        ctx.knowledge_store.search_chunks.return_value = [rec]
+        ctx.knowledge_store.get_watermark.return_value = None
+        ctx.knowledge_store.embedding_service.model = "qwen3-embedding-8b"
+        ctx.knowledge_store.embedding_service.expected_dimensions = 4096
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_search"), {"query": "auth"})
         assert "n1" in result
 
     def test_empty_results(self):
-        tools, ctx = _make_tools()
-        with patch("asyncio.run", return_value=[]):
-            result = _invoke(_get_tool(tools, "kb_search"), {"query": "nothing"})
+        ctx = _make_context()
+        ctx.knowledge_store.search_chunks.return_value = []
+        ctx.knowledge_store.embedding_service.model = "qwen3-embedding-8b"
+        ctx.knowledge_store.embedding_service.expected_dimensions = 4096
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_search"), {"query": "nothing"})
         assert "No knowledge notes match" in result
 
     def test_truncates_content_preview(self):
-        tools, ctx = _make_tools()
-        mock_record = MagicMock()
-        mock_record.note_id = "n1"
-        mock_record.title = "T"
-        mock_record.note_type = "decision"
-        mock_record.confidence = None
-        mock_record.content = "x" * 300
-
-        with patch("asyncio.run", return_value=[mock_record]):
-            result = _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
+        ctx = _make_context()
+        ctx.knowledge_store.search_chunks.return_value = [
+            _srec("n1", content="x" * 300)
+        ]
+        ctx.knowledge_store.get_watermark.return_value = None
+        ctx.knowledge_store.embedding_service.model = "qwen3-embedding-8b"
+        ctx.knowledge_store.embedding_service.expected_dimensions = 4096
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
         assert "..." in result
+
+
+# =============================================================================
+# 13.8b: kb_search chunk-retrieval cutover (slice-3 PR4)
+# =============================================================================
+
+
+def _srec(note_id, content="body text"):
+    """A note-level search result record (what search_chunks returns)."""
+    rec = MagicMock()
+    rec.note_id = note_id
+    rec.title = "Test"
+    rec.note_type = "decision"
+    rec.confidence = None
+    rec.content = content
+    return rec
+
+
+class TestKbSearchChunkCutover:
+    """kb_search retrieves over the chunk index (``search_chunks``), not the
+    note-level ``hybrid_search`` — the note row's embedding is NULL after the
+    reindexer — and surfaces the index watermark commit.
+
+    These deliberately do NOT patch ``asyncio.run`` so the AsyncMock store
+    methods actually record their calls (the tool falls back to ``asyncio.run``
+    because ``_make_tools`` leaves the creator loop unset).
+    """
+
+    def _ctx_with_store(self, records, watermark=None, project_ids=None):
+        ctx = _make_context(project_ids=project_ids)
+        ctx.knowledge_store.search_chunks.return_value = records
+        ctx.knowledge_store.get_watermark.return_value = watermark
+        ctx.knowledge_store.embedding_service.model = "qwen3-embedding-8b"
+        ctx.knowledge_store.embedding_service.expected_dimensions = 4096
+        return ctx
+
+    def test_calls_search_chunks_not_hybrid_search(self):
+        ctx = self._ctx_with_store([_srec("n1")])
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_search"), {"query": "auth"})
+        ctx.knowledge_store.search_chunks.assert_called_once()
+        ctx.knowledge_store.hybrid_search.assert_not_called()
+        assert "n1" in result
+
+    def test_passes_kb_ids_and_current_embedding_version(self):
+        pid = str(uuid.uuid4())
+        ctx = self._ctx_with_store([], project_ids=[pid])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
+        kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
+        assert kwargs["kb_ids"] == [uuid.UUID(pid)]
+        # Version string must match what the reindexer stamped so the filter
+        # doesn't silently zero out the live index.
+        assert kwargs["embedding_version"] == "qwen3-embedding-8b:4096:c1"
+
+    def test_surfaces_indexed_commit_for_single_kb(self):
+        wm = MagicMock()
+        wm.indexed_commit = "379e91846da3ffffffffffffffffffffffffffff"
+        ctx = self._ctx_with_store([_srec("n1")], watermark=wm)
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
+        assert "379e9184" in result  # short sha in the header
+
+    def test_no_watermark_still_returns_results(self):
+        ctx = self._ctx_with_store([_srec("n1")], watermark=None)
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
+        assert "n1" in result
 
 
 # =============================================================================
@@ -1616,3 +1687,114 @@ class TestKbLintUrlSweep:
             result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})
         assert checker.call_count == 25
         assert "url-sweep-truncated" in result
+
+
+# =============================================================================
+# Graph tools without Neo4j — the Full-tier 1-hop degrade (slice-3 PR4c)
+# =============================================================================
+
+
+def _make_context_no_kg():
+    """A ToolContext with no knowledge_graph (Neo4j disabled), store present."""
+    ctx = _make_context()
+    ctx.knowledge_graph = None
+    return ctx
+
+
+class TestKbToolsWithoutNeo4j:
+    """When Neo4j is absent, kb_related degrades to the knowledge_links 1-hop
+    query; the genuinely graph-shaped tools (contradictions / provenance /
+    unanswered / export) degrade honestly to a Graph-tier message rather than
+    fabricating results from the generic link table."""
+
+    def test_kb_related_uses_link_table_when_no_kg(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_related_notes.return_value = [
+            {
+                "id": "note-b",
+                "title": "B",
+                "type": "decision",
+                "status": "active",
+                "distance": 1,
+                "rel_types": ["references"],
+            }
+        ]
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_related"), {"note": "note-a"})
+        ctx.knowledge_store.get_related_notes.assert_called_once()
+        assert "note-b" in result
+
+    def test_kb_related_no_neighbours_message(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_related_notes.return_value = []
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_related"), {"note": "note-a"})
+        assert "No related notes" in result
+
+    def test_kb_contradictions_degrades_to_graph_tier_message(self):
+        ctx = _make_context_no_kg()
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_contradictions"), {})
+        assert "Graph tier" in result
+
+    def test_kb_provenance_degrades_to_graph_tier_message(self):
+        ctx = _make_context_no_kg()
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_provenance"), {"note": "note-a"})
+        assert "Graph tier" in result
+
+    def test_kb_unanswered_degrades_to_graph_tier_message(self):
+        ctx = _make_context_no_kg()
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_unanswered"), {})
+        assert "Graph tier" in result
+
+    def test_kb_export_degrades_to_graph_tier_message(self):
+        ctx = _make_context_no_kg()
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_export"), {"path": "export"})
+        assert "Graph tier" in result
+
+    def test_kb_read_uses_store_when_no_kg(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = {
+            "id": "n1",
+            "title": "T",
+            "type": "decision",
+            "status": "active",
+            "content": "the body",
+            "confidence": None,
+            "tags": [],
+            "keywords": [],
+            "job_id": None,
+            "phase": None,
+            "created": None,
+            "modified": None,
+        }
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_read"), {"note": "n1"})
+        ctx.knowledge_store.get_note_by_slug.assert_called_once()
+        assert "the body" in result
+
+    def test_kb_read_not_found_when_no_kg(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_read"), {"note": "nope"})
+        assert "not found" in result
+
+    def test_kb_list_uses_store_when_no_kg(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.list_notes.return_value = [
+            {
+                "id": "n1",
+                "title": "T",
+                "type": "decision",
+                "status": "active",
+                "confidence": None,
+            }
+        ]
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_list"), {})
+        ctx.knowledge_store.list_notes.assert_called_once()
+        assert "n1" in result

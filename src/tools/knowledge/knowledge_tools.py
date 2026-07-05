@@ -24,6 +24,7 @@ from langchain_core.tools import tool
 
 from ...services.knowledge_graph import slugify
 from ..context import ToolContext
+from .chunker import embedding_version
 from .gardener import (
     Finding,
     dead_url_findings,
@@ -37,6 +38,16 @@ from .gardener import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Shown by the genuinely graph-shaped tools when Neo4j is absent (slice-3 PR4c).
+# CONTRADICTS / DERIVED_FROM / ANSWERS edges and the Neo4j export have no
+# files-canonical representation — degrade honestly instead of faking results
+# from the generic body-link table (which only carries "references" edges).
+_GRAPH_TIER_MSG = (
+    "requires the Graph tier (Neo4j), which is not enabled for this knowledge "
+    "base. Notes remain searchable (kb_search) and 1-hop links are available "
+    "via kb_related."
+)
 
 
 def _content_hash(text: str) -> str:
@@ -368,10 +379,11 @@ def create_kb_tools(
             return future.result()
         return asyncio.run(coro)
 
-    if not kg or not ks:
-        raise ValueError(
-            "Knowledge tools require knowledge_graph and knowledge_store in ToolContext"
-        )
+    # Neo4j is OPTIONAL (slice-3 PR4c): the pgvector index is canonical for
+    # retrieval and the OKF files for content, so the KB works without a graph.
+    # Only the store is required; graph-shaped tools degrade when kg is None.
+    if not ks:
+        raise ValueError("Knowledge tools require knowledge_store in ToolContext")
 
     # =========================================================================
     # Write Tools
@@ -721,10 +733,18 @@ def create_kb_tools(
 
         try:
             data = None
-            for pid in project_ids:
-                data = kg.read_note(pid, note)
-                if data:
-                    break
+            if kg is None:
+                # Neo4j-less: read the note from the pgvector index (kb_id ==
+                # project_id). Relationships are omitted (use kb_related).
+                for pid in project_ids:
+                    data = _run_async(ks.get_note_by_slug(uuid.UUID(pid), note))
+                    if data:
+                        break
+            else:
+                for pid in project_ids:
+                    data = kg.read_note(pid, note)
+                    if data:
+                        break
             if not data:
                 return f"Note '{note}' not found."
 
@@ -801,16 +821,31 @@ def create_kb_tools(
 
         try:
             notes = []
-            for pid in project_ids:
-                notes.extend(
-                    kg.list_notes(
-                        project_id=pid,
-                        note_type=type,
-                        tag=tag,
-                        status=status,
-                        job_id=job_id,
+            if kg is None:
+                # Neo4j-less: list from the pgvector index (kb_id == project_id).
+                for pid in project_ids:
+                    notes.extend(
+                        _run_async(
+                            ks.list_notes(
+                                kb_id=uuid.UUID(pid),
+                                note_type=type,
+                                tag=tag,
+                                status=status,
+                                job_id=job_id,
+                            )
+                        )
                     )
-                )
+            else:
+                for pid in project_ids:
+                    notes.extend(
+                        kg.list_notes(
+                            project_id=pid,
+                            note_type=type,
+                            tag=tag,
+                            status=status,
+                            job_id=job_id,
+                        )
+                    )
 
             if not notes:
                 filters = []
@@ -844,7 +879,8 @@ def create_kb_tools(
         """Search the project knowledge base using hybrid ranking.
 
         Combines semantic vector search, keyword matching, and recency
-        via Reciprocal Rank Fusion (RRF). Searches active notes only.
+        via Reciprocal Rank Fusion (RRF) over the chunk index. Searches active
+        notes only.
 
         Args:
             query: Search query (natural language or keywords)
@@ -857,11 +893,27 @@ def create_kb_tools(
         if not project_ids:
             return "Error: No project_id available."
 
+        # A KB's id equals its project_id today (migration 0008 backfill).
+        kb_ids = [uuid.UUID(p) for p in project_ids]
+
+        # Filter to the live pipeline stamp so mixed-model/chunker vectors can't
+        # drift into the result set. Resolved from the same EmbeddingService that
+        # embeds the query, so it matches what the reindexer stamped; fall back to
+        # no filter if the service can't report a model (never over-filter blind).
+        try:
+            current_version = embedding_version(
+                ks.embedding_service.model,
+                ks.embedding_service.expected_dimensions,
+            )
+        except Exception:
+            current_version = None
+
         try:
             results = _run_async(
-                ks.hybrid_search(
-                    project_ids=[uuid.UUID(p) for p in project_ids],
+                ks.search_chunks(
+                    kb_ids=kb_ids,
                     query=query,
+                    embedding_version=current_version,
                     match_count=max_results,
                 )
             )
@@ -869,7 +921,20 @@ def create_kb_tools(
             if not results:
                 return f"No knowledge notes match '{query}'."
 
-            lines = [f"**Search Results** ({len(results)} matches for '{query}'):", ""]
+            header = f"**Search Results** ({len(results)} matches for '{query}')"
+            # Best-effort: stamp the index commit the results were served from so
+            # a caller can tell how fresh the index is. Only meaningful for a
+            # single KB; never let a watermark miss break search.
+            if len(kb_ids) == 1:
+                try:
+                    wm = _run_async(ks.get_watermark(kb_ids[0]))
+                    commit = getattr(wm, "indexed_commit", None)
+                    if commit:
+                        header += f" — index @ {str(commit)[:8]}"
+                except Exception as e:
+                    logger.debug(f"kb_search watermark lookup skipped: {e}")
+
+            lines = [f"{header}:", ""]
 
             for i, note in enumerate(results, 1):
                 meta_parts = [note.note_type]
@@ -915,14 +980,25 @@ def create_kb_tools(
 
         try:
             results = []
-            for pid in project_ids:
-                results.extend(
-                    kg.get_related(
-                        project_id=pid,
-                        note_id=note,
-                        max_hops=max_hops,
+            if kg is None:
+                # Neo4j-less degrade: 1-hop over the knowledge_links edge table
+                # (kb_id == project_id). Body markdown links only, so max_hops is
+                # not honoured — the graph traversal is a Graph-tier feature.
+                for pid in project_ids:
+                    results.extend(
+                        _run_async(
+                            ks.get_related_notes(kb_id=uuid.UUID(pid), note_id=note)
+                        )
                     )
-                )
+            else:
+                for pid in project_ids:
+                    results.extend(
+                        kg.get_related(
+                            project_id=pid,
+                            note_id=note,
+                            max_hops=max_hops,
+                        )
+                    )
 
             if not results:
                 return f"No related notes found for '{note}'."
@@ -956,6 +1032,9 @@ def create_kb_tools(
         Returns:
             List of contradiction pairs
         """
+        if kg is None:
+            return f"Contradiction detection {_GRAPH_TIER_MSG}"
+
         project_ids = _get_project_ids(context)
         if not project_ids:
             return "Error: No project_id available."
@@ -995,6 +1074,9 @@ def create_kb_tools(
         Returns:
             Ordered provenance chain from the note back to its sources
         """
+        if kg is None:
+            return f"Provenance tracing {_GRAPH_TIER_MSG}"
+
         project_ids = _get_project_ids(context)
         if not project_ids:
             return "Error: No project_id available."
@@ -1031,6 +1113,9 @@ def create_kb_tools(
         Returns:
             List of unanswered questions
         """
+        if kg is None:
+            return f"Unanswered-question tracking {_GRAPH_TIER_MSG}"
+
         project_ids = _get_project_ids(context)
         if not project_ids:
             return "Error: No project_id available."
@@ -1075,6 +1160,16 @@ def create_kb_tools(
         Returns:
             Summary of exported files
         """
+        if kg is None:
+            # kb_export is the one-time Neo4j → OKF migration dump. Without Neo4j
+            # the vault's `knowledge/*.md` files ARE the canonical OKF export
+            # already, so there is nothing to migrate out of the graph.
+            return (
+                "Nothing to export: this knowledge base has no Graph tier (Neo4j). "
+                "The `knowledge/*.md` files in the workspace are already the "
+                "canonical OKF export."
+            )
+
         project_ids = _get_project_ids(context)
         if not project_ids:
             return "Error: No project_id available."

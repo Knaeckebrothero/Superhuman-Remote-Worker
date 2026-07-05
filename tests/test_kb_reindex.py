@@ -335,6 +335,44 @@ class TestReindexKbIncremental:
         assert wm_kwargs["pipeline_version"] == CURRENT_VERSION
 
     @pytest.mark.asyncio
+    async def test_populates_links_from_body_markdown(self):
+        # The reindexer extracts a note's outbound body markdown links and writes
+        # them to the link table (the kg-less kb_related backend). Link targets
+        # are the basenames of `[...](slug.md)` links; the stamp lands only after
+        # links are written (same "durable-then-stamp" invariant as chunks).
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        body = "See [Other](other-note.md) and [Third](third.md)."
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=[{"path": "knowledge/changed.md", "type": "blob", "sha": "NEW"}],
+            indexed={"knowledge/changed.md": "OLD"},
+            contents={"knowledge/changed.md": _note_md("changed", body)},
+        )
+        order = []
+        store.replace_note_links.side_effect = lambda *a, **k: order.append("links")
+        store.stamp_note_indexed.side_effect = lambda *a, **k: order.append("stamp")
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        assert result["status"] == "completed"
+        link_kwargs = store.replace_note_links.await_args[1]
+        assert link_kwargs["kb_id"] == kb
+        assert link_kwargs["source_id"] == "changed"
+        assert link_kwargs["source_note_row"] == store.upsert_kb_note.return_value
+        assert link_kwargs["targets"] == ["other-note", "third"]
+        # links written before the stamp
+        assert order == ["links", "stamp"]
+
+    @pytest.mark.asyncio
     async def test_deleted_note_removed_from_index(self):
         kb = uuid.uuid4()
         wm = KbWatermark(
