@@ -385,6 +385,43 @@ class TestReplaceNoteChunks:
 
 
 # =============================================================================
+# adopt_legacy_row — claim a pre-slice-3 row by (kb_id, note_id), set its path
+# =============================================================================
+
+
+class TestAdoptLegacyRow:
+    @pytest.mark.asyncio
+    async def test_claims_pathless_row_and_returns_id(self):
+        # A legacy slice-1/2 row has (project_id, note_id) but path IS NULL.
+        # Adopting it sets path (and kb_id) so upsert_kb_note's (kb_id, path)
+        # INSERT can't unique-violate on uq_knowledge_project_note.
+        store, mock_db, _ = _make_store()
+        row_id = uuid.uuid4()
+        mock_db.fetchval.return_value = row_id
+        kb = uuid.uuid4()
+        result = await store.adopt_legacy_row(kb, "chose-jwt", "knowledge/chose-jwt.md")
+        assert result == row_id
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "UPDATE knowledge_index" in query
+        assert "path IS NULL" in query  # never steals an already-migrated row
+        assert "project_id = $1" in query
+        assert "note_id = $2" in query
+        assert "RETURNING id" in query
+        # sets BOTH kb_id and path on the claimed row
+        set_clause = query.split("SET")[1].split("WHERE")[0]
+        assert "kb_id" in set_clause and "path" in set_clause
+        assert params == [kb, "chose-jwt", "knowledge/chose-jwt.md"]
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_legacy_row(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = None
+        assert (
+            await store.adopt_legacy_row(uuid.uuid4(), "n", "knowledge/n.md") is None
+        )
+
+
+# =============================================================================
 # delete_kb_note — remove a note (cascade reaps its chunks)
 # =============================================================================
 

@@ -550,6 +550,31 @@ exactly the split-brain this design exists to kill.
      deleted → advance watermark; full rebuild re-pointed at the git tree +
      `kb reindex --full` operator hatch; per-row `blob_sha` interruption self-heal.
      Triggers: post-merge hook, job-start, leader-gated sweeper.
+     **DONE 2026-07-05 (develop, TDD, uncommitted):**
+     `orchestrator/services/kb_reindex.py` — pure helpers (`knowledge_blob_map`
+     filters `list_tree` to `knowledge/**/*.md` minus reserved; `plan_reindex`
+     blob-sha set-diff; `note_fields` inverts `_render_note_md` frontmatter with
+     CHECK-constraint-safe fallbacks) + `reindex_kb` orchestration (up-to-date
+     short-circuit on head+pipeline_version; full rebuild on version change/no
+     watermark/force; embed-BEFORE-write per note so a failed embed keeps the
+     stale blob_sha for retry; unparseable notes SKIP — lint's problem, never
+     wedges the watermark; watermark advances ONLY on zero-error runs) +
+     `kb_sweep_tick`/`kb_reindex_sweeper_loop` (KB_REINDEX_SWEEP_SECONDS=900).
+     Supporting: `EmbeddingService` gained explicit-config kwargs (orchestrator
+     pod has no EMBEDDING_* env — the factory `_build_kb_embedding_service` in
+     main.py resolves catalog-first via `resolve_default_for_capability` +
+     `_inject_env_key_credentials`, env fallback, None→skip honestly);
+     `KnowledgeStore.adopt_legacy_row` claims pathless legacy rows before the
+     `(kb_id,path)` upsert (the `uq_knowledge_project_note` collision guard).
+     Triggers wired: post-merge (fire-and-forget after `merge_status=="merged"`
+     in the loop advance), leader-gated sweeper (`run_when_leader`), operator
+     hatch (`POST /api/projects/{id}/knowledge/reindex?full=` + MCP
+     `reindex_knowledge`). **Deliberately deferred: the job-start trigger** —
+     nothing reads the index until PR4's cutover, post-merge covers the loop
+     write path, and the sweep covers out-of-band edits; revisit at PR4 where
+     stale-at-read matters and the response's `indexed_commit` exposes it.
+     30 tests `tests/test_kb_reindex.py` (+2 store, +4 embedding-service);
+     379 green across touched suites, ruff clean incl. main.py.
    - **PR4 — retrieval cutover + Neo4j demotion**: `search_knowledge` → existing RRF
      over chunk rows with `kb_id` (over-fetch ~50 → return 15–20, no-op reranker
      slot, response carries `indexed_commit`); `kb_related`/`kb_provenance`/

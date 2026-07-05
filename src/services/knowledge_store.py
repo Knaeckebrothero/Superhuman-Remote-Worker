@@ -483,6 +483,33 @@ class KnowledgeStore:
         )
         return {r["path"]: r["blob_sha"] for r in rows}
 
+    async def adopt_legacy_row(
+        self, kb_id: uuid.UUID, note_id: str, path: str
+    ) -> Optional[uuid.UUID]:
+        """Claim a pre-slice-3 row for the files-canonical index.
+
+        Legacy rows (written by the DB-first ``upsert_note`` path) carry
+        ``(project_id, note_id)`` but no ``path``. A reindex INSERT for the same
+        slug would violate ``uq_knowledge_project_note`` — an arbiter
+        ``ON CONFLICT (kb_id, path)`` can't absorb a conflict on a *different*
+        unique constraint. So the reindexer first adopts: set ``kb_id`` + ``path``
+        on the pathless row (project-scoped KB: ``project_id`` doubles as the kb
+        id), after which :meth:`upsert_kb_note` hits the ``(kb_id, path)`` arbiter
+        normally. ``path IS NULL`` guards against stealing an already-migrated
+        row. Returns the adopted row id, or ``None`` when there is no legacy row.
+        """
+        return await self.db.fetchval(
+            """
+            UPDATE knowledge_index
+            SET kb_id = $1, path = $3
+            WHERE project_id = $1 AND note_id = $2 AND path IS NULL
+            RETURNING id
+            """,
+            kb_id,
+            note_id,
+            path,
+        )
+
     async def upsert_kb_note(
         self,
         kb_id: uuid.UUID,
