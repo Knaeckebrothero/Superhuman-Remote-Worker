@@ -29,6 +29,7 @@ from .types import (
     Query,
     Scored,
     TaskFrame,
+    TransientScorerError,
 )
 
 # Importing the plugins package registers the built-in plugins (same
@@ -56,4 +57,5 @@ __all__ = [
     "Query",
     "Scored",
     "TaskFrame",
+    "TransientScorerError",
 ]

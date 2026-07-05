@@ -1,6 +1,6 @@
 # A transient reranker fault hard-fails the whole job (no retry, no degrade)
 
-**Status:** investigated 2026-07-04 — root cause confirmed end-to-end, fix proposed, **not yet implemented**
+**Status:** investigated 2026-07-04; **fix A+B IMPLEMENTED 2026-07-05** — bounded transient-only retry in `RerankerScorer._rerank` (2 extra attempts, exponential backoff; timeouts/connection drops/5xx/429 only) + `TransientScorerError` on exhaustion, which `MemoryManager.assemble` contains by degrading *that one turn* to pre-scorer (hybrid) order (loud in `stats.errors`; next turn goes back through the scorer). Structural failures (4xx/auth/route/shape) still raise `MemoryPipelineError` and stay job-fatal — the original "configured ⇒ required" guarantee holds. Config knobs `memory.reranker.retries`/`retry_backoff` (defaults 2 / 1.0 s) in both defaults files. Tests: `tests/test_memory_manager.py` (+5: retry-then-succeed, exhaustion→TransientScorerError, disconnect+5xx transient, 401 structural no-retry, manager degrade keeps order + stats.errors). **Body count that motivated it: 5 jobs** — the two below plus loop iter 12 `88cceacd` (developer, 500 at 11:21Z, ~2 h 19 m of work lost) and *both* iter-14 critics `ae7691c0`/`e785923c` (ReadTimeouts at 13:36Z/13:38Z, during redeploy churn). Every failed job in the Better-Resavio loop so far had this exact signature.
 **Severity:** high for the RSI loop — a single ~10 s network blip discards a 30-minute job and its unmerged work
 **Component:** `src/services/memory/` (reranker scorer + manager), `src/graph.py` execute node, `src/agent.py` failure classifier
 **Observed on:** main cluster (homelab), MiniMax-M3 loop + research jobs
@@ -11,6 +11,18 @@
 ## TL;DR
 
 The memory reranker scorer (memory overhaul Phase 3, "GATE B") is treated as **required-when-configured**: any runtime exception it raises becomes a `MemoryPipelineError` that propagates uncaught out of the graph's `execute` node and fails the entire job. The scorer makes a single HTTP call to the rerank endpoint with a 10 s timeout and **no retry**. So a transient upstream fault — a `ReadTimeout` or a 5xx from the shared qwen3 embed/rerank router — kills an otherwise-healthy job outright. It has already fired at least twice on 2026-07-04. The design was deliberate (never silently/permanently degrade memory order), but it conflates a *transient* transport blip with a *structural* misconfiguration; only the latter warrants a hard fail.
+
+## Backend forensics (2026-07-05): what the reranker actually is, and why it blips
+
+The rerank endpoint chain: agent → `https://ai.h4ll.app/v1/rerank` = **model-orchestrator router** (namespace `model-orchestrator`, same main cluster) → `http://uni-workstation:8082` over the **Tailscale sidecar** — Qwen3-Reranker-8B on the university workstation. That box also serves TEI embeddings (:8081), the gemma vLLM pool, whisper, and kokoro — a shared, remote, single-instance GPU host.
+
+- **Baseline is healthy**: probed from the router pod, 5/5 rerank calls at 0.14–0.90 s. Router logs show hundreds of 200s per hour.
+- **The `ReadTimeout` failures are latency spikes, not outages**: at 13:36–13:38Z (both iter-14 critics) the router logged *zero* rerank 4xx/5xx — the backend was still answering, just slower than the client's 10 s budget. GPU/queue contention on the shared box; note the duplicate critic (double-spawn regression) had *doubled* the memory-pipeline load on it at that exact moment.
+- **The single 500 in 12 h (11:19:22Z, killed iter 12)** is `httpcore.RemoteProtocolError: Server disconnected without sending a response` — the uni-box rerank container dropped the TCP connection mid-request (restart/OOM/preemption); the router has no retry either and surfaced it as a raw 500.
+
+So nothing is *chronically* wrong with the reranker — it is a best-effort remote GPU service with episodic multi-second stalls and rare connection drops, being consumed with guaranteed-availability semantics (10 s, one attempt, job-fatal). That mismatch is this issue. The client-side transient retry/degrade (fix A+B below) covers both observed signatures.
+
+Related but distinct (found in the same router logs): the TEI embedding backend rejects batches > 64 (`422: batch size N > maximum allowed batch size 64`, N observed 66–1126), and `src/services/embedding_service.py::embed_batch` never splits its input — so any KB note chunking to > 64 chunks fails deterministically and the KB reindexer re-attempts it every tick (422 storms at 09:06–09:28, 11:18…). Deserves its own fix (clamp/split in `embed_batch`).
 
 ## Symptom (observed)
 

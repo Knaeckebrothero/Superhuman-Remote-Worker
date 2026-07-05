@@ -14,18 +14,26 @@ no-op for the loser — the next job is spawned exactly once.
 
 The sweeper also heals the *torn advance*: the advance runs as three separate
 transactions (claim → create next job → re-point), so an interrupt after the
-claim strands the loop in ``status='running'`` with ``current_job_id=NULL`` —
-a state the advance pre-check can never leave (see
-docs/issues/loop_advance_nonatomic_wedges_loop.md for the live incident).
-Recovery re-points the loop at its newest spawned job and reconciles the
-counters the lost write-back would have set, deriving them from the job's own
-``context.loop_iteration`` stamp (spawn-time truth): ``total_jobs_run = N``,
-``seq_index = (N-1) % len(role_sequence)`` (the start endpoint spawns
-iteration 1 at index 0 and the sequence is immutable after start), and
-``remaining_iterations = max_iterations - (N-1)`` (seeded equal at create,
-decremented once per completed advance). The healed pointer then flows into
-the normal terminal-advance path above — same tick if the job already
-finished, via the completion hook if it is still running.
+claim strands the loop in ``status='running'`` with ``current_job_id=NULL``
+(see docs/issues/loop_advance_nonatomic_wedges_loop.md for the live incident).
+Crucially, that same state is also the *normal transient window of every
+healthy advance* — the claim nulls the pointer seconds before the write-back
+restores it — so a NULL pointer alone is NOT evidence of a tear. Healing
+inside a live advance re-arms the claim and double-spawns the next iteration
+(observed: duplicate iter-14 critics, 12 s apart, two replicas). The
+discriminator is age: the claim stamps ``updated_at=now()`` and a healthy
+advance re-points within seconds, so the heal only fires when the NULL state
+is older than ``PROJECT_LOOP_HEAL_GRACE_SECONDS`` (checked in Python against
+the row, and authoritatively re-checked on the DB clock inside the guarded
+UPDATE). Recovery then re-points the loop at its newest spawned job and
+reconciles the counters the lost write-back would have set, deriving them
+from the job's own ``context.loop_iteration`` stamp (spawn-time truth):
+``total_jobs_run = N``, ``seq_index = (N-1) % len(role_sequence)`` (the start
+endpoint spawns iteration 1 at index 0 and the sequence is immutable after
+start), and ``remaining_iterations = max_iterations - (N-1)`` (seeded equal
+at create, decremented once per completed advance). The healed pointer then
+flows into the normal terminal-advance path above — same tick if the job
+already finished, via the completion hook if it is still running.
 
 Mirrors ``cron_dispatcher_loop``'s structure (tick + shutdown-aware wait).
 
@@ -38,6 +46,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
@@ -46,6 +55,13 @@ logger = logging.getLogger(__name__)
 # completion hook handles the happy path instantly; this is only a backstop, so
 # a coarse tick is fine.
 TICK_SECONDS = int(os.getenv("PROJECT_LOOP_SWEEP_SECONDS", "60"))
+
+# A running loop with current_job_id=NULL only counts as *torn* once the state
+# is at least this old — younger means an advance is in flight (its claim just
+# stamped updated_at) and healing would double-spawn. Orders of magnitude above
+# any healthy advance (seconds) and irrelevant to the backstop's purpose (the
+# real incident sat wedged for 12 h).
+HEAL_GRACE_SECONDS = int(os.getenv("PROJECT_LOOP_HEAL_GRACE_SECONDS", "600"))
 
 _TERMINAL = ("completed", "failed", "cancelled")
 
@@ -158,16 +174,44 @@ def _derive_loop_counters(
     return seq_index, iteration, remaining
 
 
+def _wedge_age_seconds(loop: dict[str, Any]) -> float | None:
+    """Seconds since the loop row was last written, or None if unknowable.
+
+    ``updated_at`` was stamped by whatever nulled the pointer (the claim), so
+    this is exactly "how long has the pointer been NULL". None (missing or
+    non-datetime) defers the decision to the DB-side age guard.
+    """
+    updated_at = loop.get("updated_at")
+    if not isinstance(updated_at, datetime):
+        return None
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - updated_at).total_seconds()
+
+
 async def _heal_wedged_loop(db: Any, loop: dict[str, Any]) -> dict[str, Any] | None:
     """Re-point a running loop with no current_job_id at its newest job.
 
     Returns the full job row on success so the caller can continue straight
-    into the terminal-advance path. Returns None when the heal isn't possible
-    (no spawned jobs / undecodable context) — logged loudly as before — or
+    into the terminal-advance path. Returns None when the NULL pointer is
+    younger than the grace period (an advance is in flight — silent skip;
+    a real tear will still be here, older, next tick), when the heal isn't
+    possible (no spawned jobs / undecodable context — logged loudly), or
     when a concurrent replica healed first (silent back-off; its sweep runs
     the advance).
     """
     loop_id = str(loop.get("id"))
+    age = _wedge_age_seconds(loop)
+    if age is not None and age < HEAL_GRACE_SECONDS:
+        # Freshly-nulled pointer = the claim of a live advance, not a tear.
+        # Healing now would re-arm the claim and double-spawn the iteration.
+        logger.debug(
+            "project loop %s: current_job_id is NULL but only %.0fs old — "
+            "advance likely in flight, deferring heal",
+            loop_id[:8],
+            age,
+        )
+        return None
     newest = await db.list_project_loop_jobs(loop_id, limit=1)
     job = await db.get_job(str(newest[0]["id"])) if newest else None
     ctx = job.get("context") if job else None
@@ -194,8 +238,12 @@ async def _heal_wedged_loop(db: Any, loop: dict[str, Any]) -> dict[str, Any] | N
         seq_index=seq_index,
         total_jobs_run=total_jobs_run,
         remaining_iterations=remaining,
+        min_wedge_age_seconds=HEAL_GRACE_SECONDS,
     ):
-        return None  # another replica healed first — its sweep advances
+        # Another replica healed first, or the DB-side age guard saw a
+        # fresher row than our read (an advance re-claimed meanwhile) —
+        # either way, not ours to advance.
+        return None
 
     logger.warning(
         "project loop %s: healed torn advance — re-pointed at %s job %s "

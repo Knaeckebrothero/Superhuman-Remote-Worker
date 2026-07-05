@@ -292,7 +292,13 @@ memory:
     model: qwen3-reranker-8b         # rides the embedding endpoint EMBEDDING_BASE_URL (same qwen3 router; no extra credential plumbing)
     top_k: 512                       # cover the candidate set; any tail past this fails the gate open, bounded backstops it
     keep_pinned_first: false         # ~95% of project corpora freeze TTL-pinned — let the reranker rank them too
-    timeout: 10                      # live-latency cap (eval used 60 for cold-batch throughput); a slow rerank degrades to legacy order, contained
+    timeout: 10                      # live-latency cap per attempt (eval used 60 for cold-batch throughput)
+    # Transient faults (timeout/connection drop/5xx) retry in-call, then
+    # degrade THAT TURN to hybrid order instead of failing the job; structural
+    # failures (4xx/shape) stay job-fatal ("configured => required").
+    # docs/issues/reranker_transient_fault_hard_fails_job.md
+    retries: 2                       # extra attempts after the first
+    retry_backoff: 1.0               # seconds before retry 1, doubling after
   gate:
     threshold: 0.01                  # relative floor = 0.01 x the assemble's top rerank score
     mode: relative                   # absolute thresholds falsified: qwen3-reranker scale varies orders of magnitude per query

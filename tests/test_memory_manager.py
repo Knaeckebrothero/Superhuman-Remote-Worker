@@ -343,6 +343,28 @@ class TestAssemble:
             await manager.assemble(AssembleRequest(query_text="q"))
 
     @pytest.mark.asyncio
+    async def test_scorer_transient_exhaustion_degrades_turn(self):
+        from src.services.memory import TransientScorerError
+
+        first = make_candidate(kind="memory", record_id="m1")
+        second = make_candidate(kind="memory", record_id="m2")
+        manager = MemoryManager(
+            MemoryRuntime(),
+            retrievers=[("r", FakeRetriever([first, second]))],
+            scorers=[("reranker", FakeScorer(error=TransientScorerError("net blip")))],
+        )
+        # A transient transport fault that survived the scorer's bounded
+        # retries degrades THIS turn to pre-scorer (hybrid) order — loud in
+        # stats.errors, but the turn (and the job) stays alive.
+        payload = await manager.assemble(AssembleRequest(query_text="q"))
+
+        assert payload.stats.errors == [
+            "scorer:reranker: TransientScorerError: net blip"
+        ]
+        block = payload.blocks[0]
+        assert [i["record_id"] for i in block.items] == ["m1", "m2"]
+
+    @pytest.mark.asyncio
     async def test_policy_filters_items(self):
         manager = MemoryManager(
             MemoryRuntime(),
@@ -572,14 +594,17 @@ class FakeRerankResponse:
 class FakeRerankClient:
     """httpx-shaped client returning canned Cohere-style rerank results."""
 
-    def __init__(self, scores=None, error=None):
+    def __init__(self, scores=None, error=None, errors=None):
         #: text -> relevance score; results echo document order indices
         self.scores = scores or {}
-        self.error = error
+        self.error = error  # raised on every call
+        self.errors = list(errors or [])  # raised one per call, then success
         self.calls = []
 
     async def post(self, url, json=None):
         self.calls.append({"url": url, "json": json})
+        if self.errors:
+            raise self.errors.pop(0)
         if self.error:
             raise self.error
         docs = json["documents"]
@@ -670,6 +695,83 @@ class TestRerankerScorer:
         with pytest.raises(RuntimeError):
             await scorer.score(AssembleRequest(query_text="q"), items)
         assert "rerank" not in items[0].candidate.channel_scores
+        # structural (non-transient) failures don't burn the retry budget
+        assert len(client.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_fault_retries_then_succeeds(self):
+        import httpx
+
+        client = FakeRerankClient(
+            scores={"a": 0.1, "b": 0.9},
+            errors=[httpx.ReadTimeout("slow rerank")],
+        )
+        scorer = self._scorer(client, retries=2, retry_backoff=0)
+        items = [make_scored("a"), make_scored("b")]
+
+        out = await scorer.score(AssembleRequest(query_text="q"), items)
+
+        assert [i.candidate.text for i in out] == ["b", "a"]
+        assert len(client.calls) == 2  # one timeout, one success
+
+    @pytest.mark.asyncio
+    async def test_transient_exhaustion_raises_transient_scorer_error(self):
+        import httpx
+
+        from src.services.memory import TransientScorerError
+
+        client = FakeRerankClient(error=httpx.ReadTimeout("still slow"))
+        scorer = self._scorer(client, retries=2, retry_backoff=0)
+        items = [make_scored("a"), make_scored("b")]
+
+        with pytest.raises(TransientScorerError, match="3 attempts"):
+            await scorer.score(AssembleRequest(query_text="q"), items)
+        assert len(client.calls) == 3  # initial + 2 retries
+        assert "rerank" not in items[0].candidate.channel_scores
+
+    @pytest.mark.asyncio
+    async def test_server_disconnect_and_5xx_are_transient(self):
+        import httpx
+
+        req = httpx.Request("POST", "https://router/v1/rerank")
+        five_hundred = httpx.HTTPStatusError(
+            "server error",
+            request=req,
+            response=httpx.Response(500, request=req),
+        )
+        client = FakeRerankClient(
+            scores={"a": 0.5, "b": 0.6},
+            errors=[
+                httpx.RemoteProtocolError("Server disconnected"),
+                five_hundred,
+            ],
+        )
+        scorer = self._scorer(client, retries=2, retry_backoff=0)
+        items = [make_scored("a"), make_scored("b")]
+
+        out = await scorer.score(AssembleRequest(query_text="q"), items)
+
+        assert [i.candidate.text for i in out] == ["b", "a"]
+        assert len(client.calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_4xx_is_structural_and_not_retried(self):
+        import httpx
+
+        req = httpx.Request("POST", "https://router/v1/rerank")
+        client = FakeRerankClient(
+            error=httpx.HTTPStatusError(
+                "unauthorized",
+                request=req,
+                response=httpx.Response(401, request=req),
+            )
+        )
+        scorer = self._scorer(client, retries=2, retry_backoff=0)
+        items = [make_scored("a"), make_scored("b")]
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await scorer.score(AssembleRequest(query_text="q"), items)
+        assert len(client.calls) == 1
 
     @pytest.mark.asyncio
     async def test_short_or_queryless_passthrough(self):

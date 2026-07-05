@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 
 from services.project_loop_sweeper import (
+    HEAL_GRACE_SECONDS,
     _derive_loop_counters,
     _heal_wedged_loop,
     _sweep_tick,
@@ -44,6 +46,9 @@ def _loop(**over) -> dict:
         "total_jobs_run": 9,
         "max_iterations": 33,
         "remaining_iterations": 25,
+        # Well past the heal grace — a genuine tear, not an in-flight advance.
+        "updated_at": datetime.now(timezone.utc)
+        - timedelta(seconds=HEAL_GRACE_SECONDS * 2),
     }
     base.update(over)
     return base
@@ -149,6 +154,7 @@ class TestHealWedgedLoop:
             seq_index=0,
             total_jobs_run=10,
             remaining_iterations=24,
+            min_wedge_age_seconds=HEAL_GRACE_SECONDS,
         )
 
     @pytest.mark.asyncio
@@ -178,6 +184,64 @@ class TestHealWedgedLoop:
         orphan = _job(10, "scholar")
         db = _db([_loop()], [orphan], heal_wins=False)
         assert await _heal_wedged_loop(db, _loop()) is None
+
+
+class TestHealAgeGate:
+    """A NULL pointer is only a tear once it's OLD — every healthy advance
+    also traverses running+NULL between its claim and its write-back, and
+    healing inside that window double-spawns the iteration (the live iter-14
+    incident, docs/issues/loop_advance_nonatomic_wedges_loop.md)."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_null_pointer_is_deferred_silently(self):
+        # updated_at = seconds ago → the claim of an advance in flight.
+        orphan = _job(10, "scholar")
+        loop = _loop(updated_at=datetime.now(timezone.utc) - timedelta(seconds=5))
+        db = _db([loop], [orphan])
+        assert await _heal_wedged_loop(db, loop) is None
+        # Deferred before touching the DB at all — no job listing, no heal.
+        db.list_project_loop_jobs.assert_not_awaited()
+        db.heal_project_loop_pointer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_null_pointer_heals(self):
+        orphan = _job(10, "scholar")
+        loop = _loop(updated_at=datetime.now(timezone.utc) - timedelta(hours=12))
+        db = _db([loop], [orphan])
+        assert await _heal_wedged_loop(db, loop) is orphan
+
+    @pytest.mark.asyncio
+    async def test_naive_timestamp_treated_as_utc(self):
+        # asyncpg normally returns tz-aware datetimes; a naive one must not
+        # crash the comparison and reads as UTC.
+        orphan = _job(10, "scholar")
+        naive_now = datetime.now(timezone.utc).replace(tzinfo=None)
+        fresh = _loop(updated_at=naive_now - timedelta(seconds=5))
+        db = _db([fresh], [orphan])
+        assert await _heal_wedged_loop(db, fresh) is None
+        stale = _loop(updated_at=naive_now - timedelta(hours=12))
+        db = _db([stale], [orphan])
+        assert await _heal_wedged_loop(db, stale) is orphan
+
+    @pytest.mark.asyncio
+    async def test_unknown_age_defers_to_db_guard(self):
+        # No readable updated_at → attempt the heal; the SQL age guard
+        # (DB clock) is authoritative and its verdict is respected.
+        orphan = _job(10, "scholar")
+        loop = _loop(updated_at=None)
+        db = _db([loop], [orphan], heal_wins=False)
+        assert await _heal_wedged_loop(db, loop) is None
+        db.heal_project_loop_pointer.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sweep_tick_skips_fresh_wedge_without_advance(self):
+        orphan = _job(10, "scholar")  # completed — would advance if healed
+        loop = _loop(updated_at=datetime.now(timezone.utc))
+        db = _db([loop], [orphan])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 0
+        advance.assert_not_awaited()
+        db.heal_project_loop_pointer.assert_not_awaited()
 
 
 class TestSweepTick:

@@ -5405,6 +5405,44 @@ class UserSettingsUpdate(BaseModel):
     # existing model/permission_mode/greeting/idle_timeout_minutes/command_allowlist
     # keys already read in create_thread. Patch-replaces the whole sub-object.
     persistent_agent: dict[str, Any] | None = None
+    # Read-aloud rewrite preferences: {reasoning_level, custom_prompt}. Controls
+    # how the auxiliary LLM rewrites a message for speech — reasoning_level (off
+    # by default, keeps the fast path) and a free-text custom_prompt (the user's
+    # standing style/summarization instructions). Read by services/tts.py's
+    # rewrite path. Patch-replaces the whole sub-object.
+    read_aloud: dict[str, Any] | None = None
+
+    @field_validator("read_aloud")
+    @classmethod
+    def _validate_read_aloud(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Guard the read-aloud sub-object: reasoning_level must be one of the
+        allowed levels, and custom_prompt is length-capped (it rides on every aux
+        rewrite call). Mirrors the server-side constants in services/tts.py."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("read_aloud must be an object")
+        from services.tts import READ_ALOUD_PROMPT_MAX, READ_ALOUD_REASONING_LEVELS
+
+        level = v.get("reasoning_level")
+        if level is not None:
+            if (
+                not isinstance(level, str)
+                or level.lower() not in READ_ALOUD_REASONING_LEVELS
+            ):
+                raise ValueError(
+                    f"reasoning_level must be one of {list(READ_ALOUD_REASONING_LEVELS)}"
+                )
+            v["reasoning_level"] = level.lower()
+        prompt = v.get("custom_prompt")
+        if prompt is not None:
+            if not isinstance(prompt, str):
+                raise ValueError("custom_prompt must be a string")
+            if len(prompt) > READ_ALOUD_PROMPT_MAX:
+                raise ValueError(
+                    f"custom_prompt must be at most {READ_ALOUD_PROMPT_MAX} characters"
+                )
+        return v
 
 
 class ProjectCreate(BaseModel):
