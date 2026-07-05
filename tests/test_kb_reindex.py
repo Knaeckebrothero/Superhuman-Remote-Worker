@@ -8,6 +8,7 @@ notes (gardener parse_note_md) → chunk+embed (PR2) → persist (PR1 store surf
 field mapping), then the orchestration with AsyncMock deps.
 """
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -315,13 +316,19 @@ class TestReindexKbIncremental:
         up_kwargs = store.upsert_kb_note.await_args[1]
         assert up_kwargs["kb_id"] == kb
         assert up_kwargs["path"] == "knowledge/changed.md"
-        assert up_kwargs["blob_sha"] == "NEW"
-        assert up_kwargs["embedding_version"] == CURRENT_VERSION
+        # the note lands UNSTAMPED — blob_sha/embedding_version mean "chunks
+        # durable" and are set by stamp_note_indexed only after the chunk write
+        assert up_kwargs["blob_sha"] is None
+        assert up_kwargs["embedding_version"] is None
         # chunks persisted with the note row id
         rc_kwargs = store.replace_note_chunks.await_args[1]
         assert rc_kwargs["kb_id"] == kb
         assert rc_kwargs["embedding_version"] == CURRENT_VERSION
         assert len(rc_kwargs["chunks"]) >= 1
+        # ... then the stamp, carrying the git blob + pipeline version
+        store.stamp_note_indexed.assert_awaited_once_with(
+            store.upsert_kb_note.return_value, "NEW", CURRENT_VERSION
+        )
         # watermark advanced to head with the current pipeline version
         wm_kwargs = store.upsert_watermark.await_args[1]
         assert wm_kwargs["indexed_commit"] == "headsha"
@@ -461,6 +468,123 @@ class TestReindexKbFailureHonesty:
         assert result["errors"] == 1
         store.upsert_kb_note.assert_not_awaited()  # embed-first ordering
         store.upsert_watermark.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_chunk_write_failure_leaves_note_unstamped(self):
+        """Live gap 2026-07-05: chunk INSERTs failed (missing pgvector codec)
+        AFTER the note upsert had stamped blob_sha — the diff then saw the note
+        as up-to-date with zero chunks. The stamp must not survive a chunk-write
+        failure."""
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            tree=[{"path": "knowledge/a.md", "type": "blob", "sha": "s"}],
+            contents={"knowledge/a.md": _note_md("a")},
+        )
+        store.replace_note_chunks.side_effect = RuntimeError(
+            "invalid input for query argument $6"
+        )
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=uuid.uuid4(),
+            repo_name="r",
+        )
+        assert result["status"] == "partial"
+        assert result["errors"] == 1
+        store.stamp_note_indexed.assert_not_awaited()
+        store.upsert_watermark.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stamp_failure_counts_error_and_blocks_watermark(self):
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            tree=[{"path": "knowledge/a.md", "type": "blob", "sha": "s"}],
+            contents={"knowledge/a.md": _note_md("a")},
+        )
+        store.stamp_note_indexed.side_effect = RuntimeError("db blip")
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=uuid.uuid4(),
+            repo_name="r",
+        )
+        assert result["status"] == "partial"
+        assert result["errors"] == 1
+        store.upsert_watermark.assert_not_awaited()
+
+
+# =============================================================================
+# reindex_kb — per-KB serialization (PR3.1)
+# =============================================================================
+
+
+class TestReindexKbSerialization:
+    """Two post-merge triggers ~30s apart ran concurrent full rebuilds against
+    the same KB on dev (interleaved delete+insert chunk batches). reindex_kb
+    holds a per-KB asyncio lock; distinct KBs still run concurrently."""
+
+    def _slow_deps(self):
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            tree=[{"path": "knowledge/a.md", "type": "blob", "sha": "s"}],
+            contents={"knowledge/a.md": _note_md("a")},
+        )
+        state = {"active": 0, "max_active": 0}
+
+        async def slow_tree(repo, ref):
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            await asyncio.sleep(0.05)
+            state["active"] -= 1
+            return [{"path": "knowledge/a.md", "type": "blob", "sha": "s"}]
+
+        gitea.list_tree = AsyncMock(side_effect=slow_tree)
+        return gitea, store, svc, state
+
+    @pytest.mark.asyncio
+    async def test_same_kb_serializes(self):
+        gitea, store, svc, state = self._slow_deps()
+        kb = uuid.uuid4()
+        await asyncio.gather(
+            reindex_kb(
+                gitea_client=gitea,
+                store=store,
+                embedding_service=svc,
+                kb_id=kb,
+                repo_name="r",
+            ),
+            reindex_kb(
+                gitea_client=gitea,
+                store=store,
+                embedding_service=svc,
+                kb_id=kb,
+                repo_name="r",
+            ),
+        )
+        assert state["max_active"] == 1, "same-KB reindex runs overlapped"
+
+    @pytest.mark.asyncio
+    async def test_distinct_kbs_run_concurrently(self):
+        gitea, store, svc, state = self._slow_deps()
+        await asyncio.gather(
+            reindex_kb(
+                gitea_client=gitea,
+                store=store,
+                embedding_service=svc,
+                kb_id=uuid.uuid4(),
+                repo_name="r",
+            ),
+            reindex_kb(
+                gitea_client=gitea,
+                store=store,
+                embedding_service=svc,
+                kb_id=uuid.uuid4(),
+                repo_name="r",
+            ),
+        )
+        assert state["max_active"] == 2, "distinct KBs were serialized"
 
 
 # =============================================================================

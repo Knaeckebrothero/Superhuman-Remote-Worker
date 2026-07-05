@@ -155,7 +155,19 @@ async def run_when_leader(
             if shutdown_event.is_set():
                 break
             # Run the loop until we lose leadership / shut down / it exits.
-            task = asyncio.create_task(make_coro(shutdown_event))
+            try:
+                task = asyncio.create_task(make_coro(shutdown_event))
+            except Exception:
+                # A factory that raises at CALL time (e.g. a deferred import
+                # blowing up) would otherwise kill this wrapper task silently —
+                # nothing awaits it until shutdown. Scream, then propagate:
+                # this singleton loop will never run again. (Live forensics:
+                # the KB reindex sweeper's silent death, dev 2026-07-05.)
+                logger.exception(
+                    "run_when_leader: loop factory raised — singleton loop "
+                    "will NOT run on this replica"
+                )
+                raise
             while (
                 is_leader.is_set() and not shutdown_event.is_set() and not task.done()
             ):
@@ -166,6 +178,16 @@ async def run_when_leader(
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+            elif not task.cancelled() and task.exception() is not None:
+                # The loop died on its own. It is re-created on the next poll
+                # while leadership holds — without this line that's an
+                # invisible crash-loop (one unretrieved-exception GC log per
+                # poll at best).
+                logger.error(
+                    "run_when_leader: singleton loop crashed (restarting "
+                    "next poll): %r",
+                    task.exception(),
+                )
             task = None
     finally:
         if task is not None and not task.done():

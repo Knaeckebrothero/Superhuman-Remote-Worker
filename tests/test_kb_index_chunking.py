@@ -443,3 +443,28 @@ class TestDeleteKbNote:
         store, mock_db, _ = _make_store()
         mock_db.fetchval.return_value = None
         assert await store.delete_kb_note(uuid.uuid4(), "knowledge/x.md") is False
+
+
+# =============================================================================
+# KnowledgeStore.stamp_note_indexed — the chunks-are-durable stamp (PR3.1)
+# =============================================================================
+
+
+class TestStampNoteIndexed:
+    """blob_sha/embedding_version mean "this note's chunks are fully written".
+    The reindexer upserts the note UNSTAMPED, writes chunks, then stamps — so a
+    chunk-write failure leaves blob_sha NULL and the next diff retries the note
+    (live gap 2026-07-05: notes stamped, zero chunks, self-heal defeated)."""
+
+    @pytest.mark.asyncio
+    async def test_stamps_blob_sha_and_version_by_row_id(self):
+        store, db, _ = _make_store()
+        row_id = uuid.uuid4()
+        await store.stamp_note_indexed(row_id, "abc123", "m:4096:c1")
+        query = db.execute.await_args[0][0]
+        params = db.execute.await_args[0][1:]
+        assert "UPDATE knowledge_index" in query
+        assert "blob_sha" in query
+        assert "embedding_version" in query
+        assert "WHERE id = $1" in query
+        assert params == (row_id, "abc123", "m:4096:c1")
