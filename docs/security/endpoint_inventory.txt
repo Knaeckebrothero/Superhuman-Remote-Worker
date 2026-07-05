@@ -193,6 +193,7 @@ GET    /api/persistent/threads/{thread_id}/stream                               
 POST   /api/persistent/threads/{thread_id}/transcribe                                   gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/tts                                          gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/tts/plan                                     gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/tts/plan/stream                              gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/uploads                                      gated:require_thread_owner
 GET    /api/projects                                                                    gated:require_approved_user
 POST   /api/projects                                                                    gated:require_approved_user
@@ -215,6 +216,7 @@ GET    /api/projects/{project_id}/jobs                                          
 POST   /api/projects/{project_id}/jobs                                                  gated:require_project_member
 GET    /api/projects/{project_id}/knowledge                                             gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/export                                      gated:require_project_member
+POST   /api/projects/{project_id}/knowledge/reindex                                     gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/search                                      gated:require_project_member
 GET    /api/projects/{project_id}/knowledge/summary                                     gated:require_project_member
 DELETE /api/projects/{project_id}/knowledge/{note_id}                                   gated:require_project_member
@@ -241,6 +243,8 @@ POST   /api/settings/llm-endpoints/{endpoint_id}/discover                       
 POST   /api/settings/llm-endpoints/{endpoint_id}/test                                   gated:require_approved_user
 GET    /api/settings/preferences                                                        gated:require_approved_user
 PATCH  /api/settings/preferences                                                        gated:require_approved_user
+POST   /api/settings/tts/preview                                                        gated:require_approved_user
+GET    /api/settings/tts/voices                                                         gated:require_approved_user
 GET    /api/skills                                                                      gated:require_approved_user
 POST   /api/skills                                                                      gated:require_approved_user
 POST   /api/skills/import                                                               gated:require_approved_user
@@ -284,4 +288,5 @@ GET    /api/vms                                                                 
 POST   /api/vms                                                                         gated:require_job_access
 DELETE /api/vms/{job_id}                                                                gated:require_job_access
 GET    /api/vms/{job_id}                                                                gated:require_job_access
+GET    /api/voice/capabilities                                                          gated:require_approved_user
 GET    /api/workspace/status                                                            admin:_require_admin
