@@ -122,3 +122,39 @@ class TestCancelStaleVerificationSubjobs:
         db = _make_db(conn)
 
         assert await db.cancel_stale_verification_subjobs() == 0
+
+
+class TestUnstickReviewingParents:
+    @pytest.mark.asyncio
+    async def test_executes_update_with_grace_and_returns_rows(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"id": "p1", "user_id": "u1", "config_name": "scholar"},
+            ]
+        )
+        db = _make_db(conn)
+
+        rows = await db.unstick_reviewing_parents(grace_minutes=30)
+
+        assert rows == [{"id": "p1", "user_id": "u1", "config_name": "scholar"}]
+        conn.fetch.assert_awaited_once()
+        args = conn.fetch.await_args.args
+        sql = args[0]
+        # Flips reviewing → pending_review, gated by the grace floor and the
+        # "no non-failed/cancelled critic" clause; grace binds as $1.
+        assert "status = 'pending_review'" in sql
+        assert "p.status = 'reviewing'" in sql
+        assert "make_interval" in sql
+        assert "verification_target" in sql
+        assert "NOT IN ('failed', 'cancelled')" in sql
+        assert "RETURNING" in sql
+        assert args[1] == 30
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_no_rows(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        db = _make_db(conn)
+
+        assert await db.unstick_reviewing_parents() == []

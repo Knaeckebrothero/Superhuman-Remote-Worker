@@ -2785,6 +2785,63 @@ class PostgresDB:
             return int(result.split()[1])
         return 0
 
+    async def unstick_reviewing_parents(
+        self, grace_minutes: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Un-stick parents wedged in 'reviewing' whose critic pipeline is dead.
+
+        A parent goes 'reviewing' and a critic verification subjob checks its
+        work; the critic un-sticks the parent only by reaching its own
+        /complete (``_handle_critic_verdict_on_complete``). A critic that ends
+        'failed', or is orphaned → cancelled, never reaches that handler, so the
+        parent sits in 'reviewing' forever. This flips such a parent back to
+        'pending_review' (human review takes over) + lets the caller notify.
+
+        Fires only when EVERY critic child is terminal-failed/cancelled (or none
+        exists) and the parent has been reviewing past ``grace_minutes``:
+
+        - A live critic ('processing'/'created'/'paused'/'waiting…') keeps the
+          parent untouched — a long review or a recovering (paused) critic is
+          never pre-empted.
+        - A 'completed' critic also keeps the parent untouched — that is the
+          verdict handler's job; excluding it avoids racing that handler.
+        - The grace floor on ``updated_at`` dodges the critic-spawn and
+          in-flight-verdict windows.
+
+        The CAS (``WHERE status='reviewing'``) makes it idempotent and safe
+        against a concurrent sweeper / the verdict handler.
+
+        See docs/superpowers/specs/2026-07-05-reviewing-parent-unstick-watchdog-design.md
+        and critic_failure_leaves_parent_job_stuck_reviewing.md (#4).
+
+        Args:
+            grace_minutes: minimum time a parent must have been in 'reviewing'.
+
+        Returns:
+            One dict ``{id, user_id, config_name}`` per parent un-stuck.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE jobs AS p
+                   SET status = 'pending_review',
+                       error_message = 'Automated verification did not complete (critic pipeline died); returned to manual review.',
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE p.status = 'reviewing'
+                   AND p.updated_at
+                       < CURRENT_TIMESTAMP - make_interval(mins => $1::int)
+                   AND NOT EXISTS (
+                         SELECT 1 FROM jobs c
+                          WHERE c.parent_job_id = p.id
+                            AND c.context->>'verification_target' IS NOT NULL
+                            AND c.status NOT IN ('failed', 'cancelled')
+                       )
+                RETURNING p.id, p.user_id, p.config_name
+                """,
+                grace_minutes,
+            )
+        return [dict(r) for r in rows]
+
     async def get_ready_agents(self) -> List[Dict[str, Any]]:
         """Get all agents with 'ready' status.
 
