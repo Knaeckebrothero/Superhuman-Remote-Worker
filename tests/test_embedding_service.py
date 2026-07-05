@@ -365,9 +365,7 @@ class TestExplicitConfigOverrides:
 
         from src.services.embedding_service import EmbeddingService
 
-        EmbeddingService(
-            model="m", base_url="https://x.example/v1", api_key="k"
-        )
+        EmbeddingService(model="m", base_url="https://x.example/v1", api_key="k")
         kwargs = mock_cls.call_args[1]
         assert kwargs["api_key"] == "k"
         assert kwargs["base_url"] == "https://x.example/v1"
@@ -384,9 +382,7 @@ class TestExplicitConfigOverrides:
         assert service.base_url == "https://env.example/v1"
         assert service.api_key == "test-key-123"  # OPENAI_API_KEY from mock_env
 
-    def test_no_kwargs_is_pure_env_backward_compat(
-        self, mock_env, mock_openai_client
-    ):
+    def test_no_kwargs_is_pure_env_backward_compat(self, mock_env, mock_openai_client):
         from src.services.embedding_service import EmbeddingService
 
         service = EmbeddingService()

@@ -29,7 +29,9 @@ CURRENT_VERSION = f"qwen3-embedding-8b:4096:{CHUNKER_VERSION}"
 
 
 def _note_md(slug: str, body: str = "the body", note_type: str = "learning") -> str:
-    return f"---\nid: {slug}\ntype: {note_type}\nstatus: active\n---\n# {slug}\n\n{body}\n"
+    return (
+        f"---\nid: {slug}\ntype: {note_type}\nstatus: active\n---\n# {slug}\n\n{body}\n"
+    )
 
 
 def _make_deps(
@@ -105,8 +107,16 @@ class TestKnowledgeBlobMap:
 
 class TestPlanReindex:
     def test_changed_added_deleted(self):
-        indexed = {"knowledge/a.md": "sha1", "knowledge/b.md": "sha2", "knowledge/c.md": "sha3"}
-        current = {"knowledge/a.md": "sha1", "knowledge/b.md": "CHANGED", "knowledge/d.md": "NEW"}
+        indexed = {
+            "knowledge/a.md": "sha1",
+            "knowledge/b.md": "sha2",
+            "knowledge/c.md": "sha3",
+        }
+        current = {
+            "knowledge/a.md": "sha1",
+            "knowledge/b.md": "CHANGED",
+            "knowledge/d.md": "NEW",
+        }
         upserts, deletes = plan_reindex(indexed, current)
         assert upserts == ["knowledge/b.md", "knowledge/d.md"]  # sorted
         assert deletes == ["knowledge/c.md"]
@@ -204,8 +214,11 @@ class TestReindexKbShortCircuits:
     async def test_no_head_returns_without_work(self):
         gitea, store, svc = _make_deps(head=None)
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=uuid.uuid4(), repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=uuid.uuid4(),
+            repo_name="r",
         )
         assert result["status"] == "no-head"
         gitea.list_tree.assert_not_awaited()
@@ -219,8 +232,11 @@ class TestReindexKbShortCircuits:
         )
         gitea, store, svc = _make_deps(head="headsha", watermark=wm)
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=kb, repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
         )
         assert result["status"] == "up-to-date"
         gitea.list_tree.assert_not_awaited()
@@ -234,8 +250,12 @@ class TestReindexKbShortCircuits:
         )
         gitea, store, svc = _make_deps(head="headsha", watermark=wm, tree=[])
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=kb, repo_name="r", force_full=True,
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+            force_full=True,
         )
         assert result["status"] == "completed"
         gitea.list_tree.assert_awaited_once()
@@ -245,8 +265,11 @@ class TestReindexKbShortCircuits:
         gitea, store, svc = _make_deps(head="headsha")
         gitea.list_tree.return_value = None
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=uuid.uuid4(), repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=uuid.uuid4(),
+            repo_name="r",
         )
         assert result["status"] == "tree-fetch-failed"
         store.upsert_watermark.assert_not_awaited()
@@ -273,8 +296,11 @@ class TestReindexKbIncremental:
             contents={"knowledge/changed.md": _note_md("changed", "fresh insight")},
         )
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=kb, repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
         )
         assert result["status"] == "completed"
         assert result["upserted"] == 1
@@ -314,8 +340,11 @@ class TestReindexKbIncremental:
             indexed={"knowledge/same.md": "same1", "knowledge/gone.md": "x"},
         )
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=kb, repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
         )
         assert result["status"] == "completed"
         assert result["deleted"] == 1
@@ -338,8 +367,11 @@ class TestReindexKbIncremental:
             },
         )
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=kb, repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
         )
         # matching blob_shas notwithstanding, EVERY note re-embeds
         assert result["upserted"] == 2
@@ -354,8 +386,11 @@ class TestReindexKbIncremental:
             contents={"knowledge/a.md": _note_md("a")},
         )
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=uuid.uuid4(), repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=uuid.uuid4(),
+            repo_name="r",
         )
         assert result["full"] is True
         assert result["upserted"] == 1
@@ -370,8 +405,11 @@ class TestReindexKbFailureHonesty:
             contents={},  # get_file_content returns None
         )
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=uuid.uuid4(), repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=uuid.uuid4(),
+            repo_name="r",
         )
         assert result["status"] == "partial"
         assert result["errors"] == 1
@@ -391,8 +429,11 @@ class TestReindexKbFailureHonesty:
             },
         )
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=uuid.uuid4(), repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=uuid.uuid4(),
+            repo_name="r",
         )
         # the malformed note is lint's problem, not the reindexer's — the good
         # note lands and the watermark advances
@@ -410,8 +451,11 @@ class TestReindexKbFailureHonesty:
         )
         svc.embed_batch = AsyncMock(side_effect=RuntimeError("provider down"))
         result = await reindex_kb(
-            gitea_client=gitea, store=store, embedding_service=svc,
-            kb_id=uuid.uuid4(), repo_name="r",
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=uuid.uuid4(),
+            repo_name="r",
         )
         assert result["status"] == "partial"
         assert result["errors"] == 1

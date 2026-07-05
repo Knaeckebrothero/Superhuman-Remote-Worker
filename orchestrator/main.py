@@ -10342,9 +10342,7 @@ async def _advance_project_loop(
             _kb_project = loop.get("project_id")
             if _kb_project:
 
-                async def _kb_reindex_after_merge(
-                    pid: str, repo: str | None
-                ) -> None:
+                async def _kb_reindex_after_merge(pid: str, repo: str | None) -> None:
                     try:
                         await _reindex_project_kb(pid, repo_name=repo)
                     except Exception:
@@ -10354,9 +10352,7 @@ async def _advance_project_loop(
                         )
 
                 asyncio.create_task(
-                    _kb_reindex_after_merge(
-                        str(_kb_project), job.get("repo_name")
-                    )
+                    _kb_reindex_after_merge(str(_kb_project), job.get("repo_name"))
                 )
         elif merge_status == "empty" and is_loop_execution_role(completed_role):
             logger.error(

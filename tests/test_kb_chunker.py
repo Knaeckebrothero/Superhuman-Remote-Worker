@@ -246,7 +246,12 @@ class TestEmbedNoteChunks:
             embedding_service=svc,
         )
         assert len(rows) == 1
-        assert set(rows[0].keys()) == {"chunk_ix", "heading_path", "content", "embedding"}
+        assert set(rows[0].keys()) == {
+            "chunk_ix",
+            "heading_path",
+            "content",
+            "embedding",
+        }
         assert rows[0]["chunk_ix"] == 0
         assert rows[0]["heading_path"] == "A"
 
