@@ -668,6 +668,194 @@ class KnowledgeStore:
         )
         return result is not None
 
+    async def replace_note_links(
+        self,
+        source_note_row: uuid.UUID,
+        kb_id: uuid.UUID,
+        source_id: str,
+        targets: List[str],
+        rel_type: str = "references",
+    ) -> int:
+        """Replace a note's outbound link edges wholesale (slice-3 PR4c).
+
+        The files-canonical successor to the Neo4j relationship edges: the
+        reindexer extracts body markdown link targets and rewrites this note's
+        edge set (delete all + re-insert, mirroring :meth:`replace_note_chunks`),
+        so the 1-hop ``kb_related`` degrade has a link table to query when Neo4j
+        is absent. Targets are stored as slugs and resolved to note rows at read
+        time — a link to a not-yet-indexed note is kept, and dead links simply
+        fall out of the read-time join. Repeated targets collapse to one edge.
+        Returns the number of edges written.
+        """
+        await self.db.execute(
+            "DELETE FROM knowledge_links WHERE source_note_row = $1",
+            source_note_row,
+        )
+        seen: set = set()
+        written = 0
+        for target in targets:
+            if target in seen:
+                continue
+            seen.add(target)
+            await self.db.execute(
+                """
+                INSERT INTO knowledge_links
+                    (source_note_row, kb_id, source_id, target_id, rel_type)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                source_note_row,
+                kb_id,
+                source_id,
+                target,
+                rel_type,
+            )
+            written += 1
+        return written
+
+    async def get_related_notes(
+        self,
+        kb_id: uuid.UUID,
+        note_id: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """1-hop link neighbours of a note (the kg-less ``kb_related`` backend).
+
+        Neighbours are notes ``note_id`` links to (outbound) or that link to it
+        (inbound), resolved against ``knowledge_index`` for title/type/status and
+        filtered to ``status = 'active'`` — dead links (targets with no active
+        note) drop out of the join. Returns the same shape as the Neo4j
+        ``get_related`` (``id``/``title``/``type``/``status``/``distance``/
+        ``rel_types``) so the tool formats both worlds identically; every edge is
+        a generic body-markdown ``references`` link, hence ``distance = 1`` and a
+        constant ``rel_types``.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT DISTINCT ki.note_id AS id, ki.title AS title,
+                   ki.note_type AS type, ki.status AS status
+            FROM (
+                SELECT target_id AS neighbour FROM knowledge_links
+                WHERE kb_id = $1 AND source_id = $2
+                UNION
+                SELECT source_id AS neighbour FROM knowledge_links
+                WHERE kb_id = $1 AND target_id = $2
+            ) nbr
+            JOIN knowledge_index ki
+              ON ki.kb_id = $1 AND ki.note_id = nbr.neighbour
+            WHERE ki.status = 'active'
+            ORDER BY ki.title
+            LIMIT $3
+            """,
+            kb_id,
+            note_id,
+            limit,
+        )
+        return [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "type": r["type"],
+                "status": r["status"],
+                "distance": 1,
+                "rel_types": ["references"],
+            }
+            for r in rows
+        ]
+
+    async def get_note_by_slug(
+        self, kb_id: uuid.UUID, note_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """A full note read from the index (the kg-less ``kb_read`` backend).
+
+        Returns the note in the same dict shape ``KnowledgeGraphDB.read_note``
+        produces (``id``/``type`` rather than ``note_id``/``note_type``) so the
+        tool formats both worlds identically. Status-agnostic — a direct read
+        must surface superseded/archived notes too, unlike search. Neo4j-only
+        fields (``relationships``) are absent; 1-hop links come from
+        :meth:`get_related_notes`. Returns None if the slug isn't in the KB.
+        """
+        row = await self.db.fetchrow(
+            """
+            SELECT note_id, title, note_type, status, content, confidence,
+                   tags, keywords, job_id, phase, created_at, modified_at
+            FROM knowledge_index
+            WHERE kb_id = $1 AND note_id = $2
+            LIMIT 1
+            """,
+            kb_id,
+            note_id,
+        )
+        if row is None:
+            return None
+        r = dict(row)
+        return {
+            "id": r.get("note_id"),
+            "title": r.get("title", ""),
+            "type": r.get("note_type", ""),
+            "status": r.get("status", ""),
+            "content": r.get("content", ""),
+            "confidence": r.get("confidence"),
+            "tags": r.get("tags") or [],
+            "keywords": r.get("keywords") or [],
+            "job_id": r.get("job_id"),
+            "phase": r.get("phase"),
+            "created": r.get("created_at"),
+            "modified": r.get("modified_at"),
+        }
+
+    async def list_notes(
+        self,
+        kb_id: uuid.UUID,
+        note_type: Optional[str] = None,
+        tag: Optional[str] = None,
+        status: Optional[str] = None,
+        job_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List note summaries in a KB (the kg-less ``kb_list`` backend).
+
+        Same filter surface and summary-dict shape as
+        ``KnowledgeGraphDB.list_notes`` (``id``/``type``); ``tag`` matches against
+        the ``tags`` array column. No status filter is applied unless requested,
+        so an unfiltered list spans every status like the Neo4j version.
+        """
+        conditions = ["kb_id = $1"]
+        params: List[Any] = [kb_id]
+        if note_type:
+            params.append(note_type)
+            conditions.append(f"note_type = ${len(params)}")
+        if status:
+            params.append(status)
+            conditions.append(f"status = ${len(params)}")
+        if job_id:
+            params.append(job_id)
+            conditions.append(f"job_id = ${len(params)}")
+        if tag:
+            params.append(tag)
+            conditions.append(f"${len(params)} = ANY(tags)")
+        params.append(limit)
+        where = " AND ".join(conditions)
+        rows = await self.db.fetch(
+            f"""
+            SELECT note_id, title, note_type, status, confidence
+            FROM knowledge_index
+            WHERE {where}
+            ORDER BY modified_at DESC NULLS LAST
+            LIMIT ${len(params)}
+            """,
+            *params,
+        )
+        return [
+            {
+                "id": r["note_id"],
+                "title": r["title"],
+                "type": r["note_type"],
+                "status": r["status"],
+                "confidence": r["confidence"],
+            }
+            for r in rows
+        ]
+
     # =========================================================================
     # TTL lifecycle — KB convergence
     # (docs/features/kb_convergence_ttl_reverification.md)
@@ -894,6 +1082,72 @@ class KnowledgeStore:
         return [
             (str(r["note_a"]), str(r["note_b"]), float(r["similarity"])) for r in rows
         ]
+
+    async def search_chunks(
+        self,
+        kb_ids: List[uuid.UUID],
+        query: str = "",
+        embedding_version: Optional[str] = None,
+        match_count: int = 15,
+        over_fetch: int = 50,
+        dense_weight: float = 0.6,
+        sparse_weight: float = 0.3,
+        recency_weight: float = 0.1,
+        rrf_k: int = 60,
+    ) -> List[KnowledgeRecord]:
+        """Hybrid retrieval over the chunk index (slice-3 PR4, §5.1).
+
+        The chunk-granular successor to :meth:`hybrid_search`. After the PR3
+        reindexer the dense vector lives on ``knowledge_chunks`` (the note row's
+        ``embedding`` is NULL for reindexed notes), so fusion runs over chunk
+        rows — dense (chunk embedding) + sparse (chunk ``search_doc``) + recency
+        (note ``modified_at``) — and the best-scoring chunk collapses back to its
+        note. Returns note-level ``KnowledgeRecord``s so the ``kb_search`` tool
+        signature is unchanged; the ``status = 'active'`` filter is preserved
+        exactly (stricter than "not superseded").
+
+        The SQL function over-fetches ``over_fetch`` fused note candidates; this
+        method then runs the reranker slot (a no-op passthrough in v1 — a hosted
+        or local reranker wires in here as a precision mode) and truncates to
+        ``match_count``. ``embedding_version`` filters mixed-model vectors out so
+        a model migration can't silently drift the index; ``None`` disables the
+        filter (single-model deployments). An empty ``kb_ids`` is the cost guard.
+        """
+        if not kb_ids:
+            return []
+
+        query_embedding = await self.embedding_service.embed(query)
+
+        rows = await self.db.fetch(
+            """
+            SELECT * FROM knowledge_chunk_hybrid_search(
+                $1, $2, $3, $4, $5, $6, $7, $8, $9
+            )
+            """,
+            query,
+            query_embedding,
+            list(kb_ids),
+            embedding_version,
+            over_fetch,
+            dense_weight,
+            sparse_weight,
+            recency_weight,
+            rrf_k,
+        )
+
+        records = [KnowledgeRecord.from_row(dict(row)) for row in rows]
+        return self._rerank_chunks(records)[:match_count]
+
+    @staticmethod
+    def _rerank_chunks(records: List[KnowledgeRecord]) -> List[KnowledgeRecord]:
+        """Reranker slot between RRF fusion and return (§5.1).
+
+        v1 is a no-op passthrough that preserves the fusion order — the single
+        biggest post-hybrid quality lever, but agents can grep-and-read after
+        search, so a hosted/local cross-encoder reranker is a later ``rerank:
+        true`` precision mode that slots in here without touching callers.
+        """
+        return records
 
     async def get_summary(
         self,
