@@ -223,16 +223,78 @@ Two implementation facts learned during the build (both feed Phase 5):
   Rachel `21m00Tcm4TlvDq8ikWAM` works on every account). The adapter fails loud
   (logged `None` → 502) if no usable voice resolves — never a silent 404.
 
-Live end-to-end synthesis needs a real key + a registered row + a voice_id
-(user/admin actions, like Phase 3); everything above is unit- and
-import-verified.
+**Registration — auto-wired from the secret (2026-07-05, revised).** The
+original plan assumed the admin would register the model row by hand, but
+ElevenLabs isn't in `VALID_SYSTEM_API_KEY_PROVIDERS` and the model form has no
+`voice`/`params_json` field, so there is **no manual UI path** — and requiring
+one contradicts the "key in the secret is enough" (Tavily) intent. Resolution:
+`seed/llm_config.ensure_elevenlabs_tts_endpoint(db)`, called at orchestrator
+startup (lifespan) and from `init.py`, mirrors `ensure_codex_proxy_endpoint`.
+When `ELEVENLABS_API_KEY` is set it idempotently creates a system endpoint
+(label `ElevenLabs`, `base_url` placeholder, **no key stored — env is the
+source of truth**) plus the `eleven_multilingual_v2` catalog row
+(`capabilities:['tts']`, `params_json:{provider:'elevenlabs', voice:<default>}`).
+Key in secret → provider appears in the picker, zero manual steps. Rotating the
+secret takes effect with no DB write (the adapter reads the env).
 
-**Phase 5 — account voice picker**
+**Default voice — must be an account voice, not a Library voice.** First live
+test 402'd: the seeded default was Rachel `21m00Tcm4TlvDq8ikWAM`, which
+ElevenLabs moved to the shared Voice Library — and **free-tier keys cannot
+synthesize Library voices via the API** (`payment_required`, "Free users cannot
+use library voices"). The standard *premade* voices in every account's
+`/v2/voices` list DO work on free tier. Default is now Sarah
+`EXAVITQu4vr4xnSDxMaL` (a stable, every-account premade). **LIVE-VERIFIED**
+2026-07-05: provider auto-registered from the secret, selected in the picker,
+preview returned a 200 with ~55 KB of real ElevenLabs MP3 (Sarah, free tier).
+
+**Phase 5 frontend gap (known):** `tts-voices.ts` `ttsBackendForModelId` doesn't
+know `'elevenlabs'` yet, so on selecting it the voice field falls back to a
+free-text input and the language note hides (`ttsBackend()===null`). Harmless
+for synthesis (Auto resolves to the seeded voice); Phase 5 adds the
+`'elevenlabs'` case + the account-voice picker that replaces the free-text field.
+
+**Phase 5 — account voice picker** — ✅ DONE + LIVE-VERIFIED (2026-07-05)
 `GET /api/settings/tts/voices` proxy (+5 min cache) + async cockpit picker
 with server-fed labels + hosted preview playback.
 *Accept*: ElevenLabs backend shows real account voices by name with
 accent labels; selection persists as `voice_id`; synth preview + hosted
 preview both play.
+
+Implementation:
+
+- **Backend** (`services/tts.py`): `list_account_voices(user_id, postgres_db)`
+  resolves the TTS credential triple, detects the backend via
+  `_resolve_tts_provider`, and for ElevenLabs fetches `GET /v2/voices`
+  (`_fetch_elevenlabs_voices` → `_map_elevenlabs_voice` →
+  `{id, name, labels, preview_url}`), cached in-process 5 min keyed by the api
+  key. Non-ElevenLabs backends return `{backend, voices: []}` (cockpit holds
+  the static catalogs); no model → `backend: null`; any fetch failure degrades
+  to `voices: []` (never 5xx). `invalidate_account_voices_cache()` is exposed
+  for Phase 6/7 mutations. Endpoint `GET /api/settings/tts/voices` in main.py,
+  `require_approved_user`, key never leaves the server.
+- **Cockpit**: `tts-voices.ts` gains the `'elevenlabs'` backend + `eleven`
+  id-sniff (`voicesForModelId`/`voiceLanguageTag` return `[]`/`null` for it by
+  design — labels are server-fed), plus `TtsAccountVoice`/`TtsVoicesResponse`
+  types. `ApiService.listTtsVoices()`. Settings: a lazy constructor `effect`
+  loads the account voices the first time the ElevenLabs backend is in effect;
+  the voice field is a three-way (`elevenlabs` server-fed `<select>` → static
+  catalog `<select>` → free-text `<input>`); option labels compose
+  `name — accent · gender`; a "Play sample" ghost button plays the selected
+  voice's hosted `preview_url` (zero-cost, distinct from the char-spending
+  synth preview). i18n: `settings.voice.loadingVoices` + `.hostedPreview`.
+- **Tests**: `TestMapElevenLabsVoice` (2) + `TestListAccountVoices` (7:
+  no-model, non-EL backend, EL lists, no-key, fetch-failure-degrades,
+  cache-hit, cache-invalidate); `tts-voices.spec.ts` gains the `'elevenlabs'`
+  detection/`[]`/`null` cases. 95 pytest + 9 vitest green; ruff + tsc clean.
+
+**LIVE-VERIFIED** 2026-07-05 (Playwright, k3d, logged-in test user): endpoint
+`GET /api/settings/tts/voices` → 200 backed by a real `GET
+api.elevenlabs.io/v2/voices` → 200; picker rendered **10 real account voices**
+by name with accent labels (Bella/Sarah/Laura american, **Charlie australian**,
+**George british**, …); selecting George persisted `voice_id`
+`JBFqnCBsd6RMkjVDRZzb`, the hosted "Play sample" button appeared, and a synth
+preview through the selected voice returned a real 33 KB `audio/mpeg`. (The
+user's voice pref was restored to Auto after the test.)
 
 **Phase 6 — Voice Library browser**
 Search/filter proxy + add-to-account + cockpit browser UI.

@@ -48,7 +48,7 @@ export const OPENAI_TTS_VOICES: readonly string[] = [
 ];
 
 /** A recognized TTS backend, or `null` when the model id matches none. */
-export type TtsBackend = 'kokoro' | 'openai' | null;
+export type TtsBackend = 'kokoro' | 'openai' | 'elevenlabs' | null;
 
 /**
  * The backend behind a TTS model id, detected from the id. The single source
@@ -62,7 +62,32 @@ export function ttsBackendForModelId(
   if (!id) return null;
   if (id.includes('kokoro')) return 'kokoro';
   if (id.includes('tts-1') || id.includes('gpt-4o-mini-tts')) return 'openai';
+  // ElevenLabs model ids are `eleven_*` (eleven_multilingual_v2, eleven_v3, …).
+  // Its voices are NOT a static catalog — they come live from the deployment
+  // account (`GET /api/settings/tts/voices`), so `voicesForModelId` returns []
+  // and Settings renders the server-fed picker instead.
+  if (id.includes('eleven')) return 'elevenlabs';
   return null;
+}
+
+/**
+ * One account voice from `GET /api/settings/tts/voices` (server-proxied from
+ * ElevenLabs' `/v2/voices`). `labels` carries ElevenLabs' own metadata
+ * (`accent`, `gender`, `age`, `description`); `preview_url` is a public CDN
+ * mp3 the browser can hotlink to audition without spending characters.
+ */
+export interface TtsAccountVoice {
+  id: string;
+  name: string;
+  labels: Record<string, string>;
+  preview_url: string | null;
+}
+
+/** Response of `GET /api/settings/tts/voices`. `voices` is only populated for
+ * the `elevenlabs` backend; static-catalog backends return an empty list. */
+export interface TtsVoicesResponse {
+  backend: TtsBackend;
+  voices: TtsAccountVoice[];
 }
 
 /**
@@ -123,6 +148,11 @@ export function voiceLanguageTag(
       return KOKORO_LANG_BY_PREFIX[voice[0]] ?? null;
     case 'openai':
       return 'multi';
+    case 'elevenlabs':
+      // Language/accent isn't decodable from the opaque voice_id — it comes
+      // from the server `labels` metadata, which Settings renders directly on
+      // each option. So no derived tag here, by design.
+      return null;
     default:
       return null;
   }
