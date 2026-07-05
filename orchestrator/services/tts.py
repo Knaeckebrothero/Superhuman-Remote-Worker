@@ -20,6 +20,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from collections import OrderedDict
@@ -28,6 +29,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 import yaml
 from openai import AsyncOpenAI
 
@@ -495,6 +497,78 @@ async def _formulate_for_speech(
     return rewritten
 
 
+# ElevenLabs REST TTS (not OpenAI-compatible — own header/path/model ids). See
+# docs/features/tts_vendor_providers.md. mp3_44100_128 matches the mp3 the
+# OpenAI path returns, so the cache/metering/player upstream stay format-blind.
+_ELEVENLABS_BASE = "https://api.elevenlabs.io"
+_ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"
+
+
+def _resolve_tts_provider(model_id: str, provider: Optional[str]) -> str:
+    """Which synthesis backend a TTS model speaks. An explicit
+    ``params_json.provider`` wins; otherwise sniff the model id (ElevenLabs
+    model ids are ``eleven_*``). Defaults to ``"openai"`` — the OpenAI-
+    compatible shape that Kokoro / OpenAI / Groq all share."""
+    explicit = (provider or "").strip().lower()
+    if explicit:
+        return explicit
+    if "eleven" in (model_id or "").lower():
+        return "elevenlabs"
+    return "openai"
+
+
+async def _synthesize_elevenlabs(
+    text: str,
+    *,
+    model: str,
+    voice: str,
+    api_key: Optional[str],
+    timeout: float = 120.0,
+) -> Optional[bytes]:
+    """Synthesize MP3 via the ElevenLabs REST API.
+
+    Auth is ``xi-api-key``; the voice is an opaque account ``voice_id`` in the
+    path; ``model_id`` is ElevenLabs' own (``eleven_multilingual_v2`` etc.,
+    carried as the registry row's ``model_id``). The key is the resolved
+    credential if the row carries one, else the deployment-wide
+    ``ELEVENLABS_API_KEY`` (one account per deployment). Same no-retry /
+    fail-in-seconds posture as :func:`_synthesize_speech` so the "Read aloud"
+    button never hangs. Returns ``None`` (not raises) on any failure — the
+    caller maps that to the same 502 as an OpenAI-path failure."""
+    key = (api_key or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+    if not key:
+        logger.warning(
+            "ElevenLabs synthesis aborted: no ELEVENLABS_API_KEY (model=%s)", model
+        )
+        return None
+    if not voice:
+        # ElevenLabs has no built-in default voice — the registry row's
+        # params_json must set one (a voice_id). Fail loud rather than 404.
+        logger.warning(
+            "ElevenLabs synthesis aborted: no voice id resolved (model=%s)", model
+        )
+        return None
+    url = f"{_ELEVENLABS_BASE}/v1/text-to-speech/{voice}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                url,
+                params={"output_format": _ELEVENLABS_OUTPUT_FORMAT},
+                headers={"xi-api-key": key, "accept": "audio/mpeg"},
+                json={"text": text, "model_id": model},
+            )
+            resp.raise_for_status()
+            return resp.content
+    except Exception:
+        logger.exception(
+            "ElevenLabs synthesis failed (model=%s voice=%s chars=%d)",
+            model,
+            voice,
+            len(text),
+        )
+        return None
+
+
 async def _synthesize_speech(
     text: str,
     *,
@@ -504,6 +578,7 @@ async def _synthesize_speech(
     api_key: Optional[str],
     timeout: float = 120.0,
     instructions: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> Optional[bytes]:
     """Call the TTS endpoint and return MP3 bytes.
 
@@ -515,7 +590,18 @@ async def _synthesize_speech(
     through to instruction-capable models like OpenAI ``gpt-4o-mini-tts`` — the
     persona hook for Phase 5. Only sent when set, since ``tts-1``/Kokoro reject
     the param.
+
+    ``provider`` (from the row's ``params_json.provider``) selects the backend.
+    ElevenLabs is not OpenAI-compatible, so it forks to :func:`_synthesize_
+    elevenlabs`; everything else takes the OpenAI-compatible path below. The
+    fork happens *before* the ``api_key`` guard because ElevenLabs supplies its
+    key from the environment when the row carries none.
     """
+    if _resolve_tts_provider(model, provider) == "elevenlabs":
+        return await _synthesize_elevenlabs(
+            text, model=model, voice=voice, api_key=api_key, timeout=timeout
+        )
+
     if not api_key:
         logger.warning(
             "TTS synthesis aborted: no API key (stage=synthesize model=%s base_url=%s)",
@@ -647,6 +733,7 @@ async def generate_message_tts(
         base_url=tts_base_url,
         api_key=tts_api_key,
         instructions=instructions,
+        provider=tts_params.get("provider"),
     )
     if not audio:
         # Model is configured but synthesis produced nothing (missing key,
@@ -762,6 +849,7 @@ async def synthesize_voice_preview(
         base_url=tts_base_url,
         api_key=tts_api_key,
         instructions=instructions,
+        provider=tts_params.get("provider"),
     )
     if not audio:
         raise TtsSynthesisError(f"TTS preview synthesis failed for model {tts_model}")

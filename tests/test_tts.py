@@ -1178,6 +1178,158 @@ class TestPreviewEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# ElevenLabs adapter: provider routing + REST synthesis (not OpenAI-compatible).
+# ---------------------------------------------------------------------------
+
+
+def _mock_httpx(*, content=b"EL_AUDIO", status_error=None):
+    """Fake httpx.AsyncClient usable as `async with ... as client: client.post`."""
+    resp = MagicMock()
+    resp.content = content
+    resp.raise_for_status = MagicMock(side_effect=status_error)
+    client = MagicMock()
+    client.post = AsyncMock(return_value=resp)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm), client
+
+
+class TestResolveTtsProvider:
+    def test_explicit_provider_wins(self):
+        from services.tts import _resolve_tts_provider
+
+        assert _resolve_tts_provider("anything", "ElevenLabs") == "elevenlabs"
+
+    def test_sniffs_eleven_model_ids(self):
+        from services.tts import _resolve_tts_provider
+
+        assert _resolve_tts_provider("eleven_multilingual_v2", None) == "elevenlabs"
+        assert _resolve_tts_provider("eleven_flash_v2_5", "") == "elevenlabs"
+
+    def test_defaults_to_openai(self):
+        from services.tts import _resolve_tts_provider
+
+        assert _resolve_tts_provider("kokoro", None) == "openai"
+        assert _resolve_tts_provider("gpt-4o-mini-tts", None) == "openai"
+
+
+class TestElevenLabsAdapter:
+    @pytest.mark.asyncio
+    async def test_success_builds_correct_request(self):
+        from services.tts import _synthesize_elevenlabs
+
+        factory, client = _mock_httpx(content=b"MP3")
+        with patch("services.tts.httpx.AsyncClient", factory):
+            audio = await _synthesize_elevenlabs(
+                "hello world",
+                model="eleven_multilingual_v2",
+                voice="voice_abc",
+                api_key="xi-key",
+            )
+        assert audio == b"MP3"
+        args, kwargs = client.post.call_args
+        assert args[0].endswith("/v1/text-to-speech/voice_abc")
+        assert kwargs["headers"]["xi-api-key"] == "xi-key"
+        assert kwargs["json"] == {
+            "text": "hello world",
+            "model_id": "eleven_multilingual_v2",
+        }
+        assert kwargs["params"]["output_format"] == "mp3_44100_128"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_env_key(self):
+        from services.tts import _synthesize_elevenlabs
+
+        factory, client = _mock_httpx()
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            audio = await _synthesize_elevenlabs(
+                "hi", model="eleven_multilingual_v2", voice="v", api_key=None
+            )
+        assert audio == b"EL_AUDIO"
+        assert client.post.call_args.kwargs["headers"]["xi-api-key"] == "env-key"
+
+    @pytest.mark.asyncio
+    async def test_none_when_no_key(self):
+        from services.tts import _synthesize_elevenlabs
+
+        with patch.dict(os.environ, {}, clear=True):
+            audio = await _synthesize_elevenlabs(
+                "hi", model="eleven_multilingual_v2", voice="v", api_key=None
+            )
+        assert audio is None
+
+    @pytest.mark.asyncio
+    async def test_none_when_no_voice(self):
+        from services.tts import _synthesize_elevenlabs
+
+        audio = await _synthesize_elevenlabs(
+            "hi", model="eleven_multilingual_v2", voice="", api_key="xi-key"
+        )
+        assert audio is None
+
+    @pytest.mark.asyncio
+    async def test_none_on_http_error(self):
+        from services.tts import _synthesize_elevenlabs
+
+        factory, _ = _mock_httpx(status_error=RuntimeError("401 Unauthorized"))
+        with patch("services.tts.httpx.AsyncClient", factory):
+            audio = await _synthesize_elevenlabs(
+                "hi", model="eleven_multilingual_v2", voice="v", api_key="xi-key"
+            )
+        assert audio is None
+
+    @pytest.mark.asyncio
+    async def test_synthesize_speech_routes_to_elevenlabs_not_openai(self):
+        """The choke point forks to ElevenLabs on an eleven_* model and never
+        constructs an OpenAI client (the ElevenLabs API isn't OpenAI-compatible)."""
+        from services.tts import _synthesize_speech
+
+        openai_cls = MagicMock()
+        el = AsyncMock(return_value=b"MP3")
+        with (
+            patch("services.tts.AsyncOpenAI", openai_cls),
+            patch("services.tts._synthesize_elevenlabs", el),
+        ):
+            audio = await _synthesize_speech(
+                "hi",
+                model="eleven_multilingual_v2",
+                voice="v",
+                base_url=None,
+                api_key="xi-key",
+            )
+        assert audio == b"MP3"
+        el.assert_awaited_once()
+        openai_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_synthesize_speech_explicit_provider_overrides_openai_model_id(self):
+        """An explicit params_json.provider forces the ElevenLabs path even when
+        the model id doesn't contain 'eleven'."""
+        from services.tts import _synthesize_speech
+
+        openai_cls = MagicMock()
+        el = AsyncMock(return_value=b"MP3")
+        with (
+            patch("services.tts.AsyncOpenAI", openai_cls),
+            patch("services.tts._synthesize_elevenlabs", el),
+        ):
+            await _synthesize_speech(
+                "hi",
+                model="custom-voice-model",
+                voice="v",
+                base_url=None,
+                api_key="xi-key",
+                provider="elevenlabs",
+            )
+        el.assert_awaited_once()
+        openai_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Markdown-strip fallback: a timed-out/absent rewrite must still read cleanly
 # (no "asterisk asterisk", no table pipes).
 # ---------------------------------------------------------------------------
