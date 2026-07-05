@@ -1,11 +1,39 @@
 # Live validation — OKF KB slice-2 straggler batch (lint rules + curator gardening)
 
 **Type:** live / dev-cluster validation (NOT a pytest — needs the deployed image and
-the Better Resavio loop producing curator archive passes). **Status:** OWED. Unit
-coverage is green (314 across the five knowledge suites, strict TDD); this runbook
-validates the batch against the real corpus and the real curator. Nothing here
-blocks starting slice 3, but the threshold-tuning follow-ups (§Success criteria)
-should be settled before slice 3's reindex bakes them in.
+the Better Resavio loop producing curator archive passes). **Status:** RUN 2026-07-05
+(image `sha-2e8b807`, vault @ 331 files) — results inline per section, summary:
+
+- **§1+2 offline lint (PASS with corpus drift):** 331 files → 660 findings
+  (dead-link 369, oversized-note 130, duplicate-h1 104, orphan 33,
+  missing-required-key 10, missing-frontmatter 8, invalid-yaml 5, slug-forked 1).
+  ALL four fixture twins + the `-351609` canary are GONE from the vault (curator
+  converged/deleted them file-side) — but their pgvector rows are still `active`:
+  the corpus has ~250 file-less DB ghosts (deletes/renames on main never called
+  kb_delete). Dual-write gap on DELETE confirmed; resolution = slice-3 PR4
+  cutover + migration-hygiene audit (ghosts are pathless → invisible to chunk
+  retrieval). One NEW slug-forked pair: `iteration-27-phase-2-tactical-retrosp…`
+  + hash twin. Fixture table is stale within a day — the vault churns too fast
+  for named fixtures; validate by rule-shape, not by slug.
+- **§3 near-duplicate floor (DECIDED: raise 0.9 → 0.97):** pair counts at
+  floors: ≥0.99 → 1, ≥0.97 → 4, ≥0.95 → 40, ≥0.93 → 138, **≥0.90 → 451** —
+  0.9 is unusable noise (dominated by same-iteration archive-finding/retro
+  boilerplate). The kurortengine twins score **0.888** — below ANY sane floor;
+  embedding near-dup cannot catch lexical twins, `slug-forked` covers them
+  (complementary rules — do NOT chase them by lowering the floor). Curator
+  attention is the scarce resource → precision-first: **0.97**. Revisit at PR4
+  (chunk-granular changes the definition).
+- **§4 URL probe (PASS):** alive→None, 404→`HTTP 404`, no-DNS→`unreachable: …`.
+- **§5 curator Garden (FAIL — adherence):** audit trail since 07-04 shows
+  kb_write 306 / kb_read 256 / kb_search 226 / kb_update 52 — and **zero
+  kb_lint, zero kb_index** calls. Workflow step 5 is not being exercised.
+  Follow-up: confirm the tools are in the agents' tool menu; if present, the
+  fix is prompt emphasis (as this runbook predicted), not code.
+
+Unit coverage remains green; the slice-3 reindex live-verification findings from
+the same day (import heisenbug, pgvector codec, batch cap) are recorded in
+`docs/features/okf_knowledge_base.md` §11 PR3.1 — they came out of exercising
+this corpus at reindex scale, exactly what this runbook existed to provoke.
 
 **What it validates** (the 2026-07-05 batch, `docs/features/okf_knowledge_base.md`
 §11.1 addendum):
