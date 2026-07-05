@@ -535,6 +535,16 @@ exactly the split-brain this design exists to kill.
      forced mid-section splits), breadcrumb embed-text builder (title/type/tags/
      heading-path as natural text, never raw YAML), `embedding_version` stamping
      (model id + dims + chunker version), wire the unused `embed_batch` for bulk.
+     **DONE 2026-07-05 (develop, TDD, uncommitted):** `src/tools/knowledge/chunker.py`
+     — `chunk_note` (heading-stack breadcrumbs, greedy sibling merge-up to target,
+     paragraph-packed forced splits with 12 % overlap seed; reuses
+     `chunk_planner.count_text_tokens` for tiktoken sizing), `build_embed_text`,
+     `embedding_version` (`model:dims:CHUNKER_VERSION`, `CHUNKER_VERSION="c1"`), and
+     async `embed_note_chunks` → the exact dict shape `replace_note_chunks` (PR1)
+     consumes, via one bulk `embed_batch` per note. 21 tests in
+     `tests/test_kb_chunker.py` (injected word-counter for deterministic sizing);
+     real-tiktoken smoke: short note → 1 chunk, 2628-tok note → 6 chunks ~438 tok
+     each. Nothing calls it yet — PR3 wires parse → chunk → embed → persist.
    - **PR3 — tree-diff reindexer + triggers**: watermark → git tree diff → parse
      changed notes (gardener `parse_note_md`) → upsert note+chunk rows / remove
      deleted → advance watermark; full rebuild re-pointed at the git tree +
