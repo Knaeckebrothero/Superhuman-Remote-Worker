@@ -505,7 +505,9 @@
       "auto": "Standard (automatisch)",
       "customPlaceholder": "Stimmen-ID",
       "preview": "Stimme anhören",
-      "previewFailed": "Vorschau konnte nicht abgespielt werden — bitte TTS-Einrichtung prüfen."
+      "previewFailed": "Vorschau konnte nicht abgespielt werden — bitte TTS-Einrichtung prüfen.",
+      "langNote": "Die Sprache jeder Stimme steht in Klammern (z. B. [EN-US], [ES], [FR]); [multi] bedeutet mehrsprachig.",
+      "kokoroNoGerman": "Dieses Backend hat keine deutsche Stimme — für Deutsch eine (mehrsprachige) OpenAI-Stimme wählen."
     },
     "dataVisibility": {
       "title": "Datensichtbarkeit",

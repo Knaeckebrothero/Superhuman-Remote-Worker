@@ -1,5 +1,11 @@
 import {describe, expect, it} from 'vitest';
-import {KOKORO_VOICES, OPENAI_TTS_VOICES, voicesForModelId} from './tts-voices';
+import {
+  KOKORO_VOICES,
+  OPENAI_TTS_VOICES,
+  voicesForModelId,
+  voiceLanguageTag,
+  ttsBackendForModelId,
+} from './tts-voices';
 
 describe('voicesForModelId', () => {
   it('returns the Kokoro catalog for kokoro model ids (case-insensitive)', () => {
@@ -23,5 +29,50 @@ describe('voicesForModelId', () => {
     expect(voicesForModelId('')).toEqual([]);
     expect(voicesForModelId(null)).toEqual([]);
     expect(voicesForModelId(undefined)).toEqual([]);
+  });
+});
+
+describe('ttsBackendForModelId', () => {
+  it('detects kokoro / openai / unknown', () => {
+    expect(ttsBackendForModelId('kokoro-strix')).toBe('kokoro');
+    expect(ttsBackendForModelId('KOKORO')).toBe('kokoro');
+    expect(ttsBackendForModelId('tts-1')).toBe('openai');
+    expect(ttsBackendForModelId('gpt-4o-mini-tts')).toBe('openai');
+    expect(ttsBackendForModelId('some-other-model')).toBeNull();
+    expect(ttsBackendForModelId('')).toBeNull();
+    expect(ttsBackendForModelId(null)).toBeNull();
+  });
+});
+
+describe('voiceLanguageTag', () => {
+  it('decodes the Kokoro id prefix into a language tag', () => {
+    const cases: Record<string, string> = {
+      af_bella: 'EN-US', // a = American English
+      am_adam: 'EN-US',
+      bf_emma: 'EN-GB', // b = British English
+      bm_george: 'EN-GB',
+      ef_dora: 'ES', // e = Spanish
+      ff_siwis: 'FR', // f = French
+      hf_alpha: 'HI', // h = Hindi
+      if_sara: 'IT', // i = Italian
+      jf_alpha: 'JA', // j = Japanese
+      pf_dora: 'PT', // p = Portuguese
+      zf_xiaobei: 'ZH', // z = Chinese
+    };
+    for (const [voice, tag] of Object.entries(cases)) {
+      expect(voiceLanguageTag('kokoro', voice)).toBe(tag);
+    }
+  });
+
+  it('tags every OpenAI voice as multilingual', () => {
+    expect(voiceLanguageTag('tts-1', 'alloy')).toBe('multi');
+    expect(voiceLanguageTag('gpt-4o-mini-tts', 'nova')).toBe('multi');
+  });
+
+  it('returns null for unknown backends, unknown prefixes, or empty input', () => {
+    expect(voiceLanguageTag('eleven-labs-x', 'rachel')).toBeNull(); // unknown backend
+    expect(voiceLanguageTag('kokoro', 'qf_unknown')).toBeNull(); // no such prefix
+    expect(voiceLanguageTag('kokoro', '')).toBeNull();
+    expect(voiceLanguageTag(null, 'af_bella')).toBeNull();
   });
 });
