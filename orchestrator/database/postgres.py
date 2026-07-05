@@ -9796,6 +9796,42 @@ class PostgresDB:
             )
         return result.endswith(" 1")
 
+    async def heal_project_loop_pointer(
+        self,
+        loop_id: str,
+        job_id: str,
+        *,
+        seq_index: int,
+        total_jobs_run: int,
+        remaining_iterations: int | None,
+    ) -> bool:
+        """Atomically re-point a wedged loop at its newest spawned job.
+
+        The torn-advance recovery (see
+        docs/issues/loop_advance_nonatomic_wedges_loop.md): an interrupted
+        ``_advance_project_loop`` can commit the claim (``current_job_id=NULL``)
+        and the next job's insert but lose the write-back, stranding the loop
+        in ``running`` with no pointer. This re-points it and reconciles the
+        counters the lost write-back would have set.
+
+        Guarded on ``current_job_id IS NULL AND status='running'`` so
+        concurrent sweeper replicas heal exactly once — the loser matches no
+        row and backs off (mirrors ``claim_project_loop_advance``).
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE project_loops SET current_job_id = $2, seq_index = $3, "
+                "total_jobs_run = $4, remaining_iterations = $5, "
+                "updated_at = now() "
+                "WHERE id = $1 AND current_job_id IS NULL AND status = 'running'",
+                UUID(loop_id),
+                UUID(job_id),
+                seq_index,
+                total_jobs_run,
+                remaining_iterations,
+            )
+        return result.endswith(" 1")
+
     async def fetch_next_due_cron_automation(self, conn) -> Dict[str, Any] | None:
         """Pessimistically claim the next due cron automation under SKIP LOCKED.
 
