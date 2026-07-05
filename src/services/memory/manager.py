@@ -28,6 +28,7 @@ from .types import (
     MemoryPipelineError,
     MemoryRuntime,
     Scored,
+    TransientScorerError,
     _StopWatch,
 )
 
@@ -127,11 +128,16 @@ class MemoryManager:
         failing retriever contributes nothing, a failing policy passes items
         through unchanged — and recorded in stats.errors.
 
-        Scorer failures are NOT contained: a configured scorer (the reranker) is
-        required, so its runtime failure raises ``MemoryPipelineError`` rather
-        than silently serving legacy order behind the user's back ("configured ⇒
-        required" — the caller fails the turn loud). See
-        docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md.
+        Scorer failures split by cause: a *transient* transport fault that
+        outlasted the scorer's bounded retries (``TransientScorerError``)
+        degrades that one turn to the pre-scorer order — loud, recorded in
+        stats.errors, retried next turn. A *structural* failure (wrong
+        route/auth/response shape) is NOT contained: a configured scorer (the
+        reranker) is required, so it raises ``MemoryPipelineError`` rather
+        than silently serving legacy order behind the user's back ("configured
+        ⇒ required" — the caller fails the turn loud). See
+        docs/issues/openrouter_auxiliary_crashes_session_via_memory_reranker.md
+        and docs/issues/reranker_transient_fault_hard_fails_job.md.
         """
         watch = _StopWatch()
         stats = AssembleStats()
@@ -156,10 +162,19 @@ class MemoryManager:
             for name, scorer in self._scorers:
                 try:
                     items = await scorer.score(req, items)
+                except TransientScorerError as e:
+                    # The network blipped and outlasted the scorer's bounded
+                    # retries — serve THIS turn in pre-scorer (hybrid) order
+                    # instead of killing the job over a transport fault.
+                    # Loud: stats.errors + warning log; the next turn goes
+                    # back through the scorer. Structural failures (wrong
+                    # route/auth/shape) don't take this path.
+                    self._record_failure(stats, "scorer", name, e)
                 except Exception as e:
-                    # Configured scorer (reranker) is required — fail loud, do
-                    # NOT degrade to legacy order silently. Escapes the kernel
-                    # backstop below via MemoryPipelineError.
+                    # Configured scorer (reranker) is required — a structural
+                    # failure must fail loud, NOT degrade to legacy order
+                    # silently. Escapes the kernel backstop below via
+                    # MemoryPipelineError.
                     self._record_failure(stats, "scorer", name, e)
                     raise MemoryPipelineError(
                         f"required memory scorer '{name}' failed at runtime: "

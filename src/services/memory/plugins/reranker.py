@@ -25,22 +25,49 @@ Scope discipline:
   bounded-core policy's job, not the scorer's.
 - At most ``memory.reranker.top_k`` candidates go to the endpoint; the
   remainder keeps its original (hybrid) order behind the reranked head.
-- Any transport/shape failure raises. The scorer never partially
-  reorders, and the manager does NOT contain a scorer failure — a
-  configured reranker is required, so the failure propagates as
-  ``MemoryPipelineError`` and the caller fails the turn loud rather
-  than silently serving legacy order (records the error in
-  ``AssembleStats.errors`` on the way out).
+- Failure semantics split by cause (mirrors the main-LLM retry
+  classifier; docs/issues/reranker_transient_fault_hard_fails_job.md):
+  *transient* transport faults — timeouts, connection errors/resets,
+  5xx/429 — get a bounded in-call retry with backoff, and if they
+  persist the scorer raises ``TransientScorerError`` so the manager can
+  degrade to the pre-scorer (hybrid) order for that one turn.
+  *Structural* failures — 4xx, bad URL, malformed response shape —
+  raise immediately and the manager escalates them to
+  ``MemoryPipelineError`` (a configured reranker is required; never
+  silently serve legacy order behind a broken config). The scorer never
+  partially reorders either way.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any, List, Optional, Tuple
 
 from src.services.memory.registry import register_memory_plugin
-from src.services.memory.types import AssembleRequest, Scored
+from src.services.memory.types import AssembleRequest, Scored, TransientScorerError
 
 logger = logging.getLogger(__name__)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for faults where retrying is not futile (network blips, 5xx).
+
+    4xx (except 429) means the request itself is wrong — auth, route,
+    payload — and will fail identically on retry; those stay structural.
+    Everything raised outside httpx (shape/parse errors) is structural too.
+    """
+    import httpx
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code >= 500 or code == 429
+    # TimeoutException covers Connect/Read/Write/PoolTimeout; NetworkError
+    # covers ConnectError/ReadError/WriteError/CloseError; RemoteProtocolError
+    # is the server dropping the connection mid-request (observed live as the
+    # uni-box reranker restarting under it).
+    return isinstance(
+        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+    )
 
 
 def _is_pinned(item: Scored) -> bool:
@@ -59,6 +86,8 @@ class RerankerScorer:
         top_k: int = 64,
         timeout: float = 10.0,
         keep_pinned_first: bool = True,
+        retries: int = 2,
+        retry_backoff: float = 1.0,
         client: Optional[Any] = None,
     ) -> None:
         if not base_url:
@@ -72,6 +101,8 @@ class RerankerScorer:
         self.top_k = top_k
         self.timeout = timeout
         self.keep_pinned_first = keep_pinned_first
+        self.retries = max(0, retries)  # extra attempts after the first
+        self.retry_backoff = retry_backoff  # base delay, doubles per retry
         self._client = client  # injectable for tests; lazily built otherwise
 
     def _http_client(self) -> Any:
@@ -87,16 +118,49 @@ class RerankerScorer:
     async def _rerank(
         self, query: str, documents: List[str]
     ) -> List[Tuple[int, float]]:
-        """Call the endpoint; return (index, relevance_score) pairs."""
-        response = await self._http_client().post(
-            self.endpoint,
-            json={"model": self.model, "query": query, "documents": documents},
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return [
-            (int(r["index"]), float(r["relevance_score"])) for r in payload["results"]
-        ]
+        """Call the endpoint; return (index, relevance_score) pairs.
+
+        Transient transport faults are retried in-call (``retries`` extra
+        attempts, exponential backoff from ``retry_backoff``); if they outlast
+        the budget the call raises ``TransientScorerError`` for the manager to
+        degrade this one turn. Structural failures raise immediately.
+        """
+        attempts = self.retries + 1
+        last_exc: Optional[Exception] = None
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(self.retry_backoff * (2 ** (attempt - 1)))
+            try:
+                response = await self._http_client().post(
+                    self.endpoint,
+                    json={
+                        "model": self.model,
+                        "query": query,
+                        "documents": documents,
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+                return [
+                    (int(r["index"]), float(r["relevance_score"]))
+                    for r in payload["results"]
+                ]
+            except Exception as e:
+                if not _is_transient(e):
+                    raise
+                last_exc = e
+                logger.warning(
+                    "reranker transient fault (attempt %d/%d) on %s: %s: %s",
+                    attempt + 1,
+                    attempts,
+                    self.endpoint,
+                    type(e).__name__,
+                    e,
+                )
+        raise TransientScorerError(
+            f"rerank endpoint {self.endpoint} kept failing transiently "
+            f"({attempts} attempts): {type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
 
     async def score(self, req: AssembleRequest, items: List[Scored]) -> List[Scored]:
         if not req.query_text:
@@ -161,4 +225,6 @@ def _build_reranker(runtime: Any) -> RerankerScorer:
         top_k=cfg.top_k,
         timeout=cfg.timeout,
         keep_pinned_first=cfg.keep_pinned_first,
+        retries=getattr(cfg, "retries", 2),
+        retry_backoff=getattr(cfg, "retry_backoff", 1.0),
     )

@@ -9804,6 +9804,7 @@ class PostgresDB:
         seq_index: int,
         total_jobs_run: int,
         remaining_iterations: int | None,
+        min_wedge_age_seconds: float = 600.0,
     ) -> bool:
         """Atomically re-point a wedged loop at its newest spawned job.
 
@@ -9816,19 +9817,28 @@ class PostgresDB:
 
         Guarded on ``current_job_id IS NULL AND status='running'`` so
         concurrent sweeper replicas heal exactly once — the loser matches no
-        row and backs off (mirrors ``claim_project_loop_advance``).
+        row and backs off (mirrors ``claim_project_loop_advance``) — AND on
+        the wedge being at least ``min_wedge_age_seconds`` old. The age gate
+        is what separates a *torn* advance from an advance *in flight*: every
+        healthy advance also traverses ``current_job_id=NULL`` between its
+        claim and its write-back (the claim stamps ``updated_at=now()``), and
+        healing inside that window re-arms the claim and double-spawns the
+        next iteration (observed live: duplicate iter-14 critics). Evaluated
+        on the DB clock so a stale Python-side read can't sneak past it.
         """
         async with self.acquire() as conn:
             result = await conn.execute(
                 "UPDATE project_loops SET current_job_id = $2, seq_index = $3, "
                 "total_jobs_run = $4, remaining_iterations = $5, "
                 "updated_at = now() "
-                "WHERE id = $1 AND current_job_id IS NULL AND status = 'running'",
+                "WHERE id = $1 AND current_job_id IS NULL AND status = 'running' "
+                "AND updated_at < now() - make_interval(secs => $6)",
                 UUID(loop_id),
                 UUID(job_id),
                 seq_index,
                 total_jobs_run,
                 remaining_iterations,
+                float(min_wedge_age_seconds),
             )
         return result.endswith(" 1")
 

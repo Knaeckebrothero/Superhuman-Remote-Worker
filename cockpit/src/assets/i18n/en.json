@@ -524,7 +524,19 @@
       "librarySearch": "Search",
       "libraryAdd": "Add",
       "libraryAdded": "Added",
-      "libraryEmpty": "No voices found. Try a different search."
+      "libraryEmpty": "No voices found. Try a different search.",
+      "rewriteTitle": "How messages are rewritten",
+      "rewriteReasoningLabel": "Rewrite reasoning",
+      "rewriteReasoningHint": "Off is fastest. Turning it on makes the rewrite smarter but delays the first audio while the model thinks.",
+      "reasoningOff": "Off (fastest)",
+      "reasoningLow": "Low",
+      "reasoningMedium": "Medium",
+      "reasoningHigh": "High",
+      "rewritePromptLabel": "Custom rewrite instructions (optional)",
+      "rewritePromptHint": "Your standing preferences for how messages are read aloud — e.g. \"give me a TLDR for long messages\", \"skip tables\", \"leave out code file names\". These win over the defaults (except it never invents facts or changes numbers and names).",
+      "rewritePromptPlaceholder": "e.g. Summarize long messages and skip tables…",
+      "rewritePromptCounter": "{{left}} characters left.",
+      "rewriteSave": "Save rewrite settings"
     },
     "dataVisibility": {
       "title": "Data visibility",

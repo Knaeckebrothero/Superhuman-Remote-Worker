@@ -20,7 +20,8 @@ import {
     CommunicationSettings,
     LlmEndpointTestResult,
     McpTokenCreateResponse,
-    Project
+    Project,
+    ReadAloudReasoningLevel
 } from '../../core/models/api.model';
 import {
   voicesForModelId,
@@ -205,6 +206,56 @@ const EXPIRY_OPTIONS = [
                 @if (previewFailed()) {
                   <span class="voice-preview-error">{{ 'settings.voice.previewFailed' | transloco }}</span>
                 }
+              </div>
+
+              <!-- How the message is rewritten for speech (all backends). The
+                   auxiliary LLM cleans markdown + shapes the text; these two
+                   knobs steer it — reasoning (off by default; on = smarter but
+                   slower first audio) and a free-text instruction the user
+                   controls (skip tables, TLDR long messages, omit file names…). -->
+              <div class="voice-rewrite">
+                <h3 class="voice-subhead">{{ 'settings.voice.rewriteTitle' | transloco }}</h3>
+                <app-form-field
+                  [label]="'settings.voice.rewriteReasoningLabel' | transloco"
+                  [hint]="'settings.voice.rewriteReasoningHint' | transloco"
+                >
+                  <app-select
+                    [value]="readAloudReasoning()"
+                    (changed)="readAloudReasoning.set($any($event))"
+                  >
+                    <option value="off">{{ 'settings.voice.reasoningOff' | transloco }}</option>
+                    <option value="low">{{ 'settings.voice.reasoningLow' | transloco }}</option>
+                    <option value="medium">{{ 'settings.voice.reasoningMedium' | transloco }}</option>
+                    <option value="high">{{ 'settings.voice.reasoningHigh' | transloco }}</option>
+                  </app-select>
+                </app-form-field>
+                <app-form-field
+                  [label]="'settings.voice.rewritePromptLabel' | transloco"
+                  [hint]="'settings.voice.rewritePromptHint' | transloco"
+                >
+                  <app-textarea
+                    [value]="readAloudPromptDraft()"
+                    (valueChange)="onReadAloudPromptChange($event)"
+                    [rows]="3"
+                    size="sm"
+                    [placeholder]="'settings.voice.rewritePromptPlaceholder' | transloco"
+                  />
+                  <p class="voice-sample-hint">{{ 'settings.voice.rewritePromptCounter' | transloco: {left: readAloudPromptCharsLeft()} }}</p>
+                </app-form-field>
+                <div class="actions-row">
+                  <app-button
+                    variant="primary"
+                    size="sm"
+                    [loading]="savingReadAloud()"
+                    [disabled]="savingReadAloud()"
+                    (clicked)="saveReadAloud()"
+                  >
+                    {{ savingReadAloud() ? ('common.saving' | transloco) : ('settings.voice.rewriteSave' | transloco) }}
+                  </app-button>
+                  @if (readAloudSaved()) {
+                    <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
+                  }
+                </div>
               </div>
 
               <!-- ElevenLabs Voice Library browser (Phase 6): search the 10k+
@@ -1963,6 +2014,20 @@ const EXPIRY_OPTIONS = [
       font-size: 13px;
       color: var(--danger);
     }
+    .voice-rewrite {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .voice-subhead {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+    }
     .voice-library {
       margin-top: 14px;
       padding-top: 12px;
@@ -2126,6 +2191,46 @@ export class SettingsComponent implements OnInit {
     this.hostedAudio = audio;
     audio.play().catch(() => {
       /* autoplay/network failure — nothing actionable, stay silent */
+    });
+  }
+
+  // ── Read-aloud rewrite preferences (reasoning + custom prompt) ────
+  // Both feed the aux rewrite in services/tts.py. Draft signals + an explicit
+  // Save (mirrors the persistent-agent / communication sub-object pattern) so
+  // the free-text prompt isn't PATCHed on every keystroke; seeded from
+  // preferences in the sync effect.
+  readonly readAloudReasoning = signal<ReadAloudReasoningLevel>('off');
+  readonly readAloudPromptDraft = signal('');
+  /** Server caps the custom prompt (services/tts.py READ_ALOUD_PROMPT_MAX). */
+  readonly readAloudPromptMax = 1000;
+  readonly readAloudPromptCharsLeft = computed(
+    () => this.readAloudPromptMax - this.readAloudPromptDraft().length,
+  );
+  readonly savingReadAloud = signal(false);
+  readonly readAloudSaved = signal(false);
+
+  /** Clamp typed/pasted instructions to the cap so we never submit a 422. */
+  onReadAloudPromptChange(text: string): void {
+    this.readAloudPromptDraft.set(text.slice(0, this.readAloudPromptMax));
+  }
+
+  /** Persist the read-aloud rewrite preferences as one sub-object. */
+  saveReadAloud(): void {
+    this.savingReadAloud.set(true);
+    this.readAloudSaved.set(false);
+    const settings: Record<string, unknown> = {
+      read_aloud: {
+        reasoning_level: this.readAloudReasoning(),
+        custom_prompt: this.readAloudPromptDraft().trim() || null,
+      },
+    };
+    this.settingsService.updatePreferences(settings).subscribe({
+      next: () => {
+        this.savingReadAloud.set(false);
+        this.readAloudSaved.set(true);
+        setTimeout(() => this.readAloudSaved.set(false), 2000);
+      },
+      error: () => this.savingReadAloud.set(false),
     });
   }
 
@@ -2461,6 +2566,14 @@ export class SettingsComponent implements OnInit {
         this.prefWhisperModel.set(prefs.default_whisper_model ?? null);
         this.prefEmbeddingModel.set(prefs.default_embedding_model ?? null);
         this.prefEmbeddingProvider.set(prefs.embedding_provider ?? null);
+
+        // Seed the read-aloud rewrite draft (prefs only change on load/save, so
+        // this never clobbers a mid-edit draft — same as the sub-objects below).
+        const ra = prefs.read_aloud;
+        this.readAloudReasoning.set(
+          (ra?.reasoning_level as ReadAloudReasoningLevel) ?? 'off',
+        );
+        this.readAloudPromptDraft.set(ra?.custom_prompt ?? '');
 
         // Sync persistent agent preferences
         const pa = prefs.persistent_agent;

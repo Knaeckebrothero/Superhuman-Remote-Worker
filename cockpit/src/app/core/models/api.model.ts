@@ -606,7 +606,25 @@ export interface UserSettings {
   admin_view_mode?: 'me' | 'all' | null;
   communication?: CommunicationSettings | null;
   persistent_agent?: PersistentAgentSettings | null;
+  /** How the aux LLM rewrites messages for read-aloud (reasoning + custom prompt). */
+  read_aloud?: ReadAloudSettings | null;
   _resolved?: ResolvedDefaults;
+}
+
+/** A read-aloud reasoning level. 'off' (default) keeps the fast rewrite path;
+ * the rest turn the aux model's thinking on (or set its effort). */
+export type ReadAloudReasoningLevel = 'off' | 'low' | 'medium' | 'high';
+
+/**
+ * Read-aloud rewrite preferences (stored under users.settings.read_aloud, read by
+ * orchestrator/services/tts.py). `reasoning_level` trades latency for a smarter
+ * rewrite (off by default); `custom_prompt` is the user's own standing
+ * instructions ("skip tables", "give me a TLDR", "omit code file names") — it
+ * outranks the default rules, so it can summarize/omit, capped at 1000 chars.
+ */
+export interface ReadAloudSettings {
+  reasoning_level?: ReadAloudReasoningLevel | null;
+  custom_prompt?: string | null;
 }
 
 /**

@@ -129,22 +129,120 @@ def _set_nested(d: dict, dotted: str, value: Any) -> None:
     node[parts[-1]] = value
 
 
-def _aux_reasoning_off_body(model: str) -> dict:
-    """``extra_body`` that disables thinking for a hybrid-thinking aux family,
-    or ``{}`` for families without a binary thinking toggle (so we never send an
-    unsupported ``chat_template_kwargs`` to a non-vLLM endpoint). Empty is a safe
-    no-op when passed to ``chat.completions.create``."""
+def _clamp_effort(level: str, options: list[str]) -> Optional[str]:
+    """Nearest supported effort for ``level`` from a family's ``options`` list, or
+    ``None`` when it can't be mapped (skip injection rather than risk a 400 on an
+    unsupported value)."""
+    if level in options:
+        return level
+    alias = {"minimal": "low", "xhigh": "high"}.get(level)
+    return alias if alias in options else None
+
+
+def _aux_reasoning_body(model: str, level: Optional[str] = None) -> dict:
+    """``extra_body`` controlling the aux model's reasoning for the rewrite stage.
+
+    ``level`` is the user's read-aloud reasoning preference: ``None`` / ``"off"``
+    (the default) keeps reasoning OFF — the rewrite is mechanical and that pre-token
+    thinking pass is the dominant time-to-first-audio cost — while a real level
+    (``"low"`` / ``"medium"`` / ``"high"`` / …) turns thinking on or sets the
+    effort. Mirrors the agent's ``resolve_reasoning_plan`` but stays orchestrator-
+    local (reads the same ``config/model_config_matrix.yaml`` reasoning block) and
+    only emits parameters a family actually supports, so an unsupported field never
+    reaches an endpoint that would 400 on it. ``{}`` is a safe no-op for
+    ``chat.completions.create``."""
     if not model:
         return {}
+    lvl = (level or "").strip().lower()
+    is_off = lvl in ("", "off", "none", "false")
     fam = detect_family(model).family
     cap = (_model_config_matrix().get(fam) or {}).get("reasoning")
-    if not isinstance(cap, dict) or cap.get("method") != "binary_toggle":
+    if not isinstance(cap, dict):
         return {}
-    param = cap.get("toggle_param", "chat_template_kwargs.enable_thinking")
-    tmap = cap.get("toggle_map") or {"on": True, "off": False}
-    body: dict = {}
-    _set_nested(body, param, tmap.get("off", False))
-    return body
+    method = cap.get("method")
+    if method == "binary_toggle":
+        # gemma via vLLM: flip enable_thinking. off → false (the fast default),
+        # any requested level → true.
+        param = cap.get("toggle_param", "chat_template_kwargs.enable_thinking")
+        tmap = cap.get("toggle_map") or {"on": True, "off": False}
+        body: dict = {}
+        _set_nested(body, param, tmap.get("off" if is_off else "on", not is_off))
+        return body
+    if method == "effort_enum" and cap.get("delivery") == "native":
+        options = [str(o).lower() for o in (cap.get("options") or [])]
+        if is_off:
+            # No universal "off" for an effort model — use an explicit low-reasoning
+            # option when the family offers one, else inherit the endpoint default
+            # (matches the prior behavior: we never forced these families off).
+            for off_opt in ("none", "minimal"):
+                if off_opt in options:
+                    return {"reasoning_effort": off_opt}
+            return {}
+        chosen = _clamp_effort(lvl, options)
+        return {"reasoning_effort": chosen} if chosen else {}
+    # prompt-delivery effort, always_on, token_budget, none → nothing to inject.
+    return {}
+
+
+def _aux_reasoning_off_body(model: str) -> dict:
+    """The reasoning-OFF ``extra_body`` (the default read-aloud path). Thin alias
+    over :func:`_aux_reasoning_body` with no requested level."""
+    return _aux_reasoning_body(model, None)
+
+
+# Valid read-aloud reasoning levels (Settings picker + server validation). "off"
+# is the default and keeps the fast rewrite path; the rest turn the aux model's
+# thinking on (or set its effort where the family supports levels).
+READ_ALOUD_REASONING_LEVELS = ("off", "low", "medium", "high")
+# The user's custom rewrite instructions ride on every aux call, so cap them to
+# keep aux context + latency sane (mirrors the preview-text cap).
+READ_ALOUD_PROMPT_MAX = 1000
+
+# Appended to a rewrite system prompt when the user has set custom read-aloud
+# instructions. Their preference outranks the default rules (they may ask to
+# summarize / shorten / omit) — but NEVER the no-fabrication / no-altered-figures
+# floor, because the whole point of read-aloud is to hear the message faithfully.
+_READ_ALOUD_PREFERENCE_TEMPLATE = """The user has standing preferences for how their own messages are read aloud to them. Follow these preferences. Where they conflict with the rules above — for example the user may ask you to summarize, shorten, skip sections, or leave out particular details — THE USER'S PREFERENCES WIN. Two limits still hold regardless of the preferences: never invent facts that are not in the source text, and never change numbers, names, code identifiers, or quoted figures (you may drop them if asked, but never alter them).
+
+User preferences:
+{custom}"""
+
+
+def _augment_rewrite_prompt(base: str, custom_prompt: Optional[str]) -> str:
+    """Append the user's custom read-aloud instructions to a rewrite system prompt
+    (no-op when unset). User preference outranks the default rules but not the
+    no-fabrication floor — see :data:`_READ_ALOUD_PREFERENCE_TEMPLATE`."""
+    custom = (custom_prompt or "").strip()
+    if not custom:
+        return base
+    return f"{base}\n\n{_READ_ALOUD_PREFERENCE_TEMPLATE.format(custom=custom)}"
+
+
+def _read_aloud_prefs(user_settings: dict) -> tuple[Optional[str], str]:
+    """Extract ``(custom_prompt, reasoning_level)`` from the user's ``read_aloud``
+    settings sub-object. Missing/blank → ``(None, "off")`` (the fast default)."""
+    ra = user_settings.get("read_aloud") if isinstance(user_settings, dict) else None
+    if not isinstance(ra, dict):
+        return None, "off"
+    custom = ra.get("custom_prompt")
+    custom = custom.strip() if isinstance(custom, str) and custom.strip() else None
+    level = ra.get("reasoning_level")
+    level = level.strip().lower() if isinstance(level, str) and level.strip() else "off"
+    if level not in READ_ALOUD_REASONING_LEVELS:
+        level = "off"
+    return custom, level
+
+
+def _rewrite_variant_key(
+    custom_prompt: Optional[str], reasoning_level: Optional[str]
+) -> str:
+    """A short, stable cache discriminator for the rewrite variant. The rewritten
+    text depends on the user's custom instructions and reasoning level, so the
+    plan / formulation caches (keyed on the ORIGINAL content) must fold it in — or
+    editing the read-aloud prompt would replay a stale rewrite from cache."""
+    cp = (custom_prompt or "").strip()
+    lvl = (reasoning_level or "off").strip().lower() or "off"
+    return _hash_key("rw", lvl, cp)
 
 
 FORMULATION_SYSTEM_PROMPT = """You rewrite text so it sounds natural when read aloud by a text-to-speech engine.
@@ -432,9 +530,18 @@ async def _formulate_for_speech(
     ledger: Optional[UsageLedger] = None,
     user_id: Optional[str] = None,
     ref_id: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    reasoning_level: Optional[str] = None,
 ) -> str:
-    """Run the auxiliary LLM to rewrite ``text`` for natural speech."""
-    cache_key = _hash_key(model, text)
+    """Run the auxiliary LLM to rewrite ``text`` for natural speech.
+
+    ``custom_prompt`` (the user's standing read-aloud instructions) and
+    ``reasoning_level`` (off by default) come from the user's ``read_aloud``
+    settings; both feed the cache key so a preference change doesn't replay a
+    stale rewrite."""
+    cache_key = _hash_key(
+        model, _rewrite_variant_key(custom_prompt, reasoning_level), text
+    )
     async with _formulation_lock:
         cached = _cache_get(_formulation_cache, cache_key)
     if cached is not None:
@@ -459,11 +566,16 @@ async def _formulate_for_speech(
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": FORMULATION_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": _augment_rewrite_prompt(
+                        FORMULATION_SYSTEM_PROMPT, custom_prompt
+                    ),
+                },
                 {"role": "user", "content": text},
             ],
             temperature=0.3,
-            extra_body=_aux_reasoning_off_body(model),
+            extra_body=_aux_reasoning_body(model, reasoning_level),
         )
         rewritten = (response.choices[0].message.content or "").strip()
         if _metering_enabled(ledger):
@@ -1009,6 +1121,7 @@ async def generate_message_tts(
         )
         if aux_creds is not None:
             aux_model, aux_base_url, aux_api_key = aux_creds
+            custom_prompt, reasoning_level = _read_aloud_prefs(user_settings)
             speech_input = await _formulate_for_speech(
                 content,
                 model=aux_model,
@@ -1017,6 +1130,8 @@ async def generate_message_tts(
                 ledger=ledger,
                 user_id=user_id,
                 ref_id=ref_id,
+                custom_prompt=custom_prompt,
+                reasoning_level=reasoning_level,
             )
         else:
             logger.debug(
@@ -1449,6 +1564,8 @@ async def _llm_clean_and_chunk(
     ledger: Optional[UsageLedger] = None,
     user_id: Optional[str] = None,
     ref_id: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    reasoning_level: Optional[str] = None,
 ) -> Optional[list[str]]:
     """LLM cleanup + natural chunking → ordered chunk list, or ``None`` to signal
     the caller should fall back to deterministic splitting.
@@ -1456,6 +1573,8 @@ async def _llm_clean_and_chunk(
     ``None`` on: no key, call error, truncated output (hit max tokens — the
     array would be incomplete), or unparseable output. Oversized chunks are
     re-prompted once; the caller's gate enforces the hard ceiling regardless.
+    ``custom_prompt`` / ``reasoning_level`` come from the user's ``read_aloud``
+    settings (see :func:`_augment_rewrite_prompt` / :func:`_aux_reasoning_body`).
     """
     if not api_key:
         return None
@@ -1466,11 +1585,16 @@ async def _llm_clean_and_chunk(
         response = await client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": CHUNKING_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": _augment_rewrite_prompt(
+                        CHUNKING_SYSTEM_PROMPT, custom_prompt
+                    ),
+                },
                 {"role": "user", "content": text},
             ],
             temperature=0.3,
-            extra_body=_aux_reasoning_off_body(model),
+            extra_body=_aux_reasoning_body(model, reasoning_level),
         )
         if _metering_enabled(ledger):
             # Meter tokens even when the plan is truncated/unparseable below —
@@ -1544,14 +1668,22 @@ async def plan_tts_chunks(
     if not content or not content.strip():
         return None
 
-    cache_key = _hash_key("plan", "reform" if reformulate else "raw", content)
+    # Load user_settings first so the rewrite variant (custom prompt + reasoning
+    # level) is part of the cache key — otherwise editing the read-aloud prompt
+    # would replay a stale rewrite. Only the reformulate path uses it; the raw
+    # bailout keeps a constant key so its cache hit-rate is unaffected.
+    user_settings = await postgres_db.get_user_settings(user_id) or {}
+    custom_prompt, reasoning_level = _read_aloud_prefs(user_settings)
+    variant = (
+        _rewrite_variant_key(custom_prompt, reasoning_level) if reformulate else ""
+    )
+    cache_key = _hash_key("plan", "reform" if reformulate else "raw", variant, content)
     async with _plan_lock:
         cached = _cache_get(_plan_cache, cache_key)
     if cached is not None:
         logger.debug("TTS chunk-plan cache hit")
         return {"chunks": list(cached["chunks"]), "rewritten": cached["rewritten"]}
 
-    user_settings = await postgres_db.get_user_settings(user_id) or {}
     resolved_keys = await postgres_db.resolve_api_keys_for_job(
         user_id=user_id, project_id=None
     )
@@ -1589,6 +1721,8 @@ async def plan_tts_chunks(
                 ledger=ledger,
                 user_id=user_id,
                 ref_id=ref_id,
+                custom_prompt=custom_prompt,
+                reasoning_level=reasoning_level,
             )
             # rewritten iff the LLM actually produced the chunks (not fallback).
             rewritten = chunks is not None
@@ -1720,16 +1854,22 @@ async def stream_tts_chunks(
     usage_obj: Any = None
     stalled = False
     try:
+        custom_prompt, reasoning_level = _read_aloud_prefs(user_settings)
         stream = await client.chat.completions.create(
             model=aux_model,
             messages=[
-                {"role": "system", "content": CHUNKING_STREAM_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": _augment_rewrite_prompt(
+                        CHUNKING_STREAM_SYSTEM_PROMPT, custom_prompt
+                    ),
+                },
                 {"role": "user", "content": content},
             ],
             temperature=0.3,
             stream=True,
             stream_options={"include_usage": True},
-            extra_body=_aux_reasoning_off_body(aux_model),
+            extra_body=_aux_reasoning_body(aux_model, reasoning_level),
         )
         stream_iter = stream.__aiter__()
         while True:

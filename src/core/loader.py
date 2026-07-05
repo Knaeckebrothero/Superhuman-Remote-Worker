@@ -1563,6 +1563,13 @@ class RerankerConfig:
     api_key: Optional[str] = None  # null = EMBEDDING_API_KEY
     top_k: int = 64  # rerank at most this many candidates per assemble
     timeout: float = 10.0  # seconds per rerank call
+    # Transient-fault budget (timeouts / connection drops / 5xx): extra
+    # attempts after the first, with exponential backoff from retry_backoff
+    # seconds. Exhausting it degrades that one turn to hybrid order instead
+    # of failing the job (structural 4xx/shape errors stay job-fatal). See
+    # docs/issues/reranker_transient_fault_hard_fails_job.md.
+    retries: int = 2
+    retry_backoff: float = 1.0
     # Keep TTL-pinned items (the recency working set) ahead of the
     # reranked tail — Phase 3's bounded-core policy revisits pinning
     # itself; the scorer doesn't change tier semantics.
