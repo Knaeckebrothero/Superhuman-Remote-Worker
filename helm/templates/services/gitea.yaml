@@ -131,6 +131,18 @@ spec:
                         --group-claim-name "groups" --admin-group "admin" \
                         --skip-local-2fa 2>/dev/null || true
                     fi
+                    # Re-assert the browser-facing auth URL on every start so a
+                    # global.domain flip (srw.authUrl) reaches the existing DB-stored
+                    # source — add-oauth above only fires when the source is missing.
+                    # The OAuth flow must START on Keycloak's canonical KC_HOSTNAME;
+                    # if it starts on a stale host, KC bounces the browser mid-flow to
+                    # KC_HOSTNAME and the transient auth-session cookie is lost →
+                    # temporarily_unavailable/authentication_expired. token/profile URLs
+                    # stay on the internal service (KI) and are unaffected by the flip.
+                    GKP="{{ include "srw.authUrl" . }}"; GR="{{ .Values.keycloak.realm }}"
+                    GAID=$(gitea admin auth list 2>/dev/null | grep -w "Keycloak" | awk '{print $1}' | head -1)
+                    [ -n "$GAID" ] && gitea admin auth update-oauth --id "$GAID" \
+                      --custom-auth-url "${GKP}/realms/${GR}/protocol/openid-connect/auth" 2>/dev/null || true
           volumeMounts:
             - name: data
               mountPath: /var/lib/gitea
