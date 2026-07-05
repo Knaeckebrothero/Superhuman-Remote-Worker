@@ -74,8 +74,21 @@ export class AppReadAloudComponent implements OnDestroy {
     readonly retryInfo = signal<{index: number; attempt: number} | null>(null);
     readonly keptParts = signal(0);
     readonly hardError = signal<
-        'rewrite' | 'synthesis' | 'empty' | 'no-thread' | 'unavailable' | null
+        'rewrite' | 'synthesis' | 'empty' | 'no-thread' | 'unavailable' | 'provider' | null
     >(null);
+    /** Provider failure code behind a 'provider' hardError (payment_required /
+     *  auth / rate_limit) — drives a specific message instead of "synthesis
+     *  failed". Set when the synth endpoint returns an actionable error. */
+    readonly synthErrorCode = signal<string | null>(null);
+    /** i18n key for the provider error message, chosen by code. */
+    readonly providerErrorKey = computed(() => {
+        switch (this.synthErrorCode()) {
+            case 'payment_required': return 'chat.tts.err.paymentRequired';
+            case 'auth': return 'chat.tts.err.auth';
+            case 'rate_limit': return 'chat.tts.err.rateLimit';
+            default: return 'chat.tts.err.generic';
+        }
+    });
 
     readonly unavailable = computed(() => this.voiceCaps.tts() === false);
     readonly total = computed(() => this.chunks().length);
@@ -284,6 +297,15 @@ export class AppReadAloudComponent implements OnDestroy {
             this.synthIndex.set(i);
             const part = await this.synthChunk(i);
             if (this.cancelRequested) return;
+            if (part && 'errorCode' in part) {
+                // Actionable provider error (e.g. this voice needs a paid plan)
+                // — retrying every part is pointless, so fail the whole read with
+                // a specific message rather than a generic per-part retry.
+                this.synthErrorCode.set(part.errorCode);
+                this.hardError.set('provider');
+                this.phase.set('error');
+                return;
+            }
             if (!part) {
                 if (i === 0) {
                     this.hardError.set('synthesis');
@@ -321,8 +343,13 @@ export class AppReadAloudComponent implements OnDestroy {
         }
     }
 
-    /** Synthesize chunk `i` with bounded auto-retry; measure its duration. */
-    private async synthChunk(i: number): Promise<PlaybackPart | null> {
+    /** Synthesize chunk `i` with bounded auto-retry; measure its duration.
+     *  Returns the ready part, `null` for a transient/exhausted failure, or
+     *  `{errorCode}` for an *actionable* provider error (paid-plan / auth /
+     *  rate-limit) — which is NOT retried, since retrying can't fix it. */
+    private async synthChunk(
+        i: number,
+    ): Promise<PlaybackPart | {errorCode: string} | null> {
         const chunks = this.chunks();
         if (i < 0 || i >= chunks.length) return null;
         const threadId = this.threadId();
@@ -336,7 +363,7 @@ export class AppReadAloudComponent implements OnDestroy {
                 await this.delay(600 * (attempt - 1));
                 if (this.cancelRequested) return null;
             }
-            let res: {text: string; audio: Blob} | 'unavailable' | null;
+            let res: {text: string; audio: Blob} | 'unavailable' | {errorCode: string} | null;
             try {
                 res = await firstValueFrom(
                     this.api.generateTTS(threadId, chunks[i], {language: lang, reformulate: false}),
@@ -344,7 +371,7 @@ export class AppReadAloudComponent implements OnDestroy {
             } catch {
                 res = null;
             }
-            if (res && res !== 'unavailable') {
+            if (res && res !== 'unavailable' && 'audio' in res) {
                 this.retryInfo.set(null);
                 const url = URL.createObjectURL(res.audio);
                 this.blobUrls.add(url);
@@ -352,6 +379,10 @@ export class AppReadAloudComponent implements OnDestroy {
                 return {url, duration};
             }
             if (res === 'unavailable') break;
+            if (res && 'errorCode' in res) {
+                this.retryInfo.set(null);
+                return res; // actionable — stop retrying, surface it
+            }
         }
         this.retryInfo.set(null);
         return null;
@@ -375,6 +406,12 @@ export class AppReadAloudComponent implements OnDestroy {
         this.partError.set(null);
         this.cancelRequested = false;
         const part = await this.synthChunk(i);
+        if (part && 'errorCode' in part) {
+            this.synthErrorCode.set(part.errorCode);
+            this.hardError.set('provider');
+            this.phase.set('error');
+            return;
+        }
         if (!part) {
             this.partError.set(i);
             return;
@@ -474,6 +511,7 @@ export class AppReadAloudComponent implements OnDestroy {
         this.retryInfo.set(null);
         this.keptParts.set(0);
         this.hardError.set(null);
+        this.synthErrorCode.set(null);
     }
 
     ngOnDestroy(): void {
