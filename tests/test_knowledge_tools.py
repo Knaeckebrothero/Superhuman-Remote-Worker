@@ -1487,3 +1487,132 @@ class TestKbWriteSlugDedup:
             )
         kg.create_note.assert_called_once()
         assert "fresh-slug" in result
+
+
+# =============================================================================
+# kb_lint — embedding-backed near-duplicate pass (slice-2 owed rule)
+# =============================================================================
+
+
+_KB_LINT_TWIN_FILES = {
+    "knowledge/n1.md": (
+        '---\nid: n1\ntype: learning\ndescription: "d"\n---\n\n# N1\n\n[n2](n2.md)\n'
+    ),
+    "knowledge/n2.md": (
+        '---\nid: n2\ntype: learning\ndescription: "d"\n---\n\n# N2\n\n[n1](n1.md)\n'
+    ),
+}
+
+
+class TestKbLintNearDuplicates:
+    def _ctx(self, files):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ws, _ = _fake_kb_workspace(dict(files))
+        ctx.workspace_manager = ws
+        return ctx
+
+    def test_reports_near_duplicate_pairs_from_index(self):
+        ctx = self._ctx(_KB_LINT_TWIN_FILES)
+        ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(
+            return_value=[("n1", "n2", 0.95)]
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "near-duplicate" in result
+        assert "95" in result
+
+    def test_index_pairs_outside_vault_ignored(self):
+        ctx = self._ctx(_KB_LINT_TWIN_FILES)
+        ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(
+            return_value=[("ghost-a", "ghost-b", 0.99)]
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "near-duplicate" not in result
+
+    def test_store_error_is_non_fatal(self):
+        # The deterministic report must stand alone when pgvector is down.
+        ctx = self._ctx(_KB_LINT_TWIN_FILES)
+        ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(
+            side_effect=RuntimeError("pgvector down")
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "kb_lint:" in result
+        assert "near-duplicate" not in result
+
+
+# =============================================================================
+# kb_lint — opt-in dead-external-URL sweep
+# =============================================================================
+
+
+_KB_LINT_URL_FILES = {
+    "knowledge/n1.md": (
+        '---\nid: n1\ntype: source\ndescription: "d"\n---\n\n'
+        "# N1\n\n[docs](https://gone.example/x) [n2](n2.md)\n"
+    ),
+    "knowledge/n2.md": (
+        '---\nid: n2\ntype: source\ndescription: "d"\n---\n\n# N2\n\n[n1](n1.md)\n'
+    ),
+}
+
+
+class TestKbLintUrlSweep:
+    def _ctx(self, files):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ws, _ = _fake_kb_workspace(dict(files))
+        ctx.workspace_manager = ws
+        ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(return_value=[])
+        return ctx
+
+    def test_off_by_default_no_network(self):
+        ctx = self._ctx(_KB_LINT_URL_FILES)
+        tools, _ = _make_tools(ctx)
+        with patch(
+            "src.tools.knowledge.knowledge_tools._check_external_url"
+        ) as checker:
+            result = _invoke(_get_tool(tools, "kb_lint"), {})
+        checker.assert_not_called()
+        assert "dead-external-url" not in result
+
+    def test_flags_dead_url_when_enabled(self):
+        ctx = self._ctx(_KB_LINT_URL_FILES)
+        tools, _ = _make_tools(ctx)
+        with patch(
+            "src.tools.knowledge.knowledge_tools._check_external_url",
+            return_value="HTTP 404",
+        ):
+            result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})
+        assert "dead-external-url" in result
+        assert "gone.example" in result
+
+    def test_alive_url_not_flagged(self):
+        ctx = self._ctx(_KB_LINT_URL_FILES)
+        tools, _ = _make_tools(ctx)
+        with patch(
+            "src.tools.knowledge.knowledge_tools._check_external_url",
+            return_value=None,
+        ):
+            result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})
+        assert "dead-external-url" not in result
+
+    def test_cap_is_loud(self):
+        files = {
+            f"knowledge/n{i}.md": (
+                f'---\nid: n{i}\ntype: source\ndescription: "d"\n---\n\n'
+                f"# N{i}\n\n[u](https://example.com/{i}) [n0](n0.md)\n"
+            )
+            for i in range(30)
+        }
+        ctx = self._ctx(files)
+        tools, _ = _make_tools(ctx)
+        with patch(
+            "src.tools.knowledge.knowledge_tools._check_external_url",
+            return_value=None,
+        ) as checker:
+            result = _invoke(_get_tool(tools, "kb_lint"), {"check_urls": True})
+        assert checker.call_count == 25
+        assert "url-sweep-truncated" in result

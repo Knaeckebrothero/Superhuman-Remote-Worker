@@ -195,6 +195,99 @@ class TestLintKb:
         report = lint_kb([_note("knowledge/n1.md", text)])
         assert "duplicate-h1" not in _rules(report)
 
+    def test_oversized_note_warning(self):
+        # §11.1 item 2: 131 KB curator dumps — loud-flag bodies above ~15 KB.
+        from src.tools.knowledge.gardener import lint_kb
+
+        big_body = "# Big\n\n" + ("x" * (16 * 1024)) + "\n\nSee [n2](n2.md).\n"
+        text = f'---\nid: n1\ntype: learning\ndescription: "d"\n---\n\n{big_body}'
+        text2 = '---\nid: n2\ntype: decision\ndescription: "d"\n---\n\n# N2\n\n[n1](n1.md)\n'
+        report = lint_kb(
+            [_note("knowledge/n1.md", text), _note("knowledge/n2.md", text2)]
+        )
+        rules = _rules(report)
+        assert "oversized-note" in rules
+        assert all(
+            f.severity == "warning" for f in report.findings if f.rule == "oversized-note"
+        )
+        # The small sibling is not flagged.
+        assert not any(
+            f.rule == "oversized-note" and f.path == "knowledge/n2.md"
+            for f in report.findings
+        )
+
+    def test_normal_size_note_not_flagged(self):
+        from src.tools.knowledge.gardener import lint_kb
+
+        text = (
+            '---\nid: n1\ntype: decision\ndescription: "d"\n---\n\n'
+            "# N1\n\nA perfectly reasonable note. [n1](n1.md)\n"
+        )
+        report = lint_kb([_note("knowledge/n1.md", text)])
+        assert "oversized-note" not in _rules(report)
+
+    def test_oversized_reserved_index_exempt(self):
+        # index.md has its own render_index_md budget; reserved files stay
+        # exempt from note-level rules.
+        from src.tools.knowledge.gardener import lint_kb
+
+        text = "# Index\n\n" + ("- [x](x.md)\n" * 4000)
+        report = lint_kb([_note("knowledge/index.md", text)])
+        assert "oversized-note" not in _rules(report)
+
+    def test_slug_forked_twins_warning(self):
+        # The bare-agent collision signature: kb_write minted foo-<hash6>.md
+        # next to foo.md (both active). Detection net for ungated writers.
+        from src.tools.knowledge.gardener import lint_kb
+
+        base = (
+            '---\nid: my-note\ntype: learning\ndescription: "d"\n---\n\n'
+            "# My Note\n\nbody one [my-note-ef33b5](my-note-ef33b5.md)\n"
+        )
+        fork = (
+            '---\nid: my-note-ef33b5\ntype: learning\ndescription: "d"\n---\n\n'
+            "# My Note\n\nbody two [my-note](my-note.md)\n"
+        )
+        report = lint_kb(
+            [_note("knowledge/my-note.md", base), _note("knowledge/my-note-ef33b5.md", fork)]
+        )
+        rules = _rules(report)
+        assert "slug-forked" in rules
+        assert all(
+            f.severity == "warning" for f in report.findings if f.rule == "slug-forked"
+        )
+
+    def test_slug_fork_superseded_base_not_flagged(self):
+        # A superseded base + active suffixed survivor is the gate's SUPERSEDE
+        # outcome working as designed — not a twin to sweep.
+        from src.tools.knowledge.gardener import lint_kb
+
+        base = (
+            "---\nid: my-note\ntype: learning\ndescription: \"d\"\n"
+            "status: superseded\nsuperseded_by: my-note-ef33b5\n---\n\n"
+            "# My Note\n\nold [my-note-ef33b5](my-note-ef33b5.md)\n"
+        )
+        fork = (
+            '---\nid: my-note-ef33b5\ntype: learning\ndescription: "d"\n---\n\n'
+            "# My Note\n\nnew [my-note](my-note.md)\n"
+        )
+        report = lint_kb(
+            [_note("knowledge/my-note.md", base), _note("knowledge/my-note-ef33b5.md", fork)]
+        )
+        assert "slug-forked" not in _rules(report)
+
+    def test_hexlike_slug_without_base_not_flagged(self):
+        # A note whose slug merely *ends* in 6 hex chars but has no base
+        # sibling is not a fork.
+        from src.tools.knowledge.gardener import lint_kb
+
+        text = (
+            '---\nid: release-1a2b3c\ntype: decision\ndescription: "d"\n---\n\n'
+            "# R\n\n[release-1a2b3c](release-1a2b3c.md)\n"
+        )
+        report = lint_kb([_note("knowledge/release-1a2b3c.md", text)])
+        assert "slug-forked" not in _rules(report)
+
     def test_report_separates_errors_and_warnings(self):
         from src.tools.knowledge.gardener import lint_kb
 
@@ -285,6 +378,102 @@ class TestRenderIndexMd:
         ]
         out = render_index_md(notes)
         assert "truncated" in out.lower()
+
+
+# =============================================================================
+# near_duplicate_findings — pure formatter for the embedding-backed rule
+# =============================================================================
+
+
+class TestNearDuplicateFindings:
+    def test_emits_warning_for_pair_in_scope(self):
+        from src.tools.knowledge.gardener import near_duplicate_findings
+
+        findings = near_duplicate_findings(
+            [("note-a", "note-b", 0.93)],
+            ["knowledge/note-a.md", "knowledge/note-b.md"],
+        )
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.rule == "near-duplicate"
+        assert f.severity == "warning"
+        assert f.path == "knowledge/note-a.md"
+        assert "note-b" in f.message
+        assert "93" in f.message
+
+    def test_pair_outside_vault_skipped(self):
+        # The index may hold notes that aren't in the vault being linted
+        # (other roots, not-yet-dual-written legacy rows) — never flag those.
+        from src.tools.knowledge.gardener import near_duplicate_findings
+
+        findings = near_duplicate_findings(
+            [("note-a", "ghost", 0.95)],
+            ["knowledge/note-a.md"],
+        )
+        assert findings == []
+
+    def test_empty_pairs_no_findings(self):
+        from src.tools.knowledge.gardener import near_duplicate_findings
+
+        assert near_duplicate_findings([], []) == []
+
+
+# =============================================================================
+# external URL sweep — pure extraction + formatting (network stays in the tool)
+# =============================================================================
+
+
+class TestExternalUrlMap:
+    def test_collects_urls_with_referencing_paths(self):
+        from src.tools.knowledge.gardener import external_url_map
+
+        n1 = (
+            '---\nid: n1\ntype: source\ndescription: "d"\n---\n\n'
+            "# N1\n\nSee [docs](https://example.com/a) and [n2](n2.md).\n"
+        )
+        n2 = (
+            '---\nid: n2\ntype: source\ndescription: "d"\n---\n\n'
+            "# N2\n\nAlso [docs](https://example.com/a) plus "
+            "[other](http://other.io/x).\n"
+        )
+        url_map = external_url_map(
+            [_note("knowledge/n1.md", n1), _note("knowledge/n2.md", n2)]
+        )
+        assert url_map["https://example.com/a"] == [
+            "knowledge/n1.md",
+            "knowledge/n2.md",
+        ]
+        assert url_map["http://other.io/x"] == ["knowledge/n2.md"]
+
+    def test_ignores_internal_mailto_and_anchor_links(self):
+        from src.tools.knowledge.gardener import external_url_map
+
+        text = (
+            '---\nid: n1\ntype: note\ndescription: "d"\n---\n\n'
+            "# N1\n\n[a](a.md) [m](mailto:x@y.z) [s](#section)\n"
+        )
+        assert external_url_map([_note("knowledge/n1.md", text)]) == {}
+
+
+class TestDeadUrlFindings:
+    def test_emits_warning_per_referencing_path(self):
+        from src.tools.knowledge.gardener import dead_url_findings
+
+        findings = dead_url_findings(
+            {"https://gone.example/x": "HTTP 404"},
+            {"https://gone.example/x": ["knowledge/n1.md", "knowledge/n2.md"]},
+        )
+        assert len(findings) == 2
+        assert {f.path for f in findings} == {"knowledge/n1.md", "knowledge/n2.md"}
+        assert all(f.rule == "dead-external-url" for f in findings)
+        assert all(f.severity == "warning" for f in findings)
+        assert all("https://gone.example/x" in f.message for f in findings)
+        assert all("404" in f.message for f in findings)
+
+    def test_alive_urls_produce_nothing(self):
+        from src.tools.knowledge.gardener import dead_url_findings
+
+        assert dead_url_findings({}, {"https://ok.example": ["knowledge/n1.md"]}) == []
 
 
 # =============================================================================

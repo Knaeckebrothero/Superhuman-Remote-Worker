@@ -25,16 +25,21 @@ related:
 
 # OKF Knowledge Base — Files-Canonical KB as a Datasource
 
-**Status:** SHIPPING; **slice 1 (dual-write, `68fc0603`) + slice 2
-PR1 (gardener tools, `d0125805`) + slice 2 PR2 (curator verdict gate, `16105a96`) all
-COMMITTED, pushed and DEPLOYED to dev** (image `sha-16105a9` 2026-07-03, superseded by
-`sha-0b71ff3` the same evening) — all TDD-built, ruff clean, 233 green across the
-knowledge suites (§11). **Slice 1 is LIVE-VERIFIED at production scale** — the first
-overnight loop run on the new image produced 151 interlinked OKF files on the loop
-repo's `main` (§11.1). Slice 2 PR2 remains **inert** (`curator.enabled` +
-`curate_knowledge.verdict` both default off); enabling it is a config flip,
-deliberately deferred to a scoped test run — §11.1's observed duplication is the
-corpus it will be tuned against. Origin: design discussion 2026-07-03, building on the
+**Status:** SHIPPING; **slices 1+2 COMPLETE** — slice 1 (dual-write, `68fc0603`),
+slice 2 PR1 (gardener tools, `d0125805`), PR2 (curator verdict gate, `16105a96`),
+the §11.1 hardening batch (`e1183757`: deterministic collision suffix, exact-dup
+no-op, double-H1 fix, `duplicate-h1` lint) all COMMITTED, pushed and DEPLOYED to
+dev; all TDD-built, ruff clean. **Slice 1 is LIVE-VERIFIED at production scale**
+(151 interlinked OKF files in one night, §11.1). **The verdict gate was ENABLED
+loop-wide 2026-07-04** (`7ae56e6f`, `curate_knowledge.verdict: true`; fires only
+where `curator.enabled` — loops) and is **LIVE-VERIFIED**: over iters 7–10 on
+Better Resavio the KB moved superseded 66→102 / archived 76→88, and an intra-job
+duplicate written 42 s after its twin was SUPERSEDE'd at write time (§11.1
+addendum). **Slice-2 stragglers landed 2026-07-05** (see §11.1 addendum):
+`oversized-note`, `slug-forked`, embedding-backed `near-duplicate` (one pgvector
+self-join, `KnowledgeStore.find_near_duplicate_pairs`) and opt-in
+`dead-external-url` lint rules, plus distill-don't-dump + Garden-step direction
+in all five curation prompt forks. Slices 3–4 owed. Origin: design discussion 2026-07-03, building on the
 substrate findings in [[knowledge_base_substrate_decision]]; refined the same day by a
 six-agent research sweep (three codebase audits, three web — sources in §12).
 [[loop_repo_compounding_v2]] shipped the same day, which changes this doc's footing: the
@@ -452,8 +457,9 @@ exactly the split-brain this design exists to kill.
      invalid-id, duplicate-id, dead-link, broken-supersede, orphan, missing-title —
      reserved `index.md`/`log.md` exempt), `render_index_md` (OKF §6 index: `## <type>`
      groups, gen-markers preserve human sections, loud 200-line/25 KB truncation). Two
-     thin `@tool` wrappers `kb_lint`/`kb_index` (12 KB tools now). Deferred to PR2: the
-     embedding-backed near-duplicate rule + the network dead-external-URL sweep.
+     thin `@tool` wrappers `kb_lint`/`kb_index` (12 KB tools now). The two deferred
+     rules (embedding-backed near-duplicate, network dead-external-URL sweep) landed
+     2026-07-05 with the straggler batch — §11.1 addendum.
    - **PR2 — curator verdict gate ✅ COMMITTED 2026-07-03** (`16105a96`, on `develop`;
      strict TDD, 233 green across the knowledge suites, ruff clean). Ships **inert**
      (both knobs default off) — a deliberate config-flip-and-deploy step, deferred to a
@@ -495,9 +501,11 @@ exactly the split-brain this design exists to kill.
        candidate's `content` onto the target (drops title/type — the target keeps its
        identity); the new SUPERSEDE note gets the reverse `SUPERSEDED_BY` edge but not a
        forward `SUPERSEDES` link; the curator prompt has the gardener verbs in its tool
-       surface but isn't *directed* to run a lint/index pass. Still owed from slice-2's
-       four pieces: the `kb_lint` embedding-backed **near-duplicate** rule (overlaps the
-       verdict gate) and the network **dead-external-URL** sweep.
+       surface but isn't *directed* to run a lint/index pass. (All three closed by the
+       2026-07-05 straggler batch — the near-duplicate rule, the dead-external-URL
+       sweep, and the curator prompts' Garden step; §11.1 addendum. The UPDATE
+       content-only carry and the missing forward `SUPERSEDES` link remain open
+       polish.)
 3. **Postgres index + query tools + retrieval cutover** — the §5/§5.1 spec: tree-diff
    watermark reindex, chunk rows, `embedding_version` + `pipeline_version`, migration
    `vector/0008`; `search_knowledge` backend swap (the RRF functions gain `kb_id`);
@@ -592,6 +600,35 @@ counts: **hubs survive, the twin/fuzz thins out** — the graph should get *shar
 not merely smaller. The `kb_lint` near-duplicate rule (still owed from slice 2) gets
 tuned against the same corpus. Slice 3 follows unchanged; its Neo4j question now has
 an evidence-backed answer.
+
+**Addendum 2026-07-04/05 — the worklist above is now worked:**
+
+- Item 1 (slug twins): hardening batch `e1183757` (deterministic content-hash
+  collision suffix + idempotent re-check in `create_note`; exact-content no-op
+  short-circuit in `kb_write` reaching every writer). **Live evidence the stack
+  works**: iter-9's curator wrote the same "Phase 0 strategic archive finding"
+  twice 42 s apart — the gate saw the first as a neighbour (pgvector upsert is
+  synchronous; `find_similar_many` has no job filter, so same-job notes ARE
+  visible) and SUPERSEDE'd it at write time. The only both-active twins left in
+  the corpus predate the gate (06-27, 07-02 legacy pairs, genuinely different
+  content). Residual hole: a **bare** (ungated) writer's same-slug-different-content
+  collision still mints a silent suffixed twin — covered by detection, not
+  prevention: the new `slug-forked` lint rule (base + 6-hex-suffix sibling, both
+  active) flags them for the gardener.
+- Item 2 (curator bloat): `oversized-note` lint rule (loud WARNING above ~15 KB,
+  mirroring `render_index_md`'s posture) + "Distill, Don't Dump" section and a
+  **Garden** workflow step (run `kb_lint`, merge/supersede twins, `kb_index`) in
+  all five curation prompt forks (base/gpt_5/deepseek/gemma/gpt_oss).
+- Item 3 (double-H1): fixed in `e1183757` (renderer skips the prepended title
+  when the body opens with an H1; `duplicate-h1` lint covers legacy files).
+- Slice-2 deferred rules: `near-duplicate` (embedding-backed — one active-only
+  pgvector self-join via `KnowledgeStore.find_near_duplicate_pairs`, 0.9 floor vs
+  the verdict's 0.6 fetch floor; pure formatter in the gardener keeps the engine
+  DB-free; non-fatal when the index is unreachable) and `dead-external-url`
+  (opt-in `check_urls` arg — stdlib HEAD probe, flags only clear negatives
+  404/410/unreachable, 25-URL cap reported loudly as `url-sweep-truncated`).
+- Item 4 (numbering chaos) remains open — an orchestrator/prompt concern, not an
+  OKF one.
 
 ## Open questions
 

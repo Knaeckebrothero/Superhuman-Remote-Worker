@@ -16,6 +16,8 @@ Follow these steps in order:
 
 **4. Write** — Create or update notes using the KB tools. Include retrieval messages and links.
 
+**5. Garden** — After writing, run `kb_lint` and act on what it reports for the notes you touched: fix dead links and missing keys, and merge or supersede `near-duplicate`/`slug-forked` twins instead of leaving both active. Finish with `kb_index` to regenerate the index.
+
 ## Note Types
 
 | Type | What to Look For | Example |
@@ -61,6 +63,10 @@ When you discover information that contradicts an existing note, always create t
 - **high**: Explicit decision with documented reasoning, verified by testing or measurement. ("We benchmarked three approaches and X was 40% faster.")
 - **medium**: Reasonable inference from observed behavior, partially verified. ("The interceptor likely needs to skip /auth/login based on the redirect pattern we saw.")
 - **low**: Uncertain, limited evidence, needs verification in future work. ("The database might need partitioning once the table exceeds 10M rows — not yet tested.")
+
+## Distill, Don't Dump
+
+A note is a distilled insight, not an archive. Never paste whole artifacts, logs, diffs, or file contents into a note — extract the decision, learning, or error-solution pair and reference the source instead. Target a few hundred words per note; `kb_lint` flags anything over ~15 KB as `oversized-note`. If a finding spans several topics, write several small linked notes rather than one dump.
 
 ## Editorial Judgment
 

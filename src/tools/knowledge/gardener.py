@@ -29,6 +29,12 @@ _MD_LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")
 _HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
 
 _REQUIRED_KEYS = ("id", "type", "description")
+# Loud-flag budget for a single note body (§11.1 item 2 — the 131 KB curator
+# dumps). Same posture as render_index_md's budget: never silently accepted.
+_MAX_NOTE_BYTES = 15 * 1024
+# A hash-suffixed sibling slug (foo-a1b2c3) — the collision-suffix shape both
+# the legacy random and the deterministic content-hash paths produce.
+_FORK_RE = re.compile(r"^(?P<base>.+)-(?P<suffix>[0-9a-f]{6})$")
 # OKF reserved filenames — exempt from per-note structural rules (index.md
 # carries no frontmatter by spec; log.md is generated change history).
 _RESERVED = {"index", "log"}
@@ -199,6 +205,20 @@ def lint_kb(notes: List[Dict[str, str]]) -> LintReport:
         if reserved:
             continue  # index.md / log.md are exempt from note-level structure rules
 
+        # Oversized note — before the parse gate so a 131 KB dump with broken
+        # frontmatter still gets flagged for size.
+        body_bytes = len(p["body"].encode("utf-8"))
+        if body_bytes > _MAX_NOTE_BYTES:
+            report.findings.append(
+                Finding(
+                    "oversized-note",
+                    WARNING,
+                    path,
+                    f"note body is {body_bytes // 1024} KB "
+                    f"(budget ~{_MAX_NOTE_BYTES // 1024} KB) — distill or split it",
+                )
+            )
+
         if p["parse_error"] is not None:
             report.findings.append(
                 Finding("invalid-yaml", ERROR, path, p["parse_error"])
@@ -273,6 +293,36 @@ def lint_kb(notes: List[Dict[str, str]]) -> LintReport:
                     )
                 )
 
+    # Slug-forked twins (global): a hash-suffixed sibling next to its base
+    # slug, both active — the bare-agent collision signature (§11.1 item 1;
+    # gated writers get SUPERSEDE instead, which retires the base). A
+    # superseded/archived member is the gate working as designed, not a twin.
+    def _is_active(note: Dict[str, Any]) -> bool:
+        fm = note["fm"]
+        status = str(fm.get("status") or "").lower() if isinstance(fm, dict) else ""
+        return status in ("", "active")
+
+    by_slug = {p["slug"]: p for p in parsed}
+    for p in parsed:
+        if p["reserved"]:
+            continue
+        m = _FORK_RE.match(p["slug"])
+        if not m:
+            continue
+        base = by_slug.get(m.group("base"))
+        if base is None or base["reserved"]:
+            continue
+        if _is_active(p) and _is_active(base):
+            report.findings.append(
+                Finding(
+                    "slug-forked",
+                    WARNING,
+                    p["path"],
+                    f"hash-suffixed twin of '{m.group('base')}' with both notes "
+                    f"active — merge the content or supersede one side",
+                )
+            )
+
     # Duplicate ids (global).
     for note_id, paths in id_to_paths.items():
         if len(paths) > 1:
@@ -286,6 +336,82 @@ def lint_kb(notes: List[Dict[str, str]]) -> LintReport:
             )
 
     return report
+
+
+def external_url_map(notes: List[Dict[str, str]]) -> Dict[str, List[str]]:
+    """Map of external http(s) URL → referencing note paths.
+
+    Pure extraction for the dead-external-URL sweep — the reachability check
+    (network) lives in the ``kb_lint`` tool wrapper, keeping this engine
+    network-free. Only body markdown links count (same parser as dead-link;
+    images excluded by the link regex).
+    """
+    url_map: Dict[str, List[str]] = {}
+    for note in notes:
+        path = note["path"]
+        try:
+            _, body = parse_note_md(note["text"])
+        except ValueError:
+            body = note["text"]
+        for raw in _MD_LINK_RE.findall(body):
+            target = raw.strip()
+            if target.startswith(("http://", "https://")):
+                paths = url_map.setdefault(target, [])
+                if path not in paths:
+                    paths.append(path)
+    return {url: sorted(paths) for url, paths in url_map.items()}
+
+
+def dead_url_findings(
+    dead: Dict[str, str], url_map: Dict[str, List[str]]
+) -> List[Finding]:
+    """WARNING findings for unreachable external URLs, one per referencing note.
+
+    ``dead`` maps URL → failure reason (from the wrapper's probe); ``url_map``
+    comes from :func:`external_url_map`.
+    """
+    findings: List[Finding] = []
+    for url, reason in dead.items():
+        for path in url_map.get(url, []):
+            findings.append(
+                Finding(
+                    "dead-external-url",
+                    WARNING,
+                    path,
+                    f"external link {url} appears dead ({reason})",
+                )
+            )
+    return findings
+
+
+def near_duplicate_findings(
+    pairs: List[Tuple[str, str, float]], paths: List[str]
+) -> List[Finding]:
+    """Findings for embedding-near-duplicate note pairs (WARNING).
+
+    ``pairs`` are ``(slug_a, slug_b, similarity)`` triples fetched from the
+    pgvector index (``KnowledgeStore.find_near_duplicate_pairs``); ``paths``
+    are the files of the vault being linted. Pure formatter — the engine stays
+    DB-free: pairs whose slugs aren't both files in this vault are dropped
+    (index rows from other roots, or notes not yet dual-written).
+    """
+    path_by_slug = {_basename(p): p for p in paths}
+    findings: List[Finding] = []
+    for slug_a, slug_b, similarity in pairs:
+        path_a = path_by_slug.get(slug_a)
+        if path_a is None or slug_b not in path_by_slug:
+            continue
+        pct = int(round(similarity * 100))
+        findings.append(
+            Finding(
+                "near-duplicate",
+                WARNING,
+                path_a,
+                f"{pct}% embedding-similar to '{slug_b}' — merge or supersede "
+                f"one side",
+            )
+        )
+    return findings
 
 
 # =============================================================================
