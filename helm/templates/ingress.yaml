@@ -552,6 +552,9 @@ spec:
       - "X-Admin-View-As"
     accessControlAllowOriginList:
       - {{ include "srw.cockpitUrl" . | quote }}
+      {{- range .Values.ingress.cors.additionalOrigins | default list }}
+      - {{ . | quote }}
+      {{- end }}
     accessControlMaxAge: 86400
 {{- end }}
 {{- end }}

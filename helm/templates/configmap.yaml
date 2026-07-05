@@ -145,8 +145,10 @@ data:
   SRW_SESSION_ABSOLUTE_TIMEOUT_S: {{ .Values.auth.bff.sessionAbsoluteTimeoutSeconds | default 2592000 | int | quote }}
   SRW_ACCESS_TOKEN_REFRESH_SKEW_S: {{ .Values.auth.bff.accessTokenRefreshSkewSeconds | default 60 | int | quote }}
 
-  # CORS (orchestrator reads this for additional allowed origins)
-  CORS_ORIGINS: {{ include "srw.cockpitUrl" . | quote }}
+  # CORS (orchestrator reads this comma-separated list for allowed origins).
+  # Canonical cockpit URL first, then any ingress.cors.additionalOrigins (e.g.
+  # a legacy hostname kept as an alias during a domain migration).
+  CORS_ORIGINS: {{ concat (list (include "srw.cockpitUrl" .)) (.Values.ingress.cors.additionalOrigins | default list) | join "," | quote }}
 
   # Cockpit external URL (for deep links in emails/notifications)
   COCKPIT_EXTERNAL_URL: {{ include "srw.cockpitUrl" . | quote }}
