@@ -972,11 +972,21 @@ export class ApiService {
   previewTTSVoice(
     voice: string,
     language = 'en',
+    text?: string,
   ): Observable<Blob | 'unavailable' | null> {
+    // `text` (optional) auditions the voice on the user's own words; omitted or
+    // blank falls back to the server's canned phrase. Only sent when non-empty
+    // so the request body stays identical to before when unused.
+    const body: {voice: string; language: string; text?: string} = {
+      voice,
+      language,
+    };
+    const trimmed = (text ?? '').trim();
+    if (trimmed) body.text = trimmed;
     return this.http
       .post<{audio: string}>(
         `${this.baseUrl}/settings/tts/preview`,
-        {voice, language},
+        body,
         {observe: 'response'},
       )
       .pipe(

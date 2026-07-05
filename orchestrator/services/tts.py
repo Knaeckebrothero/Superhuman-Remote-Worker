@@ -688,6 +688,12 @@ _PREVIEW_TEXT = {
     "de": "Hallo — so klinge ich, wenn ich deine Nachrichten vorlese.",
 }
 
+# Upper bound on user-supplied preview text. Generous enough to audition a
+# voice on a real sentence or two, short enough that a bake-off across voices
+# stays cheap (each unique text is one cache entry + one synth). Enforced at
+# the endpoint (422); the service clamps defensively for any other caller.
+_PREVIEW_TEXT_MAX = 500
+
 
 async def synthesize_voice_preview(
     *,
@@ -695,6 +701,7 @@ async def synthesize_voice_preview(
     language: str,
     user_id: str,
     postgres_db,
+    text: Optional[str] = None,
     ledger: Optional[UsageLedger] = None,
 ) -> Optional[bytes]:
     """Synthesize a short canned phrase in ``voice`` so the settings voice
@@ -706,6 +713,12 @@ async def synthesize_voice_preview(
     default). Uses the user's configured TTS model. No aux rewrite (the phrase
     is already clean and short), so it's cheap and low-latency, and the fixed
     phrase makes the audio cache near-100% effective on repeat previews.
+
+    ``text`` overrides the canned phrase so the user can audition a voice on
+    their own words (e.g. a name, a German sentence). It is spoken verbatim —
+    no aux rewrite — and clamped to ``_PREVIEW_TEXT_MAX``. A distinct text is a
+    distinct cache key, so a bake-off across voices with the same sentence
+    still serves repeats from cache.
 
     Returns MP3 bytes, ``None`` when no TTS model is configured (endpoint maps
     to ``204``), or raises :class:`TtsSynthesisError` when a configured model
@@ -730,12 +743,12 @@ async def synthesize_voice_preview(
 
     tts_params = await _resolve_tts_params(tts_model, postgres_db)
     lang = "de" if (language or "").lower().startswith("de") else "en"
-    text = _PREVIEW_TEXT[lang]
+    spoken = (text or "").strip()[:_PREVIEW_TEXT_MAX] or _PREVIEW_TEXT[lang]
     candidate = (voice or "").strip() or None
     resolved_voice = _pick_voice(tts_params, lang, candidate)
     instructions = (tts_params.get("instructions") or "").strip() or None
 
-    audio_key = _hash_key(tts_model, resolved_voice, instructions or "", text)
+    audio_key = _hash_key(tts_model, resolved_voice, instructions or "", spoken)
     async with _audio_lock:
         cached = _cache_get(_audio_cache, audio_key)
     if cached is not None:
@@ -743,7 +756,7 @@ async def synthesize_voice_preview(
         return cached
 
     audio = await _synthesize_speech(
-        text,
+        spoken,
         model=tts_model,
         voice=resolved_voice,
         base_url=tts_base_url,
@@ -761,7 +774,7 @@ async def synthesize_voice_preview(
                 UsageEvent(
                     category="tts",
                     resource=tts_model,
-                    quantity=len(text),
+                    quantity=len(spoken),
                     unit="tts-character",
                     source="orchestrator",
                     source_id=uuid.uuid4().hex,

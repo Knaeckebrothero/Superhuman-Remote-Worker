@@ -22451,6 +22451,9 @@ async def preview_tts_voice(
         "Auto" (resolve like normal read-aloud).
         ``language`` (str, default ``"en"``) — selects the preview phrase and
         the Auto-voice default.
+        ``text`` (str, optional) — custom sample text to audition the voice on,
+        spoken verbatim; empty/omitted uses the canned phrase. Capped at
+        ``_PREVIEW_TEXT_MAX`` chars (``422`` if exceeded).
 
     Returns JSON ``{"audio": <base64 MP3>}``. ``204`` when no TTS model is
     configured (UI treats as feature-off); ``502`` when a configured model
@@ -22458,11 +22461,21 @@ async def preview_tts_voice(
     """
     import base64
 
-    from services.tts import TtsSynthesisError, synthesize_voice_preview
+    from services.tts import (
+        _PREVIEW_TEXT_MAX,
+        TtsSynthesisError,
+        synthesize_voice_preview,
+    )
 
     user = await require_approved_user(request, postgres_db)
     voice = (body.get("voice") or "").strip()
     language = (body.get("language") or "en").strip() or "en"
+    text = body.get("text") or ""
+    if len(text) > _PREVIEW_TEXT_MAX:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Preview text must be at most {_PREVIEW_TEXT_MAX} characters",
+        )
 
     try:
         audio = await synthesize_voice_preview(
@@ -22470,6 +22483,7 @@ async def preview_tts_voice(
             language=language,
             user_id=str(user["id"]),
             postgres_db=postgres_db,
+            text=text or None,
             ledger=usage_ledger,
         )
     except TtsSynthesisError as exc:
