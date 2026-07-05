@@ -1171,9 +1171,7 @@ def create_kb_tools(
         project_id = _get_project_id(context)
         if project_id:
             try:
-                pairs = _run_async(
-                    ks.find_near_duplicate_pairs(uuid.UUID(project_id))
-                )
+                pairs = _run_async(ks.find_near_duplicate_pairs(uuid.UUID(project_id)))
                 report.findings.extend(
                     near_duplicate_findings(pairs, [n["path"] for n in notes])
                 )
