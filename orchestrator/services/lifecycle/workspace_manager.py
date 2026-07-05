@@ -21,6 +21,7 @@ import logging
 import os
 import socket
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from .types import Instance
@@ -30,6 +31,13 @@ logger = logging.getLogger(__name__)
 
 
 _LABEL_SELECTOR = "srw.io/component=agent-workspace"
+
+# Sentinel distinguishing "the bound-row lookup failed" (DB error / no DB) from
+# "the lookup succeeded and found no row". The distinction matters: a missing
+# row means the job/thread was deleted and the pod is an orphan we may reap
+# (age-gated), while a failed lookup means we know nothing and must not act.
+# See docs/issues/deleted_job_orphans_workspace_pod.md.
+_FETCH_FAILED = object()
 
 # 'reviewing' is the verification-enabled twin of 'pending_review'
 # (determine_job_status sets it on a critic-enabled completion freeze). The
@@ -68,6 +76,17 @@ def expected_workspace_shas() -> set[str]:
     if ":sha-" in tag:
         shas.add(tag.rsplit(":sha-", 1)[-1])
     return shas
+
+
+def _pod_age_seconds(pod: Any) -> float | None:
+    """Pod age from creationTimestamp, or None when it can't be determined."""
+    try:
+        created = pod.metadata.creation_timestamp
+        if not isinstance(created, datetime):
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - created).total_seconds())
+    except Exception:
+        return None
 
 
 def _pod_volume_is_ephemeral(pod: Any) -> bool:
@@ -139,10 +158,15 @@ class WorkspaceInstanceManager:
                 "labels": dict(labels),
                 "kind_label": labels.get("srw/component"),
                 "volume_ephemeral": _pod_volume_is_ephemeral(pod),
+                "pod_age_s": _pod_age_seconds(pod),
             }
             if thread_id:
                 row = await self._fetch_thread(thread_id)
-                if row is not None:
+                if row is _FETCH_FAILED:
+                    pass  # unknown state — leave metadata bare, never reap
+                elif row is None:
+                    metadata["bound_row_missing"] = True
+                else:
                     metadata["thread_status"] = row.get("status")
                     metadata["total_turns"] = row.get("total_turns") or 0
                     md = row.get("metadata") or {}
@@ -160,7 +184,11 @@ class WorkspaceInstanceManager:
                     metadata["snapshot_status"] = snap.get("status")
             elif job_id:
                 row = await self._fetch_job(job_id)
-                if row is not None:
+                if row is _FETCH_FAILED:
+                    pass  # unknown state — leave metadata bare, never reap
+                elif row is None:
+                    metadata["bound_row_missing"] = True
+                else:
                     metadata["job_status"] = row.get("status")
                     ctx = row.get("context") or {}
                     if isinstance(ctx, str):
@@ -226,7 +254,14 @@ class WorkspaceInstanceManager:
 
         Superset of ``is_idle``: adds terminal job/thread states. Terminal
         instances get cleaned up; suspendable-idle ones get snapshot+freed.
-        A pod with no bound row is never reapable (context may be in flight).
+
+        A pod whose bound row is confirmed gone (``bound_row_missing`` — the
+        job/thread was deleted) is an orphan and reapable once the pod is
+        older than the orphan grace period. The age gate protects the
+        pod-created-but-row-not-yet-persisted provisioning window, which is
+        seconds long — the grace default is minutes. A pod whose row state is
+        merely *unknown* (lookup failed) is never reapable.
+        See docs/issues/deleted_job_orphans_workspace_pod.md.
 
         Guard: a workspace shared by a live child job (a critic SSHed into the
         parent's pod) is never reapable, regardless of the parent's own status —
@@ -235,6 +270,9 @@ class WorkspaceInstanceManager:
         """
         if inst.metadata.get("has_live_shared_child"):
             return False
+        if inst.metadata.get("bound_row_missing"):
+            age = inst.metadata.get("pod_age_s")
+            return age is not None and age >= self._orphan_grace_s()
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
@@ -245,7 +283,11 @@ class WorkspaceInstanceManager:
 
     def _is_terminal(self, inst: Instance) -> bool:
         """Bound work is finished (vs merely paused) — nothing to preserve
-        beyond an existing snapshot."""
+        beyond an existing snapshot. A deleted row is definitively finished,
+        so orphans count as terminal (delete() then reclaims PVC + Service,
+        and give_up() won't recreate the pod)."""
+        if inst.metadata.get("bound_row_missing"):
+            return True
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
@@ -270,6 +312,11 @@ class WorkspaceInstanceManager:
         NOTE: never reads ``last_activity`` — it is bumped by the orchestrator's
         own context merges and cannot distinguish real work from bookkeeping.
         """
+        # Orphan (bound row deleted): nothing is worth saving — no entity can
+        # ever restore the snapshot, and record_attempt would merge into a
+        # deleted row (silent no-op), retrying forever. Clean → direct delete.
+        if inst.metadata.get("bound_row_missing"):
+            return False
         thread_status = inst.metadata.get("thread_status")
         if thread_status is not None:
             turns = inst.metadata.get("total_turns") or 0
@@ -327,6 +374,17 @@ class WorkspaceInstanceManager:
             return int(os.environ.get("WORKSPACE_SNAPSHOT_MAX_ATTEMPTS", "5"))
         except ValueError:
             return 5
+
+    def _orphan_grace_s(self) -> float:
+        """Minimum pod age before a missing-row pod is treated as an orphan.
+
+        Must comfortably exceed the create-pod → persist-context window during
+        provisioning (seconds); anything shorter risks reaping an in-flight pod
+        whose row simply hasn't landed yet."""
+        try:
+            return float(os.environ.get("WORKSPACE_ORPHAN_GRACE_SECONDS", "900"))
+        except ValueError:
+            return 900.0
 
     async def attempts_exhausted(self, inst: Instance) -> bool:
         return (inst.metadata.get("snapshot_attempts") or 0) >= self._max_attempts()
@@ -616,19 +674,21 @@ class WorkspaceInstanceManager:
             return []
         return list(result.items)
 
-    async def _fetch_job(self, job_id: str) -> dict[str, Any] | None:
+    async def _fetch_job(self, job_id: str) -> dict[str, Any] | None | Any:
+        """Bound-row lookup: the row, None when confirmed absent, or
+        ``_FETCH_FAILED`` when the lookup itself failed (DB error / no DB)."""
         if self._db is None:
-            return None
+            return _FETCH_FAILED
         try:
-            row = await self._db.get_job(job_id)
-            return row
+            return await self._db.get_job(job_id)
         except Exception:
             logger.exception("Failed to fetch job %s for workspace lifecycle", job_id)
-            return None
+            return _FETCH_FAILED
 
-    async def _fetch_thread(self, thread_id: str) -> dict[str, Any] | None:
+    async def _fetch_thread(self, thread_id: str) -> dict[str, Any] | None | Any:
+        """Same three-way contract as ``_fetch_job``."""
         if self._db is None:
-            return None
+            return _FETCH_FAILED
         try:
             async with self._db.acquire() as conn:
                 row = await conn.fetchrow(
@@ -641,7 +701,7 @@ class WorkspaceInstanceManager:
             logger.exception(
                 "Failed to fetch thread %s for workspace lifecycle", thread_id
             )
-            return None
+            return _FETCH_FAILED
 
     async def _live_shared_child_exists(
         self, parent_job_id: str, pod_name: str | None
