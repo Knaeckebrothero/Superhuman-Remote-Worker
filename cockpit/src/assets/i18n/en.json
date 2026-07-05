@@ -505,7 +505,9 @@
       "auto": "Default (auto)",
       "customPlaceholder": "Voice id",
       "preview": "Preview voice",
-      "previewFailed": "Couldn't play a preview — check your TTS setup."
+      "previewFailed": "Couldn't play a preview — check your TTS setup.",
+      "langNote": "Each voice's language is shown in brackets (e.g. [EN-US], [ES], [FR]); [multi] means multilingual.",
+      "kokoroNoGerman": "This backend has no German voice — for German, use an OpenAI (multilingual) voice."
     },
     "dataVisibility": {
       "title": "Data visibility",

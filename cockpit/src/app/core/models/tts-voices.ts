@@ -47,19 +47,83 @@ export const OPENAI_TTS_VOICES: readonly string[] = [
   'nova', 'onyx', 'sage', 'shimmer', 'verse',
 ];
 
+/** A recognized TTS backend, or `null` when the model id matches none. */
+export type TtsBackend = 'kokoro' | 'openai' | null;
+
 /**
- * Voices offered by the backend behind `modelId`, detected from the id.
- * Returns `[]` for unrecognized backends — the caller then shows a free-text
- * field instead of a dropdown.
+ * The backend behind a TTS model id, detected from the id. The single source
+ * of backend detection — `voicesForModelId` and `voiceLanguageTag` both
+ * dispatch on it, so a new backend is added in exactly one place.
+ */
+export function ttsBackendForModelId(
+  modelId: string | null | undefined,
+): TtsBackend {
+  const id = (modelId ?? '').toLowerCase();
+  if (!id) return null;
+  if (id.includes('kokoro')) return 'kokoro';
+  if (id.includes('tts-1') || id.includes('gpt-4o-mini-tts')) return 'openai';
+  return null;
+}
+
+/**
+ * Voices offered by the backend behind `modelId`. Returns `[]` for
+ * unrecognized backends — the caller then shows a free-text field instead of
+ * a dropdown.
  */
 export function voicesForModelId(
   modelId: string | null | undefined,
 ): readonly string[] {
-  const id = (modelId ?? '').toLowerCase();
-  if (!id) return [];
-  if (id.includes('kokoro')) return KOKORO_VOICES;
-  if (id.includes('tts-1') || id.includes('gpt-4o-mini-tts')) {
-    return OPENAI_TTS_VOICES;
+  switch (ttsBackendForModelId(modelId)) {
+    case 'kokoro':
+      return KOKORO_VOICES;
+    case 'openai':
+      return OPENAI_TTS_VOICES;
+    default:
+      return [];
   }
-  return [];
+}
+
+/**
+ * Kokoro encodes a voice's language in the FIRST letter of its id
+ * (`<lang><gender>_<name>`; second letter is gender). This map is
+ * Kokoro-SPECIFIC — its misaki G2P scheme, NOT ISO 639 (note the single
+ * letters, and English split into American `a` / British `b`) — so it stays
+ * hidden behind `voiceLanguageTag` and never leaks into the UI.
+ */
+const KOKORO_LANG_BY_PREFIX: Readonly<Record<string, string>> = {
+  a: 'EN-US',
+  b: 'EN-GB',
+  e: 'ES',
+  f: 'FR',
+  h: 'HI',
+  i: 'IT',
+  j: 'JA',
+  p: 'PT',
+  z: 'ZH',
+};
+
+/**
+ * A short language tag for a voice (e.g. `'EN-US'`, `'ES'`, `'multi'`), or
+ * `null` when it can't be derived. Backend-dispatched exactly like
+ * `voicesForModelId`, so callers stay backend-agnostic:
+ *   - Kokoro: decoded from the id prefix (the only place the Kokoro-ism lives).
+ *   - OpenAI: `'multi'` — the voices are multilingual, not per-language.
+ *   - Unrecognized backend: `null` — no tag, no claim.
+ * Swapping in a vendor backend later (ElevenLabs/Hume/MiniMax) means adding a
+ * case here that reads their API language metadata; the UI is unchanged.
+ */
+export function voiceLanguageTag(
+  modelId: string | null | undefined,
+  voiceId: string | null | undefined,
+): string | null {
+  const voice = (voiceId ?? '').toLowerCase();
+  if (!voice) return null;
+  switch (ttsBackendForModelId(modelId)) {
+    case 'kokoro':
+      return KOKORO_LANG_BY_PREFIX[voice[0]] ?? null;
+    case 'openai':
+      return 'multi';
+    default:
+      return null;
+  }
 }

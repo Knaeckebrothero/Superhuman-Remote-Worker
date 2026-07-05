@@ -22,7 +22,11 @@ import {
     McpTokenCreateResponse,
     Project
 } from '../../core/models/api.model';
-import {voicesForModelId} from '../../core/models/tts-voices';
+import {
+  voicesForModelId,
+  voiceLanguageTag,
+  ttsBackendForModelId,
+} from '../../core/models/tts-voices';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppThemeToggleComponent} from '../../ui/theme-toggle';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -115,7 +119,7 @@ const EXPIRY_OPTIONS = [
                   <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
                     <option value="">{{ 'settings.voice.auto' | transloco }}</option>
                     @for (v of ttsVoices(); track v) {
-                      <option [value]="v">{{ v }}</option>
+                      <option [value]="v">{{ voiceOptionLabel(v) }}</option>
                     }
                   </app-select>
                 } @else {
@@ -126,6 +130,14 @@ const EXPIRY_OPTIONS = [
                   />
                 }
               </app-form-field>
+              @if (ttsVoices().length > 0) {
+                <p class="voice-lang-note">
+                  {{ 'settings.voice.langNote' | transloco }}
+                  @if (ttsBackend() === 'kokoro') {
+                    {{ 'settings.voice.kokoroNoGerman' | transloco }}
+                  }
+                </p>
+              }
               <div class="voice-preview-row">
                 <app-button
                   variant="secondary"
@@ -1776,6 +1788,12 @@ const EXPIRY_OPTIONS = [
       .codex-account-row > * { min-width: 0; }
       .codex-account-row .mono { overflow-wrap: anywhere; }
     }
+    .voice-lang-note {
+      margin: 8px 0 0;
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text-muted);
+    }
     .voice-preview-row {
       display: flex;
       align-items: center;
@@ -1820,10 +1838,19 @@ export class SettingsComponent implements OnInit {
   readonly ttsConfigured = computed(() => !!this.ttsModel());
   /** Voices offered by the configured backend ([] ⇒ show a free-text field). */
   readonly ttsVoices = computed(() => voicesForModelId(this.ttsModel()));
+  /** The configured TTS backend — drives the backend-specific note. */
+  readonly ttsBackend = computed(() => ttsBackendForModelId(this.ttsModel()));
   /** The user's chosen voice ('' = follow the admin/per-language default). */
   readonly ttsVoice = computed(
     () => this.settingsService.preferences().default_tts_voice ?? '',
   );
+
+  /** Option label for a voice: the raw id plus a language tag when known
+   * (e.g. `af_bella [EN-US]`). The `<option>` value stays the raw id. */
+  voiceOptionLabel(voice: string): string {
+    const tag = voiceLanguageTag(this.ttsModel(), voice);
+    return tag ? `${voice} [${tag}]` : voice;
+  }
 
   /** Persist the read-aloud voice choice (empty ⇒ clear the override). */
   setTtsVoice(voice: string): void {
