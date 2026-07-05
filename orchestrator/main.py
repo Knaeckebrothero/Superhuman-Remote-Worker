@@ -5607,6 +5607,19 @@ async def lifespan(app: FastAPI):
             audit_ready = False
     logger.info("Database migrations applied")
 
+    # Auto-wire the ElevenLabs TTS provider when ELEVENLABS_API_KEY is present,
+    # so the read-aloud voice provider appears with no manual Admin step (same
+    # pattern as the codex proxy). Best-effort: never blocks startup.
+    try:
+        from seed.llm_config import ensure_elevenlabs_tts_endpoint
+
+        if await ensure_elevenlabs_tts_endpoint(postgres_db):
+            logger.info("ElevenLabs TTS provider registered from ELEVENLABS_API_KEY")
+    except Exception:
+        logger.warning(
+            "ensure_elevenlabs_tts_endpoint failed at startup", exc_info=True
+        )
+
     # Usage-metering ledger (Slice 4). Writes go to the auditdb usage_events
     # table (None → no-op when the audit tier is absent); rates resolve against
     # the app-DB usage_rates table created by the migration above. Built here so
@@ -22492,6 +22505,27 @@ async def preview_tts_voice(
     if audio is None:
         return Response(status_code=204)
     return JSONResponse({"audio": base64.b64encode(audio).decode("ascii")})
+
+
+@app.get("/api/settings/tts/voices")
+async def list_tts_voices(request: Request) -> dict[str, Any]:
+    """Voices offered by the caller's configured TTS backend, for the Settings
+    read-aloud picker.
+
+    ElevenLabs → live account voices (name + accent/gender labels + hosted
+    ``preview_url``), fetched server-side and cached ~5 min. Kokoro/OpenAI →
+    empty list (the cockpit holds their static catalogs locally). No TTS model
+    configured → ``backend: null``. The key never reaches the browser — every
+    ElevenLabs call is proxied here.
+
+    Shape: ``{"backend": <str|null>, "voices": [{id, name, labels,
+    preview_url}]}``. A listing failure degrades to an empty list (the picker
+    falls back to free-text), never a 5xx.
+    """
+    from services.tts import list_account_voices
+
+    user = await require_approved_user(request, postgres_db)
+    return await list_account_voices(user_id=str(user["id"]), postgres_db=postgres_db)
 
 
 # =============================================================================

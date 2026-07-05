@@ -569,6 +569,109 @@ async def _synthesize_elevenlabs(
         return None
 
 
+# ElevenLabs account-voice listing (Phase 5 — settings voice picker). The
+# deployment account's voice list changes rarely and listing is free (spends no
+# characters), so cache it in-process ~5 min: opening Settings shouldn't hit
+# ElevenLabs on every render. Keyed by the api key so a rotated key re-fetches.
+_VOICES_CACHE_TTL_SECONDS = 300
+_voices_cache: "dict[str, tuple[datetime, list[dict]]]" = {}
+_voices_lock = asyncio.Lock()
+
+
+def _map_elevenlabs_voice(v: dict) -> dict:
+    """One ``GET /v2/voices`` entry → the picker's ``{id, name, labels,
+    preview_url}``. ``labels`` (accent / gender / age / description) is
+    ElevenLabs' own metadata — strictly better than prefix-decoding — and the
+    cockpit composes option labels from it. ``preview_url`` is a public CDN mp3
+    the browser can hotlink to audition the voice without spending characters."""
+    labels = v.get("labels")
+    return {
+        "id": v.get("voice_id") or "",
+        "name": v.get("name") or v.get("voice_id") or "",
+        "labels": labels if isinstance(labels, dict) else {},
+        "preview_url": v.get("preview_url") or None,
+    }
+
+
+async def _fetch_elevenlabs_voices(api_key: str, timeout: float = 15.0) -> list[dict]:
+    """Live ``GET /v2/voices`` → mapped picker entries. Raises on HTTP error so
+    the caller can log-and-degrade rather than cache a failure."""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(
+            f"{_ELEVENLABS_BASE}/v2/voices",
+            headers={"xi-api-key": api_key, "accept": "application/json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    voices = data.get("voices") if isinstance(data, dict) else None
+    if not isinstance(voices, list):
+        return []
+    return [_map_elevenlabs_voice(v) for v in voices if isinstance(v, dict)]
+
+
+async def invalidate_account_voices_cache() -> None:
+    """Drop the cached account voice list so a freshly-added/designed voice
+    (Phases 6/7) shows up immediately instead of after the TTL."""
+    async with _voices_lock:
+        _voices_cache.clear()
+
+
+async def list_account_voices(*, user_id: str, postgres_db) -> dict:
+    """Voices the user's configured TTS backend offers, for the Settings picker.
+
+    Returns ``{"backend": <str|None>, "voices": [{id, name, labels,
+    preview_url}]}``. Only ElevenLabs returns a populated list (fetched live
+    from the one-per-deployment account, cached ~5 min); Kokoro/OpenAI return
+    ``voices: []`` because the cockpit holds their static catalogs locally. No
+    TTS model configured → ``backend: None``. A listing failure degrades to an
+    empty list (never raises) so Settings still renders — the voice field just
+    falls back to free-text entry, same as an unrecognized backend."""
+    user_settings = await postgres_db.get_user_settings(user_id) or {}
+    resolved_keys = await postgres_db.resolve_api_keys_for_job(
+        user_id=user_id, project_id=None
+    )
+    tts_creds = await _resolve_capability_credentials(
+        capability="tts",
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        postgres_db=postgres_db,
+    )
+    if tts_creds is None:
+        return {"backend": None, "voices": []}
+    tts_model, _tts_base_url, tts_api_key = tts_creds
+
+    tts_params = await _resolve_tts_params(tts_model, postgres_db)
+    backend = _resolve_tts_provider(tts_model, tts_params.get("provider"))
+    if backend != "elevenlabs":
+        # Kokoro / OpenAI voices are static catalogs the cockpit already holds.
+        return {"backend": backend, "voices": []}
+
+    key = (tts_api_key or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+    if not key:
+        logger.warning("ElevenLabs voice list: no ELEVENLABS_API_KEY resolved")
+        return {"backend": backend, "voices": []}
+
+    cache_key = _hash_key("el-voices", key)
+    async with _voices_lock:
+        hit = _voices_cache.get(cache_key)
+        if (
+            hit is not None
+            and (_now() - hit[0]).total_seconds() < _VOICES_CACHE_TTL_SECONDS
+        ):
+            return {"backend": backend, "voices": hit[1]}
+
+    try:
+        voices = await _fetch_elevenlabs_voices(key)
+    except Exception:
+        logger.exception("ElevenLabs voice list fetch failed")
+        return {"backend": backend, "voices": []}
+
+    async with _voices_lock:
+        _voices_cache[cache_key] = (_now(), voices)
+    return {"backend": backend, "voices": voices}
+
+
 async def _synthesize_speech(
     text: str,
     *,

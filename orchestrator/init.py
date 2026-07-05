@@ -185,6 +185,11 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # (idempotent; matched by well-known label)
         await _seed_codex_proxy_endpoint(db)
 
+        # Auto-wire the ElevenLabs TTS provider when ELEVENLABS_API_KEY is set
+        # (idempotent; env is the source of truth for the key)
+        if await ensure_elevenlabs_tts_endpoint(db):
+            logger.info("  Registered ElevenLabs TTS provider from ELEVENLABS_API_KEY")
+
         # Seed the models catalog from the helm seed payload — same source
         # the helm Job consumes. helm/values.yaml's llm.seed.systemModels[]
         # is the only source; the legacy config/models.yaml bridge was
@@ -813,6 +818,7 @@ async def _seed_llm_keys_from_env(db) -> None:
 from orchestrator.seed.llm_config import (  # noqa: E402, F401
     CODEX_PROXY_ENDPOINT_LABEL,  # re-exported: tests reference init_mod.CODEX_PROXY_ENDPOINT_LABEL
     ensure_codex_proxy_endpoint,
+    ensure_elevenlabs_tts_endpoint,
 )
 
 
