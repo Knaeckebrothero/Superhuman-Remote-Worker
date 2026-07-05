@@ -91,7 +91,9 @@ def _split_sections(body: str) -> List[Tuple[Optional[str], str]]:
     return sections
 
 
-def _char_split(text: str, target_tokens: int, count: Callable[[str], int]) -> List[str]:
+def _char_split(
+    text: str, target_tokens: int, count: Callable[[str], int]
+) -> List[str]:
     """Last-resort split of a single oversized paragraph into ~target pieces."""
     toks = count(text)
     n = math.ceil(toks / target_tokens) if target_tokens > 0 else 1

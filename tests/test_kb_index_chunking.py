@@ -416,9 +416,7 @@ class TestAdoptLegacyRow:
     async def test_returns_none_when_no_legacy_row(self):
         store, mock_db, _ = _make_store()
         mock_db.fetchval.return_value = None
-        assert (
-            await store.adopt_legacy_row(uuid.uuid4(), "n", "knowledge/n.md") is None
-        )
+        assert await store.adopt_legacy_row(uuid.uuid4(), "n", "knowledge/n.md") is None
 
 
 # =============================================================================
