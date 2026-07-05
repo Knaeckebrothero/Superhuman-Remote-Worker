@@ -30,6 +30,7 @@ from langchain_core.messages import (
 
 from .core.context import ContextManager, extract_summary_text, repair_tool_pairing
 from .core.summarizer import count_text_tokens
+from .core.workspace_backend import WorkspaceUnavailableError
 from .llm.exceptions import ContextOverflowError
 from .llm.reasoning_chat import (
     _STREAM_REASONING_SINK,
@@ -224,6 +225,13 @@ def _user_facing_turn_error(e: BaseException) -> str:
     ContextOverflowError.
     """
     cause = getattr(e, "__cause__", None)
+    if isinstance(e, WorkspaceUnavailableError) or isinstance(
+        cause, WorkspaceUnavailableError
+    ):
+        return (
+            "Your workspace became unavailable and is being recovered. "
+            "Resend your message in a moment to reconnect."
+        )
     overflow = next(
         (x for x in (e, cause) if isinstance(x, ContextOverflowError)), None
     )
@@ -1815,6 +1823,11 @@ async def _execute_turn(
             try:
                 result = await tool.ainvoke(tool_args)
                 result_str = str(result) if result is not None else ""
+            except WorkspaceUnavailableError:
+                # Dead workspace mid-turn: propagate so the turn handler surfaces
+                # a clean recovery message via on_error, instead of flattening it
+                # into a retryable ToolMessage (the ~39-min spin).
+                raise
             except Exception as e:
                 logger.warning(f"Tool {tool_name} failed: {e}")
                 result_str = f"Tool execution error: {e}"
