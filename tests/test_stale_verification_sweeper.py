@@ -39,14 +39,63 @@ def _make_db(mock_conn):
 
 class TestSweepTick:
     @pytest.mark.asyncio
-    async def test_delegates_to_db_helper_and_returns_count(self):
+    async def test_runs_both_steps_and_returns_counts(self):
         db = AsyncMock()
         db.cancel_stale_verification_subjobs = AsyncMock(return_value=3)
+        db.unstick_reviewing_parents = AsyncMock(return_value=[])
+        notifier = AsyncMock()
 
-        cancelled = await _sweep_tick(db, stale_hours=6)
+        cancelled, unstuck = await _sweep_tick(
+            db, stale_hours=6, grace_minutes=30, notifier=notifier
+        )
 
-        assert cancelled == 3
+        assert (cancelled, unstuck) == (3, 0)
         db.cancel_stale_verification_subjobs.assert_awaited_once_with(6)
+        db.unstick_reviewing_parents.assert_awaited_once_with(30)
+        notifier.notify_review_returned_to_manual.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_notifies_each_unstuck_parent(self):
+        db = AsyncMock()
+        db.cancel_stale_verification_subjobs = AsyncMock(return_value=0)
+        db.unstick_reviewing_parents = AsyncMock(
+            return_value=[
+                {"id": "p1", "user_id": "u1", "config_name": "scholar"},
+                {"id": "p2", "user_id": "u2", "config_name": "developer"},
+            ]
+        )
+        notifier = AsyncMock()
+
+        cancelled, unstuck = await _sweep_tick(
+            db, stale_hours=6, grace_minutes=30, notifier=notifier
+        )
+
+        assert (cancelled, unstuck) == (0, 2)
+        assert notifier.notify_review_returned_to_manual.await_count == 2
+        first = notifier.notify_review_returned_to_manual.await_args_list[0].kwargs
+        assert first == {
+            "user_id": "u1",
+            "job_id": "p1",
+            "config_name": "scholar",
+        }
+
+    @pytest.mark.asyncio
+    async def test_notify_failure_does_not_abort_tick(self):
+        db = AsyncMock()
+        db.cancel_stale_verification_subjobs = AsyncMock(return_value=0)
+        db.unstick_reviewing_parents = AsyncMock(
+            return_value=[{"id": "p1", "user_id": "u1", "config_name": "scholar"}]
+        )
+        notifier = AsyncMock()
+        notifier.notify_review_returned_to_manual = AsyncMock(
+            side_effect=RuntimeError("smtp down")
+        )
+
+        # Must swallow the notify error and still report the un-stuck count.
+        cancelled, unstuck = await _sweep_tick(
+            db, stale_hours=6, grace_minutes=30, notifier=notifier
+        )
+        assert (cancelled, unstuck) == (0, 1)
 
 
 class TestSweeperLoop:
@@ -54,6 +103,7 @@ class TestSweeperLoop:
     async def test_no_tick_when_shutdown_preset(self):
         db = AsyncMock()
         db.cancel_stale_verification_subjobs = AsyncMock(return_value=0)
+        db.unstick_reviewing_parents = AsyncMock(return_value=[])
         shutdown = asyncio.Event()
         shutdown.set()
 
@@ -72,6 +122,7 @@ class TestSweeperLoop:
             return 2
 
         db.cancel_stale_verification_subjobs = AsyncMock(side_effect=_count_then_stop)
+        db.unstick_reviewing_parents = AsyncMock(return_value=[])
 
         await asyncio.wait_for(
             stale_verification_sweeper_loop(db, shutdown), timeout=1.0
@@ -88,6 +139,7 @@ class TestSweeperLoop:
             raise RuntimeError("boom")
 
         db.cancel_stale_verification_subjobs = AsyncMock(side_effect=_raise_then_stop)
+        db.unstick_reviewing_parents = AsyncMock(return_value=[])
 
         # Must swallow the tick error and exit cleanly on shutdown, not raise.
         await asyncio.wait_for(
