@@ -66,6 +66,7 @@ import {LLMRequest} from '../../debug/request.model';
 import {GraphChangeResponse} from '../../debug/graph.model';
 import {ChatEntry, ChatHistoryResponse} from '../models/chat.model';
 import {PendingActionCounts, ThreadDetail} from '../models/action.model';
+import {TtsVoicesResponse} from '../models/tts-voices';
 import {environment} from '../environment';
 
 /**
@@ -997,6 +998,25 @@ export class ApiService {
         catchError((error) => {
           console.error('Failed to preview TTS voice:', error);
           return of(null);
+        }),
+      );
+  }
+
+  /**
+   * List the voices the caller's configured TTS backend offers, for the
+   * Settings read-aloud picker. Only ElevenLabs returns a populated list
+   * (server-fed from the deployment account with accent labels + hosted
+   * previews); Kokoro/OpenAI return `[]` (the cockpit holds their static
+   * catalogs locally). Never rejects — a failure degrades to
+   * `{backend: null, voices: []}` so Settings still renders.
+   */
+  listTtsVoices(): Observable<TtsVoicesResponse> {
+    return this.http
+      .get<TtsVoicesResponse>(`${this.baseUrl}/settings/tts/voices`)
+      .pipe(
+        catchError((error) => {
+          console.error('Failed to list TTS voices:', error);
+          return of({backend: null, voices: []} as TtsVoicesResponse);
         }),
       );
   }

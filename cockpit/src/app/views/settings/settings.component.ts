@@ -26,6 +26,7 @@ import {
   voicesForModelId,
   voiceLanguageTag,
   ttsBackendForModelId,
+  TtsAccountVoice,
 } from '../../core/models/tts-voices';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppThemeToggleComponent} from '../../ui/theme-toggle';
@@ -127,7 +128,24 @@ const EXPIRY_OPTIONS = [
                 </app-select>
               </app-form-field>
               <app-form-field [label]="'settings.voice.label' | transloco">
-                @if (ttsVoices().length > 0) {
+                @if (ttsBackend() === 'elevenlabs') {
+                  @if (elevenVoicesLoading()) {
+                    <p class="voice-lang-note">{{ 'settings.voice.loadingVoices' | transloco }}</p>
+                  } @else if (elevenVoices().length > 0) {
+                    <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
+                      <option value="">{{ 'settings.voice.auto' | transloco }}</option>
+                      @for (v of elevenVoices(); track v.id) {
+                        <option [value]="v.id">{{ elevenVoiceLabel(v) }}</option>
+                      }
+                    </app-select>
+                  } @else {
+                    <app-input
+                      [value]="ttsVoice()"
+                      [placeholder]="'settings.voice.customPlaceholder' | transloco"
+                      (changed)="setTtsVoice($event)"
+                    />
+                  }
+                } @else if (ttsVoices().length > 0) {
                   <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
                     <option value="">{{ 'settings.voice.auto' | transloco }}</option>
                     @for (v of ttsVoices(); track v) {
@@ -171,6 +189,16 @@ const EXPIRY_OPTIONS = [
                   <app-icon size="sm">play_arrow</app-icon>
                   {{ 'settings.voice.preview' | transloco }}
                 </app-button>
+                @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
+                  <app-button
+                    variant="ghost"
+                    size="sm"
+                    (clicked)="playHostedPreview()"
+                  >
+                    <app-icon size="sm">graphic_eq</app-icon>
+                    {{ 'settings.voice.hostedPreview' | transloco }}
+                  </app-button>
+                }
                 @if (previewFailed()) {
                   <span class="voice-preview-error">{{ 'settings.voice.previewFailed' | transloco }}</span>
                 }
@@ -1884,6 +1912,47 @@ export class SettingsComponent implements OnInit {
     return tag ? `${voice} [${tag}]` : voice;
   }
 
+  // ── ElevenLabs account voices ─────────────────────────────────────
+  // Unlike Kokoro/OpenAI's static catalogs, ElevenLabs voices come live from
+  // the deployment account (server-proxied `GET /api/settings/tts/voices`), so
+  // they're an async signal loaded lazily when that backend is selected.
+  readonly elevenVoices = signal<TtsAccountVoice[]>([]);
+  readonly elevenVoicesLoading = signal(false);
+  /** Fetched once per session; the orchestrator caches ~5 min so re-selecting
+   * ElevenLabs doesn't re-hit the API. */
+  private _elevenVoicesLoaded = false;
+  private hostedAudio: HTMLAudioElement | null = null;
+
+  /** The account voice matching the current selection (for the hosted-preview
+   * button), or null when on Auto ('') or the voice isn't in the list. */
+  readonly selectedElevenVoice = computed(
+    () => this.elevenVoices().find((v) => v.id === this.ttsVoice()) ?? null,
+  );
+
+  /** Option label for an ElevenLabs voice: name + its own accent/gender labels
+   * (e.g. `Sarah — american · female`) — strictly better than prefix-decoding.
+   * The `<option>` value is the opaque account `voice_id`. */
+  elevenVoiceLabel(v: TtsAccountVoice): string {
+    const tags = [v.labels?.['accent'], v.labels?.['gender']]
+      .filter(Boolean)
+      .join(' · ');
+    return tags ? `${v.name} — ${tags}` : v.name;
+  }
+
+  /** Play the selected voice's hosted `preview_url` (a public ElevenLabs CDN
+   * mp3) — a zero-cost audition, distinct from the synth preview which spends
+   * characters. No-op when the selected voice has no preview. */
+  playHostedPreview(): void {
+    const url = this.selectedElevenVoice()?.preview_url;
+    if (!url) return;
+    this.hostedAudio?.pause();
+    const audio = new Audio(url);
+    this.hostedAudio = audio;
+    audio.play().catch(() => {
+      /* autoplay/network failure — nothing actionable, stay silent */
+    });
+  }
+
   /** Persist the read-aloud provider/model choice. Selecting the resolved
    * default clears the override (mirrors the aux-model picker); any real change
    * also clears the voice override, because voice ids are backend-specific — a
@@ -2160,6 +2229,22 @@ export class SettingsComponent implements OnInit {
         this.loadCodexStatus();
         this.loadCloudSettings();
       }
+    });
+
+    // Lazily load ElevenLabs account voices the first time that backend is in
+    // effect — the list is server-fed (names + accent labels + hosted
+    // previews), not a static catalog like Kokoro/OpenAI. Depends only on
+    // ttsBackend(); the one-shot flag keeps it from re-firing.
+    effect(() => {
+      if (this.ttsBackend() !== 'elevenlabs' || this._elevenVoicesLoaded) return;
+      this._elevenVoicesLoaded = true;
+      this.elevenVoicesLoading.set(true);
+      this.apiService.listTtsVoices().subscribe((resp) => {
+        this.elevenVoicesLoading.set(false);
+        this.elevenVoices.set(
+          resp.backend === 'elevenlabs' ? resp.voices : [],
+        );
+      });
     });
   }
 

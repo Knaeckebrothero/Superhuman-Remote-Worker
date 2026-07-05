@@ -23,6 +23,11 @@ describe('voicesForModelId', () => {
     expect(OPENAI_TTS_VOICES).toContain('alloy');
   });
 
+  it('returns [] for ElevenLabs (voices are server-fed, not a static catalog)', () => {
+    expect(voicesForModelId('eleven_multilingual_v2')).toEqual([]);
+    expect(voicesForModelId('eleven_v3')).toEqual([]);
+  });
+
   it('returns [] for unrecognized or empty ids (free-text fallback)', () => {
     expect(voicesForModelId('claude-opus-4-8')).toEqual([]);
     expect(voicesForModelId('gemma-4-moe-strix')).toEqual([]);
@@ -33,11 +38,13 @@ describe('voicesForModelId', () => {
 });
 
 describe('ttsBackendForModelId', () => {
-  it('detects kokoro / openai / unknown', () => {
+  it('detects kokoro / openai / elevenlabs / unknown', () => {
     expect(ttsBackendForModelId('kokoro-strix')).toBe('kokoro');
     expect(ttsBackendForModelId('KOKORO')).toBe('kokoro');
     expect(ttsBackendForModelId('tts-1')).toBe('openai');
     expect(ttsBackendForModelId('gpt-4o-mini-tts')).toBe('openai');
+    expect(ttsBackendForModelId('eleven_multilingual_v2')).toBe('elevenlabs');
+    expect(ttsBackendForModelId('eleven_v3')).toBe('elevenlabs');
     expect(ttsBackendForModelId('some-other-model')).toBeNull();
     expect(ttsBackendForModelId('')).toBeNull();
     expect(ttsBackendForModelId(null)).toBeNull();
@@ -69,8 +76,12 @@ describe('voiceLanguageTag', () => {
     expect(voiceLanguageTag('gpt-4o-mini-tts', 'nova')).toBe('multi');
   });
 
+  it('returns null for ElevenLabs (accent labels come from the server, not the id)', () => {
+    expect(voiceLanguageTag('eleven_multilingual_v2', 'v_sarah')).toBeNull();
+  });
+
   it('returns null for unknown backends, unknown prefixes, or empty input', () => {
-    expect(voiceLanguageTag('eleven-labs-x', 'rachel')).toBeNull(); // unknown backend
+    expect(voiceLanguageTag('some-tts-x', 'rachel')).toBeNull(); // unknown backend
     expect(voiceLanguageTag('kokoro', 'qf_unknown')).toBeNull(); // no such prefix
     expect(voiceLanguageTag('kokoro', '')).toBeNull();
     expect(voiceLanguageTag(null, 'af_bella')).toBeNull();

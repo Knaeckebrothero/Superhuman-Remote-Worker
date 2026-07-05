@@ -510,7 +510,9 @@
       "samplePlaceholder": "Eigenen Text eingeben, um diese Stimme zu hören…",
       "sampleHint": "Noch {{left}} Zeichen. Leer lassen für einen Standardsatz.",
       "preview": "Stimme anhören",
+      "hostedPreview": "Hörprobe",
       "previewFailed": "Vorschau konnte nicht abgespielt werden — bitte TTS-Einrichtung prüfen.",
+      "loadingVoices": "Stimmen werden geladen…",
       "langNote": "Die Sprache jeder Stimme steht in Klammern (z. B. [EN-US], [ES], [FR]); [multi] bedeutet mehrsprachig.",
       "kokoroNoGerman": "Dieses Backend hat keine deutsche Stimme — für Deutsch eine (mehrsprachige) OpenAI-Stimme wählen."
     },

@@ -1371,6 +1371,200 @@ class TestStripMarkdownForSpeech:
         assert "code snippet" in out
         assert "Before" in out and "After" in out
 
+
+# ---------------------------------------------------------------------------
+# Phase 5 — account voice listing for the Settings picker.
+# ---------------------------------------------------------------------------
+
+
+def _mock_httpx_get(*, json_body, status_error=None):
+    """Fake httpx.AsyncClient usable as `async with ... as c: c.get`."""
+    resp = MagicMock()
+    resp.json = MagicMock(return_value=json_body)
+    resp.raise_for_status = MagicMock(side_effect=status_error)
+    client = MagicMock()
+    client.get = AsyncMock(return_value=resp)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm), client
+
+
+def _voices_db(*, tts_model, params_json=None, api_keys=None):
+    """A postgres_db double resolving to ``tts_model`` as the user's TTS model,
+    with an optional catalog ``params_json`` (provider/voice)."""
+    db = MagicMock()
+    db.get_user_settings = AsyncMock(return_value={"default_tts_model": tts_model})
+    db.resolve_api_keys_for_job = AsyncMock(return_value=api_keys or {})
+    db.resolve_default_for_capability = AsyncMock(return_value=None)
+    db.resolve_catalog_model = AsyncMock(
+        return_value={"params_json": params_json} if params_json is not None else None
+    )
+    return db
+
+
+_EL_VOICES_BODY = {
+    "voices": [
+        {
+            "voice_id": "v_sarah",
+            "name": "Sarah",
+            "labels": {"accent": "american", "gender": "female"},
+            "preview_url": "https://cdn.elevenlabs.io/sarah.mp3",
+        },
+        {
+            "voice_id": "v_george",
+            "name": "George",
+            "labels": {"accent": "british", "gender": "male"},
+            "preview_url": "https://cdn.elevenlabs.io/george.mp3",
+        },
+    ]
+}
+
+
+class TestMapElevenLabsVoice:
+    def test_maps_fields(self):
+        from services.tts import _map_elevenlabs_voice
+
+        out = _map_elevenlabs_voice(_EL_VOICES_BODY["voices"][0])
+        assert out == {
+            "id": "v_sarah",
+            "name": "Sarah",
+            "labels": {"accent": "american", "gender": "female"},
+            "preview_url": "https://cdn.elevenlabs.io/sarah.mp3",
+        }
+
+    def test_missing_fields_degrade_gracefully(self):
+        from services.tts import _map_elevenlabs_voice
+
+        out = _map_elevenlabs_voice({"voice_id": "v1"})
+        # name falls back to the id; labels default to {}, preview to None.
+        assert out == {"id": "v1", "name": "v1", "labels": {}, "preview_url": None}
+
+
+class TestListAccountVoices:
+    @pytest.fixture(autouse=True)
+    def _clear_voice_cache(self):
+        from services import tts
+
+        tts._voices_cache.clear()
+        yield
+        tts._voices_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_no_model_configured_returns_backend_none(self):
+        from services.tts import list_account_voices
+
+        db = MagicMock()
+        db.get_user_settings = AsyncMock(return_value={})
+        db.resolve_api_keys_for_job = AsyncMock(return_value={})
+        db.resolve_default_for_capability = AsyncMock(return_value=None)
+        out = await list_account_voices(user_id="u1", postgres_db=db)
+        assert out == {"backend": None, "voices": []}
+
+    @pytest.mark.asyncio
+    async def test_non_elevenlabs_backend_returns_empty_list(self):
+        """Kokoro/OpenAI keep their static catalogs in the cockpit — the server
+        returns the backend name but no voices, and never calls ElevenLabs."""
+        from services.tts import list_account_voices
+
+        db = _voices_db(tts_model="kokoro")
+        factory, _ = _mock_httpx_get(json_body=_EL_VOICES_BODY)
+        with patch("services.tts.httpx.AsyncClient", factory):
+            out = await list_account_voices(user_id="u1", postgres_db=db)
+        assert out == {"backend": "openai", "voices": []}
+        factory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_elevenlabs_lists_account_voices(self):
+        from services.tts import list_account_voices
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs", "voice": "v_sarah"},
+        )
+        factory, client = _mock_httpx_get(json_body=_EL_VOICES_BODY)
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            out = await list_account_voices(user_id="u1", postgres_db=db)
+        assert out["backend"] == "elevenlabs"
+        assert [v["id"] for v in out["voices"]] == ["v_sarah", "v_george"]
+        assert out["voices"][1]["name"] == "George"
+        # Auth header attached server-side; voices endpoint hit.
+        assert client.get.call_args.args[0].endswith("/v2/voices")
+        assert client.get.call_args.kwargs["headers"]["xi-api-key"] == "env-key"
+
+    @pytest.mark.asyncio
+    async def test_elevenlabs_no_key_returns_empty(self):
+        from services.tts import list_account_voices
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            out = await list_account_voices(user_id="u1", postgres_db=db)
+        assert out == {"backend": "elevenlabs", "voices": []}
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_degrades_to_empty(self):
+        """A 5xx/timeout from ElevenLabs must not 500 the Settings page — the
+        picker falls back to free-text, so an empty list is the contract."""
+        from services.tts import list_account_voices
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        factory, _ = _mock_httpx_get(
+            json_body={}, status_error=RuntimeError("503 upstream")
+        )
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            out = await list_account_voices(user_id="u1", postgres_db=db)
+        assert out == {"backend": "elevenlabs", "voices": []}
+
+    @pytest.mark.asyncio
+    async def test_second_call_served_from_cache(self):
+        """The ~5 min in-process cache means opening Settings twice hits
+        ElevenLabs once."""
+        from services.tts import list_account_voices
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        factory, client = _mock_httpx_get(json_body=_EL_VOICES_BODY)
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            first = await list_account_voices(user_id="u1", postgres_db=db)
+            second = await list_account_voices(user_id="u1", postgres_db=db)
+        assert first == second
+        assert client.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_invalidate_cache_forces_refetch(self):
+        from services.tts import invalidate_account_voices_cache, list_account_voices
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        factory, client = _mock_httpx_get(json_body=_EL_VOICES_BODY)
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            await list_account_voices(user_id="u1", postgres_db=db)
+            await invalidate_account_voices_cache()
+            await list_account_voices(user_id="u1", postgres_db=db)
+        assert client.get.await_count == 2
+
     def test_preserves_snake_case_identifiers(self):
         from services.tts import _strip_markdown_for_speech
 
