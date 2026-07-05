@@ -135,6 +135,12 @@ CREATE TABLE public.knowledge_index (
     content_hash character varying(64),
     remaining_cycles integer,
     last_verified_cycle integer,
+    kb_id uuid,
+    path text,
+    blob_sha character varying(64),
+    superseded_by character varying(100),
+    invalidated_at timestamp with time zone,
+    embedding_version text,
     CONSTRAINT valid_note_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'resolved'::character varying, 'superseded'::character varying, 'archived'::character varying])::text[]))),
     CONSTRAINT valid_note_type CHECK (((note_type)::text = ANY ((ARRAY['goal'::character varying, 'plan'::character varying, 'decision'::character varying, 'learning'::character varying, 'code'::character varying, 'source'::character varying, 'question'::character varying, 'state'::character varying, 'retrospective'::character varying, 'datasource'::character varying])::text[])))
 );
@@ -503,6 +509,38 @@ CREATE TABLE public.job_sources (
 
 
 --
+-- Name: kb_index_watermark; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.kb_index_watermark (
+    kb_id uuid NOT NULL,
+    repo_name text,
+    branch text,
+    indexed_commit character varying(64),
+    pipeline_version text,
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
+-- Name: knowledge_chunks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.knowledge_chunks (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    note_row uuid NOT NULL,
+    kb_id uuid NOT NULL,
+    chunk_ix integer NOT NULL,
+    heading_path text,
+    content text NOT NULL,
+    embedding public.vector(4096),
+    search_doc tsvector,
+    embedding_version text,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
 -- Name: memory_retrieval_messages; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -723,6 +761,22 @@ ALTER TABLE ONLY public.job_sources
 
 
 --
+-- Name: kb_index_watermark kb_index_watermark_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.kb_index_watermark
+    ADD CONSTRAINT kb_index_watermark_pkey PRIMARY KEY (kb_id);
+
+
+--
+-- Name: knowledge_chunks knowledge_chunks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.knowledge_chunks
+    ADD CONSTRAINT knowledge_chunks_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: knowledge_index knowledge_index_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -800,6 +854,14 @@ ALTER TABLE ONLY public.source_tags
 
 ALTER TABLE ONLY public.sources
     ADD CONSTRAINT sources_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: knowledge_chunks uq_knowledge_chunk; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.knowledge_chunks
+    ADD CONSTRAINT uq_knowledge_chunk UNIQUE (note_row, chunk_ix);
 
 
 --
@@ -896,6 +958,34 @@ CREATE INDEX idx_citations_verification_status ON public.citations USING btree (
 
 
 --
+-- Name: idx_knowledge_chunks_embedding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_chunks_embedding ON public.knowledge_chunks USING hnsw (((public.subvector(embedding, 1, 4000))::public.halfvec(4000)) public.halfvec_cosine_ops) WITH (m='16', ef_construction='64');
+
+
+--
+-- Name: idx_knowledge_chunks_kb_version; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_chunks_kb_version ON public.knowledge_chunks USING btree (kb_id, embedding_version);
+
+
+--
+-- Name: idx_knowledge_chunks_note; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_chunks_note ON public.knowledge_chunks USING btree (note_row);
+
+
+--
+-- Name: idx_knowledge_chunks_search; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_chunks_search ON public.knowledge_chunks USING gin (search_doc);
+
+
+--
 -- Name: idx_knowledge_embedding_halfvec; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -907,6 +997,13 @@ CREATE INDEX idx_knowledge_embedding_halfvec ON public.knowledge_index USING hns
 --
 
 CREATE INDEX idx_knowledge_index_stale ON public.knowledge_index USING btree (project_id) WHERE ((remaining_cycles <= 0) AND ((status)::text = 'active'::text));
+
+
+--
+-- Name: idx_knowledge_kb; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_kb ON public.knowledge_index USING btree (kb_id);
 
 
 --
@@ -1127,6 +1224,13 @@ CREATE INDEX schema_migrations_dirty_idx ON public.schema_migrations USING btree
 
 
 --
+-- Name: uq_knowledge_kb_path; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_knowledge_kb_path ON public.knowledge_index USING btree (kb_id, path) WHERE ((kb_id IS NOT NULL) AND (path IS NOT NULL));
+
+
+--
 -- Name: citations citations_source_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1148,6 +1252,14 @@ ALTER TABLE ONLY public.memories
 
 ALTER TABLE ONLY public.job_sources
     ADD CONSTRAINT job_sources_source_id_fkey FOREIGN KEY (source_id) REFERENCES public.sources(id);
+
+
+--
+-- Name: knowledge_chunks knowledge_chunks_note_row_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.knowledge_chunks
+    ADD CONSTRAINT knowledge_chunks_note_row_fkey FOREIGN KEY (note_row) REFERENCES public.knowledge_index(id) ON DELETE CASCADE;
 
 
 --
