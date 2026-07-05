@@ -13,12 +13,53 @@ from __future__ import annotations
 
 import logging
 import posixpath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List
 
 if TYPE_CHECKING:
     from ..workspace_backend import WorkspaceBackend
 
 logger = logging.getLogger(__name__)
+
+
+def reseed_missing_files(
+    backend: "WorkspaceBackend", seed_files: Dict[str, str]
+) -> List[str]:
+    """Idempotently (re)write agent-authored seed files that are absent.
+
+    A sandbox pod is provisioned WITH its git clone (instructions.md, tools/),
+    then the agent writes files on top (task_brief.md, bound skills). If the pod
+    is torn down and re-provisioned mid-run, the clone comes back but the
+    agent-written files do not, so the agent reconnects onto a workspace missing
+    them (docs/issues/reviewing_parent_pod_reaped_under_critic.md Issue 4). This
+    restores exactly the agent-authored files that are currently absent.
+
+    Write-if-absent, never clobber: a file that survived the re-provision may
+    have been edited by the agent since seeding, so it is left untouched.
+
+    Args:
+        backend: The (re)connected workspace backend to write into.
+        seed_files: Mapping of workspace-relative path → original content.
+
+    Returns:
+        The paths that were (re)written (absent → restored), in input order.
+    """
+    written: List[str] = []
+    for path, content in seed_files.items():
+        try:
+            if backend.exists(path):
+                continue
+            parent = posixpath.dirname(path)
+            if parent:
+                backend.mkdir(parent)
+            backend.write_file(path, content)
+            written.append(path)
+        except Exception:
+            # One un-writable seed file must not abort the rest; the agent still
+            # detects+reports a genuinely un-seedable workspace (BLOCKER.md).
+            logger.exception("Re-seed: failed to restore %r (continuing)", path)
+    if written:
+        logger.info("Re-seeded %d missing agent-authored file(s): %s", len(written), written)
+    return written
 
 
 def seed_workspace(src: "WorkspaceBackend", dst: "WorkspaceBackend") -> int:
