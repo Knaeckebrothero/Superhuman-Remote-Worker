@@ -38,23 +38,38 @@ TICK_SECONDS = int(os.getenv("STALE_VERIFICATION_SWEEP_SECONDS", "300"))
 # live one.
 STALE_HOURS = int(os.getenv("STALE_VERIFICATION_HOURS", "6"))
 
+# Grace floor (minutes) a parent must have sat in 'reviewing' before the
+# watchdog un-sticks it. Long enough to clear the critic-spawn window and any
+# in-flight verdict; the real gate is "no non-failed/cancelled critic exists".
+REVIEWING_STUCK_MINUTES = int(os.getenv("REVIEWING_STUCK_GRACE_MINUTES", "30"))
+
 
 async def stale_verification_sweeper_loop(
     db: Any, shutdown_event: asyncio.Event
 ) -> None:
     """Reap orphaned verification subjobs until ``shutdown_event`` is set."""
     logger.info(
-        "Stale verification sweeper started (tick=%ds, stale_hours=%d)",
+        "Stale verification sweeper started (tick=%ds, stale_hours=%d, "
+        "reviewing_grace_min=%d)",
         TICK_SECONDS,
         STALE_HOURS,
+        REVIEWING_STUCK_MINUTES,
     )
     while not shutdown_event.is_set():
         try:
-            cancelled = await _sweep_tick(db, STALE_HOURS)
+            cancelled, unstuck = await _sweep_tick(
+                db, STALE_HOURS, REVIEWING_STUCK_MINUTES
+            )
             if cancelled:
                 logger.info(
                     "Stale verification sweeper cancelled %d orphaned subjob(s)",
                     cancelled,
+                )
+            if unstuck:
+                logger.info(
+                    "Stale verification sweeper un-stuck %d reviewing parent(s) "
+                    "→ pending_review",
+                    unstuck,
                 )
         except Exception:
             logger.exception(
@@ -70,6 +85,40 @@ async def stale_verification_sweeper_loop(
     logger.info("Stale verification sweeper stopped")
 
 
-async def _sweep_tick(db: Any, stale_hours: int) -> int:
-    """Cancel stale verification subjobs once. Returns the number cancelled."""
-    return await db.cancel_stale_verification_subjobs(stale_hours)
+async def _sweep_tick(
+    db: Any,
+    stale_hours: int,
+    grace_minutes: int,
+    notifier: Any = None,
+) -> tuple[int, int]:
+    """Run one sweep. Returns ``(cancelled_subjobs, unstuck_parents)``.
+
+    Step 1 cancels dead/orphaned critic subjobs (also what turns a lingering
+    'paused' orphan terminal at the stale horizon). Step 2 then un-sticks any
+    parent whose critic pipeline is now dead and notifies its owner. Ordering
+    matters: a critic cancelled in Step 1 makes its parent eligible in Step 2
+    on this same tick.
+    """
+    cancelled = await db.cancel_stale_verification_subjobs(stale_hours)
+
+    unstuck_rows = await db.unstick_reviewing_parents(grace_minutes)
+    if unstuck_rows and notifier is None:
+        # Lazy import keeps the sweeper's test import free of the
+        # notification_service dependency (tests always inject a notifier).
+        from services.notification_service import notification_service as notifier
+
+    for row in unstuck_rows:
+        try:
+            await notifier.notify_review_returned_to_manual(
+                user_id=str(row["user_id"]),
+                job_id=str(row["id"]),
+                config_name=row.get("config_name") or "",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to notify owner of un-stuck reviewing parent %s "
+                "(non-fatal)",
+                row.get("id"),
+            )
+
+    return cancelled, len(unstuck_rows)
