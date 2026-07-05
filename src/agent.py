@@ -212,6 +212,11 @@ class UniversalAgent:
         self._todo_manager: Optional[TodoManager] = None
         self._current_job_id: Optional[str] = None
         self._job_metadata: Optional[Dict[str, Any]] = None
+        # Agent-authored workspace files (path → content) that a pod re-provision
+        # would drop (task_brief.md, bound skills). Re-asserted on SSH reconnect
+        # via RemoteBackend's on_reconnect hook. See
+        # docs/issues/reviewing_parent_pod_reaped_under_critic.md (Issue 4).
+        self._agent_seed_files: Dict[str, str] = {}
         self._datasource_connections: Dict[str, Any] = {}
         self._datasource_clients: Dict[
             str, Any
@@ -1503,6 +1508,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             Updated metadata with workspace-relative paths
         """
         metadata = metadata or {}
+        # Fresh capture per job: files we write on top of the pod's git clone,
+        # re-asserted if a pod re-provision drops them (see the reconnect hook).
+        self._agent_seed_files = {}
 
         # On resume: try to load frozen config from JSONB (prevents config drift).
         # NOTE: serialize_resolved_config strips api_key from agent.llm before
@@ -1901,6 +1909,22 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             backend=workspace_backend,
         )
 
+        # Re-seed agent-authored files after a pod tear-down + re-provision. The
+        # pod comes back with its git clone (instructions.md, tools/) but not the
+        # files the agent wrote on top (task_brief.md, bound skills); a genuine
+        # SSH reconnect fires this hook, which restores whatever is now absent
+        # from self._agent_seed_files (populated by the seed tail below and
+        # _deploy_instruction_files). Read at fire time, so ordering is fine.
+        # Lite/virtual backends have no pod to lose and lack the hook.
+        if hasattr(workspace_backend, "set_reconnect_hook"):
+            from .core.backends.seed import reseed_missing_files
+
+            workspace_backend.set_reconnect_hook(
+                lambda b=workspace_backend: reseed_missing_files(
+                    b, self._agent_seed_files
+                )
+            )
+
         # VM recovery: seed fresh VM workspace from last snapshot if needed
         if resume and workspace_backend and workspace_backend.supports_shell:
             try:
@@ -2161,7 +2185,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         brief_parts = [f"# Task Brief\n\n## Description\n\n{description}"]
         if kickoff_message:
             brief_parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
-        self._workspace_manager.write_file("task_brief.md", "".join(brief_parts))
+        brief_content = "".join(brief_parts)
+        self._workspace_manager.write_file("task_brief.md", brief_content)
+        self._agent_seed_files["task_brief.md"] = brief_content
         logger.debug("Wrote task_brief.md to workspace")
 
         # Process initial_files from config (templates seeded into the workspace)
@@ -2871,6 +2897,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         if parent_dir and parent_dir != ".":
                             self._workspace_manager.backend.mkdir(parent_dir)
                         self._workspace_manager.write_file(entry.path, content)
+                        self._agent_seed_files[entry.path] = content
                         logger.debug(f"Deployed bound skill to workspace: {entry.path}")
                         continue
                     # Check resolved config first (resumed jobs)
