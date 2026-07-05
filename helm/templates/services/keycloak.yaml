@@ -891,9 +891,9 @@ spec:
                       $KC update "realms/{{ .Values.keycloak.realm }}" \
                         -s "smtpServer.host=$SMTP_HOST" \
                         -s "smtpServer.port=1025" \
-                        -s "smtpServer.from=noreply@{{ .Values.global.domain }}" \
+                        -s "smtpServer.from={{ .Values.email.smtp.from | default (printf "noreply@%s" .Values.global.domain) }}" \
                         -s "smtpServer.fromDisplayName=Superhuman Remote Worker" \
-                        -s "smtpServer.envelopeFrom=noreply@{{ .Values.global.domain }}" \
+                        -s "smtpServer.envelopeFrom={{ .Values.email.smtp.from | default (printf "noreply@%s" .Values.global.domain) }}" \
                         -s "smtpServer.ssl=false" \
                         -s "smtpServer.starttls=true" \
                         -s "smtpServer.auth=true" \
