@@ -575,6 +575,53 @@ exactly the split-brain this design exists to kill.
      stale-at-read matters and the response's `indexed_commit` exposes it.
      30 tests `tests/test_kb_reindex.py` (+2 store, +4 embedding-service);
      379 green across touched suites, ruff clean incl. main.py.
+     Pushed 2026-07-05 (`cc94d336` PR1 / `7210604c` PR2 / `bfce75ec` PR3).
+   - **PR3.1 — live-verification fixes (2026-07-05, develop, TDD, uncommitted).**
+     Dev deploy shook out three production-only bugs no unit test could see
+     (full forensics: gitea access logs + pgvector row timestamps + podman
+     import bisection of the deployed images):
+     1. **Import heisenbug / sweeper silent death.** The orchestrator image
+        ships without `neo4j`, and `src/tools/__init__` eagerly builds the
+        registry → `knowledge_tools` → `knowledge_graph` → `neo4j_db` — so the
+        FIRST import of anything under `src.tools` (chunker → `services.
+        kb_reindex`) raised ModuleNotFoundError, and the failure left
+        `src.tools.knowledge` cached so every RETRY succeeded. Net effect: the
+        sweeper (first import at leadership acquisition) died silently on every
+        pod generation, while post-merge triggers worked once an earlier failed
+        import had polluted `sys.modules` (the 13:28Z run indexed 323 notes).
+        Fix: neo4j import guarded in `src/database/neo4j_db.py` (failure moves
+        to `Neo4jDB(...)` construction); `run_when_leader` now logs factory
+        raises + loop crashes at ERROR instead of dying/respawning invisibly.
+        Regression-pinned by `tests/test_neo4j_import_guard.py` (subprocess,
+        blocks neo4j, first-import + order-independence) and
+        `tests/test_leader_election_wrapper.py`; import validated green inside
+        the actual `sha-2e8b807` image via podman mount.
+     2. **Zero chunks: missing pgvector codec.** `postgres.py` registers the
+        asyncpg vector codec in `try/except ImportError: pass` — the
+        orchestrator image lacks the `pgvector` package, so every chunk INSERT
+        failed with `invalid input for query argument $6 … (expected str, got
+        list)`; 323 notes upserted, 0 chunks, watermark honestly refused
+        (`partial`, errors=325 — reproduced live via the operator endpoint).
+        Agent-side slice-1 writes never hit this (agents ship pgvector). Fix:
+        `pgvector>=0.2.0` added to `orchestrator/requirements.txt`. Plus the
+        **stamp-after-chunks** redesign: `upsert_kb_note` now lands UNSTAMPED
+        (blob_sha/embedding_version NULL) and `stamp_note_indexed` sets both
+        only after `replace_note_chunks` succeeds — before this, a chunk-write
+        failure left the note stamped and the incremental diff would have
+        skipped it forever once a watermark existed.
+     3. **Embed batch cap.** The self-hosted TEI endpoint 422s above 64 inputs
+        per request; the 127 KB legacy dumps chunk into 95+. `embed_note_chunks`
+        now splits into ≤`EMBEDDING_MAX_BATCH` (env, default 64) sub-batches,
+        order-preserving.
+     Also: per-KB asyncio lock in `reindex_kb` (two post-merge triggers 30s
+     apart ran interleaved full rebuilds), and the post-merge trigger now fires
+     on `merge_status in ("merged", "empty")` — knowledge-only jobs (iter-16
+     scholar) land notes via kb_write with an empty branch diff, and the
+     up-to-date short-circuit makes a false fire one HEAD read. Live state
+     note: ~250 active pgvector rows are file-less ghosts (files deleted/renamed
+     on main without kb_delete — dual-write gap on delete); they stay pathless,
+     invisible to the diff and to PR4 chunk retrieval, and get archived by the
+     migration-hygiene audit.
    - **PR4 — retrieval cutover + Neo4j demotion**: `search_knowledge` → existing RRF
      over chunk rows with `kb_id` (over-fetch ~50 → return 15–20, no-op reranker
      slot, response carries `indexed_commit`); `kb_related`/`kb_provenance`/
