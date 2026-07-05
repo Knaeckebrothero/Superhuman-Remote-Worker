@@ -46,6 +46,8 @@ GET    /api/admin/system-settings/main_cloud                                    
 PUT    /api/admin/system-settings/main_cloud                                            admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/reload                                     admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/test                                       admin:_require_admin
+GET    /api/admin/system-settings/tts_library                                           admin:_require_admin
+PUT    /api/admin/system-settings/tts_library                                           admin:_require_admin
 GET    /api/admin/system-settings/user_experts                                          admin:_require_admin
 PUT    /api/admin/system-settings/user_experts                                          admin:_require_admin
 GET    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
@@ -243,6 +245,8 @@ POST   /api/settings/llm-endpoints/{endpoint_id}/discover                       
 POST   /api/settings/llm-endpoints/{endpoint_id}/test                                   gated:require_approved_user
 GET    /api/settings/preferences                                                        gated:require_approved_user
 PATCH  /api/settings/preferences                                                        gated:require_approved_user
+GET    /api/settings/tts/library                                                        gated:require_approved_user
+POST   /api/settings/tts/library/add                                                    gated:require_approved_user
 POST   /api/settings/tts/preview                                                        gated:require_approved_user
 GET    /api/settings/tts/voices                                                         gated:require_approved_user
 GET    /api/skills                                                                      gated:require_approved_user
