@@ -116,8 +116,7 @@ async def _sweep_tick(
             )
         except Exception:
             logger.exception(
-                "Failed to notify owner of un-stuck reviewing parent %s "
-                "(non-fatal)",
+                "Failed to notify owner of un-stuck reviewing parent %s (non-fatal)",
                 row.get("id"),
             )
 

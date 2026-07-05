@@ -58,7 +58,9 @@ def reseed_missing_files(
             # detects+reports a genuinely un-seedable workspace (BLOCKER.md).
             logger.exception("Re-seed: failed to restore %r (continuing)", path)
     if written:
-        logger.info("Re-seeded %d missing agent-authored file(s): %s", len(written), written)
+        logger.info(
+            "Re-seeded %d missing agent-authored file(s): %s", len(written), written
+        )
     return written
 
 
