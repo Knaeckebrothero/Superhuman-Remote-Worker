@@ -407,8 +407,7 @@ def near_duplicate_findings(
                 "near-duplicate",
                 WARNING,
                 path_a,
-                f"{pct}% embedding-similar to '{slug_b}' — merge or supersede "
-                f"one side",
+                f"{pct}% embedding-similar to '{slug_b}' — merge or supersede one side",
             )
         )
     return findings
