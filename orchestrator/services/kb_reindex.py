@@ -26,7 +26,11 @@ import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from src.tools.knowledge.chunker import embed_note_chunks, embedding_version
-from src.tools.knowledge.gardener import parse_note_md
+
+# _internal_link_targets is the same body-markdown link parser the dead-link lint
+# rule uses (external URLs / anchors / images excluded, `.md` basename returned) —
+# reused here so the link table and the linter agree on what a "link" is.
+from src.tools.knowledge.gardener import _internal_link_targets, parse_note_md
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +349,15 @@ async def _reindex_kb_unlocked(
                 kb_id=kb_id,
                 chunks=chunk_rows,
                 embedding_version=current_version,
+            )
+            # Rewrite the note's outbound link edges (the kg-less kb_related
+            # backend). Before the stamp, so a link-write failure keeps the note
+            # in the next run's diff — same durable-then-stamp invariant as chunks.
+            await store.replace_note_links(
+                source_note_row=note_row,
+                kb_id=kb_id,
+                source_id=fields["note_id"],
+                targets=_internal_link_targets(body),
             )
             await store.stamp_note_indexed(note_row, current_map[path], current_version)
             upserted += 1

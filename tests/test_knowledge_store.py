@@ -825,3 +825,111 @@ class TestFindNearDuplicatePairs:
         store, mock_db, _ = _make_store()
         mock_db.fetch.return_value = []
         assert await store.find_near_duplicate_pairs(uuid.uuid4()) == []
+
+
+# =============================================================================
+# search_chunks() — the slice-3 PR4 retrieval cutover (RRF over knowledge_chunks)
+# =============================================================================
+
+
+class TestSearchChunks:
+    """Tests for search_chunks() — hybrid retrieval over the chunk index.
+
+    The chunk-granular successor to hybrid_search: after the PR3 reindexer the
+    dense vector lives on ``knowledge_chunks`` (the note row's ``embedding`` is
+    NULL for reindexed notes), so retrieval must fuse over chunk rows and
+    collapse the best chunk back to its note. Returns note-level
+    ``KnowledgeRecord``s so the ``kb_search`` tool signature is unchanged.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_kb_ids(self):
+        store, mock_db, _ = _make_store()
+        result = await store.search_chunks(kb_ids=[], query="test")
+        assert result == []
+        mock_db.fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_calls_embed_for_query(self):
+        store, mock_db, mock_embed = _make_store()
+        mock_db.fetch.return_value = []
+        await store.search_chunks(kb_ids=[uuid.uuid4()], query="search term")
+        mock_embed.embed.assert_called_once_with("search term")
+
+    @pytest.mark.asyncio
+    async def test_uses_chunk_hybrid_search_function(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.search_chunks(kb_ids=[uuid.uuid4()], query="q")
+        sql = mock_db.fetch.call_args[0][0]
+        assert "knowledge_chunk_hybrid_search" in sql
+
+    @pytest.mark.asyncio
+    async def test_passes_kb_ids_as_array_and_version_filter(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        kb_ids = [uuid.uuid4(), uuid.uuid4()]
+        await store.search_chunks(
+            kb_ids=kb_ids, query="q", embedding_version="m:4096:c1"
+        )
+        args = mock_db.fetch.call_args[0]
+        # kb_ids threaded as a single array param (ANY(...) in the function);
+        # embedding_version threaded so mixed-model vectors can't drift.
+        assert kb_ids in args
+        assert "m:4096:c1" in args
+
+    @pytest.mark.asyncio
+    async def test_default_weights_and_rrf_k(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.search_chunks(kb_ids=[uuid.uuid4()], query="q")
+        args = mock_db.fetch.call_args[0]
+        # RRF weights match §5.1 (0.6/0.3/0.1); rrf_k defaults to 60.
+        assert 0.6 in args
+        assert 0.3 in args
+        assert 0.1 in args
+        assert 60 in args
+
+    @pytest.mark.asyncio
+    async def test_over_fetches_then_truncates_to_match_count(self):
+        store, mock_db, _ = _make_store()
+        # The function over-fetches ~over_fetch fused candidates; the method
+        # reranks (no-op v1) then truncates to match_count.
+        mock_db.fetch.return_value = [
+            {"note_id": f"n{i}", "title": "T", "content": "b"} for i in range(50)
+        ]
+        result = await store.search_chunks(
+            kb_ids=[uuid.uuid4()], query="q", match_count=15
+        )
+        assert len(result) == 15
+        # The SQL LIMIT is the over-fetch, strictly larger than match_count.
+        args = mock_db.fetch.call_args[0]
+        assert any(isinstance(a, int) and a >= 50 for a in args)
+
+    @pytest.mark.asyncio
+    async def test_returns_knowledge_records(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {
+                "note_id": "n1",
+                "title": "A",
+                "note_type": "decision",
+                "status": "active",
+                "content": "body",
+            }
+        ]
+        result = await store.search_chunks(kb_ids=[uuid.uuid4()], query="q")
+        assert len(result) == 1
+        assert isinstance(result[0], KnowledgeRecord)
+        assert result[0].note_id == "n1"
+
+    @pytest.mark.asyncio
+    async def test_reranker_slot_preserves_fusion_order_by_default(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {"note_id": "first", "title": "A", "content": "b"},
+            {"note_id": "second", "title": "B", "content": "b"},
+        ]
+        result = await store.search_chunks(kb_ids=[uuid.uuid4()], query="q")
+        # The no-op reranker slot must not reorder the RRF ranking.
+        assert [r.note_id for r in result] == ["first", "second"]

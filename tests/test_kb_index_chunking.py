@@ -468,3 +468,240 @@ class TestStampNoteIndexed:
         assert "embedding_version" in query
         assert "WHERE id = $1" in query
         assert params == (row_id, "abc123", "m:4096:c1")
+
+
+# =============================================================================
+# KnowledgeStore.replace_note_links — the body-link edge set for the 1-hop
+# graph-tool degrade when Neo4j is absent (slice-3 PR4c)
+# =============================================================================
+
+
+class TestReplaceNoteLinks:
+    """Body markdown links become rows the reindexer rewrites per note (delete +
+    re-insert, mirroring replace_note_chunks). Targets are stored as slugs and
+    resolved to note rows at read time — so a link to a not-yet-indexed note is
+    kept, not dropped (dead links fall out of the read-time join naturally)."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_then_inserts_each_target(self):
+        store, mock_db, _ = _make_store()
+        note_row = uuid.uuid4()
+        kb = uuid.uuid4()
+        n = await store.replace_note_links(
+            source_note_row=note_row,
+            kb_id=kb,
+            source_id="note-a",
+            targets=["note-b", "note-c"],
+        )
+        assert n == 2
+        calls = mock_db.execute.call_args_list
+        assert "DELETE FROM knowledge_links" in calls[0][0][0]
+        assert calls[0][0][1] == note_row
+        insert_calls = [c for c in calls if "INSERT INTO knowledge_links" in c[0][0]]
+        assert len(insert_calls) == 2
+        first = insert_calls[0][0]
+        assert note_row in first
+        assert kb in first
+        assert "note-a" in first  # source_id denormalized for query
+        assert "note-b" in first  # target_id (a slug, resolved at read time)
+
+    @pytest.mark.asyncio
+    async def test_empty_targets_clears_and_returns_zero(self):
+        store, mock_db, _ = _make_store()
+        note_row = uuid.uuid4()
+        n = await store.replace_note_links(
+            source_note_row=note_row, kb_id=uuid.uuid4(), source_id="a", targets=[]
+        )
+        assert n == 0
+        calls = mock_db.execute.call_args_list
+        assert len(calls) == 1
+        assert "DELETE FROM knowledge_links" in calls[0][0][0]
+
+    @pytest.mark.asyncio
+    async def test_dedupes_repeated_targets(self):
+        store, mock_db, _ = _make_store()
+        n = await store.replace_note_links(
+            source_note_row=uuid.uuid4(),
+            kb_id=uuid.uuid4(),
+            source_id="a",
+            targets=["b", "b", "c"],
+        )
+        assert n == 2  # one edge per distinct target
+        insert_calls = [
+            c
+            for c in mock_db.execute.call_args_list
+            if "INSERT INTO knowledge_links" in c[0][0]
+        ]
+        assert len(insert_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_default_rel_type_is_references(self):
+        store, mock_db, _ = _make_store()
+        await store.replace_note_links(
+            source_note_row=uuid.uuid4(),
+            kb_id=uuid.uuid4(),
+            source_id="a",
+            targets=["b"],
+        )
+        insert = [
+            c
+            for c in mock_db.execute.call_args_list
+            if "INSERT INTO knowledge_links" in c[0][0]
+        ][0][0]
+        assert "references" in insert
+
+
+# =============================================================================
+# KnowledgeStore.get_related_notes — 1-hop link neighbours (the kg-less
+# kb_related backend), resolved and active-only at read time (slice-3 PR4c)
+# =============================================================================
+
+
+class TestGetRelatedNotes:
+    @pytest.mark.asyncio
+    async def test_returns_one_hop_neighbours(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {"id": "note-b", "title": "B", "type": "decision", "status": "active"},
+        ]
+        result = await store.get_related_notes(kb_id=uuid.uuid4(), note_id="note-a")
+        assert len(result) == 1
+        assert result[0]["id"] == "note-b"
+        assert result[0]["distance"] == 1
+        assert result[0]["rel_types"] == ["references"]
+
+    @pytest.mark.asyncio
+    async def test_query_is_bidirectional_active_only_kb_scoped(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        kb = uuid.uuid4()
+        await store.get_related_notes(kb_id=kb, note_id="note-a", limit=7)
+        sql, *params = mock_db.fetch.call_args[0]
+        # Neighbours where note is the source (outbound) OR the target (inbound).
+        assert "source_id" in sql and "target_id" in sql
+        # Joined to knowledge_index for title/type/status, active-only.
+        assert "knowledge_index" in sql
+        assert "status = 'active'" in sql
+        assert kb in params
+        assert "note-a" in params
+        assert 7 in params
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_links(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        assert await store.get_related_notes(uuid.uuid4(), "x") == []
+
+
+# =============================================================================
+# KnowledgeStore.get_note_by_slug — the kg-less kb_read backend (slice-3 PR4c).
+# Reads a full note from the pgvector index by (kb_id, note_id), returning the
+# same dict shape kg.read_note does so the tool formats both worlds identically.
+# =============================================================================
+
+
+class TestGetNoteBySlug:
+    @pytest.mark.asyncio
+    async def test_returns_note_dict_shaped_like_kg(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = {
+            "note_id": "chose-jwt",
+            "title": "Chose JWT",
+            "note_type": "decision",
+            "status": "active",
+            "content": "body",
+            "confidence": "high",
+            "tags": ["auth"],
+            "keywords": ["jwt"],
+            "job_id": None,
+            "phase": 2,
+            "created_at": None,
+            "modified_at": None,
+        }
+        result = await store.get_note_by_slug(kb_id=uuid.uuid4(), note_id="chose-jwt")
+        # kg.read_note keys: id / type (not note_id / note_type)
+        assert result["id"] == "chose-jwt"
+        assert result["type"] == "decision"
+        assert result["title"] == "Chose JWT"
+        assert result["content"] == "body"
+        assert result["tags"] == ["auth"]
+        assert result["confidence"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_scopes_by_kb_and_note_status_agnostic(self):
+        # kb_read must find a note of ANY status (superseded/archived included).
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = None
+        kb = uuid.uuid4()
+        await store.get_note_by_slug(kb_id=kb, note_id="n1")
+        sql, *params = mock_db.fetchrow.call_args[0]
+        assert "knowledge_index" in sql
+        assert "kb_id = $1" in sql
+        assert "note_id = $2" in sql
+        assert "'active'" not in sql  # no active-only filter on a direct read
+        assert kb in params
+        assert "n1" in params
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_absent(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = None
+        assert await store.get_note_by_slug(uuid.uuid4(), "missing") is None
+
+
+# =============================================================================
+# KnowledgeStore.list_notes — the kg-less kb_list backend (slice-3 PR4c).
+# =============================================================================
+
+
+class TestListNotes:
+    @pytest.mark.asyncio
+    async def test_returns_summary_dicts_shaped_like_kg(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {
+                "note_id": "n1",
+                "title": "T",
+                "note_type": "decision",
+                "status": "active",
+                "confidence": "high",
+            }
+        ]
+        result = await store.list_notes(kb_id=uuid.uuid4())
+        assert result[0]["id"] == "n1"
+        assert result[0]["type"] == "decision"
+        assert result[0]["confidence"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_applies_type_status_job_and_tag_filters(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        kb = uuid.uuid4()
+        await store.list_notes(
+            kb_id=kb,
+            note_type="decision",
+            tag="auth",
+            status="active",
+            job_id="job-1",
+        )
+        sql, *params = mock_db.fetch.call_args[0]
+        assert "kb_id" in sql
+        assert "note_type =" in sql
+        assert "status =" in sql
+        assert "job_id =" in sql
+        assert "ANY(tags)" in sql  # tag membership against the array column
+        assert kb in params
+        assert "decision" in params
+        assert "active" in params
+        assert "auth" in params
+
+    @pytest.mark.asyncio
+    async def test_no_filters_lists_all_in_kb(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        kb = uuid.uuid4()
+        await store.list_notes(kb_id=kb)
+        sql, *params = mock_db.fetch.call_args[0]
+        assert "kb_id = $1" in sql
+        assert "note_type =" not in sql  # no type filter clause when unfiltered
+        assert kb in params

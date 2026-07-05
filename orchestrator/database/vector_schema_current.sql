@@ -147,6 +147,80 @@ CREATE TABLE public.knowledge_index (
 
 
 --
+-- Name: knowledge_chunk_hybrid_search(text, public.vector, uuid[], text, integer, double precision, double precision, double precision, integer); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.knowledge_chunk_hybrid_search(query_text text, query_embedding public.vector, kb_ids_param uuid[], version_param text DEFAULT NULL::text, match_count integer DEFAULT 15, dense_weight double precision DEFAULT 0.6, sparse_weight double precision DEFAULT 0.3, recency_weight double precision DEFAULT 0.1, rrf_k integer DEFAULT 60) RETURNS SETOF public.knowledge_index
+    LANGUAGE sql
+    SET "hnsw.iterative_scan" TO 'relaxed_order'
+    AS $$
+-- Dense arm: top chunks by vector distance (HNSW), collapsed to the best-ranked
+-- chunk per note. Over-fetch match_count * 4 chunks so a note whose best chunk
+-- ranks behind several other notes' chunks still survives the collapse.
+WITH dense AS (
+    SELECT mid, MIN(rank_ix) AS rank_ix FROM (
+        SELECT c.note_row AS mid,
+               ROW_NUMBER() OVER (
+                   ORDER BY subvector(c.embedding, 1, 4000)::halfvec(4000)
+                            <=> subvector(query_embedding, 1, 4000)::halfvec(4000)
+               ) AS rank_ix
+        FROM knowledge_chunks c
+        JOIN knowledge_index ki ON ki.id = c.note_row
+        WHERE c.kb_id = ANY(kb_ids_param)
+          AND ki.status = 'active'
+          AND c.embedding IS NOT NULL
+          AND (version_param IS NULL OR c.embedding_version = version_param)
+        ORDER BY subvector(c.embedding, 1, 4000)::halfvec(4000)
+                 <=> subvector(query_embedding, 1, 4000)::halfvec(4000)
+        LIMIT match_count * 4
+    ) ranked_chunks
+    GROUP BY mid
+),
+-- Sparse arm: chunk-granular tsvector match, same best-chunk-per-note collapse.
+sparse AS (
+    SELECT mid, MIN(rank_ix) AS rank_ix FROM (
+        SELECT c.note_row AS mid,
+               ROW_NUMBER() OVER (
+                   ORDER BY ts_rank_cd(c.search_doc, websearch_to_tsquery('english', query_text)) DESC
+               ) AS rank_ix
+        FROM knowledge_chunks c
+        JOIN knowledge_index ki ON ki.id = c.note_row
+        WHERE c.kb_id = ANY(kb_ids_param)
+          AND ki.status = 'active'
+          AND (version_param IS NULL OR c.embedding_version = version_param)
+          AND c.search_doc @@ websearch_to_tsquery('english', query_text)
+        ORDER BY ts_rank_cd(c.search_doc, websearch_to_tsquery('english', query_text)) DESC
+        LIMIT match_count * 4
+    ) ranked_chunks
+    GROUP BY mid
+),
+-- Recency arm: note-level freshness, restricted to notes that actually carry
+-- chunks of the current pipeline version (keeps ghosts out — see header).
+recent AS (
+    SELECT ki.id AS mid, ROW_NUMBER() OVER (ORDER BY ki.modified_at DESC) AS rank_ix
+    FROM knowledge_index ki
+    WHERE ki.kb_id = ANY(kb_ids_param) AND ki.status = 'active'
+      AND EXISTS (
+          SELECT 1 FROM knowledge_chunks c
+          WHERE c.note_row = ki.id
+            AND (version_param IS NULL OR c.embedding_version = version_param)
+      )
+    ORDER BY rank_ix LIMIT match_count
+)
+SELECT ki.* FROM (
+    SELECT COALESCE(d.mid, s.mid, r.mid) AS mid,
+        COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
+        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
+        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+    FROM dense d
+             FULL OUTER JOIN sparse s ON d.mid = s.mid
+             FULL OUTER JOIN recent r ON COALESCE(d.mid, s.mid) = r.mid) ranked
+                     JOIN knowledge_index ki ON ranked.mid = ki.id
+ORDER BY ranked.rrf_score DESC LIMIT match_count
+$$;
+
+
+--
 -- Name: knowledge_hybrid_search(text, public.vector, uuid, integer, double precision, double precision, double precision, integer); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -541,6 +615,21 @@ CREATE TABLE public.knowledge_chunks (
 
 
 --
+-- Name: knowledge_links; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.knowledge_links (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    source_note_row uuid NOT NULL,
+    kb_id uuid NOT NULL,
+    source_id character varying(100) NOT NULL,
+    target_id character varying(100) NOT NULL,
+    rel_type text DEFAULT 'references'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+--
 -- Name: memory_retrieval_messages; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -785,6 +874,14 @@ ALTER TABLE ONLY public.knowledge_index
 
 
 --
+-- Name: knowledge_links knowledge_links_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.knowledge_links
+    ADD CONSTRAINT knowledge_links_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: memories memories_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1004,6 +1101,27 @@ CREATE INDEX idx_knowledge_index_stale ON public.knowledge_index USING btree (pr
 --
 
 CREATE INDEX idx_knowledge_kb ON public.knowledge_index USING btree (kb_id);
+
+
+--
+-- Name: idx_knowledge_links_note_row; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_links_note_row ON public.knowledge_links USING btree (source_note_row);
+
+
+--
+-- Name: idx_knowledge_links_source; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_links_source ON public.knowledge_links USING btree (kb_id, source_id);
+
+
+--
+-- Name: idx_knowledge_links_target; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_links_target ON public.knowledge_links USING btree (kb_id, target_id);
 
 
 --
@@ -1260,6 +1378,14 @@ ALTER TABLE ONLY public.job_sources
 
 ALTER TABLE ONLY public.knowledge_chunks
     ADD CONSTRAINT knowledge_chunks_note_row_fkey FOREIGN KEY (note_row) REFERENCES public.knowledge_index(id) ON DELETE CASCADE;
+
+
+--
+-- Name: knowledge_links knowledge_links_source_note_row_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.knowledge_links
+    ADD CONSTRAINT knowledge_links_source_note_row_fkey FOREIGN KEY (source_note_row) REFERENCES public.knowledge_index(id) ON DELETE CASCADE;
 
 
 --
