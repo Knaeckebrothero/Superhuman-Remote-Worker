@@ -295,3 +295,95 @@ class TestEmbedNoteChunks:
         assert rows == []
         assert version == f"qwen3-embedding-8b:4096:{CHUNKER_VERSION}"
         svc.embed_batch.assert_not_awaited()
+
+
+# =============================================================================
+# embed_note_chunks — batch cap (PR3.1)
+# =============================================================================
+
+
+class TestEmbedBatchCap:
+    """Embedding backends cap the inputs-per-request (live: TEI rejects > 64
+    with HTTP 422 "batch size 95 > maximum allowed batch size 64"). The bulk
+    embed for a big note must split into sub-batches, order preserved."""
+
+    def _many_section_note(self, n: int) -> str:
+        return "\n\n".join(f"## H{i}\n\nparagraph {i}" for i in range(n))
+
+    def _recording_service(self):
+        svc = MagicMock()
+        svc.model = "qwen3-embedding-8b"
+        svc.expected_dimensions = 4096
+        calls = []
+        counter = {"n": 0}
+
+        async def _batch(texts):
+            calls.append(len(texts))
+            out = []
+            for _ in texts:
+                out.append([float(counter["n"])])
+                counter["n"] += 1
+            return out
+
+        svc.embed_batch = AsyncMock(side_effect=_batch)
+        return svc, calls
+
+    @pytest.mark.asyncio
+    async def test_splits_at_default_max_of_64(self):
+        svc, calls = self._recording_service()
+        rows, _ = await embed_note_chunks(
+            self._many_section_note(130),
+            title="big",
+            note_type="learning",
+            tags=[],
+            embedding_service=svc,
+            target_tokens=4,
+            token_counter=_wc,
+        )
+        assert len(rows) == 130
+        assert calls == [64, 64, 2]
+
+    @pytest.mark.asyncio
+    async def test_order_preserved_across_sub_batches(self):
+        svc, _ = self._recording_service()
+        rows, _ = await embed_note_chunks(
+            self._many_section_note(70),
+            title="big",
+            note_type="learning",
+            tags=[],
+            embedding_service=svc,
+            target_tokens=4,
+            token_counter=_wc,
+        )
+        # the i-th chunk carries the i-th vector overall, across the split
+        assert [r["embedding"] for r in rows] == [[float(i)] for i in range(70)]
+
+    @pytest.mark.asyncio
+    async def test_max_batch_parameter_override(self):
+        svc, calls = self._recording_service()
+        rows, _ = await embed_note_chunks(
+            self._many_section_note(25),
+            title="big",
+            note_type="learning",
+            tags=[],
+            embedding_service=svc,
+            target_tokens=4,
+            token_counter=_wc,
+            max_batch=10,
+        )
+        assert len(rows) == 25
+        assert calls == [10, 10, 5]
+
+    @pytest.mark.asyncio
+    async def test_small_note_stays_one_call(self):
+        svc, calls = self._recording_service()
+        await embed_note_chunks(
+            self._many_section_note(3),
+            title="small",
+            note_type="learning",
+            tags=[],
+            embedding_service=svc,
+            target_tokens=4,
+            token_counter=_wc,
+        )
+        assert calls == [3]

@@ -518,8 +518,8 @@ class KnowledgeStore:
         title: str,
         note_type: str,
         content: str,
-        blob_sha: str,
-        embedding_version: str,
+        blob_sha: Optional[str],
+        embedding_version: Optional[str],
         *,
         status: str = "active",
         confidence: Optional[str] = None,
@@ -537,10 +537,11 @@ class KnowledgeStore:
 
         The metadata half of a reindex write — the dense vectors live on
         ``knowledge_chunks`` (see :meth:`replace_note_chunks`), so this INSERT never
-        touches the ``embedding`` column. ``blob_sha`` is the git-level change
-        signal the reindexer already used to decide this note changed; the row also
-        carries ``project_id = kb_id`` so legacy project-scoped queries keep working
-        through the transition. Returns the row id (for the chunk foreign key).
+        touches the ``embedding`` column. The reindexer passes ``blob_sha`` /
+        ``embedding_version`` as None and stamps them via
+        :meth:`stamp_note_indexed` only after the chunk write succeeds; the row
+        also carries ``project_id = kb_id`` so legacy project-scoped queries keep
+        working through the transition. Returns the row id (for the chunk FK).
         """
         content_hash = self._content_hash(content)
         return await self.db.fetchval(
@@ -584,6 +585,32 @@ class KnowledgeStore:
             content_hash,
             created_at,
             modified_at,
+        )
+
+    async def stamp_note_indexed(
+        self,
+        note_row: uuid.UUID,
+        blob_sha: str,
+        embedding_version: str,
+    ) -> None:
+        """Mark a note's chunks as durably written (PR3.1).
+
+        ``blob_sha``/``embedding_version`` on the note row mean "the chunk set for
+        this git blob is fully persisted" — so the reindexer upserts the note
+        UNSTAMPED, writes chunks, then stamps. A chunk-write failure leaves
+        ``blob_sha`` NULL and the next tree-diff retries the note (a stamped-but-
+        chunkless note would read as up-to-date forever — the live 2026-07-05
+        zero-chunks gap).
+        """
+        await self.db.execute(
+            """
+            UPDATE knowledge_index
+            SET blob_sha = $2, embedding_version = $3
+            WHERE id = $1
+            """,
+            note_row,
+            blob_sha,
+            embedding_version,
         )
 
     async def replace_note_chunks(

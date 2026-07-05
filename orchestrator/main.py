@@ -10399,11 +10399,16 @@ async def _advance_project_loop(
                 str(job["id"])[:8],
                 (merged_sha or "")[:8],
             )
-            # Slice-3 KB freshness (post-merge trigger): the squash just moved
-            # `main`, likely including knowledge/ writes — bring the chunk
-            # index up to the new HEAD. Fire-and-forget: a first full rebuild
-            # can take minutes and must never delay the loop advance; a lost
-            # task self-heals via the leader-gated sweep (blob_sha diff).
+        # Slice-3 KB freshness (post-merge trigger): the squash — or the job's
+        # own direct-to-main kb_write pushes — likely moved knowledge/ on
+        # `main`; bring the chunk index up to the new HEAD. Fires on `empty`
+        # too: knowledge-only jobs (scholars) land notes via kb_write while
+        # their branch diff is empty (live: iter-16 scholar, 2026-07-05), and
+        # the up-to-date short-circuit makes a false fire one HEAD read.
+        # Fire-and-forget: a first full rebuild can take minutes and must
+        # never delay the loop advance; a lost task self-heals via the
+        # leader-gated sweep (blob_sha diff).
+        if merge_status in ("merged", "empty"):
             _kb_project = loop.get("project_id")
             if _kb_project:
 
@@ -10419,7 +10424,7 @@ async def _advance_project_loop(
                 asyncio.create_task(
                     _kb_reindex_after_merge(str(_kb_project), job.get("repo_name"))
                 )
-        elif merge_status == "empty" and is_loop_execution_role(completed_role):
+        if merge_status == "empty" and is_loop_execution_role(completed_role):
             logger.error(
                 "project loop %s: execution job %s COMPLETED but its branch has "
                 "no commits — nothing landed on `main` (F29 family); flagged "
