@@ -352,6 +352,58 @@ class TestSynthesizeVoicePreview:
         )
 
     @pytest.mark.asyncio
+    async def test_custom_text_spoken_verbatim(self):
+        from services.tts import synthesize_voice_preview
+
+        cls, client = _mock_openai(speech=b"PREVIEW")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+            ),
+        ):
+            await synthesize_voice_preview(
+                voice="af_nova",
+                language="en",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                text="  Guten Tag, mein Name ist Klaus.  ",
+            )
+        # Spoken verbatim (stripped), overriding the canned phrase; still no
+        # aux rewrite.
+        assert (
+            client.audio.speech.create.call_args.kwargs["input"]
+            == "Guten Tag, mein Name ist Klaus."
+        )
+        client.chat.completions.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_custom_text_clamped_to_max(self):
+        from services.tts import _PREVIEW_TEXT_MAX, synthesize_voice_preview
+
+        cls, client = _mock_openai(speech=b"PREVIEW")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+            ),
+        ):
+            await synthesize_voice_preview(
+                voice="af_nova",
+                language="en",
+                user_id="u1",
+                postgres_db=_mock_db(),
+                text="x" * (_PREVIEW_TEXT_MAX + 100),
+            )
+        # The service clamps defensively even though the endpoint 422s first.
+        assert (
+            len(client.audio.speech.create.call_args.kwargs["input"])
+            == _PREVIEW_TEXT_MAX
+        )
+
+    @pytest.mark.asyncio
     async def test_returns_none_when_no_tts_model(self):
         from services.tts import synthesize_voice_preview
 
@@ -1080,6 +1132,49 @@ class TestVoiceCapabilitiesEndpoint:
         ):
             result = await main.voice_capabilities(MagicMock())
         assert result == {"tts": False, "stt": True}
+
+
+# ---------------------------------------------------------------------------
+# Voice-preview endpoint: custom sample text passthrough + length cap.
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewEndpoint:
+    @pytest.mark.asyncio
+    async def test_passes_custom_text_and_returns_audio(self):
+        import main
+
+        preview = AsyncMock(return_value=b"AUD")
+        with (
+            patch.object(
+                main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+            ),
+            patch("services.tts.synthesize_voice_preview", preview),
+        ):
+            resp = await main.preview_tts_voice(
+                request=MagicMock(),
+                body={"voice": "af_nova", "text": "hello there"},
+            )
+        assert resp.status_code == 200
+        assert base64.b64decode(json.loads(resp.body)["audio"]) == b"AUD"
+        assert preview.call_args.kwargs["text"] == "hello there"
+
+    @pytest.mark.asyncio
+    async def test_422_on_overlength_text(self):
+        import main
+        from fastapi import HTTPException
+
+        from services.tts import _PREVIEW_TEXT_MAX
+
+        with patch.object(
+            main, "require_approved_user", AsyncMock(return_value={"id": "u1"})
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await main.preview_tts_voice(
+                    request=MagicMock(),
+                    body={"text": "x" * (_PREVIEW_TEXT_MAX + 1)},
+                )
+        assert exc.value.status_code == 422
 
 
 # ---------------------------------------------------------------------------

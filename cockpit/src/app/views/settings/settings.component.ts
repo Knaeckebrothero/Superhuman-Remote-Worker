@@ -32,6 +32,7 @@ import {AppThemeToggleComponent} from '../../ui/theme-toggle';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
 import {AppInputComponent} from '../../ui/input';
+import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSelectComponent} from '../../ui/select';
 import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppFormFieldComponent} from '../../ui/form-field';
@@ -66,6 +67,7 @@ const EXPIRY_OPTIONS = [
     TranslocoPipe,
     AppButtonComponent,
     AppInputComponent,
+    AppTextareaComponent,
     AppSelectComponent,
     AppCheckboxComponent,
     AppFormFieldComponent,
@@ -114,6 +116,16 @@ const EXPIRY_OPTIONS = [
             <h2 class="section-title">{{ 'settings.voice.title' | transloco }}</h2>
             <p class="section-desc">{{ 'settings.voice.desc' | transloco }}</p>
             <div class="form-block">
+              <app-form-field
+                [label]="'settings.voice.provider' | transloco"
+                [hint]="'settings.voice.providerHint' | transloco"
+              >
+                <app-select [value]="ttsModel()" (changed)="setTtsModel($any($event))">
+                  @for (m of modelService.ttsModels(); track m.id) {
+                    <option [value]="m.id">{{ m.label }}{{ !ttsModelOverridden() && m.id === resolved().default_tts_model ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  }
+                </app-select>
+              </app-form-field>
               <app-form-field [label]="'settings.voice.label' | transloco">
                 @if (ttsVoices().length > 0) {
                   <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
@@ -138,6 +150,16 @@ const EXPIRY_OPTIONS = [
                   }
                 </p>
               }
+              <app-form-field [label]="'settings.voice.sampleLabel' | transloco">
+                <app-textarea
+                  [value]="previewText()"
+                  (valueChange)="onPreviewTextChange($event)"
+                  [rows]="2"
+                  size="sm"
+                  [placeholder]="'settings.voice.samplePlaceholder' | transloco"
+                />
+                <p class="voice-sample-hint">{{ 'settings.voice.sampleHint' | transloco: {left: previewCharsLeft()} }}</p>
+              </app-form-field>
               <div class="voice-preview-row">
                 <app-button
                   variant="secondary"
@@ -1794,6 +1816,11 @@ const EXPIRY_OPTIONS = [
       line-height: 1.45;
       color: var(--text-muted);
     }
+    .voice-sample-hint {
+      margin: 4px 0 0;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
     .voice-preview-row {
       display: flex;
       align-items: center;
@@ -1836,6 +1863,11 @@ export class SettingsComponent implements OnInit {
     );
   });
   readonly ttsConfigured = computed(() => !!this.ttsModel());
+  /** True when the user has pinned a TTS model (vs following the system
+   * default) — drives the "(default)" annotation on the provider picker. */
+  readonly ttsModelOverridden = computed(
+    () => !!this.settingsService.preferences().default_tts_model,
+  );
   /** Voices offered by the configured backend ([] ⇒ show a free-text field). */
   readonly ttsVoices = computed(() => voicesForModelId(this.ttsModel()));
   /** The configured TTS backend — drives the backend-specific note. */
@@ -1852,6 +1884,22 @@ export class SettingsComponent implements OnInit {
     return tag ? `${voice} [${tag}]` : voice;
   }
 
+  /** Persist the read-aloud provider/model choice. Selecting the resolved
+   * default clears the override (mirrors the aux-model picker); any real change
+   * also clears the voice override, because voice ids are backend-specific — a
+   * Kokoro `af_*` id is meaningless to OpenAI/ElevenLabs, so carrying it over
+   * would make the new backend reject the voice. */
+  setTtsModel(modelId: string): void {
+    if (modelId === this.ttsModel()) return;
+    const resolvedDefault =
+      this.settingsService.resolvedDefaults().default_tts_model ?? '';
+    const override = !modelId || modelId === resolvedDefault ? null : modelId;
+    this.settingsService
+      .updatePreferences({default_tts_model: override, default_tts_voice: null})
+      .subscribe();
+    this.previewFailed.set(false);
+  }
+
   /** Persist the read-aloud voice choice (empty ⇒ clear the override). */
   setTtsVoice(voice: string): void {
     this.settingsService.updatePreferences({default_tts_voice: voice || null}).subscribe();
@@ -1863,6 +1911,20 @@ export class SettingsComponent implements OnInit {
   readonly previewingVoice = signal(false);
   readonly previewFailed = signal(false);
   private previewAudio: HTMLAudioElement | null = null;
+
+  /** Optional custom sample text to audition the voice on (blank ⇒ canned
+   * phrase). Mirrors the server's `_PREVIEW_TEXT_MAX`. */
+  readonly previewTextMax = 500;
+  readonly previewText = signal('');
+  readonly previewCharsLeft = computed(
+    () => this.previewTextMax - this.previewText().length,
+  );
+
+  /** Clamp typed/pasted preview text to the cap so the UI can't submit
+   * something the server would 422. */
+  onPreviewTextChange(text: string): void {
+    this.previewText.set(text.slice(0, this.previewTextMax));
+  }
 
   /**
    * Synthesize and play a short sample of the currently-selected voice so the
@@ -1877,7 +1939,7 @@ export class SettingsComponent implements OnInit {
     this.previewFailed.set(false);
     this.previewingVoice.set(true);
     this.apiService
-      .previewTTSVoice(this.ttsVoice(), this.i18n.activeLang())
+      .previewTTSVoice(this.ttsVoice(), this.i18n.activeLang(), this.previewText())
       .subscribe((result) => {
         this.previewingVoice.set(false);
         if (result === 'unavailable' || result === null) {
