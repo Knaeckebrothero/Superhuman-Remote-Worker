@@ -20,7 +20,7 @@ import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import paramiko
@@ -180,6 +180,15 @@ class RemoteBackend(WorkspaceBackend):
         self._sync_lock = threading.Lock()
         self._shell_initialized = False
 
+        # Reconnect hook: fired after a genuine reconnect in _ensure_connected
+        # (NOT the initial connect()). Lets the agent re-assert files it wrote on
+        # top of the pod's git clone (task_brief.md, bound skills) that a pod
+        # tear-down + re-provision would have dropped. Kept generic — the backend
+        # knows nothing about *what* gets re-seeded. See
+        # docs/issues/reviewing_parent_pod_reaped_under_critic.md (Issue 4).
+        self._on_reconnect: Optional[Callable[[], None]] = None
+        self._reseeding = False  # re-entrancy guard: the hook writes via us
+
     @property
     def root(self) -> str:
         return self._remote_root
@@ -308,6 +317,13 @@ class RemoteBackend(WorkspaceBackend):
         transport = self._ssh.get_transport()
         return transport is not None and transport.is_active()
 
+    def set_reconnect_hook(self, hook: Optional[Callable[[], None]]) -> None:
+        """Register a callback fired after a genuine reconnect (see
+        ``_ensure_connected``). Used by the agent to idempotently re-assert
+        files it wrote on top of the pod's git clone, which a pod tear-down +
+        re-provision drops (task_brief.md, bound skills)."""
+        self._on_reconnect = hook
+
     def _ensure_connected(self) -> None:
         """Reconnect if the SSH connection is dead.
 
@@ -322,6 +338,22 @@ class RemoteBackend(WorkspaceBackend):
         logger.warning(f"SSH connection to {self._host} lost, reconnecting...")
         self.connect()
         logger.info(f"Reconnected to {self._host}")
+        # A reconnect means the SSH transport died — often because the workspace
+        # pod was torn down and re-provisioned. The new pod has its git clone but
+        # not the files the agent wrote on top, so re-assert them. Guard against
+        # re-entrancy: the hook writes files through us, which re-enters
+        # _ensure_connected (now live → no-op), but a drop mid-hook must not
+        # recurse into the hook again.
+        if self._on_reconnect is not None and not self._reseeding:
+            self._reseeding = True
+            try:
+                self._on_reconnect()
+            except Exception:
+                logger.exception(
+                    "Workspace re-seed hook failed after reconnect (non-fatal)"
+                )
+            finally:
+                self._reseeding = False
 
     def _exec(self, command: str, timeout: int = 30) -> str:
         """Execute a command via SSH and return stdout.
