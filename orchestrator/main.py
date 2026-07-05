@@ -22571,6 +22571,90 @@ async def list_tts_voices(request: Request) -> dict[str, Any]:
     return await list_account_voices(user_id=str(user["id"]), postgres_db=postgres_db)
 
 
+async def _elevenlabs_library_enabled() -> bool:
+    """The Voice Library *add* gate. DECIDED (tts_vendor_providers.md, OQ 1):
+    library adds + designed voices consume the deployment account's plan-limited
+    voice slots, so account-mutating actions ship behind this admin flag —
+    default OFF (fail-closed, unlike the fail-open ``user_experts`` switch).
+    Browsing / previewing the library stays ungated."""
+    try:
+        row = await postgres_db.get_system_setting("tts.elevenlabs_library_enabled")
+    except Exception:
+        logger.exception("elevenlabs_library flag read failed; fail-closed")
+        return False
+    value = (row or {}).get("value") or {}
+    return isinstance(value, dict) and value.get("enabled") is True
+
+
+@app.get("/api/settings/tts/library")
+async def search_tts_library(request: Request) -> dict[str, Any]:
+    """Search the ElevenLabs community Voice Library (read-only, ungated).
+
+    Proxies ``/v1/shared-voices`` server-side (the key never reaches the
+    browser), passing through ``search / language / accent / gender / age /
+    page``. Returns ``{backend, voices, has_more, error, add_enabled}``;
+    ``add_enabled`` mirrors the admin flag so the browser knows whether to offer
+    "Add to deployment". Only ElevenLabs returns results; other backends → empty.
+    Failures degrade to an empty list with a readable ``error``, never a 5xx.
+    """
+    from services.tts import search_voice_library
+
+    user = await require_approved_user(request, postgres_db)
+    q = request.query_params
+    filters = {
+        "search": q.get("search"),
+        "language": q.get("language"),
+        "accent": q.get("accent"),
+        "gender": q.get("gender"),
+        "age": q.get("age"),
+        "page": q.get("page"),
+    }
+    result = await search_voice_library(
+        user_id=str(user["id"]), postgres_db=postgres_db, filters=filters
+    )
+    result["add_enabled"] = await _elevenlabs_library_enabled()
+    return result
+
+
+@app.post("/api/settings/tts/library/add")
+async def add_tts_library_voice(
+    request: Request, body: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
+    """Copy a Library voice into the deployment ElevenLabs account.
+
+    Behind the ``tts.elevenlabs_library_enabled`` admin flag (default off)
+    because it consumes a plan-limited account voice slot shared by every user.
+    On success the account-voice cache is invalidated so the voice appears in the
+    Settings picker immediately. ElevenLabs slot-limit / validation errors
+    surface as a readable message with their status, not a 500."""
+    from services.tts import TtsLibraryError, add_library_voice
+
+    user = await require_approved_user(request, postgres_db)
+    if not await _elevenlabs_library_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="Adding voices from the library is disabled for this deployment.",
+        )
+    public_owner_id = (body.get("public_owner_id") or "").strip()
+    voice_id = (body.get("voice_id") or "").strip()
+    new_name = (body.get("new_name") or "").strip()
+    if not public_owner_id or not voice_id or not new_name:
+        raise HTTPException(
+            status_code=422,
+            detail="public_owner_id, voice_id and new_name are required.",
+        )
+    try:
+        return await add_library_voice(
+            user_id=str(user["id"]),
+            postgres_db=postgres_db,
+            public_owner_id=public_owner_id,
+            voice_id=voice_id,
+            new_name=new_name,
+        )
+    except TtsLibraryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
 # =============================================================================
 # Project API Key Endpoints
 # =============================================================================
@@ -23679,6 +23763,55 @@ async def put_vm_workspaces_settings(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     return _vm_workspaces_response(row)
+
+
+def _tts_library_response(row: dict | None) -> dict[str, Any]:
+    """Shape the ``tts.elevenlabs_library_enabled`` system_settings row for API
+    responses. Absent row → disabled (fail-closed default)."""
+    value = (row or {}).get("value") or {}
+    enabled = bool(isinstance(value, dict) and value.get("enabled") is True)
+    updated_at = (row or {}).get("updated_at")
+    return {
+        "enabled": enabled,
+        "updated_at": updated_at.isoformat() if updated_at is not None else None,
+        "updated_by": (row or {}).get("updated_by"),
+    }
+
+
+@app.get("/api/admin/system-settings/tts_library")
+async def get_tts_library_settings(request: Request) -> dict[str, Any]:
+    """Return the ElevenLabs Voice Library add gate. Admin-only. Absent row is
+    reported as disabled (fail-closed default)."""
+    await _require_admin(request)
+    try:
+        row = await postgres_db.get_system_setting("tts.elevenlabs_library_enabled")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _tts_library_response(row)
+
+
+@app.put("/api/admin/system-settings/tts_library")
+async def put_tts_library_settings(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Toggle the ElevenLabs Voice Library add gate. Admin-only. When disabled
+    (the default), ``POST /api/settings/tts/library/add`` is refused for
+    everyone; browsing and previewing the library stay available regardless.
+    Adds consume the shared deployment account's plan-limited voice slots, hence
+    the gate."""
+    admin = await _require_admin(request)
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="`enabled` must be a boolean")
+    try:
+        row = await postgres_db.upsert_system_setting(
+            "tts.elevenlabs_library_enabled",
+            {"enabled": enabled},
+            updated_by=admin.get("email") or str(admin.get("id", "")),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _tts_library_response(row)
 
 
 # =============================================================================

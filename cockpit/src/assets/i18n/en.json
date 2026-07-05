@@ -514,7 +514,17 @@
       "previewFailed": "Couldn't play a preview — check your TTS setup.",
       "loadingVoices": "Loading voices…",
       "langNote": "Each voice's language is shown in brackets (e.g. [EN-US], [ES], [FR]); [multi] means multilingual.",
-      "kokoroNoGerman": "This backend has no German voice — for German, use an OpenAI (multilingual) voice."
+      "kokoroNoGerman": "This backend has no German voice — for German, use an OpenAI (multilingual) voice.",
+      "libraryToggle": "Browse voice library",
+      "libraryAdminFlag": "Allow adding library voices",
+      "librarySearchPlaceholder": "Search voices (e.g. french english)",
+      "libraryAnyGender": "Any gender",
+      "female": "Female",
+      "male": "Male",
+      "librarySearch": "Search",
+      "libraryAdd": "Add",
+      "libraryAdded": "Added",
+      "libraryEmpty": "No voices found. Try a different search."
     },
     "dataVisibility": {
       "title": "Data visibility",

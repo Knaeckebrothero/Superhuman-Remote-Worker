@@ -1573,6 +1573,285 @@ class TestListAccountVoices:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 — ElevenLabs Voice Library: search proxy + add-to-account.
+# ---------------------------------------------------------------------------
+
+
+def _mock_httpx_post(*, json_body=None, status_code=200):
+    """Fake httpx.AsyncClient whose `.post` returns a response with the given
+    status + JSON body. Usable as `async with ... as c: await c.post(...)`."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json = MagicMock(return_value=json_body if json_body is not None else {})
+    client = MagicMock()
+    client.post = AsyncMock(return_value=resp)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm), client
+
+
+_SHARED_VOICES_BODY = {
+    "has_more": True,
+    "voices": [
+        {
+            "voice_id": "pub_amelie",
+            "public_owner_id": "owner_1",
+            "name": "Amélie",
+            "accent": "french",
+            "gender": "female",
+            "age": "young",
+            "language": "en",
+            "descriptive": "warm",
+            "preview_url": "https://cdn.elevenlabs.io/amelie.mp3",
+            "free_users_allowed": True,
+        }
+    ],
+}
+
+
+class TestMapSharedVoice:
+    def test_maps_fields(self):
+        from services.tts import _map_shared_voice
+
+        out = _map_shared_voice(_SHARED_VOICES_BODY["voices"][0])
+        assert out["id"] == "pub_amelie"
+        assert out["public_owner_id"] == "owner_1"
+        assert out["name"] == "Amélie"
+        assert out["accent"] == "french"
+        # `description` falls back to the library's `descriptive` field.
+        assert out["description"] == "warm"
+        assert out["free"] is True
+
+    def test_missing_fields_degrade(self):
+        from services.tts import _map_shared_voice
+
+        out = _map_shared_voice({"voice_id": "v1", "public_owner_id": "o1"})
+        assert out == {
+            "id": "v1",
+            "public_owner_id": "o1",
+            "name": "v1",
+            "accent": None,
+            "gender": None,
+            "age": None,
+            "language": None,
+            "description": None,
+            "preview_url": None,
+            "free": False,
+        }
+
+
+class TestSearchVoiceLibrary:
+    @pytest.fixture(autouse=True)
+    def _clear_voice_cache(self):
+        from services import tts
+
+        tts._voices_cache.clear()
+        yield
+        tts._voices_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_non_elevenlabs_backend_returns_empty(self):
+        """The library is ElevenLabs-only; other backends short-circuit without
+        an HTTP call."""
+        from services.tts import search_voice_library
+
+        db = _voices_db(tts_model="kokoro")
+        out = await search_voice_library(user_id="u1", postgres_db=db, filters={})
+        assert out == {
+            "backend": "openai",
+            "voices": [],
+            "has_more": False,
+            "error": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_search_passes_filters_and_maps(self):
+        from services.tts import search_voice_library
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        factory, client = _mock_httpx_get(json_body=_SHARED_VOICES_BODY)
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            out = await search_voice_library(
+                user_id="u1",
+                postgres_db=db,
+                filters={"search": "french english", "gender": "female", "page": "0"},
+            )
+        assert out["backend"] == "elevenlabs"
+        assert out["has_more"] is True
+        assert out["voices"][0]["accent"] == "french"
+        # search + gender forwarded; page 0 omitted; page_size defaulted; key server-side.
+        params = client.get.call_args.kwargs["params"]
+        assert params["search"] == "french english"
+        assert params["gender"] == "female"
+        assert "page" not in params
+        assert params["page_size"] == 30
+        assert client.get.call_args.args[0].endswith("/v1/shared-voices")
+        assert client.get.call_args.kwargs["headers"]["xi-api-key"] == "env-key"
+
+    @pytest.mark.asyncio
+    async def test_no_key_returns_error(self):
+        from services.tts import search_voice_library
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            out = await search_voice_library(user_id="u1", postgres_db=db, filters={})
+        assert out["backend"] == "elevenlabs"
+        assert out["voices"] == []
+        assert out["error"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_degrades_with_error(self):
+        """A 5xx/timeout from ElevenLabs must not 500 the Settings page — the
+        browser shows a banner, so an empty list + readable error is the
+        contract."""
+        from services.tts import search_voice_library
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        factory, _ = _mock_httpx_get(json_body={}, status_error=RuntimeError("503"))
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            out = await search_voice_library(
+                user_id="u1", postgres_db=db, filters={"search": "x"}
+            )
+        assert out["voices"] == []
+        assert out["error"]
+
+
+class TestAddLibraryVoice:
+    @pytest.fixture(autouse=True)
+    def _clear_voice_cache(self):
+        from services import tts
+
+        tts._voices_cache.clear()
+        yield
+        tts._voices_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_add_success_returns_id_and_invalidates_cache(self):
+        from services import tts
+        from services.tts import add_library_voice
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        # Seed the account-voice cache so we can prove the add invalidates it —
+        # the new voice must show up in the Settings picker immediately.
+        tts._voices_cache["stale"] = (tts._now(), [{"id": "old"}])
+        factory, client = _mock_httpx_post(json_body={"voice_id": "acct_new"})
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            out = await add_library_voice(
+                user_id="u1",
+                postgres_db=db,
+                public_owner_id="owner_1",
+                voice_id="pub_amelie",
+                new_name="Amélie",
+            )
+        assert out == {"voice_id": "acct_new", "name": "Amélie"}
+        assert tts._voices_cache == {}  # invalidated
+        assert client.post.call_args.args[0].endswith(
+            "/v1/voices/add/owner_1/pub_amelie"
+        )
+        assert client.post.call_args.kwargs["json"] == {"new_name": "Amélie"}
+        assert client.post.call_args.kwargs["headers"]["xi-api-key"] == "env-key"
+
+    @pytest.mark.asyncio
+    async def test_slot_limit_raises_readable_error(self):
+        """ElevenLabs' voice-slot-limit 400 becomes a readable TtsLibraryError
+        carrying its status — never a bare 500."""
+        from services.tts import TtsLibraryError, add_library_voice
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        factory, _ = _mock_httpx_post(
+            json_body={
+                "detail": {
+                    "status": "voice_limit_reached",
+                    "message": "You have reached your voice limit.",
+                }
+            },
+            status_code=400,
+        )
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            with pytest.raises(TtsLibraryError) as exc:
+                await add_library_voice(
+                    user_id="u1",
+                    postgres_db=db,
+                    public_owner_id="o",
+                    voice_id="v",
+                    new_name="X",
+                )
+        assert exc.value.status_code == 400
+        assert "voice limit" in exc.value.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_non_elevenlabs_backend_raises(self):
+        from services.tts import TtsLibraryError, add_library_voice
+
+        db = _voices_db(tts_model="kokoro")
+        with pytest.raises(TtsLibraryError) as exc:
+            await add_library_voice(
+                user_id="u1",
+                postgres_db=db,
+                public_owner_id="o",
+                voice_id="v",
+                new_name="X",
+            )
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_network_failure_raises_502(self):
+        from services.tts import TtsLibraryError, add_library_voice
+
+        db = _voices_db(
+            tts_model="eleven_multilingual_v2",
+            params_json={"provider": "elevenlabs"},
+        )
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=RuntimeError("boom"))
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        factory = MagicMock(return_value=cm)
+        with (
+            patch("services.tts.httpx.AsyncClient", factory),
+            patch.dict(os.environ, {"ELEVENLABS_API_KEY": "env-key"}),
+        ):
+            with pytest.raises(TtsLibraryError) as exc:
+                await add_library_voice(
+                    user_id="u1",
+                    postgres_db=db,
+                    public_owner_id="o",
+                    voice_id="v",
+                    new_name="X",
+                )
+        assert exc.value.status_code == 502
+
+
+# ---------------------------------------------------------------------------
 # Streaming chunk plan: sentinel parsing + stream_tts_chunks generator.
 # ---------------------------------------------------------------------------
 

@@ -514,7 +514,17 @@
       "previewFailed": "Vorschau konnte nicht abgespielt werden — bitte TTS-Einrichtung prüfen.",
       "loadingVoices": "Stimmen werden geladen…",
       "langNote": "Die Sprache jeder Stimme steht in Klammern (z. B. [EN-US], [ES], [FR]); [multi] bedeutet mehrsprachig.",
-      "kokoroNoGerman": "Dieses Backend hat keine deutsche Stimme — für Deutsch eine (mehrsprachige) OpenAI-Stimme wählen."
+      "kokoroNoGerman": "Dieses Backend hat keine deutsche Stimme — für Deutsch eine (mehrsprachige) OpenAI-Stimme wählen.",
+      "libraryToggle": "Stimmenbibliothek durchsuchen",
+      "libraryAdminFlag": "Hinzufügen von Bibliotheksstimmen erlauben",
+      "librarySearchPlaceholder": "Stimmen suchen (z. B. french english)",
+      "libraryAnyGender": "Beliebiges Geschlecht",
+      "female": "Weiblich",
+      "male": "Männlich",
+      "librarySearch": "Suchen",
+      "libraryAdd": "Hinzufügen",
+      "libraryAdded": "Hinzugefügt",
+      "libraryEmpty": "Keine Stimmen gefunden. Andere Suche versuchen."
     },
     "dataVisibility": {
       "title": "Datensichtbarkeit",
