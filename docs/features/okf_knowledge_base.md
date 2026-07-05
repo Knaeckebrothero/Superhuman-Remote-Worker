@@ -630,6 +630,10 @@ an evidence-backed answer.
 - Item 4 (numbering chaos) remains open — an orchestrator/prompt concern, not an
   OKF one.
 
+Live verification of this batch is OWED — runbook with known-answer fixtures and
+success criteria: `tests/okf_kb_slice2_straggler_validation.md` (settle the 0.9
+near-duplicate floor there before slice 3 bakes it into the reindex).
+
 ## Open questions
 
 - **Datasource shape**: new `kb` type vs. `repository` + `format: okf` flag. Leaning new
