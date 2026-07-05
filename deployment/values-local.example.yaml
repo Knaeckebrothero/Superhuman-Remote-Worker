@@ -88,6 +88,14 @@ secrets:
     # https://app.tavily.com (free tier available), then `helm upgrade`.
     TAVILY_API_KEY: ""
 
+    # ElevenLabs API key for the premium TTS read-aloud voice provider (accented,
+    # expressive voices + Voice Library). One account per deployment; the key
+    # stays orchestrator-side (TTS is orchestrator-only, never fanned out to
+    # agents). Leave blank to skip — Kokoro/OpenAI still work. Get a key at
+    # https://elevenlabs.io, then `helm upgrade`. See
+    # docs/features/tts_vendor_providers.md for registering the voice model row.
+    ELEVENLABS_API_KEY: ""
+
     # App DBs (dev passwords, never rotate locally)
     POSTGRES_USER: "srw"
     POSTGRES_PASSWORD: "dev_pg_password"
