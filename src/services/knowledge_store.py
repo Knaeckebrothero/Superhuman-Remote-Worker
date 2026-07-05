@@ -114,6 +114,71 @@ class KnowledgeRecord:
         )
 
 
+@dataclass
+class KbWatermark:
+    """The as-of git commit a KB's index was built from (slice 3, §5.1).
+
+    One row per KB in ``kb_index_watermark``. The incremental reindexer (PR3)
+    diffs the repo HEAD against ``indexed_commit`` and re-embeds only the changed
+    blobs; ``pipeline_version`` (model id + dims + chunker version) invalidates the
+    whole KB when it changes, forcing a full rebuild.
+    """
+
+    kb_id: Optional[uuid.UUID] = None
+    repo_name: Optional[str] = None
+    branch: Optional[str] = None
+    indexed_commit: Optional[str] = None
+    pipeline_version: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> "KbWatermark":
+        """Create a KbWatermark from a database row dict."""
+        return cls(
+            kb_id=row.get("kb_id"),
+            repo_name=row.get("repo_name"),
+            branch=row.get("branch"),
+            indexed_commit=row.get("indexed_commit"),
+            pipeline_version=row.get("pipeline_version"),
+            updated_at=row.get("updated_at"),
+        )
+
+
+@dataclass
+class KnowledgeChunk:
+    """A single heading-aware chunk of a note (slice 3, §5.1).
+
+    In the chunk-granular model the dense vector lives on chunk rows
+    (``knowledge_chunks``), not the note row. ``heading_path`` is the breadcrumb
+    (``"Design > Storage > Chunking"``) prepended to the embed text; ``chunk_ix``
+    is the 0-based position within the note. The raw ``embedding`` is not carried
+    on the dataclass (mirrors KnowledgeRecord — vectors stay in the DB).
+    """
+
+    id: Optional[uuid.UUID] = None
+    note_row: Optional[uuid.UUID] = None
+    kb_id: Optional[uuid.UUID] = None
+    chunk_ix: int = 0
+    heading_path: Optional[str] = None
+    content: str = ""
+    embedding_version: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    @classmethod
+    def from_row(cls, row: Dict[str, Any]) -> "KnowledgeChunk":
+        """Create a KnowledgeChunk from a database row dict."""
+        return cls(
+            id=row.get("id"),
+            note_row=row.get("note_row"),
+            kb_id=row.get("kb_id"),
+            chunk_ix=row.get("chunk_ix", 0),
+            heading_path=row.get("heading_path"),
+            content=row.get("content", ""),
+            embedding_version=row.get("embedding_version"),
+            created_at=row.get("created_at"),
+        )
+
+
 class KnowledgeStore:
     """pgvector search index for project knowledge base.
 
@@ -344,6 +409,208 @@ class KnowledgeStore:
             """,
             project_id,
             note_id,
+        )
+        return result is not None
+
+    # =========================================================================
+    # Chunk-granular index — OKF files-canonical KB slice 3 (§5.1)
+    #
+    # Inert persistence primitives: the git-tree reindexer (PR3) writes these and
+    # the retrieval cutover (PR4) reads them. Nothing in the running system calls
+    # them yet — the schema (0008_kb_index_chunking.sql) and this surface land
+    # together so PR3/PR4 are pure query code.
+    # =========================================================================
+
+    async def get_watermark(self, kb_id: uuid.UUID) -> Optional[KbWatermark]:
+        """The index watermark for a KB, or ``None`` if never indexed.
+
+        PR3 reads this to learn the commit the index was built as-of, then diffs
+        the repo HEAD against it.
+        """
+        row = await self.db.fetchrow(
+            "SELECT * FROM kb_index_watermark WHERE kb_id = $1",
+            kb_id,
+        )
+        return KbWatermark.from_row(dict(row)) if row else None
+
+    async def upsert_watermark(
+        self,
+        kb_id: uuid.UUID,
+        repo_name: Optional[str],
+        branch: Optional[str],
+        indexed_commit: Optional[str],
+        pipeline_version: Optional[str],
+    ) -> None:
+        """Record (or advance) the as-of commit for a KB's index.
+
+        PR3 calls this once, at the END of a reindex — the watermark advances only
+        after every changed row is written, so an interrupted run leaves the old
+        commit and the next run re-diffs from there (per-row ``blob_sha`` skips the
+        already-current rows).
+        """
+        await self.db.execute(
+            """
+            INSERT INTO kb_index_watermark
+                (kb_id, repo_name, branch, indexed_commit, pipeline_version, updated_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            ON CONFLICT (kb_id) DO UPDATE
+               SET repo_name = $2,
+                   branch = $3,
+                   indexed_commit = $4,
+                   pipeline_version = $5,
+                   updated_at = NOW()
+            """,
+            kb_id,
+            repo_name,
+            branch,
+            indexed_commit,
+            pipeline_version,
+        )
+
+    async def get_indexed_blob_shas(self, kb_id: uuid.UUID) -> Dict[str, str]:
+        """``{path: blob_sha}`` for every indexed note in a KB.
+
+        The tree-diff reindexer (PR3) compares this against the git tree's
+        ``{path: blob_sha}`` map to decide which notes changed, were added, or were
+        removed — the per-row self-heal that makes interrupted re-runs cheap.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT path, blob_sha FROM knowledge_index
+            WHERE kb_id = $1 AND path IS NOT NULL
+            """,
+            kb_id,
+        )
+        return {r["path"]: r["blob_sha"] for r in rows}
+
+    async def upsert_kb_note(
+        self,
+        kb_id: uuid.UUID,
+        note_id: str,
+        path: str,
+        title: str,
+        note_type: str,
+        content: str,
+        blob_sha: str,
+        embedding_version: str,
+        *,
+        status: str = "active",
+        confidence: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        keywords: Optional[List[str]] = None,
+        retrieval_messages: Optional[List[str]] = None,
+        superseded_by: Optional[str] = None,
+        invalidated_at: Optional[datetime] = None,
+        job_id: Optional[uuid.UUID] = None,
+        phase: Optional[int] = None,
+        created_at: Optional[datetime] = None,
+        modified_at: Optional[datetime] = None,
+    ) -> uuid.UUID:
+        """Upsert a note-level row keyed by ``(kb_id, path)``.
+
+        The metadata half of a reindex write — the dense vectors live on
+        ``knowledge_chunks`` (see :meth:`replace_note_chunks`), so this INSERT never
+        touches the ``embedding`` column. ``blob_sha`` is the git-level change
+        signal the reindexer already used to decide this note changed; the row also
+        carries ``project_id = kb_id`` so legacy project-scoped queries keep working
+        through the transition. Returns the row id (for the chunk foreign key).
+        """
+        content_hash = self._content_hash(content)
+        return await self.db.fetchval(
+            """
+            INSERT INTO knowledge_index
+                (kb_id, project_id, note_id, path, title, note_type, content,
+                 status, confidence, tags, keywords, retrieval_messages,
+                 blob_sha, embedding_version, superseded_by, invalidated_at,
+                 job_id, phase, content_hash, created_at, modified_at, indexed_at)
+            VALUES
+                ($1, $1, $2, $3, $4, $5, $6,
+                 $7, $8, $9, $10, $11,
+                 $12, $13, $14, $15,
+                 $16, $17, $18, $19, $20, NOW())
+            ON CONFLICT (kb_id, path) WHERE kb_id IS NOT NULL AND path IS NOT NULL
+            DO UPDATE SET
+                note_id = $2, title = $4, note_type = $5, content = $6,
+                status = $7, confidence = $8, tags = $9, keywords = $10,
+                retrieval_messages = $11, blob_sha = $12, embedding_version = $13,
+                superseded_by = $14, invalidated_at = $15, job_id = $16,
+                phase = $17, content_hash = $18, modified_at = $20, indexed_at = NOW()
+            RETURNING id
+            """,
+            kb_id,
+            note_id,
+            path,
+            title,
+            note_type,
+            content,
+            status,
+            confidence,
+            tags or [],
+            keywords or [],
+            retrieval_messages or [],
+            blob_sha,
+            embedding_version,
+            superseded_by,
+            invalidated_at,
+            job_id,
+            phase,
+            content_hash,
+            created_at,
+            modified_at,
+        )
+
+    async def replace_note_chunks(
+        self,
+        note_row: uuid.UUID,
+        kb_id: uuid.UUID,
+        chunks: List[Dict[str, Any]],
+        embedding_version: str,
+    ) -> int:
+        """Replace a note's chunk rows wholesale — delete all, insert the new set.
+
+        Called by the reindexer right after :meth:`upsert_kb_note`; the delete keeps
+        chunk_ix contiguous when a note shrinks. Each chunk is a dict with
+        ``chunk_ix``, ``content``, ``embedding`` (and optional ``heading_path``);
+        ``search_doc`` is computed at write time so the sparse arm needs no trigger.
+        Returns the number of chunks written.
+        """
+        await self.db.execute(
+            "DELETE FROM knowledge_chunks WHERE note_row = $1",
+            note_row,
+        )
+        for ch in chunks:
+            await self.db.execute(
+                """
+                INSERT INTO knowledge_chunks
+                    (note_row, kb_id, chunk_ix, heading_path, content,
+                     embedding, search_doc, embedding_version)
+                VALUES ($1, $2, $3, $4, $5, $6, to_tsvector('english', $5), $7)
+                """,
+                note_row,
+                kb_id,
+                ch["chunk_ix"],
+                ch.get("heading_path"),
+                ch["content"],
+                self._prepare_embedding(ch["embedding"]),
+                embedding_version,
+            )
+        return len(chunks)
+
+    async def delete_kb_note(self, kb_id: uuid.UUID, path: str) -> bool:
+        """Remove a note by ``(kb_id, path)``; its chunks cascade away.
+
+        The reindexer calls this for notes that vanished from the git tree. The
+        ``ON DELETE CASCADE`` on ``knowledge_chunks.note_row`` reaps the chunk rows.
+        Returns True if a row was deleted.
+        """
+        result = await self.db.fetchval(
+            """
+            DELETE FROM knowledge_index
+            WHERE kb_id = $1 AND path = $2
+            RETURNING id
+            """,
+            kb_id,
+            path,
         )
         return result is not None
 

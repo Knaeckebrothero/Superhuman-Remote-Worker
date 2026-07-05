@@ -512,6 +512,50 @@ exactly the split-brain this design exists to kill.
    post-merge + job-start + leader-gated-sweeper triggers; `kb reindex --full`. DB write
    path retired (files become canonical, completing the strangler fig). **This slice is
    also what makes the existing `databases.neo4j.enabled` toggle real** (§9.4).
+   **PR breakdown (2026-07-05, mirrors slice 2's split — each inert until PR4 flips):**
+   - **PR1 — schema + store surface** (migration `vector/0008`, additive-only):
+     `knowledge_index` gains `kb_id`, `path` (UNIQUE `(kb_id, path)`), `blob_sha`,
+     `superseded_by`, `invalidated_at`, `embedding_version`; new chunk table
+     (`note_row`, `chunk_ix`, `heading_path`, `embedding`, `embedding_version`) and
+     `kb_index_watermark`; `KnowledgeStore` CRUD for the new shapes. Nothing reads
+     the new columns yet — the live upsert path is untouched.
+     **DONE 2026-07-05 (develop, TDD, uncommitted):** `0008_kb_index_chunking.sql`
+     (halfvec HNSW on chunks mirrors 0005; chunk vector lives on `knowledge_chunks`,
+     not the note row); `KbWatermark`/`KnowledgeChunk` dataclasses + six store
+     primitives (`get_watermark`, `upsert_watermark`, `get_indexed_blob_shas`,
+     `upsert_kb_note`, `replace_note_chunks`, `delete_kb_note`), `project_id = kb_id`
+     backfill so legacy filters keep working. 19 tests in
+     `tests/test_kb_index_chunking.py`; 331 green across the knowledge suites.
+     *PR3 hygiene note:* `upsert_kb_note` targets the `(kb_id, path)` arbiter, so a
+     legacy row sharing `(project_id, note_id)` would collide there — the reindexer's
+     full-rebuild-first / migrated-rows path resolves this (same gate as the
+     historically-retired-frontmatter audit below).
+   - **PR2 — chunker + embed pipeline** (pure, no DB): heading-aware structural
+     chunker (~400–512-token target, sibling merge-up, 10–15 % overlap only on
+     forced mid-section splits), breadcrumb embed-text builder (title/type/tags/
+     heading-path as natural text, never raw YAML), `embedding_version` stamping
+     (model id + dims + chunker version), wire the unused `embed_batch` for bulk.
+   - **PR3 — tree-diff reindexer + triggers**: watermark → git tree diff → parse
+     changed notes (gardener `parse_note_md`) → upsert note+chunk rows / remove
+     deleted → advance watermark; full rebuild re-pointed at the git tree +
+     `kb reindex --full` operator hatch; per-row `blob_sha` interruption self-heal.
+     Triggers: post-merge hook, job-start, leader-gated sweeper.
+   - **PR4 — retrieval cutover + Neo4j demotion**: `search_knowledge` → existing RRF
+     over chunk rows with `kb_id` (over-fetch ~50 → return 15–20, no-op reranker
+     slot, response carries `indexed_commit`); `kb_related`/`kb_provenance`/
+     `kb_contradictions` degrade to 1-hop link-table queries; `create_kb_tools`
+     stops hard-requiring Neo4j (the registry no longer strips `kb_*` on Neo4j-less
+     deployments); DB-first write path retired — files canonical. Preserve the
+     `status='active'` search filter exactly. Port `find_near_duplicate_pairs` to
+     the new schema — which forces the **near-duplicate definition under chunking**
+     (note-level representative embedding vs. max chunk-pair similarity): decide
+     here with the runbook's self-join SQL against live data.
+   **Migration-hygiene prerequisite (before PR3/PR4 land, zero-job, offline):** the
+   reindex reads truth from *files* — audit the vault for historically-retired notes
+   whose file frontmatter still says `active` (retired before `_update_existing`'s
+   dual-write existed) and repair, or the cutover resurrects them. This is
+   `tests/okf_kb_slice2_straggler_validation.md` §1+2 promoted to a slice-3 gate.
+   Sequencing: PR1 ∥ PR2, PR3 needs both, PR4 last.
 4. **KB datasource type + auto-attach as project KB** — the unification; Neo4j export
    migration for pre-existing notes. Mechanics (audited 2026-07-03 — most of the
    substrate is already live):
@@ -631,8 +675,15 @@ an evidence-backed answer.
   OKF one.
 
 Live verification of this batch is OWED — runbook with known-answer fixtures and
-success criteria: `tests/okf_kb_slice2_straggler_validation.md` (settle the 0.9
-near-duplicate floor there before slice 3 bakes it into the reindex).
+success criteria: `tests/okf_kb_slice2_straggler_validation.md`. **Sequencing
+corrected 2026-07-05: slice 3 does NOT wait on this runbook.** The 0.9
+near-duplicate floor is a parameter, not architecture — and slice 3 re-embeds the
+corpus (chunked, breadcrumb-prefixed, new `embedding_version`), shifting similarity
+distributions, so the floor is re-judged *after* the re-embed with the same
+self-join SQL. The runbook's only slice-3 gate is the offline frontmatter status
+audit (§1+2 — promoted into the slice-3 entry above as migration hygiene, zero
+jobs needed); the curator Garden E2E validates prompts, not slice-3 design, and
+accumulates passively while the loop runs.
 
 ## Open questions
 
