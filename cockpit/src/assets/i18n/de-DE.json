@@ -503,7 +503,9 @@
       "desc": "Die Stimme, mit der eine Assistenten-Nachricht vorgelesen wird. Gilt ab sofort für jedes Vorlesen.",
       "label": "Stimme",
       "auto": "Standard (automatisch)",
-      "customPlaceholder": "Stimmen-ID"
+      "customPlaceholder": "Stimmen-ID",
+      "preview": "Stimme anhören",
+      "previewFailed": "Vorschau konnte nicht abgespielt werden — bitte TTS-Einrichtung prüfen."
     },
     "dataVisibility": {
       "title": "Datensichtbarkeit",

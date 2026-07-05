@@ -126,6 +126,21 @@ const EXPIRY_OPTIONS = [
                   />
                 }
               </app-form-field>
+              <div class="voice-preview-row">
+                <app-button
+                  variant="secondary"
+                  size="sm"
+                  [loading]="previewingVoice()"
+                  [disabled]="previewingVoice()"
+                  (clicked)="previewVoice()"
+                >
+                  <app-icon size="sm">play_arrow</app-icon>
+                  {{ 'settings.voice.preview' | transloco }}
+                </app-button>
+                @if (previewFailed()) {
+                  <span class="voice-preview-error">{{ 'settings.voice.previewFailed' | transloco }}</span>
+                }
+              </div>
             </div>
           </section>
         }
@@ -1761,6 +1776,17 @@ const EXPIRY_OPTIONS = [
       .codex-account-row > * { min-width: 0; }
       .codex-account-row .mono { overflow-wrap: anywhere; }
     }
+    .voice-preview-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .voice-preview-row app-icon { margin-right: 4px; }
+    .voice-preview-error {
+      font-size: 13px;
+      color: var(--danger);
+    }
   `],
 })
 export class SettingsComponent implements OnInit {
@@ -1779,10 +1805,17 @@ export class SettingsComponent implements OnInit {
   readonly providers = PROVIDERS;
 
   // ── Read-aloud voice ──────────────────────────────────────────────
-  /** The TTS model in effect (user override or system default). */
+  /** The TTS model in effect (user override or system default). The resolved
+   * default lives on the service's `resolvedDefaults` signal — SettingsService
+   * strips `_resolved` off `preferences` — so read it from there, not from
+   * `preferences()._resolved` (which is always undefined). */
   readonly ttsModel = computed(() => {
     const p = this.settingsService.preferences();
-    return p.default_tts_model || p._resolved?.default_tts_model || '';
+    return (
+      p.default_tts_model ||
+      this.settingsService.resolvedDefaults().default_tts_model ||
+      ''
+    );
   });
   readonly ttsConfigured = computed(() => !!this.ttsModel());
   /** Voices offered by the configured backend ([] ⇒ show a free-text field). */
@@ -1795,6 +1828,46 @@ export class SettingsComponent implements OnInit {
   /** Persist the read-aloud voice choice (empty ⇒ clear the override). */
   setTtsVoice(voice: string): void {
     this.settingsService.updatePreferences({default_tts_voice: voice || null}).subscribe();
+    // A fresh selection invalidates any earlier preview error.
+    this.previewFailed.set(false);
+  }
+
+  /** In-flight + last-error state for the "preview voice" button. */
+  readonly previewingVoice = signal(false);
+  readonly previewFailed = signal(false);
+  private previewAudio: HTMLAudioElement | null = null;
+
+  /**
+   * Synthesize and play a short sample of the currently-selected voice so the
+   * user can hear it before committing. Empty voice ('' = Auto) is resolved
+   * server-side exactly like normal read-aloud.
+   */
+  previewVoice(): void {
+    if (this.previewingVoice()) return;
+    // Stop any clip still playing from a previous press.
+    this.previewAudio?.pause();
+    this.previewAudio = null;
+    this.previewFailed.set(false);
+    this.previewingVoice.set(true);
+    this.apiService
+      .previewTTSVoice(this.ttsVoice(), this.i18n.activeLang())
+      .subscribe((result) => {
+        this.previewingVoice.set(false);
+        if (result === 'unavailable' || result === null) {
+          this.previewFailed.set(true);
+          return;
+        }
+        const url = URL.createObjectURL(result);
+        const audio = new Audio(url);
+        this.previewAudio = audio;
+        audio.addEventListener('ended', () => URL.revokeObjectURL(url));
+        // The click is a user gesture, so autoplay policy permits play();
+        // guard anyway so a rejection surfaces as the error hint, not a throw.
+        audio.play().catch(() => {
+          this.previewFailed.set(true);
+          URL.revokeObjectURL(url);
+        });
+      });
   }
 
   // MCP token form state

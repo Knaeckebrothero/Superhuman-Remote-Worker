@@ -964,6 +964,34 @@ export class ApiService {
   }
 
   /**
+   * Synthesize a short canned phrase in a candidate voice, for the settings
+   * voice picker's "preview" button. `voice` may be `''` (Auto — resolved
+   * server-side like normal read-aloud). Returns the MP3 blob, `'unavailable'`
+   * (204 — no TTS model configured), or `null` on error.
+   */
+  previewTTSVoice(
+    voice: string,
+    language = 'en',
+  ): Observable<Blob | 'unavailable' | null> {
+    return this.http
+      .post<{audio: string}>(
+        `${this.baseUrl}/settings/tts/preview`,
+        {voice, language},
+        {observe: 'response'},
+      )
+      .pipe(
+        map((resp) => {
+          if (resp.status === 204 || !resp.body) return 'unavailable' as const;
+          return this.decodeBase64ToBlob(resp.body.audio, 'audio/mpeg');
+        }),
+        catchError((error) => {
+          console.error('Failed to preview TTS voice:', error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
    * Plan a (possibly long) message into ordered, speakable chunks for
    * sequential synthesis + playback. Returns `{chunks, rewritten}` — `rewritten`
    * is `false` when the auxiliary LLM was unavailable and the raw markdown was
