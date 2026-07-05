@@ -158,9 +158,7 @@ def _derive_loop_counters(
     return seq_index, iteration, remaining
 
 
-async def _heal_wedged_loop(
-    db: Any, loop: dict[str, Any]
-) -> dict[str, Any] | None:
+async def _heal_wedged_loop(db: Any, loop: dict[str, Any]) -> dict[str, Any] | None:
     """Re-point a running loop with no current_job_id at its newest job.
 
     Returns the full job row on success so the caller can continue straight

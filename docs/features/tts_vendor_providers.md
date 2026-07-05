@@ -190,14 +190,42 @@ OpenAI key). Expected to ride the existing seam untouched.
 *Accept*: German read-aloud works end-to-end; picker shows `[multi]` tags;
 preview works; `instructions` param honored from `params_json`.
 
-**Phase 4 — ElevenLabs synthesis adapter**
-Helm: `ELEVENLABS_API_KEY` (values-local example + ESO template + orchestrator
-env, `optional: true`). Backend: adapter branch + registry row
-(`eleven_multilingual_v2`, `params_json: {provider: "elevenlabs", voice:
-"<default voice_id>"}`). Tests mock the HTTP layer.
+**Phase 4 — ElevenLabs synthesis adapter** — ✅ CODE DONE (2026-07-05)
+Helm: `ELEVENLABS_API_KEY` (values-local example + orchestrator env,
+`optional: true`; ESO needs **no** change — `dataFrom: extract` pulls the whole
+Vault bundle, same as Tavily). Backend: `_synthesize_elevenlabs` (httpx POST
+`/v1/text-to-speech/{voice_id}`, `mp3_44100_128`, 120 s / no-retry) +
+`_resolve_tts_provider` (explicit `params_json.provider` → model-id sniff
+`eleven_*` → default `openai`) + a fork at the top of `_synthesize_speech`
+(before the api-key guard, since ElevenLabs supplies its key from env);
+`provider` threaded from both call sites. 10 unit tests mock the HTTP layer.
 *Accept*: read-aloud + preview + SSE chunk-streaming produce ElevenLabs audio;
 missing key → clean "not configured" (204 on preview), never a crash; usage
 metered per character.
+
+Two implementation facts learned during the build (both feed Phase 5):
+
+- **Key wiring — either path works, adapter is agnostic.** The adapter uses the
+  resolved credential's `api_key` if present, else `os.environ["ELEVENLABS_API_
+  KEY"]`. So a deployment can either (a) set the raw env (Tavily style — what the
+  Helm plumbing above does), or (b) seed an `elevenlabs` row in `systemApiKeys`
+  (idiomatic: it flows through `resolve_capability_credentials` **and** lets a
+  `systemModels` entry auto-seed the model row, since `_seed_system_models` skips
+  providers with no key). Recommend (a) for simplicity; (b) if you want the row
+  to self-seed.
+- **The registry row's default voice can't be seeded.** `_seed_system_models`
+  calls `create_model()` without `params_json`, so a seeded `eleven_*` row has
+  no default `voice_id`. `_pick_voice` would then fall through to the OpenAI
+  `alloy`/`nova` default, which ElevenLabs 404s on. Resolution: the voice comes
+  from the **user's `default_tts_voice`** (the Phase 5 account picker sets a real
+  `voice_id`) or an admin `params_json.voice` edit in Admin → Models. Until
+  Phase 5 ships, set a default via admin edit (a known-public voice id such as
+  Rachel `21m00Tcm4TlvDq8ikWAM` works on every account). The adapter fails loud
+  (logged `None` → 502) if no usable voice resolves — never a silent 404.
+
+Live end-to-end synthesis needs a real key + a registered row + a voice_id
+(user/admin actions, like Phase 3); everything above is unit- and
+import-verified.
 
 **Phase 5 — account voice picker**
 `GET /api/settings/tts/voices` proxy (+5 min cache) + async cockpit picker

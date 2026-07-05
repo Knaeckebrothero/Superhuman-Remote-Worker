@@ -466,6 +466,20 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: TAVILY_API_KEY
                   optional: true
+            # ELEVENLABS_API_KEY — one ElevenLabs account per deployment for the
+            # TTS read-aloud voice provider (docs/features/tts_vendor_providers.md).
+            # TTS runs in-process here (orchestrator-only), so the orchestrator
+            # reads the key directly; it is NOT fanned out to agent/workspace pods.
+            # The adapter (services/tts.py) also accepts the key via the
+            # `elevenlabs` system_api_keys row when seeded — this env is the
+            # simpler Tavily-style path. optional:true so installs without an
+            # ElevenLabs account still start.
+            - name: ELEVENLABS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: ELEVENLABS_API_KEY
+                  optional: true
             # BUILDER_MODEL + BUILDER_LLM_PROVIDER removed in chunk 7 of
             # models_yaml_removal — both resolved from the catalog at
             # request time (system_settings['llm.default_builder_model']
