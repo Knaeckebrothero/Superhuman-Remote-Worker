@@ -287,6 +287,86 @@ class NotificationService:
 
         return results
 
+    async def notify_review_returned_to_manual(
+        self,
+        user_id: str,
+        job_id: str,
+        config_name: str,
+    ) -> dict[str, Any]:
+        """Notify the owner that automated review died and the job is back to manual review.
+
+        Called from ``stale_verification_sweeper`` after
+        ``unstick_reviewing_parents`` flips a parent 'reviewing' →
+        'pending_review' because its critic pipeline died. Mirrors
+        ``notify_automation_auto_disabled``: SSE for real-time cockpit plus an
+        email if the user has that channel enabled. Does NOT respect quiet
+        hours — an unattended job needing manual review should reach the owner
+        promptly. Best-effort; failures are logged, never raised.
+        """
+        if not self._available:
+            return {"error": "NotificationService not initialized"}
+
+        results: dict[str, Any] = {}
+        user_channels = await self._get_user_channels(user_id)
+
+        label = config_name or "job"
+        review_path = f"/inbox?job={job_id}&review=1"
+        subject = "Job needs manual review — automated verification failed"
+        body_md = (
+            f"Automated verification for your **{label}** job did not complete "
+            f"(the review pipeline died), so it has been returned to **manual "
+            f"review**. Open it in the cockpit to approve it or send it back "
+            f"with feedback."
+        )
+
+        # SSE broadcast — real-time cockpit notification.
+        if self._notification_feed:
+            try:
+                self._notification_feed.broadcast(
+                    user_id=user_id,
+                    event_type="review_returned_to_manual",
+                    data={
+                        "job_id": job_id,
+                        "config_name": config_name,
+                        "cockpit_url": f"{self._cockpit_url}{review_path}",
+                    },
+                )
+                results["sse"] = True
+            except Exception as e:
+                logger.warning(
+                    "SSE broadcast failed for review-returned (job=%s): %s",
+                    job_id,
+                    e,
+                )
+                results["sse"] = False
+
+        # Email — only if the user has the email channel enabled and SMTP is
+        # configured. The SSE event is the primary in-cockpit signal.
+        if user_channels.get("email", True) and self._email_service and self._db:
+            try:
+                user = await self._db.get_user(user_id)
+            except Exception:
+                user = None
+            if user and user.get("email"):
+                try:
+                    results[
+                        "email"
+                    ] = await self._email_service.send_system_notification(
+                        to=user["email"],
+                        to_name=user.get("display_name") or "User",
+                        subject=subject,
+                        body_md=body_md,
+                        cockpit_path=review_path,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Email send failed for review-returned (job=%s): %s",
+                        job_id,
+                        e,
+                    )
+                    results["email"] = False
+        return results
+
     async def notify_admins_user_registered(
         self,
         new_user_id: str,
