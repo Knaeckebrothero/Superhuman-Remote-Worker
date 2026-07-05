@@ -525,6 +525,8 @@
       "libraryAdd": "Hinzufügen",
       "libraryAdded": "Hinzugefügt",
       "libraryEmpty": "Keine Stimmen gefunden. Andere Suche versuchen.",
+      "previewCaveat": "„Hörprobe“ ist der Demo-Clip des Anbieters — nutze „Stimme testen“, um die tatsächliche Synthese zu hören, die anders klingen kann.",
+      "libraryPreviewCaveat": "Hörproben sind Demo-Clips des Anbieters und stimmen ggf. nicht mit der synthetisierten Ausgabe überein (Hintergrundrauschen, Klarheit). Füge eine Stimme hinzu und nutze dann „Stimme testen“, um das echte Ergebnis zu hören.",
       "rewriteTitle": "Wie Nachrichten umformuliert werden",
       "rewriteReasoningLabel": "Reasoning beim Umformulieren",
       "rewriteReasoningHint": "Aus ist am schnellsten. Eingeschaltet wird die Umformulierung besser, verzögert aber das erste Audio, während das Modell nachdenkt.",
@@ -1210,7 +1212,13 @@
       "pause": "Pause",
       "prevPart": "Vorheriger Abschnitt",
       "nextPart": "Nächster Abschnitt",
-      "speed": "Wiedergabegeschwindigkeit"
+      "speed": "Wiedergabegeschwindigkeit",
+      "err": {
+        "paymentRequired": "Diese Stimme erfordert einen kostenpflichtigen ElevenLabs-Plan oder mehr Guthaben. Wähle in den Einstellungen eine andere Stimme.",
+        "auth": "Der Sprachanbieter hat seinen API-Schlüssel abgelehnt. Bitte einen Admin, die Anbieter-Einrichtung zu prüfen.",
+        "rateLimit": "Der Sprachanbieter drosselt gerade die Anfragen. Versuche es gleich noch einmal.",
+        "generic": "Audioerzeugung fehlgeschlagen. Bitte erneut versuchen."
+      }
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",

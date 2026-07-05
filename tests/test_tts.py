@@ -1129,6 +1129,52 @@ class TestPlanTtsChunks:
 # ---------------------------------------------------------------------------
 
 
+class TestTtsSynthesisHttpError:
+    """The endpoints map a synthesis code → HTTP status. Critically, "auth" must
+    NOT become 401 — the cockpit auth interceptor redirects to login on 401, so a
+    provider-key problem must not look like the user's own session expiring."""
+
+    def test_status_by_code(self):
+        from main import _tts_synthesis_http_error
+        from services.tts import TtsSynthesisError
+
+        assert (
+            _tts_synthesis_http_error(
+                TtsSynthesisError("x", code="payment_required")
+            ).status_code
+            == 402
+        )
+        assert (
+            _tts_synthesis_http_error(
+                TtsSynthesisError("x", code="rate_limit")
+            ).status_code
+            == 429
+        )
+        # auth + generic → 502 (never 401/403)
+        assert (
+            _tts_synthesis_http_error(TtsSynthesisError("x", code="auth")).status_code
+            == 502
+        )
+        assert (
+            _tts_synthesis_http_error(
+                TtsSynthesisError("x", code="generic")
+            ).status_code
+            == 502
+        )
+
+    def test_detail_is_machine_readable(self):
+        from main import _tts_synthesis_http_error
+        from services.tts import TtsSynthesisError
+
+        exc = _tts_synthesis_http_error(
+            TtsSynthesisError("needs a paid plan", code="payment_required")
+        )
+        assert exc.detail == {
+            "code": "payment_required",
+            "message": "needs a paid plan",
+        }
+
+
 class TestTtsPlanEndpoint:
     def test_route_is_registered(self):
         from main import app
@@ -1405,10 +1451,14 @@ class TestPreviewEndpoint:
 # ---------------------------------------------------------------------------
 
 
-def _mock_httpx(*, content=b"EL_AUDIO", status_error=None):
-    """Fake httpx.AsyncClient usable as `async with ... as client: client.post`."""
+def _mock_httpx(*, content=b"EL_AUDIO", status_code=200, status_error=None):
+    """Fake httpx.AsyncClient usable as `async with ... as client: client.post`.
+    ``status_code`` drives the adapter's success/error branch (it now inspects
+    the status directly rather than calling ``raise_for_status``)."""
     resp = MagicMock()
     resp.content = content
+    resp.status_code = status_code
+    resp.json = MagicMock(return_value={})
     resp.raise_for_status = MagicMock(side_effect=status_error)
     client = MagicMock()
     client.post = AsyncMock(return_value=resp)
@@ -1495,10 +1545,12 @@ class TestElevenLabsAdapter:
         assert audio is None
 
     @pytest.mark.asyncio
-    async def test_none_on_http_error(self):
+    async def test_none_on_generic_http_error(self):
+        """A non-actionable upstream status (5xx) → None (the caller maps that to
+        a generic 502); actionable codes raise instead — see TestTtsErrorSurfacing."""
         from services.tts import _synthesize_elevenlabs
 
-        factory, _ = _mock_httpx(status_error=RuntimeError("401 Unauthorized"))
+        factory, _ = _mock_httpx(status_code=500)
         with patch("services.tts.httpx.AsyncClient", factory):
             audio = await _synthesize_elevenlabs(
                 "hi", model="eleven_multilingual_v2", voice="v", api_key="xi-key"
@@ -2072,6 +2124,177 @@ class TestAddLibraryVoice:
                     new_name="X",
                 )
         assert exc.value.status_code == 502
+
+
+class TestTtsErrorSurfacing:
+    """Actionable synthesis failures (402 needs-paid-plan, 401 auth, 429 rate)
+    carry a code so the UI can say what's wrong instead of a generic failure —
+    the ElevenLabs free-tier "can't use library voices" 402 is the motivating
+    case."""
+
+    def test_error_code_mapping(self):
+        from services.tts import _tts_error_code
+
+        assert _tts_error_code(402) == "payment_required"
+        assert _tts_error_code(401) == "auth"
+        assert _tts_error_code(403) == "auth"
+        assert _tts_error_code(429) == "rate_limit"
+        assert _tts_error_code(500) is None
+        assert _tts_error_code(None) is None
+
+    @pytest.mark.asyncio
+    async def test_elevenlabs_402_raises_payment_required(self):
+        from services.tts import TtsSynthesisError, _synthesize_elevenlabs
+
+        factory, _ = _mock_httpx_post(
+            json_body={
+                "detail": {
+                    "status": "payment_required",
+                    "message": "Free users cannot use library voices via the API.",
+                }
+            },
+            status_code=402,
+        )
+        with patch("services.tts.httpx.AsyncClient", factory):
+            with pytest.raises(TtsSynthesisError) as exc:
+                await _synthesize_elevenlabs(
+                    "hi", model="eleven_multilingual_v2", voice="v1", api_key="k"
+                )
+        assert exc.value.code == "payment_required"
+        assert "library voices" in str(exc.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_elevenlabs_500_returns_none(self):
+        """A transient 5xx has no actionable code → return None (generic 502, the
+        caller may retry), not a raise."""
+        from services.tts import _synthesize_elevenlabs
+
+        factory, _ = _mock_httpx_post(json_body={}, status_code=500)
+        with patch("services.tts.httpx.AsyncClient", factory):
+            out = await _synthesize_elevenlabs(
+                "hi", model="eleven_x", voice="v1", api_key="k"
+            )
+        assert out is None
+
+    @pytest.mark.asyncio
+    async def test_synthesize_speech_propagates_coded_error(self):
+        from services.tts import TtsSynthesisError, _synthesize_speech
+
+        factory, _ = _mock_httpx_post(
+            json_body={"detail": {"message": "pay up"}}, status_code=402
+        )
+        with patch("services.tts.httpx.AsyncClient", factory):
+            with pytest.raises(TtsSynthesisError) as exc:
+                await _synthesize_speech(
+                    "hi",
+                    model="eleven_multilingual_v2",
+                    voice="v1",
+                    base_url=None,
+                    api_key="k",
+                    provider="elevenlabs",
+                )
+        assert exc.value.code == "payment_required"
+
+
+class TestAuxThinkLeakControl:
+    """The rewrite path must apply the aux family's matrix settings.extra_body
+    (MiniMax reasoning_split) so <think> never lands in content — the main agent
+    did this via create_llm; the TTS lane historically didn't ("extra_body layer
+    2")."""
+
+    def test_family_extra_body_from_matrix_minimax(self):
+        from services.tts import _aux_family_extra_body
+
+        # Real matrix: minimax-m3 carries reasoning_split to keep reasoning out of
+        # `content` (returned as a separate reasoning_content field instead).
+        assert _aux_family_extra_body("MiniMax-M3") == {"reasoning_split": True}
+
+    def test_family_extra_body_empty_for_gemma(self):
+        from services.tts import _aux_family_extra_body
+
+        assert _aux_family_extra_body("gemma-4-moe") == {}
+
+    def test_aux_extra_body_merges_reasoning_and_family(self):
+        from services.tts import _aux_extra_body
+
+        # gemma: reasoning toggle only (no family extra_body).
+        assert _aux_extra_body("gemma-4-moe", "off") == {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
+        # minimax: family reasoning_split; its reasoning method is 'none' so no toggle.
+        assert _aux_extra_body("MiniMax-M3", "off") == {"reasoning_split": True}
+
+
+class TestThinkStrip:
+    """Belt-and-suspenders: <think>…</think> reasoning must never be spoken, even
+    if a provider leaks it into content despite reasoning_split."""
+
+    def test_strip_complete_block(self):
+        from services.tts import _strip_think_tags
+
+        assert (
+            _strip_think_tags("<think>reasoning here</think>Hello world.")
+            == "Hello world."
+        )
+
+    def test_strip_multiline_block(self):
+        from services.tts import _strip_think_tags
+
+        t = "<think>\nline1\nline2\n</think>\n\nActual answer."
+        assert _strip_think_tags(t) == "Actual answer."
+
+    def test_unclosed_think_dropped_to_end(self):
+        from services.tts import _strip_think_tags
+
+        assert _strip_think_tags("Answer.<think>truncated reasoning") == "Answer."
+
+    def test_no_think_unchanged(self):
+        from services.tts import _strip_think_tags
+
+        assert _strip_think_tags("Just plain text.") == "Just plain text."
+
+    def test_case_insensitive(self):
+        from services.tts import _strip_think_tags
+
+        assert _strip_think_tags("<THINK>x</THINK>ok") == "ok"
+
+
+class TestThinkStreamStrip:
+    def test_withholds_while_open_then_releases(self):
+        from services.tts import _strip_think_stream
+
+        assert _strip_think_stream("<think>reasoning so f") == ""
+        assert _strip_think_stream("<think>reasoning</think>Hello") == "Hello"
+
+    def test_withholds_partial_open_tag(self):
+        from services.tts import _strip_think_stream
+
+        assert _strip_think_stream("Hello <thi") == "Hello "
+
+    def test_final_releases_partial_tail(self):
+        from services.tts import _strip_think_stream
+
+        assert _strip_think_stream("done <") == "done "  # withheld mid-stream
+        assert _strip_think_stream("done <", final=True) == "done <"
+
+    def test_incremental_diff_matches_stream(self):
+        """Simulate the streaming loop: accumulate deltas (tags split across
+        them), feed only newly-clean text — the think block must vanish and only
+        the answer survive."""
+        from services.tts import _strip_think_stream
+
+        deltas = ["<thi", "nk>let me ", "reason</thi", "nk>The ", "answer is 42."]
+        raw, emitted, out = "", 0, ""
+        for d in deltas:
+            raw += d
+            clean = _strip_think_stream(raw)
+            if len(clean) > emitted:
+                out += clean[emitted:]
+                emitted = len(clean)
+        final = _strip_think_stream(raw, final=True)
+        if len(final) > emitted:
+            out += final[emitted:]
+        assert out == "The answer is 42."
 
 
 # ---------------------------------------------------------------------------

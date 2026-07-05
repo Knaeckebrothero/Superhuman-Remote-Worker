@@ -525,6 +525,8 @@
       "libraryAdd": "Add",
       "libraryAdded": "Added",
       "libraryEmpty": "No voices found. Try a different search.",
+      "previewCaveat": "\"Play sample\" is the provider's demo clip — use \"Preview voice\" to hear the actual synthesis, which can sound different.",
+      "libraryPreviewCaveat": "Samples are provider demo clips and may not match the synthesized output (background noise, clarity). Add a voice, then use \"Preview voice\" to hear the real thing.",
       "rewriteTitle": "How messages are rewritten",
       "rewriteReasoningLabel": "Rewrite reasoning",
       "rewriteReasoningHint": "Off is fastest. Turning it on makes the rewrite smarter but delays the first audio while the model thinks.",
@@ -1210,7 +1212,13 @@
       "pause": "Pause",
       "prevPart": "Previous section",
       "nextPart": "Next section",
-      "speed": "Playback speed"
+      "speed": "Playback speed",
+      "err": {
+        "paymentRequired": "This voice needs a paid ElevenLabs plan or more credit. Try a different voice in Settings.",
+        "auth": "The speech provider rejected its API key. Ask an admin to check the provider setup.",
+        "rateLimit": "The speech provider is rate-limiting right now. Try again in a moment.",
+        "generic": "Audio generation failed. Try again."
+      }
     },
     "code": {
       "expandHint": "Click to expand",

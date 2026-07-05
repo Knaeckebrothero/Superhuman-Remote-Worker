@@ -203,10 +203,13 @@ const EXPIRY_OPTIONS = [
                     {{ 'settings.voice.hostedPreview' | transloco }}
                   </app-button>
                 }
-                @if (previewFailed()) {
-                  <span class="voice-preview-error">{{ 'settings.voice.previewFailed' | transloco }}</span>
+                @if (previewErrorKey()) {
+                  <span class="voice-preview-error">{{ previewErrorKey()! | transloco }}</span>
                 }
               </div>
+              @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
+                <p class="voice-lang-note">{{ 'settings.voice.previewCaveat' | transloco }}</p>
+              }
 
               <!-- How the message is rewritten for speech (all backends). The
                    auxiliary LLM cleans markdown + shapes the text; these two
@@ -307,6 +310,9 @@ const EXPIRY_OPTIONS = [
 
                     @if (libraryError()) {
                       <p class="voice-preview-error">{{ libraryError() }}</p>
+                    }
+                    @if (libraryVoices().length > 0) {
+                      <p class="voice-lang-note">{{ 'settings.voice.libraryPreviewCaveat' | transloco }}</p>
                     }
 
                     <div class="voice-library-results">
@@ -2312,13 +2318,34 @@ export class SettingsComponent implements OnInit {
         next: (res) => {
           this.libraryAddingId.set(null);
           this.libraryAdded.set(v.id);
-          // Refetch the account voices (cache was invalidated server-side) and
-          // select the freshly-added one.
+          const newId = res.voice_id || v.id;
+          // Optimistically show + select the added voice NOW: the account list
+          // is eventually-consistent, so an immediate bare refetch can miss the
+          // just-added voice (that's the "Add did nothing until I toggled
+          // provider" symptom). Insert a local entry built from the library card.
+          const optimistic: TtsAccountVoice = {
+            id: newId,
+            name: v.name,
+            labels: {
+              ...(v.accent ? {accent: v.accent} : {}),
+              ...(v.gender ? {gender: v.gender} : {}),
+            },
+            preview_url: v.preview_url,
+          };
+          if (!this.elevenVoices().some((x) => x.id === newId)) {
+            this.elevenVoices.set([optimistic, ...this.elevenVoices()]);
+          }
+          this._elevenVoicesLoaded = true;
+          this.setTtsVoice(newId);
+          // Reconcile with the server in the background; if the fresh list still
+          // lacks the voice (propagation lag), keep the optimistic entry.
           this.apiService.listTtsVoices().subscribe((r) => {
-            const voices = r.backend === 'elevenlabs' ? r.voices : [];
-            this.elevenVoices.set(voices);
-            this._elevenVoicesLoaded = true;
-            if (res.voice_id) this.setTtsVoice(res.voice_id);
+            if (r.backend !== 'elevenlabs' || r.voices.length === 0) return;
+            this.elevenVoices.set(
+              r.voices.some((x) => x.id === newId)
+                ? r.voices
+                : [optimistic, ...r.voices],
+            );
           });
         },
         error: (err) => {
@@ -2360,20 +2387,34 @@ export class SettingsComponent implements OnInit {
     this.settingsService
       .updatePreferences({default_tts_model: override, default_tts_voice: null})
       .subscribe();
-    this.previewFailed.set(false);
+    this.previewErrorKey.set(null);
   }
 
   /** Persist the read-aloud voice choice (empty ⇒ clear the override). */
   setTtsVoice(voice: string): void {
     this.settingsService.updatePreferences({default_tts_voice: voice || null}).subscribe();
     // A fresh selection invalidates any earlier preview error.
-    this.previewFailed.set(false);
+    this.previewErrorKey.set(null);
   }
 
-  /** In-flight + last-error state for the "preview voice" button. */
+  /** In-flight + last-error state for the "preview voice" button. Holds the
+   * i18n key of the failure message (null = no error), so an actionable
+   * provider error (paid-plan / auth / rate-limit) reads specifically instead
+   * of a generic "couldn't preview". */
   readonly previewingVoice = signal(false);
-  readonly previewFailed = signal(false);
+  readonly previewErrorKey = signal<string | null>(null);
   private previewAudio: HTMLAudioElement | null = null;
+
+  /** Map an actionable TTS error code to its message key (shared wording with
+   * the read-aloud box). */
+  private ttsErrorKey(code: string): string {
+    switch (code) {
+      case 'payment_required': return 'chat.tts.err.paymentRequired';
+      case 'auth': return 'chat.tts.err.auth';
+      case 'rate_limit': return 'chat.tts.err.rateLimit';
+      default: return 'settings.voice.previewFailed';
+    }
+  }
 
   /** Optional custom sample text to audition the voice on (blank ⇒ canned
    * phrase). Mirrors the server's `_PREVIEW_TEXT_MAX`. */
@@ -2399,14 +2440,19 @@ export class SettingsComponent implements OnInit {
     // Stop any clip still playing from a previous press.
     this.previewAudio?.pause();
     this.previewAudio = null;
-    this.previewFailed.set(false);
+    this.previewErrorKey.set(null);
     this.previewingVoice.set(true);
     this.apiService
       .previewTTSVoice(this.ttsVoice(), this.i18n.activeLang(), this.previewText())
       .subscribe((result) => {
         this.previewingVoice.set(false);
         if (result === 'unavailable' || result === null) {
-          this.previewFailed.set(true);
+          this.previewErrorKey.set('settings.voice.previewFailed');
+          return;
+        }
+        if ('errorCode' in result) {
+          // e.g. a free-tier ElevenLabs Library voice → "needs a paid plan".
+          this.previewErrorKey.set(this.ttsErrorKey(result.errorCode));
           return;
         }
         const url = URL.createObjectURL(result);
@@ -2416,7 +2462,7 @@ export class SettingsComponent implements OnInit {
         // The click is a user gesture, so autoplay policy permits play();
         // guard anyway so a rejection surfaces as the error hint, not a throw.
         audio.play().catch(() => {
-          this.previewFailed.set(true);
+          this.previewErrorKey.set('settings.voice.previewFailed');
           URL.revokeObjectURL(url);
         });
       });
