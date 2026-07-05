@@ -616,16 +616,20 @@ async def invalidate_account_voices_cache() -> None:
         _voices_cache.clear()
 
 
-async def list_account_voices(*, user_id: str, postgres_db) -> dict:
-    """Voices the user's configured TTS backend offers, for the Settings picker.
+async def _resolve_elevenlabs_context(
+    *, user_id: str, postgres_db
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the caller's configured TTS backend and — for ElevenLabs — the
+    deployment api key. Returns ``(backend, key)``:
 
-    Returns ``{"backend": <str|None>, "voices": [{id, name, labels,
-    preview_url}]}``. Only ElevenLabs returns a populated list (fetched live
-    from the one-per-deployment account, cached ~5 min); Kokoro/OpenAI return
-    ``voices: []`` because the cockpit holds their static catalogs locally. No
-    TTS model configured → ``backend: None``. A listing failure degrades to an
-    empty list (never raises) so Settings still renders — the voice field just
-    falls back to free-text entry, same as an unrecognized backend."""
+    - ``backend`` is ``None`` when no TTS model is configured, else the resolved
+      backend name (``"kokoro"`` / ``"openai"`` / ``"elevenlabs"`` / …).
+    - ``key`` is the ElevenLabs api key (resolved credential, else the
+      deployment-wide ``ELEVENLABS_API_KEY``) when the backend is ElevenLabs and
+      a key exists; ``None`` for non-ElevenLabs backends or a missing key.
+
+    Shared by the account-voice list and the Voice Library proxies so all three
+    agree on which ElevenLabs account (and key) they're talking to."""
     user_settings = await postgres_db.get_user_settings(user_id) or {}
     resolved_keys = await postgres_db.resolve_api_keys_for_job(
         user_id=user_id, project_id=None
@@ -638,16 +642,33 @@ async def list_account_voices(*, user_id: str, postgres_db) -> dict:
         postgres_db=postgres_db,
     )
     if tts_creds is None:
-        return {"backend": None, "voices": []}
+        return None, None
     tts_model, _tts_base_url, tts_api_key = tts_creds
-
     tts_params = await _resolve_tts_params(tts_model, postgres_db)
     backend = _resolve_tts_provider(tts_model, tts_params.get("provider"))
     if backend != "elevenlabs":
-        # Kokoro / OpenAI voices are static catalogs the cockpit already holds.
-        return {"backend": backend, "voices": []}
-
+        return backend, None
     key = (tts_api_key or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+    return backend, (key or None)
+
+
+async def list_account_voices(*, user_id: str, postgres_db) -> dict:
+    """Voices the user's configured TTS backend offers, for the Settings picker.
+
+    Returns ``{"backend": <str|None>, "voices": [{id, name, labels,
+    preview_url}]}``. Only ElevenLabs returns a populated list (fetched live
+    from the one-per-deployment account, cached ~5 min); Kokoro/OpenAI return
+    ``voices: []`` because the cockpit holds their static catalogs locally. No
+    TTS model configured → ``backend: None``. A listing failure degrades to an
+    empty list (never raises) so Settings still renders — the voice field just
+    falls back to free-text entry, same as an unrecognized backend."""
+    backend, key = await _resolve_elevenlabs_context(
+        user_id=user_id, postgres_db=postgres_db
+    )
+    if backend != "elevenlabs":
+        # None (no model) or a static-catalog backend (Kokoro / OpenAI) — the
+        # cockpit already holds their voice lists locally.
+        return {"backend": backend, "voices": []}
     if not key:
         logger.warning("ElevenLabs voice list: no ELEVENLABS_API_KEY resolved")
         return {"backend": backend, "voices": []}
@@ -670,6 +691,187 @@ async def list_account_voices(*, user_id: str, postgres_db) -> dict:
     async with _voices_lock:
         _voices_cache[cache_key] = (_now(), voices)
     return {"backend": backend, "voices": voices}
+
+
+# ElevenLabs Voice Library (Phase 6 — browse the 10k+ community library and add
+# voices to the deployment account). Browsing/previewing is read-only and free
+# (public CDN previews); *adding* copies a voice into the shared account and
+# consumes a plan-limited voice slot, so the endpoint that calls
+# :func:`add_library_voice` gates it behind an admin flag.
+_LIBRARY_PAGE_SIZE = 30
+
+
+class TtsLibraryError(RuntimeError):
+    """A Voice Library mutation (add) failed in a way worth showing the user —
+    most importantly the account's plan voice-slot limit. Carries a readable
+    ``message`` and an HTTP ``status_code`` so the endpoint surfaces it instead
+    of leaking a bare 500."""
+
+    def __init__(self, message: str, *, status_code: int = 502):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+def _map_shared_voice(v: dict) -> dict:
+    """One ``GET /v1/shared-voices`` entry → a library result card. The shared
+    library exposes accent / gender / age / language as flat fields (not the
+    account voices' ``labels`` dict), plus ``public_owner_id`` — the pair
+    ``(public_owner_id, voice_id)`` is what ``/v1/voices/add`` needs to copy the
+    voice into the deployment account."""
+
+    def _s(*keys: str) -> Optional[str]:
+        for k in keys:
+            val = v.get(k)
+            if isinstance(val, str) and val:
+                return val
+        return None
+
+    return {
+        "id": v.get("voice_id") or "",
+        "public_owner_id": v.get("public_owner_id") or "",
+        "name": v.get("name") or v.get("voice_id") or "",
+        "accent": _s("accent"),
+        "gender": _s("gender"),
+        "age": _s("age"),
+        "language": _s("language"),
+        "description": _s("description", "descriptive"),
+        "preview_url": v.get("preview_url") or None,
+        "free": bool(v.get("free_users_allowed")),
+    }
+
+
+async def _fetch_shared_voices(
+    api_key: str, params: dict, timeout: float = 15.0
+) -> tuple[list[dict], bool]:
+    """Live ``GET /v1/shared-voices`` → ``(mapped cards, has_more)``. Raises on
+    HTTP error so the caller can degrade with a readable message."""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(
+            f"{_ELEVENLABS_BASE}/v1/shared-voices",
+            headers={"xi-api-key": api_key, "accept": "application/json"},
+            params=params,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    if not isinstance(data, dict):
+        return [], False
+    voices = data.get("voices")
+    has_more = bool(data.get("has_more"))
+    if not isinstance(voices, list):
+        return [], has_more
+    return [_map_shared_voice(v) for v in voices if isinstance(v, dict)], has_more
+
+
+async def search_voice_library(*, user_id: str, postgres_db, filters: dict) -> dict:
+    """Search the ElevenLabs community Voice Library (read-only proxy).
+
+    ``filters`` carries optional ``search`` / ``language`` / ``accent`` /
+    ``gender`` / ``age`` / ``page`` passthroughs. Returns ``{"backend",
+    "voices": [...], "has_more": bool, "error": <str|None>}``. Non-ElevenLabs
+    backends (or no TTS model) return an empty list — the library is
+    ElevenLabs-only. A fetch failure degrades to ``voices: []`` with a readable
+    ``error`` rather than a 5xx, so the browser shows a banner, not a crash."""
+    backend, key = await _resolve_elevenlabs_context(
+        user_id=user_id, postgres_db=postgres_db
+    )
+    base = {"backend": backend, "voices": [], "has_more": False, "error": None}
+    if backend != "elevenlabs":
+        return base
+    if not key:
+        return {**base, "error": "ElevenLabs is not configured."}
+
+    params: dict = {"page_size": _LIBRARY_PAGE_SIZE}
+    for name in ("search", "language", "accent", "gender", "age"):
+        raw = filters.get(name)
+        val = raw.strip() if isinstance(raw, str) else raw
+        if val:
+            params[name] = val
+    try:
+        page = int(filters.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    if page > 0:
+        params["page"] = page
+
+    try:
+        voices, has_more = await _fetch_shared_voices(key, params)
+    except Exception:
+        logger.exception("ElevenLabs voice library search failed")
+        return {**base, "error": "Voice library search failed. Try again."}
+    return {"backend": backend, "voices": voices, "has_more": has_more, "error": None}
+
+
+def _elevenlabs_error_message(resp) -> str:
+    """Pull a human-readable message out of an ElevenLabs error response. Their
+    errors are ``{"detail": {"status": ..., "message": ...}}`` or ``{"detail":
+    "..."}``; fall back to a generic line."""
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        detail = body.get("detail")
+        if isinstance(detail, dict):
+            msg = detail.get("message") or detail.get("status")
+            if isinstance(msg, str) and msg:
+                return msg
+        elif isinstance(detail, str) and detail:
+            return detail
+    return f"ElevenLabs returned an error (HTTP {resp.status_code})."
+
+
+async def add_library_voice(
+    *, user_id: str, postgres_db, public_owner_id: str, voice_id: str, new_name: str
+) -> dict:
+    """Copy a Library voice into the deployment ElevenLabs account.
+
+    Proxies ``POST /v1/voices/add/{public_owner_id}/{voice_id}`` (body
+    ``{new_name}``); on success invalidates the account-voice cache so the new
+    voice shows up in the Settings picker immediately. Raises
+    :class:`TtsLibraryError` (readable message + status) on any failure — the
+    important one being the account's plan voice-slot limit, which ElevenLabs
+    returns as a 4xx we translate rather than leak as a 500. Returns
+    ``{"voice_id": <account-scoped id>, "name": <new_name>}``."""
+    backend, key = await _resolve_elevenlabs_context(
+        user_id=user_id, postgres_db=postgres_db
+    )
+    if backend != "elevenlabs":
+        raise TtsLibraryError(
+            "ElevenLabs is not the configured TTS provider.", status_code=400
+        )
+    if not key:
+        raise TtsLibraryError("ElevenLabs is not configured.", status_code=400)
+
+    url = f"{_ELEVENLABS_BASE}/v1/voices/add/{public_owner_id}/{voice_id}"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                url,
+                headers={"xi-api-key": key, "accept": "application/json"},
+                json={"new_name": new_name},
+            )
+    except Exception as exc:
+        logger.exception("ElevenLabs add-voice request failed")
+        raise TtsLibraryError("Could not reach ElevenLabs. Try again.") from exc
+
+    if resp.status_code >= 400:
+        message = _elevenlabs_error_message(resp)
+        logger.warning(
+            "ElevenLabs add-voice rejected (status=%s): %s", resp.status_code, message
+        )
+        # A 4xx from ElevenLabs is a client-actionable condition (slot limit, bad
+        # id) — surface its status so the UI distinguishes "your fault" from 502.
+        status = resp.status_code if 400 <= resp.status_code < 500 else 502
+        raise TtsLibraryError(message, status_code=status)
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    new_id = data.get("voice_id") if isinstance(data, dict) else None
+    await invalidate_account_voices_cache()
+    return {"voice_id": new_id or "", "name": new_name}
 
 
 async def _synthesize_speech(

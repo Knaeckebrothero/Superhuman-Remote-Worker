@@ -27,6 +27,7 @@ import {
   voiceLanguageTag,
   ttsBackendForModelId,
   TtsAccountVoice,
+  TtsLibraryVoice,
 } from '../../core/models/tts-voices';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppThemeToggleComponent} from '../../ui/theme-toggle';
@@ -35,6 +36,7 @@ import {AppButtonComponent} from '../../ui/button';
 import {AppInputComponent} from '../../ui/input';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSelectComponent} from '../../ui/select';
+import {AppSwitchComponent} from '../../ui/switch';
 import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppBadgeComponent} from '../../ui/badge';
@@ -70,6 +72,7 @@ const EXPIRY_OPTIONS = [
     AppInputComponent,
     AppTextareaComponent,
     AppSelectComponent,
+    AppSwitchComponent,
     AppCheckboxComponent,
     AppFormFieldComponent,
     AppBadgeComponent,
@@ -203,6 +206,106 @@ const EXPIRY_OPTIONS = [
                   <span class="voice-preview-error">{{ 'settings.voice.previewFailed' | transloco }}</span>
                 }
               </div>
+
+              <!-- ElevenLabs Voice Library browser (Phase 6): search the 10k+
+                   community library, audition via hosted previews, and (when the
+                   admin add-gate is on) copy a voice into the deployment account. -->
+              @if (ttsBackend() === 'elevenlabs') {
+                <div class="voice-library">
+                  <div class="voice-library-head">
+                    <app-button variant="ghost" size="sm" (clicked)="toggleLibrary()">
+                      <app-icon size="sm">{{ libraryOpen() ? 'expand_less' : 'travel_explore' }}</app-icon>
+                      {{ 'settings.voice.libraryToggle' | transloco }}
+                    </app-button>
+                    @if (userService.currentUser()?.is_admin) {
+                      <label class="voice-library-flag">
+                        <app-switch
+                          size="sm"
+                          [checked]="ttsLibraryFlag()"
+                          [disabled]="ttsLibraryFlagSaving()"
+                          (changed)="setTtsLibraryFlag($event)"
+                        />
+                        <span>{{ 'settings.voice.libraryAdminFlag' | transloco }}</span>
+                      </label>
+                    }
+                  </div>
+
+                  @if (libraryOpen()) {
+                    <div class="voice-library-search">
+                      <app-input
+                        [value]="librarySearch()"
+                        [placeholder]="'settings.voice.librarySearchPlaceholder' | transloco"
+                        (changed)="librarySearch.set($event)"
+                      />
+                      <app-select [value]="libraryGender()" (changed)="libraryGender.set($any($event))">
+                        <option value="">{{ 'settings.voice.libraryAnyGender' | transloco }}</option>
+                        <option value="female">{{ 'settings.voice.female' | transloco }}</option>
+                        <option value="male">{{ 'settings.voice.male' | transloco }}</option>
+                      </app-select>
+                      <app-button
+                        variant="secondary"
+                        size="sm"
+                        [loading]="libraryLoading()"
+                        [disabled]="libraryLoading()"
+                        (clicked)="searchLibrary()"
+                      >
+                        <app-icon size="sm">search</app-icon>
+                        {{ 'settings.voice.librarySearch' | transloco }}
+                      </app-button>
+                    </div>
+
+                    @if (libraryError()) {
+                      <p class="voice-preview-error">{{ libraryError() }}</p>
+                    }
+
+                    <div class="voice-library-results">
+                      @for (v of libraryVoices(); track v.id) {
+                        <div class="voice-library-card" [class.is-added]="libraryAdded() === v.id">
+                          <div class="voice-library-card__info">
+                            <span class="voice-library-card__name">{{ v.name }}</span>
+                            @if (libraryVoiceLabel(v)) {
+                              <span class="voice-library-card__tags">{{ libraryVoiceLabel(v) }}</span>
+                            }
+                          </div>
+                          <div class="voice-library-card__actions">
+                            @if (v.preview_url) {
+                              <app-button
+                                variant="ghost"
+                                size="sm"
+                                [ariaLabel]="'settings.voice.hostedPreview' | transloco"
+                                (clicked)="playLibrarySample(v)"
+                              >
+                                <app-icon size="sm">graphic_eq</app-icon>
+                              </app-button>
+                            }
+                            @if (libraryAddEnabled()) {
+                              @if (libraryAdded() === v.id) {
+                                <span class="voice-library-card__done">
+                                  <app-icon size="sm">check</app-icon>
+                                  {{ 'settings.voice.libraryAdded' | transloco }}
+                                </span>
+                              } @else {
+                                <app-button
+                                  variant="secondary"
+                                  size="sm"
+                                  [loading]="libraryAddingId() === v.id"
+                                  [disabled]="libraryAddingId() !== null"
+                                  (clicked)="addLibraryVoice(v)"
+                                >
+                                  {{ 'settings.voice.libraryAdd' | transloco }}
+                                </app-button>
+                              }
+                            }
+                          </div>
+                        </div>
+                      }
+                      @if (!libraryLoading() && libraryVoices().length === 0 && !libraryError()) {
+                        <p class="voice-lang-note">{{ 'settings.voice.libraryEmpty' | transloco }}</p>
+                      }
+                    </div>
+                  }
+                </div>
+              }
             </div>
           </section>
         }
@@ -1860,6 +1963,79 @@ const EXPIRY_OPTIONS = [
       font-size: 13px;
       color: var(--danger);
     }
+    .voice-library {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+    }
+    .voice-library-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .voice-library-flag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .voice-library-search {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+    .voice-library-search app-input { flex: 1 1 180px; }
+    .voice-library-results {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 12px;
+    }
+    .voice-library-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 10px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: var(--surface-1);
+    }
+    .voice-library-card.is-added { border-color: var(--accent-color); }
+    .voice-library-card__info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .voice-library-card__name {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .voice-library-card__tags {
+      font-size: 12px;
+      color: var(--text-muted);
+      text-transform: capitalize;
+    }
+    .voice-library-card__actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .voice-library-card__done {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      color: var(--accent-color);
+    }
   `],
 })
 export class SettingsComponent implements OnInit {
@@ -1950,6 +2126,119 @@ export class SettingsComponent implements OnInit {
     this.hostedAudio = audio;
     audio.play().catch(() => {
       /* autoplay/network failure — nothing actionable, stay silent */
+    });
+  }
+
+  // ── ElevenLabs Voice Library browser (Phase 6) ────────────────────
+  // A thin skin over the server-proxied `/api/settings/tts/library` search.
+  // Browsing/previewing is free; "Add to deployment" copies a voice into the
+  // shared account and is gated by the admin flag (`libraryAddEnabled`).
+  readonly libraryOpen = signal(false);
+  readonly librarySearch = signal('');
+  readonly libraryGender = signal('');
+  readonly libraryLoading = signal(false);
+  readonly libraryVoices = signal<TtsLibraryVoice[]>([]);
+  readonly libraryError = signal<string | null>(null);
+  /** Mirrors the deployment's add-gate; also reflected by the admin switch. */
+  readonly libraryAddEnabled = signal(false);
+  /** id of the library voice whose add is in-flight (drives its button spinner). */
+  readonly libraryAddingId = signal<string | null>(null);
+  /** id of the library voice just added, for a transient "Added ✓" affordance. */
+  readonly libraryAdded = signal<string | null>(null);
+
+  /** Open/close the library panel; first open kicks off an empty-query search
+   * (the library's default "featured" listing). */
+  toggleLibrary(): void {
+    const open = !this.libraryOpen();
+    this.libraryOpen.set(open);
+    if (open && this.libraryVoices().length === 0 && !this.libraryLoading()) {
+      this.searchLibrary();
+    }
+  }
+
+  /** Run a library search with the current query + gender filter. */
+  searchLibrary(): void {
+    if (this.libraryLoading()) return;
+    this.libraryLoading.set(true);
+    this.libraryError.set(null);
+    this.apiService
+      .searchTtsLibrary({
+        search: this.librarySearch(),
+        gender: this.libraryGender(),
+      })
+      .subscribe((resp) => {
+        this.libraryLoading.set(false);
+        this.libraryAddEnabled.set(resp.add_enabled);
+        this.libraryError.set(resp.error);
+        this.libraryVoices.set(resp.voices);
+      });
+  }
+
+  /** `accent · gender · language`, blanks dropped — the card's subtitle. */
+  libraryVoiceLabel(v: TtsLibraryVoice): string {
+    return [v.accent, v.gender, v.language].filter(Boolean).join(' · ');
+  }
+
+  /** Audition a library voice via its public CDN preview (zero characters). */
+  playLibrarySample(v: TtsLibraryVoice): void {
+    if (!v.preview_url) return;
+    this.hostedAudio?.pause();
+    const audio = new Audio(v.preview_url);
+    this.hostedAudio = audio;
+    audio.play().catch(() => {
+      /* autoplay/network failure — stay silent */
+    });
+  }
+
+  /** Copy a library voice into the deployment account, then refresh the account
+   * picker (the server invalidated its cache) and select the new voice so the
+   * user can immediately preview/use it. */
+  addLibraryVoice(v: TtsLibraryVoice): void {
+    if (this.libraryAddingId()) return;
+    this.libraryAddingId.set(v.id);
+    this.libraryError.set(null);
+    this.apiService
+      .addTtsLibraryVoice({
+        public_owner_id: v.public_owner_id,
+        voice_id: v.id,
+        new_name: v.name,
+      })
+      .subscribe({
+        next: (res) => {
+          this.libraryAddingId.set(null);
+          this.libraryAdded.set(v.id);
+          // Refetch the account voices (cache was invalidated server-side) and
+          // select the freshly-added one.
+          this.apiService.listTtsVoices().subscribe((r) => {
+            const voices = r.backend === 'elevenlabs' ? r.voices : [];
+            this.elevenVoices.set(voices);
+            this._elevenVoicesLoaded = true;
+            if (res.voice_id) this.setTtsVoice(res.voice_id);
+          });
+        },
+        error: (err) => {
+          this.libraryAddingId.set(null);
+          this.libraryError.set(
+            (err?.error?.detail as string) || 'Could not add this voice.',
+          );
+        },
+      });
+  }
+
+  // ── Voice Library admin add-gate (admin-only switch) ──────────────
+  readonly ttsLibraryFlag = signal(false);
+  readonly ttsLibraryFlagSaving = signal(false);
+
+  /** Toggle the deployment-wide "allow adding library voices" flag. */
+  setTtsLibraryFlag(enabled: boolean): void {
+    this.ttsLibraryFlagSaving.set(true);
+    this.apiService.setTtsLibrarySetting(enabled).subscribe({
+      next: (row) => {
+        this.ttsLibraryFlag.set(row.enabled);
+        this.libraryAddEnabled.set(row.enabled);
+        this.ttsLibraryFlagSaving.set(false);
+      },
+      error: () => this.ttsLibraryFlagSaving.set(false),
     });
   }
 
@@ -2228,6 +2517,11 @@ export class SettingsComponent implements OnInit {
         this._adminLoadersFired = true;
         this.loadCodexStatus();
         this.loadCloudSettings();
+        // Seed the Voice Library add-gate switch with its persisted state.
+        this.apiService.getTtsLibrarySetting().subscribe((row) => {
+          this.ttsLibraryFlag.set(row.enabled);
+          this.libraryAddEnabled.set(row.enabled);
+        });
       }
     });
 

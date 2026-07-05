@@ -296,12 +296,59 @@ by name with accent labels (Bella/Sarah/Laura american, **Charlie australian**,
 preview through the selected voice returned a real 33 KB `audio/mpeg`. (The
 user's voice pref was restored to Auto after the test.)
 
-**Phase 6 — Voice Library browser**
+**Phase 6 — Voice Library browser** — ✅ DONE + LIVE-VERIFIED (2026-07-05)
 Search/filter proxy + add-to-account + cockpit browser UI.
 *Accept*: searching "french english" surfaces French-accented English voices;
 preview plays from `preview_url`; Add makes the voice appear in the Phase 5
 picker (cache invalidated); slot-limit errors from ElevenLabs surface as a
 readable message, not a 500.
+
+Implementation:
+
+- **Backend** (`services/tts.py`): factored `_resolve_elevenlabs_context`
+  (backend + key, shared by the voice list and both library proxies).
+  `search_voice_library` proxies `GET /v1/shared-voices` (`_fetch_shared_voices`
+  → `_map_shared_voice` → `{id, public_owner_id, name, accent, gender, age,
+  language, description, preview_url, free}`), passing through
+  `search/language/accent/gender/age/page` (+`page_size=30`); non-EL backend or
+  no key → empty; any fetch failure degrades to `{voices: [], error}` (never
+  5xx). `add_library_voice` proxies `POST /v1/voices/add/{owner}/{voice}`, then
+  `invalidate_account_voices_cache()`; a new `TtsLibraryError(message,
+  status_code)` translates ElevenLabs 4xx (slot-limit, bad id) via
+  `_elevenlabs_error_message` — never a bare 500. Endpoints in main.py:
+  `GET /api/settings/tts/library` (ungated, returns `add_enabled`),
+  `POST /api/settings/tts/library/add` (flag-gated 403 when off, 422 on missing
+  fields), and admin `GET|PUT /api/admin/system-settings/tts_library`
+  (mirrors `vm_workspaces`). Flag `tts.elevenlabs_library_enabled` is
+  **fail-closed** (default off) via `_elevenlabs_library_enabled()`.
+- **Cockpit**: `tts-voices.ts` gains `TtsLibraryVoice` / `TtsLibraryResponse` /
+  `TtsLibraryFilters` / `TtsLibrarySetting`. `ApiService`: `searchTtsLibrary`,
+  `addTtsLibraryVoice`, `getTtsLibrarySetting`, `setTtsLibrarySetting`. Settings:
+  a collapsible "Browse voice library" panel under the ElevenLabs backend block
+  (search box + gender filter + result cards with name, accent·gender·language,
+  hosted "Play sample", and a flag-gated "Add"); an admin-only `app-switch`
+  toggling the add-gate (seeded in the admin-loaders effect). On a successful
+  add the account voices refetch (server cache already invalidated) and the new
+  voice is auto-selected. i18n `settings.voice.library*` in en + de-DE.
+- **Tests**: `TestMapSharedVoice` (2), `TestSearchVoiceLibrary` (4: non-EL,
+  filter-passthrough+map, no-key error, fetch-failure degrade),
+  `TestAddLibraryVoice` (4: success+cache-invalidation, slot-limit readable
+  4xx, non-EL raises, network→502). 105 pytest + 9 vitest green; ruff + tsc +
+  i18n parity/hardcoded clean.
+
+**LIVE-VERIFIED** 2026-07-05 (Playwright, k3d, admin `test`): backend already
+ElevenLabs. Searching **"french english"** returned **30 French-accented English
+voices** rendered as cards (Nicolas — French English Male, Cyril —
+French-Accented Narrator, **Lison — Seductive and soft French accent**, Chloé,
+Jamie…), each with the hosted preview icon; every result carried
+`public_owner_id` + a valid `storage.googleapis.com/eleven-public-prod/…mp3`
+preview. Flag **off** → 0 Add buttons + endpoints 401 unauth; admin switch **on**
+→ persisted (`updated_by: admin@localhost`), search `add_enabled:true`, all 30
+Add buttons appear. Add with a deliberately-invalid voice id (no account
+mutation) → **HTTP 404 "A voice for the voice_id … was not found."** (ElevenLabs'
+own message, `is500:false`) — the same path a slot-limit 400 takes. The flag was
+restored to its default (off) after the test. (A *successful* add mutates the
+real shared account / consumes a plan slot, so it's left as an on-demand step.)
 
 **Phase 7 — Voice Design (stretch)**
 Design/save proxies + generate-preview-save UI.
