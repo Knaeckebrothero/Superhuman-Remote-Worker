@@ -25,7 +25,11 @@ from langchain_core.tools import tool
 from ...services.knowledge_graph import slugify
 from ..context import ToolContext
 from .gardener import (
+    Finding,
+    dead_url_findings,
+    external_url_map,
     is_reserved,
+    near_duplicate_findings,
     lint_kb,
     note_title,
     parse_note_md,
@@ -38,6 +42,35 @@ logger = logging.getLogger(__name__)
 def _content_hash(text: str) -> str:
     """Stable content fingerprint for exact-duplicate detection."""
     return hashlib.sha256((text or "").encode()).hexdigest()
+
+
+# The kb_lint URL sweep checks at most this many unique external URLs per run;
+# the remainder is reported loudly (never a silent cap).
+_URL_SWEEP_CAP = 25
+
+
+def _check_external_url(url: str, timeout: float = 5.0) -> Optional[str]:
+    """Reachability probe for the kb_lint dead-URL sweep.
+
+    Returns a failure reason for CLEAR negatives only — HTTP 404/410 and
+    DNS/connection-level failures. Bot-shy responses (403/405) and transient
+    5xx count as alive, keeping the rule false-positive-shy.
+    """
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": "srw-kb-lint/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            return None
+    except urllib.error.HTTPError as e:
+        return f"HTTP {e.code}" if e.code in (404, 410) else None
+    except urllib.error.URLError as e:
+        return f"unreachable: {e.reason}"
+    except Exception as e:
+        return f"unreachable: {e}"
 
 
 # Tool metadata for registry
@@ -1090,17 +1123,21 @@ def create_kb_tools(
     # =========================================================================
 
     @tool
-    def kb_lint(path: str = "knowledge") -> str:
+    def kb_lint(path: str = "knowledge", check_urls: bool = False) -> str:
         """Lint an OKF knowledge base for structural, id and link issues.
 
         Reads every `*.md` note under `path` and checks frontmatter validity,
         required keys (id/type/description), id format/uniqueness, dead and
-        broken-supersede links, orphans and missing titles. Read-only — returns
+        broken-supersede links, orphans, missing titles, oversized notes,
+        slug-forked twins and embedding-near-duplicates. Read-only — returns
         a report; it never edits notes. Point it at the project KB
         (`knowledge/`), a repository datasource, or any markdown vault.
 
         Args:
             path: Directory to lint (default "knowledge").
+            check_urls: Also probe external http(s) links and flag clearly
+                dead ones (404/410, unreachable host). Off by default —
+                it is slow (network) and capped per run.
 
         Returns:
             A markdown lint report (errors then warnings), or a status message.
@@ -1124,7 +1161,48 @@ def create_kb_tools(
                 logger.warning(f"kb_lint: could not read {rel}: {e}")
         if not notes:
             return f"No markdown notes found under `{root}/`."
-        return lint_kb(notes).format_markdown()
+        report = lint_kb(notes)
+
+        # Embedding-backed near-duplicate pass (the slice-2 deferred rule):
+        # the pgvector index already holds one embedding per note, so one
+        # self-join yields every high-similarity pair — no re-embedding here.
+        # Non-fatal by design, matching the write-through posture: the
+        # deterministic report stands alone when the index is unreachable.
+        project_id = _get_project_id(context)
+        if project_id:
+            try:
+                pairs = _run_async(
+                    ks.find_near_duplicate_pairs(uuid.UUID(project_id))
+                )
+                report.findings.extend(
+                    near_duplicate_findings(pairs, [n["path"] for n in notes])
+                )
+            except Exception as e:
+                logger.warning(f"kb_lint: near-duplicate pass skipped: {e}")
+
+        # Opt-in dead-external-URL sweep: probe each unique http(s) link once,
+        # flag only clear negatives, and report any capped remainder loudly.
+        if check_urls:
+            url_map = external_url_map(notes)
+            urls = sorted(url_map)
+            checked, skipped = urls[:_URL_SWEEP_CAP], urls[_URL_SWEEP_CAP:]
+            dead: Dict[str, str] = {}
+            for url in checked:
+                reason = _check_external_url(url)
+                if reason:
+                    dead[url] = reason
+            report.findings.extend(dead_url_findings(dead, url_map))
+            if skipped:
+                report.findings.append(
+                    Finding(
+                        "url-sweep-truncated",
+                        "warning",
+                        root,
+                        f"{len(skipped)} external URL(s) not checked this run "
+                        f"(cap {_URL_SWEEP_CAP}) — re-run to continue",
+                    )
+                )
+        return report.format_markdown()
 
     @tool
     def kb_index(path: str = "knowledge") -> str:

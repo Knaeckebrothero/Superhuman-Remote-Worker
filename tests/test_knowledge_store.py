@@ -785,3 +785,43 @@ class TestAssembleKnowledgeBlock:
         result = KnowledgeStore.assemble_knowledge_block(notes)
         assert "[1]" in result
         assert "[2]" in result
+
+
+# =============================================================================
+# find_near_duplicate_pairs() — the kb_lint near-duplicate fetch
+# =============================================================================
+
+
+class TestFindNearDuplicatePairs:
+    @pytest.mark.asyncio
+    async def test_returns_pair_tuples_from_rows(self):
+        store, mock_db, _ = _make_store()
+        pid = uuid.uuid4()
+        mock_db.fetch.return_value = [
+            {"note_a": "n1", "note_b": "n2", "similarity": 0.94},
+            {"note_a": "n3", "note_b": "n4", "similarity": 0.91},
+        ]
+        pairs = await store.find_near_duplicate_pairs(pid)
+        assert pairs == [("n1", "n2", 0.94), ("n3", "n4", 0.91)]
+
+    @pytest.mark.asyncio
+    async def test_query_is_active_only_self_join_with_knobs(self):
+        store, mock_db, _ = _make_store()
+        pid = uuid.uuid4()
+        mock_db.fetch.return_value = []
+        await store.find_near_duplicate_pairs(pid, min_similarity=0.88, limit=25)
+        args = mock_db.fetch.call_args[0]
+        sql = args[0]
+        # Active-only on both sides, each pair once, embeddings required.
+        assert sql.count("status = 'active'") == 2
+        assert "a.note_id < b.note_id" in sql
+        assert "embedding IS NOT NULL" in sql
+        assert pid in args
+        assert 0.88 in args
+        assert 25 in args
+
+    @pytest.mark.asyncio
+    async def test_empty_result(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        assert await store.find_near_duplicate_pairs(uuid.uuid4()) == []

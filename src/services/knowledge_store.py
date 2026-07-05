@@ -41,7 +41,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -533,6 +533,47 @@ class KnowledgeStore:
             rec.similarity = row_dict.get("similarity")
             records.append(rec)
         return records
+
+    async def find_near_duplicate_pairs(
+        self,
+        project_id: uuid.UUID,
+        min_similarity: float = 0.9,
+        limit: int = 50,
+    ) -> List[Tuple[str, str, float]]:
+        """All active note pairs whose embeddings are near-duplicates.
+
+        One self-join over the index (each unordered pair once, via
+        ``a.note_id < b.note_id``), feeding ``kb_lint``'s near-duplicate rule —
+        detection for the bare-writer twins the verdict gate never adjudicates.
+        Most-similar pairs first. The 0.9 default floor is deliberately far
+        above the verdict fetch floor (0.6): lint flags only what a gardener
+        should merge, not everything topically related.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT a.note_id AS note_a, b.note_id AS note_b,
+                   1 - (a.embedding <=> b.embedding) AS similarity
+            FROM knowledge_index a
+            JOIN knowledge_index b
+              ON b.project_id = a.project_id
+             AND a.note_id < b.note_id
+            WHERE a.project_id = $1
+              AND a.status = 'active'
+              AND b.status = 'active'
+              AND a.embedding IS NOT NULL
+              AND b.embedding IS NOT NULL
+              AND 1 - (a.embedding <=> b.embedding) >= $2
+            ORDER BY similarity DESC
+            LIMIT $3
+            """,
+            project_id,
+            min_similarity,
+            limit,
+        )
+        return [
+            (str(r["note_a"]), str(r["note_b"]), float(r["similarity"]))
+            for r in rows
+        ]
 
     async def get_summary(
         self,
