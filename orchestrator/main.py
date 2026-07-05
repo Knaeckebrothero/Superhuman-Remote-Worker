@@ -22371,6 +22371,12 @@ async def _resolve_preference_defaults() -> dict[str, Any]:
     # Fall back to the YAML model only when the registry has no capability default.
     registry_chat = await postgres_db.resolve_default_for_capability("chat")
     registry_aux = await postgres_db.resolve_default_for_capability("auxiliary")
+    # TTS is orchestrator-only (the read-aloud feature), resolved from the model
+    # registry by resolve_capability_credentials — NOT an agent env-helper like
+    # vision/whisper/embedding below. Resolve it the same way here so the Settings
+    # voice picker shows the model actually in effect (and thus the right voice
+    # list); env TTS_MODEL is only a last-ditch fallback.
+    registry_tts = await postgres_db.resolve_default_for_capability("tts")
 
     return {
         "default_model": registry_chat or llm.get("model"),
@@ -22381,7 +22387,7 @@ async def _resolve_preference_defaults() -> dict[str, Any]:
         # (src/services/vision_helper.py, audio_helper.py, embedding_service.py)
         "default_vision_model": os.environ.get("VISION_MODEL", "gpt-4o"),
         "default_whisper_model": os.environ.get("WHISPER_MODEL", "whisper-1"),
-        "default_tts_model": os.environ.get("TTS_MODEL", "tts-1"),
+        "default_tts_model": registry_tts or os.environ.get("TTS_MODEL", "tts-1"),
         "default_embedding_model": os.environ.get(
             "EMBEDDING_MODEL", "qwen3-embedding-8b"
         ),
@@ -22431,6 +22437,47 @@ async def update_user_preferences(
         raise HTTPException(status_code=400, detail="No settings provided")
     await postgres_db.update_user_settings(str(user["id"]), settings)
     return {"status": "updated"}
+
+
+@app.post("/api/settings/tts/preview")
+async def preview_tts_voice(
+    request: Request, body: dict[str, Any] = Body(...)
+) -> Response:
+    """Synthesize a short canned phrase in a candidate voice so the settings
+    voice picker can preview how it sounds before the user saves it.
+
+    Body:
+        ``voice`` (str, optional) — the candidate voice id; empty/omitted means
+        "Auto" (resolve like normal read-aloud).
+        ``language`` (str, default ``"en"``) — selects the preview phrase and
+        the Auto-voice default.
+
+    Returns JSON ``{"audio": <base64 MP3>}``. ``204`` when no TTS model is
+    configured (UI treats as feature-off); ``502`` when a configured model
+    fails to synthesize.
+    """
+    import base64
+
+    from services.tts import TtsSynthesisError, synthesize_voice_preview
+
+    user = await require_approved_user(request, postgres_db)
+    voice = (body.get("voice") or "").strip()
+    language = (body.get("language") or "en").strip() or "en"
+
+    try:
+        audio = await synthesize_voice_preview(
+            voice=voice or None,
+            language=language,
+            user_id=str(user["id"]),
+            postgres_db=postgres_db,
+            ledger=usage_ledger,
+        )
+    except TtsSynthesisError as exc:
+        raise HTTPException(status_code=502, detail="Voice preview failed") from exc
+
+    if audio is None:
+        return Response(status_code=204)
+    return JSONResponse({"audio": base64.b64encode(audio).decode("ascii")})
 
 
 # =============================================================================

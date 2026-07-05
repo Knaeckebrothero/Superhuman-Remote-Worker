@@ -503,7 +503,9 @@
       "desc": "The voice used when you read an assistant message aloud. Applies to every Read from now on.",
       "label": "Voice",
       "auto": "Default (auto)",
-      "customPlaceholder": "Voice id"
+      "customPlaceholder": "Voice id",
+      "preview": "Preview voice",
+      "previewFailed": "Couldn't play a preview — check your TTS setup."
     },
     "dataVisibility": {
       "title": "Data visibility",

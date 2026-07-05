@@ -679,6 +679,104 @@ async def generate_message_tts(
     return speech_input, audio
 
 
+# Fixed, self-descriptive preview phrases (one per supported UI language). Kept
+# short — under _FORMULATION_MIN_LEN — so the preview never invokes the aux
+# rewrite LLM, and identical every time so the audio cache serves repeat
+# previews of the same voice instantly (the cache key is model+voice+text).
+_PREVIEW_TEXT = {
+    "en": "Hi — this is how I'll sound when I read your messages aloud.",
+    "de": "Hallo — so klinge ich, wenn ich deine Nachrichten vorlese.",
+}
+
+
+async def synthesize_voice_preview(
+    *,
+    voice: Optional[str],
+    language: str,
+    user_id: str,
+    postgres_db,
+    ledger: Optional[UsageLedger] = None,
+) -> Optional[bytes]:
+    """Synthesize a short canned phrase in ``voice`` so the settings voice
+    picker can preview how it sounds before the user commits to it.
+
+    ``voice`` is the *candidate* voice — it may not be the saved default yet.
+    An empty/``None`` value means "Auto", resolved exactly like real read-aloud
+    via :func:`_pick_voice` (admin single voice → per-language map → built-in
+    default). Uses the user's configured TTS model. No aux rewrite (the phrase
+    is already clean and short), so it's cheap and low-latency, and the fixed
+    phrase makes the audio cache near-100% effective on repeat previews.
+
+    Returns MP3 bytes, ``None`` when no TTS model is configured (endpoint maps
+    to ``204``), or raises :class:`TtsSynthesisError` when a configured model
+    fails to synthesize (endpoint maps to ``502``) — same contract as
+    :func:`generate_message_tts`.
+    """
+    user_settings = await postgres_db.get_user_settings(user_id) or {}
+    resolved_keys = await postgres_db.resolve_api_keys_for_job(
+        user_id=user_id, project_id=None
+    )
+    tts_creds = await _resolve_capability_credentials(
+        capability="tts",
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        postgres_db=postgres_db,
+    )
+    if tts_creds is None:
+        logger.info("No TTS model configured for user %s (voice preview)", user_id)
+        return None
+    tts_model, tts_base_url, tts_api_key = tts_creds
+
+    tts_params = await _resolve_tts_params(tts_model, postgres_db)
+    lang = "de" if (language or "").lower().startswith("de") else "en"
+    text = _PREVIEW_TEXT[lang]
+    candidate = (voice or "").strip() or None
+    resolved_voice = _pick_voice(tts_params, lang, candidate)
+    instructions = (tts_params.get("instructions") or "").strip() or None
+
+    audio_key = _hash_key(tts_model, resolved_voice, instructions or "", text)
+    async with _audio_lock:
+        cached = _cache_get(_audio_cache, audio_key)
+    if cached is not None:
+        logger.debug("TTS preview cache hit (voice=%s)", resolved_voice)
+        return cached
+
+    audio = await _synthesize_speech(
+        text,
+        model=tts_model,
+        voice=resolved_voice,
+        base_url=tts_base_url,
+        api_key=tts_api_key,
+        instructions=instructions,
+    )
+    if not audio:
+        raise TtsSynthesisError(f"TTS preview synthesis failed for model {tts_model}")
+    async with _audio_lock:
+        _cache_put(_audio_cache, audio_key, audio, _AUDIO_CACHE_MAX)
+    if _metering_enabled(ledger):
+        await _record_usage(
+            ledger,
+            [
+                UsageEvent(
+                    category="tts",
+                    resource=tts_model,
+                    quantity=len(text),
+                    unit="tts-character",
+                    source="orchestrator",
+                    source_id=uuid.uuid4().hex,
+                    ts=_now(),
+                    user_id=user_id,
+                    project_id=None,
+                    ref_kind=None,
+                    ref_id=None,
+                    details={"voice": resolved_voice, "preview": True},
+                )
+            ],
+        )
+    return audio
+
+
 # ---------------------------------------------------------------------------
 # Chunk planning — split a long message into ordered, speakable chunks so the
 # UI can synthesize + play them one after another (no truncation, no single

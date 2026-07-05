@@ -282,6 +282,112 @@ class TestGenerateMessageTts:
         assert client.audio.speech.create.call_args.kwargs["voice"] == "alloy"
 
 
+class TestSynthesizeVoicePreview:
+    """The settings voice-picker preview: canned phrase, candidate voice,
+    no aux rewrite."""
+
+    @pytest.mark.asyncio
+    async def test_uses_candidate_voice_and_returns_audio(self):
+        from services.tts import synthesize_voice_preview
+
+        cls, client = _mock_openai(speech=b"PREVIEW")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+            ),
+        ):
+            audio = await synthesize_voice_preview(
+                voice="af_nova",
+                language="en",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert audio == b"PREVIEW"
+        assert client.audio.speech.create.call_args.kwargs["voice"] == "af_nova"
+        # A canned phrase never triggers the aux rewrite LLM.
+        client.chat.completions.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_voice_resolves_language_default(self):
+        from services.tts import synthesize_voice_preview
+
+        cls, client = _mock_openai(speech=b"PREVIEW")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+            ),
+        ):
+            await synthesize_voice_preview(
+                voice="",  # Auto
+                language="en",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert client.audio.speech.create.call_args.kwargs["voice"] == "alloy"
+
+    @pytest.mark.asyncio
+    async def test_german_language_speaks_german_phrase(self):
+        from services.tts import _PREVIEW_TEXT, synthesize_voice_preview
+
+        cls, client = _mock_openai(speech=b"PREVIEW")
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+            ),
+        ):
+            await synthesize_voice_preview(
+                voice="af_nova",
+                language="de-DE",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert (
+            client.audio.speech.create.call_args.kwargs["input"] == _PREVIEW_TEXT["de"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_tts_model(self):
+        from services.tts import synthesize_voice_preview
+
+        with patch(
+            "services.tts._resolve_capability_credentials",
+            AsyncMock(return_value=None),
+        ):
+            audio = await synthesize_voice_preview(
+                voice="af_nova",
+                language="en",
+                user_id="u1",
+                postgres_db=_mock_db(),
+            )
+        assert audio is None
+
+    @pytest.mark.asyncio
+    async def test_raises_on_synthesis_failure(self):
+        from services.tts import TtsSynthesisError, synthesize_voice_preview
+
+        cls, _ = _mock_openai(speech_error=RuntimeError("boom"))
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch(
+                "services.tts._resolve_capability_credentials",
+                AsyncMock(return_value=("kokoro-strix", None, "sk-key")),
+            ),
+        ):
+            with pytest.raises(TtsSynthesisError):
+                await synthesize_voice_preview(
+                    voice="af_nova",
+                    language="en",
+                    user_id="u1",
+                    postgres_db=_mock_db(),
+                )
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: content-language voice selection, user voice choice, instructions
 # ---------------------------------------------------------------------------
