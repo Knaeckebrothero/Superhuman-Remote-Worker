@@ -7,12 +7,14 @@ job and thread workspace deletion.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.services.lifecycle import (
     Instance,
+    InstanceLifecycleReconciler,
     StatefulInstanceManager,
     WorkspaceInstanceManager,
     expected_workspace_shas,
@@ -471,6 +473,185 @@ class TestIsReapable:
         mgr, *_ = _make_manager()
         inst = Instance(kind="workspace", id="x", metadata={})
         assert await mgr.is_reapable(inst) is False
+
+
+# =============================================================================
+# Missing-row orphan reap (job deleted while its pod lived)
+# =============================================================================
+
+
+class TestMissingRowOrphan:
+    """A pod whose bound row is confirmed gone (job/thread deleted) is an
+    orphan: reapable once past the grace age, clean (nothing to snapshot),
+    terminal (PVC/Service reclaimed). A *failed* lookup must never be
+    mistaken for a missing row. See
+    docs/issues/deleted_job_orphans_workspace_pod.md."""
+
+    @staticmethod
+    def _orphan_pod(job_id: str = "jgone", age_hours: float = 2.0):
+        pod = _make_pod(
+            f"workspace-{job_id}",
+            labels={"srw/job-id": job_id, "srw.io/component": "agent-workspace"},
+        )
+        pod.metadata.creation_timestamp = datetime.now(timezone.utc) - timedelta(
+            hours=age_hours
+        )
+        return pod
+
+    @pytest.mark.asyncio
+    async def test_list_instances_marks_missing_job_row(self):
+        mgr, *_ = _make_manager(pods=[self._orphan_pod()])  # no job_rows → row gone
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            (inst,) = await mgr.list_instances()
+        assert inst.metadata["bound_row_missing"] is True
+        assert inst.metadata["pod_age_s"] == pytest.approx(7200, abs=60)
+
+    @pytest.mark.asyncio
+    async def test_list_instances_marks_missing_thread_row(self):
+        pod = _make_pod(
+            "ws-thread-gone",
+            labels={
+                "srw/thread-id": "tgone",
+                "srw.io/component": "agent-workspace",
+            },
+        )
+        mgr, *_ = _make_manager(pods=[pod])  # no thread_rows → row gone
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            (inst,) = await mgr.list_instances()
+        assert inst.metadata["bound_row_missing"] is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_is_not_marked_missing(self):
+        # DB error ≠ row gone: metadata stays bare → never reapable.
+        mgr, _, _, _, db = _make_manager(pods=[self._orphan_pod()])
+        db.get_job = AsyncMock(side_effect=RuntimeError("db down"))
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            (inst,) = await mgr.list_instances()
+        assert "bound_row_missing" not in inst.metadata
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_aged_orphan_is_reapable(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="jgone",
+            metadata={"bound_row_missing": True, "pod_age_s": 3600.0},
+        )
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_young_orphan_is_not_reapable(self, monkeypatch):
+        # Protects the pod-created-but-row-not-yet-persisted window.
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="jgone",
+            metadata={"bound_row_missing": True, "pod_age_s": 30.0},
+        )
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_age_orphan_is_not_reapable(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="jgone",
+            metadata={"bound_row_missing": True, "pod_age_s": None},
+        )
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_orphan_is_clean_and_terminal(self):
+        # Clean: no entity can restore a snapshot, and record_attempt would
+        # merge into a deleted row (silent no-op → infinite retry).
+        # Terminal: delete() reclaims PVC + Service; give_up won't recreate.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            bound_to="jgone",
+            metadata={"bound_row_missing": True, "pod_age_s": 3600.0},
+        )
+        assert await mgr.is_dirty(inst) is False
+        assert mgr._is_terminal(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_pvc_backed_orphan_delete_reclaims_pvc_and_service(self):
+        mgr, container, *_ = _make_manager()
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-jgone",
+            bound_to="jgone",
+            metadata={
+                "labels": {"srw/job-id": "jgone"},
+                "bound_row_missing": True,
+                "volume_ephemeral": False,
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        container.delete_workspace_pvc.assert_awaited_once_with(
+            WorkspaceOwner.job("jgone")
+        )
+        container._delete_service.assert_awaited_once_with(WorkspaceOwner.job("jgone"))
+
+    @staticmethod
+    def _wire_empty_pvcs(container):
+        pvc_list = MagicMock()
+        pvc_list.items = []
+        container._core_api.list_namespaced_persistent_volume_claim.return_value = (
+            pvc_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconciler_tick_reaps_aged_orphan_without_snapshot(
+        self, monkeypatch
+    ):
+        # End-to-end through the reconciler: the aged orphan goes straight to
+        # delete — no snapshot capture, no attempt bookkeeping.
+        monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, container, _, snapshot, _ = _make_manager(pods=[self._orphan_pod()])
+        self._wire_empty_pvcs(container)
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            report = await reconciler.tick()
+        assert report["workspace"]["reaped"] == 1
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("jgone"))
+        snapshot.capture_vm_snapshot.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconciler_tick_spares_young_orphan(self, monkeypatch):
+        monkeypatch.delenv("WORKSPACE_IMAGE", raising=False)
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, container, _, _, _ = _make_manager(pods=[self._orphan_pod(age_hours=0.01)])
+        self._wire_empty_pvcs(container)
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            report = await reconciler.tick()
+        assert report["workspace"]["reaped"] == 0
+        container.delete_workspace.assert_not_called()
 
 
 # =============================================================================
