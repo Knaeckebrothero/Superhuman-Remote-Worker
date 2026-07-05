@@ -208,7 +208,9 @@ class TestLintKb:
         rules = _rules(report)
         assert "oversized-note" in rules
         assert all(
-            f.severity == "warning" for f in report.findings if f.rule == "oversized-note"
+            f.severity == "warning"
+            for f in report.findings
+            if f.rule == "oversized-note"
         )
         # The small sibling is not flagged.
         assert not any(
@@ -249,7 +251,10 @@ class TestLintKb:
             "# My Note\n\nbody two [my-note](my-note.md)\n"
         )
         report = lint_kb(
-            [_note("knowledge/my-note.md", base), _note("knowledge/my-note-ef33b5.md", fork)]
+            [
+                _note("knowledge/my-note.md", base),
+                _note("knowledge/my-note-ef33b5.md", fork),
+            ]
         )
         rules = _rules(report)
         assert "slug-forked" in rules
@@ -263,7 +268,7 @@ class TestLintKb:
         from src.tools.knowledge.gardener import lint_kb
 
         base = (
-            "---\nid: my-note\ntype: learning\ndescription: \"d\"\n"
+            '---\nid: my-note\ntype: learning\ndescription: "d"\n'
             "status: superseded\nsuperseded_by: my-note-ef33b5\n---\n\n"
             "# My Note\n\nold [my-note-ef33b5](my-note-ef33b5.md)\n"
         )
@@ -272,7 +277,10 @@ class TestLintKb:
             "# My Note\n\nnew [my-note](my-note.md)\n"
         )
         report = lint_kb(
-            [_note("knowledge/my-note.md", base), _note("knowledge/my-note-ef33b5.md", fork)]
+            [
+                _note("knowledge/my-note.md", base),
+                _note("knowledge/my-note-ef33b5.md", fork),
+            ]
         )
         assert "slug-forked" not in _rules(report)
 

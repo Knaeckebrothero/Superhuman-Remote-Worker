@@ -571,8 +571,7 @@ class KnowledgeStore:
             limit,
         )
         return [
-            (str(r["note_a"]), str(r["note_b"]), float(r["similarity"]))
-            for r in rows
+            (str(r["note_a"]), str(r["note_b"]), float(r["similarity"])) for r in rows
         ]
 
     async def get_summary(
