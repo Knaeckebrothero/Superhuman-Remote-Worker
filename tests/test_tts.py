@@ -807,6 +807,229 @@ class TestAuxReasoningControl:
         assert kwargs["extra_body"] == {}
 
 
+class TestReadAloudRewritePrefs:
+    """User read-aloud prefs: a reasoning-level knob (off by default) + a custom
+    rewrite prompt that can override the default 'don't summarize' rule."""
+
+    # ── reasoning level → aux extra_body ──────────────────────────────
+    def test_toggle_family_off_disables_thinking(self):
+        from services.tts import _aux_reasoning_body
+
+        for level in (None, "off", "none"):
+            assert _aux_reasoning_body("gemma-4-moe", level) == {
+                "chat_template_kwargs": {"enable_thinking": False}
+            }, level
+
+    def test_toggle_family_level_enables_thinking(self):
+        from services.tts import _aux_reasoning_body
+
+        # gemma has no low/medium/high — any requested level just flips it ON.
+        for level in ("low", "medium", "high"):
+            assert _aux_reasoning_body("gemma-4-moe", level) == {
+                "chat_template_kwargs": {"enable_thinking": True}
+            }, level
+
+    def test_effort_enum_family_maps_level_to_effort(self):
+        from services.tts import _aux_reasoning_body
+
+        fam = MagicMock()
+        fam.family = "synthfam"
+        matrix = {
+            "synthfam": {
+                "reasoning": {
+                    "method": "effort_enum",
+                    "delivery": "native",
+                    "options": ["none", "low", "medium", "high"],
+                }
+            }
+        }
+        with (
+            patch("services.tts._model_config_matrix", lambda: matrix),
+            patch("services.tts.detect_family", lambda m: fam),
+        ):
+            assert _aux_reasoning_body("x", "low") == {"reasoning_effort": "low"}
+            assert _aux_reasoning_body("x", "high") == {"reasoning_effort": "high"}
+            # off → the family's explicit low-reasoning option ('none').
+            assert _aux_reasoning_body("x", "off") == {"reasoning_effort": "none"}
+
+    def test_effort_enum_without_off_option_inherits_default(self):
+        """A [low,medium,high]-only family has no real 'off' — the off default must
+        inject nothing (inherit the endpoint default), never an unsupported value."""
+        from services.tts import _aux_reasoning_body
+
+        fam = MagicMock()
+        fam.family = "synthfam"
+        matrix = {
+            "synthfam": {
+                "reasoning": {
+                    "method": "effort_enum",
+                    "delivery": "native",
+                    "options": ["low", "medium", "high"],
+                }
+            }
+        }
+        with (
+            patch("services.tts._model_config_matrix", lambda: matrix),
+            patch("services.tts.detect_family", lambda m: fam),
+        ):
+            assert _aux_reasoning_body("x", "off") == {}
+            assert _aux_reasoning_body("x", "medium") == {"reasoning_effort": "medium"}
+
+    # ── custom prompt injection ───────────────────────────────────────
+    def test_augment_prompt_noop_when_empty(self):
+        from services.tts import FORMULATION_SYSTEM_PROMPT, _augment_rewrite_prompt
+
+        assert (
+            _augment_rewrite_prompt(FORMULATION_SYSTEM_PROMPT, None)
+            == FORMULATION_SYSTEM_PROMPT
+        )
+        assert (
+            _augment_rewrite_prompt(FORMULATION_SYSTEM_PROMPT, "   ")
+            == FORMULATION_SYSTEM_PROMPT
+        )
+
+    def test_augment_prompt_appends_pref_with_override_and_floor(self):
+        from services.tts import _augment_rewrite_prompt
+
+        out = _augment_rewrite_prompt("BASE RULES", "Give me a TLDR, skip tables")
+        assert "BASE RULES" in out
+        assert "Give me a TLDR, skip tables" in out
+        # The user's preference must be granted authority to override 'don't
+        # summarize'…
+        assert "PREFERENCES WIN" in out
+        # …but the no-fabrication / no-altered-figures floor must remain.
+        assert "never invent facts" in out.lower()
+        assert "never change numbers" in out.lower()
+
+    # ── prefs extraction + cache-variant key ──────────────────────────
+    def test_read_aloud_prefs_defaults_and_parse(self):
+        from services.tts import _read_aloud_prefs
+
+        assert _read_aloud_prefs({}) == (None, "off")
+        assert _read_aloud_prefs({"read_aloud": {}}) == (None, "off")
+        assert _read_aloud_prefs(
+            {
+                "read_aloud": {
+                    "reasoning_level": "HIGH",
+                    "custom_prompt": " skip tables ",
+                }
+            }
+        ) == ("skip tables", "high")
+        # Unknown level degrades to off (defense-in-depth alongside the API validator).
+        assert _read_aloud_prefs({"read_aloud": {"reasoning_level": "bogus"}}) == (
+            None,
+            "off",
+        )
+
+    def test_variant_key_differs_by_prompt_and_level(self):
+        from services.tts import _rewrite_variant_key
+
+        base = _rewrite_variant_key(None, "off")
+        by_prompt = _rewrite_variant_key("skip tables", "off")
+        by_level = _rewrite_variant_key(None, "high")
+        assert len({base, by_prompt, by_level}) == 3
+        # Stable for the same inputs (so the cache actually hits when unchanged).
+        assert _rewrite_variant_key("skip tables", "off") == by_prompt
+
+    # ── end-to-end wiring through plan_tts_chunks ─────────────────────
+    @pytest.mark.asyncio
+    async def test_plan_applies_custom_prompt_and_reasoning(self):
+        from services.tts import plan_tts_chunks
+
+        cls, client = _mock_openai_chat('["A."]')
+        db = _mock_db()
+        db.get_user_settings = AsyncMock(
+            return_value={
+                "read_aloud": {
+                    "reasoning_level": "high",
+                    "custom_prompt": "Give me a TLDR",
+                }
+            }
+        )
+        with (
+            patch("services.tts.AsyncOpenAI", cls),
+            patch("services.tts._resolve_capability_credentials", _caps()),  # aux=gemma
+        ):
+            await plan_tts_chunks(
+                content="some **markdown** message", user_id="u1", postgres_db=db
+            )
+        kwargs = client.chat.completions.create.call_args.kwargs
+        # Reasoning turned ON for gemma because a level was requested.
+        assert kwargs["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": True}
+        }
+        # Custom instructions injected into the rewrite system prompt.
+        sys_msg = kwargs["messages"][0]["content"]
+        assert "Give me a TLDR" in sys_msg
+        assert "PREFERENCES WIN" in sys_msg
+
+    @pytest.mark.asyncio
+    async def test_different_custom_prompt_busts_plan_cache(self):
+        """Two different custom prompts over the SAME content must both hit the aux
+        — the rewrite variant is part of the cache key, so no stale replay."""
+        from services import tts
+        from services.tts import plan_tts_chunks
+
+        tts._plan_cache.clear()
+        cls, client = _mock_openai_chat('["A."]')
+
+        def _db_with(prompt):
+            db = _mock_db()
+            db.get_user_settings = AsyncMock(
+                return_value={"read_aloud": {"custom_prompt": prompt}}
+            )
+            return db
+
+        try:
+            with (
+                patch("services.tts.AsyncOpenAI", cls),
+                patch("services.tts._resolve_capability_credentials", _caps()),
+            ):
+                await plan_tts_chunks(
+                    content="same content here",
+                    user_id="u1",
+                    postgres_db=_db_with("skip tables"),
+                )
+                await plan_tts_chunks(
+                    content="same content here",
+                    user_id="u1",
+                    postgres_db=_db_with("give me a tldr"),
+                )
+            assert client.chat.completions.create.await_count == 2
+        finally:
+            tts._plan_cache.clear()
+
+
+class TestReadAloudSettingsValidation:
+    """The PATCH /api/settings/preferences body validator guards the read_aloud
+    sub-object (level enum + prompt length) — 422 before it reaches the DB."""
+
+    def test_valid_read_aloud_accepted_and_normalized(self):
+        from main import UserSettingsUpdate
+
+        m = UserSettingsUpdate(
+            read_aloud={"reasoning_level": "HIGH", "custom_prompt": "skip tables"}
+        )
+        assert m.read_aloud["reasoning_level"] == "high"  # lowercased
+
+    def test_bad_level_rejected(self):
+        from main import UserSettingsUpdate
+
+        with pytest.raises(Exception):
+            UserSettingsUpdate(read_aloud={"reasoning_level": "ultra"})
+
+    def test_overlong_prompt_rejected(self):
+        from main import UserSettingsUpdate
+
+        with pytest.raises(Exception):
+            UserSettingsUpdate(read_aloud={"custom_prompt": "z" * 1001})
+
+    def test_prompt_at_cap_accepted(self):
+        from main import UserSettingsUpdate
+
+        UserSettingsUpdate(read_aloud={"custom_prompt": "z" * 1000})
+
+
 class TestPlanTtsChunks:
     @pytest.mark.asyncio
     async def test_none_when_no_tts_model(self):

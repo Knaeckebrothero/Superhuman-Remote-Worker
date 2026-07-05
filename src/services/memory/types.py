@@ -35,6 +35,19 @@ class MemoryPipelineError(RuntimeError):
     """
 
 
+class TransientScorerError(RuntimeError):
+    """A scorer's *transient* transport fault persisted through its bounded
+    retries.
+
+    Raised by a scorer instead of the underlying httpx error so the manager
+    can tell "the network blipped" (degrade to the pre-scorer order for this
+    one turn, keep the job alive) from "the scorer is structurally broken"
+    (wrong route/auth/response shape → ``MemoryPipelineError``, job-fatal).
+    A single reranker ReadTimeout used to discard multi-hour jobs — see
+    docs/issues/reranker_transient_fault_hard_fails_job.md.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Capture (write side)
 # ---------------------------------------------------------------------------

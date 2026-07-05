@@ -524,7 +524,19 @@
       "librarySearch": "Suchen",
       "libraryAdd": "Hinzufügen",
       "libraryAdded": "Hinzugefügt",
-      "libraryEmpty": "Keine Stimmen gefunden. Andere Suche versuchen."
+      "libraryEmpty": "Keine Stimmen gefunden. Andere Suche versuchen.",
+      "rewriteTitle": "Wie Nachrichten umformuliert werden",
+      "rewriteReasoningLabel": "Reasoning beim Umformulieren",
+      "rewriteReasoningHint": "Aus ist am schnellsten. Eingeschaltet wird die Umformulierung besser, verzögert aber das erste Audio, während das Modell nachdenkt.",
+      "reasoningOff": "Aus (am schnellsten)",
+      "reasoningLow": "Niedrig",
+      "reasoningMedium": "Mittel",
+      "reasoningHigh": "Hoch",
+      "rewritePromptLabel": "Eigene Umformulierungs-Anweisungen (optional)",
+      "rewritePromptHint": "Deine dauerhaften Vorgaben, wie Nachrichten vorgelesen werden — z. B. „gib mir bei langen Nachrichten eine Kurzfassung“, „Tabellen überspringen“, „Code-Dateinamen weglassen“. Diese haben Vorrang vor den Standardregeln (außer: es werden nie Fakten erfunden oder Zahlen und Namen geändert).",
+      "rewritePromptPlaceholder": "z. B. Lange Nachrichten zusammenfassen und Tabellen überspringen…",
+      "rewritePromptCounter": "{{left}} Zeichen übrig.",
+      "rewriteSave": "Umformulierung speichern"
     },
     "dataVisibility": {
       "title": "Datensichtbarkeit",
