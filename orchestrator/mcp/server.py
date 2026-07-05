@@ -2372,6 +2372,36 @@ async def export_knowledge(project_id: str) -> str:
     )
 
 
+@mcp.tool
+async def reindex_knowledge(project_id: str, full: bool = False) -> str:
+    """Rebuild/refresh a project KB's chunk index from its vault repo.
+
+    The `kb reindex --full` operator hatch (OKF KB slice 3): incremental by
+    default (only notes whose git blob changed re-embed, via the per-KB commit
+    watermark); `full=True` re-embeds the whole vault — use after an embedding
+    model/chunker change or to recover a corrupt index.
+
+    Args:
+        project_id: Project UUID
+        full: Re-embed every note instead of only changed blobs
+
+    Returns:
+        Reindex summary (status, commit, upserted/deleted/skipped/errors)
+    """
+    client = _get_client()
+    result = await client.reindex_knowledge(project_id, full=full)
+    status = result.get("status", "unknown")
+    commit = (result.get("indexed_commit") or "")[:12]
+    return (
+        f"KB reindex: {status} (commit {commit or 'n/a'}, "
+        f"full={result.get('full', False)}).\n"
+        f"  Upserted: {result.get('upserted', 0)}, "
+        f"deleted: {result.get('deleted', 0)}, "
+        f"skipped: {result.get('skipped', 0)}, "
+        f"errors: {result.get('errors', 0)}"
+    )
+
+
 # =============================================================================
 # Job Promotion
 # =============================================================================

@@ -336,3 +336,59 @@ class TestEmbeddingProviders:
         # Unknown provider goes through the else (local) branch
         assert service.provider == "nonexistent"
         assert service.base_url == "https://api.openai.com/v1"
+
+
+class TestExplicitConfigOverrides:
+    """Explicit constructor kwargs (slice 3 PR3 — the orchestrator builds an
+    EmbeddingService from catalog-resolved credentials, not env)."""
+
+    def test_explicit_kwargs_override_env(self, monkeypatch, mock_openai_client):
+        monkeypatch.setenv("EMBEDDING_API_KEY", "env-key")
+        monkeypatch.setenv("EMBEDDING_MODEL", "env-model")
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
+
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService(
+            model="catalog-model",
+            base_url="https://catalog.example/v1",
+            api_key="catalog-key",
+        )
+        assert service.model == "catalog-model"
+        assert service.base_url == "https://catalog.example/v1"
+        assert service.api_key == "catalog-key"
+
+    def test_explicit_client_uses_explicit_credentials(
+        self, mock_env, mock_openai_client
+    ):
+        _, mock_cls = mock_openai_client
+
+        from src.services.embedding_service import EmbeddingService
+
+        EmbeddingService(
+            model="m", base_url="https://x.example/v1", api_key="k"
+        )
+        kwargs = mock_cls.call_args[1]
+        assert kwargs["api_key"] == "k"
+        assert kwargs["base_url"] == "https://x.example/v1"
+
+    def test_partial_kwargs_fall_back_to_env(
+        self, mock_env, monkeypatch, mock_openai_client
+    ):
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
+
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService(model="only-model-given")
+        assert service.model == "only-model-given"
+        assert service.base_url == "https://env.example/v1"
+        assert service.api_key == "test-key-123"  # OPENAI_API_KEY from mock_env
+
+    def test_no_kwargs_is_pure_env_backward_compat(
+        self, mock_env, mock_openai_client
+    ):
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService()
+        assert service.model == "qwen3-embedding-8b"
+        assert service.api_key == "test-key-123"

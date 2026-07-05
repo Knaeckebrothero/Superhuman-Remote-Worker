@@ -5959,6 +5959,28 @@ async def lifespan(app: FastAPI):
         stale_verification_sweeper_loop(postgres_db, _shutdown_event)
     )
 
+    # Slice-3 KB index freshness sweep: catch out-of-band vault edits (human
+    # pushes, recovered partial reindexes) the post-merge trigger can't see.
+    # Leader-gated — two replicas replace-note-chunks'ing the same KB would
+    # interleave delete+insert batches. The store rides the vector pool; the
+    # embedding service is catalog-re-resolved per tick inside the loop.
+    def _kb_sweeper_coro(ev: asyncio.Event):
+        from src.services.knowledge_store import KnowledgeStore
+
+        from services.kb_reindex import kb_reindex_sweeper_loop
+
+        return kb_reindex_sweeper_loop(
+            postgres_db,
+            KnowledgeStore(db=vector_db, embedding_service=None),
+            gitea_client,
+            ev,
+            embedding_service_factory=_build_kb_embedding_service,
+        )
+
+    kb_reindex_sweeper_task = asyncio.create_task(
+        run_when_leader(_kb_sweeper_coro, _shutdown_event)
+    )
+
     # LiteLLM gateway catalog sync — registers endpoint-kind catalog models into
     # the in-chart LiteLLM proxy so agent LLM traffic can be measured (and, in
     # later slices, rate-limited). Self-disables when LITELLM_BASE_URL is unset
@@ -6101,6 +6123,7 @@ async def lifespan(app: FastAPI):
     await automation_cron_task
     await project_loop_sweeper_task
     await stale_verification_sweeper_task
+    await kb_reindex_sweeper_task
     await litellm_sync_task
     await pricing_sync_task
     await quota_poll_task
@@ -10311,6 +10334,30 @@ async def _advance_project_loop(
                 str(job["id"])[:8],
                 (merged_sha or "")[:8],
             )
+            # Slice-3 KB freshness (post-merge trigger): the squash just moved
+            # `main`, likely including knowledge/ writes — bring the chunk
+            # index up to the new HEAD. Fire-and-forget: a first full rebuild
+            # can take minutes and must never delay the loop advance; a lost
+            # task self-heals via the leader-gated sweep (blob_sha diff).
+            _kb_project = loop.get("project_id")
+            if _kb_project:
+
+                async def _kb_reindex_after_merge(
+                    pid: str, repo: str | None
+                ) -> None:
+                    try:
+                        await _reindex_project_kb(pid, repo_name=repo)
+                    except Exception:
+                        logger.warning(
+                            "post-merge kb_reindex failed (non-fatal)",
+                            exc_info=True,
+                        )
+
+                asyncio.create_task(
+                    _kb_reindex_after_merge(
+                        str(_kb_project), job.get("repo_name")
+                    )
+                )
         elif merge_status == "empty" and is_loop_execution_role(completed_role):
             logger.error(
                 "project loop %s: execution job %s COMPLETED but its branch has "
@@ -25548,6 +25595,104 @@ async def get_knowledge_note(
         return result
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+async def _build_kb_embedding_service():
+    """EmbeddingService for the KB reindexer, catalog-first (slice 3 PR3).
+
+    The orchestrator pod carries no EMBEDDING_* env (models_yaml_removal), so
+    the credential comes from the same place dispatch gets it for agents: the
+    admin-curated system embedding in the catalog
+    (``resolve_default_for_capability`` + ``_inject_env_key_credentials``).
+    Env-based construction is the fallback for dev/compose stacks that still
+    set EMBEDDING_*. Returns ``None`` when no usable key resolves — the caller
+    must skip reindexing (a keyless run could only write vectorless rows).
+    """
+    from src.services.embedding_service import EmbeddingService
+
+    env: dict[str, Any] = {}
+    emb_model = await postgres_db.resolve_default_for_capability("embedding")
+    if emb_model:
+        await _inject_env_key_credentials(
+            env_keys=env,
+            prefix="EMBEDDING",
+            model_id=emb_model,
+            user_id=None,
+            resolved_keys=None,
+            capability="embedding",
+        )
+    if env.get("EMBEDDING_API_KEY"):
+        return EmbeddingService(
+            model=env.get("EMBEDDING_MODEL"),
+            base_url=env.get("EMBEDDING_BASE_URL"),
+            api_key=env.get("EMBEDDING_API_KEY"),
+        )
+    svc = EmbeddingService()
+    if svc.api_key:
+        return svc
+    return None
+
+
+async def _reindex_project_kb(
+    project_id: str,
+    *,
+    repo_name: str | None = None,
+    branch: str | None = None,
+    force_full: bool = False,
+) -> dict[str, Any]:
+    """Bring a project KB's chunk index up to its repo HEAD (slice 3 PR3).
+
+    Shared entry for the post-merge trigger and the operator reindex endpoint.
+    Resolves the vault repo (jobs-role) when not supplied, builds the
+    catalog-resolved embedding service, and runs the tree-diff reindex. Returns
+    the reindex summary dict; ``status`` carries the honesty signal
+    (no-repo / no-embedding-service / up-to-date / completed / partial / ...).
+    """
+    from src.services.knowledge_store import KnowledgeStore
+
+    from services.kb_reindex import reindex_kb, resolve_kb_repo
+
+    if not repo_name:
+        resolved = await resolve_kb_repo(postgres_db, project_id)
+        if not resolved:
+            return {"status": "no-repo"}
+        repo_name, branch = resolved
+    svc = await _build_kb_embedding_service()
+    if svc is None:
+        logger.warning(
+            "kb_reindex: no embedding service resolvable for project %s — "
+            "skipping (check the system embedding in Admin → Models)",
+            project_id,
+        )
+        return {"status": "no-embedding-service"}
+    store = KnowledgeStore(db=vector_db, embedding_service=svc)
+    return await reindex_kb(
+        gitea_client=gitea_client,
+        store=store,
+        embedding_service=svc,
+        kb_id=UUID(project_id),
+        repo_name=repo_name,
+        branch=branch or "main",
+        force_full=force_full,
+    )
+
+
+@app.post("/api/projects/{project_id}/knowledge/reindex")
+async def reindex_knowledge(
+    request: Request, project_id: str, full: bool = False
+) -> dict[str, Any]:
+    """Rebuild/refresh the KB chunk index from the vault repo (slice 3 PR3).
+
+    The ``kb reindex --full`` operator hatch (§5): ``full=true`` re-embeds the
+    whole vault (model/chunker migration, corrupt-index recovery); the default
+    incremental run only touches notes whose git blob changed. F5: member-only,
+    same gate as the sibling knowledge endpoints.
+    """
+    await require_project_member(request, postgres_db, project_id)
+    try:
+        return await _reindex_project_kb(project_id, force_full=full)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

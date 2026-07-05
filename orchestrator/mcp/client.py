@@ -2173,6 +2173,25 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def reindex_knowledge(
+        self, project_id: str, full: bool = False
+    ) -> dict[str, Any]:
+        """Rebuild/refresh the KB chunk index from the vault repo (slice 3).
+
+        Args:
+            project_id: Project UUID
+            full: Re-embed the whole vault instead of only changed blobs
+
+        Returns:
+            Reindex summary dict (status, indexed_commit, upserted, ...)
+        """
+        resp = await self._client.post(
+            f"/api/projects/{project_id}/knowledge/reindex",
+            params={"full": str(full).lower()},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # =========================================================================
     # Job Promotion
     # =========================================================================

@@ -55,22 +55,39 @@ class EmbeddingService:
     OPENAI_API_URL = "https://api.openai.com/v1"
     OPENROUTER_API_URL = "https://openrouter.ai/api/v1"
 
-    def __init__(self):
-        """Initialize the Embedding Service from environment configuration."""
-        self.provider = os.getenv("EMBEDDING_PROVIDER", "local").lower()
-        base_model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding-8b")
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        provider: Optional[str] = None,
+    ):
+        """Initialize the Embedding Service.
+
+        Configuration comes from the environment by default; any explicit
+        kwarg overrides its env counterpart (slice 3 PR3 — the orchestrator's
+        KB reindexer constructs an instance from catalog-resolved credentials,
+        since the orchestrator pod carries no EMBEDDING_* env post
+        models_yaml_removal).
+        """
+        self.provider = (provider or os.getenv("EMBEDDING_PROVIDER", "local")).lower()
+        base_model = model or os.getenv("EMBEDDING_MODEL", "qwen3-embedding-8b")
 
         if self.provider == "openrouter":
-            self.api_key = os.getenv("OPENROUTER_API_KEY", "")
-            self.base_url = self.OPENROUTER_API_URL
+            self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
+            self.base_url = base_url or self.OPENROUTER_API_URL
             # OpenRouter uses provider-prefixed model names
             self.model = f"qwen/{base_model}" if "/" not in base_model else base_model
         else:
             # "local" provider (default) — custom endpoint or OpenAI
-            self.api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv(
-                "OPENAI_API_KEY", ""
+            self.api_key = (
+                api_key
+                or os.getenv("EMBEDDING_API_KEY")
+                or os.getenv("OPENAI_API_KEY", "")
             )
-            self.base_url = os.getenv("EMBEDDING_BASE_URL", self.OPENAI_API_URL)
+            self.base_url = base_url or os.getenv(
+                "EMBEDDING_BASE_URL", self.OPENAI_API_URL
+            )
             self.model = base_model
 
         # Schema columns are vector(4096); a provider returning any other
