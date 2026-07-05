@@ -110,9 +110,7 @@ def plan_reindex(
     return upserts, deletes
 
 
-def note_fields(
-    path: str, fm: Optional[Dict[str, Any]], body: str
-) -> Dict[str, Any]:
+def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str, Any]:
     """Map a parsed note file onto ``upsert_kb_note`` arguments.
 
     The inverse of ``_render_note_md``'s frontmatter (id/type/tags/keywords/
@@ -202,8 +200,15 @@ async def reindex_kb(
     head = await gitea_client.get_branch_head_sha(repo_name, branch)
     if not head:
         logger.warning("kb_reindex[%s]: no HEAD for %s@%s", kb_id, repo_name, branch)
-        return {"status": "no-head", "indexed_commit": None, "full": False,
-                "upserted": 0, "deleted": 0, "skipped": 0, "errors": 0}
+        return {
+            "status": "no-head",
+            "indexed_commit": None,
+            "full": False,
+            "upserted": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
 
     current_version = embedding_version(
         embedding_service.model, embedding_service.expected_dimensions
@@ -215,16 +220,30 @@ async def reindex_kb(
         and wm.pipeline_version == current_version
         and not force_full
     ):
-        return {"status": "up-to-date", "indexed_commit": head, "full": False,
-                "upserted": 0, "deleted": 0, "skipped": 0, "errors": 0}
+        return {
+            "status": "up-to-date",
+            "indexed_commit": head,
+            "full": False,
+            "upserted": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
 
     full = force_full or wm is None or wm.pipeline_version != current_version
 
     tree = await gitea_client.list_tree(repo_name, head)
     if tree is None:
         logger.warning("kb_reindex[%s]: tree fetch failed at %s", kb_id, head)
-        return {"status": "tree-fetch-failed", "indexed_commit": None, "full": full,
-                "upserted": 0, "deleted": 0, "skipped": 0, "errors": 0}
+        return {
+            "status": "tree-fetch-failed",
+            "indexed_commit": None,
+            "full": full,
+            "upserted": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
 
     current_map = knowledge_blob_map(tree)
     indexed_map = await store.get_indexed_blob_shas(kb_id)
@@ -308,11 +327,24 @@ async def reindex_kb(
     logger.info(
         "kb_reindex[%s]: %s at %s (full=%s upserted=%d deleted=%d "
         "skipped=%d errors=%d)",
-        kb_id, status, head[:12], full, upserted, deleted, skipped, errors,
+        kb_id,
+        status,
+        head[:12],
+        full,
+        upserted,
+        deleted,
+        skipped,
+        errors,
     )
-    return {"status": status, "indexed_commit": head, "full": full,
-            "upserted": upserted, "deleted": deleted,
-            "skipped": skipped, "errors": errors}
+    return {
+        "status": status,
+        "indexed_commit": head,
+        "full": full,
+        "upserted": upserted,
+        "deleted": deleted,
+        "skipped": skipped,
+        "errors": errors,
+    }
 
 
 async def resolve_kb_repo(
@@ -391,9 +423,7 @@ async def kb_reindex_sweeper_loop(
     logger.info("KB reindex sweeper started (tick=%ds)", SWEEP_TICK_SECONDS)
     while not shutdown_event.is_set():
         try:
-            await asyncio.wait_for(
-                shutdown_event.wait(), timeout=SWEEP_TICK_SECONDS
-            )
+            await asyncio.wait_for(shutdown_event.wait(), timeout=SWEEP_TICK_SECONDS)
             break  # shutdown requested
         except asyncio.TimeoutError:
             pass  # tick due
