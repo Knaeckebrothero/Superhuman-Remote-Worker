@@ -900,6 +900,74 @@ class TestJobMutationGates:
         assert "owner" in exc.value.detail.lower()
 
     @pytest.mark.asyncio
+    async def test_delete_job_tears_down_workspace_before_row_delete(
+        self, user_a, job_a, fake_db, fake_request
+    ):
+        """Owner-path delete must release workspace/VM resources and the S3
+        snapshots while the row still exists — once the row is gone the
+        lifecycle reconciler can no longer reap the pod (no-bound-row is
+        treated as in-flight provisioning). See
+        docs/issues/deleted_job_orphans_workspace_pod.md."""
+        from main import delete_job
+
+        calls: list[str] = []
+
+        async def _cleanup(jid):
+            calls.append("workspace")
+            return []
+
+        async def _row_delete(jid):
+            calls.append("row")
+            return True
+
+        fake_db.delete_job = AsyncMock(side_effect=_row_delete)
+        fake_db.has_child_jobs = AsyncMock(return_value=False)
+        cleanup = AsyncMock(side_effect=_cleanup)
+        fake_snapshot = MagicMock()
+        fake_snapshot.is_available = True
+        fake_snapshot.delete_snapshot = AsyncMock(return_value=True)
+        fake_gitea = MagicMock()
+        fake_gitea.is_initialized = False
+
+        with (
+            _patch_caller_and_db(user_a, fake_db),
+            patch("main._archive_and_cleanup_workspace", cleanup),
+            patch("main.snapshot_service", fake_snapshot),
+            patch("main.gitea_client", fake_gitea),
+            patch("main.vector_db", _make_dud("vector_db")),
+        ):
+            result = await delete_job(fake_request, str(job_a["id"]))
+
+        assert result == {"status": "deleted"}
+        cleanup.assert_awaited_once_with(str(job_a["id"]))
+        fake_snapshot.delete_snapshot.assert_awaited_once_with(str(job_a["id"]))
+        assert calls == ["workspace", "row"]
+
+    @pytest.mark.asyncio
+    async def test_delete_job_with_children_409s_before_teardown(
+        self, user_a, job_a, fake_db, fake_request
+    ):
+        """A parent with surviving child rows can't be row-deleted (FK) — the
+        endpoint must fail fast BEFORE tearing down the workspace, or the
+        failed delete would leave the job alive with its pod gone."""
+        from main import delete_job
+
+        fake_db.has_child_jobs = AsyncMock(return_value=True)
+        cleanup = AsyncMock()
+
+        with (
+            _patch_caller_and_db(user_a, fake_db),
+            patch("main._archive_and_cleanup_workspace", cleanup),
+            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("main.vector_db", _make_dud("vector_db")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await delete_job(fake_request, str(job_a["id"]))
+
+        assert exc.value.status_code == 409
+        cleanup.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_assign_job_to_agent_blocked_non_admin(
         self, user_a, job_a, fake_db, fake_request
     ):

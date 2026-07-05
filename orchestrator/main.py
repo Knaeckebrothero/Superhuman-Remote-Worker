@@ -6856,6 +6856,33 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
                 detail="Only the job owner, the project owner, or an admin may delete this job",
             )
     try:
+        # A parent with surviving child rows can't be row-deleted anyway
+        # (parent_job_id FK, no cascade) — fail fast BEFORE tearing down the
+        # workspace, or the failed delete would leave the job alive with its
+        # pod gone.
+        if await postgres_db.has_child_jobs(job_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Job has child jobs; delete them first",
+            )
+
+        # Tear down workspace/VM resources while the row still exists — the
+        # provisioners resolve them through the job's context, and once the
+        # row is gone the lifecycle reconciler refuses to reap the pod
+        # (no-bound-row is treated as in-flight provisioning; see
+        # docs/issues/deleted_job_orphans_workspace_pod.md).
+        try:
+            await _archive_and_cleanup_workspace(job_id)
+        except Exception as e:
+            logger.warning(f"Workspace cleanup failed for deleted job {job_id}: {e}")
+        # A deleted job can never be restored, so its S3 snapshots (including
+        # the one release_workspace may have just captured) are garbage.
+        if snapshot_service.is_available:
+            try:
+                await snapshot_service.delete_snapshot(job_id)
+            except Exception as e:
+                logger.warning(f"Snapshot cleanup failed for deleted job {job_id}: {e}")
+
         # Clean up Gitea repo/branch
         if gitea_client.is_initialized:
             if (

@@ -914,6 +914,25 @@ class PostgresDB:
 
         return result == "DELETE 1"
 
+    async def has_child_jobs(self, job_id: str) -> bool:
+        """True if any job row (any status) has this job as its parent.
+
+        Mirrors the ``parent_job_id`` FK exactly: such a parent cannot be
+        row-deleted until its descendants are gone.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM jobs WHERE parent_job_id = $1)",
+                    uuid_val,
+                )
+            )
+
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a job by setting its status to 'cancelled'.
 

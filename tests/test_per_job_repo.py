@@ -178,6 +178,7 @@ class TestDeleteJobGiteaCleanup:
             _bypass_job_access_gate(job),
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_gitea.is_initialized = True
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
@@ -204,6 +205,7 @@ class TestDeleteJobGiteaCleanup:
             _bypass_job_access_gate(job),
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_gitea.is_initialized = True
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
@@ -232,6 +234,7 @@ class TestDeleteJobGiteaCleanup:
             _bypass_job_access_gate(job),
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_db.get_project_repositories = AsyncMock(
                 return_value=[{"name": "project-jobs-repo"}]
             )
@@ -257,6 +260,7 @@ class TestDeleteJobGiteaCleanup:
             _bypass_job_access_gate(job),
         ):
             mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
             mock_gitea.is_initialized = False
 
             result = await orch_main.delete_job(_stub_request(), "some-id")

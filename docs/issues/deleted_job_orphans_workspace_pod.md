@@ -1,6 +1,6 @@
 # Deleting a job orphans its workspace pod forever (no-bound-row = never reapable)
 
-**Status:** investigated 2026-07-05 — root cause confirmed from a live orphan on the main cluster; fix not started
+**Status:** investigated 2026-07-05 — root cause confirmed from a live orphan on the main cluster; **both fixes IMPLEMENTED + k3d-verified 2026-07-05** (see "Fix directions" — teardown-in-delete verified end-to-end via API delete of a pod-backed job row; reaper verified via planted orphan pod: spared while under grace, reaped after). Uncommitted.
 **Severity:** low urgency (leaks one pod's worth of node resources per occurrence) but unbounded — every orphan persists until someone hand-deletes it, and nothing surfaces it
 **Component:** `orchestrator/main.py` `delete_job` (`DELETE /api/jobs/{job_id}`), `orchestrator/services/lifecycle/workspace_manager.py` (`is_reapable`/`is_idle`/`reap_orphans`)
 **Observed on:** main cluster (`superhuman-remote-worker`), pod `workspace-a9ad385d-0ed` (job `a9ad385d-0edd-4bc3-8407-4e0523a0d35f`), alive 7d22h at investigation
@@ -66,30 +66,47 @@ Two halves, both necessary:
    direct query, row present → check status, **no row → genuinely gone → reap**,
    query raised → skip. Pods never get that logic.
 
-## Fix directions
+## Fix directions (both implemented 2026-07-05)
 
-1. **Teardown in `delete_job`** (primary): before deleting the row, best-effort
-   `delete_workspace(WorkspaceOwner.job(job_id))` (which also removes the seed
-   ConfigMap), plus `delete_workspace_pvc` + `_delete_service` when PVC-backed —
-   the same trio the reconciler's terminal-delete runs. The job row (and its
-   `workspace_container` context) is still available at that point, so the
-   provisioner has everything it needs. Failures should warn, not block the
-   delete (matches the vector-DB cleanup stance).
+1. **Teardown in `delete_job`** (primary) — IMPLEMENTED: `delete_job` now
+   first 409s when the job has child rows (`postgres_db.has_child_jobs`, a new
+   method mirroring the `parent_job_id` FK — the row delete would fail anyway,
+   and it must fail BEFORE teardown or the job would survive with its pod
+   gone; previously this case was an opaque FK 500). It then calls
+   `_archive_and_cleanup_workspace(job_id)` (the same centralized helper the
+   cancel/completion paths use — handles k8s pod + seed ConfigMap + PVC +
+   Service, docker pool release, and VM release uniformly) before deleting the
+   row, then `snapshot_service.delete_snapshot(job_id)` since a deleted job's
+   S3 snapshots (including the one the release just captured) can never be
+   restored. Both best-effort: failures warn, the delete proceeds (matches the
+   vector-DB cleanup stance).
 2. **Age-gated missing-row reap in the reconciler** (backstop, covers any other
-   row-deletion path and crash windows): in `list_instances`, distinguish
-   "fetch returned no row" (`bound_row_missing=True`) from "fetch raised"
-   (skip, as today). In `is_reapable`, treat `bound_row_missing` as reapable
-   once the pod is older than a grace period (e.g. 15–30 min via
-   `metadata.creationTimestamp`, far beyond any provisioning window). The reap
-   flow must then short-circuit `is_dirty`/snapshot for missing-row instances —
-   there is no row to snapshot against (`capture_vm_snapshot` keys by job id,
-   `record_attempt` merges into the deleted row and would silently no-op,
-   leaving `attempts_exhausted` false forever) — and go straight to
-   `delete(grace_s=0)`.
+   row-deletion path and crash windows) — IMPLEMENTED in
+   `workspace_manager.py`: `_fetch_job`/`_fetch_thread` now return a
+   `_FETCH_FAILED` sentinel on lookup errors so `list_instances` can set
+   `bound_row_missing=True` only when the query succeeded and found no row
+   (plus `pod_age_s` from `creationTimestamp`). `is_reapable` treats a
+   missing-row pod as reapable once older than
+   `WORKSPACE_ORPHAN_GRACE_SECONDS` (default 900 — the provisioning
+   pod-before-row window is seconds). `is_dirty` returns False for orphans
+   (no entity can restore a snapshot; `record_attempt` would merge into the
+   deleted row as a silent no-op and retry forever), so the reap goes straight
+   to `delete(grace_s=0)`; `_is_terminal` returns True so PVC + Service are
+   reclaimed and `give_up` never recreates.
 
-Either half alone closes the observed leak; (1) fixes the common path cheaply,
-(2) makes the reconciler actually self-healing, which is what its
-`srw.io/managed-by` annotation already promises.
+Verification (k3d, 2026-07-05): unit — 106 tests in
+`test_lifecycle_workspace_manager.py`/`test_lifecycle_reconciler_reap.py`
+incl. new `TestMissingRowOrphan` (marking, fetch-failure distinction, age
+gate, clean+terminal, reconciler-tick end-to-end) + a `delete_job` ordering
+test in `test_job_access.py` (teardown before row delete). Live — inserted a
+`paused` job row bound to a planted pod, `DELETE /api/jobs/{id}` as the test
+user → `{"status":"deleted"}`, row gone, pod Terminating inline; planted a
+second pod with a nonexistent job id → reconciler listed it every tick,
+spared it under the grace age, reaped it after.
+
+NOTE: the VM manager (`vm_manager.py`) has the same no-bound-row-never-reapable
+stance; fix (1) covers deleted jobs' VMs (release via the shared helper), but
+the reconciler backstop for VM orphans is a follow-up if ever observed.
 
 ## Cleanup for the live orphan
 

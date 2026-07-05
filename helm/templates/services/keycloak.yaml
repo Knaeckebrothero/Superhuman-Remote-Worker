@@ -950,6 +950,16 @@ spec:
                           -s "redirectUris=[\"$OC_URL/*\"]" -s "webOrigins=[\"$OC_URL\"]" \
                           -s 'attributes={"pkce.code.challenge.method":"S256"}' 2>/dev/null
                       fi
+                      # Re-assert redirect URI + web origin on every start so a
+                      # domain flip (OPENCLOUD_PUBLIC_URL / cloudUrl change) propagates
+                      # to an existing client without a DB wipe — the create above
+                      # only fires when missing. Same self-heal as gitea/cockpit-bff.
+                      OWID=$($KC get clients -r {{ .Values.keycloak.realm }} -q clientId=opencloud-web --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                      if [ -n "$OWID" ]; then
+                        $KC update "clients/$OWID" -r {{ .Values.keycloak.realm }} \
+                          -s "redirectUris=[\"$OC_URL/*\"]" -s "webOrigins=[\"$OC_URL\"]" 2>/dev/null \
+                          || echo "WARN: kcadm opencloud-web redirectUris re-assert failed"
+                      fi
                       # OpenCloud Desktop sync client (public, localhost OAuth redirect)
                       if ! $KC get clients -r {{ .Values.keycloak.realm }} -q clientId=OpenCloudDesktop 2>/dev/null | grep -q '"OpenCloudDesktop"'; then
                         $KC create clients -r {{ .Values.keycloak.realm }} \
@@ -1054,6 +1064,16 @@ spec:
                     # (realm import sometimes stores empty config objects)
                     GID=$($KC get clients -r {{ .Values.keycloak.realm }} -q clientId=gitea --fields id --format csv --noquotes 2>/dev/null | tail -1)
                     if [ -n "$GID" ]; then
+                      # Re-assert redirect URIs + web origins on every start so a
+                      # domain flip (global.domain change) propagates without a DB
+                      # wipe — realm-import only seeds these on first boot, mirroring
+                      # the cockpit-bff self-heal above. Gitea builds its OAuth
+                      # redirect from ROOT_URL (srw.gitUrl), so only that host is ever
+                      # sent; localhost stays for in-cluster/dev callbacks.
+                      $KC update "clients/$GID" -r {{ .Values.keycloak.realm }} \
+                        -s "redirectUris=[\"http://localhost:3000/user/oauth2/Keycloak/callback\",\"{{ include "srw.gitUrl" . }}/user/oauth2/Keycloak/callback\"]" \
+                        -s "webOrigins=[\"http://localhost:3000\",\"{{ include "srw.gitUrl" . }}\"]" 2>/dev/null \
+                        || echo "WARN: kcadm gitea redirectUris update failed"
                       ensure_mapper() {
                         NAME="$1"; ATTR="$2"; CLAIM="$3"; JTYPE="$4"
                         MID=$($KC get "clients/$GID/protocol-mappers/models" -r {{ .Values.keycloak.realm }} 2>/dev/null \
@@ -1067,6 +1087,20 @@ spec:
                       ensure_mapper "given-name" "firstName" "given_name" "String"
                       ensure_mapper "family-name" "lastName" "family_name" "String"
                     fi
+                    {{- if .Values.mcp.enabled }}
+                    # --- Re-assert mcp-server redirect URIs (domain-flip self-heal) ---
+                    # realm-import seeds these on first boot only; a global.domain
+                    # change (mcpUrl) otherwise strands the MCP OAuth-bridge → Keycloak
+                    # callback at the old host, breaking interactive MCP login while
+                    # discovery still looks healthy. Mirrors the gitea/cockpit-bff pattern.
+                    MSID=$($KC get clients -r {{ .Values.keycloak.realm }} -q clientId=mcp-server --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                    if [ -n "$MSID" ]; then
+                      $KC update "clients/$MSID" -r {{ .Values.keycloak.realm }} \
+                        -s "redirectUris=[\"http://localhost:8055/auth/callback\",\"{{ include "srw.mcpUrl" . }}/auth/callback\"]" \
+                        -s "webOrigins=[\"http://localhost:8055\",\"{{ include "srw.mcpUrl" . }}\"]" 2>/dev/null \
+                        || echo "WARN: kcadm mcp-server redirectUris update failed"
+                    fi
+                    {{- end }}
           volumeMounts:
             - name: realm-import
               mountPath: /opt/keycloak/data/import
