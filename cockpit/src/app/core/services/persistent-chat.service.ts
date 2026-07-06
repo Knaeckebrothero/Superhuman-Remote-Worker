@@ -605,6 +605,15 @@ export class PersistentChatService {
     // than the watchdog window forces an unconditional revalidate on return — a
     // socket that died while the tab was frozen still reports readyState===OPEN.
     private hiddenAt = 0;
+
+    // --- Streamed-delta coalescing (de-flicker) ---
+    // token/thinking deltas buffer here and fold into `conversation` at most
+    // once per DELTA_FLUSH_MS via a single signal write, instead of one
+    // change-detection pass per token. Any non-delta action flushes first, so
+    // wire order is preserved and no buffered delta outlives a turn boundary.
+    private deltaQueue: Extract<ReducerAction, { type: 'token' | 'thinking' }>[] = [];
+    private deltaFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    private static readonly DELTA_FLUSH_MS = 80;
     private controlWs: WebSocket | null = null;
     private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private controlWsReconnectAttempt = 0;
@@ -1501,6 +1510,10 @@ export class PersistentChatService {
         this.reconnectAttempt.set(0);
         this.reconnectGaveUp.set(false);
         this.connectionState.set('disconnected');
+        // Fold any buffered streamed deltas (and cancel their timer) before we
+        // close the turn — otherwise a stale flush could fire ≤80ms later and
+        // resurrect a `recovered:` bubble on a disconnected/thread-switched view.
+        this._flushDeltas();
         // If a turn was streaming when we disconnected, mark it interrupted
         // so isStreaming flips to false and the bubble shows it stopped.
         this._closeActiveTurnIfAny('turn_interrupted');
@@ -2083,6 +2096,16 @@ export class PersistentChatService {
         const params = data.params ?? {};
         const now = Date.now();
 
+        // Fold any buffered streamed deltas before handling a non-delta frame.
+        // Several handlers below read conversation() and may skip dispatching
+        // (_closeActiveTurnIfAny, the turn.completed handler); if buffered
+        // tokens weren't applied first they'd materialize a placeholder turn
+        // *after* the close ran, wedging isStreaming() true. token/thinking
+        // frames enqueue further down and must NOT flush here.
+        if (data.method !== 'token' && data.method !== 'thinking') {
+            this._flushDeltas();
+        }
+
         // Agent-liveness tracking (session_silent_failure_audit.md #8):
         // "Connected" only proves the orchestrator SSE is up. Every frame
         // reaching this dispatcher is agent-origin (orchestrator pings and
@@ -2617,9 +2640,53 @@ export class PersistentChatService {
         this.dispatch({type: kind, turnId: activeId, finishedAt: Date.now()});
     }
 
-    /** Apply a reducer action to the conversation state. */
+    /** Apply a reducer action to the conversation state. Streamed deltas
+     *  (token/thinking) are buffered and coalesced; every other action folds
+     *  the buffer first so wire order is preserved. */
     private dispatch(action: ReducerAction): void {
+        if (action.type === 'token' || action.type === 'thinking') {
+            this._enqueueDelta(action);
+            return;
+        }
+        this._flushDeltas();
         this.conversation.update((s) => reduce(s, action));
+    }
+
+    /** Buffer a streamed delta. Adjacent same-kind deltas concatenate (thinking
+     *  only when the messageId matches), keeping the first delta's timestamp. */
+    private _enqueueDelta(
+        action: Extract<ReducerAction, { type: 'token' | 'thinking' }>,
+    ): void {
+        const last = this.deltaQueue[this.deltaQueue.length - 1];
+        // messageId is undefined on token actions, so this comparison is safe
+        // for both kinds: tokens always match (undefined === undefined),
+        // thinking merges only within the same reasoning message.
+        const sameMessage =
+            (last as { messageId?: string } | undefined)?.messageId ===
+            (action as { messageId?: string }).messageId;
+        if (last && last.type === action.type && sameMessage) {
+            last.content += action.content;
+        } else {
+            this.deltaQueue.push({...action});
+        }
+        this.deltaFlushTimer ??= setTimeout(
+            () => this._flushDeltas(),
+            PersistentChatService.DELTA_FLUSH_MS,
+        );
+    }
+
+    /** Fold every buffered delta into `conversation` in one signal write. Safe
+     *  to call anytime — a no-op when the queue is empty. Also cancels the
+     *  pending flush timer so a stale delta can never leak past teardown. */
+    private _flushDeltas(): void {
+        if (this.deltaFlushTimer) {
+            clearTimeout(this.deltaFlushTimer);
+            this.deltaFlushTimer = null;
+        }
+        if (this.deltaQueue.length === 0) return;
+        const queued = this.deltaQueue;
+        this.deltaQueue = [];
+        this.conversation.update((s) => queued.reduce((acc, a) => reduce(acc, a), s));
     }
 
     /**

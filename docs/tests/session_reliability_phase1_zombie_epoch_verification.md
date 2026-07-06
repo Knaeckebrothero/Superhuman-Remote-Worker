@@ -268,6 +268,50 @@ a **503/network** error keeps the bubble + shows the banner and does **not**
 auto-retry (no double-send) — the next send retriggers the flush; a **404/410**
 (e.g. the thread was deleted) drains the queue and removes the bubbles.
 
+---
+
+## Phase 4 live criteria (client — de-flicker generation)
+
+Phase 4 attacks bug #2 (flicker during generation): streamed deltas coalesce on
+an 80ms timer (one CD pass per burst instead of per token), DOM post-processing
+(code-collapse, copy buttons, KaTeX) is gated off the still-streaming block, and
+scroll pinning re-checks intent at fire time. Service coalescing is unit-tested
+(6 new tests); the rendering effects are browser-verified. Use a **long-turn
+fixture**: a reply with **5 fenced code blocks and a `$$…$$` math expression**.
+
+### P4-#7 — DOM enhancements never attach mid-stream, appear right after
+
+While the turn streams, in DevTools watch `details.code-collapse` /
+`.code-copy-btn` counts:
+- **PASS:** counts are **monotonically non-decreasing**; no collapse wrapper or
+  copy button ever exists inside an element with class `.streaming-block`; each
+  block gets its collapse/button within a frame of *that block* finishing (not
+  only at turn end). **Also test with the turn manually collapsed mid-stream**
+  (click the turn's chevron while it streams) — the final-answer path must stay
+  gated too (this is the vacuous-pass trap the review caught).
+- **FAIL (pre-P4):** wrappers/buttons flicker in and out every token; the whole
+  turn visibly reflows on each delta.
+
+### P4-#8 — KaTeX renders once, on completion
+
+- **PASS:** the `$$…$$` shows as **raw text** while the block streams (no KaTeX
+  DOM), then typesets **once** when the block completes — no per-token height
+  jump. **FAIL:** the equation re-typesets every token, jumping the layout.
+
+### P4-#9 — Scroll pinning respects intent
+
+- Pinned to bottom during a stream → stays pinned smoothly, no jumps.
+- **Wheel up mid-stream** → the view stays where you scrolled; the next token
+  must **not** yank you back to the bottom (the fire-time `autoScroll` re-check).
+  Scroll back to the bottom → auto-pin resumes.
+
+### P4-#10 — Reflow reduction (optional, timeboxed)
+
+DevTools Performance: record a token burst on `develop` vs this branch over the
+same fixture. Expect a **visibly reduced** layout/recalc-style count. Don't sink
+the whole verification budget chasing an exact "≥10×" — "visibly reduced + trace
+attached" is enough.
+
 ## Notes & gotchas
 
 - **Two replicas.** Repeated everywhere above because it's the most likely way to
