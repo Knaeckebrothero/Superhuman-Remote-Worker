@@ -684,7 +684,7 @@ exactly the split-brain this design exists to kill.
          Neo4j-less deployment even though the outer `has_knowledge()` gate now passes. No
          crash, no regression (kg-less curation never worked); wire it to the store's
          `list_notes` when doing the Neo4j-less E2E.
-     - **PR4d DONE (2026-07-06, TDD, uncommitted) — near-dup restored via note centroid.**
+     - **PR4d DONE (2026-07-06, TDD, deployed `sha-ae0cddc`) — near-dup restored via note centroid.**
        Decision (settled): the near-dup-under-chunking semantic stays *whole-note*
        ("should a gardener merge these two notes?"), so instead of a chunk×chunk self-join
        (O(chunks²) ≈ 20M pairs, noisy on shared boilerplate sections) the reindexer stores a
@@ -712,6 +712,19 @@ exactly the split-brain this design exists to kill.
    `tags`/`keywords` flow sequences); the 07-05 0.97 near-dup floor was never
    applied in code. Concrete per-item remediation tracker (code fixes + live
    mutations + deferred tuning): **`docs/features/okf_kb_hygiene_worklist.md`**.
+   **REMEDIATED 2026-07-06:** the four code guards shipped + deployed (`sha-ae0cddc`) —
+   C-1 renderer quoting (`33396baa`), the 0.97 `kb_lint` floor (D-1), the near-dup
+   `embedding_version` guard (D-2), and `path IS NOT NULL` on `list_notes` /
+   `get_note_by_slug` (B-1). The **root cause** was reframed: ghosts are an
+   **adoption/reconciliation gap**, not a delete gap — the agent write-through
+   (`upsert_note`) is born pathless, the reindexer adopts it slug-keyed once the file
+   lands, and un-adopted rows are invisible to the path-keyed delete. Closed by **R-1**:
+   `KnowledgeStore.reconcile_orphans` (project_id-keyed, 1h adoption grace, soft-archive)
+   + a non-fatal per-reindex pass that surfaces a `reconciled` count (implemented,
+   uncommitted; spec `docs/superpowers/specs/2026-07-06-kb-ghost-reconciliation-design.md`).
+   It archives orphans on the next clean reindex, so the bulk B-2 cleanup is retired as
+   a no-op. Live loop-repo repairs (A-1 resurrection files, C-2 invalid-YAML backfill)
+   await dev-cluster access (tunnel down 2026-07-06).
 4. **KB datasource type + auto-attach as project KB** — the unification; Neo4j export
    migration for pre-existing notes. Mechanics (audited 2026-07-03 — most of the
    substrate is already live):

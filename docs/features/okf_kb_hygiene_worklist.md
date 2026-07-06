@@ -4,7 +4,19 @@
 dev cluster, 2026-07-06. Evidence and raw numbers in the memory note
 `srw-okf-kb-migration-hygiene-audit` and `docs/features/okf_knowledge_base.md`
 §11 (PR4). This file is the **execution tracker** — one item at a time, checked
-off as landed. Nothing here is committed yet.
+off as landed.
+
+## Status — 2026-07-06
+- **Shipped + deployed** on dev (`sha-ae0cddc`): **C-1** (`33396baa`), **D-1**, **D-2**,
+  **B-1** (+ `get_note_by_slug`) — all four code guards are live.
+- **Implemented, uncommitted:** **R-1** (ghost reconciliation pass) — the root-cause
+  fix. Spec: `docs/superpowers/specs/2026-07-06-kb-ghost-reconciliation-design.md`.
+- **Skipped:** **B-2** (bulk ghost archival) — the code guards make it cosmetic, and
+  R-1 automates it on the next clean reindex.
+- **Blocked on dev-cluster access** (tunnel down 2026-07-06): **A-1**, **C-2** (live
+  loop-repo edits).
+- **Low priority / deferred:** **C-3** (file triage), **D-3** (floor tuning — needs
+  PR4d deploy + a full reindex).
 
 ## Standing rules for this work
 - Work on `develop`, no feature branches. Commit only when explicitly authorized;
@@ -19,9 +31,10 @@ off as landed. Nothing here is committed yet.
 The whole kg-less read/write surface (where ghosts and resurrection actually bite)
 is **dormant on every Neo4j-enabled deployment** — it only activates when a
 deployment sets `databases.neo4j.enabled=false` (the #35 E2E, or an OSS self-host).
-So these are **pre-flip hygiene**, not live-on-dev bugs. Exception: **C-1** (the
-renderer bug) *is* live now — it silently drops agent notes from the index and
-re-warns every sweep on dev today.
+So these are **pre-flip hygiene**, not live-on-dev bugs. The one exception was **C-1**
+(the renderer bug) — it silently dropped agent notes from the index on dev; **fixed and
+deployed** (`33396baa`, `sha-ae0cddc`). D-1/D-2 (`kb_lint` near-dup) also run live on
+dev regardless of the flip, and are deployed too.
 
 ---
 
@@ -69,7 +82,7 @@ every 15-min sweep, forever** (5 such files today, more accruing).
   `gardener.parse_note` and the list is recovered intact.
 - **Blast radius:** write path only; no schema change. Neo4j-agnostic.
 
-### D-1 — Apply the 0.97 floor  ·  code · ☑ **DONE (uncommitted)**
+### D-1 — Apply the 0.97 floor  ·  code · ☑ **DONE (deployed `sha-ae0cddc`)**
 The 07-05 decision (raise 0.9→0.97) was **never applied**: `kb_lint`
 (`knowledge_tools.py:1422`) calls `find_near_duplicate_pairs(project_id)` with no
 `min_similarity`, so it uses the store default `0.9`. Live floor read confirms
@@ -79,7 +92,7 @@ The 07-05 decision (raise 0.9→0.97) was **never applied**: `kb_lint`
   implementing). Prefer the call site so the *lint policy* owns the floor.
 - **Test:** `kb_lint` invokes the store with `0.97`.
 
-### D-2 — Version guard on the self-join  ·  code · ☑ **DONE (uncommitted)**
+### D-2 — Version guard on the self-join  ·  code · ☑ **DONE (deployed `sha-ae0cddc`)**
 `find_near_duplicate_pairs` (`src/services/knowledge_store.py:1082`) filters
 `status='active'` + `embedding IS NOT NULL` but **not `embedding_version`** → it
 cosine-compares vectors from different embedding models (ghost `null-version` vs
@@ -88,7 +101,7 @@ cosine-compares vectors from different embedding models (ghost `null-version` vs
   param to scope to the query-time version). Keeps the fn byte-compatible otherwise.
 - **Test:** two rows with differing `embedding_version` are never returned as a pair.
 
-### B-1 — `list_notes` (+ `get_note_by_slug`) path filter  ·  code · ☑ **DONE (uncommitted)**
+### B-1 — `list_notes` (+ `get_note_by_slug`) path filter  ·  code · ☑ **DONE (deployed `sha-ae0cddc`)**
 `list_notes` (`knowledge_store.py:859`) filtered only `kb_id` → after the kg-less
 flip, `kb_list` would return all 396 active ghosts. **Decision resolved:**
 `get_note_by_slug` (the `kb_read` backend) got the same guard — a direct read of a
@@ -158,10 +171,22 @@ delete. Spec: `docs/superpowers/specs/2026-07-06-kb-ghost-reconciliation-design.
 
 ---
 
-## Recommended sequence
-1. **C-1** (live bug — stops new index dropouts) → verify green.
-2. **D-1 + D-2 + B-1** (cheap, independent code fixes) → one commit or three.
-3. Commit the code batch when authorized.
-4. **B-2 / A-1 / C-2** (live mutations) — per-item authz, prefer tool-driven writes.
-5. **D-3** after the next deploy + reindex.
-6. **R-1** as a follow-up design item so ghosts stop recurring.
+## Remaining work
+Code side is **complete**: C-1/D-1/D-2/B-1 deployed (`sha-ae0cddc`); R-1 implemented
+(uncommitted). What's left:
+
+1. **Commit R-1** (store method + reindexer pass + spec) on `develop`, then push/deploy
+   so the reconciliation pass goes live and the 384 ghosts self-archive.
+2. **A-1 / C-2** (live loop-repo edits) — **blocked** on dev-cluster access (tunnel down
+   2026-07-06). Per-item authz, prefer `kb_update` / a quiet window over a raw commit.
+3. **C-3** (file triage) — low priority, whenever.
+4. **D-3** (confirm the 0.97 floor) — **deferred** until PR4d is deployed and a full
+   reindex has written centroids; record the result in `okf_knowledge_base.md` §11.1.
+5. **B-2** — retired: R-1 makes the bulk archival automatic. The one-liner op above
+   stays only as a manual fallback.
+
+### History (done)
+- **C-1** renderer YAML safety → `33396baa`.
+- **D-1 / D-2 / B-1** (+ `get_note_by_slug`) code batch → `ae0cddc9`, deployed
+  `sha-ae0cddc`.
+- **R-1** ghost reconciliation → implemented, spec written, tests green (uncommitted).
