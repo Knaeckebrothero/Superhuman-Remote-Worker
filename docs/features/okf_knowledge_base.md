@@ -684,9 +684,22 @@ exactly the split-brain this design exists to kill.
          Neo4j-less deployment even though the outer `has_knowledge()` gate now passes. No
          crash, no regression (kg-less curation never worked); wire it to the store's
          `list_notes` when doing the Neo4j-less E2E.
-     - **PR4d NOT STARTED — near-dup port.** `find_near_duplicate_pairs` still runs on the
-       note-level `embedding` (NULL for reindexed notes → increasingly blind); port to the
-       chunk schema + settle the near-dup-under-chunking definition against live data.
+     - **PR4d DONE (2026-07-06, TDD, uncommitted) — near-dup restored via note centroid.**
+       Decision (settled): the near-dup-under-chunking semantic stays *whole-note*
+       ("should a gardener merge these two notes?"), so instead of a chunk×chunk self-join
+       (O(chunks²) ≈ 20M pairs, noisy on shared boilerplate sections) the reindexer stores a
+       **centroid** — `note_centroid()` = the per-dimension mean of a note's chunk embeddings
+       (pure helper in `chunker.py`) — back onto `knowledge_index.embedding` *atomically with
+       the stamp* (`stamp_note_indexed(..., centroid=)`, one UPDATE, no stamped-without-centroid
+       window; omitted → embedding left untouched). **`find_near_duplicate_pairs` is byte-for-
+       byte unchanged** (it already filters `embedding IS NOT NULL`); reindexed notes, whose
+       note-row embedding had gone NULL at the chunk cutover, are visible to the self-join
+       again. No schema/migration change. Cosine (`<=>`) normalises magnitude so a plain mean
+       is a sound centroid; legacy agent-written notes still carry a whole-note embedding —
+       same space, cosine-comparable, and they converge to centroids as they reindex.
+       - **Floor still 0.9 default; live re-tuning deferred** (as with the note-level 0.97):
+         chunked + breadcrumb-prefixed embeddings shift the similarity distribution, so the
+         floor is re-judged against the live centroid index in the migration-hygiene pass.
    **Migration-hygiene prerequisite (before PR3/PR4 land, zero-job, offline):** the
    reindex reads truth from *files* — audit the vault for historically-retired notes
    whose file frontmatter still says `active` (retired before `_update_existing`'s

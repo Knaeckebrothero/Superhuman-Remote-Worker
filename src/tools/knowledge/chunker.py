@@ -245,6 +245,23 @@ def embedding_version(
     return f"{model}:{dimensions}:{chunker_version}"
 
 
+def note_centroid(embeddings: List[List[float]]) -> Optional[List[float]]:
+    """Mean of a note's chunk embeddings — its whole-note vector (PR4d).
+
+    After the chunk cutover the note row's ``embedding`` is NULL (vectors live on
+    ``knowledge_chunks``), so ``find_near_duplicate_pairs`` went blind. The
+    reindexer averages the chunks it just embedded and stores the centroid back on
+    the note row, restoring the note-vs-note near-duplicate self-join with a
+    whole-note ("should a gardener merge these?") semantic. Cosine (pgvector
+    ``<=>``) normalises magnitude, so a plain mean is a sound centroid. Returns
+    ``None`` for a chunkless (empty-body) note — it simply doesn't participate.
+    """
+    if not embeddings:
+        return None
+    n = len(embeddings)
+    return [sum(col) / n for col in zip(*embeddings)]
+
+
 async def embed_note_chunks(
     body: str,
     title: str,

@@ -592,6 +592,7 @@ class KnowledgeStore:
         note_row: uuid.UUID,
         blob_sha: str,
         embedding_version: str,
+        centroid: Optional[List[float]] = None,
     ) -> None:
         """Mark a note's chunks as durably written (PR3.1).
 
@@ -601,17 +602,37 @@ class KnowledgeStore:
         ``blob_sha`` NULL and the next tree-diff retries the note (a stamped-but-
         chunkless note would read as up-to-date forever — the live 2026-07-05
         zero-chunks gap).
+
+        ``centroid`` (PR4d) is the note's whole-note vector — the mean of its
+        chunk embeddings — written back to the ``embedding`` column *in the same
+        UPDATE* so it lands atomically with the stamp (no stamped-without-centroid
+        window). It re-arms ``find_near_duplicate_pairs``, which the chunk cutover
+        left blind (the note row's ``embedding`` had gone NULL). Omitted for a
+        chunkless note, in which case the embedding column is left untouched.
         """
-        await self.db.execute(
-            """
-            UPDATE knowledge_index
-            SET blob_sha = $2, embedding_version = $3
-            WHERE id = $1
-            """,
-            note_row,
-            blob_sha,
-            embedding_version,
-        )
+        if centroid is not None:
+            await self.db.execute(
+                """
+                UPDATE knowledge_index
+                SET blob_sha = $2, embedding_version = $3, embedding = $4
+                WHERE id = $1
+                """,
+                note_row,
+                blob_sha,
+                embedding_version,
+                self._prepare_embedding(centroid),
+            )
+        else:
+            await self.db.execute(
+                """
+                UPDATE knowledge_index
+                SET blob_sha = $2, embedding_version = $3
+                WHERE id = $1
+                """,
+                note_row,
+                blob_sha,
+                embedding_version,
+            )
 
     async def replace_note_chunks(
         self,

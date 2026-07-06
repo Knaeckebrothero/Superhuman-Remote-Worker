@@ -469,6 +469,30 @@ class TestStampNoteIndexed:
         assert "WHERE id = $1" in query
         assert params == (row_id, "abc123", "m:4096:c1")
 
+    @pytest.mark.asyncio
+    async def test_no_centroid_leaves_embedding_untouched(self):
+        # Backward-compatible: without a centroid the stamp must not clobber the
+        # note row's embedding column (an empty-body note has no centroid).
+        store, db, _ = _make_store()
+        await store.stamp_note_indexed(uuid.uuid4(), "abc123", "m:4096:c1")
+        query = db.execute.await_args[0][0]
+        assert "embedding =" not in query
+
+    @pytest.mark.asyncio
+    async def test_centroid_written_to_embedding_column(self):
+        # PR4d: the reindexer's whole-note centroid lands on the note row so
+        # find_near_duplicate_pairs (which filters embedding IS NOT NULL) sees
+        # reindexed notes again. Atomic with the stamp — same UPDATE.
+        store, db, _ = _make_store()
+        row_id = uuid.uuid4()
+        centroid = [0.1, 0.2, 0.3]
+        await store.stamp_note_indexed(row_id, "abc123", "m:4096:c1", centroid=centroid)
+        query = db.execute.await_args[0][0]
+        params = db.execute.await_args[0][1:]
+        assert "UPDATE knowledge_index" in query
+        assert "embedding = $4" in query
+        assert params == (row_id, "abc123", "m:4096:c1", centroid)
+
 
 # =============================================================================
 # KnowledgeStore.replace_note_links — the body-link edge set for the 1-hop
