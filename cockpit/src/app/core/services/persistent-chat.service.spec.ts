@@ -837,16 +837,20 @@ describe('PersistentChatService — SSE event dispatch', () => {
         });
     });
 
-    it('promotes ready event to sessionReady=true and flushes a pending message', async () => {
+    it('promotes ready event to sessionReady=true and flushes the outbox', async () => {
         const {service, es, mockHttp} = await setup();
-        // Stuff a pending message as if user typed while session wasn't ready.
-        (service as any).pendingMessage.set('queued msg');
+        // Queue a send as if the user typed while the session wasn't ready.
+        (service as any).outbox.set([
+            {localId: 'user-q', content: 'queued msg', displayContent: 'queued msg', attempts: 0},
+        ]);
 
         fireSseMessage(es, {method: 'ready', params: {}}, '1:1');
+        // The flush POSTs on a microtask.
+        await new Promise((r) => setTimeout(r, 0));
 
         expect(service.sessionReady()).toBe(true);
-        expect(service.pendingMessage()).toBeNull();
-        // pendingMessage flushed via POST /input.
+        // Accepted item removed from the outbox.
+        expect(service.outbox().length).toBe(0);
         const postCalls = mockHttp.post.mock.calls.filter((c: any) =>
             String(c[0]).endsWith('/persistent/threads/thread-X/input'),
         );
@@ -1294,12 +1298,13 @@ describe('PersistentChatService — REST sends', () => {
         // No 'ready' event yet → sessionReady is false.
 
         await ctx.service.sendMessage('queued');
-        // No POST.
+        // No POST — the flush no-ops while !sessionReady.
         const inputCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
             String(c[0]).endsWith('/persistent/threads/thread-q/input'),
         );
         expect(inputCalls).toHaveLength(0);
-        expect(ctx.service.pendingMessage()).toBe('queued');
+        expect(ctx.service.outbox().length).toBe(1);
+        expect(ctx.service.outbox()[0].content).toBe('queued');
     });
 
     it('sendMessage on 409 conflict silently no-ops (server has the turn)', async () => {
@@ -1310,19 +1315,25 @@ describe('PersistentChatService — REST sends', () => {
         expect(ctx.service.error()).toBeNull();
     });
 
-    it('rolls back the optimistic bubble and resolves false on a hard POST failure', async () => {
+    it('keeps the bubble + queued item and sets the banner on a hard POST failure (no drop, no retry)', async () => {
         const ctx = await readySession();
         ctx.mockHttp.post.mockReturnValue(
             throwError(() => ({status: 500, error: {detail: 'boom'}})),
         );
+        // Optimistic-send contract: sendMessage accepts into the outbox and
+        // returns true; the flush handles the transport outcome.
         const ok = await ctx.service.sendMessage('will fail');
-        expect(ok).toBe(false);
-        // The optimistic UserTurn is removed so the composer can restore the
-        // draft for retry; the error banner explains why.
+        expect(ok).toBe(true);
+        // Drain the flush's rejected POST microtask.
+        await new Promise((r) => setTimeout(r, 0));
+        // A 500 is NOT terminal: the send may have been accepted server-side
+        // (accept-time persistence), so the bubble + queued item are KEPT (no
+        // silent loss, no auto-retry double-send). The banner explains.
         const stillThere = ctx.service
             .turns()
             .some((t) => isUserTurn(t) && t.content === 'will fail');
-        expect(stillThere).toBe(false);
+        expect(stillThere).toBe(true);
+        expect(ctx.service.outbox().length).toBe(1);
         expect(ctx.service.error()).not.toBeNull();
     });
 
