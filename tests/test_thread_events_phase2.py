@@ -565,3 +565,204 @@ class TestNoCursorReplayStart:
 
         start = await om._no_cursor_replay_start(_Conn(), "thread-x", 0)
         assert start == 0
+
+
+# ---------------------------------------------------------------------------
+# Section 7 — thread_event_stream kills the zombie epoch (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedConn:
+    """A fake asyncpg connection for driving the SSE generator's poll loop.
+
+    Dispatches on the SQL text rather than call order, so the open-path
+    MIN(seq) probe, the mid-loop events_epoch re-read, and the
+    _no_cursor_replay_start anchor query stay independently controllable.
+    """
+
+    def __init__(self, *, epochs, anchor=0, min_seq=0, rows_script=None):
+        # Successive values returned by the events_epoch re-read.
+        self._epochs = list(epochs)
+        self._anchor = anchor
+        self._min_seq = min_seq
+        # A list of row-batches; each fetch() pops one, [] once exhausted.
+        self._rows_script = list(rows_script or [])
+        self.epoch_reads = 0
+
+    async def fetch(self, sql, *args):
+        if self._rows_script:
+            return self._rows_script.pop(0)
+        return []
+
+    async def fetchval(self, sql, *args):
+        if "events_epoch" in sql:
+            self.epoch_reads += 1
+            return self._epochs.pop(0) if self._epochs else None
+        if "MIN(seq)" in sql:
+            return self._min_seq
+        if "turn.completed" in sql:  # _no_cursor_replay_start anchor
+            return self._anchor
+        return 0  # generic MAX(seq) tail (unused on the matching-cursor path)
+
+
+class _Acquire:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeRequest:
+    """Minimal stand-in for starlette Request used by the SSE endpoint."""
+
+    def __init__(self, last_event_id=None):
+        self.headers = {}
+        self.query_params = {"last_event_id": last_event_id} if last_event_id else {}
+
+    async def is_disconnected(self):
+        return False
+
+
+class TestThreadEventStreamEpochRecheck:
+    """Phase 1: a live SSE generator opened before an agent re-attach must
+    detect the events_epoch bump on its own poll loop and terminate with a
+    re-anchoring gone_beyond_horizon frame, instead of polling the dead epoch
+    forever while its keepalive pings fool the client watchdog."""
+
+    def _patch(self, monkeypatch, conn, *, server_epoch=3, recheck_s=0.0):
+        import orchestrator.main as om
+
+        monkeypatch.setattr(om, "THREAD_EVENTS_EPOCH_RECHECK_S", recheck_s)
+        monkeypatch.setattr(
+            om,
+            "require_thread_owner",
+            AsyncMock(return_value=(MagicMock(), {"events_epoch": server_epoch})),
+        )
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire(conn)
+        monkeypatch.setattr(om, "postgres_db", fake_db)
+        # Neutralize the backoff sleeps so the loop spins instantly.
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
+
+    async def _drain(self, resp, cap=25):
+        chunks = []
+        async for chunk in resp.body_iterator:
+            chunks.append(chunk)
+            if len(chunks) > cap:
+                await resp.body_iterator.aclose()
+                break
+        return chunks
+
+    @pytest.mark.asyncio
+    async def test_midstream_bump_emits_single_horizon(self, monkeypatch):
+        """Criterion 1: epoch reads 3, 3, then 4; anchor 17 → exactly one
+        gone_beyond_horizon with id: 4:17 and the epoch_bumped params, then
+        the generator terminates."""
+        import json
+
+        import orchestrator.main as om
+
+        conn = _ScriptedConn(epochs=[3, 3, 4], anchor=17, min_seq=0)
+        self._patch(monkeypatch, conn, server_epoch=3)
+
+        # Matching cursor (epoch 3) so the open path skips the mismatch/
+        # retention branches and the loop starts clean.
+        req = _FakeRequest(last_event_id="3:100")
+        resp = await om.thread_event_stream("thread-x", req)
+        chunks = await self._drain(resp)
+
+        assert chunks[0] == ": open\n\n"
+        horizon = [c for c in chunks if "gone_beyond_horizon" in c]
+        assert len(horizon) == 1
+        h = horizon[0]
+        assert "id: 4:17\n" in h
+        assert "event: gone_beyond_horizon\n" in h
+        data_line = next(ln for ln in h.split("\n") if ln.startswith("data: "))
+        payload = json.loads(data_line[len("data: ") :])
+        assert payload["method"] == "gone_beyond_horizon"
+        assert payload["params"] == {
+            "epoch": 4,
+            "server_seq": 17,
+            "reason": "epoch_bumped_mid_stream",
+        }
+        # Three re-reads (matched, matched, changed); no more after terminate.
+        assert conn.epoch_reads == 3
+        # No frames after the horizon — the generator returned.
+        assert chunks[-1] is h
+
+    @pytest.mark.asyncio
+    async def test_bump_with_empty_new_epoch_anchors_zero(self, monkeypatch):
+        """Criterion 2: new epoch has no terminal turn yet → anchor 0 →
+        id: 4:0, server_seq 0."""
+        import json
+
+        import orchestrator.main as om
+
+        conn = _ScriptedConn(epochs=[4], anchor=0, min_seq=0)
+        self._patch(monkeypatch, conn, server_epoch=3)
+
+        req = _FakeRequest(last_event_id="3:100")
+        resp = await om.thread_event_stream("thread-x", req)
+        chunks = await self._drain(resp)
+
+        horizon = [c for c in chunks if "gone_beyond_horizon" in c]
+        assert len(horizon) == 1
+        assert "id: 4:0\n" in horizon[0]
+        data_line = next(ln for ln in horizon[0].split("\n") if ln.startswith("data: "))
+        payload = json.loads(data_line[len("data: ") :])
+        assert payload["params"]["server_seq"] == 0
+        assert payload["params"]["epoch"] == 4
+
+    @pytest.mark.asyncio
+    async def test_thread_deleted_terminates_without_horizon(self, monkeypatch):
+        """Criterion 3: events_epoch re-read returns None (row gone) → the
+        generator terminates silently, no horizon frame."""
+        import orchestrator.main as om
+
+        conn = _ScriptedConn(epochs=[None], min_seq=0)
+        self._patch(monkeypatch, conn, server_epoch=3)
+
+        req = _FakeRequest(last_event_id="3:100")
+        resp = await om.thread_event_stream("thread-x", req)
+        chunks = await self._drain(resp)
+
+        assert chunks == [": open\n\n"]
+        assert conn.epoch_reads == 1
+
+    @pytest.mark.asyncio
+    async def test_steady_state_streams_without_epoch_query(self, monkeypatch):
+        """Criterion 4: while rows flow the epoch is never re-read and no
+        horizon frame appears — the guard is idle-only. id: lines carry the
+        unchanged server epoch."""
+        import orchestrator.main as om
+
+        rows = [
+            {"seq": 1, "kind": "token", "payload": {"content": "a"}},
+            {"seq": 2, "kind": "token", "payload": {"content": "b"}},
+        ]
+        # High recheck window so the brief idle after the batch never trips it.
+        conn = _ScriptedConn(epochs=[9], rows_script=[rows], min_seq=0)
+        self._patch(monkeypatch, conn, server_epoch=3, recheck_s=999.0)
+
+        req = _FakeRequest(last_event_id="3:0")
+        resp = await om.thread_event_stream("thread-x", req)
+
+        # Pull exactly the open comment + the two row frames, then close —
+        # the post-batch idle loop spins without yielding, so don't ask for a
+        # fourth chunk.
+        it = resp.body_iterator
+        c0 = await it.__anext__()
+        c1 = await it.__anext__()
+        c2 = await it.__anext__()
+        await it.aclose()
+
+        assert c0 == ": open\n\n"
+        assert "id: 3:1\n" in c1
+        assert "id: 3:2\n" in c2
+        for c in (c1, c2):
+            assert "gone_beyond_horizon" not in c
+        assert conn.epoch_reads == 0
