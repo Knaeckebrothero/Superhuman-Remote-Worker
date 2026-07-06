@@ -764,6 +764,9 @@ describe('PersistentChatService — SSE event dispatch', () => {
         fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
         fireSseMessage(es, {method: 'token', params: {content: 'Hello '}}, '1:2');
         fireSseMessage(es, {method: 'token', params: {content: 'world'}}, '1:3');
+        // Token deltas coalesce on an 80ms timer (Phase 4 de-flicker); wait for
+        // the flush before asserting the rendered content.
+        await new Promise((r) => setTimeout(r, 90));
         const turn = service.currentStreamingTurn();
         expect(turn).not.toBeNull();
         const text = turn!.events.find((e) => e.kind === 'text') as TextEvent;
@@ -795,10 +798,13 @@ describe('PersistentChatService — SSE event dispatch', () => {
             {method: 'thinking', params: {content: 'dead-end reasoning', message_id: 'a1'}},
             '1:2',
         );
+        // thinking deltas coalesce on an 80ms timer; wait for the flush.
+        await new Promise((r) => setTimeout(r, 90));
         expect(
             service.currentStreamingTurn()!.events.filter((e) => e.kind === 'thought'),
         ).toHaveLength(1);
         // The agent's empty-response retry asks the client to clear the bubble.
+        // thinking.reset is a non-delta frame → flushes the buffer then drops.
         fireSseMessage(es, {method: 'thinking.reset', params: {message_id: 'a1'}}, '1:3');
         expect(
             service.currentStreamingTurn()!.events.filter((e) => e.kind === 'thought'),
@@ -2814,5 +2820,134 @@ describe('PersistentChatService — Phase 2: _openSse single-flight guard', () =
 
         expect(ctx.sseInstances.length).toBe(0);
         expect((ctx.service as any).sse).toBeNull();
+    });
+});
+
+describe('PersistentChatService — Phase 4: delta coalescing', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    // Connect, open the SSE, and open a turn so tokens have somewhere to land.
+    async function streamingTurn() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('t-p4');
+        await vi.advanceTimersByTimeAsync(0);
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es);
+        fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
+        return {...ctx, es};
+    }
+
+    it('coalesces N token frames into a single conversation update at flush', async () => {
+        const ctx = await streamingTurn();
+        const updateSpy = vi.spyOn(ctx.service.conversation, 'update');
+
+        for (const c of ['a', 'b', 'c', 'd', 'e']) {
+            fireSseMessage(ctx.es, {method: 'token', params: {content: c}}, `1:${c}`);
+        }
+        // Nothing written to the signal before the 80ms flush.
+        expect(updateSpy).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(80);
+        // Exactly one signal write folds the whole burst, in wire order.
+        expect(updateSpy).toHaveBeenCalledTimes(1);
+        const text = ctx.service
+            .currentStreamingTurn()!
+            .events.find((e) => e.kind === 'text') as TextEvent;
+        expect(text.content).toBe('abcde');
+    });
+
+    it('flushes buffered text before a non-delta frame; a post-tool token opens a new block', async () => {
+        const ctx = await streamingTurn();
+        fireSseMessage(ctx.es, {method: 'token', params: {content: 'before '}}, '1:2');
+        fireSseMessage(ctx.es, {method: 'token', params: {content: 'tool'}}, '1:3');
+        // tool.started is non-delta → flushes the buffered text synchronously.
+        fireSseMessage(
+            ctx.es,
+            {method: 'tool.started', params: {id: 'tc1', tool: 'run_command', args: {}}},
+            '1:4',
+        );
+
+        const evs = ctx.service.currentStreamingTurn()!.events;
+        const textIdx = evs.findIndex((e) => e.kind === 'text');
+        const toolIdx = evs.findIndex((e) => e.kind === 'tool_call');
+        expect(textIdx).toBeGreaterThanOrEqual(0);
+        expect(toolIdx).toBeGreaterThan(textIdx); // text precedes the tool
+
+        fireSseMessage(ctx.es, {method: 'token', params: {content: 'after'}}, '1:5');
+        await vi.advanceTimersByTimeAsync(80);
+        const texts = ctx.service.currentStreamingTurn()!.events.filter((e) => e.kind === 'text');
+        expect(texts.length).toBe(2); // post-tool token is a new block
+    });
+
+    it('never cross-merges thinking deltas with different message_ids', async () => {
+        const ctx = await streamingTurn();
+        fireSseMessage(ctx.es, {method: 'thinking', params: {content: 'first', message_id: 'm1'}}, '1:2');
+        fireSseMessage(ctx.es, {method: 'thinking', params: {content: 'second', message_id: 'm2'}}, '1:3');
+        await vi.advanceTimersByTimeAsync(80);
+
+        const thoughts = ctx.service.currentStreamingTurn()!.events.filter((e) => e.kind === 'thought');
+        expect(thoughts.length).toBe(2);
+    });
+
+    it('turn.completed mid-buffer applies the token then closes — no stuck streaming (S1 wedge)', async () => {
+        const ctx = await streamingTurn();
+        fireSseMessage(ctx.es, {method: 'token', params: {content: 'partial'}}, '1:2');
+        // Buffered (not flushed). The turn boundary arrives.
+        fireSseMessage(ctx.es, {method: 'turn.completed', params: {turn_id: 1}}, '1:3');
+
+        expect(ctx.service.isStreaming()).toBe(false);
+        expect(ctx.service.currentStreamingTurn()).toBeNull();
+        const last = ctx.service.turns().filter(isAssistantTurn).at(-1) as AssistantTurn;
+        expect(last.status).toBe('done');
+        expect((last.events.find((e) => e.kind === 'text') as TextEvent).content).toBe('partial');
+
+        // The (already-cleared) flush timer must not resurrect a placeholder.
+        await vi.advanceTimersByTimeAsync(80);
+        expect(ctx.service.isStreaming()).toBe(false);
+        expect(ctx.service.currentStreamingTurn()).toBeNull();
+    });
+
+    it('turn.error mid-buffer closes via _closeActiveTurnIfAny — no stranded placeholder', async () => {
+        const ctx = await streamingTurn();
+        fireSseMessage(ctx.es, {method: 'token', params: {content: 'oops'}}, '1:2');
+        fireSseMessage(ctx.es, {method: 'turn.error', params: {message: 'boom'}}, '1:3');
+
+        // The buffered token was applied before _closeActiveTurnIfAny read the
+        // active turn id, so the turn is properly closed, not left spinning.
+        expect(ctx.service.isStreaming()).toBe(false);
+        expect(ctx.service.currentStreamingTurn()).toBeNull();
+        await vi.advanceTimersByTimeAsync(80);
+        expect(ctx.service.isStreaming()).toBe(false);
+    });
+
+    it('disconnect() mid-buffer flushes/cancels — timer no-ops, nothing leaks', async () => {
+        const ctx = await streamingTurn();
+        fireSseMessage(ctx.es, {method: 'token', params: {content: 'x'}}, '1:2');
+
+        ctx.service.disconnect();
+        expect(ctx.service.isStreaming()).toBe(false);
+        const turnsAfterDisconnect = ctx.service.turns().length;
+
+        // Stale timer would otherwise fire here and resurrect a bubble.
+        await vi.advanceTimersByTimeAsync(80);
+        expect(ctx.service.turns().length).toBe(turnsAfterDisconnect);
+        expect(ctx.service.isStreaming()).toBe(false);
     });
 });

@@ -684,8 +684,9 @@ export function clearDraft(threadId: string | null): void {
               {{ (event.status === 'streaming' ? 'chat.thinking.now' : 'chat.thinking.past') | transloco }}
             </span>
           </summary>
-          <div class="thinking-content">
-            <markdown appCitationRef appKatex [data]="event.content"></markdown>
+          <div class="thinking-content" [class.streaming-block]="event.status === 'streaming'">
+            <markdown appCitationRef appKatex [data]="event.content"
+                      [katexDefer]="event.status === 'streaming'"></markdown>
           </div>
         </details>
       </ng-template>
@@ -837,8 +838,12 @@ export function clearDraft(threadId: string | null): void {
                          that defeat nowrap). -->
                     @let answer = finalAnswer(turn);
                     @if (answer) {
-                      <div class="event-text turn-final-answer">
-                        <markdown appCitationRef appKatex [data]="answer"></markdown>
+                      <!-- A user can collapse a still-streaming turn (the manual
+                           override wins over the streaming check), so this path
+                           renders growing text too — gate its DOM post-processing
+                           + KaTeX off the turn's streaming status. -->
+                      <div class="event-text turn-final-answer" [class.streaming-block]="streaming">
+                        <markdown appCitationRef appKatex [data]="answer" [katexDefer]="streaming"></markdown>
                       </div>
                     } @else {
                       <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
@@ -879,8 +884,9 @@ export function clearDraft(threadId: string | null): void {
                             }
                           }
                           @case ('text') {
-                            <div class="event-text">
-                              <markdown appCitationRef appKatex [data]="group.event.content"></markdown>
+                            <div class="event-text" [class.streaming-block]="group.event.status === 'streaming'">
+                              <markdown appCitationRef appKatex [data]="group.event.content"
+                                        [katexDefer]="group.event.status === 'streaming'"></markdown>
                             </div>
                           }
                           @case ('compaction') {
@@ -1769,7 +1775,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.chat.pendingPermission();
 
             if (this.autoScroll) {
-                setTimeout(() => this.scrollToBottom(), 0);
+                // Re-check at fire time: a wheel-up during this scheduled tick
+                // flips autoScroll off, and we must not stomp the user's scroll.
+                setTimeout(() => {
+                    if (this.autoScroll) this.scrollToBottom();
+                }, 0);
             }
         });
 
@@ -1781,7 +1791,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         effect(() => {
             this.chat.pendingAttachments().length;
             if (this.autoScroll) {
-                setTimeout(() => this.scrollToBottom(), 0);
+                setTimeout(() => {
+                    if (this.autoScroll) this.scrollToBottom();
+                }, 0);
             }
         });
 
@@ -2591,6 +2603,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             '.message-body pre:not([data-collapsed]):not(.tc__result):not(.tc__code)',
         );
         for (const pre of Array.from(blocks)) {
+            // Skip blocks still streaming — marking/wrapping them now destroys the
+            // wrapper every flush (flicker) and reads scrollHeight on a growing
+            // element. The class drops when the block completes; the next pass
+            // processes the now-final <pre>.
+            if (pre.closest('.streaming-block')) continue;
             pre.setAttribute('data-collapsed', '');
             if (pre.scrollHeight <= 200) continue;
             const lang = pre.querySelector('code')?.className?.match(/language-(\S+)/)?.[1] || '';
@@ -2618,6 +2635,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             '.message-body pre:not([data-copy-btn]):not(.tc__result):not(.tc__code)',
         );
         for (const pre of Array.from(blocks)) {
+            // Same streaming exclusion as collapseCodeBlocks — don't attach a
+            // copy button inside a block that's still growing.
+            if (pre.closest('.streaming-block')) continue;
             pre.setAttribute('data-copy-btn', '');
             const btn = document.createElement('button');
             btn.className = 'code-copy-btn';
@@ -2682,8 +2702,17 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly TOOL_GROUP_THRESHOLD = 4;
 
     /** Coalesce a turn's events into render groups (consecutive tools merged). */
+    // Memoized per turn object. The reducer rebuilds the turn immutably on
+    // every update, so a changed turn is a new key and the cache invalidates
+    // naturally — this turns 50 rebuilds per change-detection pass into 1.
+    private readonly groupedEventsCache = new WeakMap<AssistantTurn, EventGroup[]>();
+
     groupedEvents(turn: AssistantTurn): EventGroup[] {
-        return groupEvents(turn.events);
+        const cached = this.groupedEventsCache.get(turn);
+        if (cached) return cached;
+        const groups = groupEvents(turn.events);
+        this.groupedEventsCache.set(turn, groups);
+        return groups;
     }
 
     /**

@@ -303,6 +303,10 @@
         padding: 16px;
         display: flex;
         flex-direction: column;
+        // Suppress browser scroll anchoring: it fires unreliably exactly when
+        // the last child mutates (streaming turn) and fights our programmatic
+        // bottom-pinning. We own the scroll in script (autoScroll + watchdog).
+        overflow-anchor: none;
         // Scrollbar theming is global (see styles.scss `html` rule); both
         // scrollbar-width and scrollbar-color inherit, so no local override here.
       }

@@ -1,4 +1,4 @@
-import {AfterViewInit, Directive, ElementRef, OnDestroy, inject} from '@angular/core';
+import {AfterViewInit, Directive, ElementRef, OnDestroy, effect, inject, input} from '@angular/core';
 import {MarkdownComponent} from 'ngx-markdown';
 import {Subscription} from 'rxjs';
 import {KATEX_OPTIONS} from './katex-options';
@@ -35,6 +35,25 @@ export class KatexDirective implements AfterViewInit, OnDestroy {
     private readonly markdown = inject(MarkdownComponent, {self: true});
     private sub?: Subscription;
 
+    /**
+     * While true, skip typesetting: the block is still streaming and its math
+     * delimiters may be incomplete, so a lone `$$` would re-typeset on every
+     * flush (the visible per-delta height jump). Defaults false, so every
+     * existing `appKatex` site is unaffected. When it flips true→false (the
+     * block finished streaming) we typeset once — the markdown `[data]` didn't
+     * change, only the event status did, so `ready` won't re-fire.
+     */
+    readonly katexDefer = input(false);
+
+    constructor() {
+        let wasDeferred = this.katexDefer();
+        effect(() => {
+            const deferred = this.katexDefer();
+            if (wasDeferred && !deferred) this.typeset();
+            wasDeferred = deferred;
+        });
+    }
+
     ngAfterViewInit(): void {
         this.sub = this.markdown.ready.subscribe(() => this.typeset());
         loadKatex()
@@ -48,6 +67,7 @@ export class KatexDirective implements AfterViewInit, OnDestroy {
     }
 
     private typeset(): void {
+        if (this.katexDefer()) return; // still streaming — defer to the flip
         const renderMathInElement = (globalThis as any).renderMathInElement as
             | ((el: HTMLElement, opts: unknown) => void)
             | undefined;
