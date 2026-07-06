@@ -663,13 +663,27 @@ exactly the split-brain this design exists to kill.
      - **PR4c-3 read half DONE.** `KnowledgeStore.get_note_by_slug` (status-agnostic full
        read, kg.read_note dict shape) + `list_notes` (kg.list_notes shape, tag via
        `ANY(tags)`); `kb_read`/`kb_list` gain `kg is None` branches over them.
-     - **PR4c-3 write half + toggle flip: NOT DONE (the remaining risky slice).** kg-less
-       `kb_write` (slug via `slugify` + collision/dup via `get_note_by_slug` + deterministic
-       hash suffix, then `upsert_note` + `_dual_write_note`, skip Neo4j) and `_update_existing`;
-       then relax `ToolContext.has_knowledge()` to store-only + registry gate message. The
-       Neo4j path stays byte-identical (additive `kg is None` branches). Hot write path —
-       deferred to a focused pass. **Until has_knowledge is relaxed, all the kg-None code
-       above is dormant (kg is never None in prod yet) — the toggle is not live.**
+     - **PR4c-3 write half + toggle flip DONE (2026-07-06, TDD, uncommitted).** kg-less
+       `kb_write` (validates `note_type`/`confidence` up-front like `kg.create_note`; slug via
+       `slugify`, deterministic content-hash fork on base-slug collision, content-hashed
+       fallback for empty slugs; then `upsert_note` + `_dual_write_note`, Neo4j never touched)
+       and `_update_existing_kgless` (reads the row via `get_note_by_slug`, applies
+       content/append/status/confidence/add_tags in Python, writes store + OKF file; `add_links`
+       round-trip as generic body links via the reindexer — graph-only rel_type not preserved,
+       matching the honest degrade). `ToolContext.has_knowledge()` relaxed to **store-only**
+       (Neo4j optional); registry gate message updated. Neo4j path byte-identical (additive
+       `kg is None` branches). 15 write-path tests + 4 `has_knowledge` tests; 459 green across
+       the touched suites; ruff clean.
+       - **Risk reframe:** because the Neo4j path is byte-identical, the whole kg-None surface
+         is dormant on every Neo4j-*enabled* deployment (dev/prod included) — the flip changes
+         behavior only when a deployment sets `databases.neo4j.enabled=false`, a controlled
+         event. Real milestone test = a Neo4j-less E2E on local k3d.
+       - **Known follow-up (out of scope):** the inline curator
+         (`curate_and_store_knowledge` / `assemble_and_converge_knowledge` in `auxiliary.py`)
+         still guards internally on `if not kg: return None`, so it silently no-ops on a
+         Neo4j-less deployment even though the outer `has_knowledge()` gate now passes. No
+         crash, no regression (kg-less curation never worked); wire it to the store's
+         `list_notes` when doing the Neo4j-less E2E.
      - **PR4d NOT STARTED — near-dup port.** `find_near_duplicate_pairs` still runs on the
        note-level `embedding` (NULL for reindexed notes → increasingly blind); port to the
        chunk schema + settle the near-dup-under-chunking definition against live data.

@@ -1798,3 +1798,216 @@ class TestKbToolsWithoutNeo4j:
         result = _invoke(_get_tool(tools, "kb_list"), {})
         ctx.knowledge_store.list_notes.assert_called_once()
         assert "n1" in result
+
+
+def _existing_note(note_id="n1", content="old body", **over):
+    """A get_note_by_slug-shaped dict for the kg-less write-path tests."""
+    base = {
+        "id": note_id,
+        "title": "T",
+        "type": "decision",
+        "status": "active",
+        "content": content,
+        "confidence": None,
+        "tags": [],
+        "keywords": [],
+        "job_id": None,
+        "phase": None,
+        "created": None,
+        "modified": None,
+    }
+    base.update(over)
+    return base
+
+
+class TestKbWriteWithoutNeo4j:
+    """kg-less kb_write (PR4c-3 write half): the pgvector store is the write
+    target and the OKF file is the canonical export; Neo4j is never touched."""
+
+    def test_no_kg_upserts_via_store(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = None  # no collision
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {"title": "New Title", "type": "decision", "content": "body"},
+        )
+        assert ctx.knowledge_store.upsert_note.called
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert kwargs["note_id"] == "new-title"
+        assert kwargs["content"] == "body"
+        assert "new-title" in result
+
+    def test_no_kg_never_calls_neo4j(self):
+        # kg is None — there is nothing to call; the guard must not dereference it.
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {"title": "Some Note", "type": "learning", "content": "x"},
+        )
+        assert "Error" not in result
+
+    def test_no_kg_exact_duplicate_short_circuits(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            note_id="new-title", content="identical"
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {"title": "New Title", "type": "decision", "content": "identical"},
+        )
+        assert "identical content" in result
+        assert not ctx.knowledge_store.upsert_note.called
+
+    def test_no_kg_collision_appends_content_hash(self):
+        import hashlib
+
+        ctx = _make_context_no_kg()
+        # Base slug taken by DIFFERENT content -> deterministic hash-suffixed fork.
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            note_id="new-title", content="other body"
+        )
+        tools, _ = _make_tools(ctx)
+        _invoke(
+            _get_tool(tools, "kb_write"),
+            {"title": "New Title", "type": "decision", "content": "fresh body"},
+        )
+        digest = hashlib.sha256(b"fresh body").hexdigest()[:6]
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert kwargs["note_id"] == f"new-title-{digest}"
+
+    def test_no_kg_invalid_type_errors(self):
+        # Parity with kg.create_note: an invalid note_type is a clean up-front
+        # error, not a misleading "Created" after a silent DB CHECK failure.
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {"title": "New Title", "type": "bogus", "content": "body"},
+        )
+        assert "Error" in result
+        assert not ctx.knowledge_store.upsert_note.called
+
+    def test_no_kg_invalid_confidence_errors(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {
+                "title": "New Title",
+                "type": "decision",
+                "content": "body",
+                "confidence": "bogus",
+            },
+        )
+        assert "Error" in result
+        assert not ctx.knowledge_store.upsert_note.called
+
+    def test_no_kg_writes_okf_file(self):
+        ws, writes = _capture_workspace()
+        ctx = _make_context_no_kg()
+        ctx.workspace_manager = ws
+        ctx.has_git.return_value = True
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        tools, _ = _make_tools(ctx)
+        _invoke(
+            _get_tool(tools, "kb_write"),
+            {"title": "New Title", "type": "decision", "content": "body"},
+        )
+        assert "knowledge/new-title.md" in writes
+
+    def test_no_kg_empty_slug_falls_back_deterministically(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        tools, _ = _make_tools(ctx)
+        _invoke(
+            _get_tool(tools, "kb_write"),
+            {"title": "!!!", "type": "learning", "content": "body"},
+        )
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert kwargs["note_id"].startswith("note-")
+
+
+class TestKbUpdateWithoutNeo4j:
+    """kg-less _update_existing (via kb_update): read the current row from the
+    store, apply the mutation in Python, write back to store + OKF file."""
+
+    def test_no_kg_replaces_content(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            content="old body"
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_update"), {"note": "n1", "content": "new body"}
+        )
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert kwargs["content"] == "new body"
+        assert "content replaced" in result
+
+    def test_no_kg_not_found(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = None
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_update"), {"note": "nope", "content": "x"}
+        )
+        assert "not found" in result
+        assert not ctx.knowledge_store.upsert_note.called
+
+    def test_no_kg_appends_content(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            content="old body"
+        )
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_update"), {"note": "n1", "append": "more"})
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert "old body" in kwargs["content"]
+        assert "more" in kwargs["content"]
+
+    def test_no_kg_changes_status(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note()
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_update"), {"note": "n1", "status": "superseded"}
+        )
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert kwargs["status"] == "superseded"
+        assert "status → superseded" in result
+
+    def test_no_kg_invalid_status_errors(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note()
+        tools, _ = _make_tools(ctx)
+        result = _invoke(
+            _get_tool(tools, "kb_update"), {"note": "n1", "status": "bogus"}
+        )
+        assert "Error" in result
+        assert not ctx.knowledge_store.upsert_note.called
+
+    def test_no_kg_merges_tags_lowercased(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            tags=["security"]
+        )
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_update"), {"note": "n1", "add_tags": ["Auth"]})
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert kwargs["tags"] == ["security", "auth"]
+
+    def test_no_kg_preserves_type_from_existing(self):
+        ctx = _make_context_no_kg()
+        ctx.knowledge_store.get_note_by_slug.return_value = _existing_note(
+            type="retrospective"
+        )
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_update"), {"note": "n1", "content": "x"})
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert kwargs["note_type"] == "retrospective"
