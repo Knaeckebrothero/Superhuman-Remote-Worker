@@ -81,6 +81,14 @@ const SSE_WATCHDOG_TIMEOUT_MS = 45000;
 // (replay-from-cursor) which re-delivers the durable turn boundary.
 const INTERRUPT_ACK_TIMEOUT_MS = 8000;
 
+// After a send is accepted (POST 200, or 409 turn_in_flight — a duplicate that
+// still streams), the reply must begin arriving over SSE. If no SSE *data*
+// frame lands within this window the receive path is presumed dead (zombie
+// epoch, silently-dropped socket) and we force one reopen so replay-from-cursor
+// delivers the turn. One-shot per send; never re-POSTs (the input is already
+// accepted server-side and there's no idempotency key).
+const SEND_KICKSTART_TIMEOUT_MS = 5000;
+
 /** Attachment chip shown alongside a user message. */
 export interface ChatAttachment {
     name: string;
@@ -312,17 +320,40 @@ export class PersistentChatService {
         // hence zone.run. Registered once on this root singleton and torn down
         // via DestroyRef (matters for test isolation, not prod lifetime).
         if (typeof document !== 'undefined') {
-            const onWake = () => this.zone.run(() => this._revalidateConnection());
+            const revalidate = (force: boolean) =>
+                this.zone.run(() => this._revalidateConnection(force));
             const onVisible = () => {
-                if (document.visibilityState === 'visible') onWake();
+                if (document.visibilityState === 'visible') {
+                    // A hide longer than the watchdog window means the socket
+                    // may have died silently while the tab was frozen (it still
+                    // reports readyState===OPEN) — force an unconditional
+                    // revalidate in that case; otherwise the cheap check.
+                    const hiddenFor = this.hiddenAt ? Date.now() - this.hiddenAt : 0;
+                    this.hiddenAt = 0;
+                    revalidate(hiddenFor > SSE_WATCHDOG_TIMEOUT_MS);
+                } else {
+                    this.hiddenAt = Date.now();
+                }
             };
+            // online / focus: cheap re-check (a live OPEN socket needn't reopen).
+            const onUnforced = () => revalidate(false);
+            // bfcache restore (persisted) and Chromium's page 'resume' both can
+            // close sockets or skip events while frozen → always force.
+            const onPageShow = (e: PageTransitionEvent) => {
+                if (e.persisted) revalidate(true);
+            };
+            const onResume = () => revalidate(true);
             document.addEventListener('visibilitychange', onVisible);
-            window.addEventListener('online', onWake);
-            window.addEventListener('focus', onWake);
+            window.addEventListener('online', onUnforced);
+            window.addEventListener('focus', onUnforced);
+            window.addEventListener('pageshow', onPageShow);
+            document.addEventListener('resume', onResume);
             this.destroyRef.onDestroy(() => {
                 document.removeEventListener('visibilitychange', onVisible);
-                window.removeEventListener('online', onWake);
-                window.removeEventListener('focus', onWake);
+                window.removeEventListener('online', onUnforced);
+                window.removeEventListener('focus', onUnforced);
+                window.removeEventListener('pageshow', onPageShow);
+                document.removeEventListener('resume', onResume);
             });
         }
     }
@@ -521,7 +552,26 @@ export class PersistentChatService {
     // an interrupt POST (lost ack frame). Armed in interrupt(), cleared by the
     // isInterrupting invariant effect.
     private interruptFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    // One-shot send-liveness kickstart: force a reopen if a send is accepted
+    // but no SSE data frame follows (see SEND_KICKSTART_TIMEOUT_MS). Armed in
+    // _postInput, cleared in disconnect().
+    private sendKickstartTimer: ReturnType<typeof setTimeout> | null = null;
     private sseLastEventAt = 0;
+    // Timestamp of the last SSE *data* frame — bumped ONLY in _handleSseFrame.
+    // Deliberately distinct from sseLastEventAt (bumped by onopen-reset + pings)
+    // and agentLastEventAt (bumped by control-WS frames too): those signals get
+    // refreshed with zero real data in exactly the zombie-stream case, so the
+    // send-kickstart must key off this clean data-only clock.
+    private sseDataLastAt = 0;
+    // Single-flight generation for _openSse. Bumped at every open attempt and in
+    // disconnect(); an open whose generation is stale after its async cursor
+    // fetch bails instead of installing a resurrected EventSource on a
+    // closed/superseded session.
+    private sseGeneration = 0;
+    // Wall-clock time the tab was last hidden (visibilitychange). A hide longer
+    // than the watchdog window forces an unconditional revalidate on return — a
+    // socket that died while the tab was frozen still reports readyState===OPEN.
+    private hiddenAt = 0;
     private controlWs: WebSocket | null = null;
     private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private controlWsReconnectAttempt = 0;
@@ -809,7 +859,15 @@ export class PersistentChatService {
         // Drop any stale watchdog from a prior open before installing a new one.
         this._stopSseWatchdog();
 
+        // Single-flight guard: claim a generation up front. If a newer open (or
+        // a disconnect()) supersedes us while we await the cursor, bail before
+        // constructing an EventSource — otherwise a slow cursor read could
+        // resurrect a stream on a closed or replaced session.
+        const generation = ++this.sseGeneration;
+
         const cursor = await this.cache.getThreadCursor(threadId);
+        if (generation !== this.sseGeneration) return;
+
         // ngsw-bypass keeps the Angular service worker out of the SSE path. Its
         // /api/** dataGroup otherwise buffers the stream body (which never ends),
         // stalling EventSource.onopen ~20s. The param's presence alone is enough.
@@ -817,11 +875,21 @@ export class PersistentChatService {
         if (cursor) params.set('last_event_id', `${cursor.epoch}:${cursor.seq}`);
         const url = `${environment.apiUrl}/persistent/threads/${threadId}/stream?${params.toString()}`;
 
+        // A racing reopen may have installed a stream before we passed the guard
+        // above (its generation could equal ours after an intervening bump/undo).
+        // Close whatever's there so we never leak a live socket on replace.
+        if (this.sse) {
+            this.sse.close();
+            this.sse = null;
+        }
+
         // withCredentials true so the srw_session cookie rides along on the
         // cross-origin SSE handshake.
-        this.sse = new EventSource(url, {withCredentials: true});
+        const es = new EventSource(url, {withCredentials: true});
+        this.sse = es;
 
-        this.sse.onopen = () => {
+        es.onopen = () => {
+            if (this.sse !== es) return; // superseded — ignore late open
             this.zone.run(() => {
                 const wasReconnecting = this.connectionState() !== 'connected';
                 this.connectionState.set('connected');
@@ -845,25 +913,29 @@ export class PersistentChatService {
             });
         };
 
-        this.sse.onmessage = (event: MessageEvent) => {
+        es.onmessage = (event: MessageEvent) => {
+            if (this.sse !== es) return;
             this.sseLastEventAt = Date.now();
             this.zone.run(() => this._handleSseFrame(event));
         };
 
         // Server idle-heartbeat — no payload to dispatch, just liveness.
-        this.sse.addEventListener('ping', () => {
+        es.addEventListener('ping', () => {
+            if (this.sse !== es) return;
             this.sseLastEventAt = Date.now();
         });
 
-        this.sse.addEventListener('gone_beyond_horizon', (event) => {
+        es.addEventListener('gone_beyond_horizon', (event) => {
+            if (this.sse !== es) return;
             this.sseLastEventAt = Date.now();
             this.zone.run(() => this._handleGoneBeyondHorizon(event as MessageEvent));
         });
 
-        this.sse.onerror = () => {
+        es.onerror = () => {
+            if (this.sse !== es) return;
             this.zone.run(() => {
-                if (!this.sse) return;
-                if (this.sse.readyState === EventSource.CLOSED) {
+                if (this.sse !== es) return;
+                if (es.readyState === EventSource.CLOSED) {
                     // Terminal — auth failure, thread gone, etc. The browser
                     // gave up. Don't bury the UI in a generic banner; let
                     // the threadStatus refresh below surface "ended" if
@@ -942,12 +1014,17 @@ export class PersistentChatService {
      * then ensure the control WS — which has no probe of its own — is back.
      * No-op when there's no active, live session.
      */
-    private _revalidateConnection(): void {
+    private _revalidateConnection(force = false): void {
         if (this.intentionalClose) return;
         const tid = this.threadId();
         if (!tid) return;
         if (this.threadStatus() === 'ended') return;
+        // `force` (long hidden-tab wake / bfcache restore / page resume) skips
+        // the liveness heuristics: a socket that died while frozen still reports
+        // readyState===OPEN with a stale-but-recent sseLastEventAt, so the
+        // heuristics can't be trusted after a freeze.
         const sseStale =
+            force ||
             !this.sse ||
             this.sse.readyState !== EventSource.OPEN ||
             Date.now() - this.sseLastEventAt > SSE_WATCHDOG_TIMEOUT_MS;
@@ -977,6 +1054,11 @@ export class PersistentChatService {
         } catch {
             return;
         }
+        // Data-only liveness clock for the send-kickstart. Bump here and only
+        // here — a real journal frame arrived. `ping`/`onopen`/control-WS frames
+        // deliberately don't touch this (they flow even when the receive path is
+        // a zombie polling a dead epoch).
+        this.sseDataLastAt = Date.now();
         this._handleEvent(frame);
     }
 
@@ -1342,6 +1424,10 @@ export class PersistentChatService {
         this.controlWsReconnectAttempt = 0;
         this._stopSseWatchdog();
         this._stopControlWsWatchdog();
+        this._clearSendKickstart();
+        // Supersede any _openSse still awaiting its cursor read so it can't
+        // resurrect a stream after we've torn down.
+        this.sseGeneration++;
         if (this.sse) {
             this.sse.close();
             this.sse = null;
@@ -1571,14 +1657,54 @@ export class PersistentChatService {
                     {content}
                 )
             );
+            // Accepted — the reply must now stream over SSE. Arm the one-shot
+            // kickstart so a dead receive path self-heals (covers the direct
+            // send and the queued-flush path, both of which route through here).
+            this._armSendKickstart(tid);
             return true;
         } catch (err: any) {
             // 409 means a duplicate POST landed for the same turn — the user
             // still sees the response stream via SSE, so treat it as success
             // and keep the optimistic bubble.
-            if (err?.status === 409) return true;
+            if (err?.status === 409) {
+                this._armSendKickstart(tid);
+                return true;
+            }
             this.error.set(this.sanitizeError(err?.error?.detail || err?.message));
             return false;
+        }
+    }
+
+    /**
+     * Arm the one-shot send-liveness kickstart. The input is accepted
+     * server-side; if no SSE *data* frame arrives within
+     * SEND_KICKSTART_TIMEOUT_MS the receive path is presumed dead and we force
+     * a single reopen (replay-from-cursor delivers the turn). Deadline-checked
+     * against `sseDataLastAt` (survives hidden-tab timer clamping) and never
+     * re-POSTs — there's no idempotency key, so a replayed POST could double-run
+     * the turn.
+     */
+    private _armSendKickstart(threadId: string): void {
+        this._clearSendKickstart();
+        const armedAt = Date.now();
+        this.sendKickstartTimer = setTimeout(() => {
+            this.sendKickstartTimer = null;
+            if (this.intentionalClose || this.threadId() !== threadId) return;
+            // A data frame landed after we armed → the pipeline is alive.
+            if (this.sseDataLastAt >= armedAt) return;
+            console.warn(
+                '[persistent-chat] no SSE data within ' +
+                `${SEND_KICKSTART_TIMEOUT_MS}ms of send — forcing reconnect`,
+            );
+            this.reconnectNow();
+        }, SEND_KICKSTART_TIMEOUT_MS);
+    }
+
+    /** Cancel the send-liveness kickstart timer if armed. */
+    private _clearSendKickstart(): void {
+        if (this.sendKickstartTimer) {
+            clearTimeout(this.sendKickstartTimer);
+            this.sendKickstartTimer = null;
         }
     }
 
