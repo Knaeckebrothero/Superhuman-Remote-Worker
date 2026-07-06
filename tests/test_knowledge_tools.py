@@ -1615,6 +1615,17 @@ class TestKbLintNearDuplicates:
         assert "kb_lint:" in result
         assert "near-duplicate" not in result
 
+    def test_applies_0_97_near_duplicate_floor(self):
+        # D-1: the 07-05 lint-policy decision (raise 0.9→0.97) lives at this
+        # call site — the store default (0.9) is unusable lint noise (307 pairs
+        # vs 7 at 0.97 on the live KB). The lint policy owns its floor.
+        ctx = self._ctx(_KB_LINT_TWIN_FILES)
+        ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(return_value=[])
+        tools, _ = _make_tools(ctx)
+        _invoke(_get_tool(tools, "kb_lint"), {})
+        _, kwargs = ctx.knowledge_store.find_near_duplicate_pairs.call_args
+        assert kwargs.get("min_similarity") == 0.97
+
 
 # =============================================================================
 # kb_lint — opt-in dead-external-URL sweep
