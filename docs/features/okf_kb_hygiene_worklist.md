@@ -88,11 +88,13 @@ cosine-compares vectors from different embedding models (ghost `null-version` vs
   param to scope to the query-time version). Keeps the fn byte-compatible otherwise.
 - **Test:** two rows with differing `embedding_version` are never returned as a pair.
 
-### B-1 — `list_notes` path filter  ·  code · ☑ **DONE (uncommitted)**
-`list_notes` (`knowledge_store.py:859`) filters only `kb_id` → after the kg-less
-flip, `kb_list` would return all 396 active ghosts. (`get_note_by_slug` keys on
-`(kb_id, note_id)` and is a much smaller surface — decide whether it needs the same
-guard; leaning yes for symmetry.)
+### B-1 — `list_notes` (+ `get_note_by_slug`) path filter  ·  code · ☑ **DONE (uncommitted)**
+`list_notes` (`knowledge_store.py:859`) filtered only `kb_id` → after the kg-less
+flip, `kb_list` would return all 396 active ghosts. **Decision resolved:**
+`get_note_by_slug` (the `kb_read` backend) got the same guard — a direct read of a
+slug that only exists as a pathless ghost would otherwise resolve it. Both now carry
+`AND path IS NOT NULL`; status stays unfiltered so superseded/archived *files* still
+read.
 - **Fix:** add `AND path IS NOT NULL` to the `list_notes` WHERE. Files-canonical:
   the store lists what a file backs. Durable — handles future ghosts regardless of
   B-2/R-1.

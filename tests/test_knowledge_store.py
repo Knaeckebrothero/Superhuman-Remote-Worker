@@ -839,6 +839,53 @@ class TestFindNearDuplicatePairs:
 
 
 # =============================================================================
+# get_note_by_slug() — the kg-less kb_read backend
+# =============================================================================
+
+
+class TestGetNoteBySlug:
+    @pytest.mark.asyncio
+    async def test_excludes_pathless_ghost_rows(self):
+        # B-1 (symmetry with list_notes): a direct read must not surface a
+        # pathless ghost row either — files-canonical means a file must back it.
+        # Status stays unfiltered (superseded/archived files still read).
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = None
+        await store.get_note_by_slug(uuid.uuid4(), "some-slug")
+        sql = mock_db.fetchrow.call_args[0][0]
+        assert "path IS NOT NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_maps_row_to_note_dict(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = {
+            "note_id": "n1",
+            "title": "N1",
+            "note_type": "decision",
+            "status": "superseded",
+            "content": "body",
+            "confidence": "high",
+            "tags": ["a"],
+            "keywords": ["k"],
+            "job_id": None,
+            "phase": None,
+            "created_at": None,
+            "modified_at": None,
+        }
+        out = await store.get_note_by_slug(uuid.uuid4(), "n1")
+        assert out["id"] == "n1"
+        assert out["type"] == "decision"
+        assert out["status"] == "superseded"
+        assert out["tags"] == ["a"]
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_absent(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = None
+        assert await store.get_note_by_slug(uuid.uuid4(), "nope") is None
+
+
+# =============================================================================
 # list_notes() — the kg-less kb_list backend
 # =============================================================================
 
