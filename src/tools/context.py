@@ -243,8 +243,15 @@ class ToolContext:
         return self.shell_manager is not None
 
     def has_knowledge(self) -> bool:
-        """Check if knowledge base (Neo4j + pgvector) is available."""
-        return self.knowledge_graph is not None and self.knowledge_store is not None
+        """Check if the knowledge base is available.
+
+        Neo4j is OPTIONAL (OKF slice-3 PR4c): the pgvector store is canonical for
+        retrieval and the OKF files for content, so the KB works graph-less — the
+        graph-shaped tools degrade honestly (see ``create_kb_tools``). Only the
+        store is required. On a Neo4j-enabled deployment both are present and the
+        full graph path runs unchanged.
+        """
+        return self.knowledge_store is not None
 
     @property
     def project_id(self) -> Optional[str]:
