@@ -794,13 +794,17 @@ class KnowledgeStore:
         must surface superseded/archived notes too, unlike search. Neo4j-only
         fields (``relationships``) are absent; 1-hop links come from
         :meth:`get_related_notes`. Returns None if the slug isn't in the KB.
+
+        Files-canonical (symmetry with :meth:`list_notes`): only rows a file
+        backs are read (``path IS NOT NULL``) — a pathless ghost row from the
+        DELETE dual-write gap must never resolve. Status stays unfiltered.
         """
         row = await self.db.fetchrow(
             """
             SELECT note_id, title, note_type, status, content, confidence,
                    tags, keywords, job_id, phase, created_at, modified_at
             FROM knowledge_index
-            WHERE kb_id = $1 AND note_id = $2
+            WHERE kb_id = $1 AND note_id = $2 AND path IS NOT NULL
             LIMIT 1
             """,
             kb_id,
