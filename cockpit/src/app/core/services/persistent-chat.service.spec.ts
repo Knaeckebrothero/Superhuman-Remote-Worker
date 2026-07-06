@@ -2551,3 +2551,257 @@ describe('PersistentChatService — renameThread', () => {
         expect(service.sessionTitle()).toBe('Active title');
     });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 2 — send-liveness kickstart, wake recovery, _openSse single-flight
+// (docs/features/session_reliability_and_transport_simplification.md)
+// ---------------------------------------------------------------------------
+
+describe('PersistentChatService — Phase 2: send-liveness kickstart', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    async function connectOpened() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-ks');
+        await vi.advanceTimersByTimeAsync(0); // drain _openSse cursor await
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es);
+        return {...ctx, es};
+    }
+
+    it('forces a reconnect when a send is accepted but no SSE data follows', async () => {
+        const {service, es} = await connectOpened();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        // 200 → kickstart armed.
+        await (service as any)._postInput('hi');
+
+        // Contaminated liveness signals that must NOT defuse the kickstart:
+        // an onopen already fired (bumped sseLastEventAt + agentLastEventAt), a
+        // ping bumps sseLastEventAt, and a control-WS frame routed through
+        // _handleEvent bumps agentLastEventAt. None are real SSE data.
+        fireSseNamedEvent(es, 'ping', {});
+        (service as any)._handleEvent({method: 'session.state', params: {}});
+
+        await vi.advanceTimersByTimeAsync(5_001);
+        expect(reconnectSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not reconnect when an SSE data frame arrives after the send', async () => {
+        const {service, es} = await connectOpened();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        await (service as any)._postInput('hi');
+        // A real journal frame lands (onmessage) → data clock advances.
+        fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
+
+        await vi.advanceTimersByTimeAsync(5_001);
+        expect(reconnectSpy).not.toHaveBeenCalled();
+    });
+
+    it('arms the kickstart on a 409 turn_in_flight (queued-flush / dup path)', async () => {
+        const {service} = await connectOpened();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        (service as any).http.post = vi
+            .fn()
+            .mockReturnValue(throwError(() => ({status: 409})));
+
+        await (service as any)._postInput('dup');
+        await vi.advanceTimersByTimeAsync(5_001);
+        expect(reconnectSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('disconnect() clears a pending kickstart timer', async () => {
+        const {service} = await connectOpened();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        await (service as any)._postInput('hi');
+        service.disconnect();
+        await vi.advanceTimersByTimeAsync(5_001);
+        expect(reconnectSpy).not.toHaveBeenCalled();
+    });
+});
+
+describe('PersistentChatService — Phase 2: wake recovery', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    function setVisibility(state: string): void {
+        Object.defineProperty(document, 'visibilityState', {
+            value: state,
+            configurable: true,
+        });
+    }
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        setVisibility('visible');
+        vi.clearAllMocks();
+    });
+
+    async function connectOpened() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-wake');
+        await vi.advanceTimersByTimeAsync(0);
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es); // sse OPEN + fresh sseLastEventAt
+        return {...ctx, es};
+    }
+
+    it('records hiddenAt when the tab goes hidden', async () => {
+        const {service} = await connectOpened();
+        setVisibility('hidden');
+        document.dispatchEvent(new Event('visibilitychange'));
+        expect((service as any).hiddenAt).toBeGreaterThan(0);
+    });
+
+    it('forces a reopen after a long hide even with an OPEN, fresh SSE', async () => {
+        const {service} = await connectOpened();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        // Backdate the hide past the watchdog window without advancing timers,
+        // so the SSE stays OPEN + sseLastEventAt fresh: only `force` can trigger
+        // the reopen.
+        (service as any).hiddenAt = Date.now() - 46_000;
+        setVisibility('visible');
+        document.dispatchEvent(new Event('visibilitychange'));
+
+        expect(reconnectSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not reopen after a short hide when the SSE is healthy', async () => {
+        const {service} = await connectOpened();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        (service as any).hiddenAt = Date.now() - 1_000;
+        setVisibility('visible');
+        document.dispatchEvent(new Event('visibilitychange'));
+
+        expect(reconnectSpy).not.toHaveBeenCalled();
+    });
+
+    it('pageshow(persisted) forces a revalidate; persisted=false does not', async () => {
+        const {service} = await connectOpened();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        const persisted = new Event('pageshow');
+        Object.defineProperty(persisted, 'persisted', {value: true});
+        window.dispatchEvent(persisted);
+        expect(reconnectSpy).toHaveBeenCalledTimes(1);
+
+        reconnectSpy.mockClear();
+        const fresh = new Event('pageshow');
+        Object.defineProperty(fresh, 'persisted', {value: false});
+        window.dispatchEvent(fresh);
+        expect(reconnectSpy).not.toHaveBeenCalled();
+    });
+
+    it('document resume forces a revalidate', async () => {
+        const {service} = await connectOpened();
+        const reconnectSpy = vi
+            .spyOn(service, 'reconnectNow')
+            .mockImplementation(() => {});
+
+        document.dispatchEvent(new Event('resume'));
+        expect(reconnectSpy).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('PersistentChatService — Phase 2: _openSse single-flight guard', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    it('two concurrent opens retain exactly one EventSource', async () => {
+        const ctx = createService();
+        let resolveCursor: (v: any) => void = () => {};
+        ctx.mockCache.getThreadCursor.mockReturnValue(
+            new Promise((r) => {
+                resolveCursor = r;
+            }),
+        );
+        ctx.service.threadId.set('tid');
+
+        const p1 = (ctx.service as any)._openSse('tid');
+        const p2 = (ctx.service as any)._openSse('tid');
+        resolveCursor(null);
+        await p1;
+        await p2;
+
+        // The first open is superseded post-await and bails before constructing
+        // an EventSource; only the second installs one.
+        expect(ctx.sseInstances.length).toBe(1);
+    });
+
+    it('disconnect() during the cursor await assigns no EventSource', async () => {
+        const ctx = createService();
+        let resolveCursor: (v: any) => void = () => {};
+        ctx.mockCache.getThreadCursor.mockReturnValue(
+            new Promise((r) => {
+                resolveCursor = r;
+            }),
+        );
+        ctx.service.threadId.set('tid');
+
+        const p = (ctx.service as any)._openSse('tid');
+        ctx.service.disconnect(); // bumps sseGeneration → supersedes the open
+        resolveCursor(null);
+        await p;
+
+        expect(ctx.sseInstances.length).toBe(0);
+        expect((ctx.service as any).sse).toBeNull();
+    });
+});
