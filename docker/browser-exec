@@ -23,8 +23,9 @@ so the agent-facing output (``{dom, url, title, screenshot, tabs}`` with
 stay on the agent side — this program only executes.
 
 Requires browser-use + Playwright Chromium in the workspace image. Chromium
-is resolved via ``PLAYWRIGHT_BROWSERS_PATH`` (set in Dockerfile.workspace),
-the same way the agent's local-mode browser launches.
+is pinned via the explicit ``agent-chromium`` symlink (``BROWSER_EXEC_CHROMIUM``,
+created in Dockerfile.workspace / the VM base provision) rather than
+auto-detected, so browser-use never reaches for its auto-install path.
 """
 
 from __future__ import annotations
@@ -51,6 +52,14 @@ PROFILE_DIR = os.environ.get(
     "BROWSER_EXEC_PROFILE",
     str(Path.home() / ".browser-profile"),
 )
+# Explicit Chromium binary — the ``agent-chromium`` symlink that
+# Dockerfile.workspace (and the VM base provision) create pointing at the
+# Playwright-installed Chrome. Passing this to BrowserSession makes browser
+# resolution deterministic: browser-use never has to auto-detect the binary and
+# so never falls back to auto-installing one via ``uvx playwright install``
+# (which isn't on the image, and which every browser-use >=0.13 CDP build reaches
+# for when it can't find a browser). See docs/features/browser_workspace_executor.md §5.1.
+CHROMIUM_PATH = os.environ.get("BROWSER_EXEC_CHROMIUM", "/usr/local/bin/agent-chromium")
 
 # Actions that take a positional integer ``ref`` from a prior snapshot.
 VALID_ACTIONS = {
@@ -97,12 +106,15 @@ class BrowserDaemon:
                 await self._close_session()
 
         Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
-        # browser-use launches Chromium via Playwright (PLAYWRIGHT_BROWSERS_PATH).
-        # No CDP port, no remote debugging. The workspace pod can't run Chromium's
-        # sandbox (no user namespaces), so disable it and avoid /dev/shm + GPU —
-        # the same flags the old _start_remote_chromium used.
+        # browser-use launches Chromium from the explicit executable_path below
+        # (the agent-chromium symlink → Playwright's Chromium). Pinning the binary
+        # keeps browser-use off its auto-detect/auto-install path. No CDP port, no
+        # remote debugging. The workspace pod can't run Chromium's sandbox (no user
+        # namespaces), so disable it and avoid /dev/shm + GPU — the same flags the
+        # old _start_remote_chromium used.
         session = BrowserSession(
             headless=True,
+            executable_path=CHROMIUM_PATH,
             user_data_dir=PROFILE_DIR,
             chromium_sandbox=False,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],

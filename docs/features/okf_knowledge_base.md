@@ -706,6 +706,12 @@ exactly the split-brain this design exists to kill.
    dual-write existed) and repair, or the cutover resurrects them. This is
    `tests/okf_kb_slice2_straggler_validation.md` §1+2 promoted to a slice-3 gate.
    Sequencing: PR1 ∥ PR2, PR3 needs both, PR4 last.
+   **AUDITED 2026-07-06** (read-only, dev cluster). Findings: resurrection is tiny
+   (2 files); ghosts have grown to 396 active pathless rows; the 5 invalid-YAML
+   files trace to a *live* renderer bug (`_render_note_md` emits unquoted
+   `tags`/`keywords` flow sequences); the 07-05 0.97 near-dup floor was never
+   applied in code. Concrete per-item remediation tracker (code fixes + live
+   mutations + deferred tuning): **`docs/features/okf_kb_hygiene_worklist.md`**.
 4. **KB datasource type + auto-attach as project KB** — the unification; Neo4j export
    migration for pre-existing notes. Mechanics (audited 2026-07-03 — most of the
    substrate is already live):
