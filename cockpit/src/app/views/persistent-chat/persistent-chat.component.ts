@@ -745,9 +745,15 @@ export function clearDraft(threadId: string | null): void {
               }
             }
             @case ('user') {
-              <div class="message message-user" [class.historical]="turn.historical">
+              <div class="message message-user"
+                   [class.historical]="turn.historical"
+                   [class.queued]="chat.outboxIds().has(turn.id)">
                 <div class="avatar">
-                  <app-icon size="sm" class="avatar-icon">person</app-icon>
+                  @if (chat.outboxIds().has(turn.id)) {
+                    <app-icon size="sm" class="avatar-icon" title="Queued — waiting to send">schedule</app-icon>
+                  } @else {
+                    <app-icon size="sm" class="avatar-icon">person</app-icon>
+                  }
                 </div>
                 <div class="message-body">
                   @if (turn.content) {
@@ -1908,18 +1914,21 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return this.transloco.translate('chat.input.default');
     });
 
-    /** True when there is a pending message waiting for the session to become ready. */
+    /** True while sends are queued (waiting for readiness / flushing) or files
+     *  are uploading — drives the send-button spinner. */
     readonly isPendingSend = computed(
         () =>
-            this.chat.pendingMessage() !== null ||
+            this.chat.outbox().length > 0 ||
             this.chat.isUploadingAttachments(),
     );
 
+    // Note: queueing is now supported, so canSend no longer blocks on a pending
+    // send — the user can line up a second message while the first is in flight
+    // (Enter already bypassed the old block anyway).
     readonly canSend = computed(
         () =>
             this.canCompose() &&
-            (this.inputText.trim().length > 0 || this.chat.pendingAttachments().length > 0) &&
-            !this.isPendingSend(),
+            (this.inputText.trim().length > 0 || this.chat.pendingAttachments().length > 0),
     );
 
     ngOnInit(): void {

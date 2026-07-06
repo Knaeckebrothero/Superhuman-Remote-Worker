@@ -229,6 +229,45 @@ Tip: also worth a quick check that **normal** short tab-switches (<45s) do
 *not* cause a visible reconnect blip — the wake path only forces a reopen past
 the 45s watchdog window.
 
+---
+
+## Phase 3 live criteria (client — the outbox / "Creating thread" swallow)
+
+Phase 3 (`persistent-chat.service.ts` + `persistent-chat.component.*`) is the
+categorical fix for the **original bug #1**: a message typed while the card says
+"Creating thread" is no longer swallowed. The queue is now owned by user intent
+(an `outbox`), so it survives the `disconnect()` that thread-creation runs
+internally. Unit-verified (10 tests in `persistent-chat.service.outbox.spec.ts`
++ 3 updated in the main spec). Two criteria need a browser:
+
+### P3-#7 — Send on the "Creating thread" card is never lost
+
+1. From the Sessions list, click **New Session** and, the instant the card shows
+   "Creating thread…", type a message and hit **Enter** (before "assigning
+   agent" appears — the exact window that used to swallow it).
+2. **PASS:** the message appears immediately as a **muted bubble with a clock
+   avatar** (queued style), stays through provisioning, then — once the agent is
+   ready — un-mutes, POSTs exactly once, and the reply streams. After a **hard
+   reload**, the message renders **exactly once** (not zero, not doubled).
+   **FAIL (pre-P3):** the bubble flickers in and vanishes; nothing is sent.
+3. Bonus check (the send-once guarantee): watch the orchestrator log / Network
+   tab — exactly one `POST …/input` for that message, even though creation ran a
+   `disconnect()`/`connect()` in between.
+
+### P3-#8 — Two rapid sends during startup both queue and flush in order
+
+1. New Session, then hit **Enter** twice quickly with two different messages
+   while it's still starting (both land before ready).
+2. **PASS:** both show as queued (clock) bubbles in order, then flush **FIFO**
+   with one POST at a time once ready — two turns, correct order, no collision.
+   **FAIL (old):** the second overwrites the first (single-slot), or they
+   collide on the same turn_id and one is dropped behind a 409.
+
+Failure-mode spot checks (optional, via DevTools "Offline" toggle mid-send):
+a **503/network** error keeps the bubble + shows the banner and does **not**
+auto-retry (no double-send) — the next send retriggers the flush; a **404/410**
+(e.g. the thread was deleted) drains the queue and removes the bubbles.
+
 ## Notes & gotchas
 
 - **Two replicas.** Repeated everywhere above because it's the most likely way to
