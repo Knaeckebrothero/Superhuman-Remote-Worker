@@ -52,6 +52,34 @@ class TestParseNoteMd:
         assert fm["id"] == "chose-jwt"
         assert fm["type"] == "decision"
 
+    def test_roundtrips_tags_keywords_with_yaml_flow_breakers(self):
+        # C-1: agent-authored keyword strings carry YAML flow-sequence breakers
+        # (@-scalars, embedded commas/colons, nested brackets, `#` comments).
+        # The renderer must quote each element so the frontmatter still parses;
+        # an unquoted `[@dataclass(frozen=True, slots=True), a: b]` is invalid
+        # YAML → the reindexer skips the note and re-warns every sweep.
+        from src.tools.knowledge.gardener import parse_note_md
+        from src.tools.knowledge.knowledge_tools import _render_note_md
+
+        tags = ["config.py:", "a: b"]
+        keywords = [
+            "@dataclass(frozen=True, slots=True)",
+            "pick-first proposal #1",
+            "[nested]",
+        ]
+        md = _render_note_md(
+            {
+                "id": "n1",
+                "type": "learning",
+                "content": "body",
+                "tags": tags,
+                "keywords": keywords,
+            }
+        )
+        fm, _ = parse_note_md(md)  # must not raise
+        assert fm["tags"] == tags
+        assert fm["keywords"] == keywords
+
 
 # =============================================================================
 # lint_kb — the deterministic rule set

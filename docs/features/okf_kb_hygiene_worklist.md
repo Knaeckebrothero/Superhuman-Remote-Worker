@@ -32,7 +32,7 @@ Legend — **Type:** `code` (my repo, TDD) · `data` (live mutation, needs authz
 
 | # | Item | Type | Status | Depends on |
 |---|------|------|--------|-----------|
-| C-1 | Renderer: quote `tags`/`keywords` flow-seq elements | code | ☐ | — |
+| C-1 | Renderer: quote `tags`/`keywords` flow-seq elements | code | ☑ | — |
 | D-1 | Apply the 0.97 near-dup floor at the `kb_lint` call site | code | ☐ | — |
 | D-2 | `find_near_duplicate_pairs`: add `embedding_version` equality guard | code | ☐ | — |
 | B-1 | `list_notes`: add `path IS NOT NULL` filter (durable ghost guard) | code | ☐ | — |
@@ -47,7 +47,14 @@ Legend — **Type:** `code` (my repo, TDD) · `data` (live mutation, needs authz
 
 ## Item detail
 
-### C-1 — Renderer YAML safety  ·  code · **live bug, do first**
+### C-1 — Renderer YAML safety  ·  code · ☑ **DONE (uncommitted)**
+Landed on `develop` (uncommitted): both flow-seqs now emit
+`', '.join(_yaml_quote(x) for x in …)`. RED test
+`test_roundtrips_tags_keywords_with_yaml_flow_breakers` (renders `@dataclass(...)`,
+`a: b`, `[nested]`, `#1` → round-trips through `parse_note_md`) failed on the `@`
+scalar, passes after the fix. Existing `test_emits_tags_keywords_confidence_and_superseded_by`
+updated to the quoted form. Full gardener+tools+reindex suites green (201), ruff clean.
+
 `_render_note_md` (`src/tools/knowledge/knowledge_tools.py:260,262`) emits
 `tags: [{', '.join(...)}]` / `keywords: [...]` **unquoted**. Agent keyword strings
 contain flow-breakers (`@dataclass(frozen=True, …)`, `pick-first proposal #1`,

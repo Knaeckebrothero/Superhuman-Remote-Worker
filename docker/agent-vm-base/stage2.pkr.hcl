@@ -128,7 +128,18 @@ build {
 
   # Final cleanup: removes packer user, runs cloud-init clean, truncates
   # machine-id, disables sshd PasswordAuthentication, then shuts down.
+  #
+  # cleanup.sh deletes the packer user + sudoers and ends in `shutdown -P now`
+  # inside one sudo block (shutdown_command is empty above), so shutdown MUST
+  # stay in-script — Packer can't SSH back as the deleted packer user. These
+  # two flags stop Packer racing the poweroff to `rm` its temp script, which
+  # intermittently fails with "Error removing temporary script: connection
+  # refused".
+  #   expect_disconnect: the SSH drop on shutdown is expected, not an error.
+  #   skip_clean:        don't reconnect to delete the temp script.
   provisioner "shell" {
-    script = "scripts/cleanup.sh"
+    script            = "scripts/cleanup.sh"
+    expect_disconnect = true
+    skip_clean        = true
   }
 }
