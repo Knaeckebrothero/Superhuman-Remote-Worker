@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.services.knowledge_store import KbWatermark
-from src.tools.knowledge.chunker import CHUNKER_VERSION
+from src.tools.knowledge.chunker import CHUNKER_VERSION, note_centroid
 
 from orchestrator.services.kb_reindex import (
     kb_sweep_tick,
@@ -325,14 +325,55 @@ class TestReindexKbIncremental:
         assert rc_kwargs["kb_id"] == kb
         assert rc_kwargs["embedding_version"] == CURRENT_VERSION
         assert len(rc_kwargs["chunks"]) >= 1
-        # ... then the stamp, carrying the git blob + pipeline version
+        # ... then the stamp, carrying the git blob + pipeline version + the
+        # whole-note centroid of the chunk embeddings (PR4d).
+        expected_centroid = note_centroid([c["embedding"] for c in rc_kwargs["chunks"]])
         store.stamp_note_indexed.assert_awaited_once_with(
-            store.upsert_kb_note.return_value, "NEW", CURRENT_VERSION
+            store.upsert_kb_note.return_value,
+            "NEW",
+            CURRENT_VERSION,
+            centroid=expected_centroid,
         )
         # watermark advanced to head with the current pipeline version
         wm_kwargs = store.upsert_watermark.await_args[1]
         assert wm_kwargs["indexed_commit"] == "headsha"
         assert wm_kwargs["pipeline_version"] == CURRENT_VERSION
+
+    @pytest.mark.asyncio
+    async def test_stamp_centroid_spans_multiple_chunks(self):
+        # A genuinely multi-chunk note: the stamped centroid must be the
+        # per-dimension mean of ALL the note's chunk vectors (not just the first),
+        # so find_near_duplicate_pairs compares a faithful whole-note vector.
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        body = "alpha " * 2000  # far over target_tokens -> splits into pieces
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=[{"path": "knowledge/big.md", "type": "blob", "sha": "NEW"}],
+            indexed={"knowledge/big.md": "OLD"},
+            contents={"knowledge/big.md": _note_md("big", body)},
+        )
+
+        async def _batch(texts):
+            # A distinct vector per chunk so the mean is non-trivial.
+            return [[float(i), float(i) * 2] for i in range(len(texts))]
+
+        svc.embed_batch = AsyncMock(side_effect=_batch)
+
+        await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        chunks = store.replace_note_chunks.await_args[1]["chunks"]
+        assert len(chunks) >= 2  # guard: the note really did split
+        centroid = store.stamp_note_indexed.await_args.kwargs["centroid"]
+        assert centroid == note_centroid([c["embedding"] for c in chunks])
 
     @pytest.mark.asyncio
     async def test_populates_links_from_body_markdown(self):
