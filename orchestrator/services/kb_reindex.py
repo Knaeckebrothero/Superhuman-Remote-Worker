@@ -25,7 +25,11 @@ import re
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from src.tools.knowledge.chunker import embed_note_chunks, embedding_version
+from src.tools.knowledge.chunker import (
+    embed_note_chunks,
+    embedding_version,
+    note_centroid,
+)
 
 # _internal_link_targets is the same body-markdown link parser the dead-link lint
 # rule uses (external URLs / anchors / images excluded, `.md` basename returned) —
@@ -359,7 +363,14 @@ async def _reindex_kb_unlocked(
                 source_id=fields["note_id"],
                 targets=_internal_link_targets(body),
             )
-            await store.stamp_note_indexed(note_row, current_map[path], current_version)
+            # Whole-note centroid (PR4d): the mean of this note's chunk vectors,
+            # written back onto the note row atomically with the stamp so
+            # find_near_duplicate_pairs (which filters embedding IS NOT NULL) sees
+            # reindexed notes again.
+            centroid = note_centroid([c["embedding"] for c in chunk_rows])
+            await store.stamp_note_indexed(
+                note_row, current_map[path], current_version, centroid=centroid
+            )
             upserted += 1
         except Exception as exc:
             logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, exc)

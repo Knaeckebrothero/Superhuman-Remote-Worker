@@ -22,6 +22,7 @@ from src.tools.knowledge.chunker import (
     chunk_note,
     embed_note_chunks,
     embedding_version,
+    note_centroid,
 )
 
 
@@ -207,6 +208,26 @@ class TestEmbeddingVersion:
     def test_defaults_to_module_chunker_version(self):
         stamp = embedding_version("qwen3-embedding-8b", 4096)
         assert stamp.endswith(f":{CHUNKER_VERSION}")
+
+
+# =============================================================================
+# note_centroid — mean of a note's chunk embeddings (PR4d near-dup port)
+# =============================================================================
+
+
+class TestNoteCentroid:
+    def test_mean_per_dimension(self):
+        assert note_centroid([[1.0, 2.0], [3.0, 4.0]]) == [2.0, 3.0]
+
+    def test_single_chunk_is_itself(self):
+        assert note_centroid([[1.0, 1.0, 1.0]]) == [1.0, 1.0, 1.0]
+
+    def test_empty_is_none(self):
+        # An empty-body note has no chunks -> no centroid, near-dup skips it.
+        assert note_centroid([]) is None
+
+    def test_averages_three_chunks(self):
+        assert note_centroid([[0.0, 0.0], [3.0, 6.0], [6.0, 3.0]]) == [3.0, 3.0]
 
 
 # =============================================================================
