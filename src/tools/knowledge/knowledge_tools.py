@@ -1419,7 +1419,13 @@ def create_kb_tools(
         project_id = _get_project_id(context)
         if project_id:
             try:
-                pairs = _run_async(ks.find_near_duplicate_pairs(uuid.UUID(project_id)))
+                # Lint policy owns its floor: 0.97 (07-05 runbook decision) —
+                # the store default (0.9) is unusable noise for a merge signal.
+                pairs = _run_async(
+                    ks.find_near_duplicate_pairs(
+                        uuid.UUID(project_id), min_similarity=0.97
+                    )
+                )
                 report.findings.extend(
                     near_duplicate_findings(pairs, [n["path"] for n in notes])
                 )

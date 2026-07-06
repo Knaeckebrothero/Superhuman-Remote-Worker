@@ -33,9 +33,9 @@ Legend — **Type:** `code` (my repo, TDD) · `data` (live mutation, needs authz
 | # | Item | Type | Status | Depends on |
 |---|------|------|--------|-----------|
 | C-1 | Renderer: quote `tags`/`keywords` flow-seq elements | code | ☑ | — |
-| D-1 | Apply the 0.97 near-dup floor at the `kb_lint` call site | code | ☐ | — |
-| D-2 | `find_near_duplicate_pairs`: add `embedding_version` equality guard | code | ☐ | — |
-| B-1 | `list_notes`: add `path IS NOT NULL` filter (durable ghost guard) | code | ☐ | — |
+| D-1 | Apply the 0.97 near-dup floor at the `kb_lint` call site | code | ☑ | — |
+| D-2 | `find_near_duplicate_pairs`: add `embedding_version` equality guard | code | ☑ | — |
+| B-1 | `list_notes`: add `path IS NOT NULL` filter (durable ghost guard) | code | ☑ | — |
 | B-2 | Archive the 396 active pathless ghost rows | data | ☐ | — |
 | A-1 | Repair 2 resurrection files (`status: superseded`) | data | ☐ | — |
 | C-2 | Backfill the 5 invalid-YAML files | data | ☐ | C-1 landed+deployed |
@@ -47,8 +47,9 @@ Legend — **Type:** `code` (my repo, TDD) · `data` (live mutation, needs authz
 
 ## Item detail
 
-### C-1 — Renderer YAML safety  ·  code · ☑ **DONE (uncommitted)**
-Landed on `develop` (uncommitted): both flow-seqs now emit
+### C-1 — Renderer YAML safety  ·  code · ☑ **DONE (committed `33396baa`)**
+Committed on `develop` in `33396baa` (bundled with unrelated Packer changes):
+both flow-seqs now emit
 `', '.join(_yaml_quote(x) for x in …)`. RED test
 `test_roundtrips_tags_keywords_with_yaml_flow_breakers` (renders `@dataclass(...)`,
 `a: b`, `[nested]`, `#1` → round-trips through `parse_note_md`) failed on the `@`
@@ -68,7 +69,7 @@ every 15-min sweep, forever** (5 such files today, more accruing).
   `gardener.parse_note` and the list is recovered intact.
 - **Blast radius:** write path only; no schema change. Neo4j-agnostic.
 
-### D-1 — Apply the 0.97 floor  ·  code
+### D-1 — Apply the 0.97 floor  ·  code · ☑ **DONE (uncommitted)**
 The 07-05 decision (raise 0.9→0.97) was **never applied**: `kb_lint`
 (`knowledge_tools.py:1422`) calls `find_near_duplicate_pairs(project_id)` with no
 `min_similarity`, so it uses the store default `0.9`. Live floor read confirms
@@ -78,7 +79,7 @@ The 07-05 decision (raise 0.9→0.97) was **never applied**: `kb_lint`
   implementing). Prefer the call site so the *lint policy* owns the floor.
 - **Test:** `kb_lint` invokes the store with `0.97`.
 
-### D-2 — Version guard on the self-join  ·  code
+### D-2 — Version guard on the self-join  ·  code · ☑ **DONE (uncommitted)**
 `find_near_duplicate_pairs` (`src/services/knowledge_store.py:1082`) filters
 `status='active'` + `embedding IS NOT NULL` but **not `embedding_version`** → it
 cosine-compares vectors from different embedding models (ghost `null-version` vs
@@ -87,7 +88,7 @@ cosine-compares vectors from different embedding models (ghost `null-version` vs
   param to scope to the query-time version). Keeps the fn byte-compatible otherwise.
 - **Test:** two rows with differing `embedding_version` are never returned as a pair.
 
-### B-1 — `list_notes` path filter  ·  code
+### B-1 — `list_notes` path filter  ·  code · ☑ **DONE (uncommitted)**
 `list_notes` (`knowledge_store.py:859`) filters only `kb_id` → after the kg-less
 flip, `kb_list` would return all 396 active ghosts. (`get_note_by_slug` keys on
 `(kb_id, note_id)` and is a much smaller surface — decide whether it needs the same

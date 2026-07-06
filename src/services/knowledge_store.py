@@ -839,8 +839,12 @@ class KnowledgeStore:
         ``KnowledgeGraphDB.list_notes`` (``id``/``type``); ``tag`` matches against
         the ``tags`` array column. No status filter is applied unless requested,
         so an unfiltered list spans every status like the Neo4j version.
+
+        Files-canonical: only rows a file backs are listed (``path IS NOT NULL``).
+        Pathless ghost rows from the DELETE dual-write gap are excluded — a
+        durable guard independent of any one-off ghost cleanup.
         """
-        conditions = ["kb_id = $1"]
+        conditions = ["kb_id = $1", "path IS NOT NULL"]
         params: List[Any] = [kb_id]
         if note_type:
             params.append(note_type)
@@ -1077,7 +1081,9 @@ class KnowledgeStore:
         detection for the bare-writer twins the verdict gate never adjudicates.
         Most-similar pairs first. The 0.9 default floor is deliberately far
         above the verdict fetch floor (0.6): lint flags only what a gardener
-        should merge, not everything topically related.
+        should merge, not everything topically related. Pairs are constrained to
+        a matching ``embedding_version`` — cosine distance across embedding
+        models is meaningless, so mixed-version rows are never compared.
         """
         rows = await self.db.fetch(
             """
@@ -1092,6 +1098,7 @@ class KnowledgeStore:
               AND b.status = 'active'
               AND a.embedding IS NOT NULL
               AND b.embedding IS NOT NULL
+              AND a.embedding_version = b.embedding_version
               AND 1 - (a.embedding <=> b.embedding) >= $2
             ORDER BY similarity DESC
             LIMIT $3
