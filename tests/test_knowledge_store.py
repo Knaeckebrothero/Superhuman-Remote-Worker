@@ -926,6 +926,44 @@ class TestListNotes:
 
 
 # =============================================================================
+# reconcile_orphans() — R-1 ghost reconciliation
+# =============================================================================
+
+
+class TestReconcileOrphans:
+    @pytest.mark.asyncio
+    async def test_archives_pathless_orphans_keyed_on_project_id(self):
+        # R-1: un-adopted ghost rows carry project_id but kb_id IS NULL, so the
+        # reconciliation MUST key on project_id — a kb_id filter matches zero.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [{"id": uuid.uuid4()}, {"id": uuid.uuid4()}]
+        pid = uuid.uuid4()
+        n = await store.reconcile_orphans(pid, ["keep-a", "keep-b"])
+        assert n == 2
+        sql = mock_db.fetch.call_args[0][0]
+        assert "project_id = $1" in sql
+        assert "kb_id" not in sql  # the landmine: ghosts have kb_id NULL
+        assert "path IS NULL" in sql
+        assert "status = 'active'" in sql  # only reap active rows
+        assert "note_id <> ALL" in sql  # slug absent from the tree
+        assert "indexed_at <" in sql  # adoption grace
+        assert "status = 'archived'" in sql  # soft-archive, not delete
+        assert "invalidated_at = now()" in sql
+        args = mock_db.fetch.call_args[0]
+        assert pid in args
+        assert ["keep-a", "keep-b"] in args
+
+    @pytest.mark.asyncio
+    async def test_grace_defaults_to_one_hour(self):
+        import datetime
+
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.reconcile_orphans(uuid.uuid4(), [])
+        assert datetime.timedelta(hours=1) in mock_db.fetch.call_args[0]
+
+
+# =============================================================================
 # search_chunks() — the slice-3 PR4 retrieval cutover (RRF over knowledge_chunks)
 # =============================================================================
 

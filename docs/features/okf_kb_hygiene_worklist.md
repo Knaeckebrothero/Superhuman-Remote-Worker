@@ -36,12 +36,12 @@ Legend — **Type:** `code` (my repo, TDD) · `data` (live mutation, needs authz
 | D-1 | Apply the 0.97 near-dup floor at the `kb_lint` call site | code | ☑ | — |
 | D-2 | `find_near_duplicate_pairs`: add `embedding_version` equality guard | code | ☑ | — |
 | B-1 | `list_notes`: add `path IS NOT NULL` filter (durable ghost guard) | code | ☑ | — |
-| B-2 | Archive the 396 active pathless ghost rows | data | ☐ | — |
+| B-2 | Archive the 384 active pathless ghost rows | data | ⊘ skip | R-1 (do once, after) |
 | A-1 | Repair 2 resurrection files (`status: superseded`) | data | ☐ | — |
 | C-2 | Backfill the 5 invalid-YAML files | data | ☐ | C-1 landed+deployed |
 | C-3 | Triage 8 missing-frontmatter + 8 no-`id` files | data | ☐ | — |
 | D-3 | Final near-dup floor tuning against the centroid index | deferred | ☐ | PR4d deploy + reindex |
-| R-1 | Close the DELETE dual-write gap (root cause of ghosts) | code | ☐ | design decision |
+| R-1 | Ghost reconciliation pass (root cause) | code | ☑ | — |
 
 ---
 
@@ -101,11 +101,15 @@ read.
 - **Test:** a pathless active row is excluded from `list_notes`; a file-backed row
   of every status is included.
 
-### B-2 — Archive the ghosts  ·  data · needs authz
-396 active pathless rows (532 across all statuses), **0 matching any live file** →
-pure orphans. Invisible to chunk search; pollute the near-dup self-join; would flood
-kg-less `kb_list` (mitigated by B-1). Archiving de-pollutes the self-join and
-**unblocks D-3**.
+### B-2 — Archive the ghosts  ·  data · **SKIPPED for now (2026-07-06)**
+384 active pathless rows (520 across all statuses; count fluctuates with loop
+activity), **0 matching any live file** → pure orphans. **Decision: skip.** With
+D-2 (version guard) and B-1 (path filter) now *deployed*, the ghosts are already
+neutralized in code — invisible to chunk search, the near-dup self-join, `kb_list`,
+and `kb_read`. Archiving is now cosmetic DB honesty only, and it **recurs until R-1**
+closes the DELETE gap. Left as a one-liner we can run anytime; not worth a live
+mutation today. Op preserved below for when R-1 lands (do it once, after the gap
+is closed, so it stays clean).
 - **Op (reversible, matches the doc's language):**
   `UPDATE knowledge_index SET status='archived', invalidated_at=now()
    WHERE project_id='68137e29-…' AND path IS NULL AND status='active';`
@@ -136,12 +140,21 @@ After PR4d ships and a full reindex writes centroids, re-run the self-join
 (ghosts archived, version-guarded) and confirm 0.97. Record the outcome in
 `okf_knowledge_base.md` §11.1. Preliminary read already supports 0.97.
 
-### R-1 — Close the DELETE dual-write gap  ·  code · root cause, needs design
-Ghosts accrue because pathless rows are invisible to the reindexer's path-keyed
-tree-diff, and note deletes never propagate to the DB. Without this, B-2 is a
-recurring chore. Options to weigh: reindexer archives rows whose backing file
-vanished; or `kb_delete` (+ curator supersede) propagates to the row. Bigger change
-— scope separately once the smaller items land.
+### R-1 — Ghost reconciliation  ·  code · ☑ **DONE (uncommitted)**
+Reframed by the design as an **adoption/reconciliation gap** (not a delete gap): the
+agent write-through (`upsert_note`) is born pathless; the reindexer adopts it
+(slug-keyed) once the file lands; un-adopted rows are invisible to the path-keyed
+delete. Spec: `docs/superpowers/specs/2026-07-06-kb-ghost-reconciliation-design.md`.
+- **Fix (implemented):** new `KnowledgeStore.reconcile_orphans(project_id, tree_slugs,
+  grace=1h)` — soft-archives pathless active rows whose slug is absent from the tree
+  and past the adoption grace. Keyed on `project_id` (ghosts have `kb_id` NULL). Called
+  once per reindex after the delete loop, non-fatally; `reconciled` surfaced in the
+  summary + log. TDD: 2 store + 3 reindexer tests, RED→GREEN; 290 pass, ruff clean.
+- **Rejected (scope):** path-at-birth (fights the intentional provisional pattern) and
+  a dedicated "prompt tool-delete" (no delete tool; `kb_update` retire already
+  dual-writes status; self-heals via adoption). See spec §Non-goals.
+- **Makes B-2 automatic:** on the first clean reindex after deploy, the 384 existing
+  ghosts archive themselves.
 
 ---
 
