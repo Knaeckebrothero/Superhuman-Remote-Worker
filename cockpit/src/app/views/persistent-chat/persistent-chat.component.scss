@@ -597,6 +597,25 @@
         border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
       }
 
+      /* Queued send (in the outbox, not yet accepted by the server): muted, with
+         a dashed border + clock avatar, so the user can tell it hasn't gone out
+         yet. Clears to the normal style once the flush's POST is accepted. */
+      .message-user.queued {
+        opacity: 0.65;
+
+        .message-body {
+          border-style: dashed;
+        }
+
+        .avatar {
+          background: var(--surface-0);
+        }
+
+        .avatar-icon {
+          color: var(--text-secondary);
+        }
+      }
+
       /* Assistant: no bubble — flush text aligned with the avatar gutter. */
       .message-assistant .message-body {
         padding: 4px 0;

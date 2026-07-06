@@ -98,6 +98,27 @@ export interface ChatAttachment {
     path: string;
 }
 
+/**
+ * A queued outgoing send. The queue is *user intent*, not transport state:
+ * it survives disconnect/reconnect/thread-creation and is the single source of
+ * truth for "messages the user asked to send but which haven't been accepted by
+ * the server yet". `localId` is the optimistic bubble's id, so a flushed/failed
+ * item can find and restyle or roll back its bubble.
+ */
+export interface OutboxItem {
+    /** The optimistic user-bubble's makeLocalId('user') — bubble↔queue link. */
+    localId: string;
+    /** What gets POSTed to the agent (may include the attachment-hint suffix). */
+    content: string;
+    /** The user's typed text only — used to re-dispatch the bubble faithfully
+     *  (without the attachment hint) after a history reload. */
+    displayContent: string;
+    /** Attachment chips to re-render on the bubble, if any. */
+    attachments?: ChatAttachment[];
+    /** Flush attempts so far (diagnostic; there is deliberately no auto-retry). */
+    attempts: number;
+}
+
 /** Info about a tool call within an assistant message. */
 export interface ToolCallInfo {
     id: string;
@@ -509,8 +530,20 @@ export class PersistentChatService {
     // --- Startup progress phase (sent by orchestrator while waiting for agent) ---
     readonly startupPhase = signal<string | null>(null);
 
-    // --- Pending message (submitted before session was ready) ---
-    readonly pendingMessage = signal<string | null>(null);
+    // --- Outbox: sends the user has committed but the server hasn't accepted
+    //     yet. Owned by user intent, NOT the transport lifecycle — it survives
+    //     disconnect/reconnect/thread-creation so a message typed on the
+    //     "Creating thread" card is never swallowed. ---
+    readonly outbox = signal<OutboxItem[]>([]);
+    /** localIds of queued (not-yet-accepted) sends — drives queued-bubble
+     *  styling in the template. */
+    readonly outboxIds = computed(() => new Set(this.outbox().map((i) => i.localId)));
+    // Single-flight guard for _flushOutbox (one POST in flight per tab).
+    private flushingOutbox = false;
+    // localId of the item whose POST is currently in flight (skipped by
+    // horizon re-dispatch, since accept-time persistence may already have put
+    // its row in the reloaded history).
+    private flushingHeadId: string | null = null;
 
     // --- Pending attachments (queued in composer before send) ---
     readonly pendingAttachments = signal<FilePreview[]>([]);
@@ -606,7 +639,10 @@ export class PersistentChatService {
      * `recovered:` bubble — but that recovery is a fallback, not a reason to
      * blow away the live turn here.
      */
-    async connect(threadId: string): Promise<void> {
+    async connect(
+        threadId: string,
+        opts: { carryOutbox?: boolean } = {},
+    ): Promise<void> {
         const sameThread = this.threadId() === threadId && this.historyLoaded();
         this.disconnect();
         this.connectionState.set('connecting');
@@ -618,7 +654,10 @@ export class PersistentChatService {
             this.historyLoaded.set(false);
             this.sessionReady.set(false);
             this.startupPhase.set(null);
-            this.pendingMessage.set(null);
+            // A genuine thread switch is the ONLY place the outbox is cleared
+            // wholesale — unless we're carrying it across a create/reprovision
+            // (createAndConnect), where the queued sends belong to *this* thread.
+            if (!opts.carryOutbox) this.outbox.set([]);
             this.sessionTitle.set(null);
             this.modelName.set(null);
             this.temperature.set(0);
@@ -634,6 +673,13 @@ export class PersistentChatService {
 
             this.threadId.set(threadId);
             await this.loadHistory(threadId);
+            // loadHistory wholesale-replaced turns, killing the optimistic
+            // bubbles for any carried outbox items. Re-dispatch them now —
+            // BEFORE _openSse and _openControlWs, either of which can trigger
+            // markSessionReady (and thus a flush) from the first frame /
+            // /connection ready. The queued send must be visible + present
+            // before any readiness path runs.
+            if (opts.carryOutbox) this._redispatchOutboxBubbles();
         }
         await this.loadThreadMeta(threadId);
         void this.loadCitations(threadId);
@@ -673,12 +719,18 @@ export class PersistentChatService {
             );
             const threadId = resp.thread_id;
             this.isCreating.set(false);
-            await this.connect(threadId);
+            // Carry the outbox: messages typed on the "Creating thread" card
+            // belong to this new thread and must survive the connect() reset.
+            await this.connect(threadId, {carryOutbox: true});
             return threadId;
         } catch (e) {
             this.isCreating.set(false);
             this.connectionState.set('error');
             this.startupPhase.set(null);
+            // The reset at the top of createAndConnect wiped the optimistic
+            // bubbles; re-show any queued sends on the error screen so the user
+            // doesn't have a silently-retained outbox with no visible messages.
+            this._redispatchOutboxBubbles();
             throw e;
         }
     }
@@ -1097,6 +1149,11 @@ export class PersistentChatService {
         }
         // Reload transcript so visible history doesn't have a silent gap.
         await this.loadHistory(tid);
+        // loadHistory replaced turns → re-dispatch bubbles for still-queued
+        // sends. Skip the item whose POST is in flight: accept-time persistence
+        // may already have put its row in the reloaded history, so re-adding it
+        // would double the bubble (the flush reconciles it when it resolves).
+        this._redispatchOutboxBubbles(true);
         // Re-anchor to the server tail so the reopened stream replays only
         // events newer than the history we just loaded; drop the cursor only
         // when the frame lacked a usable tail.
@@ -1450,7 +1507,10 @@ export class PersistentChatService {
         this.isWaitingForInput.set(false);
         this.sessionReady.set(false);
         this.startupPhase.set(null);
-        this.pendingMessage.set(null);
+        // NOTE: the outbox is deliberately NOT cleared here. Transport teardown
+        // (thread creation calls disconnect() before connect()) must never
+        // destroy queued sends — that was the root of the "Creating thread"
+        // swallow. Only a genuine thread switch (connect() cold path) clears it.
         this.pendingPermission.set(null);
         this.compaction.set(null);
         this.sessionTitle.set(null);
@@ -1626,30 +1686,129 @@ export class PersistentChatService {
             timestamp: Date.now(),
         });
 
-        // If session isn't ready yet, queue and send when ready.
-        if (!this.sessionReady()) {
-            this.pendingMessage.set(sendContent);
-            return true;
-        }
-
+        // Every send goes through the outbox — queued when the session isn't
+        // ready yet, flushed immediately when it is. This serializes to one POST
+        // in flight per tab (so two rapid sends can't collide on the default
+        // turn_id and lose the second behind a 409), and the queue survives
+        // reconnects. Bubble rollback (on 404/410) is the flush's job now.
+        this.outbox.update((q) => [
+            ...q,
+            {
+                localId,
+                content: sendContent,
+                displayContent: trimmed,
+                attachments: attachments.length > 0 ? attachments : undefined,
+                attempts: 0,
+            },
+        ]);
         this.isWaitingForInput.set(false);
-        const ok = await this._postInput(sendContent);
-        if (!ok) {
-            // Hard send failure — roll back the optimistic bubble so the
-            // composer can restore the draft for retry (the error banner set
-            // by _postInput explains why). A 409 dup is treated as success.
-            this.dispatch({type: 'remove_turn', id: localId});
-            return false;
-        }
+        void this._flushOutbox();
         return true;
     }
 
-    /** POST the input to the orchestrator's REST endpoint. Returns true when
-     *  the input was accepted (or a 409 dup — the reply still streams via
-     *  SSE), false on a hard failure so the caller can roll back. */
-    private async _postInput(content: string): Promise<boolean> {
+    /**
+     * Drain the outbox FIFO with exactly one POST in flight (single-flight).
+     * Only runs while the session is ready; otherwise items wait for the next
+     * markSessionReady / sendMessage to retrigger. Deliberately has NO timed
+     * auto-retry: the agent persists + enqueues input *before* returning 200,
+     * so a transient 503 / pod-churn reset can mask an already-accepted send —
+     * retrying would double-send. On a non-terminal failure we stop, leave the
+     * item queued, and let the next trigger retry.
+     */
+    private async _flushOutbox(): Promise<void> {
+        if (this.flushingOutbox) return;
+        this.flushingOutbox = true;
+        try {
+            while (
+                !this.intentionalClose &&
+                this.sessionReady() &&
+                this.outbox().length > 0
+            ) {
+                const head = this.outbox()[0];
+                const tidAtPost = this.threadId();
+                if (!tidAtPost) break;
+                head.attempts += 1;
+                this.flushingHeadId = head.localId;
+                let result: { ok: boolean; status: number };
+                try {
+                    result = await this._postInput(head.content);
+                } finally {
+                    this.flushingHeadId = null;
+                }
+                // The queue's identity may have changed while the POST was in
+                // flight (thread switch, up to the ~30s forward timeout). If so,
+                // drop this resolution: mutating another thread's queue here is
+                // the cross-thread head-swap swallow this phase exists to kill.
+                // Hand off to a fresh flush for whatever thread is current now —
+                // its own markSessionReady-triggered flush may have been blocked
+                // by this lock, and we don't want its queue to stall.
+                if (this.threadId() !== tidAtPost) {
+                    queueMicrotask(() => void this._flushOutbox());
+                    return;
+                }
+                if (result.ok) {
+                    // 200 or 409 dup — the turn is live server-side. Remove by
+                    // localId (never positionally: the head may have shifted)
+                    // and keep the bubble; SSE renders the turn.
+                    this._removeFromOutbox(head.localId);
+                    continue;
+                }
+                if (result.status === 404 || result.status === 410) {
+                    // Thread gone — draining is correct; roll back the bubbles.
+                    this._drainOutboxWithRollback();
+                    return;
+                }
+                // Any other failure: stop, keep the item + bubble queued. The
+                // banner (_postInput set it) explains; next trigger retries.
+                return;
+            }
+        } finally {
+            this.flushingOutbox = false;
+        }
+    }
+
+    private _removeFromOutbox(localId: string): void {
+        this.outbox.update((q) => q.filter((i) => i.localId !== localId));
+    }
+
+    /** Drop the whole outbox and remove its optimistic bubbles (thread gone). */
+    private _drainOutboxWithRollback(): void {
+        const items = this.outbox();
+        this.outbox.set([]);
+        for (const item of items) {
+            this.dispatch({type: 'remove_turn', id: item.localId});
+        }
+    }
+
+    /**
+     * Re-dispatch an optimistic user bubble for each queued outbox item — used
+     * after a history reload (connect carry / horizon reload / create failure)
+     * wholesale-replaces turns. `skipInFlight` omits the item whose POST is
+     * currently in flight (its row may already be in the reloaded history).
+     */
+    private _redispatchOutboxBubbles(skipInFlight = false): void {
+        for (const item of this.outbox()) {
+            if (skipInFlight && item.localId === this.flushingHeadId) continue;
+            this.dispatch({
+                type: 'user_message',
+                id: item.localId,
+                content: item.displayContent,
+                attachments: item.attachments,
+                timestamp: Date.now(),
+            });
+        }
+    }
+
+    /** POST the input to the orchestrator's REST endpoint. Returns `{ok,
+     *  status}`: ok=true when accepted (or a 409 dup — the reply still streams
+     *  via SSE); the flush uses `status` to distinguish a terminal 404/410
+     *  (drain) from a retriable failure (keep queued). Sets the error banner on
+     *  a hard failure. */
+    private async _postInput(
+        content: string,
+    ): Promise<{ ok: boolean; status: number }> {
         const tid = this.threadId();
-        if (!tid) return false;
+        if (!tid) return {ok: false, status: 0};
         try {
             await firstValueFrom(
                 this.http.post<{ accepted: boolean; turn_id: number }>(
@@ -1661,17 +1820,18 @@ export class PersistentChatService {
             // kickstart so a dead receive path self-heals (covers the direct
             // send and the queued-flush path, both of which route through here).
             this._armSendKickstart(tid);
-            return true;
+            return {ok: true, status: 200};
         } catch (err: any) {
+            const status = err?.status ?? 0;
             // 409 means a duplicate POST landed for the same turn — the user
             // still sees the response stream via SSE, so treat it as success
             // and keep the optimistic bubble.
-            if (err?.status === 409) {
+            if (status === 409) {
                 this._armSendKickstart(tid);
-                return true;
+                return {ok: true, status};
             }
             this.error.set(this.sanitizeError(err?.error?.detail || err?.message));
-            return false;
+            return {ok: false, status};
         }
     }
 
@@ -2519,15 +2679,11 @@ export class PersistentChatService {
         // banner contradicting a healthy session.
         this.error.set(null);
 
-        const pending = this.pendingMessage();
-        if (pending) {
-            this.pendingMessage.set(null);
-            // Send directly — the message was already added to the messages
-            // array when the user submitted it, so we skip sendMessage() to
-            // avoid duplicates.
-            this.isWaitingForInput.set(false);
-            void this._postInput(pending);
-        }
+        // Flush anything the user queued before the session was ready. The
+        // bubbles are already on screen (dispatched at send time); _flushOutbox
+        // just POSTs them FIFO, one in flight at a time.
+        this.isWaitingForInput.set(false);
+        void this._flushOutbox();
     }
 
 }
