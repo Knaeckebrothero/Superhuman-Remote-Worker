@@ -257,9 +257,9 @@ def _render_note_md(note: Dict[str, Any]) -> str:
     if description:
         fm.append(f"description: {_yaml_quote(description)}")
     if note.get("tags"):
-        fm.append(f"tags: [{', '.join(note['tags'])}]")
+        fm.append(f"tags: [{', '.join(_yaml_quote(t) for t in note['tags'])}]")
     if note.get("keywords"):
-        fm.append(f"keywords: [{', '.join(note['keywords'])}]")
+        fm.append(f"keywords: [{', '.join(_yaml_quote(k) for k in note['keywords'])}]")
     if note.get("confidence"):
         fm.append(f"confidence: {note['confidence']}")
     fm.append(f"status: {note.get('status', 'active')}")

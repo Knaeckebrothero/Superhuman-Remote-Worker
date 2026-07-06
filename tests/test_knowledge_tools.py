@@ -1181,8 +1181,10 @@ class TestRenderNoteMd:
                 "superseded_by": "new-note",
             }
         )
-        assert "tags: [auth, security]" in md
-        assert "keywords: [jwt]" in md
+        # C-1: flow-sequence elements are quoted so arbitrary agent strings
+        # (commas, colons, @-scalars) stay valid YAML.
+        assert 'tags: ["auth", "security"]' in md
+        assert 'keywords: ["jwt"]' in md
         assert "confidence: high" in md
         assert "status: superseded" in md
         assert "superseded_by: new-note" in md
