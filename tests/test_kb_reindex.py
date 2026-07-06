@@ -765,3 +765,72 @@ class TestKbSweepTick:
         )
         assert n == 1  # the second KB still reindexed
         assert reindex_fn.await_count == 2
+
+
+# =============================================================================
+# reindex_kb — R-1 ghost reconciliation pass
+# =============================================================================
+
+
+class TestReindexKbReconciliation:
+    def _tree(self):
+        return [{"path": "knowledge/keep.md", "type": "blob", "sha": "s1"}]
+
+    async def _run(self, kb, store, gitea, svc):
+        return await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconciles_orphans_and_reports_count(self):
+        # No upsert/delete work (indexed == tree), so the reconciliation pass is
+        # isolated: it must still fire, keyed on the KB id (== project_id) with
+        # the tree's slug set, and surface its count in the summary.
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/keep.md": "s1"},
+        )
+        store.reconcile_orphans.return_value = 3
+        result = await self._run(kb, store, gitea, svc)
+        store.reconcile_orphans.assert_awaited_once()
+        kwargs = store.reconcile_orphans.await_args.kwargs
+        assert kwargs["project_id"] == kb
+        assert set(kwargs["tree_slugs"]) == {"keep"}  # basename minus .md
+        assert result["reconciled"] == 3
+
+    @pytest.mark.asyncio
+    async def test_no_reconcile_when_tree_fetch_fails(self):
+        gitea, store, svc = _make_deps(head="headsha")
+        gitea.list_tree.return_value = None
+        result = await self._run(uuid.uuid4(), store, gitea, svc)
+        store.reconcile_orphans.assert_not_awaited()
+        assert result["status"] == "tree-fetch-failed"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_failure_is_non_fatal(self):
+        # A hygiene pass must never wedge the watermark or count as an error.
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/keep.md": "s1"},
+        )
+        store.reconcile_orphans.side_effect = RuntimeError("db down")
+        result = await self._run(kb, store, gitea, svc)
+        assert result["status"] == "completed"  # watermark still advanced
+        assert result["errors"] == 0
+        assert result["reconciled"] == 0

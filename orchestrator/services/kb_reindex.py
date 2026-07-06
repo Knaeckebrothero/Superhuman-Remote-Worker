@@ -385,6 +385,20 @@ async def _reindex_kb_unlocked(
             logger.warning("kb_reindex[%s]: delete error on %s: %s", kb_id, path, exc)
             errors += 1
 
+    # Reconcile orphaned provisional rows (R-1): pathless active rows the tree can
+    # never adopt (failed/squashed commit, slug mismatch, create-then-delete).
+    # current_map holds EVERY knowledge file in the tree, so the slug set is
+    # complete even on an incremental run. Non-fatal and outside the error count —
+    # a hygiene pass must never wedge the watermark or fail the reindex.
+    reconciled = 0
+    try:
+        tree_slugs = [posixpath.basename(p)[: -len(".md")] for p in current_map]
+        reconciled = await store.reconcile_orphans(
+            project_id=kb_id, tree_slugs=tree_slugs
+        )
+    except Exception as exc:
+        logger.warning("kb_reindex[%s]: reconcile pass skipped: %s", kb_id, exc)
+
     if errors == 0:
         await store.upsert_watermark(
             kb_id=kb_id,
@@ -399,13 +413,14 @@ async def _reindex_kb_unlocked(
 
     logger.info(
         "kb_reindex[%s]: %s at %s (full=%s upserted=%d deleted=%d "
-        "skipped=%d errors=%d)",
+        "reconciled=%d skipped=%d errors=%d)",
         kb_id,
         status,
         head[:12],
         full,
         upserted,
         deleted,
+        reconciled,
         skipped,
         errors,
     )
@@ -415,6 +430,7 @@ async def _reindex_kb_unlocked(
         "full": full,
         "upserted": upserted,
         "deleted": deleted,
+        "reconciled": reconciled,
         "skipped": skipped,
         "errors": errors,
     }

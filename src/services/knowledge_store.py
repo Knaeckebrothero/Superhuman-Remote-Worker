@@ -40,7 +40,7 @@ import hashlib
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -688,6 +688,47 @@ class KnowledgeStore:
             path,
         )
         return result is not None
+
+    async def reconcile_orphans(
+        self,
+        project_id: uuid.UUID,
+        tree_slugs: List[str],
+        grace: timedelta = timedelta(hours=1),
+    ) -> int:
+        """Archive pathless active rows the git tree can never adopt (R-1).
+
+        A row written by the agent write-through (:meth:`upsert_note`) carries
+        ``(project_id, note_id)`` but no ``kb_id``/``path``; the reindexer adopts
+        it once a file with ``note_id``'s slug appears in the tree
+        (:meth:`adopt_legacy_row`). A pathless *active* row whose ``note_id``
+        matches no current tree slug, and which has sat unadopted past the
+        adoption ``grace``, is an orphan (failed/squashed commit, slug mismatch,
+        create-then-delete). Soft-archive it — reversible, and it drops out of
+        every functional surface (search/near-dup via status, list/read via the
+        path guard); ``invalidated_at`` leaves an audit trail.
+
+        Keyed on ``project_id``, **not** ``kb_id``: un-adopted ghosts have
+        ``kb_id IS NULL``, so a ``kb_id`` filter would match none of them. The
+        ``grace`` (anchored on ``indexed_at``, the last write) protects a
+        just-written provisional row whose file is committed but not yet in the
+        fetched HEAD. Returns the number of rows archived.
+        """
+        rows = await self.db.fetch(
+            """
+            UPDATE knowledge_index
+               SET status = 'archived', invalidated_at = now()
+             WHERE project_id = $1
+               AND path IS NULL
+               AND status = 'active'
+               AND note_id <> ALL($2::text[])
+               AND indexed_at < now() - $3::interval
+            RETURNING id
+            """,
+            project_id,
+            list(tree_slugs),
+            grace,
+        )
+        return len(rows)
 
     async def replace_note_links(
         self,
