@@ -210,6 +210,26 @@ class TestHasMethods:
         ctx = ToolContext(workspace_manager=ws)
         assert ctx.has_git() is False
 
+    def test_has_knowledge_true_with_store_only(self):
+        # PR4c-3 flip: Neo4j is optional. The pgvector store is the sole
+        # requirement — a graph-less deployment must still load KB tools.
+        ctx = ToolContext(knowledge_store=MagicMock(), knowledge_graph=None)
+        assert ctx.has_knowledge() is True
+
+    def test_has_knowledge_true_with_both(self):
+        ctx = ToolContext(knowledge_store=MagicMock(), knowledge_graph=MagicMock())
+        assert ctx.has_knowledge() is True
+
+    def test_has_knowledge_false_without_store(self):
+        # Graph present but store absent: retrieval is impossible, so the KB
+        # is not available regardless of Neo4j.
+        ctx = ToolContext(knowledge_store=None, knowledge_graph=MagicMock())
+        assert ctx.has_knowledge() is False
+
+    def test_has_knowledge_false_when_nothing(self):
+        ctx = ToolContext()
+        assert ctx.has_knowledge() is False
+
 
 # =============================================================================
 # db property and get_config

@@ -22,7 +22,12 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-from ...services.knowledge_graph import slugify
+from ...services.knowledge_graph import (
+    CONFIDENCE_LEVELS,
+    NOTE_STATUSES,
+    NOTE_TYPES,
+    slugify,
+)
 from ..context import ToolContext
 from .chunker import embedding_version
 from .gardener import (
@@ -389,6 +394,116 @@ def create_kb_tools(
     # Write Tools
     # =========================================================================
 
+    def _update_existing_kgless(
+        note: str,
+        content: Optional[str],
+        append: Optional[str],
+        status: Optional[str],
+        confidence: Optional[str],
+        add_tags: Optional[List[str]],
+        add_links: Optional[List[dict]],
+    ) -> str:
+        """Neo4j-less update: read the row from the store, apply the mutation in
+        Python (the graph does this in Cypher), write back to store + OKF file.
+
+        Same return contract and status/confidence validation as the Neo4j path.
+        ``add_links`` round-trip as generic body links via the reindexer — the
+        graph-only relationship *type* is not preserved (no Neo4j to hold it),
+        consistent with the honest graph-tier degrade elsewhere in PR4c.
+        """
+        project_id = _get_project_id(context)
+        if not project_id:
+            return "Error: No project_id available."
+
+        if status is not None and status not in NOTE_STATUSES:
+            return f"Error: Invalid status: {status}"
+        if confidence is not None and confidence not in CONFIDENCE_LEVELS:
+            return f"Error: Invalid confidence: {confidence}"
+
+        try:
+            existing = _run_async(ks.get_note_by_slug(uuid.UUID(project_id), note))
+            if not existing:
+                return f"Error: Note '{note}' not found in project."
+
+            if content is not None:
+                new_content = content
+            elif append is not None:
+                new_content = (existing.get("content") or "") + "\n\n" + append
+            else:
+                new_content = existing.get("content") or ""
+
+            new_status = status or existing.get("status") or "active"
+            new_confidence = (
+                confidence if confidence is not None else existing.get("confidence")
+            )
+            new_type = existing.get("type") or "learning"
+            new_title = existing.get("title") or note
+
+            merged_tags = list(existing.get("tags") or [])
+            for t in add_tags or []:
+                tl = t.lower()
+                if tl not in merged_tags:
+                    merged_tags.append(tl)
+
+            _jid = existing.get("job_id")
+            job_id_arg = uuid.UUID(_jid) if isinstance(_jid, str) else _jid
+
+            # OKF file is canonical — write it first (mirrors kb_write ordering),
+            # so the edit survives even if the disposable pgvector write fails.
+            _dual_write_note(
+                context,
+                note,
+                {
+                    "id": note,
+                    "type": new_type,
+                    "title": new_title,
+                    "description": existing.get("description"),
+                    "content": new_content,
+                    "tags": merged_tags,
+                    "keywords": existing.get("keywords", []),
+                    "confidence": new_confidence,
+                    "status": new_status,
+                    "relationships": add_links or [],
+                },
+            )
+            try:
+                _run_async(
+                    ks.upsert_note(
+                        note_id=note,
+                        project_id=uuid.UUID(project_id),
+                        title=new_title,
+                        note_type=new_type,
+                        content=new_content,
+                        status=new_status,
+                        confidence=new_confidence,
+                        tags=merged_tags,
+                        keywords=existing.get("keywords", []),
+                        job_id=job_id_arg,
+                        phase=existing.get("phase"),
+                        modified_at=datetime.now(timezone.utc),
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"pgvector write-through failed for {note}: {e}")
+
+            changes = []
+            if content is not None:
+                changes.append("content replaced")
+            if append is not None:
+                changes.append("content appended")
+            if status:
+                changes.append(f"status → {status}")
+            if confidence:
+                changes.append(f"confidence → {confidence}")
+            if add_tags:
+                changes.append(f"+{len(add_tags)} tag(s)")
+            if add_links:
+                changes.append(f"+{len(add_links)} link(s)")
+            return f"Updated **{note}**: {', '.join(changes)}"
+        except Exception as e:
+            logger.error(f"kb_update failed: {e}")
+            return f"Error updating note: {e}"
+
     def _update_existing(
         note: str,
         content: Optional[str] = None,
@@ -403,6 +518,11 @@ def create_kb_tools(
         Shared by the ``kb_update`` tool and the verdict gate's UPDATE/SUPERSEDE
         routing, so both apply an edit the same way.
         """
+        if kg is None:
+            return _update_existing_kgless(
+                note, content, append, status, confidence, add_tags, add_links
+            )
+
         project_id = _get_project_id(context)
         if not project_id:
             return "Error: No project_id available."
@@ -538,7 +658,12 @@ def create_kb_tools(
         # duplication for bare loop agents the verdict gate never reaches.
         # `read_note` returns the note dict (or None); a non-dict means no match.
         candidate_slug = slugify(title)
-        existing = kg.read_note(project_id, candidate_slug)
+        if kg is None:
+            existing = _run_async(
+                ks.get_note_by_slug(uuid.UUID(project_id), candidate_slug)
+            )
+        else:
+            existing = kg.read_note(project_id, candidate_slug)
         if isinstance(existing, dict) and _content_hash(content) == _content_hash(
             existing.get("content", "")
         ):
@@ -589,21 +714,48 @@ def create_kb_tools(
                 )
 
         try:
-            slug = kg.create_note(
-                project_id=project_id,
-                title=title,
-                note_type=type,
-                content=content,
-                tags=tags,
-                keywords=keywords,
-                confidence=confidence,
-                job_id=context.job_id,
-                phase=context.config.get("current_phase"),
-                retrieval_messages=retrieval_messages,
-                links=links,
-            )
+            if kg is None:
+                # Validate up-front, exactly where kg.create_note would (the
+                # graph path raises ValueError here) — otherwise an invalid type
+                # slips through to a silent DB CHECK failure and the tool would
+                # misleadingly report "Created".
+                if type not in NOTE_TYPES:
+                    raise ValueError(
+                        f"Invalid note_type: {type}. Must be one of {NOTE_TYPES}"
+                    )
+                if confidence and confidence not in CONFIDENCE_LEVELS:
+                    raise ValueError(
+                        f"Invalid confidence: {confidence}. "
+                        f"Must be one of {CONFIDENCE_LEVELS}"
+                    )
+                # Neo4j-less: derive the slug ourselves (the graph normally does
+                # this). Base slug, or a deterministic content-hash fork when the
+                # base is taken by a *different* note (identical content already
+                # short-circuited above). Empty slug → deterministic fallback
+                # (content-hashed, not random, so re-writes converge).
+                if not candidate_slug:
+                    slug = f"note-{_content_hash(content)[:8]}"
+                elif isinstance(existing, dict):
+                    slug = f"{candidate_slug}-{_content_hash(content)[:6]}"
+                else:
+                    slug = candidate_slug
+            else:
+                slug = kg.create_note(
+                    project_id=project_id,
+                    title=title,
+                    note_type=type,
+                    content=content,
+                    tags=tags,
+                    keywords=keywords,
+                    confidence=confidence,
+                    job_id=context.job_id,
+                    phase=context.config.get("current_phase"),
+                    retrieval_messages=retrieval_messages,
+                    links=links,
+                )
 
-            # Write-through to pgvector
+            # Write to pgvector — the primary write when Neo4j-less, a
+            # write-through otherwise.
             now = datetime.now(timezone.utc)
             try:
                 _run_async(
@@ -625,7 +777,8 @@ def create_kb_tools(
                 )
             except Exception as e:
                 logger.warning(f"pgvector write-through failed for {slug}: {e}")
-                # Note exists in Neo4j — pgvector can be rebuilt
+                # Durable truth is Neo4j (graph path) or the OKF file (kg-less);
+                # the reindexer can rebuild pgvector from either.
 
             # Files-canonical dual-write (slice 1): materialize knowledge/<slug>.md.
             _dual_write_note(
