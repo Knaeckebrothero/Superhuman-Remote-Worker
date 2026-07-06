@@ -826,6 +826,57 @@ class TestFindNearDuplicatePairs:
         mock_db.fetch.return_value = []
         assert await store.find_near_duplicate_pairs(uuid.uuid4()) == []
 
+    @pytest.mark.asyncio
+    async def test_self_join_guards_embedding_version(self):
+        # D-2: cosine-comparing vectors from different embedding models is
+        # meaningless (ghost null-version vs qwen3 c1). The self-join must only
+        # pair rows that share an embedding_version.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.find_near_duplicate_pairs(uuid.uuid4())
+        sql = mock_db.fetch.call_args[0][0]
+        assert "a.embedding_version = b.embedding_version" in sql
+
+
+# =============================================================================
+# list_notes() — the kg-less kb_list backend
+# =============================================================================
+
+
+class TestListNotes:
+    @pytest.mark.asyncio
+    async def test_excludes_pathless_ghost_rows(self):
+        # B-1: files-canonical — the store lists what a file backs. Pathless
+        # ghost rows (the DELETE dual-write gap) must never surface in kb_list.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.list_notes(uuid.uuid4())
+        sql = mock_db.fetch.call_args[0][0]
+        assert "path IS NOT NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_maps_rows_to_summary_dicts(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = [
+            {
+                "note_id": "n1",
+                "title": "N1",
+                "note_type": "decision",
+                "status": "active",
+                "confidence": "high",
+            }
+        ]
+        out = await store.list_notes(uuid.uuid4())
+        assert out == [
+            {
+                "id": "n1",
+                "title": "N1",
+                "type": "decision",
+                "status": "active",
+                "confidence": "high",
+            }
+        ]
+
 
 # =============================================================================
 # search_chunks() — the slice-3 PR4 retrieval cutover (RRF over knowledge_chunks)
