@@ -208,8 +208,11 @@ class BrowserDaemon:
             raise ValueError(
                 f"Element ref={ref} not found. Use snapshot to get current refs."
             )
+        # browser-use's SelectDropdownOptionEvent selects by the option's visible
+        # text; the field is ``text`` (not ``option``). Passing the wrong kwarg
+        # trips a pydantic "text Field required" error and the select never runs.
         event = session.event_bus.dispatch(
-            SelectDropdownOptionEvent(node=node, option=value)
+            SelectDropdownOptionEvent(node=node, text=value)
         )
         await event
         await event.event_result(raise_if_any=True)
@@ -226,7 +229,11 @@ class BrowserDaemon:
             ScrollEvent(direction=direction, amount=amount, node=node)
         )
         await event
-        await event.event_result(raise_if_any=True)
+        # ScrollEvent's handler returns None (EventResult[NoneType]); the default
+        # raise_if_none=True would reject a perfectly good scroll with "Expected at
+        # least one handler to return a non-None result". Keep raise_if_any so real
+        # handler exceptions still surface.
+        await event.event_result(raise_if_any=True, raise_if_none=False)
 
     async def _back(self, session) -> None:
         page = await session.get_current_page()
