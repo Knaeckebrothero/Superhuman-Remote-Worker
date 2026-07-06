@@ -164,7 +164,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/pip \
     test -n "$PLAYWRIGHT_VERSION" || (echo "PLAYWRIGHT_VERSION build-arg required" && exit 1) \
-    && eatmydata pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" "browser-use>=0.11.0" \
+    # browser-use is CAPPED below 0.13.0: 0.13 (2026-06-08) rewrote the browser
+    # layer to pure CDP and dropped Playwright, so it no longer finds the
+    # Playwright-installed Chromium under PLAYWRIGHT_BROWSERS_PATH and falls back
+    # to auto-installing one via `uvx playwright install` — which fails on this
+    # image ([Errno 2] No such file or directory: 'uvx'), breaking every
+    # browser_* tool cluster-wide. 0.12.x (validated 2026-05-27) is the last
+    # Playwright-compatible line the browser-exec daemon is written against. Do
+    # NOT loosen this cap without upgrading docker/browser-exec to the 0.13 API.
+    && eatmydata pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" "browser-use>=0.12.9,<0.13.0" \
     && apt-get update -y && eatmydata apt-get install -y fonts-noto-core \
     && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright eatmydata playwright install --with-deps chromium \
     # Layout varies by version: older revs use chrome-linux/, newer (>=1.49) use
