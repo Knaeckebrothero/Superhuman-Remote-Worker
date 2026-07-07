@@ -49,6 +49,25 @@ def is_loop_execution_role(role: str | None) -> bool:
     return bool(role) and role not in LOOP_ANALYSIS_ROLES
 
 
+def job_loop_id(job: dict[str, Any]) -> str | None:
+    """Return the project-loop id a job belongs to, or None if it isn't a loop job.
+
+    Reads ``context.loop_id`` (the stamp ``create_loop_job`` writes), tolerating a
+    JSON-string context. This is the same signal ``_advance_project_loop`` keys
+    off; exposed so the completion handler can ask "is this a loop job?" before
+    applying human-in-the-loop gates (e.g. Mode-A diff review) that would wedge an
+    unattended loop — its advance hook fires only on a terminal status.
+    """
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    loop_id = ctx.get("loop_id") if isinstance(ctx, dict) else None
+    return str(loop_id) if loop_id else None
+
+
 def normalize_stage(entry: Any) -> list[str]:
     """Normalize one ``role_sequence`` entry to its list of concurrent roles.
 
@@ -318,6 +337,7 @@ async def create_loop_job(
     iteration: int,
     seq_index: int | None = None,
     remaining_iterations: int | None = None,
+    disable_memory_assembler: bool = False,
 ) -> dict[str, Any]:
     """Materialize ONE bare loop job for the given role + iteration.
 
@@ -337,6 +357,17 @@ async def create_loop_job(
     truth the torn-advance sweeper reads back directly to reconstruct the loop's
     counters — robust to variable-width parallel stages, where the old
     ``(iteration-1) % len(roles)`` modulo no longer maps job-count to stage.
+
+    ``disable_memory_assembler`` turns off the RecallStore TTL-curation
+    assembler for this job (set by the caller for members of a *fan-out* stage).
+    The assembler is the one memory writer that does a read-modify-write over the
+    project-scoped shared store (it retires/re-TTLs existing memories); running N
+    of them concurrently over one project would race that curation slot. It is
+    disabled via the existing ``auxiliary.tasks.assemble_memories.enabled`` flag
+    (the same lever ``persistent_defaults.yaml`` uses) rather than by editing the
+    ``memory.pipeline.writers`` list — a scalar deep-merge that leaves the
+    append-only extractors, the KB curator, and the writers list untouched. See
+    docs/features/loop_parallel_stages.md and [[project_kb_convergence_f13]].
     """
     loop_id = str(loop["id"])
     project_id = str(loop["project_id"]) if loop.get("project_id") else None
@@ -371,6 +402,15 @@ async def create_loop_job(
     workspace_backend = loop.get("workspace_backend")
     if workspace_backend:
         config_override["workspace"] = {"backend": workspace_backend}
+
+    # Fan-out members: silence the TTL-curation assembler so N concurrent
+    # analysis roles don't race the shared project RecallStore's read-modify-
+    # write curation slot (see docstring). Scalar override on the existing aux
+    # gate — no list surgery, extractors/curator keep running.
+    if disable_memory_assembler:
+        config_override["auxiliary"] = {
+            "tasks": {"assemble_memories": {"enabled": False}}
+        }
 
     # Split the synthesized prompt the way the manual create-job form does:
     # a concise `description` (the cockpit row title + task_brief "## Description")
