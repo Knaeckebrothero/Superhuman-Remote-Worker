@@ -1002,6 +1002,10 @@ class TestHandleTransitionNode:
             "is_strategic_phase": True,
             "phase_number": 0,
             "iteration": 10,
+            # A stale error left in state by a mid-phase node must NOT ride out
+            # with the drain freeze (else the orchestrator fails instead of
+            # pauses — version_upgrade_drain_masked_by_coincident_error).
+            "error": {"message": "stale mid-phase error", "type": "job_error"},
         }
         with patch("src.graph._is_drain_requested", return_value=True):
             result = await node(state)
@@ -1012,6 +1016,9 @@ class TestHandleTransitionNode:
         assert freeze["freeze_type"] == "version_upgrade"
         assert freeze["phase_number"] == 0
         assert "drain intent" in freeze["reason"].lower()
+
+        # The drain branch explicitly clears the stale error.
+        assert "error" in result and result["error"] is None
 
         # Marker file written for parity with other freeze types.
         marker = managers["workspace"].read_file("output/job_frozen.json")

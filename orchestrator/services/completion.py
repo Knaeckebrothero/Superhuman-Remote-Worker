@@ -274,6 +274,22 @@ AUTO_REDISPATCH_FREEZE_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Freeze types whose dedicated branch in ``determine_job_status`` must own the
+# pause-vs-fail decision even when a coincident ``error`` rides the same
+# completion report. A drain/outage freeze taken at a clean phase boundary beats
+# a transient interrupt error — the work is checkpointed and re-dispatch resumes
+# it — whereas the bare ``if error`` short-circuit would hard-fail an otherwise
+# re-dispatchable job (observed: a deploy drain racing a SIGTERM-interrupt
+# failing loop iterations instead of pausing them). These freezes' own branches
+# still enforce their fail conditions (memory/KB retry caps, LLM-outage 24h
+# ceiling), so guarding the short-circuit does not turn a genuine give-up into a
+# pause. ``llm_unavailable`` is included alongside the auto-redispatch set (same
+# failure class — the outage sweeper re-dispatches it).
+# docs/issues/version_upgrade_drain_masked_by_coincident_error.md
+ERROR_IMMUNE_FREEZE_TYPES: frozenset[str] = AUTO_REDISPATCH_FREEZE_TYPES | frozenset(
+    {"llm_unavailable"}
+)
+
 
 def auto_continue_drain_update(
     context: dict[str, Any], freeze_data: dict[str, Any], *, cap: int
@@ -482,21 +498,42 @@ def determine_job_status(
     should_stop = result.get("should_stop", False)
     goal_achieved = result.get("goal_achieved", False)
 
-    if error:
-        error_msg = (
-            error.get("message", str(error)) if isinstance(error, dict) else str(error)
-        )
-        return ("failed", error_msg)
-
-    if not should_stop:
-        return (None, None)  # Still running — leave as processing
-
-    # Resolve freeze_data from DB or request body
+    # Resolve freeze_data (DB row preferred, request-body fallback) BEFORE the
+    # error short-circuit so it can consult an auto-redispatch / outage freeze.
     fd = _parse_freeze_data(job)
     if not fd:
         fd = result.get("freeze_data")
         if not isinstance(fd, dict):
             fd = {}
+    freeze_type = fd.get("freeze_type")
+
+    if error:
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        # A coincident error must not mask a clean-boundary freeze whose own
+        # branch below owns the pause-vs-fail decision (drain Continue-as-New,
+        # memory/KB retry caps, LLM-outage ceiling). Scoped to top-level jobs
+        # that actually stopped: critic subjobs (parent_job_id) keep failing on
+        # error as before, and a stale row freeze can't shield a crashed run
+        # (should_stop is False there, so the guard falls through to failed).
+        # docs/issues/version_upgrade_drain_masked_by_coincident_error.md
+        if not (
+            should_stop
+            and job.get("parent_job_id") is None
+            and freeze_type in ERROR_IMMUNE_FREEZE_TYPES
+        ):
+            return ("failed", error_msg)
+        logger.warning(
+            "Job %s: '%s' freeze accompanied by coincident error — routing the "
+            "freeze, not the error: %s",
+            job.get("id"),
+            freeze_type,
+            error_msg[:200],
+        )
+
+    if not should_stop:
+        return (None, None)  # Still running — leave as processing
 
     # Critic jobs (have parent_job_id): read status from freeze_data.
     # Approved → "completed", returned → "waiting".
@@ -516,8 +553,8 @@ def determine_job_status(
         return ("completed" if goal_achieved else "pending_review", None)
 
     # Check if this is a job completion.
-    # freeze_data may come from the DB (job dict) or from the request (result).
-    freeze_type = fd.get("freeze_type")
+    # freeze_data may come from the DB (job dict) or from the request (result);
+    # freeze_type was resolved above.
     is_completion = (
         goal_achieved
         or freeze_type == "job_complete"
