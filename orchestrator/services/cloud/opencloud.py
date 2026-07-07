@@ -726,23 +726,29 @@ class OpenCloudBackend:
     ) -> Optional[str]:
         """Browser deep-link to a Space in the OpenCloud Web UI.
 
-        Prefers the ``webUrl`` captured from the drive-creation response
-        (persisted as ``vendor_meta.web_url``) because OpenCloud Web routes
-        Spaces by drive *alias* (e.g. ``project/<uuid>``), not by the raw
-        composite drive id. Falling back to ``/files/spaces/<drive_id>``
-        silently resolves to the user's personal space on real OpenCloud.
+        Derived from the LIVE ``public_url`` plus the Space's stable fileId
+        (``native_id``) via OpenCloud's ``/f/<fileId>`` private-link
+        resolver — the same form ``get_session_folder_browser_url`` uses.
+        The resolver routes to the exact Space for any member, so we do NOT
+        need the drive *alias*; and we deliberately do NOT return the
+        persisted ``vendor_meta.web_url``. That value is the ``webUrl``
+        OpenCloud emitted at Space-creation time, which bakes in whatever
+        ``OC_URL`` was canonical then — a later domain rebrand
+        (``cloud.superhuman-remote-worker.com`` -> ``cloud.srw.works``)
+        freezes every stored link on the dead host. Reconstructing keeps the
+        link current for old and new projects alike.
         """
-        web_url = handle.vendor_meta.get("web_url")
-        if web_url:
-            return str(web_url)
         drive_id = handle.native_id
-        if not drive_id:
-            return None
-        # Delimiters in the composite drive id must be percent-encoded.
-        # See opencloud-eu/web#1795 — most HTTP clients skip `!` and `$`
-        # by default.
-        safe_id = quote(drive_id, safe="")
-        return f"{self._public_url}/files/spaces/{safe_id}"
+        if drive_id:
+            # Delimiters in the composite fileId must be percent-encoded.
+            # See opencloud-eu/web#1795 — most HTTP clients skip `!` and `$`
+            # by default.
+            safe_id = quote(drive_id, safe="")
+            return f"{self._public_url}/f/{safe_id}"
+        # Legacy handle with no drive id: nothing to reconstruct from, so fall
+        # back to whatever absolute link was captured (may carry a stale host).
+        web_url = handle.vendor_meta.get("web_url")
+        return str(web_url) if web_url else None
 
     @instrument_backend_op("list_project_folder")
     async def list_project_folder(
@@ -1007,17 +1013,20 @@ class OpenCloudBackend:
     ) -> Optional[str]:
         """Internal WebDAV URL for a Space.
 
-        Preference order: persisted ``webdav_url`` from the create response
-        → reconstructed ``{base_url}/dav/spaces/{drive_id}/``.
+        Reconstructed from the LIVE internal ``base_url`` plus the Space drive
+        id, mirroring ``build_rclone_mount_spec`` (which already reconstructs
+        rather than trusting ``vendor_meta``). The persisted ``webdav_url`` is
+        the PUBLIC graph-response URL and freezes on the ``OC_URL`` domain at
+        creation time, so trusting it both hairpins traffic through the edge
+        and breaks after a domain rebrand. Only fall back to the persisted
+        value for legacy handles that carry no drive id.
         """
-        persisted = handle.vendor_meta.get("webdav_url")
-        if persisted:
-            return str(persisted)
         drive_id = handle.native_id
-        if not drive_id:
-            return None
-        safe_id = quote(drive_id, safe="")
-        return f"{self._base_url}/dav/spaces/{safe_id}/"
+        if drive_id:
+            safe_id = quote(drive_id, safe="")
+            return f"{self._base_url}/dav/spaces/{safe_id}/"
+        persisted = handle.vendor_meta.get("webdav_url")
+        return str(persisted) if persisted else None
 
     # ------------------------------------------------------------- Session folders
 
