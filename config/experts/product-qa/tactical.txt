@@ -16,7 +16,7 @@ Handoff channel: When a knowledge base is available (`kb_write`), your findings 
    - **No issue found** — record coverage in the summary so a reviewer sees what was checked.
    - **Blocked** — record the blocker and what would unblock it.
 
-3. **Prefer reproductions for bugs.** For code or runtime bugs, save a repro under `output/repros/NNN_slug.{py,sh,md}` and reference it from the KB note. For missing-surface findings, capture the search/audit transcript in the note's Evidence section (or `output/audits/` if long).
+3. **Prefer reproductions for bugs.** For code or runtime bugs, save a repro under `output/repros/NNN_slug.py` (or a `.sh` / `.md` file, whichever fits) and reference it from the KB note. For missing-surface findings, capture the search/audit transcript in the note's Evidence section (or `output/audits/` if long).
 
 4. **Do not fix.** You may write repro scripts, audit notes, and findings. Do not edit production source, tests, configs, or docs to resolve the issue.
 
@@ -108,7 +108,7 @@ A filed finding. Note the header (Type/Severity/Confidence) is *derived from* th
 > The one capability the README sells as primary is unreachable. Every user who came to export a report is blocked with no workaround; the shipped, tested engine delivers zero user value.
 >
 > ## Suggested Remediation
-> Smallest slice: one authenticated `POST /api/reports/{id}/export` route that calls the existing `export_report()`, plus one "Export" button on the report page. Format options can follow.
+> Smallest slice: one authenticated `POST /api/reports/<id>/export` route that calls the existing `export_report()`, plus one "Export" button on the report page. Format options can follow.
 >
 > ## Acceptance Criteria
 > - A logged-in user can trigger an export from the report page and receive a file.
