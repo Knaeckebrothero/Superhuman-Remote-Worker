@@ -10276,6 +10276,7 @@ async def _spawn_loop_job(
     iteration: int,
     seq_index: int | None = None,
     remaining_iterations: int | None = None,
+    disable_memory_assembler: bool = False,
 ) -> dict[str, Any]:
     """Create + provision + dispatch one bare project-loop job.
 
@@ -10286,7 +10287,9 @@ async def _spawn_loop_job(
     handle); provisioning / dispatch failures are non-fatal (logged), matching
     POST /api/jobs + run-now. ``seq_index`` / ``remaining_iterations`` are
     stamped into the job's context for the torn-advance heal (see
-    ``create_loop_job``).
+    ``create_loop_job``). ``disable_memory_assembler`` (set for fan-out stage
+    members) turns off the TTL-curation assembler so concurrent members don't
+    race the shared project store.
     """
     from services.job_provisioning import provision_job_repo
     from services.project_loops import create_loop_job
@@ -10298,6 +10301,7 @@ async def _spawn_loop_job(
         iteration=iteration,
         seq_index=seq_index,
         remaining_iterations=remaining_iterations,
+        disable_memory_assembler=disable_memory_assembler,
     )
 
     try:
@@ -10347,6 +10351,10 @@ async def _spawn_loop_stage(
 
     roles = normalize_stage(stage)
     new_total = int(base_total) + len(roles)
+    # A fan-out stage runs >1 analysis role concurrently against the one shared
+    # project store — its members must not each run the TTL-curation assembler
+    # (read-modify-write race). A single-role stage keeps the assembler on.
+    is_fan_out = len(roles) > 1
     jobs: list[dict[str, Any]] = []
     for role in roles:
         job = await _spawn_loop_job(
@@ -10355,6 +10363,7 @@ async def _spawn_loop_stage(
             iteration=new_total,
             seq_index=seq_index,
             remaining_iterations=remaining,
+            disable_memory_assembler=is_fan_out,
         )
         jobs.append(job)
     return jobs, new_total
@@ -11241,10 +11250,21 @@ async def complete_job(
         # override new_status to pending_review and stamp
         # diff_status='pending'. Skipped for failed/cancelled exits — only
         # an actually-completed run gets a diff review.
+        #
+        # EXEMPT project-loop jobs: they run unattended (autonomy: full) and route
+        # their changes through the loop's own branch squash-merge + retro trail,
+        # not the cloud accept/reject diff path. Holding one at pending_review
+        # would wedge the loop forever — the advance hook (§5d) fires only on a
+        # TERMINAL status, and the torn-advance sweeper won't heal a non-NULL
+        # pointer — so an execution role (or any role that writes project files)
+        # would stall every iteration awaiting a review nobody performs.
+        from services.project_loops import job_loop_id
+
         if (
             job.get("cloud_diff_baseline_commit")
             and new_status in ("completed", "pending_review")
             and gitea_client.is_initialized
+            and not job_loop_id(job)
         ):
             try:
                 from services.job_cloud_baseline import capture_diff_for_mode_a_job

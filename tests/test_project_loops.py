@@ -16,6 +16,7 @@ from services.project_loops import (
     build_loop_description,
     build_loop_kickoff,
     create_loop_job,
+    job_loop_id,
     normalize_stage,
     validate_role_sequence,
 )
@@ -88,6 +89,87 @@ async def test_model_and_backend_coexist_with_bare_invariants():
     assert co["scholar"] == {"enabled": False}
     assert co["autonomy"] == "full"
     assert co["memory"] == {"required": True}
+
+
+class TestJobLoopId:
+    """job_loop_id detects loop membership from context.loop_id — the guard the
+    completion handler uses to exempt loop jobs from the Mode-A diff-review gate
+    (which would wedge an unattended loop). docs/features/loop_parallel_stages.md."""
+
+    def test_loop_job_returns_id(self) -> None:
+        assert job_loop_id({"context": {"loop_id": "abc-123"}}) == "abc-123"
+
+    def test_json_string_context(self) -> None:
+        # The DB layer sometimes hands back context as a JSON string.
+        assert job_loop_id({"context": '{"loop_id": "abc-123"}'}) == "abc-123"
+
+    def test_non_loop_job_returns_none(self) -> None:
+        assert job_loop_id({"context": {"kickoff_message": "hi"}}) is None
+
+    def test_missing_context_returns_none(self) -> None:
+        assert job_loop_id({}) is None
+
+    def test_none_context_returns_none(self) -> None:
+        assert job_loop_id({"context": None}) is None
+
+    def test_malformed_json_context_returns_none(self) -> None:
+        assert job_loop_id({"context": "{not json"}) is None
+
+    def test_empty_loop_id_returns_none(self) -> None:
+        assert job_loop_id({"context": {"loop_id": ""}}) is None
+
+
+class TestFanOutMemoryAssembler:
+    """Fan-out stage members disable the TTL-curation assembler so concurrent
+    analysis roles don't race the shared project RecallStore's curation slot
+    (docs/features/loop_parallel_stages.md). The lever is the existing
+    ``auxiliary.tasks.assemble_memories.enabled`` gate — a scalar deep-merge,
+    NOT a rewrite of ``memory.pipeline.writers``."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_when_flag_set(self) -> None:
+        db = _db()
+        await create_loop_job(
+            db, _loop(), role="scholar", iteration=2, disable_memory_assembler=True
+        )
+        co = _config_override(db)
+        assert co["auxiliary"]["tasks"]["assemble_memories"]["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_auxiliary_override_by_default(self) -> None:
+        # Single-role stages (the default) leave the resolved config untouched —
+        # the assembler keeps compounding the KB across sequential iterations.
+        db = _db()
+        await create_loop_job(db, _loop(), role="scholar", iteration=1)
+        assert "auxiliary" not in _config_override(db)
+
+    @pytest.mark.asyncio
+    async def test_override_is_scalar_not_writers_list(self) -> None:
+        # The disable must NOT clobber the memory.pipeline.writers list (that
+        # would drop the append-only extractors too, and drift from defaults).
+        db = _db()
+        await create_loop_job(
+            db, _loop(), role="product-qa", iteration=2, disable_memory_assembler=True
+        )
+        co = _config_override(db)
+        assert "memory" in co and "pipeline" not in co["memory"]
+
+    @pytest.mark.asyncio
+    async def test_coexists_with_bare_invariants(self) -> None:
+        db = _db()
+        await create_loop_job(
+            db,
+            _loop(model="openrouter/minimax/minimax-m3"),
+            role="scholar",
+            iteration=2,
+            disable_memory_assembler=True,
+        )
+        co = _config_override(db)
+        # The bare lifecycle invariants and the model override survive alongside.
+        assert co["auxiliary"]["tasks"]["assemble_memories"]["enabled"] is False
+        assert co["memory"] == {"required": True}
+        assert co["curator"] == {"enabled": True}
+        assert co["llm"] == {"model": "openrouter/minimax/minimax-m3"}
 
 
 class TestProductQaLoopWiring:
