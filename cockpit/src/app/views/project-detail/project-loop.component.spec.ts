@@ -2,7 +2,10 @@ import {describe, it, expect} from 'vitest';
 
 import {
   buildRoleSequence,
+  formatRoleSequence,
+  formatStage,
   hasInFlightJob,
+  isAnalysisRole,
   isLoopWindingDown,
   workerExpertsOnly,
 } from './project-loop.component';
@@ -86,26 +89,74 @@ describe('workerExpertsOnly', () => {
 });
 
 describe('buildRoleSequence', () => {
-  it('returns the preset roles in preset mode (ignores custom slots)', () => {
-    expect(buildRoleSequence('preset', ['ignored'], ['scholar', 'critic'])).toEqual([
-      'scholar',
-      'critic',
-    ]);
-  });
-
-  it('returns the custom slots in custom mode', () => {
+  it('returns the preset roles in preset mode (ignores custom stages)', () => {
     expect(
-      buildRoleSequence('custom', ['scholar-fast', 'critic', 'developer'], ['scholar']),
-    ).toEqual(['scholar-fast', 'critic', 'developer']);
-  });
-
-  it('trims whitespace and drops blank custom slots', () => {
-    expect(
-      buildRoleSequence('custom', ['  scholar  ', '', '   ', 'critic'], []),
+      buildRoleSequence('preset', [['ignored']], ['scholar', 'critic']),
     ).toEqual(['scholar', 'critic']);
   });
 
-  it('is empty when every custom slot is blank (blocks an empty start)', () => {
-    expect(buildRoleSequence('custom', ['', '  '], ['scholar'])).toEqual([]);
+  it('collapses single-role stages to bare strings in custom mode', () => {
+    expect(
+      buildRoleSequence(
+        'custom',
+        [['scholar-fast'], ['critic'], ['developer']],
+        ['scholar'],
+      ),
+    ).toEqual(['scholar-fast', 'critic', 'developer']);
+  });
+
+  it('keeps a multi-role step as a parallel (nested) stage', () => {
+    expect(
+      buildRoleSequence(
+        'custom',
+        [['scholar', 'product-qa'], ['critic'], ['developer']],
+        [],
+      ),
+    ).toEqual([['scholar', 'product-qa'], 'critic', 'developer']);
+  });
+
+  it('trims whitespace, de-dupes within a stage, and drops blank steps', () => {
+    expect(
+      buildRoleSequence(
+        'custom',
+        [['  scholar  ', 'scholar'], [''], ['   '], ['critic']],
+        [],
+      ),
+    ).toEqual(['scholar', 'critic']);
+  });
+
+  it('is empty when every custom stage is blank (blocks an empty start)', () => {
+    expect(buildRoleSequence('custom', [['', '  ']], ['scholar'])).toEqual([]);
+  });
+});
+
+describe('isAnalysisRole', () => {
+  it('accepts the three analysis roles (trimmed)', () => {
+    expect(isAnalysisRole('scholar')).toBe(true);
+    expect(isAnalysisRole('critic')).toBe(true);
+    expect(isAnalysisRole('  product-qa ')).toBe(true);
+  });
+
+  it('rejects execution and unknown roles', () => {
+    expect(isAnalysisRole('developer')).toBe(false);
+    expect(isAnalysisRole('default')).toBe(false);
+    expect(isAnalysisRole('my-custom-expert')).toBe(false);
+    expect(isAnalysisRole('')).toBe(false);
+  });
+});
+
+describe('formatStage / formatRoleSequence', () => {
+  it('renders a bare role unchanged', () => {
+    expect(formatStage('scholar')).toBe('scholar');
+  });
+
+  it('joins a fan-out stage with the parallel separator', () => {
+    expect(formatStage(['scholar', 'product-qa'])).toBe('scholar ∥ product-qa');
+  });
+
+  it('renders a full mixed rotation with arrows and parallel bars', () => {
+    expect(
+      formatRoleSequence([['scholar', 'product-qa'], 'critic', 'developer']),
+    ).toBe('scholar ∥ product-qa → critic → developer');
   });
 });

@@ -25,11 +25,13 @@ related:
 
 ## Status
 
-**Phase 0 + Phase 1 COMPLETE (2026-07-07), uncommitted.** Phase 0 loop-wires the `product-qa` expert (sequential) — done, unit-tested, and live-verified on a k3d gemma smoke loop (`670130c6`: scholar→product-qa→critic advanced correctly, no F29). Phase 1 adds the concurrent stage — schema, grammar, barrier, advance, and torn-advance recovery — done, with **70 loop unit tests green**, the barrier SQL **validated against real Postgres** (last-out drill), and the **refactored single-role advance path live-verified on k3d** (the gemma loop's scholar→product-qa rotation ran through the new `_spawn_loop_stage`/`_rotate_loop_to_next_stage` and stamped `loop_seq_index` correctly). The last Phase 1 sub-item — disabling `memory_assembler` for fan-out members — is **done** (scalar `auxiliary.tasks.assemble_memories.enabled` override, 4 unit tests), so Phase 1 is complete.
+**Phases 0, 1, 2 COMPLETE (2026-07-07), uncommitted.** Phase 0 loop-wires the `product-qa` expert (sequential) — done, unit-tested, and live-verified on a k3d gemma smoke loop (`670130c6`: scholar→product-qa→critic advanced correctly, no F29). Phase 1 adds the concurrent stage — schema, grammar, barrier, advance, and torn-advance recovery — done, with **70 loop unit tests green**, the barrier SQL **validated against real Postgres** (last-out drill), and the **refactored single-role advance path live-verified on k3d** (the gemma loop's scholar→product-qa rotation ran through the new `_spawn_loop_stage`/`_rotate_loop_to_next_stage` and stamped `loop_seq_index` correctly). The last Phase 1 sub-item — disabling `memory_assembler` for fan-out members — is **done** (scalar `auxiliary.tasks.assemble_memories.enabled` override, 4 unit tests), so Phase 1 is complete.
+
+Phase 2 adds the **cockpit builder + display** so a parallel stage can be composed and scheduled from the UI (no more API-by-hand). Done, with the loop-component spec grown to **21 tests (841 cockpit tests green)** and **live-verified end-to-end on k3d** — see [Phase-2 verification](#phase-2-verification).
 
 The k3d smoke also surfaced — and we fixed — an **unrelated interaction bug**: Mode-A cloud-diff capture held the product-qa job at `pending_review`, wedging the loop (the advance hook fires only on a terminal status). Loop jobs are now exempt from that gate. Details in [Phase-0 smoke findings](#phase-0-smoke-findings) and `docs/done/job_cloud_export.md`.
 
-**Phase 2** (cockpit stage chips) and **Phase 3** (representative `scholar ∥ product-qa` e2e on homelab/minimax + flip the Better Resavio loop) remain.
+**Phase 3** (representative `scholar ∥ product-qa` e2e on homelab/minimax — real note quality + full barrier drain over ≥2 cycles + flip the Better Resavio loop) remains. Phase 2's live check already confirmed the concurrent path *spawns* correctly (two jobs, `current_job_id` NULL + `current_stage_jobs` populated); what's left for Phase 3 is the drain→rotate→critic-reads-both over a full run on a model that actually writes the KB.
 
 ## Phase-0 smoke findings
 
@@ -40,6 +42,14 @@ The k3d gemma smoke (`670130c6`, sequence `[scholar, product-qa, critic, develop
 **Fix (implemented, uncommitted):** loop jobs are exempt from the Mode-A gate. A new pure helper `services/project_loops.py:job_loop_id(job)` (reads `context.loop_id`, JSON-string tolerant, 7 unit tests) gates the block: `... and not job_loop_id(job)`. A loop routes its changes through its own branch squash-merge + `retros/` trail, so the cloud accept/reject diff path is inapplicable and a human review gate is the wrong gate for an unattended `autonomy: full` loop. Full write-up in `docs/done/job_cloud_export.md` (Update 2026-07-07).
 
 **Verification:** 7 unit tests for the helper (+63 → **70 loop tests green**), ruff clean, guard confirmed live on the k3d pod. The sweeper self-heal was live-verified: flipping the wedged job to `completed` made the sweeper re-run the advance and rotate the loop cleanly to `critic` — confirming `pending_review` was the *only* blocker (it is deliberately outside the sweeper's `_TERMINAL` set). **The definitive live check passed 2026-07-07:** the smoke loop rotated all the way through `scholar → product-qa → critic → developer`, and the `developer` job (`3ce2f836`) — an execution role that *did* carry a `cloud_diff_baseline_commit` — landed **`completed`, not `pending_review`**, with `diff_status` never set (the Mode-A capture block was skipped entirely, exactly as the `and not job_loop_id(job)` guard intends). The loop then advanced developer → done cleanly (`rem 0`). Execution roles no longer wedge under Mode-A.
+
+## Phase-2 verification
+
+Phase 2 is a cockpit-only change (`cockpit/src/app/views/project-detail/project-loop.component.ts` + `core/models/api.model.ts`); the backend already accepted nested `role_sequence` and returned `current_stage_jobs` from Phase 1. The custom cycle builder now represents each step as a *stage* (a list of roles): a solo step picks any worker expert, and an analysis step (scholar/critic/product-qa) offers **"+ parallel role"** to fan out. Parallel steps are gated to analysis roles only (mirrors the backend `LOOP_ANALYSIS_ROLES`), their selects are constrained to analysis experts and de-duped within the stage, and a live **rotation preview** + the running panel format stages with `∥`. The running panel also shows a **Stage jobs** row (`current_stage_jobs` short ids) while a fan-out is in flight.
+
+**Unit:** the loop-component spec grew from 15 to 21 pure-function tests (841 cockpit tests green overall) — `buildRoleSequence` collapses a one-role step to a bare string and keeps a multi-role step nested, de-dupes within a stage, drops blank steps; `isAnalysisRole` and `formatStage`/`formatRoleSequence` cover the gating + display. A full production build type-checked the templates clean.
+
+**Live (k3d, Playwright, 2026-07-07):** logged in as `test`, opened a project's Loop tab → Custom. Confirmed "+ parallel role" appears on the scholar and critic steps but **not** on the developer step. Fanned step 1 out to **scholar ∥ product-qa**; the rotation preview read `scholar ∥ product-qa → critic → developer`. Clicked **Start loop** (model gemma-4-moe, max 4). The API accepted the nested body and the DB row persisted `role_sequence = [["scholar","product-qa"], "critic", "developer"]` with `current_job_id = NULL` and `current_stage_jobs = [<scholar-id>, <product-qa-id>]` — i.e. the parallel barrier spawned **two concurrent jobs**, the exact fan-out invariant. The live panel rendered the step as `scholar ∥ product-qa · job 2 of 4`, the sequence with `∥`, and both stage-job ids. Stopped the loop (graceful wind-down) to bound the gemma burn — the full barrier *drain*/rotate on real concurrency is Phase 3's homelab job.
 
 ## Problem
 
@@ -211,12 +221,12 @@ Minimal: the loop status payload (`GET /api/projects/{id}/loop`) adds `current_s
 - [x] Sweeper: `_sweep_parallel_stage` backstop; `heal_project_loop_pointer`/`heal_project_loop_stage` guard on `current_stage_jobs = '[]'`; stamp-preferring `_derive_loop_counters`; `get_newest_loop_stage`. Tear-drill unit tests (Tear A repoint, Tear B restore) for both widths.
 - [x] disable `memory_assembler` for fan-out members via `config_override` — done via the scalar `auxiliary.tasks.assemble_memories.enabled = false` gate (not the sketched writers list-replace; cleaner, see [KB safety](#kb-safety)), 4 unit tests. Single-role stages unaffected.
 
-**Phase 2 — API + cockpit**
-- [ ] Start endpoint accepts nested arrays; rejects execution roles in parallel stages (422) and duplicate roles within a stage.
-- [ ] Loop status exposes `current_stage_jobs`; Loop tab renders stage chips; vitest for the component mapping.
+**Phase 2 — API + cockpit** — DONE 2026-07-07 (see [Phase-2 verification](#phase-2-verification)).
+- [x] Start endpoint accepts nested arrays; rejects execution roles in parallel stages and duplicate roles within a stage. (Landed in Phase 1: `routers/project_loops.py` types `role_sequence: list[str | list[str]]` and calls `validate_role_sequence`, which raises → HTTP 400; `normalize_stage` de-dupes within a stage.)
+- [x] Loop status exposes `current_stage_jobs` (already decoded by `_project_loop_row_to_dict` and returned by `GET /loop`); Loop tab **builds and renders** parallel stages — the custom cycle builder gates "+ parallel role" to analysis steps, the rotation preview + live panel format stages with `∥`, and the live panel shows `current_stage_jobs` chips. Vitest covers `buildRoleSequence` (nested mapping + de-dupe + blank-drop), `isAnalysisRole`, and `formatStage`/`formatRoleSequence`.
 
 **Phase 3 — e2e + rollout**
-- [ ] k3d: loop with `[["scholar","product-qa"],"critic","developer"]` runs ≥2 full cycles; both stage jobs run concurrently (overlapping timestamps); Critic reads both streams post-barrier.
+- [~] k3d: loop with `[["scholar","product-qa"],"critic","developer"]` — **concurrent spawn confirmed live** (Phase-2 check: two jobs dispatched, `current_job_id` NULL + `current_stage_jobs` = both ids). Still to verify on homelab/minimax: ≥2 full cycles, barrier **drain**, and Critic reading both streams post-barrier (gemma under-writes the KB, so quality needs minimax).
 - [ ] Kill drill: delete the orchestrator pod mid-stage → sweeper recovers, no double-spawn (age-gate respected), no lost rotation.
 - [ ] Flip the Better Resavio loop to the parallel sequence; first triage where the Critic explicitly weighs a `qa-finding` against a `proposal` is the acceptance demo.
 

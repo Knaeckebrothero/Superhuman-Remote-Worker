@@ -59,17 +59,59 @@ export function workerExpertsOnly<T extends {expert_type?: string}>(
 }
 
 /**
- * The effective rotation to send as `role_sequence`: the preset list, or the
- * custom slots with surrounding blanks trimmed (so an unfilled custom slot can
- * never ship and the API never sees an empty entry).
+ * Analysis roles that may run concurrently in one stage. Mirrors the backend
+ * `LOOP_ANALYSIS_ROLES` (services/project_loops.py) — execution roles stay a
+ * singleton because two executors would race the branch squash-merge. The
+ * cockpit gates parallel fan-out to these so a bad stage never reaches the API.
+ */
+export const LOOP_ANALYSIS_ROLES: ReadonlySet<string> = new Set([
+  'scholar',
+  'critic',
+  'product-qa',
+]);
+
+/** A role slug may join a parallel fan-out only if it's an analysis role. */
+export function isAnalysisRole(slug: string): boolean {
+  return LOOP_ANALYSIS_ROLES.has(slug.trim());
+}
+
+/** Separator between concurrent roles in one stage (∥ = "runs in parallel"). */
+export const STAGE_SEP = ' ∥ ';
+
+/** Render one `role_sequence` entry: a fan-out stage joins members with ∥. */
+export function formatStage(entry: string | string[]): string {
+  return Array.isArray(entry) ? entry.join(STAGE_SEP) : entry;
+}
+
+/** Render the whole rotation, e.g. "scholar ∥ product-qa → critic → developer". */
+export function formatRoleSequence(seq: (string | string[])[]): string {
+  return seq.map(formatStage).join(' → ');
+}
+
+/**
+ * The effective rotation to send as `role_sequence`. Preset mode returns its
+ * flat role list. Custom mode maps each step (a list of roles) to a stage:
+ * blanks trimmed, roles de-duped within a step (mirrors the backend's
+ * `normalize_stage`), fully-blank steps dropped. A one-role step collapses to a
+ * bare string (single-job stage); a multi-role step stays an array (parallel
+ * fan-out) — so an unfilled slot can never ship and the API never sees an empty
+ * entry.
  */
 export function buildRoleSequence(
   mode: 'preset' | 'custom',
-  customSlots: string[],
+  customSlots: string[][],
   presetRoles: string[],
-): string[] {
-  const seq = mode === 'custom' ? customSlots : presetRoles;
-  return seq.map((s) => s.trim()).filter(Boolean);
+): (string | string[])[] {
+  if (mode !== 'custom') {
+    return presetRoles.map((s) => s.trim()).filter(Boolean);
+  }
+  const out: (string | string[])[] = [];
+  for (const stage of customSlots) {
+    const roles = [...new Set(stage.map((s) => s.trim()).filter(Boolean))];
+    if (roles.length === 0) continue;
+    out.push(roles.length === 1 ? roles[0] : roles);
+  }
+  return out;
 }
 
 /**
@@ -124,14 +166,16 @@ export function buildRoleSequence(
               <div class="loop-meta">
                 <div><span class="k">Model</span><span class="v">{{ l.model || 'project default' }}</span></div>
                 <div><span class="k">Workspace</span><span class="v">{{ l.workspace_backend === 'vm' ? 'VM (root)' : (l.workspace_backend || 'sandbox') }}</span></div>
-                <div><span class="k">Sequence</span><span class="v">{{ l.role_sequence.join(' → ') }}</span></div>
+                <div><span class="k">Sequence</span><span class="v">{{ fmtSequence(l.role_sequence) }}</span></div>
                 @if (l.remaining_iterations !== null) {
                   <div><span class="k">Iterations left</span><span class="v">{{ l.remaining_iterations }}</span></div>
                 }
                 @if (l.run_until) {
                   <div><span class="k">Runs until</span><span class="v">{{ l.run_until | date: 'short' }}</span></div>
                 }
-                @if (l.current_job_id) {
+                @if (l.current_stage_jobs?.length) {
+                  <div><span class="k">Stage jobs</span><span class="v mono">{{ stageJobsShort(l) }}</span></div>
+                } @else if (l.current_job_id) {
                   <div><span class="k">Current job</span><span class="v mono">{{ l.current_job_id.slice(0, 8) }}</span></div>
                 }
               </div>
@@ -232,38 +276,74 @@ export function buildRoleSequence(
               </app-select>
               <div class="loop-seq">
                 @for (r of roleSequence(); track $index) {
-                  <span class="loop-role-chip">{{ r }}</span>
+                  <span class="loop-role-chip">{{ fmtStage(r) }}</span>
                 }
               </div>
             } @else {
               <p class="loop-hint">
-                Pick an expert per step — they rotate one job each, repeating.
-                Swap in a custom expert to change that step's model.
+                Each step runs one job; steps rotate in order, repeating. Add a
+                parallel role to a step to run analysis experts (scholar, critic,
+                product-qa) side by side — they finish together, then the next
+                step sees both. Execution experts run one at a time.
               </p>
               <div class="loop-slots">
-                @for (slot of customSlots(); track $index) {
-                  <div class="loop-slot">
-                    <span class="loop-slot-n">{{ $index + 1 }}</span>
-                    <app-select [value]="slot" (changed)="setSlot($index, $event)">
-                      <option value="">— pick an expert —</option>
-                      @for (e of workerExperts(); track e.id) {
-                        <option [value]="slug(e)">{{ e.display_name }}</option>
+                @for (stage of customSlots(); track $index; let si = $index) {
+                  <div class="loop-stage">
+                    <span class="loop-slot-n">{{ si + 1 }}</span>
+                    <div class="loop-stage-body">
+                      @for (role of stage; track $index; let ri = $index) {
+                        <div class="loop-slot">
+                          @if (ri > 0) { <span class="loop-par">∥</span> }
+                          <app-select
+                            [value]="role"
+                            (changed)="setStageRole(si, ri, $event)"
+                          >
+                            <option value="">— pick an expert —</option>
+                            @for (e of roleOptions(si, ri); track e.id) {
+                              <option [value]="slug(e)">{{ e.display_name }}</option>
+                            }
+                          </app-select>
+                          @if (stage.length > 1) {
+                            <app-button
+                              variant="ghost"
+                              size="sm"
+                              (clicked)="removeStageRole(si, ri)"
+                            >
+                              Remove role
+                            </app-button>
+                          }
+                        </div>
                       }
-                    </app-select>
+                      @if (stageCanAddParallel(si)) {
+                        <app-button
+                          variant="ghost"
+                          size="sm"
+                          (clicked)="addStageRole(si)"
+                        >
+                          + parallel role
+                        </app-button>
+                      }
+                    </div>
                     <app-button
                       variant="ghost"
                       size="sm"
                       [disabled]="customSlots().length <= 1"
-                      (clicked)="removeSlot($index)"
+                      (clicked)="removeStage(si)"
                     >
-                      Remove
+                      Remove step
                     </app-button>
                   </div>
                 }
               </div>
-              <app-button variant="secondary" size="sm" (clicked)="addSlot()">
+              <app-button variant="secondary" size="sm" (clicked)="addStage()">
                 Add step
               </app-button>
+              @if (roleSequence().length) {
+                <div class="loop-seq-preview">
+                  <span class="k">Rotation</span>
+                  <span class="v" data-testid="rotation-preview">{{ fmtSequence(roleSequence()) }}</span>
+                </div>
+              }
               @if (!workerExperts().length) {
                 <p class="loop-hint">
                   No experts available — create a custom expert to pin a model.
@@ -348,6 +428,11 @@ export function buildRoleSequence(
       .loop-outcome.winding { border-left-color: var(--warning); }
       .loop-outcome .err { display: block; margin-top: 4px; color: var(--danger); font-size: 12px; }
       .loop-seq { display: flex; gap: 6px; flex-wrap: wrap; margin-top: -6px; }
+      .loop-seq-preview {
+        display: flex; flex-direction: column; gap: 2px; margin-top: 2px;
+      }
+      .loop-seq-preview .k { font-size: 11px; color: var(--text-muted); }
+      .loop-seq-preview .v { font-size: 13px; color: var(--text-primary); }
       .loop-role-chip {
         font-size: 11px; padding: 2px 8px; border-radius: var(--radius-tag);
         background: var(--surface-1); color: var(--text-secondary); text-transform: capitalize;
@@ -363,12 +448,18 @@ export function buildRoleSequence(
         background: color-mix(in srgb, var(--accent-color) 15%, transparent);
       }
       .loop-slots { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+      .loop-stage { display: flex; align-items: flex-start; gap: 8px; }
+      .loop-stage-body {
+        flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px;
+      }
       .loop-slot { display: flex; align-items: center; gap: 8px; }
       .loop-slot app-select { flex: 1; min-width: 0; }
+      .loop-par { flex: 0 0 auto; color: var(--text-muted); font-size: 13px; }
       .loop-slot-n {
         flex: 0 0 auto; width: 20px; height: 20px; display: flex;
         align-items: center; justify-content: center; font-size: 11px;
         border-radius: 50%; background: var(--surface-1); color: var(--text-muted);
+        margin-top: 6px;
       }
       .loop-budget { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
       .loop-hint, .loop-msg { font-size: 12px; margin: 0; }
@@ -400,9 +491,11 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   readonly fAcceptance = signal('');
   readonly fUserPrompt = signal('');
   // Cycle builder: 'preset' uses a ready-made rotation; 'custom' lets the user
-  // pick an expert per step (each step's expert carries its own model).
+  // pick an expert per step (each step's expert carries its own model). A step
+  // is a *stage* — a list of roles; length 1 runs one job, length >1 runs the
+  // analysis roles concurrently (parallel fan-out) and barriers before rotating.
   readonly fMode = signal<'preset' | 'custom'>('preset');
-  readonly customSlots = signal<string[]>([]);
+  readonly customSlots = signal<string[][]>([]);
   // Worker experts available to fill custom slots (bundled + DB worker experts).
   readonly workerExperts = signal<Expert[]>([]);
 
@@ -417,7 +510,7 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   readonly modelOptions = computed(() =>
     this.modelService.models().flatMap((g) => g.models),
   );
-  // Effective rotation sent to the API: the preset list, or the custom slots
+  // Effective rotation sent to the API: the preset list, or the custom stages
   // with blanks trimmed (so an unfilled custom slot can never ship).
   readonly roleSequence = computed(() =>
     buildRoleSequence(
@@ -426,6 +519,10 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
       this.presets[this.fPreset()],
     ),
   );
+  // Worker experts eligible to run concurrently in a fan-out stage.
+  readonly analysisExperts = computed(() =>
+    this.workerExperts().filter((e) => isAnalysisRole(this.slug(e))),
+  );
   readonly isActive = computed(() => {
     const l = this.loop();
     return !!l && (l.status === 'running' || l.status === 'paused');
@@ -433,7 +530,7 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   readonly currentRole = computed(() => {
     const l = this.loop();
     if (!l || !l.role_sequence.length) return '';
-    return l.role_sequence[l.seq_index % l.role_sequence.length];
+    return formatStage(l.role_sequence[l.seq_index % l.role_sequence.length]);
   });
 
   /**
@@ -498,10 +595,11 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   }
 
   setMode(mode: 'preset' | 'custom'): void {
-    // Seed the custom slots from the current preset the first time in, so the
-    // user starts from a sensible rotation instead of a blank list.
+    // Seed the custom stages from the current preset the first time in, so the
+    // user starts from a sensible rotation instead of a blank list. Each preset
+    // role becomes its own single-role stage.
     if (mode === 'custom' && !this.customSlots().length) {
-      this.customSlots.set([...this.presets[this.fPreset()]]);
+      this.customSlots.set(this.presets[this.fPreset()].map((r) => [r]));
     }
     this.fMode.set(mode);
   }
@@ -511,20 +609,87 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
     return e.name ?? e.id;
   }
 
-  setSlot(i: number, value: string | null): void {
-    const next = [...this.customSlots()];
-    next[i] = value ?? '';
-    this.customSlots.set(next);
+  /** Deep copy of the current stages so signal updates stay immutable. */
+  private cloneStages(): string[][] {
+    return this.customSlots().map((s) => [...s]);
   }
 
-  addSlot(): void {
+  /**
+   * Experts offered for one role select. A solo step can pick any worker
+   * expert; a fan-out step (2+ roles) is analysis-only. Either way, roles
+   * already chosen elsewhere in the same stage are excluded so a fan-out never
+   * duplicates a role (which would collide on branch name and race the KB).
+   */
+  roleOptions(si: number, ri: number): Expert[] {
+    const stage = this.customSlots()[si] ?? [];
+    const filled = stage.map((s) => s.trim()).filter(Boolean);
+    const pool = filled.length > 1 ? this.analysisExperts() : this.workerExperts();
+    const taken = new Set(
+      stage.filter((_, idx) => idx !== ri).map((s) => s.trim()).filter(Boolean),
+    );
+    return pool.filter((e) => !taken.has(this.slug(e)));
+  }
+
+  /**
+   * A step can gain a parallel member only if all its current roles are
+   * analysis roles and there's another analysis expert left to add. Execution
+   * roles (developer, custom experts) stay singletons.
+   */
+  stageCanAddParallel(si: number): boolean {
+    const stage = (this.customSlots()[si] ?? [])
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!stage.length || !stage.every(isAnalysisRole)) return false;
+    return this.analysisExperts().length > stage.length;
+  }
+
+  setStageRole(si: number, ri: number, value: string | null): void {
+    const stages = this.cloneStages();
+    if (!stages[si]) return;
+    stages[si][ri] = (value ?? '').trim();
+    this.customSlots.set(stages);
+  }
+
+  /** Append the next unused analysis role to a step, making it a fan-out. */
+  addStageRole(si: number): void {
+    const stages = this.cloneStages();
+    const stage = stages[si];
+    if (!stage) return;
+    const taken = new Set(stage.map((s) => s.trim()).filter(Boolean));
+    const next = this.analysisExperts().find((e) => !taken.has(this.slug(e)));
+    if (!next) return;
+    stage.push(this.slug(next));
+    this.customSlots.set(stages);
+  }
+
+  removeStageRole(si: number, ri: number): void {
+    const stages = this.cloneStages();
+    if (!stages[si]) return;
+    stages[si].splice(ri, 1);
+    if (stages[si].length === 0) stages.splice(si, 1); // emptied step → drop it
+    this.customSlots.set(stages);
+  }
+
+  addStage(): void {
     const first = this.workerExperts()[0];
-    this.customSlots.set([...this.customSlots(), first ? this.slug(first) : '']);
+    this.customSlots.set([
+      ...this.customSlots(),
+      [first ? this.slug(first) : ''],
+    ]);
   }
 
-  removeSlot(i: number): void {
-    this.customSlots.set(this.customSlots().filter((_, idx) => idx !== i));
+  removeStage(si: number): void {
+    this.customSlots.set(this.customSlots().filter((_, idx) => idx !== si));
   }
+
+  /** Short ids of the in-flight fan-out jobs, for the live panel. */
+  stageJobsShort(l: ProjectLoop): string {
+    return (l.current_stage_jobs ?? []).map((id) => id.slice(0, 8)).join(', ');
+  }
+
+  /** Expose formatters to the template. */
+  readonly fmtStage = formatStage;
+  readonly fmtSequence = formatRoleSequence;
 
   jobRole(j: Job): string {
     return j.config_name || 'job';
