@@ -9466,18 +9466,20 @@ class PostgresDB:
     def _project_loop_row_to_dict(row) -> Dict[str, Any] | None:
         """Normalize a project_loops asyncpg Record into a serializable dict.
 
-        Decodes the ``role_sequence`` JSONB column to a list; everything else
-        passes through. Returns None on a None row so callers can chain.
+        Decodes the ``role_sequence`` and ``current_stage_jobs`` JSONB columns
+        to lists; everything else passes through. Returns None on a None row so
+        callers can chain.
         """
         if row is None:
             return None
         out = dict(row)
-        seq = out.get("role_sequence")
-        if isinstance(seq, str):
-            try:
-                out["role_sequence"] = json.loads(seq)
-            except (TypeError, ValueError):
-                pass
+        for jsonb_col in ("role_sequence", "current_stage_jobs"):
+            val = out.get(jsonb_col)
+            if isinstance(val, str):
+                try:
+                    out[jsonb_col] = json.loads(val)
+                except (TypeError, ValueError):
+                    pass
         return out
 
     async def create_project_loop(
@@ -9604,6 +9606,7 @@ class PostgresDB:
             "max_consecutive_failures",
             "workspace_backend",
             "current_job_id",
+            "current_stage_jobs",
             "total_jobs_run",
             "consecutive_failures",
             "last_error",
@@ -9619,8 +9622,8 @@ class PostgresDB:
         """Partial update of a project_loop row.
 
         Unknown fields raise ValueError to catch typos at the boundary rather
-        than silently no-op. ``role_sequence`` is JSONB-encoded;
-        ``current_job_id`` is coerced to UUID (None clears it).
+        than silently no-op. ``role_sequence`` and ``current_stage_jobs`` are
+        JSONB-encoded; ``current_job_id`` is coerced to UUID (None clears it).
         """
         unknown = set(fields) - self._PROJECT_LOOP_UPDATABLE_FIELDS
         if unknown:
@@ -9631,7 +9634,7 @@ class PostgresDB:
         sets: list[str] = []
         params: list[Any] = []
         for key, value in fields.items():
-            if key == "role_sequence":
+            if key in ("role_sequence", "current_stage_jobs"):
                 params.append(json.dumps(value or []))
                 sets.append(f"{key} = ${len(params)}::jsonb")
             elif key == "current_job_id":
@@ -9737,6 +9740,12 @@ class PostgresDB:
         healing inside that window re-arms the claim and double-spawns the
         next iteration (observed live: duplicate iter-14 critics). Evaluated
         on the DB clock so a stale Python-side read can't sneak past it.
+
+        Also guarded on ``current_stage_jobs = '[]'`` so a parallel fan-out
+        stage in flight (current_job_id NULL by design, members listed in
+        current_stage_jobs) is never mistaken for a torn single-role advance
+        and collapsed onto one job — the sweeper routes those to the
+        stage-aware path (``heal_project_loop_stage`` / barrier) instead.
         """
         async with self.acquire() as conn:
             result = await conn.execute(
@@ -9744,9 +9753,156 @@ class PostgresDB:
                 "total_jobs_run = $4, remaining_iterations = $5, "
                 "updated_at = now() "
                 "WHERE id = $1 AND current_job_id IS NULL AND status = 'running' "
+                "AND current_stage_jobs = '[]'::jsonb "
                 "AND updated_at < now() - make_interval(secs => $6)",
                 UUID(loop_id),
                 UUID(job_id),
+                seq_index,
+                total_jobs_run,
+                remaining_iterations,
+                float(min_wedge_age_seconds),
+            )
+        return result.endswith(" 1")
+
+    async def claim_project_loop_stage_barrier(
+        self, loop_id: str, member_job_id: str
+    ) -> bool:
+        """Atomically claim the rotate for a parallel stage's LAST finisher.
+
+        The barrier for parallel (fan-out) stages. Drains ``current_stage_jobs``
+        to ``'[]'`` — and returns True to exactly one caller — iff *every* member
+        of the stage is now terminal and ``member_job_id`` is still one of them.
+        Called by each member's completion hook after that member goes terminal;
+        the member that finishes LAST (making the "no member still running"
+        predicate true) and commits first wins the rotate. Everyone else — an
+        earlier finisher (a later member still runs → predicate false), a
+        simultaneous co-last finisher (loses the row-level race → the set is
+        already ``[]``), or a stray/re-delivered hook after rotation (the set no
+        longer contains it) — matches no row and backs off.
+
+        Membership is immutable for the stage's life (this is the only writer
+        that empties it, in one shot), so the post-rotate state is the same
+        single signature the torn-advance sweeper already reasons about:
+        ``current_job_id IS NULL AND current_stage_jobs = '[]'``.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE project_loops
+                SET current_stage_jobs = '[]'::jsonb, updated_at = now()
+                WHERE id = $1
+                  AND status = 'running'
+                  AND jsonb_array_length(current_stage_jobs) > 0
+                  AND current_stage_jobs @> to_jsonb($2::text)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jobs j
+                      WHERE j.id::text IN (
+                          SELECT jsonb_array_elements_text(
+                              project_loops.current_stage_jobs
+                          )
+                      )
+                      AND j.status NOT IN ('completed', 'failed', 'cancelled')
+                  )
+                """,
+                UUID(loop_id),
+                str(member_job_id),
+            )
+        return result.endswith(" 1")
+
+    async def get_loop_stage_member_statuses(
+        self, job_ids: List[str]
+    ) -> Dict[str, str]:
+        """Map each given job id → its status (missing rows omitted).
+
+        Used by the parallel-stage last finisher to aggregate the stage
+        outcome (a stage counts as a failure only when *all* members failed;
+        one success resets the consecutive-failure counter).
+        """
+        if not job_ids:
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, status FROM jobs WHERE id = ANY($1::uuid[])",
+                [UUID(j) for j in job_ids],
+            )
+        return {str(r["id"]): r["status"] for r in rows}
+
+    async def get_newest_loop_stage(self, loop_id: str) -> List[Dict[str, Any]]:
+        """Return the newest stage's jobs (id, status, decoded context).
+
+        A stage = all of the loop's jobs that share the maximum
+        ``loop_iteration`` — members of one fan-out stage share it (spawn stamps
+        the post-stage cumulative count on every member), and a single-role
+        stage is a group of one. The torn-advance sweeper uses this to
+        reconstruct the in-flight stage of a loop whose write-back was lost:
+        one member's context carries the counter stamps, and the members'
+        statuses say whether the stage is still running (restore the barrier) or
+        fully terminal (the rotate was lost — re-point + advance). Ordered
+        oldest-first for stable representative selection.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, status, context
+                FROM jobs
+                WHERE context->>'loop_id' = $1
+                  AND context->>'loop_iteration' = (
+                      SELECT context->>'loop_iteration'
+                      FROM jobs
+                      WHERE context->>'loop_id' = $1
+                      ORDER BY created_at DESC
+                      LIMIT 1
+                  )
+                ORDER BY created_at ASC
+                """,
+                loop_id,
+            )
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            c = d.get("context")
+            if isinstance(c, str):
+                try:
+                    d["context"] = json.loads(c)
+                except (TypeError, ValueError):
+                    d["context"] = {}
+            out.append(d)
+        return out
+
+    async def heal_project_loop_stage(
+        self,
+        loop_id: str,
+        member_job_ids: List[str],
+        *,
+        seq_index: int,
+        total_jobs_run: int,
+        remaining_iterations: int | None,
+        min_wedge_age_seconds: float = 600.0,
+    ) -> bool:
+        """Restore a torn parallel stage's in-flight membership.
+
+        The fan-out analogue of ``heal_project_loop_pointer``: an advance that
+        spawned a parallel next-stage's jobs but lost its write-back leaves the
+        loop wedged with ``current_job_id IS NULL AND current_stage_jobs='[]'``
+        while the spawned members run on. This re-points ``current_stage_jobs``
+        at the still-running members so the barrier can fire when they finish,
+        and reconciles the counters the lost write-back would have set.
+
+        Guarded identically to ``heal_project_loop_pointer`` — NULL pointer,
+        empty stage set, running status, and a DB-clock age gate — so a live
+        advance's transient window (or a concurrent replica) can't be mistaken
+        for a tear and double-restored.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE project_loops SET current_stage_jobs = $2::jsonb, "
+                "seq_index = $3, total_jobs_run = $4, remaining_iterations = $5, "
+                "updated_at = now() "
+                "WHERE id = $1 AND current_job_id IS NULL AND status = 'running' "
+                "AND current_stage_jobs = '[]'::jsonb "
+                "AND updated_at < now() - make_interval(secs => $6)",
+                UUID(loop_id),
+                json.dumps([str(j) for j in member_job_ids]),
                 seq_index,
                 total_jobs_run,
                 remaining_iterations,
