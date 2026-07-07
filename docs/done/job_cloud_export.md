@@ -134,6 +134,23 @@ Code is in place; the unit-level wiring is verified. Real-LLM smoke test is left
 
 Can be smoke-tested on a future real-LLM run by manipulating cloud state during a job.
 
+### Fix 2026-07-07 — Mode-A gate wedges project self-improvement loops (loop jobs now exempt)
+
+Found during the loop-parallel-stages Phase-0 gemma smoke (`docs/features/loop_parallel_stages.md`). The completion-time Mode-A path (§3.3) overrides `completed → pending_review` for any job that has a `cloud_diff_baseline_commit` **and** wrote changes under `projects/<slug>/`. That gate is correct for a user-attended job — a human reviews the diff before it's pushed to the cloud folder. It is **wrong for a project self-improvement loop job**:
+
+- Loop jobs attach the project's datasources, so they receive a Mode-A baseline; and they routinely write project files (`developer` every iteration; `product-qa` when it drops a repro/audit transcript).
+- The loop advance hook (`main.py`, §5d "Advance project self-improvement loop") fires **only** on a terminal status (`completed`/`failed`/`cancelled`). A job parked at `pending_review` is never advanced.
+- The loop sweeper's torn-advance heal only rescues a NULL `current_job_id`; a non-NULL pointer at a `pending_review` job is not a "tear", so it is never healed either.
+
+Net effect: on a cloud-attached project, **every loop iteration that writes project files stalls the loop forever** awaiting a review nobody performs — an execution role would wedge on iteration one. Observed live: product-qa `7515953a` sat at `pending_review`, loop `670130c6` pinned at `seq_index 1`.
+
+**Fix (implemented, uncommitted):**
+
+- New pure helper `orchestrator/services/project_loops.py:job_loop_id(job)` — returns the loop id from `context.loop_id` (JSON-string tolerant), else `None`. The same signal `_advance_project_loop` keys off, hoisted so the completion handler can ask "is this a loop job?". 7 unit tests in `tests/test_project_loops.py::TestJobLoopId`.
+- Guard on the Mode-A block in `orchestrator/main.py` (§1a): `... and gitea_client.is_initialized and not job_loop_id(job)`. Loop jobs skip the block entirely — no capture, no `pending_review` override. Rationale: a loop routes its changes through its own branch squash-merge + `retros/` audit trail, so the cloud accept/reject diff path is inapplicable, and a human review gate is the wrong gate for an unattended `autonomy: full` loop.
+
+**Verification:** 70 loop unit tests green, ruff clean, guard confirmed live on the k3d pod. Sweeper self-heal live-verified: flipping the wedged job to `completed` made the sweeper re-run the advance and rotate the loop cleanly to `critic` — confirming `pending_review` was the sole blocker. The execution-role live check (`developer` writing project files completes cleanly rather than stalling) is in flight on the same smoke loop.
+
 ## 1. Motivation
 
 The cloud-mirror foundation made **sessions** first-class on cloud storage: agent edits a file, user sees it immediately, both surfaces stay in sync. **Jobs** are still a different animal:
