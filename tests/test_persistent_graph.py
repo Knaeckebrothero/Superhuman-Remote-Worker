@@ -3737,31 +3737,51 @@ def _memory_pair(content: str):
 
 
 class TestInjectionAnchorIndex:
-    """`_injection_anchor_index` anchors injected pairs after the first user turn."""
+    """`_injection_anchor_index` anchors injected pairs at the tail.
 
-    def test_after_first_human_with_system(self):
+    Tail placement is the prompt-cache optimization: the injected block
+    changes every turn, so it must sit AFTER the stable conversation prefix
+    or it invalidates the provider cache for the whole history each request.
+    The anchor is the position after the LAST Human/Tool message (normally
+    the very end), which also keeps the synthetic function-call pairs valid
+    for Gemini's turn-ordering rule.
+    """
+
+    def test_tail_after_newest_human(self):
         msgs = [SystemMessage(content="sys"), HumanMessage(content="hi")]
         assert _injection_anchor_index(msgs) == 2
 
-    def test_after_first_human_no_system(self):
-        msgs = [HumanMessage(content="hi"), AIMessage(content="yo")]
-        assert _injection_anchor_index(msgs) == 1
-
-    def test_anchors_on_first_human_not_later(self):
+    def test_tail_after_last_human_of_many(self):
         msgs = [
             SystemMessage(content="sys"),
             HumanMessage(content="h1"),
             AIMessage(content="a1"),
             HumanMessage(content="h2"),
         ]
-        assert _injection_anchor_index(msgs) == 2
+        assert _injection_anchor_index(msgs) == 4
 
-    def test_no_human_falls_back_after_system(self):
-        assert _injection_anchor_index([SystemMessage(content="sys")]) == 1
+    def test_tail_after_trailing_tool_message(self):
+        msgs = [
+            HumanMessage(content="hi"),
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "t", "args": {}, "id": "call_1"}],
+            ),
+            ToolMessage(content="result", tool_call_id="call_1"),
+        ]
+        assert _injection_anchor_index(msgs) == 3
 
-    def test_no_human_no_system_returns_zero(self):
+    def test_walks_back_past_trailing_bare_model_turn(self):
+        # Degenerate/restored history ending in a plain assistant message:
+        # the pairs must not follow a model turn (Gemini 400), so the anchor
+        # steps back to just after the last Human/Tool message.
+        msgs = [HumanMessage(content="hi"), AIMessage(content="yo")]
+        assert _injection_anchor_index(msgs) == 1
+
+    def test_no_human_or_tool_falls_back_to_end(self):
         assert _injection_anchor_index([]) == 0
-        assert _injection_anchor_index([AIMessage(content="a")]) == 0
+        assert _injection_anchor_index([SystemMessage(content="sys")]) == 1
+        assert _injection_anchor_index([AIMessage(content="a")]) == 1
 
 
 class TestInjectContextPairs:
@@ -3772,8 +3792,9 @@ class TestInjectContextPairs:
     injected pairs are synthetic AIMessage(tool_call)+ToolMessage, and placing
     them right after the SystemMessage (before the first HumanMessage) made the
     function call the first entry of Gemini's `contents` array — failing the
-    very first turn of a session. The worker graph is shielded by its leading
-    todos HumanMessage; the persistent loop now anchors on the first user turn.
+    very first turn of a session. The pairs now anchor at the TAIL (after the
+    last Human/Tool message) — prompt-cache-friendly AND trivially after the
+    first user turn, so the Gemini invariant holds by construction.
     """
 
     def _assert_gemini_ordering(self, messages):

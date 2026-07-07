@@ -506,7 +506,9 @@ class TestWorkerExecuteWiring:
         assert req.task_frame.is_strategic is False
         assert req.model == env["config"].llm.model
 
-        # -- payload spliced right after the todos injection message
+        # -- transient block spliced at the tail (after the conversation, for
+        # prompt-cache prefix stability): payload pairs first, todos message
+        # LAST (query-at-end)
         prepared = env["llm"].ainvoke.call_args[0][0]
         todo_idx = next(
             i
@@ -515,9 +517,8 @@ class TestWorkerExecuteWiring:
             and str(m.content).startswith(TODOS_INJECTION_CONTENT_PREFIX)
         )
         payload_msgs = service.payload.messages()
-        assert prepared[todo_idx + 1 : todo_idx + 1 + len(payload_msgs)] == (
-            payload_msgs
-        )
+        assert todo_idx == len(prepared) - 1
+        assert prepared[todo_idx - len(payload_msgs) : todo_idx] == payload_msgs
 
         # -- legacy direct-store path skipped entirely
         env["ctx"].recall_store.decrement_ttl.assert_not_called()
@@ -809,9 +810,11 @@ class TestPersistentTurnWiring:
         assert req.query_text == "user query"
         assert req.model == "test-model"
 
-        # -- payload inserted immediately after the first HumanMessage, so the
-        # synthetic function-call pairs always follow a real user turn (Gemini's
-        # native API 400s on a leading functionCall — see _injection_anchor_index).
+        # -- payload anchored at the tail (after the last Human/Tool message —
+        # here the sole HumanMessage), so the synthetic function-call pairs
+        # always follow a real user turn (Gemini's native API 400s on a leading
+        # functionCall) and the stable history prefix stays cache-reusable —
+        # see _injection_anchor_index.
         prepared = captured_prepared[0]
         payload_msgs = service.payload.messages()
         assert isinstance(prepared[0], SystemMessage)
