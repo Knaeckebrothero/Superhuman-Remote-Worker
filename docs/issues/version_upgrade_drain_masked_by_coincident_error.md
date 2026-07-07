@@ -12,7 +12,7 @@ tags:
 
 # A `version_upgrade` drain freeze is masked by a coincident `error` and hard-fails the job
 
-**Status:** investigated 2026-07-07 from two failed Better-Resavio loop iterations on the main cluster. **Root cause confirmed by elimination against the DB state + code paths; not yet fixed.** The exact `error_message` string on the two jobs was not retrieved (see "Open questions"). Symbols/line numbers current as of this date.
+**Status:** investigated 2026-07-07 from two failed Better-Resavio loop iterations on the main cluster. **Root cause confirmed by elimination against the DB state + code paths; fix plan written (see "Fix plan"), not yet implemented.** The exact `error_message` string on the two jobs was not retrieved (see "Open questions"). Symbols/line numbers current as of this date.
 **Severity:** high for the RSI loop — every agent-image deploy that lands while a bug-hunter is mid-run can hard-fail that loop iteration instead of gracefully re-dispatching it. Self-healing at the loop level masks it, but each occurrence burns an iteration and bumps `consecutive_failures`; a cluster of deploys close together can trip `max_consecutive_failures` and stop the loop.
 **Component:** `orchestrator/services/completion.py` (`determine_job_status`), `orchestrator/main.py` (`complete_job` `/api/jobs/{id}/complete`), `src/graph.py` (drain-intent freeze at phase boundary), `src/api/dual_app.py` (`_process_orchestrator_job` completion report)
 **Observed on:** main cluster (homelab), loop `68137e29` "Better Resavio" (Hotel Rheinland ERP), MiniMax-M3. Jobs `e55ff79a-2d64-4abb-85e6-82a7afe3259e` (iter 10) and `87a8cbe7-9f1e-4bee-8db5-15ff5e39b1a0` (iter 2).
@@ -125,35 +125,142 @@ The trigger (a `version_upgrade` drain at all) means an **agent-image deploy lan
 
 So a single drain-masked failure costs one wasted iteration (its unmerged repo work is discarded; KB writes made before the freeze persist) and one `consecutive_failures` bump. The surrounding ~28 iterations completed cleanly, so the counter reset between the two. The latent danger is correlated deploys (a burst of pushes) failing several **consecutive** iterations and stopping the loop via the failure cap.
 
-## Fix
+## Fix plan
 
-Primary: in `determine_job_status`, honor the auto-redispatch freeze types **before** the generic `error` short-circuit. A clean drain freeze at a phase boundary should pause-and-redispatch even when the interrupted run also surfaced an error:
+Two small changes — an orchestrator-side precedence guard (the real fix) and an agent-side hygiene line (defense in depth) — plus tests and a k3d drill. `determine_job_status` has exactly **one** production call-site (`orchestrator/main.py:11131`, the `/complete` handler), so the blast radius is the status-decision matrix itself; the existing test files already pin most of that matrix.
+
+### Design decision: guard the error short-circuit, don't blanket-pause
+
+The naive reorder — `if freeze_type in AUTO_REDISPATCH_FREEZE_TYPES: return ("paused", None)` before the error check — is **wrong**: it would bypass the `memory_unavailable`/`kb_unavailable` retry-cap logic (which must return `failed` at `MEMORY_RETRY_CAP`) and the `llm_unavailable` 24 h ceiling. Instead, keep every freeze branch exactly where it is and make the `error` short-circuit **step aside** when a freeze with its own pause-vs-fail branch is present. The freeze's branch then decides — pause under cap, fail past it — precisely as today.
+
+Scope: the immune set is `AUTO_REDISPATCH_FREEZE_TYPES ∪ {llm_unavailable}`. `llm_unavailable` was not in the observed incident but is the same failure class (freeze whose branch owns pause-vs-fail, with the outage sweeper doing re-dispatch), and including it is strictly safer than the status quo — its branch still enforces the ceiling. `delegation` is deliberately **not** included (an errored delegation parent failing is current behavior, and its children/unblock lifecycle is a separate can of worms — see `critic_failure_leaves_parent_job_stuck_reviewing.md`). Critic subjobs (`parent_job_id` set) keep their existing routing: the guard only prevents the error-fail; a *drained critic* landing `pending_review` instead of `paused` is a pre-existing gap, out of scope here.
+
+### Step 0 — forensics confirmation (optional, does not gate the fix)
+
+Grab the actual `error_message`/`error_details` for `e55ff79a`/`87a8cbe7` (SQL in "Open questions") to confirm the interrupt-under-SIGTERM inference and check `error.type` (`job_error` vs `workspace_unavailable`). The precedence bug holds regardless of the string, so the fix does not wait on this.
+
+### Step 1 — orchestrator: guard the error short-circuit (`orchestrator/services/completion.py`)
+
+New constant next to `AUTO_REDISPATCH_FREEZE_TYPES` (~line 268):
 
 ```python
-error = result.get("error")
-should_stop = result.get("should_stop", False)
-goal_achieved = result.get("goal_achieved", False)
-
-fd = _parse_freeze_data(job) or (result.get("freeze_data") if isinstance(result.get("freeze_data"), dict) else {})
-freeze_type = (fd or {}).get("freeze_type")
-
-# A drain / auto-redispatch freeze beats a coincident transient/interrupt error:
-# the phase boundary is clean, the work is checkpointed, re-dispatch resumes it.
-if should_stop and freeze_type in AUTO_REDISPATCH_FREEZE_TYPES:
-    return ("paused", None)
-
-if error:
-    return ("failed", error_msg)
-...
+# Freeze types whose dedicated branch in determine_job_status must own the
+# pause-vs-fail decision even when a coincident ``error`` rides the same
+# completion report — a drain/outage freeze taken at a clean phase boundary
+# beats a transient interrupt error (the work is checkpointed; re-dispatch
+# resumes it). docs/issues/version_upgrade_drain_masked_by_coincident_error.md
+ERROR_IMMUNE_FREEZE_TYPES: frozenset[str] = AUTO_REDISPATCH_FREEZE_TYPES | frozenset(
+    {"llm_unavailable"}
+)
 ```
 
-(Keep the memory/LLM cap logic that intentionally *fails* `memory_unavailable`/`llm_unavailable` after their retry ceilings — those are handled in their own branches with counters and are not part of this reorder. The reorder only guarantees the freeze type is consulted before a bare `error` hard-fails the job.)
+In `determine_job_status` (~481-499): hoist the freeze-data resolution above the error check (it's pure parsing; today it happens after the `should_stop` early-return), then guard:
 
-Belt-and-suspenders (defense in depth): on the agent side, don't attach a transient interrupt `error` to a completion report that already carries a clean `version_upgrade` (or other auto-redispatch) freeze — prefer the freeze, since the phase boundary is the intended clean hand-off point (`src/api/dual_app.py` success-path report / `src/graph.py` final-state assembly).
+```python
+    error = result.get("error")
+    should_stop = result.get("should_stop", False)
+    goal_achieved = result.get("goal_achieved", False)
 
-## Regression test
+    # Resolve freeze_data early (DB row preferred, request-body fallback) so
+    # the error short-circuit below can see an auto-redispatch freeze.
+    fd = _parse_freeze_data(job)
+    if not fd:
+        fd = result.get("freeze_data")
+        if not isinstance(fd, dict):
+            fd = {}
+    freeze_type = fd.get("freeze_type")
 
-Add to `tests/test_completion.py` (or wherever `determine_job_status` is unit-tested): a job whose `freeze_data.freeze_type="version_upgrade"` **and** `result={"should_stop": True, "error": {"message": "…interrupted…"}, "freeze_data": {...version_upgrade...}}` must resolve to `("paused", None)`, not `("failed", …)`. Cover the same for the other `AUTO_REDISPATCH_FREEZE_TYPES`, and a negative case confirming `memory_unavailable`/`llm_unavailable` past their caps still fail.
+    if error:
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        # A coincident error must not mask a clean-boundary freeze whose
+        # branch below owns the pause-vs-fail decision (drain Continue-as-New,
+        # memory/KB retry caps, LLM-outage ceiling). Otherwise a deploy drain
+        # racing a transient interrupt hard-fails a re-dispatchable job.
+        if not (should_stop and freeze_type in ERROR_IMMUNE_FREEZE_TYPES):
+            return ("failed", error_msg)
+        logger.warning(
+            "Job %s: '%s' freeze accompanied by coincident error — routing the "
+            "freeze, not the error: %s",
+            job.get("id"),
+            freeze_type,
+            error_msg[:200],
+        )
+
+    if not should_stop:
+        return (None, None)  # Still running — leave as processing
+```
+
+…and delete the now-duplicate fd-resolution block (old ~494-499) and the later `freeze_type = fd.get("freeze_type")` (old ~520). Everything downstream is unchanged: `version_upgrade`/`workspace_upgrade_required` → `paused` (then the `/complete` paused-branch clears the agent + stashes the freeze, and the 1·mem counter bump at `main.py:~11133` runs for `memory_unavailable` exactly as designed); `memory_unavailable` at cap / `llm_unavailable` over ceiling still → `failed`.
+
+Note the guard requires `should_stop` — an error with a freeze but `should_stop=False` still fails (unchanged), so a stale row-level freeze can't shield a genuinely crashed run. (Belt-and-suspenders against stale row freezes already exists: the paused-path stash clears them, per "Why the DB state pins the root cause" §1.)
+
+The coincident error is observable via the `logger.warning` (and the freeze itself lands in `context.last_freeze_data` on the stash). Don't write it to `error_message` — a paused row with an `error_message` reads as failed in the cockpit.
+
+### Step 2 — agent: don't ship a stale `error` with the drain freeze (`src/graph.py:3235-3256`)
+
+In the drain-intent branch of `handle_transition`, clear the state's `error` channel alongside setting the freeze — the phase boundary is clean and the resume continues from the checkpoint, so whatever a mid-phase node left in `error` is moot:
+
+```python
+            updates["freeze_data"] = upgrade_freeze
+            updates["should_stop"] = True
+            updates["error"] = None  # clean boundary — a stale mid-phase error must not
+                                     # mask the freeze at the orchestrator (see issue doc)
+```
+
+(`{"error": None}` is an established node-return pattern — e.g. `src/graph.py:1883`, `2120`.) With this, the observed payload shape can't be produced by the drain path at all; Step 1 remains as the orchestrator-side guarantee for old agents mid-rollout and any other producer of freeze+error payloads.
+
+### Step 3 — tests
+
+`tests/test_drain_intent.py::TestVersionUpgradeFreeze` (already pins version_upgrade → paused, lines 385-429) — add:
+
+- `test_version_upgrade_with_coincident_error_still_pauses` — the incident shape: `result={"should_stop": True, "error": {"message": "…interrupted…", "type": "job_error"}, "freeze_data": {version_upgrade}}` → `("paused", None)`. Also the DB-side variant (freeze on the job row, error in result) — that's the exact shape `/complete` produces after its early freeze write.
+- `test_error_immune_freezes_route_their_own_branch` — parametrized: `workspace_upgrade_required`+error → `paused`; `memory_unavailable`+error under cap → `paused`; **`memory_unavailable`+error at `MEMORY_RETRY_CAP` → `failed`** (cap survives the guard); `llm_unavailable`+error under ceiling → `paused`.
+- `test_bare_error_still_fails` — error with no freeze, and error with a non-immune freeze (`delegation`) → `("failed", msg)` unchanged.
+- `test_error_without_should_stop_still_fails` — error + version_upgrade freeze but `should_stop=False` → `failed` (guard requires the stop signal).
+
+Graph side: extend the drain-boundary freeze test (or add one alongside `TestDualDrainHandler`) asserting `handle_transition`'s updates include `error: None` when the drain freeze fires.
+
+Run: `pytest tests/test_drain_intent.py tests/test_complete_job_endpoint.py tests/test_completion_endpoint.py tests/test_llm_outage_resilience.py tests/test_delegation.py -x -q` + `ruff check src/ orchestrator/ tests/`.
+
+### Step 4 — verify on k3d (Tilt inner loop)
+
+1. **Endpoint simulation** (deterministic reproduction of the incident payload): create a throwaway job, let it reach `processing`, then post the double payload from inside the cluster:
+
+   ```bash
+   kubectl --context=k3d-srw -n srw exec deploy/srw-orchestrator -c orchestrator -- \
+     curl -sf -X POST http://localhost:8085/api/jobs/<id>/complete \
+     -H "X-Internal-Key: $KEY" -H 'Content-Type: application/json' \
+     -d '{"should_stop": true,
+          "error": {"message": "simulated SIGTERM interrupt", "type": "job_error"},
+          "freeze_data": {"freeze_type": "version_upgrade", "phase": "tactical",
+                          "phase_number": 5, "reason": "orchestrator drain intent at phase boundary"}}'
+   ```
+
+   Assert on the row: `status='paused'`, `assigned_agent_id IS NULL`, `freeze_data IS NULL`, `context.last_freeze_data.freeze_type='version_upgrade'`; the warning line in orchestrator logs; then the dispatcher re-dispatches and the job resumes (flips back to `processing` on a fresh pod).
+
+2. **Full drain drill** (end-to-end, covers Step 2): start a k3d loop or single worker job, then set the drain intent on its busy agent row (`UPDATE agents SET intents = intents || '{"should_drain": true, "drain_reason": "stale_image"}'::jsonb WHERE id = …`). Watch: phase-boundary freeze → `paused` → re-dispatch → job continues and completes. This re-exercises the whole Continue-as-New path (including the livelock-fix resume-clear) with the new code.
+
+### Step 5 — rollout + post-deploy watch
+
+Commit both changes together on `develop` (orchestrator guard + agent hygiene + tests), normal pipeline to the main cluster. The two sides are independently safe in either rollout order (Step 1 protects against old-agent payloads; Step 2 stops producing them).
+
+Post-deploy signal: the next agent-image deploy that lands while the Better-Resavio loop is mid-iteration should produce `paused` → re-dispatch → the **same job id** resuming and completing, not a failed iteration — grep orchestrator logs for the new "freeze accompanied by coincident error" warning and for `status set to 'paused'`. The existing `auto_continue_drains` backstop counter (progress-aware, alerts at `AUTO_CONTINUE_DRAIN_ALERT_CAP`) already guards the downside risk of this change — a job that re-pauses without progressing gets alerted on, not silently churned.
+
+When shipped, update **Status** above and the memory note (`project_version_upgrade_drain_masked_by_error`).
+
+### What must NOT change (pinned by the tests above + existing suites)
+
+| input shape | status (unchanged) |
+|---|---|
+| `error`, no freeze / non-immune freeze | `failed` |
+| `error` + immune freeze, `should_stop=False` | `failed` |
+| `memory_unavailable` at `MEMORY_RETRY_CAP` (error or not) | `failed` |
+| `llm_unavailable` over 24 h ceiling (error or not) | `failed` |
+| `delegation` freeze (no error) | `waiting` |
+| critic subjob with `freeze_data.status` | that status |
+| genuine completion (`job_complete`/`goal_achieved`) | `completed`/`reviewing`/`pending_review` |
 
 ## Open questions
 
