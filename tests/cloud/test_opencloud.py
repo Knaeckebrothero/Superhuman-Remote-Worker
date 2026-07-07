@@ -373,19 +373,65 @@ class TestUrlConstructors:
         # Both '!' and '$' must be percent-encoded (opencloud-eu/web#1795).
         assert "%21" in url
         assert "%24" in url
-        assert "files/spaces/" in url
+        # `/f/<fileId>` is OpenCloud's private-link resolver — routes to the
+        # exact Space for any member. The old `/files/spaces/<drive_id>`
+        # fallback silently resolved to the viewer's *personal* Space.
+        assert f"{OPENCLOUD_BASE}/f/" in url
 
-    def test_project_folder_webdav_url_prefers_persisted(self):
+    def test_project_folder_browser_url_ignores_stale_persisted_domain(self):
+        # Regression: OpenCloud was rebranded (cloud.superhuman-remote-worker.com
+        # -> cloud.srw.works). The webUrl OpenCloud returns at Space creation
+        # bakes in whatever OC_URL was canonical then, and we persisted it in
+        # vendor_meta.web_url. Returning that snapshot verbatim sends the
+        # "Open folder" button to a now-foreign instance. The link must be
+        # derived from the LIVE public_url instead.
+        be = OpenCloudBackend(_settings())  # public_url == OPENCLOUD_BASE
+        handle = ProjectFolderHandle(
+            backend="opencloud",
+            native_id="a03eeabc$f3f282fc",
+            vendor_meta={
+                "web_url": "https://cloud.old-domain.example/f/a03eeabc$f3f282fc",
+                "webdav_url": (
+                    "https://cloud.old-domain.example/dav/spaces/a03eeabc$f3f282fc"
+                ),
+            },
+        )
+        url = be.get_project_folder_browser_url(handle)
+        assert url == f"{OPENCLOUD_BASE}/f/a03eeabc%24f3f282fc"
+        assert "old-domain" not in url
+
+    def test_project_folder_browser_url_legacy_no_native_id_uses_persisted(self):
+        # Handles without a native_id can't be reconstructed; fall back to the
+        # persisted absolute link (best effort).
         be = OpenCloudBackend(_settings())
         handle = ProjectFolderHandle(
             backend="opencloud",
-            native_id="d1",
-            vendor_meta={"webdav_url": "https://override.example/dav/x/"},
+            native_id="",
+            vendor_meta={"web_url": "https://cloud.example.com/f/legacy"},
         )
         assert (
-            be.get_project_folder_webdav_url(handle)
-            == "https://override.example/dav/x/"
+            be.get_project_folder_browser_url(handle)
+            == "https://cloud.example.com/f/legacy"
         )
+
+    def test_project_folder_webdav_url_ignores_stale_persisted_domain(self):
+        # Same rebrand hazard as the browser link: the persisted webdav_url is
+        # the PUBLIC graph-response URL frozen on the old domain. Reconstruct
+        # from the live internal base + drive id, mirroring
+        # build_rclone_mount_spec (which already does this for real mounts).
+        be = OpenCloudBackend(_settings())  # base_url == OPENCLOUD_BASE
+        handle = ProjectFolderHandle(
+            backend="opencloud",
+            native_id="a03eeabc$f3f282fc",
+            vendor_meta={
+                "webdav_url": (
+                    "https://cloud.old-domain.example/dav/spaces/a03eeabc$f3f282fc"
+                )
+            },
+        )
+        url = be.get_project_folder_webdav_url(handle)
+        assert url == f"{OPENCLOUD_BASE}/dav/spaces/a03eeabc%24f3f282fc/"
+        assert "old-domain" not in url
 
     def test_project_folder_webdav_url_falls_back_to_reconstructed(self):
         be = OpenCloudBackend(_settings())
