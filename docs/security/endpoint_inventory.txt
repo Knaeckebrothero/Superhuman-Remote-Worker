@@ -237,12 +237,6 @@ GET    /api/requests/{doc_id}                                                   
 GET    /api/settings/api-keys                                                           gated:require_approved_user
 DELETE /api/settings/api-keys/{provider}                                                gated:require_approved_user
 PUT    /api/settings/api-keys/{provider}                                                gated:require_approved_user
-GET    /api/settings/llm-endpoints                                                      gated:require_approved_user
-POST   /api/settings/llm-endpoints                                                      gated:require_approved_user
-DELETE /api/settings/llm-endpoints/{endpoint_id}                                        gated:require_approved_user
-PATCH  /api/settings/llm-endpoints/{endpoint_id}                                        gated:require_approved_user
-POST   /api/settings/llm-endpoints/{endpoint_id}/discover                               gated:require_approved_user
-POST   /api/settings/llm-endpoints/{endpoint_id}/test                                   gated:require_approved_user
 GET    /api/settings/preferences                                                        gated:require_approved_user
 PATCH  /api/settings/preferences                                                        gated:require_approved_user
 GET    /api/settings/tts/library                                                        gated:require_approved_user
