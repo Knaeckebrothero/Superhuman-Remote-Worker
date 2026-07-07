@@ -1995,12 +1995,17 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (!el) return;
         el.style.height = 'auto';
         el.style.height = el.scrollHeight + 'px';
-        // The composer and the message list are flex siblings, so growing the
-        // textarea shrinks the .messages viewport from the bottom. Re-pin to the
-        // latest turn — only when the user was already following the bottom — so
-        // a multi-line draft never scrolls the most recent history out of view.
+        // The composer and the message list are flex siblings, so the `height:auto`
+        // reset above transiently enlarges .messages and clamps its scrollTop up by
+        // ~one line (the browser never restores it when the max grows back). Re-pin
+        // to the bottom in the SAME frame — synchronously, not via setTimeout — so
+        // that clamp and the re-pin never paint separately. A deferred re-pin is what
+        // made the conversation visibly jump up-then-down on every keystroke while
+        // composing a multi-line draft (worsened by `.messages { overflow-anchor:
+        // none }`, which strips the browser's own scroll-preservation). Only re-pin
+        // when the user was already following the bottom.
         if (this.autoScroll) {
-            setTimeout(() => this.scrollToBottom(), 0);
+            this.scrollToBottom();
         }
     }
 
