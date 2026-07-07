@@ -39,7 +39,7 @@ The k3d gemma smoke (`670130c6`, sequence `[scholar, product-qa, critic, develop
 
 **Fix (implemented, uncommitted):** loop jobs are exempt from the Mode-A gate. A new pure helper `services/project_loops.py:job_loop_id(job)` (reads `context.loop_id`, JSON-string tolerant, 7 unit tests) gates the block: `... and not job_loop_id(job)`. A loop routes its changes through its own branch squash-merge + `retros/` trail, so the cloud accept/reject diff path is inapplicable and a human review gate is the wrong gate for an unattended `autonomy: full` loop. Full write-up in `docs/done/job_cloud_export.md` (Update 2026-07-07).
 
-**Verification:** 7 unit tests for the helper (+63 → **70 loop tests green**), ruff clean, guard confirmed live on the k3d pod. The sweeper self-heal was live-verified: flipping the wedged job to `completed` made the sweeper re-run the advance and rotate the loop cleanly to `critic` — confirming `pending_review` was the *only* blocker (it is deliberately outside the sweeper's `_TERMINAL` set). The definitive live check — an execution role (`developer`) that writes project files completing cleanly rather than stalling — is in flight on the same smoke loop (budget bumped by one iteration so `developer` runs); result to be recorded here.
+**Verification:** 7 unit tests for the helper (+63 → **70 loop tests green**), ruff clean, guard confirmed live on the k3d pod. The sweeper self-heal was live-verified: flipping the wedged job to `completed` made the sweeper re-run the advance and rotate the loop cleanly to `critic` — confirming `pending_review` was the *only* blocker (it is deliberately outside the sweeper's `_TERMINAL` set). **The definitive live check passed 2026-07-07:** the smoke loop rotated all the way through `scholar → product-qa → critic → developer`, and the `developer` job (`3ce2f836`) — an execution role that *did* carry a `cloud_diff_baseline_commit` — landed **`completed`, not `pending_review`**, with `diff_status` never set (the Mode-A capture block was skipped entirely, exactly as the `and not job_loop_id(job)` guard intends). The loop then advanced developer → done cleanly (`rem 0`). Execution roles no longer wedge under Mode-A.
 
 ## Problem
 
@@ -196,7 +196,7 @@ Minimal: the loop status payload (`GET /api/projects/{id}/loop`) adds `current_s
 
 ## Implementation phases & acceptance criteria
 
-**Phase 0 — product-qa loop-wiring (sequential; no schema change)** — IMPLEMENTED + unit-tested; k3d smoke in flight.
+**Phase 0 — product-qa loop-wiring (sequential; no schema change)** — IMPLEMENTED + unit-tested; k3d smoke **passed** (full `scholar → product-qa → critic → developer → done` rotation, Mode-A guard confirmed).
 - [x] `LOOP_ANALYSIS_ROLES` includes `product-qa`; unit test asserts `is_loop_execution_role("product-qa") is False`.
 - [x] Role block + task registered; kickoff snapshot test (mirrors existing role-block tests).
 - [x] Critic block names both note streams and the build-vs-fix choice.
