@@ -8,10 +8,11 @@ The messages are transient — re-injected fresh every execute() call and
 excluded from summarization via is_memory_injection_message().
 """
 
-import uuid
 from typing import Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+
+from src.core.workspace_injection import content_hash_id
 
 # Prefix for identifying synthetic memory injection tool calls
 # Used to exclude these messages from summarization
@@ -32,7 +33,7 @@ def create_memory_injection_messages(
     Returns:
         Tuple of (AIMessage with tool_call, ToolMessage with memory content)
     """
-    tool_call_id = f"{MEMORY_TOOL_CALL_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+    tool_call_id = f"{MEMORY_TOOL_CALL_ID_PREFIX}{content_hash_id(content)}"
 
     ai_message = AIMessage(
         content="",

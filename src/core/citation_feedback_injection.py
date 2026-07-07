@@ -13,10 +13,11 @@ the agent edits a citation (which resets it to ``pending`` → re-verifies) or
 removes it, it drops out of the injected block on the next turn.
 """
 
-import uuid
 from typing import Any, List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+
+from src.core.workspace_injection import content_hash_id
 
 # Prefix for identifying synthetic citation-feedback tool calls.
 # Used to exclude these messages from summarization (re-injected fresh).
@@ -80,7 +81,7 @@ def create_citation_feedback_injection_messages(
     Returns:
         Tuple of (AIMessage with tool_call, ToolMessage with the report).
     """
-    tool_call_id = f"{CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+    tool_call_id = f"{CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX}{content_hash_id(content)}"
 
     ai_message = AIMessage(
         content="",

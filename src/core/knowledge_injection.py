@@ -8,10 +8,11 @@ The messages are transient — re-injected fresh every execute() call and
 excluded from summarization via is_knowledge_injection_message().
 """
 
-import uuid
 from typing import Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+
+from src.core.workspace_injection import content_hash_id
 
 # Prefix for identifying synthetic knowledge injection tool calls
 KNOWLEDGE_TOOL_CALL_ID_PREFIX = "knowledge_inject_"
@@ -31,7 +32,7 @@ def create_knowledge_injection_messages(
     Returns:
         Tuple of (AIMessage with tool_call, ToolMessage with knowledge content)
     """
-    tool_call_id = f"{KNOWLEDGE_TOOL_CALL_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+    tool_call_id = f"{KNOWLEDGE_TOOL_CALL_ID_PREFIX}{content_hash_id(content)}"
 
     ai_message = AIMessage(
         content="",
