@@ -844,13 +844,24 @@ export interface ProjectLoop {
   model: string | null;
   /** Per-loop workspace tier for every spawned job (null = default sandbox). */
   workspace_backend: string | null;
-  role_sequence: string[];
+  /**
+   * Rotation of stages. A plain string is a one-job stage; a nested array is a
+   * parallel *fan-out* stage whose analysis roles run concurrently and barrier
+   * before the loop rotates (e.g. `[["scholar","product-qa"], "critic"]`).
+   */
+  role_sequence: (string | string[])[];
   seq_index: number;
   max_iterations: number | null;
   remaining_iterations: number | null;
   run_until: string | null;
   max_consecutive_failures: number;
   current_job_id: string | null;
+  /**
+   * Job ids of the in-flight fan-out stage. Populated only while a parallel
+   * stage is running (single-role stages use `current_job_id` and leave this
+   * empty). Drives the stage-job chips in the live panel.
+   */
+  current_stage_jobs?: string[];
   total_jobs_run: number;
   consecutive_failures: number;
   last_error: string | null;
@@ -864,7 +875,8 @@ export interface ProjectLoopStartRequest {
   model?: string | null;
   /** Workspace tier for every spawned job: 'sandbox' | 'vm' | 'virtual' | 'none'. */
   workspace_backend?: string | null;
-  role_sequence?: string[] | null;
+  /** Stage rotation; a nested array entry is a concurrent analysis fan-out. */
+  role_sequence?: (string | string[])[] | null;
   max_iterations?: number | null;
   run_until?: string | null;
   acceptance_criteria?: string | null;

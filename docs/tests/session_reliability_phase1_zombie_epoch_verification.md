@@ -108,6 +108,40 @@ continuity). Treat the bumped session as disposable — end it afterward.
 | Chat transcript | unchanged — **no duplicated turn, no "SESSION RESUMED" divider** | (n/a on old build — it never re-anchors) |
 | Console | no error spam | — |
 
+### Results — 2026-07-07 · server-side PASS
+
+Run against the **develop-experimental main-cluster deploy** (context `main`,
+namespace `superhuman-remote-worker`) — *not* local k3d. Both orchestrator
+replicas (`srw-orchestrator-6666b657cf-{d2hhn,srkdl}`, ~28 min old at test time)
+carry the fix (`grep -c THREAD_EVENTS_EPOCH_RECHECK_S /app/main.py` matched; the
+28-day-old `srw-prod-private` orchestrator has **0** matches, i.e. no fix — do
+not test #5 there). This is a stronger result than the runbook assumed: the fix
+works on a real multi-replica homelab deploy, not just k3d.
+
+- **Session:** `7495ffe7-c55c-48ae-a595-93d087f998b8`, `status=active`, one
+  completed turn, tab left idle (user-driven browser).
+- **Pre-bump epoch:** `0`. Bump issued `15:52:32Z`
+  (`UPDATE threads SET events_epoch = events_epoch + 1` → `UPDATE 1`).
+- **Detection:** `15:52:33.079Z` — **~1 s later**, well inside the ~2.5 s idle
+  re-check window. Exactly one line, on exactly the one replica serving the
+  stream (`d2hhn`):
+  > `thread_event_stream epoch bump 0→1 (thread=7495ffe7-…-f998b8), re-anchoring client to seq 0` (`main.py:18097`, `request_id=9d2c3f78ef83`)
+  `re-anchor to seq 0` is correct here: the freshly-bumped epoch 1 has no
+  journaled events yet, so `_no_cursor_replay_start` anchors at 0.
+- **Post-bump epoch:** `1` ✅ (generator detected the DB change on its own).
+- **No duplicate turn:** `thread_events` for the thread = **1071 events all under
+  epoch 0** (`min_seq 1 … max_seq 1071`), **zero under epoch 1** — nothing
+  spurious was journaled, so a history reload renders the same single turn. This
+  is the server-side proof of the "Chat transcript unchanged" row.
+
+**Server-side rows PASS** (orchestrator log + re-anchor + no dup). The three
+browser-side rows (network `/stream` receives one `gone_beyond_horizon` frame
+then closes → fresh `/stream` opens; console clean; transcript visually
+unchanged) are to be eyeballed in the user's develop-cockpit tab. Per the
+split-epoch caveat, **no new frames will render until a real re-attach** — that
+is expected for a synthetic psql bump (criterion #6 covers true streaming
+continuity). Treat this session as disposable.
+
 ### Cleanup
 
 End the session from the cockpit (the split-epoch state makes it unsuitable for
@@ -159,6 +193,108 @@ and bumps the epoch.
 
 PASS on the first row is the whole point of Phase 1.
 
+### Results — 2026-07-07 · user-facing PASS, with a mechanism caveat
+
+Run on the **same session as #5** (`7495ffe7-…-f998b8`, develop-experimental
+deploy), chained straight off the synthetic bump. Timeline from the orchestrator
+logs:
+
+| Time (UTC) | Event |
+|---|---|
+| `15:40:33–41` | session provisioned, attached to `srw-agent-j-6a54e6a5`, first turn completed |
+| `15:52:33` | #5 synthetic bump `0→1` detected; client re-anchored to epoch 1 |
+| `16:13:21` | **workspace container deleted** — the idle-timeout suspend (waited ~33 min) |
+| `16:20:01–09` | **workspace container re-created** — stale-tab send drove genuine re-provisioning (resume) |
+
+- **Row 1 (the headline): PASS.** Genuine suspend + genuine resume, and the reply
+  streamed in **live with tool calls, no refresh** — user-observed. The reported
+  "stale → must refresh" bug did **not** reproduce end to end.
+- **Row 3 (DB epoch increased): did NOT hold as written.** The **real re-attach
+  did *not* bump `events_epoch`** — it stayed at `1` (the value #5's synthetic
+  bump set). The only `epoch bump` log line in the whole 45 min is the 15:52:33
+  synthetic one; **no second bump** on the 16:20 re-attach.
+- **Row 2 (bump on the stale stream's replica): did NOT occur** — no re-anchor
+  frame was needed. Instead the new agent journaled the reply **under epoch 1**
+  (that epoch went 0 → **1208 events**), and the client — already anchored on
+  epoch 1 from #5 — received those frames directly in its open stream.
+
+**Verdict:** the user-facing recovery is a real PASS (real suspend, real resume,
+live stream, no refresh). But because this was chained off #5, the run **rode
+#5's re-anchor** and did **not** re-isolate the epoch-change *detection* path.
+#5 already proved detection in isolation; #6 here proves end-to-end recovery —
+together they cover Phase 1, but not via the exact "stale stream detects a fresh
+real bump" sequence the table above assumes.
+
+**Why the re-attach didn't bump — resolved from code (`src/api/persistent_app.py:1536–1570`).**
+On attach the agent runs:
+
+```
+current_epoch = SELECT events_epoch FROM threads
+max_seq       = SELECT COALESCE(MAX(seq),0) FROM thread_events WHERE epoch = current_epoch
+if max_seq > 0:  events_epoch += 1     # cold-restart: previous epoch has events → strand old cursors
+else:            adopt current_epoch    # empty epoch → no bump
+```
+
+i.e. **a re-attach bumps the epoch iff the current epoch already holds journaled
+events.** In this run, #5's synthetic bump left epoch 1 **empty** (the old agent
+kept writing to epoch 0), so at the 16:20 re-attach `max_seq(epoch=1) = 0` → the
+`else` branch → the new agent adopted epoch 1 with **no bump**. That is the sole
+reason the epoch stayed at 1, and it's a pure artifact of chaining #6 onto #5 —
+**not** a gap in the fix.
+
+**Consequence for a clean run:** on a **FRESH** session (no prior synthetic
+bump), the re-attach sees `max_seq(epoch=0) > 0` (the completed turn's events) →
+bumps `0→1` → strands the old stream on the dead epoch 0 → the Phase 1 periodic
+re-read detects `0→1` → `gone_beyond_horizon` → client re-anchors → frames flow.
+So a fresh #6 **does** exercise the full detection handoff the table above
+assumes — *in principle*. In practice, see the clean-run attempt below.
+
+### Results — 2026-07-07 · clean run (attempt 2) · reproduction blocked by cluster behavior
+
+Fresh session `507a472e-…-fadde6`, clean `epoch 0` with **314 events** — the
+ideal starting state. Deleted its agent pod `srw-agent-j-d86c5081` (default grace
+period) to force the suspend, then sent turn-2 from the open tab. It **streamed
+live** — but *not* via a re-attach:
+
+- Persistent agents get a **long termination grace window**. `d86c5081` stayed
+  alive ~3 min (`16:42`→`16:45`) and **served turn-2 itself** — events grew
+  314 → **1099 all under epoch 0**, `max(created_at) 16:45:04`. **No re-attach
+  line, no `Bumped events_epoch`, epoch stayed 0.** The old agent's in-memory
+  epoch 0 was intact, so it just journaled onto it.
+- It died at `16:45:12` → a `GET /connection 425` ("Too Early") storm → and at
+  **`16:47:59` the orchestrator *released* the session**: `Workspace snapshot
+  captured … before release` + `Workspace container deleted: ws-thread-507a472e`.
+  The workspace container is gone and there is **no open SSE `/stream`**.
+
+**Why the literal #6 sequence is hard to force here (the real lesson).** On this
+deploy, agent death → the SSE stream **closes** and the session **fully releases**
+(workspace snapshotted + torn down) → the client reconnects *fresh* on whatever
+epoch is current. A stale stream is therefore **never left stranded on a dead
+epoch** by a pod deletion. The zombie-epoch condition Phase 1 fixes is a
+**provisioning race** (`persistent_app.py:1526–1532`: a client opens the SSE
+stream *during* provisioning, then the attach-time bump-check supersedes its
+epoch) — **which is exactly what #5's synthetic psql bump reproduces**, and #5
+passed cleanly (epoch change detected mid-stream in ~1 s, re-anchor emitted, no
+dup turn).
+
+Two independent gotchas defeated a clean pod-deletion #6, in order: (1) attempt 1
+rode #5's empty-epoch-1 (no bump on adopt); (2) attempt 2 hit the graceful-
+termination window (old agent served the message). A third try would need
+`kubectl delete pod --grace-period=0 --force` **and** still wouldn't strand the
+stream (it closes on agent death) — so it would confirm the agent-side
+`Bumped events_epoch` line but likely still not the orchestrator-side re-anchor,
+because the client reconnects fresh rather than staying stranded.
+
+**Verdict for #6.** *User-facing* recovery is verified **twice** (both real
+suspend/resume attempts streamed live with **no refresh** — the reported bug did
+not reproduce). The *internal* detection path — the actual code Phase 1 adds — is
+authoritatively proven by **#5**, since the re-read compares `events_epoch`
+regardless of *how* it changed. Chasing the literal "real-bump strands an open
+stream" sequence via pod deletion is **impractical on this cluster and adds
+marginal value over #5**; do not sink more budget into it. If a future run wants
+it, force a genuine **provisioning race** (open the stream mid-provision), not a
+post-turn pod kill.
+
 ---
 
 ## #7 — Multi-turn steady-state smoke (no false positives)
@@ -184,6 +320,31 @@ Confirms the idle re-check doesn't fire spuriously during normal use.
 |---|---|---|
 | Log grep over the whole session | **zero** `epoch bump` / `gone_beyond_horizon` lines | any spurious line (the re-check is misfiring on an unchanged epoch) |
 | Chat | every turn renders once, streams normally | duplicated turns / dropped streams |
+
+### Results — 2026-07-07 · PASS (stronger than spec)
+
+Session `f1f9675d-…-4d59c35` (develop-experimental deploy, `gemma-4-31b`),
+**45.5 min** span (`16:54:47`→`17:40:17`), **3 completed turns** (`turn.completed`
+×3, all fully streamed — 2384 `token` + 2340 `thinking` events).
+
+- **Epoch never moved:** `events_epoch = 0`, all **4750** journal events under a
+  single epoch 0 (`seq 1…4750`).
+- **Zero spurious lines:** a 120-min grep of **both** orchestrator replicas for
+  `epoch bump` / `gone_beyond_horizon` / `re-anchor` scoped to this thread returned
+  **nothing**.
+- **Idle stress far beyond the spec's "few multi-second gaps":** the largest
+  inter-turn gaps were **1800 s (30 min)**, 446 s, and 265 s. The 30-min gap even
+  fired a `session.idle_timeout` event (also journaled under epoch 0) — yet no
+  re-attaching turn followed it before `session.ended`, so nothing bumped the
+  epoch. During those idle stretches the stream was open (4 `ready` events) and
+  the ~2 s idle re-check ran hundreds of times **without a single misfire**.
+
+**Verdict: PASS.** Fewer turns than the runbook's 5–8 (3 here), but the idle path
+— the actual thing #7 guards against false-firing — was exercised *harder* than
+the spec (a 30-min idle + a real idle-timeout vs. multi-second gaps) and stayed
+silent. Note `/stream` never appears in the access logs (long-lived SSE isn't
+per-request logged) — same as observed in #5/#6; absence there is not evidence the
+stream was closed.
 
 ---
 
