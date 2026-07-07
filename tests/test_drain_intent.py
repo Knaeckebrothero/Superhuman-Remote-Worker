@@ -431,6 +431,159 @@ class TestVersionUpgradeFreeze:
                 f"freeze_type={ftype} → {status}, expected {expected}"
             )
 
+    # --- coincident-error masking (issue: version_upgrade_drain_masked_by_coincident_error) ---
+
+    def test_version_upgrade_with_coincident_error_still_pauses(self):
+        # The incident: a deploy drain freeze taken at a clean phase boundary
+        # races a transient interrupt error in the same completion report. The
+        # error must NOT mask the drain freeze — the job pauses for re-dispatch.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "j1", "parent_job_id": None}
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"message": "simulated SIGTERM interrupt", "type": "job_error"},
+            "freeze_data": {
+                "freeze_type": "version_upgrade",
+                "reason": "orchestrator drain intent at phase boundary",
+            },
+        }
+        status, err = determine_job_status(job, result)
+        assert status == "paused"
+        assert err is None
+
+    def test_version_upgrade_with_error_db_side_freeze_pauses(self):
+        # The exact shape /complete produces: it persists the incoming freeze to
+        # the job row FIRST, then determine_job_status runs with the freeze on
+        # the row and the error still in the request body.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {
+            "id": "j1",
+            "parent_job_id": None,
+            "freeze_data": {"freeze_type": "version_upgrade"},
+        }
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"message": "workspace SFTP write interrupted"},
+        }
+        status, _ = determine_job_status(job, result)
+        assert status == "paused"
+
+    def test_error_immune_freezes_route_their_own_branch(self):
+        # Each error-immune freeze consults ITS branch, not the error
+        # short-circuit — including the branches that intentionally FAIL past a
+        # cap/ceiling, which must survive the guard.
+        from orchestrator.services.completion import (
+            MEMORY_RETRY_CAP,
+            determine_job_status,
+        )
+
+        err = {"error": {"message": "boom"}}
+
+        # workspace_upgrade_required + error -> paused (re-dispatch)
+        status, _ = determine_job_status(
+            {"id": "j", "parent_job_id": None},
+            {
+                "should_stop": True,
+                "freeze_data": {"freeze_type": "workspace_upgrade_required"},
+                **err,
+            },
+        )
+        assert status == "paused"
+
+        # memory_unavailable + error UNDER the retry cap -> paused
+        status, _ = determine_job_status(
+            {"id": "j", "parent_job_id": None, "context": {"memory_retry_count": 0}},
+            {
+                "should_stop": True,
+                "freeze_data": {"freeze_type": "memory_unavailable"},
+                **err,
+            },
+        )
+        assert status == "paused"
+
+        # memory_unavailable + error AT the retry cap -> failed (cap beats guard)
+        status, msg = determine_job_status(
+            {
+                "id": "j",
+                "parent_job_id": None,
+                "context": {"memory_retry_count": MEMORY_RETRY_CAP},
+            },
+            {
+                "should_stop": True,
+                "freeze_data": {"freeze_type": "memory_unavailable"},
+                **err,
+            },
+        )
+        assert status == "failed"
+        assert msg is not None
+
+        # llm_unavailable + error, fresh outage -> paused (under the 24h ceiling)
+        status, _ = determine_job_status(
+            {"id": "j", "parent_job_id": None, "context": {}},
+            {
+                "should_stop": True,
+                "freeze_data": {"freeze_type": "llm_unavailable"},
+                **err,
+            },
+        )
+        assert status == "paused"
+
+    def test_bare_error_and_non_immune_freeze_still_fail(self):
+        # The guard is tight: an error with no freeze, or with a NON-immune
+        # freeze type, still hard-fails exactly as before.
+        from orchestrator.services.completion import determine_job_status
+
+        status, msg = determine_job_status(
+            {"id": "j", "parent_job_id": None},
+            {"should_stop": True, "error": {"message": "crash"}},
+        )
+        assert status == "failed"
+        assert msg == "crash"
+
+        status, _ = determine_job_status(
+            {"id": "j", "parent_job_id": None},
+            {
+                "should_stop": True,
+                "error": {"message": "crash"},
+                "freeze_data": {"freeze_type": "delegation"},
+            },
+        )
+        assert status == "failed"
+
+    def test_error_without_should_stop_still_fails(self):
+        # A genuine crash mid-phase (no clean stop) must fail even if a stale
+        # version_upgrade freeze sits on the row — the guard requires should_stop.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {
+            "id": "j",
+            "parent_job_id": None,
+            "freeze_data": {"freeze_type": "version_upgrade"},
+        }
+        status, _ = determine_job_status(
+            job, {"should_stop": False, "error": {"message": "crashed"}}
+        )
+        assert status == "failed"
+
+    def test_critic_subjob_error_still_fails(self):
+        # Critic subjobs (parent_job_id set) keep failing on error — the guard is
+        # scoped to top-level jobs, so critic routing is unchanged.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {
+            "id": "c1",
+            "parent_job_id": "p1",
+            "freeze_data": {"freeze_type": "version_upgrade"},
+        }
+        status, _ = determine_job_status(
+            job, {"should_stop": True, "error": {"message": "boom"}}
+        )
+        assert status == "failed"
+
 
 # =============================================================================
 # Auto-continue resume-clear — the version_upgrade drain livelock + its fix
