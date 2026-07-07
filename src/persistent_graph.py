@@ -31,6 +31,7 @@ from langchain_core.messages import (
 from .core.context import ContextManager, extract_summary_text, repair_tool_pairing
 from .core.summarizer import count_text_tokens
 from .core.workspace_backend import WorkspaceUnavailableError
+from .core.workspace_injection import find_tail_injection_anchor
 from .llm.exceptions import ContextOverflowError
 from .llm.reasoning_chat import (
     _STREAM_REASONING_SINK,
@@ -47,35 +48,29 @@ logger = logging.getLogger(__name__)
 
 
 def _injection_anchor_index(messages: List[BaseMessage]) -> int:
-    """Index at which to insert transient context-injection pairs.
+    """Index at which to insert transient context-injection pairs — the tail.
 
-    Returns the position immediately AFTER the first ``HumanMessage`` so the
-    synthetic ``AIMessage(tool_call)`` + ``ToolMessage`` pairs we inject for
-    memory/knowledge are always preceded by a real user turn.
+    The injected pairs change every turn (fresh retrieval per request), and
+    provider prompt caches match on a strict left-to-right prefix: the legacy
+    after-the-first-user-turn anchor placed the churning block ahead of the
+    whole conversation history, invalidating the cached prefix at that point
+    on every request — the entire history was re-processed at full input
+    price each turn. Anchoring at the tail keeps the history prefix
+    byte-identical between turns so the cache is reused; only the small
+    injected block (past the divergence point anyway) is processed fresh.
 
-    Why this matters: Gemini's native API (the ``google`` provider, via
-    ``ChatGoogleGenerativeAI``) rejects a function-call turn that does not
+    Gemini constraint (unchanged from the legacy anchor's rationale):
+    Gemini's native API rejects a function-call turn that does not
     immediately follow a user or function-response turn — it 400s with
-    "Please ensure that function call turn comes immediately after a user turn
-    or after a function response turn." The system message is lifted into a
-    separate ``system_instruction`` field, so injecting the pairs right after
-    it makes the injected ``functionCall`` the first entry of Gemini's
-    ``contents`` array and the very first turn of a session fails. The worker
-    graph avoids this because it always prepends a todos ``HumanMessage`` ahead
-    of the pairs (``src/graph.py``); interactive sessions have no todo list, so
-    we anchor on the first user turn here instead. Anchoring after the first
-    ``HumanMessage`` rather than the system message is harmless to
-    OpenAI/Anthropic, which tolerate either order.
-
-    Falls back to just after a leading ``SystemMessage`` (the legacy position)
-    when the list contains no user turn yet.
+    "Please ensure that function call turn comes immediately after a user
+    turn or after a function response turn." The turn loop only reaches the
+    LLM with a history ending in the newest ``HumanMessage`` (start of turn)
+    or the ``ToolMessage``s of the previous inner-loop iteration, so the
+    tail normally IS such a position; the shared anchor walks back past any
+    trailing bare model turn for degenerate/restored histories. See
+    ``find_tail_injection_anchor``.
     """
-    for i, m in enumerate(messages):
-        if isinstance(m, HumanMessage):
-            return i + 1
-    if messages and isinstance(messages[0], SystemMessage):
-        return 1
-    return 0
+    return find_tail_injection_anchor(messages)
 
 
 def _inject_context_pairs(
@@ -88,9 +83,10 @@ def _inject_context_pairs(
     """Insert transient memory/knowledge/citation context pairs into ``prepared``.
 
     Mutates ``prepared`` in place and returns the number of messages inserted.
-    The pairs are anchored immediately after the first user turn (see
-    ``_injection_anchor_index``) so the history stays valid for providers that
-    enforce function-call turn ordering (Gemini). Memory, knowledge, and
+    The pairs are anchored at the tail (see ``_injection_anchor_index``) so
+    the stable history prefix stays byte-identical between turns for provider
+    prompt caches, while remaining valid for providers that enforce
+    function-call turn ordering (Gemini). Memory, knowledge, and
     citation-feedback injection failures are non-fatal — the turn proceeds
     without that context.
 
@@ -1120,14 +1116,17 @@ async def _execute_turn(
         prepared = list(bounded)
 
         # Transient context injection (memory / knowledge / MemoryManager
-        # seam). Anchored immediately after the first user turn — never before
-        # it — so the synthetic tool-call pairs stay valid for providers that
-        # enforce function-call turn ordering (Gemini rejects a function-call
-        # turn not preceded by a user/function-response turn). The worker graph
-        # is shielded by its leading todos HumanMessage; interactive sessions
-        # have no todo list, so we anchor on the first user turn here. See
-        # _injection_anchor_index. The same message objects may be reused each
-        # inner-loop iteration; pair ids are only prefix-checked downstream.
+        # seam). Anchored at the TAIL — after the conversation — so the stable
+        # history prefix stays byte-identical between turns and provider
+        # prompt caches reuse it (the block changes every turn; placed ahead
+        # of the history it broke the cache for the whole conversation each
+        # request). The anchor still satisfies providers that enforce
+        # function-call turn ordering (Gemini rejects a function-call turn not
+        # preceded by a user/function-response turn): it sits after the last
+        # Human/Tool message, which is normally the very end of the history.
+        # See _injection_anchor_index. The same message objects may be reused
+        # each inner-loop iteration; pair ids are only prefix-checked
+        # downstream.
         _inject_context_pairs(
             prepared,
             manager_injection,

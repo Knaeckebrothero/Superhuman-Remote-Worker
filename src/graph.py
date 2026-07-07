@@ -1141,11 +1141,12 @@ def create_execute_node(
         # (can occur from improper context compaction or checkpoint corruption)
         messages = sanitize_message_history(messages)
 
-        # Add full conversation history in specific order:
+        # Add full conversation history in specific order (stable prefix first,
+        # per-turn transients last — prompt-cache friendly):
         # 1. Summary SystemMessages first (context from before compaction)
-        # 1.5. Todo injection (full todo list as transient HumanMessage)
-        # 2. Workspace injection (fake tool call - current workspace state)
-        # 3. Rest of conversation (excluding regular SystemMessages)
+        # 2. Rest of conversation (excluding regular SystemMessages)
+        # 3. Transient injections at the tail (memories, knowledge, citation
+        #    feedback, instruction files, then the todo list last)
 
         # Step 1: Add summaries first
         for msg in messages:
@@ -1158,6 +1159,7 @@ def create_execute_node(
         from src.core.workspace_injection import (
             create_todos_human_message,
             create_instruction_tool_messages,
+            find_tail_injection_anchor,
         )
 
         todos_injection_content = todo_manager.format_for_injection()
@@ -1358,24 +1360,33 @@ def create_execute_node(
                 )
 
         def _inject_transient_messages(target_messages: list) -> None:
-            """Append transient injection messages (todos, memories, knowledge, instruction files)."""
-            # Todo list as transient HumanMessage
-            target_messages.append(create_todos_human_message(todos_injection_content))
+            """Splice transient injections (memories, knowledge, instruction files, todos) at the tail.
+
+            The block goes AFTER the conversation (see find_tail_injection_anchor):
+            it changes every turn, and provider prompt caches match on a strict
+            left-to-right prefix — injected ahead of the history it invalidated
+            the cache for the whole conversation on every request. At the tail
+            only the block itself is re-processed.
+
+            Within the block the todo list goes LAST: it is the agent's current
+            "query", and models weight the end of the prompt highest.
+            """
+            block: list = []
 
             # MemoryManager seam: the assembled payload replaces the legacy
             # _memory_block/_knowledge_block branches below (both stay ""
             # when the manager is bound). Safety rebuilds re-call this into
             # a fresh list, so reusing the same pair objects is safe.
             if _manager_payload is not None:
-                target_messages.extend(_manager_payload.messages())
+                block.extend(_manager_payload.messages())
 
             # Memory Light: inject recalled memories
             if _memory_block[0]:
                 from src.core.memory_injection import create_memory_injection_messages
 
                 mem_ai, mem_tool = create_memory_injection_messages(_memory_block[0])
-                target_messages.append(mem_ai)
-                target_messages.append(mem_tool)
+                block.append(mem_ai)
+                block.append(mem_tool)
 
             # Knowledge Base: inject relevant project knowledge after memories
             if _knowledge_block[0]:
@@ -1386,8 +1397,8 @@ def create_execute_node(
                 kb_ai, kb_tool = create_knowledge_injection_messages(
                     _knowledge_block[0]
                 )
-                target_messages.append(kb_ai)
-                target_messages.append(kb_tool)
+                block.append(kb_ai)
+                block.append(kb_tool)
 
             # Citation verification feedback: surface failed citations (Phase 2b)
             if _citation_feedback_block[0]:
@@ -1398,8 +1409,8 @@ def create_execute_node(
                 cit_ai, cit_tool = create_citation_feedback_injection_messages(
                     _citation_feedback_block[0]
                 )
-                target_messages.append(cit_ai)
-                target_messages.append(cit_tool)
+                block.append(cit_ai)
+                block.append(cit_tool)
 
             # Phase-triggered instruction files (active injection)
             if tool_context and hasattr(tool_context, "get_phase_instruction_files"):
@@ -1412,8 +1423,8 @@ def create_execute_node(
                             instr_ai, instr_tool = create_instruction_tool_messages(
                                 entry.path, instr_content
                             )
-                            target_messages.append(instr_ai)
-                            target_messages.append(instr_tool)
+                            block.append(instr_ai)
+                            block.append(instr_tool)
                             logger.debug(
                                 f"[{job_id}] Injected instruction file: {entry.path}"
                             )
@@ -1422,13 +1433,27 @@ def create_execute_node(
                                 f"[{job_id}] Phase instruction file not found: {entry.path}"
                             )
 
-        # Inject transient messages (todos, memory, knowledge, instruction files)
-        _inject_transient_messages(prepared_messages)
+            # Todo list as transient HumanMessage — last, so the request ends
+            # with the current tasks (query-at-end) and the synthetic tool-call
+            # pairs above stay sandwiched between real turns.
+            block.append(create_todos_human_message(todos_injection_content))
+
+            # Anchor after the last Human/Tool message (normally the very end;
+            # keeps the synthetic function-call pairs Gemini-valid — a
+            # function-call turn must follow a user or function-response turn).
+            anchor = find_tail_injection_anchor(target_messages)
+            target_messages[anchor:anchor] = block
 
         # Step 3: Add rest of conversation (excluding all SystemMessages)
         for msg in messages:
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
+
+        # Inject transient messages (memory, knowledge, instruction files, todos)
+        # AFTER the conversation: the stable history prefix stays byte-identical
+        # across turns, so provider prompt caches reuse it instead of
+        # re-processing the whole conversation every request.
+        _inject_transient_messages(prepared_messages)
 
         # Todo reminders are injected post-LLM-response (see below) so they
         # persist in conversation history and survive context compaction.
@@ -1463,7 +1488,8 @@ def create_execute_node(
             messages = [m for m in messages if not isinstance(m, RemoveMessage)]
 
             # Rebuild prepared_messages with compacted history
-            # Keep system prompt, re-inject ALL transient messages, replace conversation
+            # Keep system prompt, replace conversation, re-inject ALL transient
+            # messages at the tail (same order as the normal path)
             system_msg = prepared_messages[0] if prepared_messages else None
             prepared_messages = []
             if system_msg and isinstance(system_msg, SystemMessage):
@@ -1475,15 +1501,16 @@ def create_execute_node(
                     if "[Summary of prior work]" in msg.content:
                         prepared_messages.append(msg)
 
-            # Re-inject ALL transient messages (todos + memory + knowledge + instruction files)
+            for msg in messages:
+                if not isinstance(msg, SystemMessage):
+                    prepared_messages.append(msg)
+
+            # Re-inject ALL transient messages (memory + knowledge + instruction
+            # files + todos) at the tail
             _inject_transient_messages(prepared_messages)
             logger.debug(
                 f"[{job_id}] Re-injected transient messages after safety compaction"
             )
-
-            for msg in messages:
-                if not isinstance(msg, SystemMessage):
-                    prepared_messages.append(msg)
 
             # Merge remove markers if compaction occurred
             if safety_remove_markers:
