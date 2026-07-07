@@ -7,7 +7,8 @@ Pins the post-chunk-6 contract:
 - ``family_of`` is a sync prefix-pattern fallback for callers that don't
   have a catalog row in hand.
 - ``UnknownModelError``'s message points operators at the right admin
-  surfaces (Admin → Models, /api/settings/llm-endpoints).
+  surface (Admin → Models, anchored to a system endpoint via Admin →
+  Providers).
 """
 
 from pathlib import Path
@@ -224,7 +225,7 @@ class TestUnknownModels:
             await resolve_model("never-heard-of")
         msg = str(exc_info.value)
         assert "Admin → Models" in msg or "Admin -> Models" in msg
-        assert "/api/settings/llm-endpoints" in msg
+        assert "system endpoint" in msg
 
     @pytest.mark.asyncio
     async def test_empty_id_raises(self):

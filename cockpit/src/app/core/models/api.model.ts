@@ -407,7 +407,8 @@ export interface LlmEndpointUpdateRequest {
 }
 
 /**
- * Response from the test-connection probe (POST /api/settings/llm-endpoints/{id}/test).
+ * Response from an endpoint test-connection probe (server-side
+ * `GET {base_url}/models`). Used by Admin → Providers.
  */
 export interface LlmEndpointTestResult {
   ok: boolean;
