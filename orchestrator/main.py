@@ -6234,8 +6234,8 @@ async def _unknown_model_handler(
     """Translate registry misses into a helpful 400 instead of a 500.
 
     Fires whenever a request references a model ID that isn't in the
-    built-in catalog or any of the user's custom endpoints. Points users
-    at the settings UI where they can register the model.
+    admin-curated catalog. Points operators at the admin surface where they
+    can register the model.
     """
     return JSONResponse(
         status_code=400,
@@ -6243,8 +6243,9 @@ async def _unknown_model_handler(
             "detail": str(exc),
             "model_id": exc.model_id,
             "hint": (
-                "Register this model under a custom endpoint at "
-                "/api/settings/llm-endpoints, or pick an ID from /api/models."
+                "Register this model under Admin → Models (anchored to a "
+                "system provider key or a system endpoint from Admin → "
+                "Providers), or pick an ID from /api/models."
             ),
         },
     )
@@ -21280,10 +21281,13 @@ async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]
 
 
 # =============================================================================
-# User-defined LLM Endpoints
-# OpenAI-compatible endpoints a user has registered (vLLM, Ollama, private
-# gateways). Models served by these endpoints appear in every model picker
-# and are routed to via dispatcher injection of base_url + api_key.
+# LLM endpoint helpers
+# Shared URL validation + response shaping for the admin provider-endpoint
+# routes below. The former user-facing Settings → LLM Endpoints CRUD was
+# removed: user-scoped endpoints were never resolvable at dispatch (the
+# per-user/system resolver hooks are unregistered and the catalog resolver
+# only joins system-scoped rows), so custom endpoints are admin-only now via
+# Admin → Providers + Admin → Models.
 # =============================================================================
 
 
@@ -21333,134 +21337,6 @@ def _serialize_endpoint(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
         "models": [],
-    }
-
-
-@app.get("/api/settings/llm-endpoints")
-async def list_llm_endpoints(request: Request) -> list[dict[str, Any]]:
-    """List the user's registered LLM endpoints with their model rows."""
-    user = await require_approved_user(request, postgres_db)
-    rows = await postgres_db.list_user_llm_endpoints(str(user["id"]))
-    return [_serialize_endpoint(r) for r in rows]
-
-
-@app.post("/api/settings/llm-endpoints")
-async def create_llm_endpoint(
-    request: Request, body: LlmEndpointCreate
-) -> dict[str, Any]:
-    user = await require_approved_user(request, postgres_db)
-    base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
-    key_prefix = body.api_key[:8] if body.api_key else None
-    try:
-        row = await postgres_db.create_user_llm_endpoint(
-            user_id=str(user["id"]),
-            label=body.label,
-            base_url=base_url,
-            api_key=body.api_key,
-            key_prefix=key_prefix,
-        )
-    except Exception as e:
-        # UniqueViolation on (user_id, label) — mirror the 409 style elsewhere
-        if "uq_llm_endpoint_label" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail=f"An endpoint labeled {body.label!r} already exists.",
-            )
-        raise
-    row["models"] = []
-    return _serialize_endpoint(row)
-
-
-@app.patch("/api/settings/llm-endpoints/{endpoint_id}")
-async def update_llm_endpoint(
-    request: Request, endpoint_id: str, body: LlmEndpointUpdate
-) -> dict[str, Any]:
-    user = await require_approved_user(request, postgres_db)
-    base_url = None
-    if body.base_url is not None:
-        base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
-    key_prefix = body.api_key[:8] if body.api_key else None
-
-    row = await postgres_db.update_user_llm_endpoint(
-        endpoint_id=endpoint_id,
-        user_id=str(user["id"]),
-        label=body.label,
-        base_url=base_url,
-        api_key=body.api_key,
-        key_prefix=key_prefix,
-        clear_api_key=body.clear_api_key and body.api_key is None,
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail="Endpoint not found")
-    row["models"] = []
-    return _serialize_endpoint(row)
-
-
-@app.delete("/api/settings/llm-endpoints/{endpoint_id}")
-async def delete_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, str]:
-    user = await require_approved_user(request, postgres_db)
-    deleted = await postgres_db.delete_user_llm_endpoint(
-        endpoint_id=endpoint_id, user_id=str(user["id"])
-    )
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Endpoint not found")
-    return {"status": "deleted"}
-
-
-@app.post("/api/settings/llm-endpoints/{endpoint_id}/test")
-async def test_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, Any]:
-    """Probe an endpoint by calling ``GET {base_url}/models`` server-side.
-
-    Runs from the orchestrator pod (not the browser) so the api_key is
-    never exposed to the client. Returns the HTTP status plus the first
-    error message if the probe fails.
-    """
-    user = await require_approved_user(request, postgres_db)
-    endpoint = await postgres_db.get_user_llm_endpoint(
-        endpoint_id=endpoint_id, user_id=str(user["id"])
-    )
-    if endpoint is None:
-        raise HTTPException(status_code=404, detail="Endpoint not found")
-
-    result = await probe_endpoint_models(
-        base_url=endpoint["base_url"],
-        api_key=endpoint.get("api_key"),
-    )
-    return {
-        "ok": result.ok,
-        "status": result.status,
-        "error": result.error,
-        "probe_url": result.probe_url,
-    }
-
-
-@app.post("/api/settings/llm-endpoints/{endpoint_id}/discover")
-async def discover_llm_endpoint_models(
-    request: Request, endpoint_id: str
-) -> dict[str, Any]:
-    """Return the model list served by ``GET {base_url}/models``.
-
-    Read-only — the user-side surface only exposes discovery for browsing;
-    actual catalog authoring is admin-only via Admin → Models.
-    """
-    user = await require_approved_user(request, postgres_db)
-    endpoint = await postgres_db.get_user_llm_endpoint(
-        endpoint_id=endpoint_id, user_id=str(user["id"])
-    )
-    if endpoint is None:
-        raise HTTPException(status_code=404, detail="Endpoint not found")
-
-    result = await probe_endpoint_models(
-        base_url=endpoint["base_url"],
-        api_key=endpoint.get("api_key"),
-    )
-
-    return {
-        "ok": result.ok,
-        "status": result.status,
-        "error": result.error,
-        "probe_url": result.probe_url,
-        "models": result.models,
     }
 
 
