@@ -226,6 +226,15 @@ databases:
       externalTrafficPolicy: Local
       allowedClientCIDRs:
         - "192.168.178.0/24"
+  # Audit store (srw-auditdb) — append-only observability tier. Bumped from the
+  # chart default 10Gi to 32Gi after the 10Gi Longhorn volume filled 2026-07-07,
+  # crashlooping auditdb ("No space left on device" on postmaster.pid) and
+  # stalling the orchestrator's wait-for-auditdb init container -> Fleet NotReady.
+  # The live PVC was expanded first (Longhorn online resize); this keeps git in
+  # sync so a reconcile never tries to (illegally) shrink it back to 10Gi.
+  # Retention still needs tightening so 32Gi doesn't just refill.
+  audit:
+    storageSize: "32Gi"
 # Other DBs stay internal (chart defaults). Externalize here if needed:
 #   postgres:
 #     externalUrl: ""
