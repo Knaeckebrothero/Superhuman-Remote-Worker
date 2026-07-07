@@ -25,7 +25,7 @@ related:
 
 ## Status
 
-**Proposed — awaiting alignment on acceptance criteria.** Depends on the new `product-qa` expert (`config/experts/product-qa/`, uncommitted) which is loader-validated but not yet loop-wired. Phase 0 (loop-wiring the expert, sequential) is independently shippable and delivers the functional goal on its own; Phases 1–3 add the concurrent stage.
+**Phase 0 + Phase 1 IMPLEMENTED (2026-07-07), uncommitted.** Phase 0 loop-wires the `product-qa` expert (sequential) — done, unit-tested, and now live-progressing on a k3d gemma smoke loop (`670130c6`: scholar→product-qa advance fired correctly, no F29). Phase 1 adds the concurrent stage — schema, grammar, barrier, advance, and torn-advance recovery — done, with **59 loop unit tests green**, the barrier SQL **validated against real Postgres** (last-out drill), and the **refactored single-role advance path live-verified on k3d** (the gemma loop's scholar→product-qa rotation ran through the new `_spawn_loop_stage`/`_rotate_loop_to_next_stage` and stamped `loop_seq_index` correctly). One open Phase 1 sub-item: disable `memory_assembler` for fan-out members (non-fatal; must land before the Phase 3 e2e). **Phase 2** (cockpit stage chips) and **Phase 3** (representative `scholar ∥ product-qa` e2e on homelab/minimax + flip the Better Resavio loop) remain.
 
 ## Problem
 
@@ -87,31 +87,45 @@ Invariant: **exactly one of the two pointers is populated** while a stage is in 
 
 `_advance_project_loop` (`orchestrator/main.py:10315`) grows a second entry path. When the completed job is *not* `current_job_id`, check membership in `current_stage_jobs`:
 
-1. **Per-job completion work first, unchanged and per-hook**: squash-merge the job's branch (expected `empty` for analysis roles), write the retro, record `merge_status`. Each stage job's own completion hook does its own merge/retro — so when the barrier releases, all sibling contributions are already landed.
-2. **Atomic barrier claim** — one conditional UPDATE, the parallel analogue of `claim_project_loop_advance`:
+1. **Per-job completion work first, unchanged and per-hook**: squash-merge the job's branch (expected `empty` for analysis roles), write the retro, record `merge_status`. Each stage job's own completion hook does its own merge/retro (`_merge_and_retro_loop_job`, shared with the single-role path) — so when the barrier releases, all sibling contributions are already landed.
+2. **Atomic barrier claim** — `claim_project_loop_stage_barrier(loop_id, member_id)`, the parallel analogue of `claim_project_loop_advance`.
+
+**As built — deviation from the sketch above.** Rather than *incrementally shrinking* the array (`current_stage_jobs - $2 RETURNING remaining`), membership is **immutable for the stage's life** and drained in one shot by the member that finishes last:
 
 ```sql
 UPDATE project_loops
-SET current_stage_jobs = current_stage_jobs - $2::text, updated_at = now()
-WHERE id = $1 AND current_stage_jobs ? $2::text AND status = 'running'
-RETURNING jsonb_array_length(current_stage_jobs) AS remaining;
+SET current_stage_jobs = '[]'::jsonb, updated_at = now()
+WHERE id = $1 AND status = 'running'
+  AND jsonb_array_length(current_stage_jobs) > 0
+  AND current_stage_jobs @> to_jsonb($2::text)              -- this member still in the set
+  AND NOT EXISTS (                                          -- and NO member still runs
+      SELECT 1 FROM jobs j
+      WHERE j.id::text IN (SELECT jsonb_array_elements_text(project_loops.current_stage_jobs))
+        AND j.status NOT IN ('completed','failed','cancelled'));
 ```
 
-   The `?` membership guard makes each job's claim exactly-once (a re-delivered completion or a racing sweeper matches no row and backs off — same idempotency contract as today). `RETURNING remaining` tells the caller whether it was the **last finisher**.
+   Each member runs this after it goes terminal (its own status is already written before the hook fires). Everyone but the last matches no row: an *earlier* finisher fails the `NOT EXISTS` (a later member still runs); the *co-last* loser fails `jsonb_array_length > 0` (the winner already drained it); a *stray/re-delivered* hook after rotation fails `@>` (no longer in the set). Exactly one caller drains → exactly one rotate.
 
-3. `remaining > 0` → stage still in flight; record and return. No budget/rotation work.
-4. `remaining == 0` → **last finisher rotates**: evaluate stop conditions, decrement budget, `seq_index = (seq_index + 1) % len(role_sequence)`, spawn the next stage (1 job → `current_job_id`; N jobs → `current_stage_jobs`), write back counters. Single writer — no concurrent-decrement races by construction.
+   **Why the change:** incremental shrink leaves the array in a *partially-drained* intermediate state, so a torn advance could strand it at any width — many signatures to reason about in recovery. One-shot drain means the only post-barrier state is `current_stage_jobs = '[]'`, i.e. **the same single wedge signature the single-role tear already has** (`current_job_id IS NULL ∧ current_stage_jobs = '[]'`). Recovery reasons about one shape, not N.
 
-The KB cycle-TTL decrement (fires on `next_index == 0`) is unchanged — it's already keyed to the sequence wrap, which is now a stage wrap.
+3. **Not last out** (claim returned no row) → record own merge and return. No budget/rotation work.
+4. **Last out** (claim drained the set) → `_advance_loop_parallel_member` aggregates the stage outcome from all members' final statuses, evaluates stop conditions, decrements budget, and calls the shared `_rotate_loop_to_next_stage`: `seq_index = (seq_index + 1) % len(role_sequence)`, spawn the next stage (1 job → `current_job_id`; N jobs → `current_stage_jobs`), write back counters. Single writer — no concurrent-decrement races by construction.
+
+The KB cycle-TTL decrement (fires on `next_index == 0`) is unchanged — it's already keyed to the sequence wrap, which is now a stage wrap. Both advance paths reach it through `_rotate_loop_to_next_stage`.
 
 ### Counter semantics
 
-**An iteration is a stage, not a job.** Both stage jobs are spawned together with the same `context.loop_iteration = N`; the cockpit shows "iter 29 · SCHOLAR ∥ iter 29 · PRODUCT-QA". Rationale: this preserves the sweeper's heal-derivation invariants (`seq_index = (N-1) % len(role_sequence)`, `remaining = max_iterations - (N-1)`) with `role_sequence` entries = stages, and keeps "one more full cycle = 3 iterations" arithmetic stable when a stage widens.
+**As built — deviation from "iteration = stage".** The original plan kept `loop_iteration = stage ordinal` so the sweeper's `(N-1) % len(role_sequence)` modulo still held. But that modulo *breaks* the moment stages have different widths (a 2-wide stage 0 then a 1-wide stage 1 means job-count no longer maps to stage index). Rather than add a `stage_count` column to carry the ordinal, the implementation **stamps the counters directly**:
+
+- `loop_iteration` = the **post-stage cumulative job count** (`base_total + width`), shared by every member of a stage. For all-single-role loops this is identical to today (`iteration == total_jobs_run`), so nothing changes for the common case; a fan-out stage's members simply share the cumulative count (the first `[scholar, product-qa]` stage shows iter 2 — cosmetically lumpy, honest, monotonic).
+- `loop_seq_index` and `loop_remaining` are stamped into each job's `context` at spawn (`create_loop_job`). These are **spawn-time truth the heal reads back directly** — no arithmetic, correct for any stage-width mix.
+
+`_derive_loop_counters` *prefers* these stamps and falls back to the legacy modulo only for pre-parallel (stamp-less) single-role jobs, so the migration is seamless.
 
 Consequences, stated honestly:
 
 - `remaining_iterations` buys **stages**; a parallel stage burns 2 jobs (≈2× tokens) per iteration tick. The cockpit loop card should surface jobs-per-cycle so the budget isn't misread. (On the MiniMax token plan this is a non-issue; on metered keys it matters.)
-- `total_jobs_run` keeps counting **jobs** (its name is its contract; retros and audit math depend on it): `total_jobs_run += len(stage)` at spawn. The iteration label therefore derives from a new `stage_count`-style counter — or simplest, from `seq_index` wraps — rather than from `total_jobs_run`. The sweeper's `_derive_loop_counters` is updated to the stage-aware derivation (it currently assumes iteration ≡ job — see [Sweeper](#sweeper--heal-stage-awareness)).
+- `total_jobs_run` keeps counting **jobs** (its name is its contract; retros and audit math depend on it): `total_jobs_run += len(stage)` at spawn.
 
 **Failure semantics**: a stage counts toward `consecutive_failures` only when **all** its jobs failed (no forward signal produced). Partial failure — Scholar dies, Product-QA lands findings — resets the counter to 0, logs loudly, and the retro records the dead sibling; the Critic can still triage the surviving stream. `last_error` carries the failed sibling's error either way.
 
@@ -121,8 +135,13 @@ Consequences, stated honestly:
 
 `project_loop_sweeper.py` gets two extensions, both mirroring existing logic:
 
-1. **Missed-completion backstop**: for a running loop with non-empty `current_stage_jobs`, check each member; any terminal member → re-run `advance_fn(job, {}, [])`. Idempotent via the `?` claim guard, exactly like the `current_job_id` path.
-2. **Wedge discrimination**: today `current_job_id IS NULL ∧ running ∧ old` = torn advance. A parallel stage in flight is *also* `current_job_id IS NULL` — so `heal_project_loop_pointer` gains the guard `AND current_stage_jobs = '[]'::jsonb`, and the Python-side pre-check skips loops with a non-empty stage. A **parallel** torn advance (claim landed, stage spawn or write-back lost) presents as *both pointers empty + age*; heal re-points `current_stage_jobs` at all non-terminal jobs carrying the newest `loop_iteration` stamp (terminal ones flow through path 1 next tick). Partial-spawn tears (some stage jobs created, others not) heal to **what exists** with a loud log — no speculative re-spawning of missing siblings.
+1. **Missed-completion backstop** (`_sweep_parallel_stage`): for a running loop with non-empty `current_stage_jobs`, act only once **every** member is terminal (a missed barrier hook) and re-run `advance_fn(rep, {}, [])`. Idempotent via the barrier claim, exactly like the `current_job_id` path — while any member still runs, the members' own hooks fire the barrier, so the sweep leaves it alone (no age gate needed; the barrier is the guard).
+2. **Wedge discrimination** (`_heal_wedged_loop`, via `get_newest_loop_stage`): today `current_job_id IS NULL ∧ running ∧ old` = torn advance. A healthy parallel stage in flight has non-empty `current_stage_jobs` and is handled by (1); a *torn* parallel advance drained the set in one shot, so it lands on the **same** `current_job_id IS NULL ∧ current_stage_jobs = '[]'` signature as a single-role tear. `heal_project_loop_pointer` gains the guard `AND current_stage_jobs = '[]'::jsonb`; the heal then fetches the newest stage (all jobs at the max `loop_iteration`) and branches on width + status:
+   - **width 1** → re-point `current_job_id` (unchanged single-role behavior).
+   - **width N, some member still running** (torn during the next stage's spawn) → `heal_project_loop_stage` restores `current_stage_jobs` to the **full** membership (the barrier checks live statuses, so already-terminal members count correctly); the members' hooks / next tick fire the rotate.
+   - **width N, all terminal** (torn after the last-out drain, before the rotate) → re-point `current_job_id` at a representative so the normal single-job advance rotates.
+
+   A representative's re-merge on recovery is a harmless `empty` (analysis-only stages); a member whose hook was fully lost has its retro skipped (documented gap — analysis merges carry nothing on `main` anyway). Misclassifying a just-finished Tear B as Tear A self-corrects next tick.
 
 The age-gate discipline (`PROJECT_LOOP_HEAL_GRACE_SECONDS`, DB-clock guard) applies unchanged — this feature must not reopen the double-spawn incident.
 
@@ -130,7 +149,9 @@ The age-gate discipline (`PROJECT_LOOP_HEAL_GRACE_SECONDS`, DB-clock guard) appl
 
 Same-stage roles are **additive-only** KB writers — Scholar writes `plan` notes tagged `proposal`, Product-QA writes `plan` notes tagged `qa-finding`. Neither supersedes, flips status, nor curates. Cross-contamination via recency-boosted search (Scholar surfacing QA's in-flight notes or vice versa) is harmless-to-useful; the *dangerous* reader — the Critic, who supersedes losers — runs strictly post-barrier.
 
-The one real race is the per-job **`memory_assembler`** aux writer (TTL curation / supersede re-verification, `config/defaults.yaml` `memory.pipeline.writers`), which was designed single-writer-per-turn ([kb_convergence_ttl_reverification.md](kb_convergence_ttl_reverification.md)). Parallel-stage jobs get it removed from their writer pipeline via the loop's existing `config_override` injection in `_spawn_loop_job`; the Critic's job — immediately after the barrier — runs the cycle's single curation pass. (Exact override key pinned at implementation; it's the `memory.pipeline.writers` list.)
+The one real race is the per-job **`memory_assembler`** aux writer (TTL curation / supersede re-verification, `config/defaults.yaml` `memory.pipeline.writers`), which was designed single-writer-per-turn ([kb_convergence_ttl_reverification.md](kb_convergence_ttl_reverification.md)). Parallel-stage jobs should get it removed from their writer pipeline via the loop's `config_override` injection in `create_loop_job` (the writers list is list-*replaced* on merge, so the override must carry the full list minus `memory_assembler`); the Critic's job — immediately after the barrier — runs the cycle's single curation pass.
+
+> **⚠️ NOT YET IMPLEMENTED (Phase 1 remaining sub-item).** The barrier, spawn, advance, and recovery are done and verified, but the `memory_assembler` writer is still injected into fan-out members. This is harmless until a *real* parallel stage runs (it needs a loop started with a fan-out `role_sequence`, of which none exist), and the aux writer is non-fatal besides — but it **must land before the Phase 3 e2e** (the first real `scholar ∥ product-qa` run). Tracked as the last open box below.
 
 ### Expert loop-wiring (Phase 0 — independent of concurrency)
 
@@ -159,19 +180,20 @@ Minimal: the loop status payload (`GET /api/projects/{id}/loop`) adds `current_s
 
 ## Implementation phases & acceptance criteria
 
-**Phase 0 — product-qa loop-wiring (sequential; no schema change)**
-- [ ] `LOOP_ANALYSIS_ROLES` includes `product-qa`; unit test asserts `is_loop_execution_role("product-qa") is False`.
-- [ ] Role block + task registered; kickoff snapshot test (mirrors existing role-block tests).
-- [ ] Critic block names both note streams and the build-vs-fix choice.
-- [ ] `tactical.txt` directs findings to KB notes tagged `qa-finding`.
-- [ ] k3d: loop with `["scholar","product-qa","critic","developer"]` completes one full cycle; product-qa iteration merges `empty` **without** an F29 alarm; `qa-finding` notes visible in the KB; Critic's verdict note references at least one of them.
+**Phase 0 — product-qa loop-wiring (sequential; no schema change)** — IMPLEMENTED + unit-tested; k3d smoke in flight.
+- [x] `LOOP_ANALYSIS_ROLES` includes `product-qa`; unit test asserts `is_loop_execution_role("product-qa") is False`.
+- [x] Role block + task registered; kickoff snapshot test (mirrors existing role-block tests).
+- [x] Critic block names both note streams and the build-vs-fix choice.
+- [x] `tactical.txt` directs findings to KB notes tagged `qa-finding`.
+- [~] k3d (gemma smoke `670130c6`): scholar→product-qa advance fired correctly (merged empty, **no F29**), product-qa job dispatched. Full-cycle signals (`qa-finding` notes in KB, Critic verdict references one) pending the gemma job completing. **NB:** gemma under-uses `kb_write`, so note-quality is the homelab/minimax job's to prove (Phase 3) — k3d proves plumbing only.
 
-**Phase 1 — schema + barrier advance**
-- [ ] Migration adds `current_stage_jobs` (default `[]`, backfill-free).
-- [ ] `claim_project_loop_stage_job()` with the conditional-UPDATE-RETURNING contract; unit tests: double-claim is a no-op, last-out detection correct under concurrent claims.
-- [ ] `_advance_project_loop` parallel path: per-job merge/retro always runs; only the last finisher rotates; stop conditions evaluated at barrier only; partial-failure semantics as specced.
-- [ ] `_spawn_loop_stage` spawns N jobs with shared `loop_iteration`, disables `memory_assembler` for stage jobs via `config_override`.
-- [ ] Sweeper: terminal-stage-member backstop; heal guards on `current_stage_jobs = '[]'`; stage-aware `_derive_loop_counters`. Tear-drill unit tests (claim-then-crash, spawn-then-crash) for both stage widths.
+**Phase 1 — schema + barrier advance** — IMPLEMENTED 2026-07-07 (one open sub-item below), unit-tested (59 loop tests) + barrier SQL validated against real Postgres + single-role advance path live-verified on k3d. Uncommitted.
+- [x] Migration `0048_loop_parallel_stages.sql` adds `current_stage_jobs` (default `[]`, backfill-free) + `CHECK jsonb_typeof = 'array'`; `schema_current.sql` regenerated.
+- [x] `claim_project_loop_stage_barrier()` — **immutable-membership / drain-when-all-terminal** contract (deviation from the incremental-shrink sketch; see [Advance algorithm](#advance-algorithm-barrier)). Real-Postgres drill: earlier finisher → no-op, last-out → single drain, re-fire after drain → no-op.
+- [x] `_advance_loop_parallel_member`: per-job merge/retro always runs (shared `_merge_and_retro_loop_job`); only the last finisher rotates (shared `_rotate_loop_to_next_stage`); stop conditions at barrier only; failure only when **all** members failed.
+- [x] `_spawn_loop_stage` spawns N jobs with shared `loop_iteration` + stamped `loop_seq_index`/`loop_remaining`; single-role path stays `current_job_id`, fan-out sets `current_stage_jobs`. Grammar (`normalize_stage` / `validate_role_sequence`, analysis-only fan-out) enforced at the start endpoint.
+- [x] Sweeper: `_sweep_parallel_stage` backstop; `heal_project_loop_pointer`/`heal_project_loop_stage` guard on `current_stage_jobs = '[]'`; stamp-preferring `_derive_loop_counters`; `get_newest_loop_stage`. Tear-drill unit tests (Tear A repoint, Tear B restore) for both widths.
+- [ ] **OPEN**: disable `memory_assembler` for fan-out members via `config_override` (writers list-replace). Non-fatal, no parallel loop runs before Phase 3 — but land before the e2e. See [KB safety](#kb-safety).
 
 **Phase 2 — API + cockpit**
 - [ ] Start endpoint accepts nested arrays; rejects execution roles in parallel stages (422) and duplicate roles within a stage.

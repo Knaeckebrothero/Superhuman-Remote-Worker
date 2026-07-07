@@ -10274,19 +10274,31 @@ async def _spawn_loop_job(
     *,
     role: str,
     iteration: int,
+    seq_index: int | None = None,
+    remaining_iterations: int | None = None,
 ) -> dict[str, Any]:
     """Create + provision + dispatch one bare project-loop job.
 
-    Shared by the loop start endpoint and the ``_advance_project_loop`` hook.
-    Mirrors the automation run-now path: ``create_loop_job`` does the DB write,
-    then we provision the Gitea repo and nudge the dispatcher. Raises on a
-    failed job create (caller decides how to handle); provisioning / dispatch
-    failures are non-fatal (logged), matching POST /api/jobs + run-now.
+    Shared by the loop start endpoint and the ``_advance_project_loop`` hook
+    (both via ``_spawn_loop_stage``). Mirrors the automation run-now path:
+    ``create_loop_job`` does the DB write, then we provision the Gitea repo and
+    nudge the dispatcher. Raises on a failed job create (caller decides how to
+    handle); provisioning / dispatch failures are non-fatal (logged), matching
+    POST /api/jobs + run-now. ``seq_index`` / ``remaining_iterations`` are
+    stamped into the job's context for the torn-advance heal (see
+    ``create_loop_job``).
     """
     from services.job_provisioning import provision_job_repo
     from services.project_loops import create_loop_job
 
-    job = await create_loop_job(postgres_db, loop, role=role, iteration=iteration)
+    job = await create_loop_job(
+        postgres_db,
+        loop,
+        role=role,
+        iteration=iteration,
+        seq_index=seq_index,
+        remaining_iterations=remaining_iterations,
+    )
 
     try:
         await provision_job_repo(
@@ -10313,59 +10325,94 @@ async def _spawn_loop_job(
     return job
 
 
-async def _advance_project_loop(
-    job: dict[str, Any],
-    result: dict[str, Any],
-    actions: list[str],
-) -> None:
-    """Advance a project self-improvement loop when its current job completes.
+async def _spawn_loop_stage(
+    loop: dict[str, Any],
+    *,
+    stage: Any,
+    seq_index: int,
+    base_total: int,
+    remaining: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Spawn every role in ONE loop stage and return (jobs, new_total_jobs_run).
 
-    If the completed job belongs to a *running* loop and is that loop's
-    in-flight job, decrement the budget, check stop conditions (budget /
-    deadline / consecutive-failure cap), and either stop the loop or rotate to
-    the next role and spawn the next job. Idempotent on ``current_job_id`` so a
-    re-delivered completion can't double-advance. Loop jobs run bare, so this is
-    the only completion hook that fires for them.
-
-    Design: docs/features/project_self_improvement_loop.md.
+    A single-role stage (``"scholar"``) spawns one job; a fan-out stage
+    (``["scholar", "product-qa"]``) spawns one job per role, concurrently. Each
+    job's ``loop_iteration`` is the post-stage cumulative job count
+    (``base_total + width``) so members of a stage share it; ``seq_index`` and
+    ``remaining`` are stamped for the heal. Raises if any job fails to create
+    (the caller marks the loop failed — a half-spawned stage with no barrier
+    would wedge). docs/features/loop_parallel_stages.md.
     """
-    ctx = job.get("context")
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except (json.JSONDecodeError, ValueError):
-            ctx = {}
-    loop_id = (ctx or {}).get("loop_id")
-    if not loop_id:
-        return
+    from services.project_loops import normalize_stage
 
-    loop = await postgres_db.get_project_loop(str(loop_id))
-    if not loop or loop.get("status") != "running":
-        return  # paused / stopped / terminal — leave the current job, don't advance
-    if str(job["id"]) != str(loop.get("current_job_id") or ""):
-        return  # cheap pre-check: only the in-flight job advances the loop
+    roles = normalize_stage(stage)
+    new_total = int(base_total) + len(roles)
+    jobs: list[dict[str, Any]] = []
+    for role in roles:
+        job = await _spawn_loop_job(
+            loop,
+            role=role,
+            iteration=new_total,
+            seq_index=seq_index,
+            remaining_iterations=remaining,
+        )
+        jobs.append(job)
+    return jobs, new_total
 
-    # Atomic claim: nulls current_job_id iff it still equals this job on a
-    # running loop. Guarantees exactly one advance even if the completion hook
-    # and the safety-net sweeper fire concurrently for the same terminal job
-    # (the loser gets False here and backs off). Uses the pre-claim `loop`
-    # snapshot below for seq_index / remaining — the claim only nulls the job.
-    if not await postgres_db.claim_project_loop_advance(str(loop_id), str(job["id"])):
-        return  # another caller already claimed this advance
 
-    failed = bool(result.get("error")) or job.get("status") == "failed"
-    consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if failed else 0
-    last_error = (result.get("error") or "job failed") if failed else None
+async def _writeback_loop_stage(
+    loop_id: str,
+    *,
+    jobs: list[dict[str, Any]],
+    seq_index: int,
+    remaining: int | None,
+    total: int,
+    consecutive: int,
+    last_error: str | None,
+) -> dict[str, Any] | None:
+    """Point a loop at a freshly-spawned stage.
 
-    # Loop v2 completion merge: squash the job's branch onto `main` (one clean
-    # commit per job; the branch is kept as the audit log) and record the
-    # LITERAL outcome — merged/empty/merge-failed/skipped. This replaces the v1
-    # SHA-compare no-op guard: the merge step *knows* what landed instead of
-    # inferring it. An `empty` from an execution role is the run-5/6
-    # silent-loss signature (F29 family) and is flagged loudly; `merge-failed`
-    # is flag-and-continue (visible, never silent — the loop still advances).
-    # See docs/features/loop_repo_compounding_v2.md. Best-effort; never blocks
-    # the advance.
+    One job → ``current_job_id`` (the single-role path; ``current_stage_jobs``
+    cleared to []). Multiple jobs → ``current_stage_jobs`` holds the members and
+    ``current_job_id`` stays NULL — the barrier tracks them until the last one
+    finishes. Mirrors the counters the single-role advance always wrote.
+    """
+    ids = [str(j["id"]) for j in jobs]
+    common = dict(
+        seq_index=seq_index,
+        remaining_iterations=remaining,
+        consecutive_failures=consecutive,
+        total_jobs_run=total,
+        last_error=last_error,
+    )
+    if len(ids) == 1:
+        return await postgres_db.update_project_loop(
+            loop_id, current_job_id=ids[0], current_stage_jobs=[], **common
+        )
+    return await postgres_db.update_project_loop(
+        loop_id, current_job_id=None, current_stage_jobs=ids, **common
+    )
+
+
+async def _merge_and_retro_loop_job(
+    job: dict[str, Any],
+    *,
+    ctx: dict[str, Any] | None,
+    loop: dict[str, Any],
+    loop_id: str,
+    actions: list[str],
+    failed: bool,
+    last_error: str | None,
+) -> tuple[str, str | None]:
+    """Per-job artifact handling: squash-merge the branch, flag F29 /
+    merge-failed, trigger the post-merge KB reindex, write the retro.
+
+    Shared by the single-role advance and each parallel-stage member (each
+    member merges + retros itself; the loop rotates only at the barrier). Best
+    effort — never raises. Returns ``(merge_status, merged_sha)``.
+
+    See docs/features/loop_repo_compounding_v2.md.
+    """
     from services.project_loops import (
         is_loop_execution_role,
         merge_loop_job_branch,
@@ -10403,12 +10450,11 @@ async def _advance_project_loop(
         # Slice-3 KB freshness (post-merge trigger): the squash — or the job's
         # own direct-to-main kb_write pushes — likely moved knowledge/ on
         # `main`; bring the chunk index up to the new HEAD. Fires on `empty`
-        # too: knowledge-only jobs (scholars) land notes via kb_write while
-        # their branch diff is empty (live: iter-16 scholar, 2026-07-05), and
-        # the up-to-date short-circuit makes a false fire one HEAD read.
-        # Fire-and-forget: a first full rebuild can take minutes and must
-        # never delay the loop advance; a lost task self-heals via the
-        # leader-gated sweep (blob_sha diff).
+        # too: knowledge-only jobs (scholars, product-qa) land notes via
+        # kb_write while their branch diff is empty, and the up-to-date
+        # short-circuit makes a false fire one HEAD read. Fire-and-forget: a
+        # first full rebuild can take minutes and must never delay the loop
+        # advance; a lost task self-heals via the leader-gated sweep.
         if merge_status in ("merged", "empty"):
             _kb_project = loop.get("project_id")
             if _kb_project:
@@ -10465,44 +10511,54 @@ async def _advance_project_loop(
         )
     except Exception:
         logger.exception("project loop %s: retro write failed (non-fatal)", loop_id)
+    return merge_status, merged_sha
 
-    remaining = loop.get("remaining_iterations")
-    next_remaining = (remaining - 1) if remaining is not None else None
 
-    # Stop conditions, re-checked every advance.
-    stop_reason: str | None = None
+def _loop_stop_reason(
+    loop: dict[str, Any], *, next_remaining: int | None, consecutive: int
+) -> str | None:
+    """Which stop axis (if any) trips after this advance — budget / deadline /
+    failures. Re-checked every advance; shared by the single-role and
+    parallel-stage paths."""
     if next_remaining is not None and next_remaining <= 0:
-        stop_reason = "budget"
-    elif _loop_deadline_passed(loop.get("run_until")):
-        stop_reason = "deadline"
-    elif consecutive >= int(loop.get("max_consecutive_failures") or 3):
-        stop_reason = "failures"
+        return "budget"
+    if _loop_deadline_passed(loop.get("run_until")):
+        return "deadline"
+    if consecutive >= int(loop.get("max_consecutive_failures") or 3):
+        return "failures"
+    return None
 
-    if stop_reason:
-        await postgres_db.update_project_loop(
-            str(loop_id),
-            status=("failed" if stop_reason == "failures" else "completed"),
-            remaining_iterations=next_remaining,
-            consecutive_failures=consecutive,
-            last_error=last_error,
-            stop_reason=stop_reason,
-            current_job_id=None,
-        )
-        actions.append(f"project loop {str(loop_id)[:8]} stopped ({stop_reason})")
-        return
 
-    # Rotate to the next role and spawn the next job.
+async def _rotate_loop_to_next_stage(
+    loop: dict[str, Any],
+    *,
+    seq_index_completed: int,
+    base_total: int,
+    next_remaining: int | None,
+    consecutive: int,
+    last_error: str | None,
+    actions: list[str],
+) -> None:
+    """Rotate a loop past the just-finished stage and spawn the next one.
+
+    Shared by the single-role advance and the parallel-stage last finisher:
+    ticks the KB-convergence TTL on a cycle wrap, spawns the next stage (1 or N
+    jobs), and points the loop at it (``current_job_id`` or
+    ``current_stage_jobs``). On a spawn failure the loop is marked failed — a
+    running loop with no in-flight job/stage would never advance.
+    """
+    from services.project_loops import normalize_stage
+
+    loop_id = str(loop["id"])
     roles = loop.get("role_sequence") or ["scholar", "critic", "developer"]
-    next_index = (int(loop.get("seq_index") or 0) + 1) % len(roles)
-    next_role = roles[next_index]
-    total_run = int(loop.get("total_jobs_run") or 0) + 1
+    next_index = (int(seq_index_completed) + 1) % len(roles)
 
     # KB convergence (docs/features/kb_convergence_ttl_reverification.md, F13): a
-    # full cycle completed when the rotation wraps back to the first role. Tick
-    # the per-note cycle TTL down once here; notes that reach <= 0 become the
-    # stale queue the next job's knowledge-assembler pass re-verifies. This UPDATE
-    # mirrors KnowledgeStore.decrement_ttl — the orchestrator runs it inline
-    # against the vector DB because it can't safely import src/. Non-fatal.
+    # full cycle completed when the rotation wraps back to the first stage. Tick
+    # the per-note cycle TTL down once; notes that reach <= 0 become the stale
+    # queue the next job's knowledge-assembler pass re-verifies. Mirrors
+    # KnowledgeStore.decrement_ttl (run inline — the orchestrator can't import
+    # src/). Non-fatal.
     project_id_for_ttl = loop.get("project_id")
     if next_index == 0 and project_id_for_ttl:
         try:
@@ -10522,16 +10578,20 @@ async def _advance_project_loop(
                 "project loop %s: KB TTL decrement failed (non-fatal)", loop_id
             )
 
-    # Reflect the decremented budget in the kickoff the next job sees.
+    # Reflect the decremented budget in the kickoff the next stage sees.
     loop_for_spawn = dict(loop)
     loop_for_spawn["remaining_iterations"] = next_remaining
 
     try:
-        child = await _spawn_loop_job(
-            loop_for_spawn, role=next_role, iteration=total_run
+        jobs, new_total = await _spawn_loop_stage(
+            loop_for_spawn,
+            stage=roles[next_index],
+            seq_index=next_index,
+            base_total=base_total,
+            remaining=next_remaining,
         )
     except Exception as e:
-        logger.exception("project loop %s: failed to spawn next job", loop_id)
+        logger.exception("project loop %s: failed to spawn next stage", loop_id)
         await postgres_db.update_project_loop(
             str(loop_id),
             status="failed",
@@ -10540,21 +10600,213 @@ async def _advance_project_loop(
             last_error=f"spawn failed: {e}",
             stop_reason="failures",
             current_job_id=None,
+            current_stage_jobs=[],
         )
         actions.append(f"project loop {str(loop_id)[:8]} stopped (spawn failed)")
         return
 
-    await postgres_db.update_project_loop(
+    await _writeback_loop_stage(
         str(loop_id),
+        jobs=jobs,
         seq_index=next_index,
-        current_job_id=str(child["id"]),
-        remaining_iterations=next_remaining,
-        consecutive_failures=consecutive,
-        total_jobs_run=total_run,
+        remaining=next_remaining,
+        total=new_total,
+        consecutive=consecutive,
         last_error=last_error,
     )
-    actions.append(
-        f"project loop {str(loop_id)[:8]} → {next_role} job {str(child['id'])[:8]}"
+    if len(jobs) == 1:
+        actions.append(
+            f"project loop {str(loop_id)[:8]} → {roles[next_index]} "
+            f"job {str(jobs[0]['id'])[:8]}"
+        )
+    else:
+        stage_roles = "+".join(normalize_stage(roles[next_index]))
+        actions.append(
+            f"project loop {str(loop_id)[:8]} → parallel stage "
+            f"[{stage_roles}] ({len(jobs)} jobs)"
+        )
+
+
+async def _advance_project_loop(
+    job: dict[str, Any],
+    result: dict[str, Any],
+    actions: list[str],
+) -> None:
+    """Advance a project self-improvement loop when its current job completes.
+
+    If the completed job belongs to a *running* loop and is that loop's
+    in-flight job, decrement the budget, check stop conditions (budget /
+    deadline / consecutive-failure cap), and either stop the loop or rotate to
+    the next role and spawn the next job. Idempotent on ``current_job_id`` so a
+    re-delivered completion can't double-advance. Loop jobs run bare, so this is
+    the only completion hook that fires for them.
+
+    Design: docs/features/project_self_improvement_loop.md.
+    """
+    ctx = job.get("context")
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            ctx = {}
+    loop_id = (ctx or {}).get("loop_id")
+    if not loop_id:
+        return
+
+    loop = await postgres_db.get_project_loop(str(loop_id))
+    if not loop or loop.get("status") != "running":
+        return  # paused / stopped / terminal — leave the current job, don't advance
+
+    # A parallel (fan-out) stage is in flight when current_stage_jobs is
+    # non-empty. Its members advance the loop through the barrier — NOT the
+    # single-job current_job_id path below (which is NULL for a fan-out stage).
+    stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
+    if stage_ids:
+        if str(job["id"]) not in stage_ids:
+            return  # not a member of the in-flight stage
+        await _advance_loop_parallel_member(
+            job, result, actions, loop=loop, ctx=ctx or {}
+        )
+        return
+
+    if str(job["id"]) != str(loop.get("current_job_id") or ""):
+        return  # cheap pre-check: only the in-flight job advances the loop
+
+    # Atomic claim: nulls current_job_id iff it still equals this job on a
+    # running loop. Guarantees exactly one advance even if the completion hook
+    # and the safety-net sweeper fire concurrently for the same terminal job
+    # (the loser gets False here and backs off). Uses the pre-claim `loop`
+    # snapshot below for seq_index / remaining — the claim only nulls the job.
+    if not await postgres_db.claim_project_loop_advance(str(loop_id), str(job["id"])):
+        return  # another caller already claimed this advance
+
+    failed = bool(result.get("error")) or job.get("status") == "failed"
+    consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if failed else 0
+    last_error = (result.get("error") or "job failed") if failed else None
+
+    # Per-job artifact handling: squash-merge the branch onto `main`, flag F29 /
+    # merge-failed, trigger the post-merge KB reindex, write the retro. Shared
+    # with each parallel-stage member. Best-effort; never blocks the advance.
+    await _merge_and_retro_loop_job(
+        job,
+        ctx=ctx,
+        loop=loop,
+        loop_id=loop_id,
+        actions=actions,
+        failed=failed,
+        last_error=last_error,
+    )
+
+    remaining = loop.get("remaining_iterations")
+    next_remaining = (remaining - 1) if remaining is not None else None
+
+    stop_reason = _loop_stop_reason(
+        loop, next_remaining=next_remaining, consecutive=consecutive
+    )
+    if stop_reason:
+        await postgres_db.update_project_loop(
+            str(loop_id),
+            status=("failed" if stop_reason == "failures" else "completed"),
+            remaining_iterations=next_remaining,
+            consecutive_failures=consecutive,
+            last_error=last_error,
+            stop_reason=stop_reason,
+            current_job_id=None,
+        )
+        actions.append(f"project loop {str(loop_id)[:8]} stopped ({stop_reason})")
+        return
+
+    # Rotate to the next stage and spawn it (1 or N jobs).
+    await _rotate_loop_to_next_stage(
+        loop,
+        seq_index_completed=int(loop.get("seq_index") or 0),
+        base_total=int(loop.get("total_jobs_run") or 0),
+        next_remaining=next_remaining,
+        consecutive=consecutive,
+        last_error=last_error,
+        actions=actions,
+    )
+
+
+async def _advance_loop_parallel_member(
+    job: dict[str, Any],
+    result: dict[str, Any],
+    actions: list[str],
+    *,
+    loop: dict[str, Any],
+    ctx: dict[str, Any],
+) -> None:
+    """Advance a loop when a member of its in-flight PARALLEL stage completes.
+
+    Each member merges + retros itself immediately (its artifact handling is
+    independent), then hits the barrier: ``claim_project_loop_stage_barrier``
+    drains the stage and returns True to exactly ONE caller — the member that
+    finishes last. Only that caller aggregates the stage outcome (a stage
+    counts as a failure only if EVERY member failed; one success resets the
+    consecutive counter), checks the stop conditions, and rotates to the next
+    stage. Every earlier finisher just does its own merge and backs off.
+
+    docs/features/loop_parallel_stages.md (Phase 1).
+    """
+    loop_id = str(loop["id"])
+    stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
+
+    failed = bool(result.get("error")) or job.get("status") == "failed"
+    member_error = (result.get("error") or "job failed") if failed else None
+
+    # Per-member artifact handling. The F29 execution-role check inside is a
+    # no-op here — parallel stages are validated analysis-only, so an `empty`
+    # merge (KB-only work) is expected, not lost work.
+    await _merge_and_retro_loop_job(
+        job,
+        ctx=ctx,
+        loop=loop,
+        loop_id=loop_id,
+        actions=actions,
+        failed=failed,
+        last_error=member_error,
+    )
+
+    # Barrier: only the last member to go terminal claims the rotate.
+    if not await postgres_db.claim_project_loop_stage_barrier(loop_id, str(job["id"])):
+        return  # an earlier finisher, a lost co-last race, or a stray hook
+
+    # Last out. Aggregate the stage outcome from the members' final statuses
+    # (captured from the pre-drain membership snapshot).
+    statuses = await postgres_db.get_loop_stage_member_statuses(stage_ids)
+    member_states = [statuses.get(mid, "failed") for mid in stage_ids]
+    all_failed = bool(member_states) and all(s == "failed" for s in member_states)
+    consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if all_failed else 0
+    last_error = "all stage jobs failed" if all_failed else None
+
+    remaining = loop.get("remaining_iterations")
+    next_remaining = (remaining - 1) if remaining is not None else None
+
+    stop_reason = _loop_stop_reason(
+        loop, next_remaining=next_remaining, consecutive=consecutive
+    )
+    if stop_reason:
+        await postgres_db.update_project_loop(
+            loop_id,
+            status=("failed" if stop_reason == "failures" else "completed"),
+            remaining_iterations=next_remaining,
+            consecutive_failures=consecutive,
+            last_error=last_error,
+            stop_reason=stop_reason,
+            current_job_id=None,
+            current_stage_jobs=[],
+        )
+        actions.append(f"project loop {str(loop_id)[:8]} stopped ({stop_reason})")
+        return
+
+    await _rotate_loop_to_next_stage(
+        loop,
+        seq_index_completed=int(loop.get("seq_index") or 0),
+        base_total=int(loop.get("total_jobs_run") or 0),
+        next_remaining=next_remaining,
+        consecutive=consecutive,
+        last_error=last_error,
+        actions=actions,
     )
 
 
@@ -10570,7 +10822,19 @@ async def _resume_project_loop(loop_id: str) -> dict[str, Any] | None:
     if not loop:
         return None
     cur = loop.get("current_job_id")
-    if cur:
+    stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
+    if stage_ids:
+        # A parallel stage was in flight when paused. Its barrier is gated on
+        # status='running', so any member that went terminal while paused
+        # didn't advance. Re-run the advance for one already-terminal member so
+        # the barrier can fire (the sweeper would eventually catch this too);
+        # members still running advance naturally on completion.
+        for mid in stage_ids:
+            mjob = await postgres_db.get_job(mid)
+            if mjob and mjob.get("status") in ("completed", "failed", "cancelled"):
+                await _advance_project_loop(mjob, {}, [])
+        loop = await postgres_db.get_project_loop(loop_id)
+    elif cur:
         cur_job = await postgres_db.get_job(str(cur))
         if cur_job and cur_job.get("status") in ("completed", "failed", "cancelled"):
             await _advance_project_loop(cur_job, {}, [])

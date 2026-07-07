@@ -49,6 +49,59 @@ def is_loop_execution_role(role: str | None) -> bool:
     return bool(role) and role not in LOOP_ANALYSIS_ROLES
 
 
+def normalize_stage(entry: Any) -> list[str]:
+    """Normalize one ``role_sequence`` entry to its list of concurrent roles.
+
+    The loop grammar (docs/features/loop_parallel_stages.md, Phase 1) lets an
+    entry be either a single role name (``"scholar"`` — a one-job stage) or a
+    list of role names (``["scholar", "product-qa"]`` — a fan-out stage whose
+    jobs run concurrently and barrier before the loop rotates). This collapses
+    both to a list so the spawn/advance code has one shape to handle. Raises
+    ValueError on a malformed entry so bad grammar fails at the boundary.
+    """
+    if isinstance(entry, str):
+        role = entry.strip()
+        if not role:
+            raise ValueError("role_sequence entry is an empty string")
+        return [role]
+    if isinstance(entry, (list, tuple)):
+        roles = [r.strip() for r in entry if isinstance(r, str) and r.strip()]
+        if not roles:
+            raise ValueError(f"role_sequence stage {entry!r} has no valid roles")
+        # De-dupe within a stage (a role twice in one fan-out = one job) while
+        # preserving order — two jobs of the same role would collide on branch
+        # name and race the same KB slot.
+        seen: set[str] = set()
+        deduped = [r for r in roles if not (r in seen or seen.add(r))]
+        return deduped
+    raise ValueError(f"role_sequence entry must be a string or list, got {type(entry)}")
+
+
+def validate_role_sequence(role_sequence: list[Any]) -> None:
+    """Validate loop grammar; raise ValueError on the first problem.
+
+    Enforces: non-empty sequence; every entry normalizes to ≥1 role; a fan-out
+    (multi-role) stage contains ONLY analysis roles. The last rule keeps the
+    single-writer-per-artifact invariant — two execution roles committing to
+    ``main`` concurrently would race the squash-merge — and matches the design:
+    parallel stages are additive *producers* (scholar ∥ product-qa) feeding a
+    single downstream consumer, never concurrent executors.
+    """
+    if not role_sequence:
+        raise ValueError("role_sequence must be non-empty")
+    for entry in role_sequence:
+        roles = normalize_stage(entry)
+        if len(roles) > 1:
+            execution = [r for r in roles if is_loop_execution_role(r)]
+            if execution:
+                raise ValueError(
+                    "parallel role_sequence stages may contain analysis roles "
+                    f"only (got execution role(s) {execution} in stage {roles}); "
+                    "a fan-out stage is additive producers feeding one consumer, "
+                    "not concurrent executors racing the merge."
+                )
+
+
 # Role-specific task blocks. Keyed by expert config name; unknown roles fall to
 # _ROLE_BLOCK_DEFAULT so the loop stays domain-agnostic (swap `developer` for a
 # `writer` / `default` execution role without code changes). Research-tuned:
@@ -263,6 +316,8 @@ async def create_loop_job(
     *,
     role: str,
     iteration: int,
+    seq_index: int | None = None,
+    remaining_iterations: int | None = None,
 ) -> dict[str, Any]:
     """Materialize ONE bare loop job for the given role + iteration.
 
@@ -275,6 +330,13 @@ async def create_loop_job(
     project's linked datasources explicitly (option A — mirrors the cockpit
     picker) so a repository datasource gives the execution role code continuity
     across iterations; resolution stays explicit-only.
+
+    When ``seq_index`` is given (always, when spawned through a stage), the
+    stage index and post-advance ``remaining_iterations`` are ALSO stamped into
+    context (``loop_seq_index`` / ``loop_remaining``). These are spawn-time
+    truth the torn-advance sweeper reads back directly to reconstruct the loop's
+    counters — robust to variable-width parallel stages, where the old
+    ``(iteration-1) % len(roles)`` modulo no longer maps job-count to stage.
     """
     loop_id = str(loop["id"])
     project_id = str(loop["project_id"]) if loop.get("project_id") else None
@@ -323,6 +385,13 @@ async def create_loop_job(
         "loop_iteration": iteration,
         "kickoff_message": kickoff,
     }
+    # Spawn-time counter stamps for the torn-advance heal (see docstring). Gated
+    # on seq_index so legacy single-job callers stay stamp-free and fall through
+    # to the sweeper's modulo derivation; loop_remaining is stamped alongside
+    # (None is authoritative — a deadline-only loop genuinely has no budget).
+    if seq_index is not None:
+        context["loop_seq_index"] = int(seq_index)
+        context["loop_remaining"] = remaining_iterations
 
     # Resolve the role NAME to a DB expert_id when DB-backed experts are on, so a
     # custom expert in the rotation pulls its OWN overlay (model, prompts, tools)

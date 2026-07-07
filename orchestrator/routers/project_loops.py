@@ -45,7 +45,11 @@ class ProjectLoopStart(BaseModel):
     """
 
     model: str | None = Field(None, max_length=200)
-    role_sequence: list[str] | None = None
+    # Each entry is either a single role name (a one-job stage) or a list of
+    # role names (a fan-out stage that runs concurrently and barriers before the
+    # loop rotates — e.g. [["scholar", "product-qa"], "critic"]). Fan-out stages
+    # must be analysis-only (validated at start). loop_parallel_stages.md.
+    role_sequence: list[str | list[str]] | None = None
     max_iterations: int | None = Field(None, ge=1, le=1000)
     run_until: datetime | None = None
     acceptance_criteria: str | None = Field(None, max_length=8000)
@@ -67,7 +71,12 @@ async def start_project_loop(
     (running|paused) loop. The first job is the first role in ``role_sequence``;
     everything after is driven by the completion hook.
     """
-    from main import _spawn_loop_job, postgres_db  # late import: avoid circular
+    from main import (  # late import: avoid circular
+        _spawn_loop_stage,
+        _writeback_loop_stage,
+        postgres_db,
+    )
+    from services.project_loops import validate_role_sequence
 
     caller = await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="editor")
@@ -90,11 +99,12 @@ async def start_project_loop(
             )
 
     roles = body.role_sequence or ["scholar", "critic", "developer"]
-    if not roles or not all(isinstance(r, str) and r.strip() for r in roles):
-        raise HTTPException(
-            status_code=400,
-            detail="role_sequence must be a non-empty list of expert config names.",
-        )
+    # Grammar: non-empty; every entry normalizes to ≥1 role; fan-out (multi-role)
+    # stages are analysis-only (no execution role racing the merge).
+    try:
+        validate_role_sequence(roles)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     # Workspace tier override (mirrors `model`). Normalise blank → None; reject
     # unknown tiers up front. If `vm`, enforce the same VM permission the
@@ -140,13 +150,20 @@ async def start_project_loop(
         workspace_backend=workspace_backend,
     )
 
-    # Spawn the first job and point the loop at it. If the first spawn fails,
-    # mark the loop failed and surface a 502 — don't leave a running loop with
-    # no in-flight job (the advance hook would never fire).
+    # Spawn the first stage (1 job for a single-role entry, N concurrent jobs
+    # for a fan-out) and point the loop at it. If the spawn fails, mark the loop
+    # failed and surface a 502 — don't leave a running loop with no in-flight
+    # job/stage (the advance hook would never fire).
     try:
-        first = await _spawn_loop_job(loop, role=roles[0], iteration=1)
+        jobs, new_total = await _spawn_loop_stage(
+            loop,
+            stage=roles[0],
+            seq_index=0,
+            base_total=0,
+            remaining=loop.get("remaining_iterations"),
+        )
     except Exception as e:
-        logger.exception("Failed to spawn first job for loop %s", loop["id"])
+        logger.exception("Failed to spawn first stage for loop %s", loop["id"])
         await postgres_db.update_project_loop(
             str(loop["id"]),
             status="failed",
@@ -157,10 +174,14 @@ async def start_project_loop(
             status_code=502, detail=f"Loop created but first job failed to start: {e}"
         ) from e
 
-    updated = await postgres_db.update_project_loop(
+    updated = await _writeback_loop_stage(
         str(loop["id"]),
-        current_job_id=str(first["id"]),
-        total_jobs_run=1,
+        jobs=jobs,
+        seq_index=0,
+        remaining=loop.get("remaining_iterations"),
+        total=new_total,
+        consecutive=0,
+        last_error=None,
     )
     return updated or loop
 
