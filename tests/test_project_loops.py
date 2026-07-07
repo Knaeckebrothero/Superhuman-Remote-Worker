@@ -12,7 +12,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.project_loops import create_loop_job
+from services.project_loops import (
+    build_loop_description,
+    build_loop_kickoff,
+    create_loop_job,
+)
 
 
 def _loop(**over):
@@ -78,3 +82,33 @@ async def test_model_and_backend_coexist_with_bare_invariants():
     assert co["scholar"] == {"enabled": False}
     assert co["autonomy"] == "full"
     assert co["memory"] == {"required": True}
+
+
+class TestProductQaLoopWiring:
+    """Phase 0 wiring for the product-qa role (docs/features/loop_parallel_stages.md):
+    the loop must give it a QA-specific kickoff (not the generic default) and the
+    Critic must be told to triage QA findings alongside Scholar proposals."""
+
+    def test_product_qa_gets_specific_role_block_not_default(self) -> None:
+        kick = build_loop_kickoff(_loop(), role="product-qa", iteration=4)
+        assert "YOUR ROLE THIS ITERATION — PRODUCT-QA:" in kick
+        # QA-specific, not the "advance the goal acting as 'product-qa'" default.
+        assert "advance the goal acting as" not in kick
+        # Core QA behaviors: audits shipped product, files findings, doesn't fix.
+        assert "qa-finding" in kick
+        low = kick.lower()
+        assert "do not fix" in low or "do not fix anything" in low
+        assert "scholar" in low  # counterpart framing / be-fair-to-scholar
+
+    def test_product_qa_description_is_specific(self) -> None:
+        desc = build_loop_description(_loop(), role="product-qa", iteration=4)
+        assert "PRODUCT-QA" in desc
+        assert "audit" in desc.lower()
+
+    def test_critic_block_triages_both_streams(self) -> None:
+        kick = build_loop_kickoff(_loop(), role="critic", iteration=5)
+        low = kick.lower()
+        # Critic must see BOTH candidate streams and treat fix-vs-build as a choice.
+        assert "proposal" in low
+        assert "qa-finding" in kick
+        assert "first-class" in low

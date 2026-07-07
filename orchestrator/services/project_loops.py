@@ -36,7 +36,12 @@ logger = logging.getLogger(__name__)
 # (developer / default / a future writer), so analysis is the closed set and
 # everything else is treated as execution.
 # See docs/features/loop_repo_compounding_v2.md.
-LOOP_ANALYSIS_ROLES: frozenset[str] = frozenset({"scholar", "critic"})
+#
+# product-qa audits the SHIPPED product (missing UI, broken setup, integration
+# gaps) and files issue candidates as KB notes — it never touches `repo/`, so an
+# `empty` merge is normal, not lost work. It coordinates through the KB exactly
+# like scholar/critic. Wiring per docs/features/loop_parallel_stages.md (Phase 0).
+LOOP_ANALYSIS_ROLES: frozenset[str] = frozenset({"scholar", "critic", "product-qa"})
 
 
 def is_loop_execution_role(role: str | None) -> bool:
@@ -73,15 +78,24 @@ _ROLE_BLOCKS: dict[str, str] = {
         "research scratch belongs in the KB, not the repo."
     ),
     "critic": (
-        "Select and prioritise among the open proposals AGAINST THE DEFINITION "
-        "OF DONE — not your own confidence. Verify any claimed progress at the "
+        "Select and prioritise among ALL open work candidates AGAINST THE "
+        "DEFINITION OF DONE — not your own confidence. Two kinds compete on ONE "
+        "rubric: Scholar's new-feature `proposal` notes (build something new) and "
+        "Product-QA's `qa-finding` issue notes (fix or integrate what exists). "
+        "Choosing a fix over a feature is a first-class outcome — a shipped module "
+        "no user can reach, a broken setup, or a missing product surface can "
+        "outweigh yet another new backend slice. Judge every candidate on "
+        "user-visible value, product-stability risk of ignoring it, leverage of "
+        "already-shipped work, implementation size, and evidence quality. Verify "
+        "any claimed progress at the "
         "GOAL level, not surface checks (do not approve merely because code "
         "compiles or has no leftover TODOs). Fan independent verification "
         "streams out to subagents (multiple spawn_subagent calls in one turn) "
         "and keep your own context for judging — the verdict stays yours. "
         "Write a `decision` note tagged "
         "`verdict`: the single chosen next action, explicit rationale, and how it "
-        "will be checked. Then mark every non-selected proposal `superseded` "
+        "will be checked. Then mark every non-selected candidate of BOTH kinds "
+        "`superseded` "
         "(ranking is NOT rejection — flip their status) so the tried/rejected "
         "record is real and nobody re-proposes a dead end. The loop is "
         "UNCONDITIONAL — it does not stop on 'done'; if the system already meets "
@@ -109,6 +123,34 @@ _ROLE_BLOCKS: dict[str, str] = {
         "is kept out of it for you; partial work is safe on your branch). "
         "Record in the KB what you shipped and any follow-ups."
     ),
+    "product-qa": (
+        "Audit the CURRENT application as a product a real user must operate — "
+        "not as a codebase. You are Scholar's counterpart: Scholar looks OUTWARD "
+        "for new opportunities; you look INWARD for what is broken, missing, or "
+        "unusable in what already exists. Exercise the product: run setup from a "
+        "fresh checkout, launch any UI/CLI/API/demo path, check that shipped "
+        "modules are reachable in one workflow, look for regressions, setup "
+        "failures, integration gaps, and documentation holes. A tested backend "
+        "module that no user can reach IS a product gap — missing product "
+        "surfaces (no UI, no demo path, no persistence) are legitimate HIGH "
+        "findings even when every unit test passes; the evidence for an absence "
+        "is the audit trail (paths searched, commands run, expected-vs-observed), "
+        "not a reproduction. First check the KB for findings already filed (UPDATE "
+        "them, don't re-file duplicates) and `retros/` on the repo for what prior "
+        "iterations actually landed. Then file 3-7 issue candidates MAXIMUM — "
+        "high-leverage over a long bug list — each as a `plan` note tagged "
+        "`qa-finding` carrying: severity, confidence, target user/workflow, "
+        "evidence, smallest useful remediation, acceptance criteria, and an "
+        "explicit Critic-selection argument (why this should or should not beat a "
+        "new Scholar feature). Do NOT fix anything and do NOT propose new features "
+        "— repairing is the Developer's job, new ideas are Scholar's lane; writing "
+        "a repro script or audit transcript is fine but it is not the handoff, the "
+        "KB notes are. If the product is genuinely stable and usable, SAY SO in "
+        "one summary note and recommend the Critic select a Scholar proposal — "
+        "being fair to Scholar is part of the role, not a failure to find work. "
+        "Your output is issue-candidate notes, not repo commits. You work on your "
+        "own branch; an empty merge is expected — your findings live in the KB."
+    ),
 }
 
 _ROLE_BLOCK_DEFAULT = (
@@ -123,6 +165,7 @@ _ROLE_BLOCK_DEFAULT = (
 # goal instead of the identical multi-paragraph preamble.
 _ROLE_TASKS: dict[str, str] = {
     "scholar": "research the domain & propose distinct improvements",
+    "product-qa": "audit the current product & file issue candidates",
     "critic": "select & prioritise the next improvement",
     "developer": "implement the chosen action",
 }

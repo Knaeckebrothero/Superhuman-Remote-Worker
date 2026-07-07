@@ -499,6 +499,14 @@ class TestIsLoopExecutionRole:
         assert is_loop_execution_role("scholar") is False
         assert is_loop_execution_role("critic") is False
 
+    def test_product_qa_is_analysis_not_execution(self) -> None:
+        # product-qa audits the shipped product and writes KB findings only —
+        # it never touches repo/, so an empty merge is normal, not F29 lost work.
+        # docs/features/loop_parallel_stages.md (Phase 0).
+        from services.project_loops import is_loop_execution_role
+
+        assert is_loop_execution_role("product-qa") is False
+
     def test_execution_roles(self) -> None:
         from services.project_loops import is_loop_execution_role
 
