@@ -764,8 +764,10 @@ CREATE TABLE public.project_loops (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     workspace_backend text,
+    current_stage_jobs jsonb DEFAULT '[]'::jsonb NOT NULL,
     CONSTRAINT project_loop_has_budget CHECK (((max_iterations IS NOT NULL) OR (run_until IS NOT NULL))),
     CONSTRAINT project_loop_role_sequence_nonempty CHECK (((jsonb_typeof(role_sequence) = 'array'::text) AND (jsonb_array_length(role_sequence) >= 1))),
+    CONSTRAINT project_loop_stage_jobs_is_array CHECK ((jsonb_typeof(current_stage_jobs) = 'array'::text)),
     CONSTRAINT project_loop_workspace_backend_valid CHECK (((workspace_backend IS NULL) OR (workspace_backend = ANY (ARRAY['sandbox'::text, 'vm'::text, 'virtual'::text, 'none'::text])))),
     CONSTRAINT project_loops_status_check CHECK ((status = ANY (ARRAY['running'::text, 'paused'::text, 'stopped'::text, 'completed'::text, 'failed'::text])))
 );
@@ -804,6 +806,13 @@ COMMENT ON COLUMN public.project_loops.stop_reason IS 'Why the loop ended: budge
 --
 
 COMMENT ON COLUMN public.project_loops.workspace_backend IS 'Optional per-loop workspace tier override. NULL = each spawned job uses the default (sandbox). When set, create_loop_job injects config_override.workspace.backend for every job — e.g. ''vm'' gives every role a root VM. Mirrors the per-loop model override.';
+
+
+--
+-- Name: COLUMN project_loops.current_stage_jobs; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_loops.current_stage_jobs IS 'In-flight members of a parallel (fan-out) role_sequence stage — the jobs the loop barriers on before rotating. Empty for single-role stages, which use current_job_id instead. Populated by the advance/start spawn; drained to [] by the atomic last-member barrier. docs/features/loop_parallel_stages.md.';
 
 
 --

@@ -16,6 +16,8 @@ from services.project_loops import (
     build_loop_description,
     build_loop_kickoff,
     create_loop_job,
+    normalize_stage,
+    validate_role_sequence,
 )
 
 
@@ -47,6 +49,10 @@ def _db():
 
 def _config_override(db):
     return db.create_job.call_args.kwargs["config_override"]
+
+
+def _context(db):
+    return db.create_job.call_args.kwargs["context"]
 
 
 @pytest.mark.asyncio
@@ -112,3 +118,119 @@ class TestProductQaLoopWiring:
         assert "proposal" in low
         assert "qa-finding" in kick
         assert "first-class" in low
+
+
+class TestNormalizeStage:
+    """The parallel-stage grammar: a role_sequence entry is a single role name
+    (one-job stage) or a list of role names (fan-out). docs/features/loop_parallel_stages.md."""
+
+    def test_single_role_string(self) -> None:
+        assert normalize_stage("scholar") == ["scholar"]
+
+    def test_strips_whitespace(self) -> None:
+        assert normalize_stage("  scholar  ") == ["scholar"]
+
+    def test_list_of_roles(self) -> None:
+        assert normalize_stage(["scholar", "product-qa"]) == ["scholar", "product-qa"]
+
+    def test_dedupes_within_stage_preserving_order(self) -> None:
+        # Two jobs of the same role would collide on branch name / KB slot.
+        assert normalize_stage(["scholar", "scholar", "product-qa"]) == [
+            "scholar",
+            "product-qa",
+        ]
+
+    def test_tuple_accepted(self) -> None:
+        assert normalize_stage(("scholar", "product-qa")) == ["scholar", "product-qa"]
+
+    def test_empty_string_raises(self) -> None:
+        with pytest.raises(ValueError):
+            normalize_stage("   ")
+
+    def test_empty_list_raises(self) -> None:
+        with pytest.raises(ValueError):
+            normalize_stage([])
+
+    def test_list_of_blanks_raises(self) -> None:
+        with pytest.raises(ValueError):
+            normalize_stage(["", "  "])
+
+    def test_wrong_type_raises(self) -> None:
+        with pytest.raises(ValueError):
+            normalize_stage(42)
+
+
+class TestValidateRoleSequence:
+    """Grammar validation at the start boundary: fan-out stages are analysis-only."""
+
+    def test_single_role_sequence_ok(self) -> None:
+        validate_role_sequence(["scholar", "critic", "developer"])
+
+    def test_parallel_analysis_stage_ok(self) -> None:
+        validate_role_sequence([["scholar", "product-qa"], "critic", "developer"])
+
+    def test_single_execution_role_ok(self) -> None:
+        # A lone execution role is fine — only a *fan-out* may not contain one.
+        validate_role_sequence(["developer"])
+
+    def test_empty_sequence_raises(self) -> None:
+        with pytest.raises(ValueError):
+            validate_role_sequence([])
+
+    def test_execution_role_in_fan_out_raises(self) -> None:
+        # developer commits to `main`; two concurrent committers race the merge.
+        with pytest.raises(ValueError, match="analysis roles"):
+            validate_role_sequence([["scholar", "developer"], "critic"])
+
+    def test_malformed_entry_raises(self) -> None:
+        with pytest.raises(ValueError):
+            validate_role_sequence(["scholar", []])
+
+
+class TestLoopCounterStamps:
+    """create_loop_job stamps loop_seq_index / loop_remaining into a spawned
+    job's context (spawn-time truth the torn-advance sweeper reads back)."""
+
+    @pytest.mark.asyncio
+    async def test_stamps_present_when_seq_index_given(self) -> None:
+        db = _db()
+        await create_loop_job(
+            db,
+            _loop(),
+            role="scholar",
+            iteration=2,
+            seq_index=0,
+            remaining_iterations=7,
+        )
+        ctx = _context(db)
+        assert ctx["loop_seq_index"] == 0
+        assert ctx["loop_remaining"] == 7
+        assert ctx["loop_iteration"] == 2
+        assert ctx["loop_role"] == "scholar"
+
+    @pytest.mark.asyncio
+    async def test_remaining_none_is_stamped(self) -> None:
+        # Deadline-only loop: remaining is genuinely None, and that's recorded
+        # (the sweeper uses loop_seq_index's presence as the "stamped" sentinel).
+        db = _db()
+        await create_loop_job(
+            db,
+            _loop(),
+            role="critic",
+            iteration=3,
+            seq_index=1,
+            remaining_iterations=None,
+        )
+        ctx = _context(db)
+        assert ctx["loop_seq_index"] == 1
+        assert ctx["loop_remaining"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_stamps_when_seq_index_absent(self) -> None:
+        # Legacy call path (no seq_index) stays stamp-free → sweeper falls back
+        # to modulo derivation.
+        db = _db()
+        await create_loop_job(db, _loop(), role="scholar", iteration=1)
+        ctx = _context(db)
+        assert "loop_seq_index" not in ctx
+        assert "loop_remaining" not in ctx
