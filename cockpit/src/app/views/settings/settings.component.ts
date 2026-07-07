@@ -18,7 +18,6 @@ import {
     CodexStatus,
     CodexUsage,
     CommunicationSettings,
-    LlmEndpointTestResult,
     McpTokenCreateResponse,
     Project,
     ReadAloudReasoningLevel
@@ -456,118 +455,6 @@ const EXPIRY_OPTIONS = [
               (clicked)="saveApiKey()"
             >
               {{ settingKey() ? ('common.saving' | transloco) : ('settings.apiKeys.saveButton' | transloco) }}
-            </app-button>
-          </div>
-        </section>
-
-        <!-- LLM Endpoints Section -->
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.llmEndpoints.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.llmEndpoints.desc' | transloco }}</p>
-
-          @if (settingsService.llmEndpoints().length > 0) {
-            @for (endpoint of settingsService.llmEndpoints(); track endpoint.id) {
-              <div class="endpoint-card">
-                <div class="endpoint-head">
-                  <div class="endpoint-title">
-                    <strong>{{ endpoint.label }}</strong>
-                    <span class="endpoint-url mono">{{ endpoint.base_url }}</span>
-                    @if (endpoint.key_prefix) {
-                      <span class="endpoint-key mono">key {{ endpoint.key_prefix }}...</span>
-                    } @else {
-                      <span class="endpoint-key muted">{{ 'settings.llmEndpoints.noKey' | transloco }}</span>
-                    }
-                  </div>
-                  <div class="endpoint-actions">
-                    <app-button
-                      variant="secondary"
-                      size="sm"
-                      [loading]="testingEndpointId() === endpoint.id"
-                      [disabled]="testingEndpointId() === endpoint.id"
-                      (clicked)="testLlmEndpoint(endpoint.id)"
-                    >
-                      {{ testingEndpointId() === endpoint.id
-                          ? ('settings.llmEndpoints.testing' | transloco)
-                          : ('settings.llmEndpoints.testButton' | transloco) }}
-                    </app-button>
-                    <app-button variant="danger" size="sm" (clicked)="deleteLlmEndpoint(endpoint.id)">
-                      {{ 'common.delete' | transloco }}
-                    </app-button>
-                  </div>
-                </div>
-
-                @if (testResults()[endpoint.id]; as result) {
-                  <div
-                    class="test-result"
-                    [class.ok]="result.ok"
-                    [class.err]="!result.ok"
-                  >
-                    @if (result.ok) {
-                      {{ 'settings.llmEndpoints.testOk' | transloco: {status: result.status} }}
-                    } @else {
-                      {{ 'settings.llmEndpoints.testFail' | transloco:
-                        {status: result.status ?? '-',
-                         error: result.error ?? ''} }}
-                    }
-                  </div>
-                }
-
-                <p class="catalog-hint">
-                  {{ 'settings.llmEndpoints.catalogHint' | transloco }}
-                </p>
-              </div>
-            }
-          } @else {
-            <p class="empty-state">{{ 'settings.llmEndpoints.empty' | transloco }}</p>
-          }
-
-          <!-- Create endpoint form -->
-          <div class="create-form">
-            <h3 class="form-title">{{ 'settings.llmEndpoints.addTitle' | transloco }}</h3>
-            <div class="form-row two-col">
-              <app-input
-                [value]="newEndpointLabel()"
-                [placeholder]="'settings.llmEndpoints.labelPlaceholder' | transloco"
-                [disabled]="creatingEndpoint()"
-                (changed)="newEndpointLabel.set($event)"
-              />
-              <app-input
-                [value]="newEndpointBaseUrl()"
-                [placeholder]="'settings.llmEndpoints.baseUrlPlaceholder' | transloco"
-                [disabled]="creatingEndpoint()"
-                (changed)="newEndpointBaseUrl.set($event)"
-              />
-            </div>
-            <div class="form-row">
-              <app-input
-                type="password"
-                [value]="newEndpointApiKey()"
-                [placeholder]="'settings.llmEndpoints.apiKeyPlaceholder' | transloco"
-                [disabled]="creatingEndpoint()"
-                (changed)="newEndpointApiKey.set($event)"
-              />
-            </div>
-            <app-checkbox
-              size="sm"
-              [checked]="newEndpointAllowInsecure()"
-              [disabled]="creatingEndpoint()"
-              (changed)="newEndpointAllowInsecure.set($event)"
-            >
-              {{ 'settings.llmEndpoints.allowInsecure' | transloco }}
-            </app-checkbox>
-            @if (endpointFormError()) {
-              <p class="form-error">{{ endpointFormError() }}</p>
-            }
-            <app-button
-              variant="primary"
-              size="md"
-              [loading]="creatingEndpoint()"
-              [disabled]="creatingEndpoint() || !newEndpointLabel().trim() || !newEndpointBaseUrl().trim()"
-              (clicked)="createLlmEndpoint()"
-            >
-              {{ creatingEndpoint()
-                  ? ('common.saving' | transloco)
-                  : ('settings.llmEndpoints.createButton' | transloco) }}
             </app-button>
           </div>
         </section>
@@ -1572,69 +1459,6 @@ const EXPIRY_OPTIONS = [
     }
     .time-input:focus { border-color: var(--accent-color); }
 
-    /* LLM Endpoints */
-    .endpoint-card {
-      border: 1px solid var(--border-color);
-      border-radius: var(--radius-surface);
-      padding: 12px;
-      margin-bottom: 12px;
-      background: var(--surface-0);
-    }
-
-    .endpoint-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-
-    .endpoint-title {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-      min-width: 0;
-    }
-
-    .endpoint-url {
-      font-size: 12px;
-      color: var(--text-muted);
-      word-break: break-all;
-    }
-
-    .endpoint-key {
-      font-size: 11px;
-      color: var(--text-muted);
-    }
-
-    .endpoint-key.muted {
-      font-style: italic;
-    }
-
-    .endpoint-actions {
-      display: flex;
-      gap: 8px;
-      flex-shrink: 0;
-    }
-
-    .test-result {
-      font-size: 12px;
-      padding: 6px 10px;
-      border-radius: var(--radius-control);
-      margin-bottom: 10px;
-    }
-
-    .test-result.ok {
-      background: var(--success-tint);
-      color: var(--success);
-    }
-
-    .test-result.err {
-      background: var(--danger-tint);
-      color: var(--danger);
-      word-break: break-word;
-    }
-
     .form-error {
       color: var(--danger);
       font-size: 12px;
@@ -1650,12 +1474,6 @@ const EXPIRY_OPTIONS = [
       margin: 16px 0 8px;
       padding-top: 12px;
       border-top: 1px solid var(--border-color);
-    }
-
-    .catalog-hint {
-      font-size: 12px;
-      color: var(--text-muted);
-      margin: 0;
     }
 
     /* Instructions */
@@ -2490,16 +2308,6 @@ export class SettingsComponent implements OnInit {
   readonly keyLabel = signal('');
   readonly settingKey = signal(false);
 
-  // LLM endpoint form state
-  readonly newEndpointLabel = signal('');
-  readonly newEndpointBaseUrl = signal('');
-  readonly newEndpointApiKey = signal('');
-  readonly newEndpointAllowInsecure = signal(false);
-  readonly creatingEndpoint = signal(false);
-  readonly endpointFormError = signal<string>('');
-  readonly testingEndpointId = signal<string | null>(null);
-  readonly testResults = signal<Record<string, LlmEndpointTestResult>>({});
-
   // Preferences form state — null = user hasn't overridden, use resolved default
   readonly prefModel = signal<string | null>(null);
   readonly prefAuxModel = signal<string | null>(null);
@@ -2711,7 +2519,6 @@ export class SettingsComponent implements OnInit {
     this.modelService.load();
     this.tokenService.loadTokens();
     this.settingsService.loadApiKeys();
-    this.settingsService.loadLlmEndpoints();
     this.settingsService.loadPreferences();
     // Admin-only loaders (codex status + cloud settings) are triggered
     // by the effect in the constructor — that path waits for currentUser()
@@ -2843,86 +2650,6 @@ export class SettingsComponent implements OnInit {
 
   deleteApiKey(provider: string): void {
     this.settingsService.deleteApiKey(provider).subscribe();
-  }
-
-  // ── LLM Endpoints ─────────────────────────────────────────────────
-
-  createLlmEndpoint(): void {
-    const label = this.newEndpointLabel().trim();
-    const baseUrl = this.newEndpointBaseUrl().trim();
-    if (!label || !baseUrl) return;
-
-    const httpsLike = /^https?:\/\//i.test(baseUrl);
-    if (!httpsLike) {
-      this.endpointFormError.set(
-        this.transloco.translate('settings.llmEndpoints.errorUrlScheme'),
-      );
-      return;
-    }
-    if (baseUrl.startsWith('http://') && !this.newEndpointAllowInsecure()) {
-      this.endpointFormError.set(
-        this.transloco.translate('settings.llmEndpoints.errorHttpNeedsOptIn'),
-      );
-      return;
-    }
-
-    this.endpointFormError.set('');
-    this.creatingEndpoint.set(true);
-    this.settingsService
-      .createLlmEndpoint({
-        label,
-        base_url: baseUrl,
-        api_key: this.newEndpointApiKey().trim() || null,
-        allow_insecure: this.newEndpointAllowInsecure(),
-      })
-      .subscribe({
-        next: () => {
-          this.newEndpointLabel.set('');
-          this.newEndpointBaseUrl.set('');
-          this.newEndpointApiKey.set('');
-          this.newEndpointAllowInsecure.set(false);
-          this.creatingEndpoint.set(false);
-        },
-        error: (err) => {
-          this.creatingEndpoint.set(false);
-          const detail = err?.error?.detail ?? err?.message ?? 'Failed';
-          this.endpointFormError.set(String(detail));
-        },
-      });
-  }
-
-  deleteLlmEndpoint(endpointId: string): void {
-    const msg = this.transloco.translate('settings.llmEndpoints.confirmDelete');
-    if (!window.confirm(msg)) return;
-    this.settingsService.deleteLlmEndpoint(endpointId).subscribe({
-      next: () => {
-        const next = {...this.testResults()};
-        delete next[endpointId];
-        this.testResults.set(next);
-      },
-    });
-  }
-
-  testLlmEndpoint(endpointId: string): void {
-    this.testingEndpointId.set(endpointId);
-    this.settingsService.testLlmEndpoint(endpointId).subscribe({
-      next: (result) => {
-        this.testResults.set({...this.testResults(), [endpointId]: result});
-        this.testingEndpointId.set(null);
-      },
-      error: (err) => {
-        this.testResults.set({
-          ...this.testResults(),
-          [endpointId]: {
-            ok: false,
-            status: null,
-            error: err?.error?.detail ?? err?.message ?? 'Request failed',
-            probe_url: '',
-          },
-        });
-        this.testingEndpointId.set(null);
-      },
-    });
   }
 
   // ── Preferences ───────────────────────────────────────────────────

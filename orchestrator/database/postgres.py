@@ -5595,33 +5595,12 @@ class PostgresDB:
         return resolved
 
     # =========================================================================
-    # USER LLM ENDPOINT OPERATIONS
+    # LLM ENDPOINT TRANSPORT LOOKUP
+    # Dispatch-time fetch of an endpoint row (base_url + api_key) by id, used
+    # by the model resolver / credential injector. The user-facing endpoint
+    # CRUD was removed with the Settings → LLM Endpoints page; custom endpoints
+    # are admin-only now (Admin → Providers + Admin → Models).
     # =========================================================================
-
-    async def list_user_llm_endpoints(self, user_id: str) -> List[Dict[str, Any]]:
-        """List a user's LLM endpoints with their model rows.
-
-        Returns one dict per endpoint with a nested ``models`` list.
-        API keys are never returned — only ``key_prefix`` for display.
-        """
-        async with self.acquire() as conn:
-            endpoint_rows = await conn.fetch(
-                """
-                SELECT id, label, base_url, key_prefix, created_at, updated_at
-                FROM llm_endpoints
-                WHERE user_id = $1
-                ORDER BY label
-                """,
-                UUID(user_id),
-            )
-            if not endpoint_rows:
-                return []
-
-        # Endpoint-model rows used to live on user_llm_endpoint_models; that
-        # table was retired when the admin-curated catalog became the
-        # single source of truth. The "models" key is kept on the response
-        # for shape compatibility with the Cockpit endpoints page.
-        return [dict(e, models=[]) for e in endpoint_rows]
 
     async def get_user_llm_endpoint(
         self, endpoint_id: str, user_id: str | None = None
@@ -5652,98 +5631,12 @@ class PostgresDB:
         )
         return result
 
-    async def create_user_llm_endpoint(
-        self,
-        user_id: str,
-        label: str,
-        base_url: str,
-        api_key: str | None,
-        key_prefix: str | None,
-    ) -> Dict[str, Any]:
-        """Create a new LLM endpoint for a user. Label must be unique per user."""
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO llm_endpoints
-                    (user_id, label, base_url, api_key, key_prefix)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, label, base_url, key_prefix, created_at, updated_at
-                """,
-                UUID(user_id),
-                label,
-                base_url,
-                _encrypt_optional(api_key),
-                key_prefix,
-            )
-            return dict(row)
-
-    async def update_user_llm_endpoint(
-        self,
-        endpoint_id: str,
-        user_id: str,
-        label: str | None = None,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        key_prefix: str | None = None,
-        clear_api_key: bool = False,
-    ) -> Dict[str, Any] | None:
-        """Patch an endpoint. Only non-None fields are updated.
-
-        ``clear_api_key=True`` explicitly nulls the key (for endpoints that
-        transition from authenticated to anonymous).
-        """
-        sets: List[str] = []
-        args: List[Any] = [UUID(endpoint_id), UUID(user_id)]
-        param_idx = 3
-        if label is not None:
-            sets.append(f"label = ${param_idx}")
-            args.append(label)
-            param_idx += 1
-        if base_url is not None:
-            sets.append(f"base_url = ${param_idx}")
-            args.append(base_url)
-            param_idx += 1
-        if clear_api_key:
-            sets.append("api_key = NULL")
-            sets.append("key_prefix = NULL")
-        elif api_key is not None:
-            sets.append(f"api_key = ${param_idx}")
-            args.append(encrypt(api_key))
-            param_idx += 1
-            if key_prefix is not None:
-                sets.append(f"key_prefix = ${param_idx}")
-                args.append(key_prefix)
-                param_idx += 1
-
-        if not sets:
-            # Nothing to change — return current row.
-            return await self.get_user_llm_endpoint(endpoint_id, user_id)
-
-        sets.append("updated_at = CURRENT_TIMESTAMP")
-        query = f"""
-            UPDATE llm_endpoints
-            SET {", ".join(sets)}
-            WHERE id = $1 AND user_id = $2
-            RETURNING id, label, base_url, key_prefix, created_at, updated_at
-        """
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(query, *args)
-            return dict(row) if row else None
-
-    async def delete_user_llm_endpoint(self, endpoint_id: str, user_id: str) -> bool:
-        """Delete an endpoint and cascade to its model rows."""
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM llm_endpoints WHERE id = $1 AND user_id = $2",
-                UUID(endpoint_id),
-                UUID(user_id),
-            )
-            return result == "DELETE 1"
-
-    # The user-side endpoint-model accessors (create/update/delete/resolve)
-    # were removed when the admin-curated `models` catalog became the single
-    # source of truth. User-scoped endpoints survive as transports only;
-    # offerings are resolved via PostgresDB.resolve_catalog_model.
+    # The user-side endpoint CRUD (create/update/delete) and endpoint-model
+    # accessors were removed when the admin-curated `models` catalog became the
+    # single source of truth and the Settings → LLM Endpoints page was retired.
+    # User-scoped endpoints survive as transports only; offerings are resolved
+    # via PostgresDB.resolve_catalog_model (system-scoped rows only). System
+    # endpoint CRUD lives in the *_system_llm_endpoint methods below.
 
     # =========================================================================
     # SYSTEM API KEY OPERATIONS

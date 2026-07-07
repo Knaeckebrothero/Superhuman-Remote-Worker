@@ -39,8 +39,8 @@ class UnknownModelError(LookupError):
     def __init__(self, model_id: str) -> None:
         super().__init__(
             f"Unknown model '{model_id}'. Configure it via Admin → Models "
-            f"(catalog row anchored to a system API key or system endpoint), "
-            f"or as a per-user endpoint via /api/settings/llm-endpoints."
+            f"(a catalog row anchored to a system API key or a system endpoint "
+            f"registered under Admin → Providers)."
         )
         self.model_id = model_id
 
