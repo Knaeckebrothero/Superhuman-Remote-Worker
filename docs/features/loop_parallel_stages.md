@@ -225,7 +225,7 @@ Minimal: the loop status payload (`GET /api/projects/{id}/loop`) adds `current_s
 1. **Budget display vs. semantics** — iteration=stage is decided above for invariant-preservation, but should `remaining_iterations` in the cockpit show "(≈N jobs)" to prevent misreading? (Cheap; recommend yes.)
 2. **QA depth cadence** — every cycle a full product audit may be repetitive once findings stabilize. Later: alternate light/deep QA missions via the kickoff (no schema impact), or let the Critic's verdict steer next cycle's QA charter.
 3. **Stage width > 2** — nothing in the design caps width (e.g. adding a `security-auditor` later), but rate limits (concurrent tokens/RPM against the provider) and workspace capacity do. Cap validation at, say, 4?
-4. **Critic prompt-level filtering** — should the Critic's KB read explicitly query both tags, or is recency-boosted hybrid search enough to surface both streams? Phase 0's k3d run answers this empirically before Phase 1 lands.
+4. **Critic prompt-level filtering** — should the Critic's KB read explicitly query both tags, or is recency-boosted hybrid search enough to surface both streams? Phase 0's k3d run answers this empirically before Phase 1 lands. Related, same surface: the Critic currently *sees which producer authored each candidate*, which risks LLM-judge identity bias — captured as a tackle-later item in [`../issues/loop_critic_producer_identity_bias.md`](../issues/loop_critic_producer_identity_bias.md) (note the catch: build-vs-fix triage needs the *category*, just not the *author*).
 
 ## Risks
 

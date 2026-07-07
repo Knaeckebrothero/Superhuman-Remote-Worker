@@ -68,13 +68,62 @@ Smallest useful fix. If the issue needs a multi-iteration epic, define the first
 Simple bullets are preferred for handoff to whoever triages and fixes the issue. Use Gherkin only when it clarifies behavior.
 
 ## Prioritization Argument
-State the factors a triager weighs — user-visible value, the risk of leaving it unfixed, and leverage on already-shipped work — as evidence, not persuasion. Severity is impact; priority is urgency — keep them distinct. Present the case and let the triager decide. (In a loop where findings compete with new-feature proposals, this is what the Critic weighs — give it facts, not a hard sell.)
+Give the triager the factors to weigh — user-visible value, the risk of leaving it unfixed, and leverage on already-shipped work — as evidence, not persuasion. Severity is impact; priority is urgency — keep them distinct. Present the signal and let the triager decide. (In a loop your findings sit in the KB alongside new-feature proposals; the Critic weighs all of them and picks what to do next — you are not arguing against the other producers, just giving the Critic facts.)
 
 ## Confidence Notes
 What you did NOT verify, and the single observation that would flip the verdict.
 ```
 
 (Standalone/no-KB fallback only: write the same content to `output/findings/NNN_slug.md`.)
+
+## Worked example
+
+A filed finding. Note the header (Type/Severity/Confidence) is *derived from* the evidence below it, and every claim points at something actually observed:
+
+> **Title**: `no-user-facing-surface-for-export-engine` · **Tags**: `["qa-finding", "high"]`
+>
+> ```markdown
+> **Type**: missing_product_surface
+> **Severity**: HIGH
+> **Confidence**: HIGH
+> **Target user/workflow**: An end user who wants to export a report — the core workflow named in README §"What it does".
+>
+> ## Summary
+> The report-export engine is fully implemented and unit-tested, but no UI, CLI, or documented API path invokes it. A user following the README cannot export anything: the feature exists only as an internal module.
+>
+> ## Evidence
+> - **Commands / searches run**: `grep -rn "export_report" src/ orchestrator/main.py cockpit/src/`; launched the app (`npm start`) and walked every menu.
+> - **Observed (actual)**: `export_report()` is defined at `src/export/engine.py:1` and called only from `tests/test_export.py:12`. No route in `orchestrator/main.py`, no control in the cockpit, no CLI flag. The running UI has no "export" affordance on any screen.
+> - **Expected + source**: README §"What it does" lists "export your report as PDF" as a primary user capability (documented, not inferred).
+> - **Reproducibility**: always.
+> - **Environment**: build sha-3a8579c, cockpit at `https://localhost/`, user role `test`, checked 2026-07-07.
+> - **Locations**: present `src/export/engine.py:1`; absent from `orchestrator/main.py`, `cockpit/src/app/**`.
+>
+> ## Reproduction / Audit Trail
+> 1. Fresh checkout, `npm start`, log in as `test`.
+> 2. Open every page/menu; search the UI for "export" → none present.
+> 3. `grep -rn "export" cockpit/src/` → zero call sites; `grep -rn "export_report" orchestrator/main.py` → zero routes.
+>
+> ## User Impact
+> The one capability the README sells as primary is unreachable. Every user who came to export a report is blocked with no workaround; the shipped, tested engine delivers zero user value.
+>
+> ## Suggested Remediation
+> Smallest slice: one authenticated `POST /api/reports/{id}/export` route that calls the existing `export_report()`, plus one "Export" button on the report page. Format options can follow.
+>
+> ## Acceptance Criteria
+> - A logged-in user can trigger an export from the report page and receive a file.
+> - The README's documented export step works end-to-end from a fresh checkout.
+>
+> ## Prioritization Argument
+> Blocks the product's headline capability (high user-visible value); the engine is already built and tested, so remediation is a thin integration slice (high leverage on shipped work); leaving it unfixed means continued investment in a feature no user can reach.
+>
+> ## Confidence Notes
+> Verified the absence across UI, routes, and CLI; did NOT check for an internal admin-only or MCP path. A single reachable call site a real user can invoke would drop this from HIGH toward LOW/withdrawn.
+> ```
+
+And a correctly *rejected* non-issue — abstention discipline, so you do NOT file it:
+
+> While auditing, `export_report()` returned an empty (but valid) PDF for an empty report. Before filing, checked `tests/test_export.py:40` — an empty report producing an empty PDF is asserted as intended behavior. This matches intent → **by design, not filed** (one line in `notes/by_design.md`). Filing it would have cost a reviewer triage time for a non-issue.
 
 ## Summary deliverable
 
