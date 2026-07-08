@@ -138,16 +138,12 @@ class TestInjectThreadCredentials:
 CODEX_ENDPOINT_ID = "44444444-4444-4444-4444-444444444444"
 CODEX_BASE_URL = "http://srw-codex-proxy:8317/v1"
 CODEX_API_KEY = "sk-codex-endpoint-test"
-GATEWAY_BASE_URL = "http://srw-litellm:4000/v1"
+STALE_BASE_URL = "https://stale.example/v1"
 
 
 @pytest.fixture
-def patched_main_codex_gateway(monkeypatch):
-    """A codex model (`gpt-5.5`) on the codex-proxy endpoint, with the LiteLLM
-    gateway ENABLED — the session a1153f56 environment. project_id is omitted in
-    the test so the scoped-key path (which would touch the gateway) is skipped
-    and routing falls back to ``_gateway_routing_target`` (no network)."""
-
+def patched_main_codex_endpoint(monkeypatch):
+    """A codex model (`gpt-5.5`) on the codex-proxy endpoint."""
     async def fake_resolve(model_id, user_id=None, capability="chat"):
         if model_id == "gpt-5.5":
             return ModelMeta(
@@ -186,66 +182,33 @@ def patched_main_codex_gateway(monkeypatch):
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
-    # Gateway enabled (chart sets these when litellm.enabled).
-    monkeypatch.setenv("LITELLM_BASE_URL", "http://srw-litellm:4000")
-    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master-test")
 
 
-class TestCodexSessionGatewayBaseUrl:
-    """Regression for docs/issues/codex_session_gateway_baseurl_401.md."""
+class TestCodexSessionStaleTransport:
+    """Endpoint-backed sessions refresh stale persisted transport on reattach."""
 
     @pytest.mark.asyncio
-    async def test_stale_gateway_base_url_replaced_with_codex_endpoint(
-        self, patched_main_codex_gateway
+    async def test_stale_base_url_replaced_with_codex_endpoint(
+        self, patched_main_codex_endpoint
     ):
-        """The session a1153f56 bug: a stored llm override pins a codex model
-        with a STALE LiteLLM-gateway base_url (+ provider) carried over from a
-        previously gateway-routed model. Re-injection on resume must route to
-        the codex proxy with its own key — not ship the codex key to the gateway
-        (which 401s "LiteLLM Virtual Key expected. Received=…, expected sk-")."""
+        """A stored llm override can carry transport from a previous model.
+        Re-injection on resume must route to the codex proxy with its own key."""
         stored = {
             "llm": {
                 "model": "gpt-5.5",
-                "base_url": GATEWAY_BASE_URL,  # stale — the bug
+                "base_url": STALE_BASE_URL,
+                "api_key": "sk-stale",
                 "provider": "openai",  # stale factory
             }
         }
         out = await main._inject_thread_dispatch_credentials(
             stored,
-            user_id="u",  # no project_id → fleet/master fallback, no network
+            user_id="u",
         )
         assert out["llm"]["base_url"] == CODEX_BASE_URL
         assert out["llm"]["api_key"] == CODEX_API_KEY
         assert out["llm"]["provider"] == "codex"
-        # Belt and suspenders: the codex key must NOT be paired with the gateway.
-        assert out["llm"]["base_url"] != GATEWAY_BASE_URL
-
-
-class TestGatewayHealthFallback:
-    """Phase-0 gateway-down→direct fallback: ``_gateway_routing_target`` yields
-    None once the gateway is probed unreachable, so the dispatch injectors route
-    the agent at the model's direct upstream instead of a dead gateway URL.
-    See docs/features/route_all_models_through_litellm_gateway.md §5."""
-
-    @pytest.fixture(autouse=True)
-    def _gateway_enabled(self, monkeypatch):
-        # Gateway enabled (chart sets these when litellm.enabled).
-        monkeypatch.setenv("LITELLM_BASE_URL", "http://srw-litellm:4000")
-        monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master-test")
-        yield
-        main.mark_gateway_health(True)  # never leak an outage flag to other tests
-
-    def test_healthy_returns_gateway_target(self):
-        main.mark_gateway_health(True)
-        target = main._gateway_routing_target()
-        assert target is not None
-        assert target[0] == GATEWAY_BASE_URL
-
-    def test_unhealthy_returns_none(self):
-        # A confirmed-down gateway must NOT be handed to the agent — None tells
-        # the dispatch injectors to fall back to the endpoint's direct creds.
-        main.mark_gateway_health(False)
-        assert main._gateway_routing_target() is None
+        assert out["llm"]["base_url"] != STALE_BASE_URL
 
 
 class _FakeAcquire:

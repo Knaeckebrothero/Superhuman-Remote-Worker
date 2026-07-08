@@ -3,11 +3,10 @@
 --                (Slice 4 / observability_and_quotas "The rate table"). Maps a
 --                (category, resource, unit) to a $/unit price; the ledger
 --                snapshots the newest rate <= an event's ts onto usage_events at
---                write time, so history stays immutable. Ships EMPTY — same
---                inert-until-measured posture as litellm.backstop/ratePolicy/
---                quota: v1 records quantities (tokens, vcpu/gib-hours); cost_usd
---                stays NULL until an admin seeds real rates (homelab $/vcpu-hour
---                from pdu power, provider list prices, etc.).
+--                write time, so history stays immutable. Ships EMPTY: v1 records
+--                quantities (tokens, vcpu/gib-hours); cost_usd stays NULL until
+--                an admin seeds real rates (homelab $/vcpu-hour from pdu power,
+--                provider list prices, etc.).
 -- depends-on:    0001_initial.sql
 -- expected:      < 1s. One empty table.
 -- locks:         AccessExclusiveLock on the new table only.

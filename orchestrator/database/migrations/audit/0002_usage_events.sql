@@ -10,9 +10,9 @@
 --
 -- Design: docs/features/observability_and_quotas.md — the *locked* usage_events
 -- schema (its "The spine: one usage ledger" section). This is the ledger spine
--- that docs/features/usage_monitoring_and_rate_limiting.md Slice 4 implements,
--- now gateway-sourced (LLM rows materialized from the LiteLLM spend log; compute
--- rows emitted by the orchestrator at workspace open/close).
+-- that docs/features/usage_monitoring_and_rate_limiting.md Slice 4 implements:
+-- LLM rows materialized from the audit trail, compute rows emitted by the
+-- orchestrator at workspace open/close.
 --
 -- Three invariants, mirroring 0001's append-only tables:
 --   1. APPEND-ONLY. Every row is a *finalized, costed* event — emitters INSERT,
@@ -63,8 +63,8 @@ CREATE TABLE usage_events (
     rate_usd    NUMERIC,                    -- snapshot of the rate applied (NULL = unpriced)
     cost_usd    NUMERIC,                    -- quantity * rate_usd, stored (NULL until priced)
     -- Idempotency key for the at-least-once emitters (the design mandates
-    -- at-least-once delivery). source ∈ {'litellm','orchestrator'}; source_id is
-    -- the LiteLLM request_id (LLM) or a deterministic interval key (compute).
+    -- at-least-once delivery). source is the emitting namespace; source_id is
+    -- the audit request id (LLM) or a deterministic interval key (compute).
     -- (source, source_id, unit) identifies a logical row; ts is folded in only
     -- because a partitioned-table unique index must include the partition key.
     source      TEXT         NOT NULL,
@@ -78,7 +78,7 @@ CREATE TABLE usage_events (
 
 COMMENT ON TABLE usage_events IS
     'Append-only usage/cost ledger, one row per metered resource dimension. '
-    'Written by the orchestrator (compute intervals + LiteLLM spend-log '
+    'Written by the orchestrator (compute intervals + audit LLM '
     'materialization); read by /api/usage and the usage_daily rollup. Monthly '
     'partitions on ts (audit-store machinery), partition column is ts not '
     'timestamp. NEVER UPDATE rows and NEVER add a GIN index on details.';
@@ -95,7 +95,7 @@ COMMENT ON COLUMN usage_events.rate_usd IS
     'rate edit never rewrites past cost. NULL when the resource is unpriced '
     '(homelab models today): quantity is still recorded, cost is just absent.';
 COMMENT ON COLUMN usage_events.source_id IS
-    'Per-source idempotency id: LiteLLM request_id (LLM) or a deterministic '
+    'Per-source idempotency id: audit request id (LLM) or a deterministic '
     'workspace-interval key (compute). With source + unit it dedupes re-emits '
     '(ON CONFLICT DO NOTHING) so the at-least-once emitters cannot double-count.';
 COMMENT ON COLUMN usage_events.details IS

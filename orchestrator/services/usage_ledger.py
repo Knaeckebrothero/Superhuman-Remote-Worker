@@ -1,9 +1,9 @@
 """Usage-metering ledger — the canonical cost/usage write+read path (Slice 4).
 
 The append-only ``usage_events`` table (migrations/audit/0002) is the system of
-record for metered cost: LLM tokens (materialized from the LiteLLM spend log,
-Slice 4c) and workspace compute (emitted by the orchestrator at open/close,
-Slice 4b). This module owns the **write** path (idempotent, rate-snapshotting)
+record for metered cost: LLM tokens (materialized from the audit trail) and
+workspace compute (emitted by the orchestrator at open/close). This module owns
+the **write** path (idempotent, rate-snapshotting)
 and the raw aggregate **read** that ``/api/usage`` serves; the :class:`AuditStore`
 reader stays focused on the agent trace.
 
@@ -92,7 +92,7 @@ class UsageEvent:
     resource: str  # '<model_id>' | 'workspace_pod' | ...
     quantity: Any  # int/float/Decimal in `unit`
     unit: str  # 'prompt-token' | 'vcpu-hour' | ...
-    source: str  # 'litellm' | 'orchestrator' (idempotency namespace)
+    source: str  # e.g. 'audit' | 'orchestrator' (idempotency namespace)
     source_id: str  # request_id / deterministic interval key
     ts: datetime
     user_id: Optional[str] = None
