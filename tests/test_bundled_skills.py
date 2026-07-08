@@ -1,5 +1,6 @@
 """Bundled skill fixtures must be valid and (where claimed) script-bearing."""
 
+import re
 from pathlib import Path
 
 import yaml
@@ -83,6 +84,27 @@ def test_bundled_project_onboarding_skill_is_valid_and_on_topic():
     # honesty move and an explicit termination rule (orientation must stop).
     assert "source of truth" in body.lower()
     assert "stop" in body.lower()
+
+
+def test_bundled_app_guide_skill_is_valid_and_indexes_its_references():
+    root = _SKILLS / "app-guide"
+    md = (root / "SKILL.md").read_text(encoding="utf-8")
+    fm, body = parse_skill_md(md)
+    name, desc = skill_identity(fm)
+    assert name == "app-guide"
+    # Trigger scopes to the USER asking about the product and disambiguates
+    # from orienting yourself in the user's project content.
+    assert "project-onboarding" in desc
+    # The grounding contract is the skill's whole point: retrieve-then-answer
+    # from the bundled usage docs, never from priors.
+    assert "references/" in desc
+    assert "priors" in body
+    # The body's routing index and the files on disk must agree in both
+    # directions: every bundled doc is routable, every routed path exists.
+    on_disk = {f"references/{p.name}" for p in (root / "references").glob("*.md")}
+    assert on_disk, "app-guide must bundle reference docs"
+    indexed = set(re.findall(r"references/[a-z0-9-]+\.md", body))
+    assert indexed == on_disk
 
 
 def test_bundled_tdd_skill_is_valid_and_on_topic():
