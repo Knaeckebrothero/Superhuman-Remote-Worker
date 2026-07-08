@@ -611,6 +611,8 @@ class TestSetupTools:
             "resume_worker_job",
             "cancel_worker_job",
             "pause_worker_job",
+            "get_current_project",
+            "list_project_jobs",
         ]
 
         with (

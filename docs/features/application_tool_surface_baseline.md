@@ -1021,11 +1021,11 @@ confirmation where appropriate:
 
 Implement in this order:
 
-1. `get_session_context`
+1. `get_session_context` - implemented as `get_session_context`.
 2. Fix current job tools: full IDs, richer summaries, and cancel/pause method
-   drift.
-3. `projects.get_current`
-4. `projects.list_jobs`
+   drift - implemented.
+3. `projects.get_current` - implemented as `get_current_project`.
+4. `projects.list_jobs` - implemented as `list_project_jobs`.
 5. `repositories.list_project`
 6. `repositories.checkout_project_repository`
 7. `project_loops.get`
