@@ -673,6 +673,45 @@ class TestSetupTools:
         loaded_names = mock_load.call_args[0][0]
         assert "checkout_project_repository" in loaded_names
 
+    def test_fleet_management_can_be_disabled(self):
+        """Fleet Management opt-out removes SRW app-control tools."""
+        cfg = _make_config(extra={"_fleet_management_disabled": True})
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend.supports_shell = False
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=[
+                    "web_search",
+                    "create_worker_job",
+                    "list_project_repositories",
+                    "request_workspace_upgrade",
+                ],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext"),
+        ):
+            session._setup_tools(None)
+
+        loaded_names = mock_load.call_args[0][0]
+        assert "web_search" in loaded_names
+        assert "task_add" in loaded_names
+        assert "create_worker_job" not in loaded_names
+        assert "list_project_repositories" not in loaded_names
+        assert "request_workspace_upgrade" not in loaded_names
+
     def test_no_duplicate_orchestrator_tools(self):
         """Orchestrator tools not duplicated if already in config."""
         cfg = _make_config()

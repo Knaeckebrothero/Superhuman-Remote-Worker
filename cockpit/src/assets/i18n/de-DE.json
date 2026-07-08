@@ -1289,7 +1289,7 @@
       "cloud": "Cloud-Speicher",
       "communication": "Kommunikation",
       "delegation": "Arbeit delegieren",
-      "orchestrator": "Orchestrator",
+      "orchestrator": "Flottenverwaltung",
       "evaluation": "Auswertung"
     },
     "toolContext": {
@@ -1984,6 +1984,10 @@
       "delegation": {
         "label": "Delegation",
         "description": "Kann Subagenten starten, die parallel arbeiten"
+      },
+      "orchestrator": {
+        "label": "Flottenverwaltung",
+        "description": "Kann SRW-Aufträge, Projekte, Repositories und Workspace-Upgrades für Sessions einsehen und steuern"
       },
       "knowledge": {
         "label": "Wissen",

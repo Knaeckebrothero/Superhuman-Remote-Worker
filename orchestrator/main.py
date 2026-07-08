@@ -1155,6 +1155,8 @@ async def _resolve_session_config(
         from src.core.skill_resolution import filter_bound_skills
 
         filter_bound_skills(resolved)
+        if _fleet_management_explicitly_disabled(request_override):
+            resolved.setdefault("agent", {})["_fleet_management_disabled"] = True
         # Session dispatch PEP (decision 9): the merged config — including
         # interactive.permission_mode and any persistent_agent keys baked into
         # config_override — must fit the runner's grants. GrantDenied escapes the
@@ -2680,6 +2682,34 @@ def _validated_session_workspace_override(
             status_code=400, detail=f"Invalid workspace backend '{backend}'"
         )
     return ws
+
+
+def _validated_session_fleet_tools_override(
+    config_override: Any,
+) -> Optional[list[str]]:
+    """Extract the New Session Fleet Management tool toggle.
+
+    The Cockpit tool group writes the existing registry category key
+    ``tools.orchestrator``. At session creation we intentionally honor only this
+    SRW control-plane category, not arbitrary tool grants from the request.
+    """
+    tools = config_override.get("tools") if isinstance(config_override, dict) else None
+    if not isinstance(tools, dict) or "orchestrator" not in tools:
+        return None
+    value = tools.get("orchestrator")
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid tools.orchestrator override; expected a string list.",
+        )
+    return value
+
+
+def _fleet_management_explicitly_disabled(
+    config_override: dict[str, Any] | None,
+) -> bool:
+    tools = (config_override or {}).get("tools")
+    return isinstance(tools, dict) and tools.get("orchestrator") == []
 
 
 def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
@@ -15931,10 +15961,12 @@ class ThreadCreateRequest(BaseModel):
         None,
         description=(
             "Per-session config overrides from the New Session 'Advanced' form. "
-            "Only the workspace sub-dict is honored at create time: "
-            "workspace.backend selects the tier (sandbox | virtual | none) and "
-            "MUST be set here because the workspace is provisioned at creation. "
-            "vm is not creatable directly — start on a lite tier and upgrade."
+            "The workspace sub-dict is honored at create time: workspace.backend "
+            "selects the tier (sandbox | virtual | none) and MUST be set here "
+            "because the workspace is provisioned at creation. vm is not "
+            "creatable directly — start on a lite tier and upgrade. The "
+            "tools.orchestrator category is also honored as the Fleet "
+            "Management toggle."
         ),
     )
 
@@ -16024,16 +16056,22 @@ async def create_thread(
         # Pydantic dropped it and create_thread rebuilt the override only from
         # model/temperature/permission_mode — every session booted the default
         # (sandbox) regardless of the dropdown, because the provisioning fork
-        # below keys off _backend_from_override(config_override). Honor ONLY the
-        # validated workspace sub-dict (no creds, no tool grants); the backend
-        # must land in config_override now because the workspace is provisioned
-        # synchronously at create — unlike the other Advanced settings it can't
-        # be a runtime PATCH.
+        # below keys off _backend_from_override(config_override). Honor the
+        # validated workspace sub-dict here (no creds); the backend must land in
+        # config_override now because the workspace is provisioned synchronously
+        # at create — unlike the other Advanced settings it can't be a runtime
+        # PATCH. Fleet Management's tools.orchestrator toggle is the only
+        # tool-category override accepted at create time below.
         req_workspace = _validated_session_workspace_override(
             request_body.config_override
         )
         if req_workspace:
             config_override.setdefault("workspace", {}).update(req_workspace)
+        req_fleet_tools = _validated_session_fleet_tools_override(
+            request_body.config_override
+        )
+        if req_fleet_tools is not None:
+            config_override.setdefault("tools", {})["orchestrator"] = req_fleet_tools
 
         # Normalize project_ids (backward compat: project_id → [project_id])
         effective_project_ids = request_body.project_ids or (

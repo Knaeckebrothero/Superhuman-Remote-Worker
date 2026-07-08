@@ -198,7 +198,7 @@ const CATEGORY_LABELS: Record<string, string> = {
     cloud: 'Cloud storage',
     communication: 'Communication',
     delegation: 'Delegating work',
-    orchestrator: 'Orchestrator',
+    orchestrator: 'Fleet management',
     evaluation: 'Evaluation',
 };
 

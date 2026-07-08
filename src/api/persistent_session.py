@@ -113,6 +113,21 @@ _EXCLUDED_TOOLS = frozenset(
     }
 )
 
+_FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
+_FLEET_MANAGEMENT_CONTROL_TOOLS = {"request_workspace_upgrade"}
+
+
+def _fleet_management_enabled(config: Any) -> bool:
+    """Return whether SRW control-plane tools should be exposed.
+
+    Existing session configs predate a UI toggle for these app-control tools, so
+    absence of the marker means enabled. The marker is written only when the
+    user explicitly disables ``tools.orchestrator`` in the session config
+    override.
+    """
+    extra = getattr(config, "extra", {}) or {}
+    return extra.get(_FLEET_MANAGEMENT_DISABLED_KEY) is not True
+
 
 @dataclass
 class PersistentSession:
@@ -685,25 +700,40 @@ class PersistentSession:
             if name not in tool_names:
                 tool_names.append(name)
 
-        # Always include orchestrator tools in persistent mode (job delegation)
-        _ORCHESTRATOR_TOOLS = [
-            "get_session_context",
-            "create_worker_job",
-            "list_worker_jobs",
-            "get_worker_job",
-            "get_job_workspace_file",
-            "approve_worker_job",
-            "resume_worker_job",
-            "cancel_worker_job",
-            "pause_worker_job",
-            "get_current_project",
-            "list_project_jobs",
-            "list_project_repositories",
-            "get_default_project_repository",
-        ]
-        for name in _ORCHESTRATOR_TOOLS:
-            if name not in tool_names:
-                tool_names.append(name)
+        # Fleet Management is the UI-facing group for SRW control-plane tools:
+        # session context, jobs, projects, project repositories, and future
+        # app-management readers. It defaults ON for compatibility, but an
+        # explicit ``tools.orchestrator: []`` override marks it disabled so
+        # untrusted-provider sessions can run with only work tools.
+        from ..tools.registry import get_tools_by_category
+
+        fleet_management_enabled = _fleet_management_enabled(self.config)
+        fleet_management_tools = set(get_tools_by_category("orchestrator"))
+        fleet_management_tools.update(_FLEET_MANAGEMENT_CONTROL_TOOLS)
+
+        if not fleet_management_enabled:
+            tool_names = [
+                name for name in tool_names if name not in fleet_management_tools
+            ]
+        else:
+            _ORCHESTRATOR_TOOLS = [
+                "get_session_context",
+                "create_worker_job",
+                "list_worker_jobs",
+                "get_worker_job",
+                "get_job_workspace_file",
+                "approve_worker_job",
+                "resume_worker_job",
+                "cancel_worker_job",
+                "pause_worker_job",
+                "get_current_project",
+                "list_project_jobs",
+                "list_project_repositories",
+                "get_default_project_repository",
+            ]
+            for name in _ORCHESTRATOR_TOOLS:
+                if name not in tool_names:
+                    tool_names.append(name)
 
         if self.cloud_mount_manager and self.cloud_mount_manager.active:
             if "srw_cloud_status" not in tool_names:
@@ -715,10 +745,18 @@ class PersistentSession:
         # sandbox swap this re-derives against the now-shell-capable backend and
         # the tool drops out (nothing left to upgrade to).
         _backend = getattr(self.workspace_manager, "backend", None)
-        if _backend is not None and getattr(_backend, "supports_shell", False):
+        if (
+            fleet_management_enabled
+            and _backend is not None
+            and getattr(_backend, "supports_shell", False)
+        ):
             if "checkout_project_repository" not in tool_names:
                 tool_names.append("checkout_project_repository")
-        if _backend is not None and not getattr(_backend, "supports_shell", False):
+        if (
+            fleet_management_enabled
+            and _backend is not None
+            and not getattr(_backend, "supports_shell", False)
+        ):
             if "request_workspace_upgrade" not in tool_names:
                 tool_names.append("request_workspace_upgrade")
 

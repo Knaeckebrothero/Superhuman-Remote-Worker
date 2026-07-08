@@ -126,6 +126,38 @@ class TestSessionWorkspaceBackendOverride:
         )
         assert ws == {"max_read_words": 10}
 
+    def test_fleet_management_tools_override_passes_through(self):
+        tools = orch_main._validated_session_fleet_tools_override(
+            {"tools": {"orchestrator": []}}
+        )
+        assert tools == []
+
+    def test_absent_fleet_management_tools_override_returns_none(self):
+        assert orch_main._validated_session_fleet_tools_override(None) is None
+        assert orch_main._validated_session_fleet_tools_override({}) is None
+        assert (
+            orch_main._validated_session_fleet_tools_override(
+                {"tools": {"research": []}}
+            )
+            is None
+        )
+
+    def test_invalid_fleet_management_tools_override_rejected(self):
+        with pytest.raises(orch_main.HTTPException) as exc:
+            orch_main._validated_session_fleet_tools_override(
+                {"tools": {"orchestrator": "disabled"}}
+            )
+        assert exc.value.status_code == 400
+
+    def test_fleet_management_disabled_detection(self):
+        assert orch_main._fleet_management_explicitly_disabled(
+            {"tools": {"orchestrator": []}}
+        )
+        assert not orch_main._fleet_management_explicitly_disabled(
+            {"tools": {"orchestrator": ["get_session_context"]}}
+        )
+        assert not orch_main._fleet_management_explicitly_disabled({})
+
 
 class TestSendSessionAttachPayload:
     """Hole B, orchestrator side: the attach payload carries config_name."""
