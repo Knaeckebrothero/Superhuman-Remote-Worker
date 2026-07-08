@@ -7,6 +7,7 @@ loading the appropriate tools based on configuration.
 import copy
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -3714,6 +3715,34 @@ def load_phase_component(
     return matrix_resolver.load(prompt_type)
 
 
+# Placeholders the prompt assembler owns and substitutes. Everything else that
+# looks like a brace — CSS in a designer mockup, ``{py,sh,md}`` in a repro-path
+# hint, a JSON example — is literal prose and must survive untouched. We render
+# these keys explicitly instead of ``str.format`` because ``str.format`` treats
+# EVERY ``{...}`` as a field and raises KeyError on the first literal brace,
+# which hard-fails the job at phase render (docs/issues, product-qa 'py,sh,md').
+_PROMPT_PLACEHOLDER_RE = re.compile(
+    r"\{(phase_number|agent_display_name|expert_identity|available_skills|prompt_content)\}"
+)
+
+
+def render_placeholders(text: str, **known: str) -> str:
+    """Substitute the known ``{placeholder}`` tokens; leave all other braces literal.
+
+    Single-pass (like ``str.format`` — a placeholder appearing inside an already
+    substituted value is NOT re-expanded) over an explicit allow-list, so trusted
+    prompt prose can contain arbitrary literal braces without crashing the render.
+    Only keys present in ``known`` are eligible; an allow-listed token with no
+    value supplied is left as-is rather than raising.
+    """
+
+    def _sub(m: "re.Match[str]") -> str:
+        key = m.group(1)
+        return str(known[key]) if key in known else m.group(0)
+
+    return _PROMPT_PLACEHOLDER_RE.sub(_sub, text)
+
+
 def get_phase_system_prompt(
     config: AgentConfig,
     is_strategic: bool,
@@ -3797,7 +3826,8 @@ def get_phase_system_prompt(
         available_skills = fence_skills_menu(
             config.extra.get("_resolved_skills", {}).get("menu", [])
         )
-        rendered = template.format(
+        rendered = render_placeholders(
+            template,
             agent_display_name=config.display_name,
             expert_identity=expert_identity,
             available_skills=available_skills,
@@ -3841,14 +3871,15 @@ def get_phase_system_prompt(
     # Part 2: fence a DB-authored (untrusted) phase directive — brace-safe +
     # subordinate to system/safety. Only when this segment came from a DB expert
     # row (_db_prompt_keys); bundled/disk phase prompts stay trusted. Brace-
-    # stripping also makes the .format(phase_number=...) below a safe no-op.
+    # stripping also stops a DB directive from smuggling our placeholder tokens
+    # (render_placeholders below only substitutes an explicit allow-list anyway).
     if prompt_type_key in config.extra.get("_db_prompt_keys", ()):
         from src.core.expert_resolution import fence_phase_directive
 
         phase_component = fence_phase_directive(phase_component)
 
-    # Render Jinja2 conditionals BEFORE .format() — Python's str.format()
-    # chokes on {%..%} blocks. Jinja2 leaves single-brace placeholders untouched.
+    # Render Jinja2 conditionals BEFORE placeholder substitution — Jinja2 owns
+    # {%..%} blocks and leaves single-brace placeholders untouched.
     cli_ds = config.extra.get("_cli_datasources", [])
     if tool_names is not None:
         phase_component = render_instruction_content(
@@ -3858,8 +3889,12 @@ def get_phase_system_prompt(
             base_template, tool_names, cli_datasources=cli_ds
         )
 
-    # Render phase component's {phase_number} placeholder
-    rendered_component = phase_component.format(phase_number=phase_number)
+    # Render the phase component's {phase_number} placeholder. Uses
+    # render_placeholders (NOT str.format) so literal braces in the trusted prose
+    # — repro-path hints, CSS in a mockup — pass through instead of raising.
+    rendered_component = render_placeholders(
+        phase_component, phase_number=str(phase_number)
+    )
 
     # Inject all components and render remaining placeholders
     # Slice-2 skills menu (L1): fenced, untrusted user content. Empty when no
@@ -3869,7 +3904,8 @@ def get_phase_system_prompt(
     available_skills = fence_skills_menu(
         config.extra.get("_resolved_skills", {}).get("menu", [])
     )
-    rendered = base_template.format(
+    rendered = render_placeholders(
+        base_template,
         agent_display_name=config.display_name,
         expert_identity=expert_identity,
         available_skills=available_skills,

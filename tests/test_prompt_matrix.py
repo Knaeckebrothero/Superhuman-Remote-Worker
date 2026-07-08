@@ -15,6 +15,7 @@ from src.core.loader import (
     get_phase_system_prompt,
     load_base_system_prompt,
     load_phase_component,
+    render_placeholders,
 )
 from src.core.model_registry import family_of
 
@@ -471,6 +472,79 @@ class TestDefaultResolution:
             assert "phase 1" in result
             # Claude models should not have reasoning directive injected
             assert "Reasoning:" not in result
+
+
+# =============================================================================
+# render_placeholders: literal braces in trusted prose must survive render
+# (regression: product-qa tactical.txt `{py,sh,md}` hard-failed jobs via
+#  str.format KeyError at phase render — docs/issues brace-format crash)
+# =============================================================================
+
+
+class TestRenderPlaceholders:
+    """The prompt assembler substitutes only an explicit allow-list of tokens;
+    every other brace is literal prose (CSS, repro-path hints, JSON) and must
+    pass through untouched instead of raising KeyError."""
+
+    def test_known_token_substitutes(self):
+        assert (
+            render_placeholders("phase {phase_number}", phase_number="2") == "phase 2"
+        )
+
+    def test_literal_brace_survives(self):
+        # The exact pattern that crashed the loop job.
+        text = "save repro under output/repros/NNN_slug.{py,sh,md}"
+        assert render_placeholders(text, phase_number="2") == text
+
+    def test_css_colon_brace_survives(self):
+        # A colon inside braces is the case a lenient str.format_map would still
+        # choke on (parsed as a format spec) — render_placeholders leaves it be.
+        css = "  :root { --app-bg: #1e1e2e; }"
+        assert render_placeholders(css, phase_number="2") == css
+
+    def test_single_pass_no_reexpansion(self):
+        # A placeholder appearing inside a substituted value is NOT re-expanded
+        # (matches str.format's single-pass semantics).
+        out = render_placeholders(
+            "n={agent_display_name} b={prompt_content}",
+            agent_display_name="Ada",
+            prompt_content="literal {agent_display_name} kept",
+        )
+        assert out == "n=Ada b=literal {agent_display_name} kept"
+
+    def test_allowlisted_token_without_value_left_literal(self):
+        assert (
+            render_placeholders("keep {phase_number}", agent_display_name="x")
+            == "keep {phase_number}"
+        )
+
+    def test_non_allowlisted_token_always_literal(self):
+        assert render_placeholders("{tool_name} x", phase_number="1") == "{tool_name} x"
+
+    def test_end_to_end_tactical_prompt_with_literal_braces(self, tmp_path):
+        """get_phase_system_prompt renders a tactical prompt whose prose holds a
+        literal `{py,sh,md}` AND a guardrail-style `{phase_number}` — the token
+        substitutes, the literal brace survives, and nothing raises."""
+        config = AgentConfig(agent_id="test", display_name="QA Agent")
+        with patch("src.core.loader.get_project_root", return_value=tmp_path):
+            config_prompts = tmp_path / "config" / "prompts"
+            config_prompts.mkdir(parents=True)
+            (config_prompts / "systemprompt.txt").write_text(
+                "{agent_display_name}\n{prompt_content}"
+            )
+            (config_prompts / "tactical.txt").write_text(
+                "Tactical phase {phase_number}. "
+                "Save a repro under output/repros/NNN_slug.{py,sh,md}."
+            )
+
+            result = get_phase_system_prompt(
+                config=config,
+                is_strategic=False,
+                phase_number=2,
+            )
+            assert "QA Agent" in result
+            assert "Tactical phase 2." in result  # {phase_number} substituted
+            assert "{py,sh,md}" in result  # literal brace survived
 
 
 # =============================================================================
