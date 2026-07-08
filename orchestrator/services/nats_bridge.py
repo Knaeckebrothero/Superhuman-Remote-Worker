@@ -33,6 +33,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
+from uuid import uuid4
 
 try:
     import nats
@@ -45,8 +46,31 @@ except ImportError:
     NATS_AVAILABLE = False
 
 from .notification_feed import notification_feed
+from .ssh_helpers import wait_for_agent_ssh
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %.1f", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
 
 
 class NatsBridge:
@@ -80,6 +104,16 @@ class NatsBridge:
         self._available: bool = False
         # Track which VM IDs correspond to threads (vs jobs) for context routing
         self._thread_vm_ids: set[str] = set()
+        self._ssh_probe_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        provision_timeout_s = _env_float("VM_PROVISION_TIMEOUT_S", 600.0)
+        self._ssh_ready_deadline_s = _env_float(
+            "VM_SSH_READY_DEADLINE_S", provision_timeout_s
+        )
+        self._ssh_ready_connect_timeout_s = _env_int(
+            "VM_SSH_READY_CONNECT_TIMEOUT_S", 10
+        )
+        self._ssh_ready_interval_s = _env_float("VM_SSH_READY_INTERVAL_S", 5.0)
+        self._wait_for_agent_ssh = wait_for_agent_ssh
 
         if not self._url:
             logger.info("NATS_URL not configured. VM lifecycle features disabled.")
@@ -200,6 +234,9 @@ class NatsBridge:
 
     async def disconnect(self) -> None:
         """Drain NATS connection and clean up."""
+        for task in self._ssh_probe_tasks.values():
+            task.cancel()
+        self._ssh_probe_tasks.clear()
         if self._nc is not None:
             try:
                 await self._nc.drain()
@@ -446,18 +483,22 @@ class NatsBridge:
             logger.exception("Error handling vm.lifecycle.status")
 
     async def _on_daemon_register(self, msg) -> None:
-        """Handle agent.vm.*.register — daemon announces VM is ready.
+        """Handle agent.vm.*.register — daemon announces VM network coordinates.
 
         Payload: {job_id, hostname, ip, pid}
 
         The daemon reports its Tailscale IP (100.64.x.y), which is directly
-        reachable from agent pods via the Headscale mesh VPN. No NodePort
-        lookup or pod-ip query needed.
+        reachable from agent pods via the Headscale mesh VPN. Registration is
+        not readiness; the leader must prove SSH before dispatch can use it.
         """
         try:
             data = json.loads(msg.data.decode())
             job_id = data.get("job_id")
             if not job_id:
+                return
+
+            if not self._is_leader():
+                logger.debug("Ignoring daemon register for %s on follower", job_id)
                 return
 
             # Daemon reports its Tailscale IP — directly reachable from agent pods
@@ -466,51 +507,212 @@ class NatsBridge:
 
             is_thread = job_id in self._thread_vm_ids
             logger.info(
-                "Daemon registered for %s %s (ssh=%s:%d)",
+                "Daemon registered for %s %s (ssh=%s:%d); waiting for SSH readiness",
                 "thread" if is_thread else "job",
                 job_id,
                 ssh_host,
                 ssh_port,
             )
+            registration_id = uuid4().hex
+            registered_at = datetime.now(timezone.utc).isoformat()
             vm_updates = {
-                "status": "ready",
+                "status": "ssh_pending" if ssh_host else "ssh_unreachable",
                 "ssh_host": ssh_host,
                 "ssh_port": ssh_port,
                 "hostname": data.get("hostname"),
                 "daemon_pid": data.get("pid"),
                 "recovering": False,  # Clear recovery guard
+                "registered_at": registered_at,
+                "ssh_registration_id": registration_id,
+                "ssh_probe_error": None
+                if ssh_host
+                else "daemon register did not include an SSH host",
             }
             if is_thread:
                 await self._set_thread_vm_context(job_id, vm_updates)
             else:
                 await self._set_vm_context(job_id, vm_updates)
 
-            # Seed the owner-user's code-server config into the freshly-ready VM
-            # (theme/keybindings/snippets). Fire-and-forget so the register
-            # handler isn't blocked on SSH; the helper is best-effort.
-            #
-            # agent.vm.*.register fans out to every replica (no queue group), so
-            # gate the seed on leadership to run it exactly once — the leader
-            # always receives the broadcast. A queue group would instead risk the
-            # follower winning and the leader-gated dispatch poke below no-op'ing
-            # (see the M2-L4 spec).
-            from services.leader_election import (
-                is_leader,
-            )  # flattened import (M1 lesson)
-
-            if ssh_host and is_leader.is_set():
-                asyncio.create_task(
-                    self._seed_vm_ide_config(job_id, is_thread, ssh_host, ssh_port)
+            if ssh_host:
+                self._start_vm_ssh_probe(
+                    job_id,
+                    is_thread=is_thread,
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    registration_id=registration_id,
                 )
-
-            # Trigger callback (e.g. dispatch)
-            if self._on_vm_ready:
-                try:
-                    self._on_vm_ready()
-                except Exception:
-                    logger.exception("on_vm_ready callback failed")
         except Exception:
             logger.exception("Error handling daemon register")
+
+    @staticmethod
+    def _is_leader() -> bool:
+        from services.leader_election import is_leader
+
+        return is_leader.is_set()
+
+    def _start_vm_ssh_probe(
+        self,
+        entity_id: str,
+        *,
+        is_thread: bool,
+        ssh_host: str,
+        ssh_port: int,
+        registration_id: str,
+    ) -> None:
+        key = ("thread" if is_thread else "job", entity_id)
+        existing = self._ssh_probe_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+
+        task = asyncio.create_task(
+            self._probe_vm_ssh_ready(
+                entity_id,
+                is_thread=is_thread,
+                ssh_host=ssh_host,
+                ssh_port=ssh_port,
+                registration_id=registration_id,
+            )
+        )
+        self._ssh_probe_tasks[key] = task
+
+        def _discard(done: asyncio.Task) -> None:
+            if self._ssh_probe_tasks.get(key) is done:
+                self._ssh_probe_tasks.pop(key, None)
+            if done.cancelled():
+                return
+            exc = done.exception()
+            if exc is not None:
+                logger.error(
+                    "VM SSH readiness task failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_discard)
+
+    async def _probe_vm_ssh_ready(
+        self,
+        entity_id: str,
+        *,
+        is_thread: bool,
+        ssh_host: str,
+        ssh_port: int,
+        registration_id: str,
+    ) -> None:
+        try:
+            ready, attempts, error = await self._wait_for_agent_ssh(
+                ssh_host,
+                ssh_port,
+                deadline_s=self._ssh_ready_deadline_s,
+                connect_timeout_s=self._ssh_ready_connect_timeout_s,
+                interval_s=self._ssh_ready_interval_s,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            ready = False
+            attempts = 0
+            error = str(exc)
+
+        if not self._is_leader():
+            logger.info(
+                "Skipping SSH readiness result for %s %s after losing leadership",
+                "thread" if is_thread else "job",
+                entity_id,
+            )
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        if not ready:
+            updated = await self._merge_vm_context_if_current(
+                entity_id,
+                is_thread=is_thread,
+                registration_id=registration_id,
+                updates={
+                    "status": "ssh_unreachable",
+                    "ssh_probe_attempts": attempts,
+                    "ssh_probe_failed_at": now,
+                    "ssh_probe_error": error or "SSH readiness probe timed out",
+                },
+            )
+            if updated:
+                logger.warning(
+                    "VM SSH readiness probe failed for %s %s (%s:%d) "
+                    "after %d attempt(s): %s",
+                    "thread" if is_thread else "job",
+                    entity_id,
+                    ssh_host,
+                    ssh_port,
+                    attempts,
+                    error,
+                )
+            return
+
+        updates = {
+            "status": "ready",
+            "ssh_verified_at": now,
+            "ssh_probe_attempts": attempts,
+            "ssh_probe_error": None,
+        }
+        promoted = await self._merge_vm_context_if_current(
+            entity_id,
+            is_thread=is_thread,
+            registration_id=registration_id,
+            updates=updates,
+        )
+        if not promoted:
+            logger.info(
+                "Discarded stale SSH readiness probe for %s %s (%s:%d)",
+                "thread" if is_thread else "job",
+                entity_id,
+                ssh_host,
+                ssh_port,
+            )
+            return
+
+        logger.info(
+            "VM SSH ready for %s %s (%s:%d) after %d attempt(s)",
+            "thread" if is_thread else "job",
+            entity_id,
+            ssh_host,
+            ssh_port,
+            attempts,
+        )
+        asyncio.create_task(
+            self._seed_vm_ide_config(entity_id, is_thread, ssh_host, ssh_port)
+        )
+
+        if self._on_vm_ready:
+            try:
+                self._on_vm_ready()
+            except Exception:
+                logger.exception("on_vm_ready callback failed")
+
+    async def _merge_vm_context_if_current(
+        self,
+        entity_id: str,
+        *,
+        is_thread: bool,
+        registration_id: str,
+        updates: dict,
+    ) -> bool:
+        if not self._db:
+            return False
+
+        try:
+            if is_thread:
+                return await self._db.merge_thread_vm_context_if_current(
+                    entity_id, registration_id, updates
+                )
+            return await self._db.merge_vm_context_if_current(
+                entity_id, registration_id, updates
+            )
+        except Exception:
+            logger.exception(
+                "Failed conditional VM context update for %s %s",
+                "thread" if is_thread else "job",
+                entity_id,
+            )
+            return False
 
     async def _seed_vm_ide_config(
         self, entity_id: str, is_thread: bool, ssh_host: str, ssh_port: int

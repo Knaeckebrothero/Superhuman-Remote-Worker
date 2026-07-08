@@ -29,12 +29,15 @@ def build_agent_ssh_cmd(
     remote_cmd: str,
     *,
     key_path: Optional[str] = None,
+    connect_timeout_s: int = 10,
+    batch_mode: bool = False,
 ) -> list[str]:
     """Build the SSH argv used to run ``remote_cmd`` on an agent host.
 
     Mirrors the options used across snapshot capture/restore. If ``key_path``
     is None it is resolved via ``resolve_ssh_key_path()``; an empty key path
-    omits the ``-i`` flag.
+    omits the ``-i`` flag. ``batch_mode`` is useful for readiness probes where
+    auth prompts must fail fast instead of hanging the probe.
     """
     if key_path is None:
         key_path = resolve_ssh_key_path()
@@ -46,7 +49,8 @@ def build_agent_ssh_cmd(
         "-o",
         "UserKnownHostsFile=/dev/null",
         "-o",
-        "ConnectTimeout=10",
+        f"ConnectTimeout={int(connect_timeout_s)}",
+        *(["-o", "BatchMode=yes"] if batch_mode else []),
         "-p",
         str(ssh_port),
         f"agent-host@{ssh_host}",
@@ -81,3 +85,59 @@ async def stream_extract_snapshot(
         )
         _stdout, stderr = await proc.communicate()
     return proc.returncode, stderr
+
+
+async def wait_for_agent_ssh(
+    ssh_host: str,
+    ssh_port: int,
+    *,
+    deadline_s: float,
+    connect_timeout_s: int,
+    interval_s: float,
+    key_path: Optional[str] = None,
+) -> tuple[bool, int, str]:
+    """Poll until ``agent-host@ssh_host`` accepts an authenticated SSH command.
+
+    Returns ``(ready, attempts, last_error)``. The probe proves route + sshd +
+    key authorization by running ``true`` with ``BatchMode=yes``.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(deadline_s))
+    attempts = 0
+    last_error = ""
+
+    while True:
+        attempts += 1
+        ssh_cmd = build_agent_ssh_cmd(
+            ssh_host,
+            ssh_port,
+            "true",
+            key_path=key_path,
+            connect_timeout_s=connect_timeout_s,
+            batch_mode=True,
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=max(1, int(connect_timeout_s)) + 5
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            stderr = b"ssh readiness probe process timed out"
+
+        if proc.returncode == 0:
+            return True, attempts, ""
+
+        last_error = stderr.decode("utf-8", errors="replace").strip()
+        if len(last_error) > 500:
+            last_error = last_error[-500:]
+        if loop.time() >= deadline:
+            return False, attempts, last_error or f"ssh exited {proc.returncode}"
+
+        remaining = max(0.0, deadline - loop.time())
+        await asyncio.sleep(min(max(0.0, float(interval_s)), remaining))

@@ -782,12 +782,7 @@ class TestCreateVm:
 
 
 class TestFreshProvisionReset:
-    """Every (re)provision must reset snapshot_attempts + drop the stale
-    ssh_host and stamp provisioned_at. context.vm is *merged* across provisions,
-    so without this a prior incarnation's snapshot_attempts (which reaches the
-    reaper's max and force-deletes the new VM on its first tick) and dead
-    ssh_host would leak into the fresh VM.
-    """
+    """Every (re)provision must reset stale VM lifecycle/probe state."""
 
     def test_fresh_provision_ctx_shape(self):
         from orchestrator.services.vm_provisioner import VMProvisioner
@@ -796,6 +791,12 @@ class TestFreshProvisionReset:
         assert ctx["snapshot_attempts"] == 0
         assert ctx["ssh_host"] is None
         assert ctx["ssh_port"] is None
+        assert ctx["ssh_registration_id"] is None
+        assert ctx["registered_at"] is None
+        assert ctx["ssh_verified_at"] is None
+        assert ctx["ssh_probe_attempts"] == 0
+        assert ctx["ssh_probe_error"] is None
+        assert ctx["ssh_probe_failed_at"] is None
         assert isinstance(ctx["provisioned_at"], float)
 
     @pytest.mark.asyncio
