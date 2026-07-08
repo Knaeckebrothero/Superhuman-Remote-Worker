@@ -6,6 +6,11 @@ import {VIEW_AS_OVERRIDE} from '../interceptors/view-as.interceptor';
 
 /** Page-level visibility override forwarded to the view-as interceptor. */
 export type UsageScope = 'all' | 'mine' | null;
+export type UsageWindow = number | {
+  days?: number;
+  fromIso?: string;
+  toIso?: string;
+};
 
 /** One (category, unit) usage aggregate row from `/api/usage`. */
 export interface UsageCategoryRow {
@@ -91,9 +96,19 @@ export class AdminUsageService {
     return new HttpContext().set(VIEW_AS_OVERRIDE, scope);
   }
 
-  loadUsage(days = 30, scope: UsageScope = null): void {
+  private windowParams(window: UsageWindow = 30): HttpParams {
+    if (typeof window === 'number') return new HttpParams().set('days', String(window));
+
+    let params = new HttpParams();
+    if (window.days !== undefined) params = params.set('days', String(window.days));
+    if (window.fromIso) params = params.set('from_date', window.fromIso);
+    if (window.toIso) params = params.set('to_date', window.toIso);
+    return params;
+  }
+
+  loadUsage(window: UsageWindow = 30, scope: UsageScope = null): void {
     this.loading.set(true);
-    const params = new HttpParams().set('days', String(days));
+    const params = this.windowParams(window);
     this.http
       .get<UsageSummary>(`${this.baseUrl}/usage`, {params, context: this.scopeCtx(scope)})
       .pipe(catchError(() => of(EMPTY)))
@@ -106,8 +121,8 @@ export class AdminUsageService {
   private readonly breakdowns = signal<Partial<Record<BreakdownDim, UsageBreakdown>>>({});
   breakdown(dim: BreakdownDim): UsageBreakdown | null { return this.breakdowns()[dim] ?? null; }
 
-  loadBreakdown(groupBy: BreakdownDim, days = 30, scope: UsageScope = null): void {
-    const params = new HttpParams().set('group_by', groupBy).set('days', String(days));
+  loadBreakdown(groupBy: BreakdownDim, window: UsageWindow = 30, scope: UsageScope = null): void {
+    const params = this.windowParams(window).set('group_by', groupBy);
     this.http
       .get<UsageBreakdown>(`${this.baseUrl}/usage/breakdown`, {params, context: this.scopeCtx(scope)})
       .pipe(catchError(() => of({available: false, group_by: groupBy, rows: []} as UsageBreakdown)))
@@ -117,8 +132,8 @@ export class AdminUsageService {
   private readonly timeseriesSig = signal<Partial<Record<BreakdownDim, UsageTimeseries>>>({});
   timeseries(dim: BreakdownDim): UsageTimeseries | null { return this.timeseriesSig()[dim] ?? null; }
 
-  loadTimeseries(groupBy: BreakdownDim, days = 30, scope: UsageScope = null): void {
-    const params = new HttpParams().set('group_by', groupBy).set('days', String(days));
+  loadTimeseries(groupBy: BreakdownDim, window: UsageWindow = 30, scope: UsageScope = null): void {
+    const params = this.windowParams(window).set('group_by', groupBy);
     this.http
       .get<UsageTimeseries>(`${this.baseUrl}/usage/timeseries`, {params, context: this.scopeCtx(scope)})
       .pipe(catchError(() =>
@@ -128,9 +143,7 @@ export class AdminUsageService {
 
   /** One-shot windowed fetch (used by the KPI trend's current-vs-previous pair). */
   loadUsageWindow(days: number, fromIso?: string, toIso?: string) {
-    let params = new HttpParams().set('days', String(days));
-    if (fromIso) params = params.set('from_date', fromIso);
-    if (toIso) params = params.set('to_date', toIso);
+    const params = this.windowParams({days, fromIso, toIso});
     return this.http
       .get<UsageSummary>(`${this.baseUrl}/usage`, {params})
       .pipe(catchError(() => of(EMPTY)));
