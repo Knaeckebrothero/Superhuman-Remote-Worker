@@ -576,7 +576,7 @@ ALTER TABLE ONLY public.usage_events ALTER COLUMN details SET COMPRESSION lz4;
 -- Name: TABLE usage_events; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.usage_events IS 'Append-only usage/cost ledger, one row per metered resource dimension. Written by the orchestrator (compute intervals + audit LLM materialization); read by /api/usage and the usage_daily rollup. Monthly partitions on ts (audit-store machinery), partition column is ts not timestamp. NEVER UPDATE rows and NEVER add a GIN index on details.';
+COMMENT ON TABLE public.usage_events IS 'Append-only usage/cost ledger, one row per metered resource dimension. Written by the orchestrator (compute intervals + LiteLLM spend-log materialization); read by /api/usage and the usage_daily rollup. Monthly partitions on ts (audit-store machinery), partition column is ts not timestamp. NEVER UPDATE rows and NEVER add a GIN index on details.';
 
 
 --
@@ -611,7 +611,7 @@ COMMENT ON COLUMN public.usage_events.rate_usd IS 'Snapshot of the rate applied 
 -- Name: COLUMN usage_events.source_id; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.usage_events.source_id IS 'Per-source idempotency id: audit request id (LLM) or a deterministic workspace-interval key (compute). With source + unit it dedupes re-emits (ON CONFLICT DO NOTHING) so the at-least-once emitters cannot double-count.';
+COMMENT ON COLUMN public.usage_events.source_id IS 'Per-source idempotency id: LiteLLM request_id (LLM) or a deterministic workspace-interval key (compute). With source + unit it dedupes re-emits (ON CONFLICT DO NOTHING) so the at-least-once emitters cannot double-count.';
 
 
 --
