@@ -3598,13 +3598,10 @@ def _create_codex_llm(
     model_kwargs = {}
     # NOTE: top_k is deliberately NOT forwarded. The Codex proxy speaks ONLY
     # the OpenAI Responses API, which rejects top_k with 400 "Unsupported
-    # parameter: top_k". Unlike gateway-routed models — whose stray params are
-    # absorbed by LiteLLM's drop_params — the codex lane bypasses the gateway
-    # (orchestrator/main.py:1734) to preserve the Responses-API reasoning
-    # summary, so it must self-sanitize. A stale top_k can reach here from a
-    # prior model family (e.g. gemma's top_k=64) surviving a session model
-    # switch to gpt-5.x/codex. Why codex bypasses the gateway:
-    # docs/done/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+    # parameter: top_k". The codex lane talks to that endpoint directly to
+    # preserve the Responses-API reasoning summary, so it must self-sanitize. A
+    # stale top_k can reach here from a prior model family (e.g. gemma's top_k=64)
+    # surviving a session model switch to gpt-5.x/codex.
     extra_body: dict = {}
 
     # Build kwargs for ReasoningChatOpenAI.

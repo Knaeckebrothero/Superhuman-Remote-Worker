@@ -6,7 +6,7 @@ Covers:
 - Pydantic bodies (``CatalogModelCreate``, ``CatalogModelUpdate``) accept the
   expected shapes and reject invalid enums / missing required fields.
 - ``params_json={"temperature": 0}`` and ``context_window=0`` round-trip as
-  themselves through the DB accessors (LiteLLM #14661 hazard regression).
+  themselves through the DB accessors.
 - ``resolve_catalog_model`` JOINs to the right transport (system vs endpoint)
   and prefers the system row when both are present.
 - ``list_models_by_capability_alphabetical`` filters on enabled and sorts.
@@ -235,7 +235,7 @@ def _row(**overrides):
 
 
 class TestCreateModelJsonbHandling:
-    """LiteLLM #14661 hazard — null vs explicit zero must be distinguished.
+    """Null vs explicit zero must be distinguished.
 
     Positional argument indices on the INSERT bind layout (post chunk 7):
     $1 provider_kind, $2 provider_ref, $3 model_id, $4 display_label,

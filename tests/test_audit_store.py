@@ -266,14 +266,14 @@ class TestAuditSchema:
                 await pool.execute(
                     "INSERT INTO usage_events "
                     "(ts, category, resource, quantity, unit, source, source_id) "
-                    "VALUES ($1, 'llm', 'm', 1, 'prompt-token', 'litellm', 'r1')",
+                    "VALUES ($1, 'llm', 'm', 1, 'prompt-token', 'audit', 'r1')",
                     far_future,
                 )
             assert exc.value.sqlstate == "23514"
 
     async def test_usage_events_dedupe_unique(self, pg_dsn):
         # The at-least-once idempotency key (source, source_id, unit, ts): a second
-        # identical emit is rejected, so a re-polled spend log / re-emitted close
+        # identical emit is rejected, so a re-polled request / re-emitted close
         # cannot double-count. A different unit on the same source_id is allowed
         # (one row per metered dimension).
         async with _audit_pool(pg_dsn) as pool:
@@ -284,14 +284,14 @@ class TestAuditSchema:
                 "VALUES ($1,$2,$3,$4,$5,$6,$7)"
             )
             await pool.execute(
-                sql, now, "llm", "gemma", 100, "prompt-token", "litellm", "req-abc"
+                sql, now, "llm", "gemma", 100, "prompt-token", "audit", "req-abc"
             )
             with pytest.raises(asyncpg.exceptions.UniqueViolationError):
                 await pool.execute(
-                    sql, now, "llm", "gemma", 100, "prompt-token", "litellm", "req-abc"
+                    sql, now, "llm", "gemma", 100, "prompt-token", "audit", "req-abc"
                 )
             await pool.execute(
-                sql, now, "llm", "gemma", 50, "completion-token", "litellm", "req-abc"
+                sql, now, "llm", "gemma", 50, "completion-token", "audit", "req-abc"
             )
             n = await pool.fetchval("SELECT count(*) FROM usage_events")
             assert n == 2
@@ -397,7 +397,7 @@ class TestUsageLedger:
                     resource="gemma",
                     quantity=100,
                     unit="prompt-token",
-                    source="litellm",
+                    source="audit",
                     source_id="req1",
                     ts=now,
                     user_id=str(uid),
@@ -410,7 +410,7 @@ class TestUsageLedger:
                     resource="gemma",
                     quantity=50,
                     unit="cached-prompt-token",
-                    source="litellm",
+                    source="audit",
                     source_id="req1",
                     ts=now,
                     user_id=str(uid),
@@ -423,7 +423,7 @@ class TestUsageLedger:
                     resource="gemma",
                     quantity=40,
                     unit="completion-token",
-                    source="litellm",
+                    source="audit",
                     source_id="req1",
                     ts=now,
                     user_id=str(uid),
@@ -466,7 +466,7 @@ class TestUsageLedger:
                 resource="gemma",
                 quantity=10,
                 unit="prompt-token",
-                source="litellm",
+                source="audit",
                 source_id="dup",
                 ts=now,
             )
@@ -478,7 +478,7 @@ class TestUsageLedger:
                 resource="gemma",
                 quantity=5,
                 unit="completion-token",
-                source="litellm",
+                source="audit",
                 source_id="dup",
                 ts=now,
             )
@@ -508,7 +508,7 @@ class TestUsageLedger:
                         resource="gemma",
                         quantity=1000,
                         unit="prompt-token",
-                        source="litellm",
+                        source="audit",
                         source_id="r",
                         ts=now,
                     )
@@ -532,7 +532,7 @@ class TestUsageLedger:
                 resource="g",
                 quantity=1,
                 unit="prompt-token",
-                source="litellm",
+                source="audit",
                 source_id="good",
                 ts=now,
             )
@@ -541,7 +541,7 @@ class TestUsageLedger:
                 resource="g",
                 quantity=1,
                 unit="prompt-token",
-                source="litellm",
+                source="audit",
                 source_id="bad",
                 ts=now + timedelta(days=3650),
             )
@@ -571,7 +571,7 @@ class TestUsageLedger:
                         resource="m",
                         quantity=1,
                         unit="prompt-token",
-                        source="litellm",
+                        source="audit",
                         source_id="a",
                         ts=now,
                         user_id=str(ua),
@@ -581,7 +581,7 @@ class TestUsageLedger:
                         resource="m",
                         quantity=1,
                         unit="prompt-token",
-                        source="litellm",
+                        source="audit",
                         source_id="b",
                         ts=now,
                         user_id=str(ub),
@@ -613,7 +613,7 @@ class TestUsageLedger:
                     resource=model,
                     quantity=qty,
                     unit=unit,
-                    source="litellm",
+                    source="audit",
                     source_id=sid,
                     ts=now,
                     user_id=str(uid),
@@ -654,7 +654,7 @@ class TestUsageLedger:
                     resource="gemma",
                     quantity=10,
                     unit="prompt-token",
-                    source="litellm",
+                    source="audit",
                     source_id=sid,
                     ts=now,
                     user_id=str(uid),
@@ -700,7 +700,7 @@ class TestUsageLedger:
                     resource=model,
                     quantity=qty,
                     unit=unit,
-                    source="litellm",
+                    source="audit",
                     source_id=sid,
                     ts=ts,
                     user_id=str(uid),
@@ -745,7 +745,7 @@ class TestUsageLedger:
             resource="m",
             quantity=1,
             unit="prompt-token",
-            source="litellm",
+            source="audit",
             source_id="x",
             ts=now,
         )

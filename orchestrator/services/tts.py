@@ -492,8 +492,8 @@ def _token_events_from_usage(
 ) -> list[UsageEvent]:
     """Prompt/completion-token ``UsageEvent``s from an OpenAI-compatible ``usage``
     object — ``[]`` when it's ``None`` (many local servers omit usage). Emitted
-    under ``source='orchestrator'`` so they don't collide with the LiteLLM
-    materializer's namespace and stay attributable to the TTS aux. Shared by the
+    under ``source='orchestrator'`` so they stay attributable to the TTS aux
+    without colliding with chat usage rows. Shared by the
     buffered (``response.usage``) and streaming (final-chunk ``usage``) paths."""
     if usage is None:
         return []

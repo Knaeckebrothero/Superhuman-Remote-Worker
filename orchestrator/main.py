@@ -162,16 +162,6 @@ from services.dispatch_guards import (  # noqa: E402
     preemption_blocked_reason,
     vm_provisioning_decision,
 )
-from services.litellm_gateway import (  # noqa: E402
-    LiteLLMClient,
-    _parse_quota_policy,
-    compute_project_quota_status,
-    ensure_scoped_key,
-    gateway_is_healthy,
-    gateway_registered_models,
-    get_fleet_key,
-    mark_gateway_health,
-)
 from services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
 from services.openrouter_pricing import llm_pricing_sync_loop  # noqa: E402
 from services.audit_partitions import (  # noqa: E402
@@ -1301,343 +1291,6 @@ def _looks_like_uuid(value: Any) -> bool:
         return False
 
 
-def _gateway_routing_target() -> tuple[str, str] | None:
-    """OpenAI-compatible ``(base_url, api_key)`` for the LiteLLM gateway, or None.
-
-    Returns None unless the gateway is enabled (``LITELLM_BASE_URL`` set — the
-    chart only populates it when ``litellm.enabled``). When set, **endpoint-kind**
-    models are pointed here instead of straight at their upstream, so all of their
-    traffic is measured at the one chokepoint (Slice 1). See
-    docs/done/usage_monitoring_and_rate_limiting.md.
-
-    The ``/v1`` suffix matches what the agent's OpenAI factory expects (direct
-    endpoint base_urls carry it too); the orchestrator's admin/health client uses
-    the bare ``LITELLM_BASE_URL`` instead.
-
-    Credential: the shared **fleet key** (Slice 2a) — a non-admin key carrying
-    the aggregate backstop, so the admin master key (which bypasses all limits)
-    never reaches agents. Falls back to the master key only in the brief startup
-    window before the fleet key is provisioned. Slice 2b replaces the shared key
-    with per-job least-privilege keys minted at dispatch (per-job-client-rebuild
-    prereq: docs/issues/agent_loop_mode_pod_reuse.md).
-    """
-    base = os.getenv("LITELLM_BASE_URL", "").strip()
-    if not base:
-        return None
-    # Gateway-down → direct fallback (Phase 0): once a readiness probe has
-    # confirmed the gateway is unreachable, route the agent straight at the
-    # model's upstream instead of handing it a dead gateway base_url. Returning
-    # None here is exactly how callers already express "no gateway → use the
-    # endpoint's direct creds", so both dispatch injectors degrade gracefully.
-    if not gateway_is_healthy():
-        return None
-    key = get_fleet_key() or os.getenv("LITELLM_MASTER_KEY", "").strip()
-    if not key:
-        return None
-    return f"{base.rstrip('/')}/v1", key
-
-
-async def _gateway_routing_target_scoped(
-    user_id: str | None, project_id: str | None
-) -> tuple[str, str] | None:
-    """Gateway ``(base_url, api_key)`` using the per-(user,project) scoped key (2b).
-
-    Ensures the job's scoped key (+ its team/internal-user, carrying the
-    per-project / per-user limits) exists, then routes the agent onto it so
-    LiteLLM enforces those limits. Falls back to the shared fleet key (2a) when
-    the job has no user/project, when the gateway is briefly unreachable, or when
-    the scoped-key ensure fails — the fleet key still caps the aggregate and keeps
-    agents off the admin master key, so a transient gateway blip degrades to
-    "measured + aggregate-capped" rather than failing the dispatch.
-
-    Returns None only when the gateway is disabled entirely (so callers keep their
-    direct-endpoint path), matching :func:`_gateway_routing_target`.
-    """
-    base = os.getenv("LITELLM_BASE_URL", "").strip()
-    if not base:
-        return None
-    master = os.getenv("LITELLM_MASTER_KEY", "").strip()
-    if user_id and project_id and master:
-        client = LiteLLMClient(base, master)
-        try:
-            # This probe also refreshes the cached health flag, so a gateway
-            # outage is detected on the very next dispatch (not just the 60s sync
-            # tick). When down, fall through to _gateway_routing_target(), which
-            # now returns None → the caller uses the model's direct upstream.
-            ready = await client.is_ready()
-            mark_gateway_health(ready)
-            if ready:
-                scoped = await ensure_scoped_key(
-                    client,
-                    postgres_db,
-                    master,
-                    user_id=user_id,
-                    project_id=project_id,
-                )
-                if scoped:
-                    return f"{base.rstrip('/')}/v1", scoped
-        except Exception:
-            logger.exception(
-                "Scoped-key ensure failed (user=%s project=%s); "
-                "falling back to fleet key",
-                user_id,
-                project_id,
-            )
-        finally:
-            await client.aclose()
-    return _gateway_routing_target()
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 — route system/codex models through the gateway, per-provider canary.
-#
-# Today gemma (endpoint-kind) already routes through the gateway; system models
-# (minimax/OpenRouter, gemini/Google) go direct and codex deliberately bypasses.
-# Phase 2 flips those onto the gateway too — but behind a per-provider allowlist
-# so we can canary one provider at a time. Empty allowlist = zero behaviour
-# change (the default), so this is dark until an operator opts a provider in.
-# See docs/features/route_all_models_through_litellm_gateway.md §4.2.
-# ---------------------------------------------------------------------------
-
-
-def _gateway_routed_providers() -> frozenset[str]:
-    """Provider slugs opted into gateway routing (``LITELLM_GATEWAY_ROUTED_PROVIDERS``).
-
-    Comma-separated, lowercased (e.g. ``"google,openrouter,codex"``). Empty/unset
-    → no system/codex model is forced onto the gateway (pre-Phase-2 behaviour).
-    The sentinel ``"*"`` means **every** system/codex provider routes through the
-    gateway — the end-state "single path for all LLM traffic" posture, so new
-    providers route the moment they're registered, with no per-provider edit.
-    """
-    raw = os.getenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "")
-    return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
-
-
-def _gateway_canary_provider(meta: Any) -> str | None:
-    """The canary key for a model, or None if it isn't a gateway-canary candidate.
-
-    Only **system-anchored** rows (``api_key_ref`` = provider slug) and the
-    **codex** proxy are candidates. Endpoint rows like gemma already route
-    through the gateway via the endpoint branch and are not gated by the canary.
-    """
-    if meta is None:
-        return None
-    if meta.provider == "codex":
-        return "codex"
-    if meta.endpoint_id is None and meta.api_key_ref:
-        return str(meta.api_key_ref).lower()
-    return None
-
-
-def _should_route_via_gateway(meta: Any, gw_target: tuple[str, str] | None) -> bool:
-    """True if this system/codex model should route through the gateway (Phase 2).
-
-    Three gates, all required: the gateway is reachable (``gw_target`` non-None —
-    also covers the Phase-0 health fallback), the model's provider is in the
-    canary allowlist (or the allowlist is the ``"*"`` wildcard = all providers),
-    and the model is **actually registered** in the gateway. The last is the
-    fail-loud guard: a canaried-but-unregistered model routes direct (with a
-    warning) instead of 400-ing against an unknown gateway model — so even ``"*"``
-    never forces an unregistered model onto the gateway.
-    """
-    if gw_target is None:
-        return False
-    provider = _gateway_canary_provider(meta)
-    if provider is None:
-        return False
-    routed = _gateway_routed_providers()
-    if "*" not in routed and provider not in routed:
-        return False
-    if meta.model_id not in gateway_registered_models():
-        logger.warning(
-            "Gateway canary: %s (provider %s) is opted-in but not registered in "
-            "the gateway — routing direct. Check the catalog sync / system key.",
-            meta.model_id,
-            provider,
-        )
-        return False
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Slice 3 — longer-window quota stop (orchestrator-enforced).
-#
-# LiteLLM has no native request/token daily quota (only a dollar cron budget —
-# capability gap 2), so the orchestrator polls per-project daily usage from the
-# gateway and, when a project crosses its quota, freezes that project's running
-# jobs (pause + workspace release) AND blocks the dispatcher from re-dispatching
-# them. The two enforcement points share one in-memory set, owned by the poll
-# loop. Per-project only for v1 (the per-user activity read is unreliable); daily
-# UTC window (rolling deferred). See docs/done/usage_monitoring_and_rate_limiting.md.
-# ---------------------------------------------------------------------------
-
-# Projects currently frozen for crossing their daily quota. Rebound (not mutated)
-# by the quota poll loop so the dispatcher always reads a consistent snapshot.
-_over_quota_projects: frozenset[str] = frozenset()
-
-
-def is_project_over_quota(project_id: str | None) -> bool:
-    """True if this project is currently quota-frozen (cheap in-memory lookup).
-
-    Called by the dispatcher per candidate job, so it must never touch the
-    gateway/DB — it only consults the set the poll loop maintains.
-    """
-    return bool(project_id) and str(project_id) in _over_quota_projects
-
-
-async def _active_project_ids() -> set[str]:
-    """Distinct project ids with running/pending jobs — the quota poll's scope.
-
-    Bounded to projects that actually have work, so the poll only reads usage for
-    relevant teams. (At scale this becomes one ``SELECT DISTINCT project_id``; the
-    few-hundred-row scan is fine for now — noted in the Scaling section.)
-    """
-    ids: set[str] = set()
-    for status in ("processing", "created", "paused"):
-        try:
-            for job in await postgres_db.get_jobs(status=status, limit=500):
-                pid = job.get("project_id")
-                if pid:
-                    ids.add(str(pid))
-        except Exception:
-            logger.exception("Quota poll: failed to list %s jobs", status)
-    return ids
-
-
-async def _freeze_project_over_quota(
-    project_id: str, *, usage: dict[str, int], quota: dict[str, int]
-) -> int:
-    """Freeze a project's in-flight jobs after it crossed its daily quota.
-
-    Pauses each ``processing`` job (frees its agent, stops re-dispatch via the
-    gate) and releases its workspace snapshot-first, so it resumes cleanly once
-    the quota resets. Tags ``freeze_data`` with ``type=quota_exceeded`` so the UI
-    can tell a quota stop from a normal pause. Returns the count actually frozen.
-    """
-    try:
-        jobs = await postgres_db.get_jobs(
-            status="processing", scope_project_id=project_id, limit=200
-        )
-    except Exception:
-        logger.exception("Quota freeze: failed to list jobs for project %s", project_id)
-        return 0
-
-    frozen = 0
-    for job in jobs:
-        job_id = str(job["id"])
-        try:
-            # pause_job guards on status='processing' + clears the agent; if it
-            # lost the race (already paused/done), skip — nothing to freeze.
-            if not await postgres_db.pause_job(job_id):
-                continue
-            await postgres_db.update_job_status(
-                job_id,
-                freeze_data={
-                    "type": "quota_exceeded",
-                    "scope": "project",
-                    "project_id": project_id,
-                    "usage": usage,
-                    "quota": quota,
-                },
-            )
-            await _cascade_pause_to_children(job_id)
-            if container_provisioner.is_available:
-                await container_provisioner.release_workspace(
-                    WorkspaceOwner.job(job_id)
-                )
-            frozen += 1
-            logger.warning(
-                "Quota stop: froze job %s — project %s over daily quota (%s / %s)",
-                job_id,
-                project_id,
-                usage,
-                quota,
-            )
-        except Exception:
-            logger.exception("Quota freeze: failed to freeze job %s", job_id)
-    return frozen
-
-
-async def _quota_poll_tick(client: LiteLLMClient) -> None:
-    """One quota evaluation: refresh the over-quota set + freeze newly-over jobs."""
-    global _over_quota_projects
-    # Cheap short-circuit when no quota is configured (the common case until an
-    # admin sets one): don't even scan jobs. Also clears a stale gate if the
-    # policy was just removed.
-    if not _parse_quota_policy():
-        if _over_quota_projects:
-            _over_quota_projects = frozenset()
-        return
-
-    project_ids = await _active_project_ids()
-    if not project_ids:
-        _over_quota_projects = frozenset()
-        return
-
-    day = datetime.now(timezone.utc).date().isoformat()
-    status = await compute_project_quota_status(client, list(project_ids), day=day)
-    now_over = frozenset(pid for pid, st in status.items() if st["over"])
-    newly_over = now_over - _over_quota_projects
-    newly_under = _over_quota_projects - now_over
-    # Atomic rebind (not clear+update) so the dispatcher never sees a half-empty
-    # set. Projects that dropped back under quota (e.g. the midnight reset) leave
-    # the set here → their paused jobs become dispatchable again automatically.
-    _over_quota_projects = now_over
-
-    if newly_under:
-        logger.info(
-            "Quota: project(s) %s back under daily quota — dispatch re-enabled",
-            sorted(newly_under),
-        )
-    for pid in newly_over:
-        st = status[pid]
-        logger.warning(
-            "Quota: project %s crossed daily quota (usage=%s quota=%s) — freezing jobs",
-            pid,
-            st["usage"],
-            st["quota"],
-        )
-        await _freeze_project_over_quota(pid, usage=st["usage"], quota=st["quota"])
-
-
-async def quota_poll_loop(
-    shutdown_event: asyncio.Event,
-    postgres_db: Any,
-    *,
-    interval: float = 120.0,
-) -> None:
-    """Background loop: enforce per-project daily usage quotas (Slice 3).
-
-    No-op when the gateway is unconfigured (``LITELLM_BASE_URL`` unset), mirroring
-    the catalog sync. Slower cadence than the dispatcher (quotas move over hours,
-    not seconds). Never raises into the lifespan: a tick failure is logged and
-    retried. ``postgres_db`` is accepted for symmetry with the other loops (the
-    helpers use the module global).
-    """
-    base_url = os.getenv("LITELLM_BASE_URL", "").strip()
-    master_key = os.getenv("LITELLM_MASTER_KEY", "").strip()
-    if not base_url or not master_key:
-        logger.info("Quota poll loop disabled (gateway not configured)")
-        return
-
-    client = LiteLLMClient(base_url, master_key)
-    logger.info("Quota poll loop starting (interval=%ss)", interval)
-    try:
-        while not shutdown_event.is_set():
-            try:
-                if await client.is_ready():
-                    await _quota_poll_tick(client)
-            except Exception:
-                logger.exception("Quota poll tick failed (non-fatal)")
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-    finally:
-        await client.aclose()
-        logger.info("Quota poll loop stopped")
-
-
 async def llm_usage_poll_loop(
     shutdown_event: asyncio.Event,
     *,
@@ -1645,19 +1298,15 @@ async def llm_usage_poll_loop(
 ) -> None:
     """Background loop: materialize the audit trail into usage_events (LLM cost).
 
-    In-process replacement for the LiteLLM spend-log poll now that the gateway is
-    being removed (docs/issues/remove_litellm_proxy_and_gateway_concept.md, P1).
     Reads new ``llm_requests`` rows via ``materialize_llm_usage_from_audit`` and
     prices them from ``usage_rates`` (seeded by ``llm_pricing_sync_loop``) — no
     proxy in the path. Idempotent at the ledger; never raises into the lifespan.
 
     Forward-only: the cursor anchors at the current max ``llm_requests.timestamp``
-    on startup, so re-pointing from the litellm-spend source to the audit source
-    never re-meters already-metered history under ``source='audit'`` (backfilling
-    a disable-gap is a separate, deliberate op — a lower initial anchor). The
-    cursor is a timestamp, NOT an id: ``llm_requests.id`` is not monotonic with
-    time (the audit sequence has been reset — a max-id anchor would silently miss
-    the active low-id band). No-op when the ledger or either pool is unavailable.
+    on startup, so the audit materializer does not backfill historical rows unless
+    an operator deliberately lowers the anchor. The cursor is a timestamp, NOT an
+    id: ``llm_requests.id`` is not monotonic with time. No-op when the ledger or
+    either pool is unavailable.
     """
     if usage_ledger is None or not usage_ledger.is_available:
         logger.info("LLM usage poll loop disabled (usage ledger unavailable)")
@@ -1666,9 +1315,8 @@ async def llm_usage_poll_loop(
         logger.info("LLM usage poll loop disabled (audit/app pool unavailable)")
         return
 
-    # Forward-only anchor: start after the newest existing row (by timestamp, the
-    # monotonic key) so re-pointing the source doesn't double-count calls the
-    # litellm poll already metered. Falls back to wall-clock now when empty.
+    # Forward-only anchor: start after the newest existing row by timestamp.
+    # Falls back to wall-clock now when empty.
     cursor = datetime.now(timezone.utc)
     try:
         async with audit_db.pool.acquire() as conn:
@@ -1788,13 +1436,6 @@ async def _inject_dispatch_credentials(
         project_id=project_id_str,
     )
 
-    # Resolve the gateway routing target once for the whole dispatch: the
-    # per-(user,project) scoped key (Slice 2b) when both are known, else the
-    # shared fleet key (2a). Computed here so every model section the job pins
-    # (top-level + strategic/tactical/aux) routes through the *same* key, so the
-    # job's per-project/per-user limits apply uniformly across its LLM surface.
-    _gw_scoped = await _gateway_routing_target_scoped(user_id_str, project_id_str)
-
     config_override = config_override or {}
     llm_over = config_override.setdefault("llm", {})
     model_id = llm_over.get("model")
@@ -1805,23 +1446,7 @@ async def _inject_dispatch_credentials(
         except UnknownModelError:
             meta = None
 
-    if _should_route_via_gateway(meta, _gw_scoped):
-        # Phase 2 canary: a system/codex model whose provider is opted in AND
-        # registered → route through the gateway with the **openai** factory, so
-        # the agent captures reasoning as ``reasoning_content`` (system providers
-        # natively; codex via the gateway's Chat<->Responses bridge). The gateway
-        # holds the upstream/system key, so the agent's credential is the gateway
-        # virtual key — assigned (not setdefault) so a stale direct key or
-        # provider from a prior turn can't shadow it, and so the upstream key
-        # never reaches the gateway (it 401s on non-``sk-`` keys).
-        llm_over["provider"] = "openai"
-        llm_over["base_url"] = _gw_scoped[0]
-        llm_over["api_key"] = _gw_scoped[1]
-        logger.info(
-            f"Dispatch: routed {model_id} via LiteLLM gateway "
-            f"(canary {_gateway_canary_provider(meta)})"
-        )
-    elif (
+    if (
         meta is not None
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
@@ -1831,56 +1456,19 @@ async def _inject_dispatch_credentials(
         # API Codex proxy). Inject it so the agent builds the right factory — the
         # endpoint branch otherwise leaves provider unset and the agent defaults
         # to the openai factory, which forces Chat Completions and strips gpt-5.x
-        # reasoning. See docs/done/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+        # reasoning.
         if meta.provider:
-            llm_over.setdefault("provider", meta.provider)
-        # The Codex proxy speaks ONLY the Responses API; the LiteLLM gateway
-        # normalizes to Chat Completions and drops the reasoning summary, so codex
-        # models bypass the gateway and hit their endpoint directly. _gw_scoped is
-        # also None when the gateway is unhealthy (Phase-0 fallback) → the same
-        # direct path below carries the job through a gateway outage.
-        _gw = _gw_scoped if meta.provider != "codex" else None
-        if _gw is not None:
-            # Endpoint-kind model + gateway enabled → route through LiteLLM so the
-            # traffic is measured at the chokepoint AND the job's scoped key
-            # (2b) applies its per-project/per-user limits. The gateway resolves
-            # the model_id to its real upstream (registered by the catalog sync).
-            llm_over.setdefault("base_url", _gw[0])
-            llm_over.setdefault("api_key", _gw[1])
+            llm_over["provider"] = meta.provider
+        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+        if endpoint_row:
+            if endpoint_row.get("base_url"):
+                llm_over["base_url"] = endpoint_row["base_url"]
+            if endpoint_row.get("api_key"):
+                llm_over["api_key"] = endpoint_row["api_key"]
             logger.info(
-                f"Dispatch: routed {model_id} via LiteLLM gateway "
-                f"(endpoint {meta.endpoint_id})"
+                f"Dispatch: routed {model_id} to {meta.origin} endpoint "
+                f"{endpoint_row.get('label') or meta.endpoint_id}"
             )
-        else:
-            endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-            if endpoint_row:
-                # Direct path (codex, or gateway-down fallback). On resume the
-                # config_override can carry a STALE gateway base_url from a prior
-                # gateway-routed dispatch; per-field setdefault would keep it and
-                # send the endpoint's direct key to the gateway (401). Strip a
-                # gateway base_url — detected from the resolved target and env, so
-                # it fires whether the gateway is healthy-codex (_gw_scoped set)
-                # or unhealthy (_gw_scoped None) — so it repopulates from the row.
-                _gw_urls = {_gw_scoped[0]} if _gw_scoped else set()
-                _gw_base = os.getenv("LITELLM_BASE_URL", "").strip()
-                if _gw_base:
-                    _gw_urls.add(f"{_gw_base.rstrip('/')}/v1")
-                if llm_over.get("base_url") in _gw_urls:
-                    llm_over.pop("base_url", None)
-                    if meta.provider:
-                        llm_over["provider"] = meta.provider
-                if endpoint_row.get("base_url"):
-                    llm_over.setdefault("base_url", endpoint_row["base_url"])
-                if endpoint_row.get("api_key"):
-                    llm_over.setdefault("api_key", endpoint_row["api_key"])
-                # Gateway configured (base set) + non-codex reaching the direct
-                # path ⇒ the gateway is unhealthy and we're falling back.
-                _is_fallback = bool(_gw_base) and meta.provider != "codex"
-                logger.info(
-                    f"Dispatch: routed {model_id} to {meta.origin} endpoint "
-                    f"{endpoint_row.get('label') or meta.endpoint_id}"
-                    + (" (gateway-down fallback)" if _is_fallback else "")
-                )
     elif resolved_keys:
         if meta is not None and meta.api_key_ref:
             provider_for_key: str | None = meta.api_key_ref
@@ -1943,7 +1531,7 @@ async def _inject_dispatch_credentials(
         if not isinstance(_section, dict):
             continue
         _section_model = _section.get("model")
-        if not _section_model or _section.get("base_url"):
+        if not _section_model:
             continue
         await _inject_model_credentials(
             section=_section,
@@ -1951,7 +1539,6 @@ async def _inject_dispatch_credentials(
             user_id=user_id_str,
             resolved_keys=resolved_keys,
             capability=_capability,
-            gateway_override=_gw_scoped,
         )
         if "api_key" not in _section and "base_url" not in _section:
             logger.warning(
@@ -1981,7 +1568,6 @@ async def _inject_dispatch_credentials(
                     user_id=user_id_str,
                     resolved_keys=resolved_keys,
                     capability="auxiliary",
-                    gateway_override=_gw_scoped,
                 )
                 logger.info(f"Dispatch: injected auxiliary model override: {aux_model}")
 
@@ -1995,7 +1581,6 @@ async def _inject_dispatch_credentials(
                     model_id=default_model,
                     user_id=user_id_str,
                     resolved_keys=resolved_keys,
-                    gateway_override=_gw_scoped,
                 )
                 logger.info(f"Dispatch: injected user default_model: {default_model}")
 
@@ -2107,7 +1692,6 @@ async def _inject_dispatch_credentials(
                 model_id=system_chat_model,
                 user_id=user_id_str,
                 resolved_keys=resolved_keys,
-                gateway_override=_gw_scoped,
             )
             logger.info(
                 f"Dispatch: injected system default chat model: {system_chat_model} "
@@ -3903,7 +3487,6 @@ async def _inject_model_credentials(
     user_id: str | None,
     resolved_keys: dict[str, str] | None,
     capability: str = "chat",
-    gateway_override: tuple[str, str] | None = None,
 ) -> None:
     """Populate a config-override section with the right base_url + api_key
     for a given model ID.
@@ -3917,17 +3500,17 @@ async def _inject_model_credentials(
     (the user > project > env resolution chain). No base_url injection —
     the agent's own registry handles env-driven base URLs for local models.
 
-    Never overwrites fields that are already set; this helper is always
-    additive so caller-supplied overrides win.
+    Endpoint-backed models use the endpoint row as the transport authority. That
+    intentionally replaces stale persisted transports when a session or paused
+    job is rehydrated.
     """
-    if "base_url" in section and "api_key" in section:
-        return
-
     meta = None
     try:
         meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
     except UnknownModelError:
         meta = None
+
+    transport_complete = "base_url" in section and "api_key" in section
 
     # Per-model context window (chat capability only — auxiliary/vision sections
     # carry their own windows and aren't derived this way). Set before the
@@ -3949,22 +3532,9 @@ async def _inject_model_credentials(
     # unset keeps the PREVIOUS model's factory (e.g. minimax via openrouter →
     # gpt-5.5 endpoint row kept routing through _create_openrouter_llm).
     if meta is not None and meta.provider:
-        section.setdefault("provider", meta.provider)
+        section["provider"] = meta.provider
 
-    # Prefer the caller's pre-resolved target (the dispatch's scoped key, 2b);
-    # otherwise resolve the shared fleet key here (callers without user/project
-    # context, e.g. some hot-swap paths). None when the gateway is disabled or
-    # unhealthy (Phase-0 fallback).
-    _gw_target = gateway_override or _gateway_routing_target()
-
-    if _should_route_via_gateway(meta, _gw_target):
-        # Phase 2 canary (see _inject_dispatch_credentials): a canaried +
-        # registered system/codex section routes through the gateway with the
-        # openai factory + gateway virtual key, assigned so they win over a
-        # stale/direct key carried by a hot-swapped section.
-        section["provider"] = "openai"
-        section["base_url"] = _gw_target[0]
-        section["api_key"] = _gw_target[1]
+    if transport_complete and not (meta is not None and meta.endpoint_id):
         return
 
     if (
@@ -3972,46 +3542,12 @@ async def _inject_model_credentials(
         and meta.origin in ("custom", "system", "catalog")
         and meta.endpoint_id
     ):
-        # The Codex proxy is Responses-API only and the gateway would normalize
-        # it to Chat Completions and drop reasoning, so non-canaried codex models
-        # bypass the gateway and hit their endpoint directly.
-        _gw = None if meta.provider == "codex" else _gw_target
-        if _gw is not None:
-            # Route endpoint-kind phase/aux models through the gateway too, so
-            # measurement covers the full chat/auxiliary surface (Slice 1) and the
-            # scoped key's limits apply to every section (Slice 2b).
-            section.setdefault("base_url", _gw[0])
-            section.setdefault("api_key", _gw[1])
-            return
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
-            # This model takes the direct path — either codex (always bypasses)
-            # or any endpoint model while the gateway is down (Phase-0 fallback).
-            # A persisted / hot-swapped section can still carry a STALE
-            # LiteLLM-gateway base_url (+ its provider) from a previously
-            # gateway-routed turn; per-field ``setdefault`` keeps it, so the
-            # endpoint's direct key would be sent to the gateway — which rejects
-            # any non-``sk-`` key (401 "LiteLLM Virtual Key expected"). Drop the
-            # stale gateway transport so base_url/provider/api_key repopulate
-            # coherently from the endpoint row. Detect the gateway URL from the
-            # resolved target *and* env: _gw_target[0] is None when the gateway
-            # is unhealthy (Phase-0 fallback), so fold in the env-derived prefix
-            # to cover that path too (same value in prod; the override-only test
-            # path supplies _gw_target). Scoped to the gateway URL only: a
-            # deliberately caller-pinned non-gateway base_url still wins.
-            # See docs/issues/codex_session_gateway_baseurl_401.md.
-            _gw_urls = {_gw_target[0]} if _gw_target else set()
-            _gw_base = os.getenv("LITELLM_BASE_URL", "").strip()
-            if _gw_base:
-                _gw_urls.add(f"{_gw_base.rstrip('/')}/v1")
-            if section.get("base_url") in _gw_urls:
-                section.pop("base_url", None)
-                if meta.provider:
-                    section["provider"] = meta.provider
             if endpoint_row.get("base_url"):
-                section.setdefault("base_url", endpoint_row["base_url"])
+                section["base_url"] = endpoint_row["base_url"]
             if endpoint_row.get("api_key"):
-                section.setdefault("api_key", endpoint_row["api_key"])
+                section["api_key"] = endpoint_row["api_key"]
         return
 
     provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
@@ -4105,12 +3641,11 @@ async def _inject_thread_dispatch_credentials(
     stripped via ``redact_config_override`` before persistence, so
     ``threads.metadata.config_override`` never stores plaintext keys.
 
-    Idempotent + re-injection-safe: ``_inject_model_credentials`` only early-returns
-    when both ``base_url`` and ``api_key`` are already present, and
-    ``_inject_env_key_credentials`` is fully ``setdefault``-based. So running this on
-    an already-enriched dict is a no-op, and running it on a *stripped* copy (model /
-    base_url / EMBEDDING_MODEL survive, the keys were removed) repopulates exactly the
-    removed secrets.
+    Re-injection-safe: endpoint-backed model transports are refreshed from the
+    endpoint row, while provider-key models keep caller-supplied transports.
+    ``_inject_env_key_credentials`` is ``setdefault``-based, so running this on a
+    stripped copy repopulates the removed secrets without clobbering surviving
+    model choices.
     """
     user_settings = user_settings or {}
 
@@ -4130,12 +3665,6 @@ async def _inject_thread_dispatch_credentials(
         project_id=project_id,
     )
 
-    # Route this session's LLM traffic through its per-(user,project) scoped key
-    # (2b) so per-project/per-user limits apply to sessions too; falls back to the
-    # fleet key when user/project is absent. Sessions are long-lived, so the
-    # scoped key's hash-gated ensure runs once and is cheap on re-injection.
-    _gw_scoped = await _gateway_routing_target_scoped(user_id, project_id)
-
     # Chat model. Fall back to the system default chat pin so the agent never
     # boots on its YAML default (which has no transport → api.openai.com 401).
     llm_section = config_override.get("llm") or {}
@@ -4153,7 +3682,6 @@ async def _inject_thread_dispatch_credentials(
             model_id=llm_section["model"],
             user_id=user_id,
             resolved_keys=resolved_keys,
-            gateway_override=_gw_scoped,
         )
         config_override["llm"] = llm_section
 
@@ -4173,7 +3701,6 @@ async def _inject_thread_dispatch_credentials(
             user_id=user_id,
             resolved_keys=resolved_keys,
             capability="auxiliary",
-            gateway_override=_gw_scoped,
         )
         config_override["auxiliary"] = aux_section
 
@@ -4265,17 +3792,6 @@ async def _try_dispatch_pending_jobs() -> None:
             dispatchable_jobs = []
             for job in pending_jobs:
                 job_id = str(job["id"])
-                # Slice 3 quota gate: a project that crossed its daily quota is
-                # frozen — don't dispatch/resume or provision for its jobs until
-                # the quota poll clears it (at the daily reset, or when usage
-                # drops). The poll loop separately freezes already-running jobs.
-                if is_project_over_quota(job.get("project_id")):
-                    logger.debug(
-                        "Dispatcher: skipping job %s — project %s over quota",
-                        job_id,
-                        job.get("project_id"),
-                    )
-                    continue
                 if _job_needs_vm(job):
                     # Admin-gated permission check (kill-switch + per-user grant).
                     # Re-verified here in case a grant was revoked or the
@@ -5318,8 +4834,7 @@ class CatalogModelCreate(BaseModel):
         description=(
             "Optional inference param overrides (e.g. {'temperature': 0.0}). "
             "Null means 'use family defaults'; explicit zero/false values "
-            "round-trip as themselves (LiteLLM #14661 hazard guarded by "
-            "create_model accessor)."
+            "round-trip as themselves (create_model accessor regression guard)."
         ),
     )
     enabled: bool = True
@@ -6024,9 +5539,7 @@ async def lifespan(app: FastAPI):
 
     # LLM $/token pricing sync: seed usage_rates from OpenRouter × the model
     # catalog (params_json.pricing_id) so record_events can cost the audit-
-    # sourced token rows. Replaces the gateway's per-request spend as the cost
-    # source (remove_litellm_proxy_and_gateway_concept.md, P1 Slice 1). Slow
-    # (6h) + change-only; no-op without the app pool.
+    # sourced token rows. Slow (6h) + change-only; no-op without the app pool.
     pricing_sync_task = asyncio.create_task(
         llm_pricing_sync_loop(
             _shutdown_event, postgres_db.pool, postgres_db.list_models
@@ -6045,9 +5558,8 @@ async def lifespan(app: FastAPI):
         )
     )
 
-    # LLM usage materialization (Slice 4c): poll the LiteLLM spend log into the
-    # usage ledger as category='llm' rows. Self-disables when the gateway or the
-    # ledger is absent.
+    # LLM usage materialization (Slice 4c): materialize audit llm_requests into
+    # usage ledger rows. Self-disables when audit/app pools or the ledger are absent.
     llm_usage_task = asyncio.create_task(llm_usage_poll_loop(_shutdown_event))
 
     # Usage rollup (Phase 6 / D-1): re-aggregate closed days from the auditdb
@@ -9795,28 +9307,8 @@ async def _llm_outage_sweep_once() -> tuple[int, int]:
     """One outage-sweeper tick — re-dispatch due jobs, fail-loud any past the
     ceiling. Returns ``(redispatched, failed)``. Extracted from the loop so it
     is unit-testable with a mocked ``postgres_db``.
-
-    Health gate: if the gateway is the metered LLM path (enabled) and is
-    currently unhealthy, skip the whole tick — re-dispatching now would re-hit a
-    dead gateway, fail instantly, and burn the backoff budget. Deferring leaves
-    ``next_retry_at`` as-is, so jobs re-arm on the next healthy tick WITHOUT
-    advancing their attempt counter (circuit-breaker Half-Open). v1 gates at
-    fleet granularity (gateway up/down), which also defers the minority of
-    direct-routed jobs during a gateway outage — harmless (one deferred cycle,
-    counter untouched); per-job routing precision is deferred.
     """
     from services.completion import _parse_context, evaluate_llm_outage
-
-    health_gate = (os.getenv("LLM_OUTAGE_HEALTH_GATE") or "true").strip().lower() != (
-        "false"
-    )
-    gateway_enabled = bool((os.getenv("LITELLM_BASE_URL") or "").strip())
-    if health_gate and gateway_enabled and not gateway_is_healthy():
-        logger.info(
-            "LLM-outage sweeper: gateway unhealthy — deferring re-dispatch this "
-            "tick (attempt counters unchanged)"
-        )
-        return (0, 0)
 
     due = await postgres_db.list_due_llm_outage_jobs(limit=50)
     if not due:
