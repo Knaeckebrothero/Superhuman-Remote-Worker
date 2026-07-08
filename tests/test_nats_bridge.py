@@ -1475,7 +1475,9 @@ class TestEdgeCases:
         assert updates["ssh_nodeport"] == 31022
 
     @pytest.mark.asyncio
-    async def test_register_with_unicode_hostname(self, bridge_with_db, mock_db, leader):
+    async def test_register_with_unicode_hostname(
+        self, bridge_with_db, mock_db, leader
+    ):
         """Hostnames with unusual characters should be handled."""
         bridge_with_db._start_vm_ssh_probe = MagicMock()
         msg = make_msg(
