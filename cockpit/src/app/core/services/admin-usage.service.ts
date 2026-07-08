@@ -20,12 +20,18 @@ export interface UsageCategoryRow {
 export interface UsageSummary {
   by_category: UsageCategoryRow[];
   total_cost_usd: number;
+  cache_hit_ratio: number;
   available: boolean;
   from?: string;
   to?: string;
 }
 
-const EMPTY: UsageSummary = {by_category: [], total_cost_usd: 0, available: false};
+const EMPTY: UsageSummary = {
+  by_category: [],
+  total_cost_usd: 0,
+  cache_hit_ratio: 0,
+  available: false,
+};
 
 export interface UsageUnitAgg { quantity: number; cost_usd: number; events: number; }
 export interface UsageBreakdownRow {
@@ -34,6 +40,7 @@ export interface UsageBreakdownRow {
   is_admin?: boolean | null;
   events: number;
   cost_usd: number;
+  cache_hit_ratio?: number;
   units: Record<string, UsageUnitAgg>;
 }
 export interface UsageBreakdown {

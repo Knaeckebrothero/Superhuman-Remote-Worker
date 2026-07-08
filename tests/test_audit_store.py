@@ -408,6 +408,19 @@ class TestUsageLedger:
                 UsageEvent(
                     category="llm",
                     resource="gemma",
+                    quantity=50,
+                    unit="cached-prompt-token",
+                    source="litellm",
+                    source_id="req1",
+                    ts=now,
+                    user_id=str(uid),
+                    project_id=str(pid),
+                    ref_kind="job",
+                    ref_id=str(job),
+                ),
+                UsageEvent(
+                    category="llm",
+                    resource="gemma",
                     quantity=40,
                     unit="completion-token",
                     source="litellm",
@@ -432,15 +445,17 @@ class TestUsageLedger:
                     ref_id=str(job),
                 ),
             ]
-            assert await ledger.record_events(events) == 3
+            assert await ledger.record_events(events) == 4
             res = await ledger.query_usage(
                 from_ts=now - timedelta(days=1), to_ts=now + timedelta(days=1)
             )
             by = {(b["category"], b["unit"]): b for b in res["by_category"]}
             assert by[("llm", "prompt-token")]["quantity"] == 100.0
+            assert by[("llm", "cached-prompt-token")]["quantity"] == 50.0
             assert by[("llm", "completion-token")]["quantity"] == 40.0
             assert by[("compute", "vcpu-hour")]["quantity"] == 2.0
             assert res["total_cost_usd"] == 0.0  # unpriced
+            assert round(res["cache_hit_ratio"], 6) == round(50 / 150, 6)
 
     async def test_idempotent_dedupe(self, pg_dsn):
         async with _audit_pool(pg_dsn) as pool:
@@ -695,6 +710,7 @@ class TestUsageLedger:
             await ledger.record_events(
                 [
                     ev("opus", 100, "prompt-token", "b1", d_b),
+                    ev("opus", 25, "cached-prompt-token", "b1", d_b),
                     ev("opus", 20, "completion-token", "b2", d_b),
                     ev("opus", 40, "prompt-token", "a1", d_a),
                     ev("opus", 2, "vcpu-hour", "a2", d_a),  # compute → not a token
@@ -707,9 +723,9 @@ class TestUsageLedger:
             rows = await ledger.query_timeseries(group_by="model", **window)
             by = {(r["day"], r["key"]): r for r in rows}
             day_a, day_b = d_a.date().isoformat(), d_b.date().isoformat()
-            # tokens = prompt + completion summed; rows ascend by day
-            assert by[(day_b, "opus")]["tokens"] == 120.0
-            assert by[(day_b, "opus")]["events"] == 2
+            # tokens = prompt + cached prompt + completion summed; rows ascend by day
+            assert by[(day_b, "opus")]["tokens"] == 145.0
+            assert by[(day_b, "opus")]["events"] == 3
             assert (
                 by[(day_a, "opus")]["tokens"] == 40.0
             )  # vcpu-hour excluded from tokens
@@ -735,7 +751,11 @@ class TestUsageLedger:
         )
         assert await ledger.record_events([ev]) == 0
         res = await ledger.query_usage(from_ts=now - timedelta(days=1), to_ts=now)
-        assert res == {"by_category": [], "total_cost_usd": 0.0}
+        assert res == {
+            "by_category": [],
+            "total_cost_usd": 0.0,
+            "cache_hit_ratio": 0.0,
+        }
 
 
 async def _create_intervals_table(pool) -> None:
@@ -971,6 +991,13 @@ class TestBreakdownFold:
                 "events": 2,
             },
             {
+                "key": "u1",
+                "unit": "cached-prompt-token",
+                "quantity": 25.0,
+                "cost_usd": 0.0,
+                "events": 1,
+            },
+            {
                 "key": "u2",
                 "unit": "prompt-token",
                 "quantity": 50.0,
@@ -980,7 +1007,8 @@ class TestBreakdownFold:
         ]
         folded = _fold_breakdown(rows)
         assert folded["u1"]["units"]["prompt-token"]["quantity"] == 100.0
-        assert folded["u1"]["events"] == 4  # summed across units
+        assert folded["u1"]["events"] == 5  # summed across units
+        assert folded["u1"]["cache_hit_ratio"] == 0.2
         assert folded["u2"]["units"]["prompt-token"]["events"] == 1
 
     def test_merge_labels_falls_back_to_key(self):

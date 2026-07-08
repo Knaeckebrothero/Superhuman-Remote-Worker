@@ -27,14 +27,16 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(c.refreshIntervalMs()).toBe(30000);
   });
 
-  it('tokensTotal sums prompt + completion token quantities', () => {
+  it('tokensTotal sums prompt + cached prompt + completion token quantities', () => {
     const c = TestBed.inject(AdminUsageComponent);
-    (c as any).usage.usage.set({available: true, total_cost_usd: 0, by_category: [
+    (c as any).usage.usage.set({available: true, total_cost_usd: 0, cache_hit_ratio: 0.2, by_category: [
       {category: 'llm', unit: 'prompt-token', quantity: 100, cost_usd: 0, events: 1},
+      {category: 'llm', unit: 'cached-prompt-token', quantity: 25, cost_usd: 0, events: 1},
       {category: 'llm', unit: 'completion-token', quantity: 25, cost_usd: 0, events: 1},
       {category: 'compute', unit: 'vcpu-hour', quantity: 2, cost_usd: 0, events: 1},
     ]});
-    expect(c.tokensTotal()).toBe(125);
+    expect(c.tokensTotal()).toBe(150);
+    expect(c.cacheHitRatio()).toBe(0.2);
     expect(c.computeHours()).toBe(2);
   });
 
@@ -42,7 +44,8 @@ describe('AdminUsageComponent refresh shell', () => {
     const c = TestBed.inject(AdminUsageComponent);
     (c as any).usage.breakdown = () => ({available: true, group_by: 'user', rows: [
       {key: 'u1', label: 'Alice', is_admin: true, events: 4, cost_usd: 0, units: {
-        'prompt-token': {quantity: 100, cost_usd: 0, events: 2},
+        'prompt-token': {quantity: 75, cost_usd: 0, events: 1},
+        'cached-prompt-token': {quantity: 25, cost_usd: 0, events: 1},
         'completion-token': {quantity: 30, cost_usd: 0, events: 2}}},
       {key: 'u2', label: 'Bob', is_admin: false, events: 2, cost_usd: 0, units: {
         'vcpu-hour': {quantity: 1.5, cost_usd: 0, events: 2}}},
@@ -54,13 +57,17 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(rows[1].share).toBe(0.5);
   });
 
-  it('modelRows lists per-model token columns', () => {
+  it('modelRows lists per-model token and cache columns', () => {
     const c = TestBed.inject(AdminUsageComponent);
     (c as any).usage.breakdown = (dim: string) => dim === 'model' ? ({available: true,
       group_by: 'model', rows: [{key: 'gemma', label: 'gemma', events: 2, cost_usd: 0,
-      units: {'prompt-token': {quantity: 100, cost_usd: 0, events: 1},
+      cache_hit_ratio: 0.25,
+      units: {'prompt-token': {quantity: 75, cost_usd: 0, events: 1},
+              'cached-prompt-token': {quantity: 25, cost_usd: 0, events: 1},
               'completion-token': {quantity: 20, cost_usd: 0, events: 1}}}]}) : null;
     expect(c.modelRows()[0].prompt).toBe(100);
+    expect(c.modelRows()[0].cached).toBe(25);
+    expect(c.modelRows()[0].cacheHit).toBe(0.25);
     expect(c.modelRows()[0].label).toBe('gemma');
   });
 

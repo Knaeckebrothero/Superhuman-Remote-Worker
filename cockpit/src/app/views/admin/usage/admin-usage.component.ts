@@ -63,6 +63,8 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         <section class="kpi-row">
           <div class="kpi-card"><span class="kpi-label">Tokens</span>
             <span class="kpi-value">{{ fmtQty(tokensTotal()) }}</span></div>
+          <div class="kpi-card"><span class="kpi-label">Cache hit</span>
+            <span class="kpi-value">{{ fmtPct(cacheHitRatio()) }}</span></div>
           <div class="kpi-card"><span class="kpi-label">Compute-hours</span>
             <span class="kpi-value">{{ fmtQty(computeHours()) }}</span></div>
           <div class="kpi-card"><span class="kpi-label">Events</span>
@@ -216,6 +218,8 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
               <div class="breakdown-header model-grid">
                 <span class="col-wide">Model</span>
                 <span class="col-num">Prompt tok.</span>
+                <span class="col-num">Cached tok.</span>
+                <span class="col-num">Cache hit</span>
                 <span class="col-num">Compl. tok.</span>
                 <span class="col-num">Events</span>
                 <span class="col-num">Cost</span>
@@ -224,6 +228,8 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
                 <div class="breakdown-row model-grid">
                   <span class="col-wide mono">{{ r.label }}</span>
                   <span class="col-num">{{ fmtQty(r.prompt) }}</span>
+                  <span class="col-num">{{ fmtQty(r.cached) }}</span>
+                  <span class="col-num">{{ fmtPct(r.cacheHit) }}</span>
                   <span class="col-num">{{ fmtQty(r.completion) }}</span>
                   <span class="col-num">{{ r.events }}</span>
                   <span class="col-num">{{ r.cost ? fmtCost(r.cost) : '—' }}</span>
@@ -499,7 +505,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
       .col-role { color: var(--text-muted); font-size: 12px; }
       .breakdown-row .col-share { position: relative; height: 6px; background: var(--surface-0); border-radius: 3px; overflow: hidden; }
       .share-bar { display: block; height: 100%; background: var(--accent-color); border-radius: 3px; }
-      .model-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
+      .model-grid { grid-template-columns: 1.6fr 96px 96px 78px 96px 70px 80px; }
       .project-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
       .bar-chart {
         display: flex;
@@ -720,7 +726,24 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     return (this.summary()?.by_category ?? [])
       .filter((r) => r.unit === unit).reduce((s, r) => s + r.quantity, 0);
   }
-  readonly tokensTotal = computed(() => this.qty('prompt-token') + this.qty('completion-token'));
+  private unitQty(
+    units: Record<string, {quantity: number}> | undefined,
+    unit: string,
+  ): number {
+    return units?.[unit]?.quantity ?? 0;
+  }
+  private cacheRatio(uncachedPrompt: number, cachedPrompt: number): number {
+    const total = uncachedPrompt + cachedPrompt;
+    return total > 0 ? cachedPrompt / total : 0;
+  }
+  readonly promptTokens = computed(() =>
+    this.qty('prompt-token') + this.qty('cached-prompt-token'));
+  readonly cachedPromptTokens = computed(() => this.qty('cached-prompt-token'));
+  readonly completionTokens = computed(() => this.qty('completion-token'));
+  readonly tokensTotal = computed(() => this.promptTokens() + this.completionTokens());
+  readonly cacheHitRatio = computed(() =>
+    this.summary()?.cache_hit_ratio
+      ?? this.cacheRatio(this.qty('prompt-token'), this.cachedPromptTokens()));
   readonly computeHours = computed(() => this.qty('vcpu-hour') + this.qty('gib-hour'));
   readonly eventsTotal = computed(() =>
     (this.summary()?.by_category ?? []).reduce((s, r) => s + r.events, 0));
@@ -735,14 +758,21 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
 
   readonly modelRows = computed(() => (this.usage.breakdown('model')?.rows ?? []).map((r) => ({
     label: r.label,
-    prompt: r.units['prompt-token']?.quantity ?? 0,
-    completion: r.units['completion-token']?.quantity ?? 0,
+    prompt: this.unitQty(r.units, 'prompt-token')
+      + this.unitQty(r.units, 'cached-prompt-token'),
+    cached: this.unitQty(r.units, 'cached-prompt-token'),
+    cacheHit: r.cache_hit_ratio ?? this.cacheRatio(
+      this.unitQty(r.units, 'prompt-token'),
+      this.unitQty(r.units, 'cached-prompt-token')),
+    completion: this.unitQty(r.units, 'completion-token'),
     events: r.events, cost: r.cost_usd,
   })));
   readonly projectRows = computed(() => (this.usage.breakdown('project')?.rows ?? []).map((r) => ({
     label: r.label,
-    tokens: (r.units['prompt-token']?.quantity ?? 0) + (r.units['completion-token']?.quantity ?? 0),
-    compute: (r.units['vcpu-hour']?.quantity ?? 0) + (r.units['gib-hour']?.quantity ?? 0),
+    tokens: this.unitQty(r.units, 'prompt-token')
+      + this.unitQty(r.units, 'cached-prompt-token')
+      + this.unitQty(r.units, 'completion-token'),
+    compute: this.unitQty(r.units, 'vcpu-hour') + this.unitQty(r.units, 'gib-hour'),
     events: r.events, cost: r.cost_usd,
   })));
 
@@ -752,9 +782,10 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     return rows.map((r) => ({
       label: r.label,
       role: r.is_admin ? 'Admin' : 'User',
-      prompt: r.units['prompt-token']?.quantity ?? 0,
-      completion: r.units['completion-token']?.quantity ?? 0,
-      compute: (r.units['vcpu-hour']?.quantity ?? 0) + (r.units['gib-hour']?.quantity ?? 0),
+      prompt: this.unitQty(r.units, 'prompt-token')
+        + this.unitQty(r.units, 'cached-prompt-token'),
+      completion: this.unitQty(r.units, 'completion-token'),
+      compute: this.unitQty(r.units, 'vcpu-hour') + this.unitQty(r.units, 'gib-hour'),
       events: r.events,
       cost: r.cost_usd,
       share: r.events / max,
@@ -1010,6 +1041,10 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
 
   fmtCost(n: number): string {
     return '$' + (n ?? 0).toFixed(2);
+  }
+
+  fmtPct(n: number): string {
+    return ((n ?? 0) * 100).toFixed(1) + '%';
   }
 
   catLabel(c: string): string {
