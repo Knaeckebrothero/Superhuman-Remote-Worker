@@ -47,6 +47,7 @@ def _row(
     m_completion=None,
     m_output=None,
     m_reasoning=None,
+    m_cached=None,
     md_input=None,
     md_output=None,
 ):
@@ -63,6 +64,7 @@ def _row(
         "m_completion": m_completion,
         "m_output": m_output,
         "m_reasoning": m_reasoning,
+        "m_cached": m_cached,
         "md_input": md_input,
         "md_output": md_output,
     }
@@ -202,6 +204,36 @@ class TestMaterialize:
         await materialize_llm_usage_from_audit(audit, app, ledger, min_age_s=0, now=NOW)
         by_unit = {e.unit: e.quantity for e in ledger.events}
         assert by_unit == {"prompt-token": 70, "completion-token": 30}
+
+    @pytest.mark.asyncio
+    async def test_cached_prompt_tokens_split_from_uncached_prompt(self):
+        audit = FakePool(
+            AuditConn([_row(9, m_prompt="1000", m_cached="750", m_completion="40")])
+        )
+        app = FakePool(AppConn(jobs={JOB: (USER, PROJ)}))
+        ledger = FakeLedger()
+        res = await materialize_llm_usage_from_audit(
+            audit, app, ledger, min_age_s=0, now=NOW
+        )
+        assert res["materialized"] == 3
+        by_unit = {e.unit: e for e in ledger.events}
+        assert by_unit["prompt-token"].quantity == 250
+        assert by_unit["cached-prompt-token"].quantity == 750
+        assert by_unit["completion-token"].quantity == 40
+        assert by_unit["cached-prompt-token"].details["cached_prompt_tokens"] == 750
+
+    @pytest.mark.asyncio
+    async def test_cached_prompt_tokens_clamp_at_prompt_total(self):
+        audit = FakePool(AuditConn([_row(10, m_prompt="100", m_cached="150")]))
+        app = FakePool(AppConn(jobs={JOB: (USER, PROJ)}))
+        ledger = FakeLedger()
+        res = await materialize_llm_usage_from_audit(
+            audit, app, ledger, min_age_s=0, now=NOW
+        )
+        assert res["materialized"] == 1
+        assert [(e.unit, e.quantity) for e in ledger.events] == [
+            ("cached-prompt-token", 100)
+        ]
 
     @pytest.mark.asyncio
     async def test_reasoning_tokens_in_details_not_a_third_row(self):

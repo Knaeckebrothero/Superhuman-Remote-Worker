@@ -179,7 +179,11 @@ from services.audit_partitions import (  # noqa: E402
     maintenance_loop as audit_maintenance_loop,
 )
 from services import workspace_metering  # noqa: E402
-from services.usage_ledger import UsageLedger, UsageRates  # noqa: E402
+from services.usage_ledger import (  # noqa: E402
+    UsageLedger,
+    UsageRates,
+    cache_hit_ratio_from_rows,
+)
 from services.usage_rollup import UsageRollup, usage_rollup_loop  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
@@ -13768,6 +13772,12 @@ def _fold_breakdown(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         }
         o["events"] += r["events"]
         o["cost_usd"] += r["cost_usd"]
+    for o in out.values():
+        unit_rows = [
+            {"category": "llm", "unit": unit, "quantity": agg["quantity"]}
+            for unit, agg in o["units"].items()
+        ]
+        o["cache_hit_ratio"] = cache_hit_ratio_from_rows(unit_rows)
     return out
 
 
@@ -13869,12 +13879,18 @@ async def get_usage(
     ``days``; ``from_date``/``to_date`` override it. Admins see the full fleet
     (optionally narrowed by an MCP ``project:`` scope); non-admins see only rows
     they own or can see via project membership. Returns sums by (category, unit)
-    plus the headline ``total_cost_usd`` (0 while resources are unpriced).
-    ``available=false`` means the audit tier is off — metering disabled.
+    plus the headline ``total_cost_usd`` (0 while resources are unpriced) and
+    ``cache_hit_ratio`` for LLM prompt cache reads. ``available=false`` means the
+    audit tier is off — metering disabled.
     """
     user = await require_approved_user(request, postgres_db)
     if usage_ledger is None or not usage_ledger.is_available:
-        return {"by_category": [], "total_cost_usd": 0.0, "available": False}
+        return {
+            "by_category": [],
+            "total_cost_usd": 0.0,
+            "cache_hit_ratio": 0.0,
+            "available": False,
+        }
     try:
         now = datetime.now(timezone.utc)
         to_ts = _parse_utc_date(to_date) if to_date else now

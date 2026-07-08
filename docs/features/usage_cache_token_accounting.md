@@ -1,6 +1,6 @@
 # Cache-token usage & cost accounting
 
-**Status:** Proposed · 2026-07-08
+**Status:** Implemented · 2026-07-08
 **Related:** `docs/features/observability_and_quotas.md` (the ledger spine),
 [[project_prompt_cache_tail_injection]] (the optimization that created the blind
 spot), `docs/issues/remove_litellm_proxy_and_gateway_concept.md` (why cost is now
@@ -20,7 +20,7 @@ that number verbatim and then throw it away one hop later. Cost is computed as
 cached and discounted. So the single biggest per-turn cost lever we have — cache
 hit ratio — is neither metered nor surfaced.
 
-## Current state (grounded in code)
+## Pre-implementation state (grounded in code before this change)
 
 The metering pipeline is: **agent writes raw usage → materializer extracts a few
 flat counts → ledger prices them → rollup aggregates → `/api/usage` serves →
@@ -161,7 +161,7 @@ that, per `llm_request` in the window, **deletes** its existing
 `token_usage` JSONB. Ships behind an explicit flag, not the steady-state loop.
 Deferred unless we want the retroactive dashboard.
 
-## Implementation plan (file-by-file)
+## Implemented changes (file-by-file)
 
 1. **`orchestrator/services/audit_usage.py`**
    - `_SELECT_SQL`: add
@@ -225,10 +225,9 @@ open Admin → Usage and confirm the badge renders.
 - Per-turn cache-hit visualization in the session/job trace (this feature is the
   aggregate ledger only).
 
-## Open questions
+## Decisions
 
-- **Q1 (needs sign-off):** D3 fallback for models with no published
-  `input_cache_read` — price cached at full prompt rate (conservative, may
-  overstate) vs leave unpriced (exact tokens, understates dollars)?
-- **Q2:** Do we want the bounded backfill (D5) so the 40→75% win shows
-  retroactively from `sha-eecd7fa`, or is going-forward enough?
+- **Q1:** Models with no published `input_cache_read` price cached tokens at the
+  full prompt rate. This is conservative: it may overstate cost but will not
+  understate it.
+- **Q2:** Implementation is going-forward only. No historical backfill was added.

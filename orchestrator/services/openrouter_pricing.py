@@ -2,15 +2,15 @@
 
 Replaces LiteLLM's per-request ``spend`` as the cost source now that the gateway
 is gone (``docs/issues/remove_litellm_proxy_and_gateway_concept.md``, P1). The
-in-process metering path materializes cost-free ``prompt-token`` / ``completion
--token`` rows into ``usage_events`` (from the ``llm_requests`` audit); this module
-seeds the effective-dated ``usage_rates`` table so
+in-process metering path materializes cost-free LLM token rows into
+``usage_events`` (from the ``llm_requests`` audit); this module seeds the
+effective-dated ``usage_rates`` table so
 :meth:`UsageLedger.record_events` prices those rows exactly as it priced the
 gateway spend log before.
 
 Source: OpenRouter's public model catalog (``openrouter.ai/api/v1/models`` — no
-auth), which publishes per-model ``pricing.prompt`` / ``pricing.completion`` as
-USD-*per-token* decimal strings.
+auth), which publishes per-model ``pricing.prompt`` / ``pricing.completion`` /
+``pricing.input_cache_read`` as USD-*per-token* decimal strings.
 
 Mapping: each catalog model names the OpenRouter id to price against via
 ``params_json.pricing_id`` (admin-set, Admin → Models). ``pricing_id = ""`` marks
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Iterable, Optional
@@ -40,11 +41,28 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
-# The two LLM token dimensions we price. These exact unit strings are what
-# ``usage_events`` / ``usage_rates`` key on. ``fetch_openrouter_prices`` returns
-# each model's (prompt, completion) $/token in this same order, so a positional
-# zip aligns unit ↔ rate.
-_LLM_TOKEN_UNITS = ("prompt-token", "completion-token")
+
+@dataclass(frozen=True)
+class LlmTokenPrices:
+    """OpenRouter LLM token prices in USD/token."""
+
+    prompt: Decimal
+    completion: Decimal
+    cached_prompt: Optional[Decimal] = None
+
+    def rates(self) -> dict[str, Decimal]:
+        """Usage-ledger unit → effective rate.
+
+        Missing cache-read prices fall back to the full prompt rate. That keeps
+        token accounting exact while conservatively avoiding understated costs.
+        """
+        return {
+            "prompt-token": self.prompt,
+            "completion-token": self.completion,
+            "cached-prompt-token": (
+                self.cached_prompt if self.cached_prompt is not None else self.prompt
+            ),
+        }
 
 
 def _price(v: Any) -> Optional[Decimal]:
@@ -81,12 +99,13 @@ def _pricing_id_for(resource: str, pricing_id: Optional[str]) -> Optional[str]:
 
 async def fetch_openrouter_prices(
     *, client: Optional[httpx.AsyncClient] = None, timeout: float = 15.0
-) -> dict[str, tuple[Decimal, Decimal]]:
-    """Fetch ``{openrouter_model_id: (prompt_$per_token, completion_$per_token)}``.
+) -> dict[str, LlmTokenPrices]:
+    """Fetch ``{openrouter_model_id: LlmTokenPrices}``.
 
-    Public endpoint (no key). Models missing either price are skipped. Non-fatal:
-    any network/parse error logs and returns ``{}`` (→ sync no-ops, cost stays as
-    last snapshotted).
+    Public endpoint (no key). Models missing prompt or completion prices are
+    skipped; missing cache-read price is allowed and handled conservatively by
+    ``LlmTokenPrices.rates``. Non-fatal: any network/parse error logs and returns
+    ``{}`` (→ sync no-ops, cost stays as last snapshotted).
     """
     owns = client is None
     client = client or httpx.AsyncClient(timeout=timeout)
@@ -102,14 +121,15 @@ async def fetch_openrouter_prices(
         if owns:
             await client.aclose()
 
-    out: dict[str, tuple[Decimal, Decimal]] = {}
+    out: dict[str, LlmTokenPrices] = {}
     for m in data:
         mid = m.get("id")
         pricing = m.get("pricing") or {}
         prompt = _price(pricing.get("prompt"))
         completion = _price(pricing.get("completion"))
+        cached_prompt = _price(pricing.get("input_cache_read"))
         if mid and prompt is not None and completion is not None:
-            out[str(mid)] = (prompt, completion)
+            out[str(mid)] = LlmTokenPrices(prompt, completion, cached_prompt)
     return out
 
 
@@ -131,7 +151,7 @@ async def sync_llm_rates(
     app_pool: Optional[asyncpg.Pool],
     models: Iterable[tuple[str, Optional[str]]],
     *,
-    prices: Optional[dict[str, tuple[Decimal, Decimal]]] = None,
+    prices: Optional[dict[str, LlmTokenPrices]] = None,
     now: Optional[datetime] = None,
 ) -> int:
     """Seed ``usage_rates`` LLM $/token rows for ``models`` from OpenRouter pricing.
@@ -157,7 +177,7 @@ async def sync_llm_rates(
             price = prices.get(pid) if pid else None
             if price is None:
                 continue  # unmatched / self-hosted → leave unpriced (cost = NULL)
-            for unit, rate in zip(_LLM_TOKEN_UNITS, price):
+            for unit, rate in price.rates().items():
                 if await _rate_changed(conn, resource, unit, rate):
                     await conn.execute(
                         "INSERT INTO usage_rates "
@@ -201,7 +221,7 @@ async def sync_catalog_llm_rates(
     app_pool: Optional[asyncpg.Pool],
     list_models: Callable[[], Awaitable[list[dict]]],
     *,
-    prices: Optional[dict[str, tuple[Decimal, Decimal]]] = None,
+    prices: Optional[dict[str, LlmTokenPrices]] = None,
     now: Optional[datetime] = None,
 ) -> int:
     """Seed ``usage_rates`` from the model catalog × OpenRouter. Rows inserted.
@@ -255,6 +275,7 @@ async def llm_pricing_sync_loop(
 
 
 __all__ = [
+    "LlmTokenPrices",
     "fetch_openrouter_prices",
     "sync_llm_rates",
     "sync_catalog_llm_rates",
