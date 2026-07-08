@@ -1343,6 +1343,11 @@ class UniversalAgent:
                 default_timeout=shell_config.get("default_timeout", 120),
                 max_tabs=shell_config.get("max_tabs", 15),
                 blocked_commands=shell_config.get("blocked_commands"),
+                connect_timeout=remote.get("connect_timeout", 30),
+                max_retries=remote.get("max_retries", 5),
+                retry_timeouts_as_booting=remote.get(
+                    "retry_timeouts_as_booting", False
+                ),
                 # sandbox keeps the sudo gate ("freeze") so its sudo→VM
                 # escalation path still fires; only a vm target would set "allow".
                 sudo_action=shell_config.get("sudo_action", "freeze"),
@@ -1845,6 +1850,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     default_timeout=shell_config.get("default_timeout", 120),
                     max_tabs=shell_config.get("max_tabs", 15),
                     blocked_commands=shell_config.get("blocked_commands"),
+                    connect_timeout=remote_cfg.get("connect_timeout", 30),
+                    max_retries=remote_cfg.get("max_retries", 5),
+                    retry_timeouts_as_booting=remote_cfg.get(
+                        "retry_timeouts_as_booting", False
+                    ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
                 )
                 workspace_backend.connect()

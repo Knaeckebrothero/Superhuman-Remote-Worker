@@ -61,10 +61,15 @@ def _classify_connect_error(e: Exception) -> str:
                   retrying is pointless, fail fast.
     'booting'   → host is up but sshd is not listening yet (ECONNREFUSED);
                   this is the boot window the retries exist for.
-    'ambiguous' → timeout / protocol / unknown; retry briefly then give up.
+    'timeout'   → SYN/auth path timed out. For containers this stays a short
+                  ambiguous retry; for VM backends it can mean the fresh
+                  tailnet peer path is still converging.
+    'ambiguous' → protocol / unknown; retry briefly then give up.
     """
     if isinstance(e, socket.gaierror):
         return "gone"
+    if isinstance(e, socket.timeout):
+        return "timeout"
     if isinstance(e, ConnectionRefusedError):
         return "booting"
     if isinstance(e, OSError) and e.errno in _GONE_ERRNOS:
@@ -132,6 +137,7 @@ class RemoteBackend(WorkspaceBackend):
         sandbox_cwd: Optional[str] = None,
         connect_timeout: int = 30,
         max_retries: int = 5,
+        retry_timeouts_as_booting: bool = False,
         sudo_action: str = "freeze",
     ):
         if paramiko is None:
@@ -152,6 +158,8 @@ class RemoteBackend(WorkspaceBackend):
         self._max_tabs = max_tabs
         self._connect_timeout = connect_timeout
         self._max_retries = max_retries
+        self._retry_timeouts_as_booting = retry_timeouts_as_booting
+        self._has_connected_once = False
         self._sudo_action = sudo_action
 
         if blocked_commands is None:
@@ -258,7 +266,13 @@ class RemoteBackend(WorkspaceBackend):
                 bucket = _classify_connect_error(e)
                 if bucket == "gone":
                     effective_max = 1
-                elif bucket == "ambiguous":
+                elif (
+                    bucket == "timeout"
+                    and self._retry_timeouts_as_booting
+                    and not self._has_connected_once
+                ):
+                    effective_max = self._max_retries
+                elif bucket in ("timeout", "ambiguous"):
                     effective_max = min(self._max_retries, _AMBIGUOUS_RETRY_CAP)
                 else:  # booting
                     effective_max = self._max_retries
@@ -283,6 +297,7 @@ class RemoteBackend(WorkspaceBackend):
                 backoff = min(backoff * 2, 15.0)
 
         self._sftp = self._ssh.open_sftp()
+        self._has_connected_once = True
         logger.info(f"Connected to workspace {self._host}:{self._port}")
 
     def disconnect(self) -> None:

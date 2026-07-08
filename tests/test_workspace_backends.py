@@ -267,6 +267,36 @@ class TestRemoteBackendConnectClassification:
                 backend.connect()
             assert mock_ssh.connect.call_count == 2
 
+    def test_vm_timeout_can_use_full_boot_budget(self):
+        """VM-over-tailnet timeout can represent boot/peer convergence."""
+        err = socket.timeout("timed out")
+        with self._scenario(err, 5) as (backend, mock_ssh):
+            backend._retry_timeouts_as_booting = True
+            with pytest.raises(WorkspaceUnavailableError):
+                backend.connect()
+            assert mock_ssh.connect.call_count == 5
+
+    def test_vm_timeout_budget_is_first_connect_only(self):
+        """After one successful SSH session, VM timeouts use the short cap."""
+        mock_ssh = MagicMock()
+        mock_ssh.open_sftp.return_value = MagicMock()
+        with patch("paramiko.SSHClient", return_value=mock_ssh), patch("time.sleep"):
+            backend = RemoteBackend(
+                host="10.0.0.42",
+                workspace_path="/ws",
+                connect_timeout=5,
+                max_retries=5,
+                retry_timeouts_as_booting=True,
+            )
+            backend.connect()
+            mock_ssh.connect.reset_mock()
+            mock_ssh.connect.side_effect = socket.timeout("timed out")
+
+            with pytest.raises(WorkspaceUnavailableError):
+                backend.connect()
+
+            assert mock_ssh.connect.call_count == 2
+
     def test_message_says_workspace_not_vm(self):
         """Renamed error string: 'workspace', never 'VM'."""
         err = socket.gaierror(socket.EAI_NONAME, "Name or service not known")

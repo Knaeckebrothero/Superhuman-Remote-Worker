@@ -92,9 +92,18 @@ class TestVmProvisioningDecision:
         ctx = {"status": "created", "provisioned_at": 900.0}
         assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_WAIT
 
+    def test_ssh_pending_within_budget_waits(self):
+        # Daemon registered, but the orchestrator has not proved SSH yet.
+        ctx = {"status": "ssh_pending", "provisioned_at": 900.0}
+        assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_WAIT
+
     def test_provisioning_past_budget_recycles(self):
         # 'created' 700s ago, 600s budget → stuck, recycle.
         ctx = {"status": "created", "provisioned_at": 300.0}
+        assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_RECYCLE
+
+    def test_ssh_pending_past_budget_recycles(self):
+        ctx = {"status": "ssh_pending", "provisioned_at": 300.0}
         assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_RECYCLE
 
     def test_provisioning_without_timestamp_waits_forever(self):

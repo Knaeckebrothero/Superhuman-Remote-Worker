@@ -1741,6 +1741,45 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def merge_vm_context_if_current(
+        self,
+        job_id: str,
+        expected_registration_id: str,
+        vm_updates: Dict[str, Any],
+    ) -> bool:
+        """Merge updates into context.vm only if the SSH registration still matches.
+
+        Used by VM SSH-readiness probes so a slow probe for an older VM
+        incarnation cannot promote a newer registration to ready.
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "    COALESCE(context, '{}'::jsonb), "
+            "    '{vm}', "
+            "    COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2 "
+            "  AND context->'vm'->>'ssh_registration_id' = $3"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query,
+                json_module.dumps(vm_updates),
+                uuid_val,
+                expected_registration_id,
+            )
+
+        return result == "UPDATE 1"
+
     async def merge_snapshot_context(
         self, job_id: str, snapshot_updates: Dict[str, Any]
     ) -> bool:
@@ -1931,6 +1970,41 @@ class PostgresDB:
         )
         async with self.acquire() as conn:
             result = await conn.execute(query, json_module.dumps(vm_updates), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def merge_thread_vm_context_if_current(
+        self,
+        thread_id: str,
+        expected_registration_id: str,
+        vm_updates: Dict[str, Any],
+    ) -> bool:
+        """Merge updates into metadata.vm only if the SSH registration matches."""
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE threads "
+            "SET metadata = jsonb_set("
+            "    COALESCE(metadata, '{}'::jsonb), "
+            "    '{vm}', "
+            "    COALESCE(metadata->'vm', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    last_activity = CURRENT_TIMESTAMP "
+            "WHERE id = $2 "
+            "  AND metadata->'vm'->>'ssh_registration_id' = $3"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query,
+                json_module.dumps(vm_updates),
+                uuid_val,
+                expected_registration_id,
+            )
 
         return result == "UPDATE 1"
 
