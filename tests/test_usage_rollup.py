@@ -145,6 +145,17 @@ _SEED = [
         "s1",
     ),
     (
+        datetime(2026, 1, 20, 10, tzinfo=UTC),
+        UA,
+        PP,
+        "llm",
+        "model-x",
+        50,
+        "cached-prompt-token",
+        "0.001",
+        "s1-cache",
+    ),
+    (
         datetime(2026, 1, 20, 15, tzinfo=UTC),
         UA,
         PP,
@@ -490,6 +501,7 @@ class TestServingEquivalence:
         raw = await UsageLedger(db, UsageRates(db)).query_usage(from_ts=frm, to_ts=to)
         assert _norm(rolled["by_category"]) == _norm(raw["by_category"])
         assert round(rolled["total_cost_usd"], 6) == round(raw["total_cost_usd"], 6)
+        assert round(rolled["cache_hit_ratio"], 6) == round(raw["cache_hit_ratio"], 6)
 
     async def test_usage_midday_window_low_partial_matches_raw(self, db):
         # from 01-20 14:00 excludes s1 (10:00) but includes s2 (15:00): the low

@@ -11,11 +11,12 @@ Design: ``docs/features/observability_and_quotas.md`` ("The spine: one usage
 ledger" + "The rate table"). Two pieces:
 
 - :class:`UsageRates` — effective-dated $/unit resolver over the app-DB
-  ``usage_rates`` table. LLM rates (prompt/completion-token) are auto-seeded from
-  OpenRouter's catalog by ``openrouter_pricing.llm_pricing_sync_loop``; compute
-  rates (vcpu/gib-hour) are still unseeded. An unpriced (category, resource, unit)
-  resolves to ``None`` → the quantity is metered immediately and ``cost_usd``
-  stays NULL until a rate exists.
+  ``usage_rates`` table. LLM rates (prompt/cached-prompt/completion-token) are
+  auto-seeded from OpenRouter's catalog by
+  ``openrouter_pricing.llm_pricing_sync_loop``; compute rates (vcpu/gib-hour) are
+  still unseeded. An unpriced (category, resource, unit) resolves to ``None`` →
+  the quantity is metered immediately and ``cost_usd`` stays NULL until a rate
+  exists.
 - :class:`UsageLedger` — bulk idempotent INSERT into ``usage_events`` (ON CONFLICT
   on the at-least-once dedupe key) with the rate snapshotted onto each row, plus
   the visibility-scoped aggregate read.
@@ -40,6 +41,15 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
+PROMPT_TOKEN_UNIT = "prompt-token"
+CACHED_PROMPT_TOKEN_UNIT = "cached-prompt-token"
+COMPLETION_TOKEN_UNIT = "completion-token"
+LLM_TOKEN_UNITS = (
+    PROMPT_TOKEN_UNIT,
+    CACHED_PROMPT_TOKEN_UNIT,
+    COMPLETION_TOKEN_UNIT,
+)
+
 
 def _dec(x: Any) -> Optional[Decimal]:
     """Coerce to Decimal for asyncpg's ``numeric`` codec (None stays None)."""
@@ -51,6 +61,22 @@ def _uuid(x: Any) -> Optional[uuid.UUID]:
     if x is None:
         return None
     return x if isinstance(x, uuid.UUID) else uuid.UUID(str(x))
+
+
+def cache_hit_ratio_from_rows(rows: Sequence[Dict[str, Any]]) -> float:
+    """Return cached prompt / total prompt for usage aggregate rows."""
+    uncached = 0.0
+    cached = 0.0
+    for r in rows:
+        if r.get("category") not in (None, "llm"):
+            continue
+        qty = float(r.get("quantity") or 0.0)
+        if r.get("unit") == PROMPT_TOKEN_UNIT:
+            uncached += qty
+        elif r.get("unit") == CACHED_PROMPT_TOKEN_UNIT:
+            cached += qty
+    total_prompt = uncached + cached
+    return cached / total_prompt if total_prompt > 0 else 0.0
 
 
 @dataclass
@@ -261,7 +287,7 @@ class UsageLedger:
         quantity is only meaningful within a unit, hence the (category, unit)
         grouping; ``cost_usd`` is summed across all rows for the headline total.
         """
-        empty = {"by_category": [], "total_cost_usd": 0.0}
+        empty = {"by_category": [], "total_cost_usd": 0.0, "cache_hit_ratio": 0.0}
         if self._pool is None:
             return empty
 
@@ -307,7 +333,11 @@ class UsageLedger:
             for r in rows
         ]
         total = sum(item["cost_usd"] for item in by_category)
-        return {"by_category": by_category, "total_cost_usd": total}
+        return {
+            "by_category": by_category,
+            "total_cost_usd": total,
+            "cache_hit_ratio": cache_hit_ratio_from_rows(by_category),
+        }
 
     async def query_grouped(
         self,
@@ -379,8 +409,8 @@ class UsageLedger:
 
         Like ``query_grouped`` but adds a ``date_trunc('day', ts)`` bucket so the
         caller can draw a stacked usage-over-time chart. Each row carries the three
-        dimension-agnostic metrics — ``tokens`` (prompt+completion summed), the
-        priced ``cost_usd``, and ``events`` — for one (day, key). The day is
+        dimension-agnostic metrics — ``tokens`` (prompt+cached+completion summed),
+        the priced ``cost_usd``, and ``events`` — for one (day, key). The day is
         truncated in UTC (``ts AT TIME ZONE 'UTC'``) so buckets don't drift with the
         DB session timezone. NULL group keys are excluded and visibility (G5) is
         identical to ``query_grouped`` — a non-admin is scoped strictly to self.
@@ -402,7 +432,9 @@ class UsageLedger:
             "SELECT date_trunc('day', ts AT TIME ZONE 'UTC') AS day, "
             f"{col} AS key, "
             "COALESCE(SUM(quantity) FILTER "
-            "(WHERE unit IN ('prompt-token', 'completion-token')), 0) AS tokens, "
+            "(WHERE unit IN "
+            "('prompt-token', 'cached-prompt-token', 'completion-token')), 0) "
+            "AS tokens, "
             "COALESCE(SUM(cost_usd), 0) AS cost_usd, COUNT(*) AS events "
             f"FROM usage_events WHERE {' AND '.join(clauses)} "
             f"GROUP BY date_trunc('day', ts AT TIME ZONE 'UTC'), {col} "
@@ -426,4 +458,13 @@ class UsageLedger:
         ]
 
 
-__all__ = ["UsageEvent", "UsageRates", "UsageLedger"]
+__all__ = [
+    "UsageEvent",
+    "UsageRates",
+    "UsageLedger",
+    "PROMPT_TOKEN_UNIT",
+    "CACHED_PROMPT_TOKEN_UNIT",
+    "COMPLETION_TOKEN_UNIT",
+    "LLM_TOKEN_UNITS",
+    "cache_hit_ratio_from_rows",
+]

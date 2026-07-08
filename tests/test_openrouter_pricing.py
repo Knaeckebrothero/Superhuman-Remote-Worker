@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from orchestrator.services.openrouter_pricing import (
+    LlmTokenPrices,
     _catalog_pricing_pairs,
     _price,
     _pricing_id_for,
@@ -114,7 +115,11 @@ class TestFetch:
                     "data": [
                         {
                             "id": "openai/gpt-5.5",
-                            "pricing": {"prompt": "0.0000025", "completion": "0.00001"},
+                            "pricing": {
+                                "prompt": "0.0000025",
+                                "completion": "0.00001",
+                                "input_cache_read": "0.00000025",
+                            },
                         },
                         {
                             "id": "free/model",
@@ -130,8 +135,12 @@ class TestFetch:
             )
 
         prices = await fetch_openrouter_prices(client=_client(handler))
-        assert prices["openai/gpt-5.5"] == (Decimal("0.0000025"), Decimal("0.00001"))
-        assert prices["free/model"] == (Decimal("0"), Decimal("0"))
+        assert prices["openai/gpt-5.5"] == LlmTokenPrices(
+            Decimal("0.0000025"),
+            Decimal("0.00001"),
+            Decimal("0.00000025"),
+        )
+        assert prices["free/model"] == LlmTokenPrices(Decimal("0"), Decimal("0"))
         assert "variable/model" not in prices
         assert "nopricing" not in prices
 
@@ -147,11 +156,17 @@ class TestFetch:
 
 
 class TestSyncLlmRates:
-    _PRICES = {"openai/gpt-5.5": (Decimal("0.0000025"), Decimal("0.00001"))}
+    _PRICES = {
+        "openai/gpt-5.5": LlmTokenPrices(
+            Decimal("0.0000025"),
+            Decimal("0.00001"),
+            Decimal("0.00000025"),
+        )
+    }
     _TS = datetime(2026, 7, 1, tzinfo=timezone.utc)
 
     @pytest.mark.asyncio
-    async def test_inserts_both_token_dimensions(self):
+    async def test_inserts_all_token_dimensions(self):
         conn = FakeConn()
         n = await sync_llm_rates(
             FakePool(conn),
@@ -159,9 +174,14 @@ class TestSyncLlmRates:
             prices=self._PRICES,
             now=self._TS,
         )
-        assert n == 2
+        assert n == 3
         assert ("gpt-5.5", "prompt-token", Decimal("0.0000025")) in conn.inserts
         assert ("gpt-5.5", "completion-token", Decimal("0.00001")) in conn.inserts
+        assert (
+            "gpt-5.5",
+            "cached-prompt-token",
+            Decimal("0.00000025"),
+        ) in conn.inserts
 
     @pytest.mark.asyncio
     async def test_change_only_second_run_is_noop(self):
@@ -179,10 +199,37 @@ class TestSyncLlmRates:
         conn = FakeConn()
         models = [("gpt-5.5", "openai/gpt-5.5")]
         await sync_llm_rates(FakePool(conn), models, prices=self._PRICES, now=self._TS)
-        bumped = {"openai/gpt-5.5": (Decimal("0.0000030"), Decimal("0.00001"))}
+        bumped = {
+            "openai/gpt-5.5": LlmTokenPrices(
+                Decimal("0.0000030"),
+                Decimal("0.00001"),
+                Decimal("0.00000025"),
+            )
+        }
         n2 = await sync_llm_rates(FakePool(conn), models, prices=bumped, now=self._TS)
         assert n2 == 1  # only the prompt-token rate changed
         assert ("gpt-5.5", "prompt-token", Decimal("0.0000030")) in conn.inserts
+
+    @pytest.mark.asyncio
+    async def test_missing_cache_read_price_falls_back_to_prompt_rate(self):
+        conn = FakeConn()
+        n = await sync_llm_rates(
+            FakePool(conn),
+            [("gpt-5.5", "openai/gpt-5.5")],
+            prices={
+                "openai/gpt-5.5": LlmTokenPrices(
+                    Decimal("0.0000025"),
+                    Decimal("0.00001"),
+                )
+            },
+            now=self._TS,
+        )
+        assert n == 3
+        assert (
+            "gpt-5.5",
+            "cached-prompt-token",
+            Decimal("0.0000025"),
+        ) in conn.inserts
 
     @pytest.mark.asyncio
     async def test_explicitly_unpriced_model_is_skipped(self):
@@ -233,7 +280,13 @@ class TestCatalogPairs:
 
 class TestSyncCatalogLlmRates:
     _TS = datetime(2026, 7, 1, tzinfo=timezone.utc)
-    _PRICES = {"openai/gpt-5.5": (Decimal("0.000005"), Decimal("0.00003"))}
+    _PRICES = {
+        "openai/gpt-5.5": LlmTokenPrices(
+            Decimal("0.000005"),
+            Decimal("0.00003"),
+            Decimal("0.0000005"),
+        )
+    }
 
     @pytest.mark.asyncio
     async def test_enumerates_catalog_and_seeds(self):
@@ -251,7 +304,7 @@ class TestSyncCatalogLlmRates:
         n = await sync_catalog_llm_rates(
             FakePool(conn), list_models, prices=self._PRICES, now=self._TS
         )
-        assert n == 2  # gpt-5.5 prompt + completion; gemma unpriced
+        assert n == 3  # gpt-5.5 prompt + cached prompt + completion; gemma unpriced
         assert ("gpt-5.5", "prompt-token", Decimal("0.000005")) in conn.inserts
         assert not any(r == "gemma-4-moe" for r, *_ in conn.inserts)
 

@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import asyncpg
 
-from services.usage_ledger import UsageLedger, _uuid
+from services.usage_ledger import UsageLedger, _uuid, cache_hit_ratio_from_rows
 
 logger = logging.getLogger(__name__)
 
@@ -372,7 +372,11 @@ class UsageRollup:
         by_category = _merge_sum(parts, ("category", "unit"))
         by_category.sort(key=lambda x: (x["category"], x["unit"]))
         total = sum(item["cost_usd"] for item in by_category)
-        return {"by_category": by_category, "total_cost_usd": total}
+        return {
+            "by_category": by_category,
+            "total_cost_usd": total,
+            "cache_hit_ratio": cache_hit_ratio_from_rows(by_category),
+        }
 
     async def breakdown(
         self,
@@ -551,7 +555,7 @@ class UsageRollup:
         owner_user_id: Optional[str],
         scope_project_id: Optional[str],
     ) -> List[Dict[str, Any]]:
-        """(day, key) buckets — tokens = prompt+completion, mirrors
+        """(day, key) buckets — tokens = prompt+cached+completion, mirrors
         UsageLedger.query_timeseries (already day-granular in usage_daily)."""
         col = _GROUP_COLS[group_by]
         clauses = ["day >= $1", "day <= $2", f"{col} IS NOT NULL"]
@@ -565,7 +569,9 @@ class UsageRollup:
         sql = (
             f"SELECT day, {col} AS key, "
             "COALESCE(SUM(quantity) FILTER "
-            "(WHERE unit IN ('prompt-token', 'completion-token')), 0) AS tokens, "
+            "(WHERE unit IN "
+            "('prompt-token', 'cached-prompt-token', 'completion-token')), 0) "
+            "AS tokens, "
             "COALESCE(SUM(cost_usd), 0) AS cost_usd, SUM(events) AS events "
             f"FROM usage_daily WHERE {' AND '.join(clauses)} GROUP BY day, {col}"
         )

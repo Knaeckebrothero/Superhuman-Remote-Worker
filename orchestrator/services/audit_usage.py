@@ -17,13 +17,15 @@ depend on the read pool carrying a jsonb codec):
   persistent loop stashes in ``metadata.input_tokens`` / ``metadata.output_tokens``
   (streaming providers often leave ``response_metadata.token_usage`` empty).
 
-Cost: none is written here. Two cost-free ``prompt-token`` / ``completion-token``
-rows are emitted per call; :meth:`UsageLedger.record_events` snapshots the
-$/token rate from ``usage_rates`` (seeded from OpenRouter — see
-``openrouter_pricing.py``) exactly as it priced the gateway rows. Reasoning
-tokens are a *subset* of the completion total (billed at the completion rate), so
-they ride in ``details`` for observability, never as a separate priced row (that
-would double-count cost).
+Cost: none is written here. Cost-free token rows are emitted per call;
+:meth:`UsageLedger.record_events` snapshots the $/token rate from
+``usage_rates`` (seeded from OpenRouter — see ``openrouter_pricing.py``) exactly
+as it priced the gateway rows. OpenAI-protocol cache reads are split into
+``prompt-token`` (uncached) + ``cached-prompt-token`` (cache read) so the two
+prompt rows sum to the provider's total prompt count. Reasoning tokens are a
+*subset* of the completion total (billed at the completion rate), so they ride in
+``details`` for observability, never as a separate priced row (that would
+double-count cost).
 
 Attribution: ``llm_requests.job_id`` is a job id for worker rows and a thread id
 for session rows. Resolved against the app-DB ``jobs`` / ``threads`` tables to
@@ -80,6 +82,8 @@ SELECT id, job_id, agent_type, call_type, model, timestamp,
        metrics->'token_usage'->>'completion_tokens' AS m_completion,
        metrics->'token_usage'->>'output_tokens'     AS m_output,
        metrics->'token_usage'->>'reasoning_tokens'  AS m_reasoning,
+       metrics->'token_usage'->'prompt_tokens_details'->>'cached_tokens'
+                                                   AS m_cached,
        metadata->>'input_tokens'                    AS md_input,
        metadata->>'output_tokens'                   AS md_output
 FROM llm_requests
@@ -155,8 +159,9 @@ async def materialize_llm_usage_from_audit(
 ) -> dict[str, Any]:
     """Materialize ``llm_requests`` rows after ``since_ts`` into ``usage_events``.
 
-    Emits cost-free ``prompt-token`` / ``completion-token`` rows (the ledger
-    prices them from ``usage_rates``), attributed to the row's user/project.
+    Emits cost-free ``prompt-token`` / ``cached-prompt-token`` /
+    ``completion-token`` rows (the ledger prices them from ``usage_rates``),
+    attributed to the row's user/project.
     Advances the cursor only over a contiguous run of rows older than
     ``min_age_s`` (see module docstring). ``since_ts=None`` materializes from the
     beginning. Returns ``{"materialized", "cursor", "scanned"}`` where ``cursor``
@@ -205,6 +210,8 @@ async def materialize_llm_usage_from_audit(
         completion = _first_int(r["m_completion"], r["m_output"], r["md_output"])
         if not prompt and not completion:
             continue  # health check / audio / errored call — nothing to meter
+        cached = min(_first_int(r["m_cached"]), prompt)
+        uncached_prompt = prompt - cached
         is_session = (r["agent_type"] or "") == _SESSION_AGENT_TYPE
         user_id, project_id = owners.get(r["job_id"], (None, None))
         reasoning = _first_int(r["m_reasoning"])
@@ -216,6 +223,8 @@ async def materialize_llm_usage_from_audit(
         }
         if reasoning:
             details["reasoning_tokens"] = reasoning
+        if cached:
+            details["cached_prompt_tokens"] = cached
         common = dict(
             category="llm",
             resource=str(r["model"]),
@@ -228,8 +237,14 @@ async def materialize_llm_usage_from_audit(
             ref_id=str(r["job_id"]),
             details=details,
         )
-        if prompt:
-            events.append(UsageEvent(quantity=prompt, unit="prompt-token", **common))
+        if uncached_prompt:
+            events.append(
+                UsageEvent(quantity=uncached_prompt, unit="prompt-token", **common)
+            )
+        if cached:
+            events.append(
+                UsageEvent(quantity=cached, unit="cached-prompt-token", **common)
+            )
         if completion:
             events.append(
                 UsageEvent(quantity=completion, unit="completion-token", **common)

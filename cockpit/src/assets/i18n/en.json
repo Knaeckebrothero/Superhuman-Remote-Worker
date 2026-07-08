@@ -409,6 +409,10 @@
         "settingsSaveFailed": "Failed to save settings."
       }
     },
+    "usage": {
+      "cacheHit": "Cache hit",
+      "cachedTokens": "Cached tok."
+    },
     "providers": {
       "title": "Providers",
       "desc": "System-scoped LLM providers, custom endpoints, and default models. Changes apply to every user.",

@@ -19,6 +19,7 @@ describe('AdminUsageService', () => {
         {category: 'llm', unit: 'prompt-token', quantity: 100, cost_usd: 0, events: 5},
       ],
       total_cost_usd: 0,
+      cache_hit_ratio: 0,
       available: true,
       from: 'a',
       to: 'b',
@@ -42,6 +43,7 @@ describe('AdminUsageService', () => {
     expect(service.usage()).toEqual({
       by_category: [],
       total_cost_usd: 0,
+      cache_hit_ratio: 0,
       available: false,
     });
     expect(service.loading()).toBe(false);
@@ -50,7 +52,7 @@ describe('AdminUsageService', () => {
   it('passes the requested window as the days query param', () => {
     const http = {
       get: vi.fn().mockReturnValue(
-        of({by_category: [], total_cost_usd: 0, available: true}),
+        of({by_category: [], total_cost_usd: 0, cache_hit_ratio: 0, available: true}),
       ),
     };
     const service = createService(http);
@@ -116,7 +118,12 @@ describe('AdminUsageService', () => {
   });
 
   it('defaults the scope override to null (defer to the global view-as toggle)', () => {
-    const http = {get: vi.fn().mockReturnValue(of({by_category: [], total_cost_usd: 0, available: true}))};
+    const http = {get: vi.fn().mockReturnValue(of({
+      by_category: [],
+      total_cost_usd: 0,
+      cache_hit_ratio: 0,
+      available: true,
+    }))};
     const service = createService(http);
     service.loadUsage(30);
     const options = http.get.mock.calls[0][1];

@@ -409,6 +409,10 @@
         "settingsSaveFailed": "Einstellungen konnten nicht gespeichert werden."
       }
     },
+    "usage": {
+      "cacheHit": "Cache-Treffer",
+      "cachedTokens": "Gecachte Tok."
+    },
     "providers": {
       "title": "Anbieter",
       "desc": "Systemweite LLM-Anbieter, eigene Endpunkte und Standardmodelle. Änderungen gelten für alle Nutzer.",
