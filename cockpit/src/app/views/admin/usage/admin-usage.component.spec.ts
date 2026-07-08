@@ -2,6 +2,7 @@ import {TestBed} from '@angular/core/testing';
 import {provideHttpClient} from '@angular/common/http';
 import {provideHttpClientTesting} from '@angular/common/http/testing';
 import {TranslocoService} from '@jsverse/transloco';
+import {vi} from 'vitest';
 import {AdminUsageComponent} from './admin-usage.component';
 
 // Note: uses TestBed.inject (not createComponent) to avoid JIT styleUrl
@@ -25,6 +26,16 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(c.refreshIntervalMs()).toBe(0);
     c.setRefresh(30000);
     expect(c.refreshIntervalMs()).toBe(30000);
+  });
+
+  it('offers 8h and 24h window presets before the existing day filters', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    const reload = vi.spyOn(c, 'reloadAll').mockImplementation(() => {});
+    expect(c.windows.map((w) => w.label)).toEqual(['8h', '24h', '7d', '30d', '90d']);
+    c.setWindow(8);
+    expect(c.windowHours()).toBe(8);
+    expect(c.windowDays()).toBe(1);
+    expect(reload).toHaveBeenCalledOnce();
   });
 
   it('tokensTotal sums prompt + cached prompt + completion token quantities', () => {
