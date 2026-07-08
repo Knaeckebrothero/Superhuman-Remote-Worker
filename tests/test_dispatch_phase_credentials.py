@@ -28,7 +28,6 @@ if str(_ORCH) not in sys.path:
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 import main  # noqa: E402
-from services.litellm_gateway import publish_registered_models  # noqa: E402
 from src.core.model_registry import ModelMeta  # noqa: E402
 
 
@@ -193,28 +192,24 @@ class TestPhaseOverrideCredentialInjection:
         assert result["auxiliary"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
-    async def test_existing_base_url_in_phase_block_is_not_overwritten(
+    async def test_existing_base_url_in_phase_block_is_refreshed_from_endpoint(
         self, patched_main
     ):
-        """Caller-supplied base_url wins; injection is additive-only."""
+        """Endpoint-backed phase models refresh stale caller/persisted transport."""
         override = {
             "llm": {
                 "tactical": {
                     "model": "gpt-5.3-codex-spark",
                     "base_url": "https://caller-pinned.example/v1",
+                    "api_key": "sk-stale",
                 }
             }
         }
 
         result = await main._inject_dispatch_credentials(_job(), override)
 
-        assert (
-            result["llm"]["tactical"]["base_url"] == "https://caller-pinned.example/v1"
-        )
-        # The guard skips injection entirely when base_url is already set,
-        # so api_key from the endpoint is NOT injected either — matching
-        # the pre-existing _inject_model_credentials early-return contract.
-        assert "api_key" not in result["llm"]["tactical"]
+        assert result["llm"]["tactical"]["base_url"] == CODEX_BASE_URL
+        assert result["llm"]["tactical"]["api_key"] == CODEX_API_KEY
 
     @pytest.mark.asyncio
     async def test_unknown_phase_model_logs_warning_no_crash(
@@ -559,17 +554,12 @@ class TestContextWindowInjection:
 
 
 # ---------------------------------------------------------------------------
-# Codex proxy bypasses the LiteLLM gateway (reasoning-capture regression)
+# Endpoint-backed model routing.
 #
-# The Codex proxy speaks ONLY the Responses API; routing it through the LiteLLM
-# gateway normalizes to Chat Completions and drops gpt-5.x reasoning. So an
-# endpoint model whose meta.provider == "codex" must hit the endpoint directly
-# even when the gateway is enabled, while non-codex endpoint models still route
-# through the gateway.
-# See docs/done/litellm_gateway_drops_gpt_codex_reasoning_capture.md
+# Endpoint rows are the transport authority for catalog/self-hosted models. The
+# injector refreshes base_url/api_key/provider from the endpoint row so resumed
+# jobs and hot-swapped sessions cannot keep stale transport from an older model.
 # ---------------------------------------------------------------------------
-
-GATEWAY = ("http://srw-litellm:4000/v1", "sk-fleet")
 
 
 def _patch_resolve_provider(monkeypatch, *, provider: str):
@@ -604,11 +594,11 @@ def _patch_resolve_provider(monkeypatch, *, provider: str):
     )
 
 
-class TestCodexBypassesGateway:
-    """meta.provider == 'codex' skips the gateway and injects the codex factory."""
+class TestEndpointDirectRouting:
+    """Endpoint-backed models inject their configured endpoint transport."""
 
     @pytest.mark.asyncio
-    async def test_codex_model_hits_endpoint_not_gateway(self, monkeypatch):
+    async def test_codex_model_hits_endpoint(self, monkeypatch):
         _patch_resolve_provider(monkeypatch, provider="codex")
         section = {"model": "gpt-5.5"}
         await main._inject_model_credentials(
@@ -616,15 +606,13 @@ class TestCodexBypassesGateway:
             model_id="gpt-5.5",
             user_id="u",
             resolved_keys={},
-            gateway_override=GATEWAY,
         )
-        # Direct to the codex proxy — NOT the gateway — and built via the codex factory.
         assert section["base_url"] == CODEX_BASE_URL
         assert section["api_key"] == CODEX_API_KEY
         assert section.get("provider") == "codex"
 
     @pytest.mark.asyncio
-    async def test_noncodex_endpoint_still_routes_via_gateway(self, monkeypatch):
+    async def test_openai_endpoint_model_hits_endpoint(self, monkeypatch):
         _patch_resolve_provider(monkeypatch, provider="openai")
         section = {"model": "gemma-4-moe"}
         await main._inject_model_credentials(
@@ -632,27 +620,21 @@ class TestCodexBypassesGateway:
             model_id="gemma-4-moe",
             user_id="u",
             resolved_keys={},
-            gateway_override=GATEWAY,
         )
-        # Endpoint + gateway enabled → gateway (measurement/rate-limit chokepoint).
-        assert section["base_url"] == GATEWAY[0]
-        assert section["api_key"] == GATEWAY[1]
+        assert section["base_url"] == CODEX_BASE_URL
+        assert section["api_key"] == CODEX_API_KEY
+        assert section.get("provider") == "openai"
 
     @pytest.mark.asyncio
-    async def test_codex_model_replaces_stale_gateway_base_url(self, monkeypatch):
-        """A persisted / hot-swapped session section can still carry a STALE
-        LiteLLM-gateway base_url (+ its provider) from a previously
-        gateway-routed model. A codex model bypasses the gateway, so that stale
-        base_url must be REPLACED with the codex endpoint's own — otherwise the
-        codex endpoint key is sent to the gateway, which rejects any non-`sk-`
-        key (401 "LiteLLM Virtual Key expected"). The per-field ``setdefault``
-        could not correct it. Regression for
-        docs/issues/codex_session_gateway_baseurl_401.md.
-        """
+    async def test_endpoint_model_replaces_stale_transport(self, monkeypatch):
+        """A persisted section can carry a stale base_url/provider from a
+        previous model. Endpoint-backed rows must refresh the whole transport
+        from the endpoint table."""
         _patch_resolve_provider(monkeypatch, provider="codex")
         section = {
             "model": "gpt-5.5",
-            "base_url": GATEWAY[0],  # stale gateway URL from a prior model
+            "base_url": "https://stale.example/v1",
+            "api_key": "sk-stale",
             "provider": "openai",  # stale factory from the same prior model
         }
         await main._inject_model_credentials(
@@ -660,31 +642,28 @@ class TestCodexBypassesGateway:
             model_id="gpt-5.5",
             user_id="u",
             resolved_keys={},
-            gateway_override=GATEWAY,
         )
-        # Transport must be coherent: codex proxy + codex key + codex factory.
         assert section["base_url"] == CODEX_BASE_URL
         assert section["api_key"] == CODEX_API_KEY
         assert section["provider"] == "codex"
 
     @pytest.mark.asyncio
-    async def test_codex_model_keeps_caller_pinned_nongateway_base_url(
-        self, monkeypatch
-    ):
-        """Only a stale *gateway* base_url is replaced. A deliberately
-        caller-pinned non-gateway base_url (BYO codex endpoint) is preserved —
-        the replacement must not over-reach into the additive contract."""
+    async def test_endpoint_model_replaces_caller_pinned_transport(self, monkeypatch):
+        """For a catalog endpoint model, the endpoint row wins over caller-pinned
+        transport so persisted overrides cannot split model/provider/key."""
         _patch_resolve_provider(monkeypatch, provider="codex")
-        section = {"model": "gpt-5.5", "base_url": "https://byo-codex.example/v1"}
+        section = {
+            "model": "gpt-5.5",
+            "base_url": "https://byo-codex.example/v1",
+            "api_key": "sk-byo",
+        }
         await main._inject_model_credentials(
             section=section,
             model_id="gpt-5.5",
             user_id="u",
             resolved_keys={},
-            gateway_override=GATEWAY,
         )
-        assert section["base_url"] == "https://byo-codex.example/v1"
-        # api_key still resolved from the endpoint row (base_url present, key absent).
+        assert section["base_url"] == CODEX_BASE_URL
         assert section["api_key"] == CODEX_API_KEY
 
 
@@ -824,231 +803,3 @@ class TestEmbeddingCredentialReliability:
         assert "EMBEDDING_API_KEY" not in env
         assert "EMBEDDING_BASE_URL" not in env
         assert any(EMB_ENDPOINT_ID in rec.getMessage() for rec in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 — per-provider gateway-routing canary
-#
-# System (minimax/OpenRouter, gemini/Google) and codex models route THROUGH the
-# gateway only when their provider is opted into LITELLM_GATEWAY_ROUTED_PROVIDERS
-# AND the catalog sync has registered the model. Empty allowlist = pre-Phase-2
-# behaviour (system direct, codex bypass). See
-# docs/features/route_all_models_through_litellm_gateway.md §4.2.
-# ---------------------------------------------------------------------------
-
-
-def _system_meta(model_id, provider):
-    """A system-anchored ModelMeta (endpoint_id=None, api_key_ref=provider slug)."""
-    return ModelMeta(
-        model_id=model_id,
-        provider=provider,
-        family="minimax",
-        display_name=model_id,
-        origin="catalog",
-        api_key_ref=provider,
-    )
-
-
-class TestGatewayCanaryRouting:
-    """Phase 2: per-provider canary routing of system/codex models."""
-
-    @pytest.fixture(autouse=True)
-    def _reset(self, monkeypatch):
-        monkeypatch.delenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", raising=False)
-        yield
-        publish_registered_models(set())  # never leak the registered set
-
-    # --- pure decision helpers ----------------------------------------------
-    def test_routed_providers_parses_and_lowercases(self, monkeypatch):
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", " Google, openrouter ,")
-        assert main._gateway_routed_providers() == frozenset({"google", "openrouter"})
-
-    def test_routed_providers_empty_by_default(self):
-        assert main._gateway_routed_providers() == frozenset()
-
-    def test_canary_provider_classification(self):
-        codex = ModelMeta(
-            model_id="gpt-5.5",
-            provider="codex",
-            family="gpt-5",
-            display_name="x",
-            endpoint_id=CODEX_ENDPOINT_ID,
-        )
-        gemma = ModelMeta(
-            model_id="gemma",
-            provider="openai",
-            family="gemma",
-            display_name="x",
-            endpoint_id=CODEX_ENDPOINT_ID,
-        )
-        assert main._gateway_canary_provider(codex) == "codex"
-        assert (
-            main._gateway_canary_provider(_system_meta("m", "openrouter"))
-            == "openrouter"
-        )
-        assert (
-            main._gateway_canary_provider(gemma) is None
-        )  # endpoint row, not a candidate
-        assert main._gateway_canary_provider(None) is None
-
-    def test_should_route_requires_all_three_gates(self, monkeypatch):
-        m = _system_meta("minimax-m3", "openrouter")
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "openrouter")
-        publish_registered_models({"minimax-m3"})
-        # all gates pass
-        assert main._should_route_via_gateway(m, GATEWAY) is True
-        # gateway down (target None) → no
-        assert main._should_route_via_gateway(m, None) is False
-        # not registered → no (fail-loud fallback)
-        publish_registered_models(set())
-        assert main._should_route_via_gateway(m, GATEWAY) is False
-        # not canaried → no
-        publish_registered_models({"minimax-m3"})
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "google")
-        assert main._should_route_via_gateway(m, GATEWAY) is False
-
-    def test_wildcard_routes_every_provider(self, monkeypatch):
-        # "*" = the end-state "single path for all LLM traffic" posture: every
-        # system/codex provider routes through the gateway, including ones never
-        # named in the list — as long as the model is registered.
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "*")
-        for provider, model_id in (
-            ("openrouter", "minimax-m3"),
-            ("mistral", "mistral-large"),  # never explicitly listed
-            ("groq", "groq/llama-3.3"),
-            ("google", "gemini-3.5-flash"),
-        ):
-            publish_registered_models({model_id})
-            assert (
-                main._should_route_via_gateway(
-                    _system_meta(model_id, provider), GATEWAY
-                )
-                is True
-            )
-        # codex too
-        codex = ModelMeta(
-            model_id="gpt-5.5",
-            provider="codex",
-            family="gpt-5",
-            display_name="x",
-            endpoint_id=CODEX_ENDPOINT_ID,
-        )
-        publish_registered_models({"gpt-5.5"})
-        assert main._should_route_via_gateway(codex, GATEWAY) is True
-
-    def test_wildcard_still_honours_registered_and_health_guards(self, monkeypatch):
-        # "*" widens the provider gate only — the fail-loud (registered) and
-        # gateway-health (gw_target) guards still hold, so "*" never forces an
-        # unregistered model onto the gateway or routes when it's down.
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "*")
-        m = _system_meta("mistral-large", "mistral")
-        publish_registered_models(set())  # not registered
-        assert main._should_route_via_gateway(m, GATEWAY) is False
-        publish_registered_models({"mistral-large"})
-        assert main._should_route_via_gateway(m, None) is False  # gateway down
-        assert main._should_route_via_gateway(m, GATEWAY) is True
-
-    def test_wildcard_does_not_touch_endpoint_models(self, monkeypatch):
-        # Endpoint rows (gemma) route via the endpoint branch, not the canary — "*"
-        # must not reclassify them (their canary provider is None either way).
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "*")
-        gemma = ModelMeta(
-            model_id="gemma",
-            provider="openai",
-            family="gemma",
-            display_name="x",
-            endpoint_id=CODEX_ENDPOINT_ID,
-        )
-        publish_registered_models({"gemma"})
-        assert main._should_route_via_gateway(gemma, GATEWAY) is False
-
-    # --- dispatch integration (section injector) ----------------------------
-    @pytest.mark.asyncio
-    async def test_codex_canaried_routes_via_gateway_as_openai(self, monkeypatch):
-        _patch_resolve_provider(monkeypatch, provider="codex")
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "codex")
-        publish_registered_models({"gpt-5.5"})
-        section = {"model": "gpt-5.5"}
-        await main._inject_model_credentials(
-            section=section,
-            model_id="gpt-5.5",
-            user_id="u",
-            resolved_keys={},
-            gateway_override=GATEWAY,
-        )
-        # Through the gateway, forced onto the openai factory (Chat<->Responses
-        # bridge keeps reasoning), with the gateway virtual key — not the proxy.
-        assert section["base_url"] == GATEWAY[0]
-        assert section["api_key"] == GATEWAY[1]
-        assert section["provider"] == "openai"
-
-    @pytest.mark.asyncio
-    async def test_codex_canaried_but_unregistered_falls_back_direct(self, monkeypatch):
-        _patch_resolve_provider(monkeypatch, provider="codex")
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "codex")
-        publish_registered_models(set())  # sync hasn't registered it
-        section = {"model": "gpt-5.5"}
-        await main._inject_model_credentials(
-            section=section,
-            model_id="gpt-5.5",
-            user_id="u",
-            resolved_keys={},
-            gateway_override=GATEWAY,
-        )
-        # Fail-loud guard → direct to the codex proxy, not a 400 against the gateway.
-        assert section["base_url"] == CODEX_BASE_URL
-        assert section["provider"] == "codex"
-
-    @pytest.mark.asyncio
-    async def test_system_canaried_routes_via_gateway_not_direct_key(self, monkeypatch):
-        monkeypatch.setattr(
-            main,
-            "_resolve_model",
-            AsyncMock(
-                side_effect=lambda model_id,
-                user_id=None,
-                capability="chat": _system_meta(model_id, "openrouter")
-            ),
-            raising=True,
-        )
-        monkeypatch.setenv("LITELLM_GATEWAY_ROUTED_PROVIDERS", "openrouter")
-        publish_registered_models({"openrouter/minimax/minimax-m3"})
-        section = {"model": "openrouter/minimax/minimax-m3"}
-        await main._inject_model_credentials(
-            section=section,
-            model_id="openrouter/minimax/minimax-m3",
-            user_id="u",
-            resolved_keys={"openrouter": "sk-or-DIRECT"},
-            gateway_override=GATEWAY,
-        )
-        # Gateway holds the system key → the agent gets the gateway key, never the
-        # user's direct openrouter key.
-        assert section["base_url"] == GATEWAY[0]
-        assert section["api_key"] == GATEWAY[1]
-        assert section["provider"] == "openai"
-
-    @pytest.mark.asyncio
-    async def test_system_not_canaried_routes_direct(self, monkeypatch):
-        monkeypatch.setattr(
-            main,
-            "_resolve_model",
-            AsyncMock(
-                side_effect=lambda model_id,
-                user_id=None,
-                capability="chat": _system_meta(model_id, "openrouter")
-            ),
-            raising=True,
-        )
-        # no canary env → pre-Phase-2 direct behaviour
-        publish_registered_models({"openrouter/minimax/minimax-m3"})
-        section = {"model": "openrouter/minimax/minimax-m3"}
-        await main._inject_model_credentials(
-            section=section,
-            model_id="openrouter/minimax/minimax-m3",
-            user_id="u",
-            resolved_keys={"openrouter": "sk-or-DIRECT"},
-            gateway_override=GATEWAY,
-        )
-        assert section.get("base_url") != GATEWAY[0]
-        assert section["provider"] == "openrouter"
-        assert section["api_key"] == "sk-or-DIRECT"

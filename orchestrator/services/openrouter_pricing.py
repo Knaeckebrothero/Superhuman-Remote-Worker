@@ -1,12 +1,9 @@
 """OpenRouter model-pricing sync → ``usage_rates`` (LLM $/token rates).
 
-Replaces LiteLLM's per-request ``spend`` as the cost source now that the gateway
-is gone (``docs/issues/remove_litellm_proxy_and_gateway_concept.md``, P1). The
-in-process metering path materializes cost-free LLM token rows into
-``usage_events`` (from the ``llm_requests`` audit); this module seeds the
-effective-dated ``usage_rates`` table so
-:meth:`UsageLedger.record_events` prices those rows exactly as it priced the
-gateway spend log before.
+The in-process metering path materializes cost-free LLM token rows into
+``usage_events`` from the ``llm_requests`` audit trail; this module seeds the
+effective-dated ``usage_rates`` table so :meth:`UsageLedger.record_events` prices
+those rows at write time.
 
 Source: OpenRouter's public model catalog (``openrouter.ai/api/v1/models`` — no
 auth), which publishes per-model ``pricing.prompt`` / ``pricing.completion`` /

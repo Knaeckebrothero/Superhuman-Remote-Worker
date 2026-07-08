@@ -6403,8 +6403,7 @@ class PostgresDB:
         """Insert a catalog row.
 
         ``context_window=0`` and ``params_json={"temperature": 0}`` round-trip
-        as themselves — only literal ``None`` is treated as "use default"
-        (LiteLLM #14661 hazard).
+        as themselves — only literal ``None`` is treated as "use default".
 
         Capability inputs go through :meth:`_canonicalize_capabilities`.
         ``capability`` (singular) is kept as a kwarg for legacy callers but

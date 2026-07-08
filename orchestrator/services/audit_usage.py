@@ -1,12 +1,9 @@
 """Materialize LLM token usage from the audit trail → ``usage_events``.
 
-In-process replacement for the LiteLLM spend-log materializer now that the
-gateway is gone (``docs/issues/remove_litellm_proxy_and_gateway_concept.md``, P1
-Slice 2). Where :func:`~services.litellm_gateway.materialize_llm_usage` pulled
-prompt/completion tokens from the proxy's ``/spend/logs``, this reads the same
-numbers straight from the auditdb ``llm_requests`` table the agent already writes
-for *every* LLM call — worker jobs AND persistent sessions — so metering no
-longer depends on routing traffic through a proxy.
+This reads prompt/completion token counts straight from the auditdb
+``llm_requests`` table the agent already writes for every LLM call — worker jobs
+AND persistent sessions — so metering does not depend on routing traffic through
+a proxy.
 
 Token source per row (extracted server-side as text via ``->>`` so this does not
 depend on the read pool carrying a jsonb codec):
@@ -42,8 +39,8 @@ unique dedupe ``source_id`` (the bands don't overlap). The cursor only advances
 over a *contiguous* run of rows older than ``min_age_s`` (the first too-fresh row
 halts the tick) to dodge the assign-before-commit visibility window. Idempotent
 regardless — the ledger dedupes on ``(source='audit', source_id, unit, ts)`` — so
-a re-scan never double-counts. ``source='audit'`` keeps these rows in a distinct
-idempotency namespace from the retired ``source='litellm'`` rows.
+a re-scan never double-counts. ``source='audit'`` keeps these rows in their own
+idempotency namespace.
 """
 
 from __future__ import annotations
