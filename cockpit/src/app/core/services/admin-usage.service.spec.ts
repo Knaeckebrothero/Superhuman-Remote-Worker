@@ -61,6 +61,24 @@ describe('AdminUsageService', () => {
     expect(params.get('days')).toBe('90');
   });
 
+  it('passes exact ISO windows with from_date and to_date query params', () => {
+    const http = {
+      get: vi.fn().mockReturnValue(
+        of({by_category: [], total_cost_usd: 0, cache_hit_ratio: 0, available: true}),
+      ),
+    };
+    const service = createService(http);
+    service.loadUsage({
+      days: 1,
+      fromIso: '2026-07-08T00:00:00.000Z',
+      toIso: '2026-07-08T08:00:00.000Z',
+    });
+    const params = http.get.mock.calls[0][1].params;
+    expect(params.get('days')).toBe('1');
+    expect(params.get('from_date')).toBe('2026-07-08T00:00:00.000Z');
+    expect(params.get('to_date')).toBe('2026-07-08T08:00:00.000Z');
+  });
+
   it('loadBreakdown populates the breakdown signal by groupBy', () => {
     const payload = {
       available: true,

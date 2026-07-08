@@ -9,7 +9,7 @@ import {
   signal,
 } from '@angular/core';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
-import {AdminUsageService, BreakdownDim, UsageTsPoint} from '../../../core/services/admin-usage.service';
+import {AdminUsageService, BreakdownDim, UsageTsPoint, UsageWindow} from '../../../core/services/admin-usage.service';
 import {ApiService} from '../../../core/services/api.service';
 import {UserService} from '../../../core/services/user.service';
 import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/models/api.model';
@@ -33,9 +33,9 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
           <h1 class="page-title">Usage &amp; Cost</h1>
           <div class="page-controls">
             <div class="seg">
-              @for (d of windows; track d) {
+              @for (w of windows; track w.hours) {
                 <button type="button" class="seg-btn"
-                  [class.active]="windowDays() === d" (click)="setWindow(d)">{{ d }}d</button>
+                  [class.active]="windowHours() === w.hours" (click)="setWindow(w.hours)">{{ w.label }}</button>
               }
             </div>
             <div class="seg">
@@ -712,8 +712,15 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
   private readonly users = inject(UserService);
   readonly isAdmin = computed(() => this.users.currentUser()?.is_admin === true);
 
-  readonly windows = [7, 30, 90] as const;
-  readonly windowDays = signal<number>(30);
+  readonly windows = [
+    {label: '8h', hours: 8, statsDays: 1},
+    {label: '24h', hours: 24, statsDays: 1},
+    {label: '7d', hours: 24 * 7, statsDays: 7},
+    {label: '30d', hours: 24 * 30, statsDays: 30},
+    {label: '90d', hours: 24 * 90, statsDays: 90},
+  ] as const;
+  readonly windowHours = signal<number>(24 * 30);
+  readonly windowDays = computed(() => Math.max(1, Math.ceil(this.windowHours() / 24)));
 
   readonly summary = computed(() => this.usage.usage());
   readonly rows = computed(() => this.summary()?.by_category ?? []);
@@ -1010,18 +1017,19 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
 
   /** Single funnel every panel's loader goes through (used by auto-refresh + window change). */
   reloadAll(): void {
-    const d = this.windowDays();
+    const usageWindow = this.currentUsageWindow();
+    const statsDays = this.currentStatsDays();
     const scope = this.scopeOverride();
-    this.usage.loadUsage(d, scope);
+    this.usage.loadUsage(usageWindow, scope);
     this.api.getJobStatistics().subscribe((s) => this.jobStats.set(s));
     if (this.isAdmin()) this.api.getAgentStatistics().subscribe((s) => this.agentStats.set(s));
-    this.usage.loadBreakdown('user', d, scope);
-    this.usage.loadBreakdown('model', d, scope);
-    this.usage.loadBreakdown('project', d, scope);
-    this.usage.loadTimeseries('user', d, scope);
-    this.usage.loadTimeseries('model', d, scope);
-    this.usage.loadTimeseries('project', d, scope);
-    this.api.getDailyStatistics(d).subscribe((stats) => this.daily.set(stats));
+    this.usage.loadBreakdown('user', usageWindow, scope);
+    this.usage.loadBreakdown('model', usageWindow, scope);
+    this.usage.loadBreakdown('project', usageWindow, scope);
+    this.usage.loadTimeseries('user', usageWindow, scope);
+    this.usage.loadTimeseries('model', usageWindow, scope);
+    this.usage.loadTimeseries('project', usageWindow, scope);
+    this.api.getDailyStatistics(statsDays).subscribe((stats) => this.daily.set(stats));
   }
 
   ngOnDestroy(): void { if (this.timer) clearInterval(this.timer); }
@@ -1030,9 +1038,23 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     this.reloadAll();
   }
 
-  setWindow(days: number): void {
-    this.windowDays.set(days);
+  setWindow(hours: number): void {
+    this.windowHours.set(hours);
     this.reloadAll();
+  }
+
+  private currentUsageWindow(): UsageWindow {
+    const to = new Date();
+    const from = new Date(to.getTime() - this.windowHours() * 60 * 60 * 1000);
+    return {
+      days: this.windowDays(),
+      fromIso: from.toISOString(),
+      toIso: to.toISOString(),
+    };
+  }
+
+  private currentStatsDays(): number {
+    return this.windows.find((w) => w.hours === this.windowHours())?.statsDays ?? this.windowDays();
   }
 
   fmtQty(n: number): string {
