@@ -190,11 +190,14 @@ docs/_build/
 .history/*
 
 # AI Stuff
+.ai
 CLAUDE.md
+AGENTS.md
 .claude
 .junie
 .codex
 .agents
+.playwright-mcp
 
 # Miscellaneous
 /.angular
