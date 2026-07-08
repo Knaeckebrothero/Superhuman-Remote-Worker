@@ -144,6 +144,7 @@ STALE_BASE_URL = "https://stale.example/v1"
 @pytest.fixture
 def patched_main_codex_endpoint(monkeypatch):
     """A codex model (`gpt-5.5`) on the codex-proxy endpoint."""
+
     async def fake_resolve(model_id, user_id=None, capability="chat"):
         if model_id == "gpt-5.5":
             return ModelMeta(
