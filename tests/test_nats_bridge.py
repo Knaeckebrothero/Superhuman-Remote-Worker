@@ -8,13 +8,14 @@ Tests cover:
 5. query_vm_status() — request/reply pattern, timeout
 6. send_control() — freeze/resume/terminate actions
 7. _on_vm_lifecycle_status() — parsing status messages, context updates
-8. _on_daemon_register() — daemon registration with IP/hostname, callback
+8. _on_daemon_register() — daemon registration with SSH readiness gating
 9. _on_daemon_heartbeat() — heartbeat processing, IDE session tracking
 10. _on_daemon_status() — agent process exit reporting
 11. NATS connection error/disconnect/reconnect callbacks
 12. Edge cases: malformed JSON, missing fields, reconnection, publish errors
 """
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -81,8 +82,23 @@ def mock_db():
     """Create a mock database instance."""
     db = AsyncMock()
     db.merge_vm_context = AsyncMock()
+    db.merge_thread_vm_context = AsyncMock()
+    db.merge_vm_context_if_current = AsyncMock(return_value=True)
+    db.merge_thread_vm_context_if_current = AsyncMock(return_value=True)
     db.merge_ide_session_context = AsyncMock()
     return db
+
+
+@pytest.fixture
+def leader():
+    """Mark this replica as the elected leader for register/probe tests."""
+    from services.leader_election import is_leader
+
+    is_leader.set()
+    try:
+        yield
+    finally:
+        is_leader.clear()
 
 
 @pytest.fixture
@@ -805,7 +821,10 @@ class TestOnDaemonRegister:
     """Tests for NatsBridge._on_daemon_register()."""
 
     @pytest.mark.asyncio
-    async def test_register_with_ip(self, bridge_with_db, mock_db):
+    async def test_register_with_ip_sets_ssh_pending(
+        self, bridge_with_db, mock_db, leader
+    ):
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
         msg = make_msg(
             {
                 "job_id": "job-reg-001",
@@ -817,21 +836,32 @@ class TestOnDaemonRegister:
 
         await bridge_with_db._on_daemon_register(msg)
 
-        mock_db.merge_vm_context.assert_awaited_once_with(
+        mock_db.merge_vm_context.assert_awaited_once()
+        assert mock_db.merge_vm_context.call_args.args[0] == "job-reg-001"
+        updates = mock_db.merge_vm_context.call_args.args[1]
+        assert updates["status"] == "ssh_pending"
+        assert updates["ssh_host"] == "100.64.1.5"
+        assert updates["ssh_port"] == 22
+        assert updates["hostname"] == "vm-agent-001"
+        assert updates["daemon_pid"] == 12345
+        assert updates["recovering"] is False
+        assert updates["registered_at"]
+        assert updates["ssh_registration_id"]
+        assert updates["ssh_probe_error"] is None
+        bridge_with_db._start_vm_ssh_probe.assert_called_once_with(
             "job-reg-001",
-            {
-                "status": "ready",
-                "ssh_host": "100.64.1.5",
-                "ssh_port": 22,
-                "hostname": "vm-agent-001",
-                "daemon_pid": 12345,
-                "recovering": False,
-            },
+            is_thread=False,
+            ssh_host="100.64.1.5",
+            ssh_port=22,
+            registration_id=updates["ssh_registration_id"],
         )
 
     @pytest.mark.asyncio
-    async def test_register_falls_back_to_hostname(self, bridge_with_db, mock_db):
+    async def test_register_falls_back_to_hostname(
+        self, bridge_with_db, mock_db, leader
+    ):
         """When ip is missing, hostname is used as ssh_host."""
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
         msg = make_msg(
             {
                 "job_id": "job-reg-002",
@@ -847,8 +877,11 @@ class TestOnDaemonRegister:
         assert updates["ssh_port"] == 22
 
     @pytest.mark.asyncio
-    async def test_register_ip_preferred_over_hostname(self, bridge_with_db, mock_db):
+    async def test_register_ip_preferred_over_hostname(
+        self, bridge_with_db, mock_db, leader
+    ):
         """When both ip and hostname are present, ip is preferred for ssh_host."""
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
         msg = make_msg(
             {
                 "job_id": "job-reg-003",
@@ -865,11 +898,12 @@ class TestOnDaemonRegister:
         assert updates["hostname"] == "vm-agent-003"
 
     @pytest.mark.asyncio
-    async def test_register_triggers_on_vm_ready_callback(
-        self, bridge_with_db, mock_db
+    async def test_register_does_not_trigger_callback_before_probe(
+        self, bridge_with_db, mock_db, leader
     ):
         callback = MagicMock()
         bridge_with_db._on_vm_ready = callback
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
 
         msg = make_msg(
             {
@@ -882,33 +916,65 @@ class TestOnDaemonRegister:
 
         await bridge_with_db._on_daemon_register(msg)
 
+        callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_success_promotes_and_triggers_callback(
+        self, bridge_with_db, mock_db, leader
+    ):
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        bridge_with_db._wait_for_agent_ssh = AsyncMock(return_value=(True, 2, ""))
+
+        await bridge_with_db._probe_vm_ssh_ready(
+            "job-reg-004",
+            is_thread=False,
+            ssh_host="100.64.3.1",
+            ssh_port=22,
+            registration_id="reg-123",
+        )
+        await asyncio.sleep(0)
+
+        mock_db.merge_vm_context_if_current.assert_awaited_once()
+        args = mock_db.merge_vm_context_if_current.call_args.args
+        assert args[0] == "job-reg-004"
+        assert args[1] == "reg-123"
+        updates = args[2]
+        assert updates["status"] == "ready"
+        assert updates["ssh_verified_at"]
+        assert updates["ssh_probe_attempts"] == 2
+        assert updates["ssh_probe_error"] is None
+        bridge_with_db._seed_vm_ide_config.assert_called_once_with(
+            "job-reg-004", False, "100.64.3.1", 22
+        )
         callback.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_register_callback_error_handled(self, bridge_with_db, mock_db):
+    async def test_probe_callback_error_handled(self, bridge_with_db, mock_db, leader):
         """Callback errors should not prevent registration from completing."""
         callback = MagicMock(side_effect=RuntimeError("callback boom"))
         bridge_with_db._on_vm_ready = callback
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        bridge_with_db._wait_for_agent_ssh = AsyncMock(return_value=(True, 1, ""))
 
-        msg = make_msg(
-            {
-                "job_id": "job-reg-005",
-                "hostname": "vm-agent-005",
-                "ip": "100.64.4.1",
-                "pid": 2,
-            }
+        await bridge_with_db._probe_vm_ssh_ready(
+            "job-reg-005",
+            is_thread=False,
+            ssh_host="100.64.4.1",
+            ssh_port=22,
+            registration_id="reg-err",
         )
+        await asyncio.sleep(0)
 
-        # Should not raise
-        await bridge_with_db._on_daemon_register(msg)
-
-        # Context update should still have happened
-        mock_db.merge_vm_context.assert_awaited_once()
+        mock_db.merge_vm_context_if_current.assert_awaited_once()
+        callback.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_register_no_callback_set(self, bridge_with_db, mock_db):
+    async def test_register_no_callback_set(self, bridge_with_db, mock_db, leader):
         """Register works fine when no on_vm_ready callback is set."""
         bridge_with_db._on_vm_ready = None
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
 
         msg = make_msg(
             {
@@ -940,8 +1006,11 @@ class TestOnDaemonRegister:
         mock_db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_register_clears_recovering_flag(self, bridge_with_db, mock_db):
+    async def test_register_clears_recovering_flag(
+        self, bridge_with_db, mock_db, leader
+    ):
         """Registration should set recovering=False to clear any recovery guard."""
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
         msg = make_msg(
             {
                 "job_id": "job-reg-007",
@@ -957,8 +1026,11 @@ class TestOnDaemonRegister:
         assert updates["recovering"] is False
 
     @pytest.mark.asyncio
-    async def test_register_neither_ip_nor_hostname(self, bridge_with_db, mock_db):
-        """When both ip and hostname are missing, ssh_host should be None."""
+    async def test_register_neither_ip_nor_hostname(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """Missing SSH host is recorded as non-dispatchable, with no probe."""
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
         msg = make_msg(
             {
                 "job_id": "job-reg-008",
@@ -970,6 +1042,77 @@ class TestOnDaemonRegister:
 
         updates = mock_db.merge_vm_context.call_args.args[1]
         assert updates["ssh_host"] is None
+        assert updates["status"] == "ssh_unreachable"
+        assert "SSH host" in updates["ssh_probe_error"]
+        bridge_with_db._start_vm_ssh_probe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_register_ignored_on_follower(self, bridge_with_db, mock_db):
+        from services.leader_election import is_leader
+
+        is_leader.clear()
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
+        msg = make_msg(
+            {
+                "job_id": "job-reg-follower",
+                "hostname": "vm-agent-follower",
+                "ip": "100.64.9.1",
+                "pid": 9,
+            }
+        )
+
+        await bridge_with_db._on_daemon_register(msg)
+
+        mock_db.merge_vm_context.assert_not_awaited()
+        bridge_with_db._start_vm_ssh_probe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_success_stale_registration_does_not_dispatch(
+        self, bridge_with_db, mock_db, leader
+    ):
+        mock_db.merge_vm_context_if_current.return_value = False
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        bridge_with_db._wait_for_agent_ssh = AsyncMock(return_value=(True, 1, ""))
+
+        await bridge_with_db._probe_vm_ssh_ready(
+            "job-reg-stale",
+            is_thread=False,
+            ssh_host="100.64.10.1",
+            ssh_port=22,
+            registration_id="old-reg",
+        )
+        await asyncio.sleep(0)
+
+        mock_db.merge_vm_context_if_current.assert_awaited_once()
+        callback.assert_not_called()
+        bridge_with_db._seed_vm_ide_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_probe_timeout_records_unreachable_without_dispatch(
+        self, bridge_with_db, mock_db, leader
+    ):
+        callback = MagicMock()
+        bridge_with_db._on_vm_ready = callback
+        bridge_with_db._wait_for_agent_ssh = AsyncMock(
+            return_value=(False, 3, "connection timed out")
+        )
+
+        await bridge_with_db._probe_vm_ssh_ready(
+            "job-reg-timeout",
+            is_thread=False,
+            ssh_host="100.64.11.1",
+            ssh_port=22,
+            registration_id="reg-timeout",
+        )
+
+        args = mock_db.merge_vm_context_if_current.call_args.args
+        updates = args[2]
+        assert updates["status"] == "ssh_unreachable"
+        assert updates["ssh_probe_attempts"] == 3
+        assert updates["ssh_probe_error"] == "connection timed out"
+        callback.assert_not_called()
 
 
 # =============================================================================
@@ -1332,8 +1475,9 @@ class TestEdgeCases:
         assert updates["ssh_nodeport"] == 31022
 
     @pytest.mark.asyncio
-    async def test_register_with_unicode_hostname(self, bridge_with_db, mock_db):
+    async def test_register_with_unicode_hostname(self, bridge_with_db, mock_db, leader):
         """Hostnames with unusual characters should be handled."""
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
         msg = make_msg(
             {
                 "job_id": "job-edge-002",
@@ -1404,9 +1548,12 @@ class TestEdgeCases:
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
     @pytest.mark.asyncio
-    async def test_db_merge_vm_context_error_in_register(self, bridge_with_db, mock_db):
+    async def test_db_merge_vm_context_error_in_register(
+        self, bridge_with_db, mock_db, leader
+    ):
         """DB errors in daemon register handler should be caught."""
         mock_db.merge_vm_context = AsyncMock(side_effect=RuntimeError("db gone"))
+        bridge_with_db._start_vm_ssh_probe = MagicMock()
 
         msg = make_msg(
             {

@@ -396,6 +396,11 @@ class PersistentSession:
                     job_id=self.thread_id,
                     default_timeout=shell_config.get("default_timeout", 120),
                     max_tabs=shell_config.get("max_tabs", 15),
+                    connect_timeout=remote_cfg.get("connect_timeout", 30),
+                    max_retries=remote_cfg.get("max_retries", 5),
+                    retry_timeouts_as_booting=remote_cfg.get(
+                        "retry_timeouts_as_booting", False
+                    ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
                 )
                 loop = asyncio.get_event_loop()

@@ -25,6 +25,7 @@ from orchestrator.services.ssh_helpers import (  # noqa: E402
     EXTRACT_REMOTE_CMD,
     build_agent_ssh_cmd,
     stream_extract_snapshot,
+    wait_for_agent_ssh,
 )
 
 
@@ -61,6 +62,55 @@ class TestBuildAgentSshCmd:
     def test_no_key_omits_i_flag(self):
         cmd = build_agent_ssh_cmd("h", 22, EXTRACT_REMOTE_CMD, key_path="")
         assert "-i" not in cmd
+
+    def test_probe_options_are_explicit(self):
+        cmd = build_agent_ssh_cmd(
+            "h",
+            22,
+            "true",
+            key_path="/tmp/key",
+            connect_timeout_s=3,
+            batch_mode=True,
+        )
+        assert "ConnectTimeout=3" in cmd
+        assert "BatchMode=yes" in cmd
+        assert cmd[-1] == "true"
+
+
+class TestWaitForAgentSsh:
+    @pytest.mark.asyncio
+    async def test_success_returns_attempt_count(self):
+        fake = _fake_proc(returncode=0)
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            ready, attempts, error = await wait_for_agent_ssh(
+                "10.0.0.9",
+                22,
+                deadline_s=1,
+                connect_timeout_s=1,
+                interval_s=0,
+                key_path="/tmp/k",
+            )
+
+        assert ready is True
+        assert attempts == 1
+        assert error == ""
+
+    @pytest.mark.asyncio
+    async def test_failure_returns_last_error(self):
+        fake = _fake_proc(returncode=255, stderr=b"ssh: connect timed out")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            ready, attempts, error = await wait_for_agent_ssh(
+                "10.0.0.9",
+                22,
+                deadline_s=0,
+                connect_timeout_s=1,
+                interval_s=0,
+                key_path="/tmp/k",
+            )
+
+        assert ready is False
+        assert attempts == 1
+        assert "timed out" in error
 
 
 class TestStreamExtractSnapshot:

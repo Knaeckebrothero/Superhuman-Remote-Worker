@@ -738,14 +738,20 @@ class VMProvisioner:
 
         Merged into context.vm at the start of every (re)provision so the new
         incarnation does not inherit the previous one's snapshot_attempts (which
-        would make the lifecycle reaper's attempts_exhausted instantly true) or a
-        dead ssh_host. ``provisioned_at`` (epoch seconds) anchors the dispatcher's
-        provisioning-timeout escalation.
+        would make the lifecycle reaper's attempts_exhausted instantly true), a
+        dead ssh_host, or stale SSH-readiness probe identity. ``provisioned_at``
+        (epoch seconds) anchors the dispatcher's provisioning-timeout escalation.
         """
         return {
             "snapshot_attempts": 0,
             "ssh_host": None,
             "ssh_port": None,
+            "ssh_registration_id": None,
+            "registered_at": None,
+            "ssh_verified_at": None,
+            "ssh_probe_attempts": 0,
+            "ssh_probe_error": None,
+            "ssh_probe_failed_at": None,
             "provisioned_at": time.time(),
         }
 

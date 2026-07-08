@@ -1851,6 +1851,15 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             remote.setdefault("username", "agent-host")
             remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
             remote.setdefault("workspace_path", "/home/agent-host/workspace")
+            remote.setdefault(
+                "connect_timeout",
+                int(os.environ.get("VM_REMOTE_CONNECT_TIMEOUT_S", "10")),
+            )
+            remote.setdefault(
+                "max_retries",
+                int(os.environ.get("VM_REMOTE_CONNECT_MAX_RETRIES", "6")),
+            )
+            remote.setdefault("retry_timeouts_as_booting", True)
             # VM has its own sudo gate — allow sudo through
             config_override.setdefault("shell", {})["sudo_action"] = "allow"
             logger.info(

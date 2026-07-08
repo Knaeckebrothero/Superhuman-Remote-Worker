@@ -4961,6 +4961,9 @@ async def _handle_workspace_upgrade(
             job_id=_thread_id,
             default_timeout=shell_config.get("default_timeout", 120),
             max_tabs=shell_config.get("max_tabs", 15),
+            connect_timeout=remote.get("connect_timeout", 30),
+            max_retries=remote.get("max_retries", 5),
+            retry_timeouts_as_booting=remote.get("retry_timeouts_as_booting", False),
             sudo_action=sudo_action,
         )
 
