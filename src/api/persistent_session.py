@@ -687,6 +687,7 @@ class PersistentSession:
 
         # Always include orchestrator tools in persistent mode (job delegation)
         _ORCHESTRATOR_TOOLS = [
+            "get_session_context",
             "create_worker_job",
             "list_worker_jobs",
             "get_worker_job",

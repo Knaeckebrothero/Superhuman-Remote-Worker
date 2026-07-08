@@ -1,14 +1,14 @@
 # Session job-management toolset needs a rework (truncated job IDs + missing automation control + gating)
 
 **Date:** 2026-06-28
-**Status:** Open. A bundle of related problems on the persistent-session
-orchestrator toolset, to be picked up together later. Contains **one concrete
-bug** (Problem 1 — truncated job IDs make every action tool unusable) and **two
-enhancement / design gaps** (Problem 2 — no automation create/manage tools;
-Problem 3 — the toolset deserves a holistic rework). **No decision has been made
-yet** on the automation approach or the gating policy.
+**Status:** Partially fixed. Problem 1 was fixed on 2026-07-08: session job
+lists now expose full UUIDs, action tools tolerate visible UUID prefixes, job
+summaries include more supervision context, and pause/cancel use the backend's
+`PUT` routes. Problem 2 (automation tools) and the broader Problem 3 toolset
+rework remain open. **No decision has been made yet** on the automation approach
+or the gating policy.
 **Component:**
-- `src/tools/orchestrator/jobs.py` — the 8 session job tools and their
+- `src/tools/orchestrator/jobs.py` — the session orchestrator tools and their
   formatters (`_format_job_summary` :146, list formatter :264).
 - `src/tools/orchestrator/__init__.py` — `get_orchestrator_metadata()`.
 - `config/persistent_defaults.yaml` + `config/interactive.yaml` — the
@@ -171,9 +171,9 @@ own owner." Candidate policy (recommended default, **not yet decided**):
 
 ## Problem 3 — The session orchestrator toolset deserves a holistic rework (DESIGN)
 
-The toolset (`jobs.py`, 8 tools) grew piecemeal and has accumulated rough edges
-beyond the two specific items above. Pull these into one rework rather than
-patching individually:
+The original job-control toolset (`jobs.py`, 8 job tools) grew piecemeal and
+has accumulated rough edges beyond the two specific items above. Pull these into
+one rework rather than patching individually:
 
 1. **ID + display handling** (Problem 1) — full IDs, prefix tolerance, richer
    summaries incl. pause/freeze reason.
@@ -214,7 +214,7 @@ patching individually:
 
 ## References
 
-- **The 8 session job tools + the truncation bug:**
+- **The original 8 session job tools + the truncation bug:**
   `src/tools/orchestrator/jobs.py` — list formatter truncation at `:264`,
   thin summary at `:146`, action tools `:280`/`:303`/`:333`/`:353`/`:387`/`:407`,
   the `X-MCP-User-Id`/`X-Internal-Key` client at `:121`.
