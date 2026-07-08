@@ -14874,6 +14874,54 @@ async def _resolve_thread_datasources(
     return _build_datasources_payload(resolved)
 
 
+async def _resolve_thread_repositories(
+    project_ids: list[str] | None,
+    *,
+    externalize_urls: bool = False,
+) -> list[dict[str, Any]] | None:
+    """Resolve raw project repositories for an internal thread agent.
+
+    Public project repository endpoints redact credentials and externalize
+    Gitea URLs. Session checkout needs the same internal/raw payload that worker
+    job dispatch receives, but only across the internal agent boundary. VM
+    sessions still need Gitea URLs rewritten to the ingress-routable host,
+    matching worker dispatch.
+    """
+    if not project_ids:
+        return None
+
+    payload: list[dict[str, Any]] = []
+    for project_id in project_ids:
+        try:
+            repos = await postgres_db.get_project_repositories(str(project_id))
+        except Exception as e:
+            logger.warning(
+                "Failed to resolve project repos for thread project %s: %s",
+                project_id,
+                e,
+            )
+            continue
+        for r in repos:
+            repo_url = r.get("repo_url")
+            if externalize_urls and repo_url:
+                repo_url = externalize_gitea_url(repo_url)
+            payload.append(
+                {
+                    "id": str(r["id"]),
+                    "project_id": str(r["project_id"]),
+                    "name": r["name"],
+                    "role": r["role"],
+                    "repo_url": repo_url,
+                    "read_only": r["read_only"],
+                    "branch": r.get("branch", "main"),
+                    "clone_path": r.get("clone_path"),
+                    "credentials": r.get("credentials"),
+                }
+            )
+
+    return payload or None
+
+
 @app.get("/api/agents/threads/{thread_id}/workspace")
 async def agent_get_thread_workspace(
     request: Request, thread_id: str
@@ -15010,6 +15058,12 @@ async def agent_get_thread_workspace(
         # Resolved datasources for the thread
         "datasources": await _resolve_thread_datasources(
             metadata, project_ids=project_ids
+        ),
+        # Raw project repository payload for internal session tools. Public
+        # repository routes intentionally redact clone credentials.
+        "repositories": await _resolve_thread_repositories(
+            project_ids,
+            externalize_urls=bool(vm.get("status") == "ready" and vm.get("ssh_host")),
         ),
         # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": thread.get("nc_session_folder"),
