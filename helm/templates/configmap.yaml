@@ -45,35 +45,6 @@ data:
   # set checkpointer.backend=sqlite to fall back to the legacy pod-local store.
   CHECKPOINTER_BACKEND: {{ .Values.checkpointer.backend | default "postgres" | quote }}
 
-  # LiteLLM gateway DB (srw_litellm) — non-secret connection parts. Composed
-  # with LITELLM_POSTGRES_USER/PASSWORD (Secret) into the DATABASE_URL on the
-  # LiteLLM pod. LiteLLM self-migrates this schema via Prisma (not the
-  # orchestrator migration runner). Rendered unconditionally (mirrors the
-  # audit keys); only consumed when litellm.enabled.
-  LITELLM_POSTGRES_HOST: {{ include "srw.litellmPostgresHost" . | quote }}
-  LITELLM_POSTGRES_PORT: {{ include "srw.litellmPostgresPort" . | quote }}
-  LITELLM_POSTGRES_DB: {{ include "srw.litellmPostgresDb" . | quote }}
-  {{- if .Values.litellm.enabled }}
-  # In-cluster URL agents + orchestrator use to reach the LiteLLM gateway.
-  # Presence of this key is what enables the orchestrator's catalog-sync loop.
-  LITELLM_BASE_URL: {{ printf "http://%s:%d" (include "srw.serviceName" (dict "context" . "component" "litellm")) (int .Values.litellm.port) | quote }}
-  # Aggregate upstream backstop (per-model rpm/tpm capacity) → stamped on the
-  # shared fleet key by the orchestrator. JSON map keyed by model_id (+ "*").
-  LITELLM_BACKSTOP: {{ .Values.litellm.backstop | toJson | quote }}
-  # Per-user / per-project rate-limit policy (Slice 2b) → the orchestrator
-  # expands it into LiteLLM teams (projects) + internal users + scoped keys.
-  # JSON: { categories, projects, users }.
-  LITELLM_RATE_POLICY: {{ .Values.litellm.ratePolicy | toJson | quote }}
-  # Per-project daily quota policy (Slice 3) → the orchestrator's quota poll loop
-  # freezes a project's jobs when its UTC-day usage crosses the cap.
-  # JSON: { projects: { default|<id>: { requests_per_day, tokens_per_day } } }.
-  LITELLM_QUOTA: {{ .Values.litellm.quota | toJson | quote }}
-  # Phase 2 gateway-routing canary: provider slugs whose system/codex models
-  # route THROUGH the gateway instead of direct (comma-separated; "" = none, the
-  # pre-Phase-2 default). e.g. "google,openrouter,codex". Roll out one at a time.
-  LITELLM_GATEWAY_ROUTED_PROVIDERS: {{ .Values.litellm.routedProviders | default list | join "," | quote }}
-  {{- end }}
-
   # (Citations live in the vector store — srw_vector — reached through the
   # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
   # See docs/done/citation_engine_integration.md.)
