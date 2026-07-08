@@ -1144,6 +1144,23 @@ def _session_backend_is_lite(config: Optional[Dict[str, Any]]) -> bool:
     return ws.get("backend") in LITE_BACKENDS
 
 
+_FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
+
+
+def _apply_fleet_management_marker(
+    merged_config: Dict[str, Any],
+    config_override: Optional[Dict[str, Any]],
+) -> None:
+    """Preserve explicit Fleet Management off/on across dataclass re-parsing."""
+    tools = (config_override or {}).get("tools")
+    if not isinstance(tools, dict) or "orchestrator" not in tools:
+        return
+    if tools.get("orchestrator") == []:
+        merged_config[_FLEET_MANAGEMENT_DISABLED_KEY] = True
+    else:
+        merged_config.pop(_FLEET_MANAGEMENT_DISABLED_KEY, None)
+
+
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
@@ -1380,6 +1397,7 @@ async def _attach_session(
 
         base_dict = dataclasses.asdict(effective_config)
         merged = deep_merge(base_dict, config_override)
+        _apply_fleet_management_marker(merged, config_override)
 
         # If the override changes the model, re-apply settings_matrix for the
         # new model family so temperature/top_p/limits get correct defaults.
@@ -4339,6 +4357,7 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
 
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, effective_override)
+        _apply_fleet_management_marker(merged, effective_override)
 
         # Re-apply settings_matrix when LLM config changes so model-family
         # defaults (temperature, top_p, limits) are resolved correctly.
@@ -4352,12 +4371,14 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
             merged, deployment_dir=_session.config._deployment_dir
         )
 
+        llm_changed = bool(effective_override.get("llm"))
+        tools_changed = bool(effective_override.get("tools"))
+
         # Rebuild chat LLM if llm settings changed
-        if effective_override.get("llm"):
+        if llm_changed:
             new_llm = create_llm(new_config.llm, new_config.limits)
             _session._llm = new_llm
             _session.config = new_config
-            _session._bind_tools()
             logger.info(
                 "LLM hot-swapped: model=%s, temperature=%s, base_url=%s",
                 new_config.llm.model,
@@ -4366,6 +4387,11 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
             )
         else:
             _session.config = new_config
+
+        if tools_changed:
+            _session.resetup_tools_for_backend()
+        elif llm_changed:
+            _session._bind_tools()
 
         # Re-derive the compaction thresholds from the NEW config, in place.
         # Without this the ContextManager keeps the session-start model's
