@@ -339,7 +339,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Orchestrator tools: create/monitor/manage worker jobs via the orchestrator REST API. Primarily for persistent agents (src/tools/orchestrator/)",
+          "description": "Fleet Management tools: inspect and steer SRW jobs, projects, repositories, and related orchestrator state. Primarily for persistent agents (src/tools/orchestrator/)",
           "examples": [["create_worker_job", "list_worker_jobs", "get_worker_job", "approve_worker_job", "resume_worker_job"]]
         }
       }

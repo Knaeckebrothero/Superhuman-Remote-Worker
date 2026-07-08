@@ -913,6 +913,20 @@ be added later for workspace-backed development workflows, but the direct
 session surface should cover the minimum SRW control-plane actions needed to
 understand and steer work.
 
+### Fleet Management Tool Group
+
+All SRW control-plane/session-management tools are exposed to the UI as one
+session tool group named **Fleet Management**. The backing config key remains
+`tools.orchestrator` for compatibility with the existing registry category.
+
+Fleet Management defaults on for existing sessions and configs. A session
+explicitly disables it by setting `tools.orchestrator: []`; in that mode the
+persistent agent must not receive SRW app-control tools such as job/project
+management, repository checkout through SRW, loop inspection, expert/skill
+catalog inspection, or `request_workspace_upgrade`. This supports sessions for
+untrusted LLM providers that should only receive ordinary work tools like shell,
+files, browser, research, citation, git, and local task tracking.
+
 ### Session Always-On Direct Tools
 
 These actions should be available even when the session has no shell workspace:

@@ -1289,7 +1289,7 @@
       "cloud": "Cloud storage",
       "communication": "Communication",
       "delegation": "Delegating work",
-      "orchestrator": "Orchestrator",
+      "orchestrator": "Fleet management",
       "evaluation": "Evaluation"
     },
     "toolContext": {
@@ -1984,6 +1984,10 @@
       "delegation": {
         "label": "Delegation",
         "description": "Ability to spawn subagents that work in parallel"
+      },
+      "orchestrator": {
+        "label": "Fleet Management",
+        "description": "Ability to inspect and steer SRW jobs, projects, repositories, and session workspace upgrades"
       },
       "knowledge": {
         "label": "Knowledge",
