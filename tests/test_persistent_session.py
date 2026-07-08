@@ -596,12 +596,13 @@ class TestSetupTools:
             assert excluded not in loaded_names
 
     def test_orchestrator_tools_always_included(self):
-        """8 orchestrator delegation tools are always appended."""
+        """Session context and orchestrator delegation tools are always appended."""
         cfg = _make_config()
         session = _make_session(config=cfg)
         session.workspace_manager = MagicMock()
 
         orch_tools = [
+            "get_session_context",
             "create_worker_job",
             "list_worker_jobs",
             "get_worker_job",

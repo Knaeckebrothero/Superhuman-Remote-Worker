@@ -39,6 +39,7 @@ class _CapturingClient:
     def __init__(self):
         self.posted: list[tuple[str, dict]] = []
         self.gets: list[tuple[str, dict]] = []
+        self.puts: list[tuple[str, dict]] = []
 
     async def __aenter__(self):
         return self
@@ -51,6 +52,13 @@ class _CapturingClient:
         resp = MagicMock()
         resp.raise_for_status = MagicMock()
         resp.json = MagicMock(return_value={"id": "new-job-uuid"})
+        return resp
+
+    async def put(self, url, json=None, **kwargs):
+        self.puts.append((url, json or {}))
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"status": "ok"})
         return resp
 
     async def get(self, url, params=None, **kwargs):
@@ -193,6 +201,108 @@ async def test_list_worker_jobs_forwards_user_id_from_context(monkeypatch):
     await lst.ainvoke({})
 
     assert captured["user_id"] == "user-xyz"
+
+
+@pytest.mark.asyncio
+async def test_list_worker_jobs_includes_full_job_id(monkeypatch):
+    """Regression: list output must expose a usable full UUID."""
+    job_id = "19707fa1-0000-4000-8000-000000000001"
+
+    class _Client(_CapturingClient):
+        async def get(self, url, params=None, **kwargs):
+            self.gets.append((url, params or {}))
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json = MagicMock(
+                return_value=[
+                    {
+                        "id": job_id,
+                        "status": "paused",
+                        "description": "Hotel ERP developer job",
+                        "config_name": "developer",
+                    }
+                ]
+            )
+            return resp
+
+    cap = _Client()
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    lst = _tool_by_name(tools, "list_worker_jobs")
+
+    result = await lst.ainvoke({})
+
+    assert job_id in result
+    assert "19707fa1..." not in result
+
+
+@pytest.mark.asyncio
+async def test_get_worker_job_resolves_visible_uuid_prefix(monkeypatch):
+    """Action tools tolerate the short IDs shown in older list output/logs."""
+    job_id = "19707fa1-0000-4000-8000-000000000001"
+
+    class _Client(_CapturingClient):
+        async def get(self, url, params=None, **kwargs):
+            self.gets.append((url, params or {}))
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            if url.endswith("/api/jobs"):
+                resp.json = MagicMock(return_value=[{"id": job_id, "status": "paused"}])
+            else:
+                resp.json = MagicMock(return_value={"id": job_id, "status": "paused"})
+            return resp
+
+    cap = _Client()
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    get = _tool_by_name(tools, "get_worker_job")
+
+    result = await get.ainvoke({"job_id": "19707fa1..."})
+
+    assert f"http://localhost:8085/api/jobs/{job_id}" in [url for url, _ in cap.gets]
+    assert f"Job ID: {job_id}" in result
+
+
+@pytest.mark.asyncio
+async def test_pause_and_cancel_worker_job_use_put(monkeypatch):
+    """Backend routes are PUT /pause and PUT /cancel."""
+    job_id = "19707fa1-0000-4000-8000-000000000001"
+    cap = _CapturingClient()
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    pause = _tool_by_name(tools, "pause_worker_job")
+    cancel = _tool_by_name(tools, "cancel_worker_job")
+
+    await pause.ainvoke({"job_id": job_id})
+    await cancel.ainvoke({"job_id": job_id})
+
+    assert [url for url, _ in cap.puts] == [
+        f"http://localhost:8085/api/jobs/{job_id}/pause",
+        f"http://localhost:8085/api/jobs/{job_id}/cancel",
+    ]
+    assert cap.posted == []
+
+
+@pytest.mark.asyncio
+async def test_get_session_context_reports_core_context():
+    ctx = ToolContext(
+        _thread_id="thread-abc",
+        user_id="user-xyz",
+        _project_id="project-123",
+        datasources={"postgresql": object()},
+    )
+    tools = create_orchestrator_tools(ctx)
+    get_context = _tool_by_name(tools, "get_session_context")
+
+    result = await get_context.ainvoke({})
+
+    assert "Thread ID: thread-abc" in result
+    assert "User ID: user-xyz" in result
+    assert "Primary project ID: project-123" in result
+    assert "Datasources: postgresql" in result
 
 
 @pytest.mark.asyncio
