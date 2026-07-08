@@ -181,13 +181,6 @@ checkpointer:
 # Databases — all internal (chart defaults), override here if you externalize
 # -----------------------------------------------------------------------------
 databases:
-  # LiteLLM gateway's dedicated Postgres (DB mode). LiteLLM OWNS + self-migrates
-  # this schema via Prisma on boot — the orchestrator migration runner never
-  # touches it. Creds come from Vault (srw-secrets: LITELLM_POSTGRES_USER /
-  # LITELLM_POSTGRES_PASSWORD); host/port/db are chart-provided. Required for
-  # virtual keys, per-user/team limits, and the spend/usage dashboard.
-  litellm:
-    enabled: true
   # Neo4j graph-DB browser UI. Exposed via the chart's Traefik ingress
   # (neo4j.superhuman-remote-worker.com -> srw-neo4j:7474, TLS via
   # cloudflare-dns-issuer) on the home-network Traefik LB (10.0.51.11) ONLY —
@@ -385,45 +378,6 @@ llm:
         family: "mistral"
         contextWindow: 256000
         capability: chat
-# -----------------------------------------------------------------------------
-# LiteLLM gateway — usage monitoring + rate limiting
-# (docs/done/usage_monitoring_and_rate_limiting.md)
-#
-# All agent LLM traffic routes through this in-cluster proxy (port 4000). DB
-# mode (databases.litellm above) unlocks virtual keys + the spend/usage
-# dashboard. Master/salt keys + gateway-DB creds come from Vault (srw-secrets:
-# LITELLM_MASTER_KEY / LITELLM_SALT_KEY / LITELLM_POSTGRES_*). The orchestrator
-# registers the catalog's endpoint models into the gateway on boot, mints a
-# shared fleet key + scoped per-user/project keys, and routes agents through
-# those — the admin master key stays orchestrator-only.
-#
-# Throttle knobs (backstop / ratePolicy / quota) are intentionally OMITTED here
-# = chart default {} = MEASURE-ONLY, no enforcement. The gateway records RPM/TPM
-# and the usage ledger fills, but nothing is rate-capped yet. Once real load is
-# observed (gateway UI + Cockpit Admin → Usage), set the strix box's safe
-# sustained RPM + provider/subscription tiers here to switch enforcement on.
-#
-# UI is ClusterIP-only (no ingress): kubectl -n superhuman-remote-worker
-# port-forward svc/srw-litellm 4000:4000 → http://localhost:4000/ui (master key).
-# -----------------------------------------------------------------------------
-litellm:
-  # DISABLED 2026-07-01: the gateway OOM-crashloops on litellm's DB-mode
-  # budget-reset leak (GH #13210) — balloons past the 2Gi limit in ~70s,
-  # 113 restarts/15h, blocking the loop. Off = LITELLM_BASE_URL unset, so all
-  # models route DIRECT (unmetered but working) via the gateway_is_healthy()→None
-  # fallback; the litellm DB stays up (databases.litellm) so registered models +
-  # spend history survive. Re-enable with general_settings.disable_reset_budget:
-  # true (chart change) to get a metered gateway that doesn't leak.
-  enabled: false
-  # P2 canary rollout: route these system/codex providers THROUGH the gateway so
-  # their traffic is metered (cost lands in usage_events via P3). Empty/unset =
-  # chart default = off. Starting with openrouter (the paid minimax lane).
-  # ORDER MATTERS — only flip this AFTER P0–P3 is deployed here (else the
-  # orchestrator has no canary code to read it and the gateway hasn't registered
-  # the system models). PREREQ: the `openrouter` system-provider key must exist as
-  # an app-DB row (Admin → Models) so minimax registers in the gateway; an
-  # unregistered canaried model routes direct + warns (fail-loud guard), never 400s.
-  routedProviders: [] # gateway disabled — nothing to route through it
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
 # (docs/features/direct_session_websockets.md)
