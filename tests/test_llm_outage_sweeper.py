@@ -104,4 +104,3 @@ async def test_over_ceiling_fails_not_redispatched(wired):
     db.fail_llm_outage_job.assert_awaited_once()
     db.claim_llm_outage_redispatch.assert_not_awaited()
     trigger.assert_not_called()
-
