@@ -600,6 +600,7 @@ class TestSetupTools:
         cfg = _make_config()
         session = _make_session(config=cfg)
         session.workspace_manager = MagicMock()
+        session.workspace_manager.backend.supports_shell = False
 
         orch_tools = [
             "get_session_context",
@@ -613,6 +614,8 @@ class TestSetupTools:
             "pause_worker_job",
             "get_current_project",
             "list_project_jobs",
+            "list_project_repositories",
+            "get_default_project_repository",
         ]
 
         with (
@@ -638,6 +641,37 @@ class TestSetupTools:
         loaded_names = mock_load.call_args[0][0]
         for name in orch_tools:
             assert name in loaded_names
+        assert "checkout_project_repository" not in loaded_names
+
+    def test_repository_checkout_tool_included_for_shell_workspace(self):
+        """Repository checkout is exposed only when the session backend can clone."""
+        cfg = _make_config()
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend.supports_shell = True
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=["web_search"],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext"),
+        ):
+            session._setup_tools(None)
+
+        loaded_names = mock_load.call_args[0][0]
+        assert "checkout_project_repository" in loaded_names
 
     def test_no_duplicate_orchestrator_tools(self):
         """Orchestrator tools not duplicated if already in config."""

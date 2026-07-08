@@ -1026,8 +1026,10 @@ Implement in this order:
    drift - implemented.
 3. `projects.get_current` - implemented as `get_current_project`.
 4. `projects.list_jobs` - implemented as `list_project_jobs`.
-5. `repositories.list_project`
-6. `repositories.checkout_project_repository`
+5. `repositories.list_project` - implemented as `list_project_repositories`.
+   `repositories.get_default` is implemented as `get_default_project_repository`.
+6. `repositories.checkout_project_repository` - implemented as
+   `checkout_project_repository`.
 7. `project_loops.get`
 8. `project_loops.list_jobs`
 9. `project_loops.explain_state`

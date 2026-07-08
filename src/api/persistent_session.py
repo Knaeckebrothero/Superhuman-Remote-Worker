@@ -698,6 +698,8 @@ class PersistentSession:
             "pause_worker_job",
             "get_current_project",
             "list_project_jobs",
+            "list_project_repositories",
+            "get_default_project_repository",
         ]
         for name in _ORCHESTRATOR_TOOLS:
             if name not in tool_names:
@@ -713,6 +715,9 @@ class PersistentSession:
         # sandbox swap this re-derives against the now-shell-capable backend and
         # the tool drops out (nothing left to upgrade to).
         _backend = getattr(self.workspace_manager, "backend", None)
+        if _backend is not None and getattr(_backend, "supports_shell", False):
+            if "checkout_project_repository" not in tool_names:
+                tool_names.append("checkout_project_repository")
         if _backend is not None and not getattr(_backend, "supports_shell", False):
             if "request_workspace_upgrade" not in tool_names:
                 tool_names.append("request_workspace_upgrade")
