@@ -23,13 +23,10 @@ Mockup structure template:
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>[Component/Screen Name] — Design Mockup</title>
   <style>
-    /* Design System Tokens (from project styles.scss) */
-    :root {
-      --app-bg: #1e1e2e;
-      --panel-bg: #181825;
-      /* ... include all tokens ... */
-    }
-    /* Component styles using tokens */
+    /* Design System Tokens (from project styles.scss): declare every token on a
+       :root selector — e.g. --app-bg: #1e1e2e; --panel-bg: #181825; and so on,
+       including all tokens. Then add component styles that reference those
+       tokens via var(--token-name). */
   </style>
 </head>
 <body>
