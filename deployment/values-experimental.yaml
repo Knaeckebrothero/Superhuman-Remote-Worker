@@ -63,11 +63,11 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-42e50cc
+    tag: sha-105ff91
   agent:
-    tag: sha-42e50cc
+    tag: sha-105ff91
   cockpit:
-    tag: sha-eecd7fa
+    tag: sha-105ff91
   mcp:
     tag: sha-c6a6b3d
   workspace:
