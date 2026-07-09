@@ -965,3 +965,129 @@ class TestChurnRegression:
         report = await rec.tick()
         provisioner.delete_vm.assert_awaited_once_with("j-idle")
         assert report["vm"]["reap_forced"] == 1
+
+
+# =============================================================================
+# reap_orphans() — backstop sweep for VMs whose owning row was deleted
+# =============================================================================
+
+
+class TestReapOrphans:
+    """A VM whose jobs/threads row is gone never surfaces as an Instance
+    (list_instances reads FROM the rows), so only the backend inventory
+    (provisioner.list_vms) can find it. The sweep reaps it age-gated; a row
+    of any status, a DB error, an unknown age, or a non-UUID name spares it.
+    See docs/done/deleted_job_orphans_workspace_pod.md."""
+
+    ORPHAN_ID = "deadbeef-dead-4bad-8bad-feedfacef00d"
+
+    @classmethod
+    def _vm(cls, entity_id=None, age_hours: float = 2.0, created_at="unset"):
+        if created_at == "unset":
+            created_at = (
+                datetime.now(timezone.utc) - timedelta(hours=age_hours)
+            ).isoformat()
+        return {
+            "vm_name": f"agent-vm-{entity_id or cls.ORPHAN_ID}",
+            "entity_id": entity_id or cls.ORPHAN_ID,
+            "created_at": created_at,
+            "phase": "Running",
+        }
+
+    @staticmethod
+    def _conn(db):
+        return db.acquire.return_value.__aenter__.return_value
+
+    @pytest.mark.asyncio
+    async def test_reaps_aged_orphan(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, provisioner, _, _, db = _make_manager()
+        provisioner.list_vms = AsyncMock(return_value=[self._vm()])
+        self._conn(db).fetchval = AsyncMock(return_value=False)  # no row anywhere
+        assert await mgr.reap_orphans() == 1
+        provisioner.delete_vm.assert_awaited_once_with(self.ORPHAN_ID)
+
+    @pytest.mark.asyncio
+    async def test_spares_young_orphan(self, monkeypatch):
+        # Never reap an in-flight provision whose row hasn't landed yet.
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, provisioner, _, _, db = _make_manager()
+        provisioner.list_vms = AsyncMock(return_value=[self._vm(age_hours=0.01)])
+        assert await mgr.reap_orphans() == 0
+        provisioner.delete_vm.assert_not_called()
+        db.acquire.assert_not_called()  # age gate fires before any DB work
+
+    @pytest.mark.asyncio
+    async def test_spares_vm_with_live_row(self, monkeypatch):
+        # A row of ANY status → instance path / dispatcher owns the VM.
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, provisioner, _, _, db = _make_manager()
+        provisioner.list_vms = AsyncMock(return_value=[self._vm()])
+        self._conn(db).fetchval = AsyncMock(return_value=True)
+        assert await mgr.reap_orphans() == 0
+        provisioner.delete_vm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unavailable_inventory_is_not_empty(self):
+        # None = "unknown" (old controller / docker pool) — never reap on it.
+        mgr, provisioner, _, _, db = _make_manager()
+        provisioner.list_vms = AsyncMock(return_value=None)
+        assert await mgr.reap_orphans() == 0
+        provisioner.delete_vm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_list_error_reaps_nothing(self):
+        mgr, provisioner, *_ = _make_manager()
+        provisioner.list_vms = AsyncMock(side_effect=RuntimeError("nats down"))
+        assert await mgr.reap_orphans() == 0
+        provisioner.delete_vm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_non_uuid_names(self, monkeypatch):
+        # Not one of ours (whatever it is) — never touch it.
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, provisioner, _, _, db = _make_manager()
+        provisioner.list_vms = AsyncMock(
+            return_value=[self._vm(entity_id="golden-abc123")]
+        )
+        assert await mgr.reap_orphans() == 0
+        provisioner.delete_vm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_db_error_spares_the_vm(self, monkeypatch):
+        # Unknown ≠ gone — mirrors the workspace sweep's stance.
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, provisioner, _, _, db = _make_manager()
+        provisioner.list_vms = AsyncMock(return_value=[self._vm()])
+        db.acquire = MagicMock(side_effect=RuntimeError("db down"))
+        assert await mgr.reap_orphans() == 0
+        provisioner.delete_vm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_age_spares_the_vm(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, provisioner, *_ = _make_manager()
+        provisioner.list_vms = AsyncMock(return_value=[self._vm(created_at=None)])
+        assert await mgr.reap_orphans() == 0
+        provisioner.delete_vm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_provisioner_unavailable(self):
+        mgr, provisioner, *_ = _make_manager(is_available=False)
+        provisioner.list_vms = AsyncMock(return_value=[self._vm()])
+        assert await mgr.reap_orphans() == 0
+        provisioner.delete_vm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconciler_tick_runs_the_sweep(self, monkeypatch):
+        # End-to-end: the reconciler's optional-hook path picks up
+        # reap_orphans and reports the count.
+        monkeypatch.delenv("DEFAULT_VM_IMAGE", raising=False)
+        monkeypatch.setenv("WORKSPACE_ORPHAN_GRACE_SECONDS", "900")
+        mgr, provisioner, _, _, db = _make_manager()  # no rows → no instances
+        provisioner.list_vms = AsyncMock(return_value=[self._vm()])
+        self._conn(db).fetchval = AsyncMock(return_value=False)
+        rec = InstanceLifecycleReconciler([mgr])
+        report = await rec.tick()
+        assert report["vm"]["orphans_reaped"] == 1
+        provisioner.delete_vm.assert_awaited_once_with(self.ORPHAN_ID)

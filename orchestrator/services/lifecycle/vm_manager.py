@@ -27,10 +27,12 @@ import logging
 import os
 import socket
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from .types import Instance
-from .workspace_manager import paused_within_grace
+from .workspace_manager import orphan_grace_seconds, paused_within_grace
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,22 @@ def _extract_sha(image: str | None) -> str | None:
     if not image or ":sha-" not in image:
         return None
     return image.rsplit(":sha-", 1)[-1]
+
+
+def _vm_age_seconds(created_at: Any) -> float | None:
+    """Age from a KubeVirt creationTimestamp (ISO string over the wire)."""
+    if isinstance(created_at, str):
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    elif isinstance(created_at, datetime):
+        created = created_at
+    else:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - created).total_seconds())
 
 
 def _coerce_jsonb(value: Any) -> dict[str, Any]:
@@ -405,6 +423,79 @@ class VMInstanceManager:
                 await self._provisioner.delete_vm(bound)
         except Exception:
             logger.exception("Failed to delete VM %s", inst.id)
+
+    async def reap_orphans(self) -> int:
+        """Backstop GC: delete VMs whose owning row is gone from BOTH tables.
+
+        The instance path enumerates VMs FROM the jobs/threads rows
+        (``_fetch_vm_rows``), so a VM whose row was deleted never surfaces as
+        an ``Instance`` — it is invisible, not merely un-reapable. Only the
+        backend inventory (``vm_provisioner.list_vms``) can still see it.
+        This once-per-tick sweep reaps a listed VM only when
+          - its name encodes a valid UUID (``agent-vm-<uuid>``),
+          - it is older than the shared orphan grace (never reap an in-flight
+            provision whose row hasn't landed yet), and
+          - the id has NO row in ``jobs`` NOR ``threads`` — a row of ANY
+            status means the instance path / dispatcher owns the VM.
+        A DB error skips the VM (unknown ≠ gone), and ``list_vms() is None``
+        means the inventory is unavailable (old controller, docker pool) —
+        return 0, do not treat as empty. Delete via the job-keyed path: the
+        controller keys teardown purely by id (``agent-vm-<id>``), and with
+        the row gone the job/thread distinction is unknowable and irrelevant.
+
+        Delete-path coverage for VMs lives in ``delete_job`` (release while
+        the row exists); this sweep closes the crash/failure window. See
+        docs/done/deleted_job_orphans_workspace_pod.md.
+        """
+        if not self._provisioner_available() or self._db is None:
+            return 0
+        try:
+            vms = await self._provisioner.list_vms()
+        except Exception:
+            logger.exception("VM orphan sweep: list failed")
+            return 0
+        if not vms:
+            return 0
+        reaped = 0
+        for vm in vms:
+            if not isinstance(vm, dict):
+                continue
+            entity_id = vm.get("entity_id") or ""
+            try:
+                uuid.UUID(entity_id)
+            except (ValueError, AttributeError, TypeError):
+                continue  # not one of ours — never touch it
+            age = _vm_age_seconds(vm.get("created_at"))
+            if age is None or age < orphan_grace_seconds():
+                continue
+            try:
+                async with self._db.acquire() as conn:
+                    row_exists = await conn.fetchval(
+                        """
+                        SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1::uuid)
+                            OR EXISTS (SELECT 1 FROM threads WHERE id = $1::uuid)
+                        """,
+                        entity_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "VM orphan sweep: row lookup failed for %s — skipping",
+                    entity_id,
+                )
+                continue
+            if row_exists:
+                continue
+            try:
+                if await self._provisioner.delete_vm(entity_id):
+                    reaped += 1
+                    logger.warning(
+                        "Orphan VM reaped: %s (no jobs/threads row, age %.0fs)",
+                        vm.get("vm_name") or entity_id,
+                        age,
+                    )
+            except Exception:
+                logger.exception("Orphan VM delete failed: %s", entity_id)
+        return reaped
 
     # -------------------------------------------------------------------------
     # Internals

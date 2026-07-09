@@ -71,11 +71,15 @@ import {TranslocoPipe} from '@jsverse/transloco';
   `],
 })
 export class AppPwaBannerComponent implements OnInit {
+  private static readonly CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+  private static readonly MIN_CHECK_GAP_MS = 5 * 60 * 1000;
+
   private readonly swUpdate = inject(SwUpdate);
   private readonly destroyRef = inject(DestroyRef);
 
   protected readonly offline = signal(typeof navigator !== 'undefined' ? !navigator.onLine : false);
   protected readonly updateReady = signal(false);
+  private lastUpdateCheck = 0;
 
   ngOnInit(): void {
     if (typeof window !== 'undefined') {
@@ -96,6 +100,35 @@ export class AppPwaBannerComponent implements OnInit {
           takeUntilDestroyed(this.destroyRef),
         )
         .subscribe(() => this.updateReady.set(true));
+
+      // A broken SW cache (hash mismatch after a partial deploy) cannot be
+      // repaired in place. On an installed phone app there is no DevTools
+      // escape hatch, so recover automatically with a fresh network load.
+      this.swUpdate.unrecoverable
+        .pipe(takeUntilDestroyed(this.destroyRef))
+        .subscribe((evt) => {
+          console.warn('[pwa] Unrecoverable service worker state, reloading:', evt.reason);
+          window.location.reload();
+        });
+
+      // The SW only checks for new versions on navigation, which a
+      // long-lived installed app may not perform for days. Poll on an
+      // interval and whenever the app returns to the foreground.
+      const check = () => {
+        const now = Date.now();
+        if (now - this.lastUpdateCheck < AppPwaBannerComponent.MIN_CHECK_GAP_MS) return;
+        this.lastUpdateCheck = now;
+        void this.swUpdate.checkForUpdate().catch(() => {});
+      };
+      const intervalId = window.setInterval(check, AppPwaBannerComponent.CHECK_INTERVAL_MS);
+      const onVisibilityChange = () => {
+        if (document.visibilityState === 'visible') check();
+      };
+      document.addEventListener('visibilitychange', onVisibilityChange);
+      this.destroyRef.onDestroy(() => {
+        window.clearInterval(intervalId);
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+      });
     }
   }
 

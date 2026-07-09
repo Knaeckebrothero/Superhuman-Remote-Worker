@@ -1614,3 +1614,81 @@ class TestAsyncToThread:
         mock_to_thread.assert_awaited_once()
         first_arg = mock_to_thread.await_args[0][0]
         assert first_arg == mock_k8s_api.get_namespaced_custom_object
+
+
+# =============================================================================
+# Test: list_vms() — orphan-sweep inventory across backends
+# =============================================================================
+
+
+class TestListVms:
+    @pytest.mark.asyncio
+    async def test_list_nats_backend(self, provisioner_with_nats, mock_nats_bridge):
+        expected = [{"vm_name": "agent-vm-j1", "entity_id": "j1"}]
+        mock_nats_bridge.request_vm_list = AsyncMock(return_value=expected)
+        assert await provisioner_with_nats.list_vms() == expected
+
+    @pytest.mark.asyncio
+    async def test_list_direct_backend_filters_names(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
+        mock_k8s_api.list_namespaced_custom_object = MagicMock(
+            return_value={
+                "items": [
+                    {
+                        "metadata": {
+                            "name": "agent-vm-j1",
+                            "creationTimestamp": "2026-07-09T09:00:00Z",
+                        },
+                        "status": {"printableStatus": "Running"},
+                    },
+                    {"metadata": {"name": "agent-vm-golden-abc"}},
+                    {"metadata": {"name": "unrelated"}},
+                ]
+            }
+        )
+        with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
+            nb.is_available = False
+            vms = await provisioner_with_k8s.list_vms()
+        assert vms == [
+            {
+                "vm_name": "agent-vm-j1",
+                "entity_id": "j1",
+                "created_at": "2026-07-09T09:00:00Z",
+                "phase": "Running",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_list_http_backend(self, provisioner_disabled):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "vms": [{"vm_name": "agent-vm-j2", "entity_id": "j2"}]
+        }
+        provisioner_disabled._controller_url = "http://vm-controller:8080"
+        provisioner_disabled._http_client = MagicMock()
+        provisioner_disabled._http_client.get = AsyncMock(return_value=resp)
+        with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
+            nb.is_available = False
+            vms = await provisioner_disabled.list_vms()
+        assert vms == [{"vm_name": "agent-vm-j2", "entity_id": "j2"}]
+
+    @pytest.mark.asyncio
+    async def test_list_http_404_means_unknown_not_empty(self, provisioner_disabled):
+        # An old controller without the list op must yield None (unknown),
+        # never [] — the sweep would otherwise treat it as "no VMs".
+        resp = MagicMock()
+        resp.status_code = 404
+        provisioner_disabled._controller_url = "http://vm-controller:8080"
+        provisioner_disabled._http_client = MagicMock()
+        provisioner_disabled._http_client.get = AsyncMock(return_value=resp)
+        with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
+            nb.is_available = False
+            assert await provisioner_disabled.list_vms() is None
+
+    @pytest.mark.asyncio
+    async def test_list_no_backend_returns_none(self, provisioner_disabled):
+        with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
+            nb.is_available = False
+            assert await provisioner_disabled.list_vms() is None

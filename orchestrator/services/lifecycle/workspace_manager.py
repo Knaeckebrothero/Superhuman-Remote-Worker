@@ -78,6 +78,19 @@ def expected_workspace_shas() -> set[str]:
     return shas
 
 
+def orphan_grace_seconds() -> float:
+    """Minimum instance age before a missing-row pod/VM is treated as an orphan.
+
+    Must comfortably exceed the create-instance → persist-context window during
+    provisioning (seconds); anything shorter risks reaping an in-flight
+    instance whose row simply hasn't landed yet. Shared by the workspace
+    missing-row reap and the VM orphan sweep."""
+    try:
+        return float(os.environ.get("WORKSPACE_ORPHAN_GRACE_SECONDS", "900"))
+    except ValueError:
+        return 900.0
+
+
 def _pod_age_seconds(pod: Any) -> float | None:
     """Pod age from creationTimestamp, or None when it can't be determined."""
     try:
@@ -434,15 +447,7 @@ class WorkspaceInstanceManager:
             return 5
 
     def _orphan_grace_s(self) -> float:
-        """Minimum pod age before a missing-row pod is treated as an orphan.
-
-        Must comfortably exceed the create-pod → persist-context window during
-        provisioning (seconds); anything shorter risks reaping an in-flight pod
-        whose row simply hasn't landed yet."""
-        try:
-            return float(os.environ.get("WORKSPACE_ORPHAN_GRACE_SECONDS", "900"))
-        except ValueError:
-            return 900.0
+        return orphan_grace_seconds()
 
     async def attempts_exhausted(self, inst: Instance) -> bool:
         return (inst.metadata.get("snapshot_attempts") or 0) >= self._max_attempts()
