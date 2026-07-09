@@ -24,19 +24,32 @@ is held to fail-closed standards throughout:
   have nothing to do with restore-permission enforcement, giving false
   assurance against the very CVE class this module exists to catch.
 
-Important caveat, tracked explicitly rather than glossed over: the exact
-success/rejection status codes for the side channels (in particular
-whether synthetic, nonexistent ids come back 404/409 vs. some other
-code on a given server/version) are **assumed, not yet validated**
-against a live backend. That validation is out of scope for this spike
-and happens in the design's live-probe run
-(docs/design/cloud_access_unification.md §6.4 / §6 item 4 — "Live RO
-probe"). Until that run has executed against a real Nextcloud (>=28.0.3)
-and OpenCloud instance, Phase 1 callers MUST treat a non-empty
-``RoProbeResult.skipped`` as "side channels unverified" — i.e. not a
-substitute for having actually probed them — and should surface that
-distinction to whatever gates protected-mode engagement rather than
-silently claiming full coverage.
+Gate semantics — ``RoProbeResult.ok`` is the engage gate, strictly. It
+is True only when *every* check was attempted AND verified rejected:
+no ``failures``, no ``skipped``, no ``inconclusive`` (spec §3.3
+verbatim: the side channels "all must 403/405 or protected mode refuses
+to engage"). The three lists distinguish *why* a refusal happened and
+how it is cured:
+
+* ``failures`` — a write path is demonstrably open, or a check could
+  not be trusted (transport error, unparseable response). Not curable
+  by configuration; the deployment is unsafe for protected mode.
+* ``skipped`` — the side channels were never attempted because
+  ``dav_root``/``username`` weren't supplied to ``probe_read_only``.
+  Curable: supply both.
+* ``inconclusive`` — a side channel came back 404/409. With the current
+  synthetic ids this is the *expected* outcome against live backends:
+  it proves the request round-tripped, not that the authz layer
+  rejected a real restore. Curable: Phase 1 probes REAL fixture ids
+  (the orchestrator-side write identity seeds a canary file, versions
+  it, and trashes it; the RO identity then attempts restore of those
+  real ids), and/or the design's §6.4 live-probe run
+  (docs/design/cloud_access_unification.md §6 item 4 — "Live RO probe")
+  tunes the status map from observed behavior.
+
+Phase 1 must call BOTH ``check_version_floors`` and ``probe_read_only``
+and require ``ok`` from each — passing one gate does not imply the
+other.
 """
 from __future__ import annotations
 
@@ -47,7 +60,9 @@ REJECTED_STATUSES = frozenset({401, 403, 405})
 
 # Status codes for side-channel probes that mean "the request didn't reach
 # far enough to prove anything" (synthetic ids are expected to 404/409 on a
-# server that never heard of them) — recorded as inconclusive, not ok.
+# server that never heard of them) — recorded in ``inconclusive``, which
+# refuses the engage gate like everything else that isn't a verified
+# rejection (see the module docstring for the cure).
 _INCONCLUSIVE_STATUSES = frozenset({404, 409})
 
 # Version floors from docs/design/cloud_access_unification.md §3.3: the
@@ -108,9 +123,13 @@ def side_channel_probes(
       chunk collection's ``.file`` marker into ``files`` — this is how a
       chunked upload is finalized/committed on Nextcloud's ``uploads``
       DAV namespace.
-    * **TUS creation** (oCIS/OpenCloud path): a TUS-style ``POST`` with
-      ``Tus-Resumable``/``Upload-Length`` headers against the uploads
-      collection, attempting to start a brand-new upload session.
+    * **TUS-style creation attempt**: a ``POST`` with
+      ``Tus-Resumable``/``Upload-Length`` headers, attempting to start a
+      brand-new upload session. Honest caveat: it targets the NC-shaped
+      ``{root}/uploads/{username}/`` collection here; a real
+      oCIS/OpenCloud TUS creation targets the spaces endpoint instead —
+      the §6.4 live-probe run will correct the request shape per
+      backend.
 
     Synthetic ids (see the ``_SYNTHETIC_*`` constants) stand in for real
     file/version/transfer ids so no real cloud state needs to exist for
@@ -169,18 +188,30 @@ def side_channel_probes(
 
 @dataclass
 class RoProbeResult:
-    ok: bool
+    """Outcome of one probe run. ``ok`` is the engage gate, strictly.
+
+    ``ok`` is True only when ``failures``, ``skipped``, AND
+    ``inconclusive`` are all empty — every check attempted, every check
+    verified rejected. It is derived from the three lists (a property,
+    so it cannot drift out of sync with them); see the module docstring
+    for what each list means and how its refusal is cured.
+    """
+
+    # A write path is demonstrably open, or a check couldn't be trusted
+    # (transport error, unparseable response). Not curable by config.
     failures: list[str] = field(default_factory=list)
     # 404/409 on a side channel: the request round-tripped but synthetic
     # ids mean we can't tell whether the authz layer was even reached.
-    # Does NOT flip ``ok`` — it is neither a pass nor a fail.
+    # Refuses the gate; cure = real fixture ids / §6.4 live-run tuning.
     inconclusive: list[str] = field(default_factory=list)
     # Side channels never attempted (``dav_root``/``username`` not
-    # supplied to ``probe_read_only``). Non-empty means the result makes
-    # no claim about the CVE-class side channels at all; see the module
-    # docstring's "Phase 1 MUST treat non-empty skipped as unverified"
-    # note.
+    # supplied to ``probe_read_only``). Refuses the gate; cure = supply
+    # both.
     skipped: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not (self.failures or self.skipped or self.inconclusive)
 
 
 async def probe_read_only(
@@ -241,8 +272,9 @@ async def probe_read_only(
                 f"{label} -> {status} (expected 401/403/405; write path open)"
             )
     else:
-        # dav_root/username weren't supplied — don't silently claim
-        # coverage we never attempted. See module docstring.
+        # dav_root/username weren't supplied — the side channels were
+        # never attempted, so the gate refuses until they are (see
+        # module docstring; the refusal is curable, not an error).
         for verb, note, _req in side_channel_probes(
             dav_root or "<unset>", username or "<unset>"
         ):
@@ -252,7 +284,6 @@ async def probe_read_only(
             )
 
     return RoProbeResult(
-        ok=not failures,
         failures=failures,
         inconclusive=inconclusive,
         skipped=skipped,
@@ -320,11 +351,16 @@ async def check_version_floors(
     floors: Nextcloud server >= 28.0.3, groupfolders >= 20.1.2. The probe
     converts version-assumption risk into a runtime check."
 
-    The spec defines floors **only for Nextcloud** — OpenCloud/oCIS has
-    no equivalent CVE-fix floor documented here, so ``backend="opencloud"``
-    always returns ``ok=True`` with no failures; this function is a no-op
-    gate for that backend, not a claim that OpenCloud has been verified
-    against anything.
+    Backend allowlist, fail-closed: ``"nextcloud"`` runs the floor
+    checks below; ``"opencloud"`` returns ok with no failures — the spec
+    defines floors **only for Nextcloud**, OpenCloud/oCIS has no
+    equivalent CVE-fix floor documented here, so this is a documented
+    no-op gate for that backend, not a claim that OpenCloud has been
+    verified against anything. ANY other value (typo, wrong case,
+    future backend) refuses with ``"unknown backend ... (fail-closed)"``
+    rather than silently passing. Note this gate checks versions only —
+    Phase 1 must ALSO call ``probe_read_only``; passing one gate does
+    not imply the other.
 
     For ``backend="nextcloud"``: GETs
     ``{origin}/ocs/v2.php/cloud/capabilities?format=json`` (origin derived
@@ -338,8 +374,14 @@ async def check_version_floors(
     specifically records
     ``"groupfolders version unverifiable via capabilities (fail-closed)"``.
     """
+    if backend == "opencloud":
+        return RoProbeResult()
     if backend != "nextcloud":
-        return RoProbeResult(ok=True, failures=[])
+        # Allowlist: an unrecognized backend value must refuse, not
+        # silently skip the floors (fail-open would defeat the gate).
+        return RoProbeResult(
+            failures=[f"unknown backend {backend!r} (fail-closed)"]
+        )
 
     url = f"{_capabilities_origin(base_url)}/ocs/v2.php/cloud/capabilities?format=json"
 
@@ -347,7 +389,6 @@ async def check_version_floors(
         resp = await client.request("GET", url, headers={"OCS-APIRequest": "true"})
     except Exception as e:
         return RoProbeResult(
-            ok=False,
             failures=[
                 f"capabilities -> transport error {type(e).__name__} (fail-closed)"
             ],
@@ -355,7 +396,6 @@ async def check_version_floors(
 
     if not (200 <= resp.status_code < 300):
         return RoProbeResult(
-            ok=False,
             failures=[f"capabilities -> {resp.status_code} (expected 2xx)"],
         )
 
@@ -363,7 +403,6 @@ async def check_version_floors(
         data = resp.json()
     except Exception as e:
         return RoProbeResult(
-            ok=False,
             failures=[
                 "capabilities response unparseable as JSON "
                 f"({type(e).__name__}) (fail-closed)"
@@ -409,4 +448,4 @@ async def check_version_floors(
                 f"floor {'.'.join(map(str, floor))} (GHSA-2vrq-fhmf-c49m)"
             )
 
-    return RoProbeResult(ok=not failures, failures=failures)
+    return RoProbeResult(failures=failures)
