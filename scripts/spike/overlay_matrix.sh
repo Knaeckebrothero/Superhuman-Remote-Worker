@@ -183,6 +183,8 @@ if [ -n "${BIGM:-}" ]; then
   echo "upper size after delete (0 expected — whiteout only, no copy-up):"
   du -sb "$UP"
   show_markers
+else
+  echo "!! no ~100MB file matched '$BIG_GLOB' under $MTEST — cold binary delete NOT measured"
 fi
 
 # ===========================================================================
@@ -201,6 +203,8 @@ if [ -n "${BIGM:-}" ]; then
   time sh -c "printf 'X' | dd of=\"$BIGM\" bs=1 count=1 conv=notrunc status=none"
   echo "-- upper now holds the copied-up file: --"
   find "$UP" -type f -size +50M -exec ls -la {} \; 2>/dev/null | head
+else
+  echo "!! no ~100MB file matched '$BIG_GLOB' under $MTEST — copy-up NOT measured"
 fi
 
 # ===========================================================================
