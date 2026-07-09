@@ -284,6 +284,28 @@ class TestListProjectFolder:
         assert len(file_paths) == len(set(file_paths))
 
     @pytest.mark.asyncio
+    async def test_does_not_double_count_subdirs(self):
+        # Regression for the double-subdir bug (design §11.5): each Depth:1
+        # PROPFIND of a subdir returns that subdir's own self-entry, which the
+        # walker must drop (its parent already emitted it). Assert directory
+        # entries — not just files — appear exactly once.
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.add_file("Documents/a.md", b"a")
+        fake.add_file("Documents/Sub/b.md", b"b")
+        _install_fake(be, fake)
+
+        entries = await be.list_project_folder(_handle())
+        paths = [e.path for e in entries]
+        assert len(paths) == len(set(paths)), f"duplicate paths: {paths}"
+        assert set(paths) == {
+            "Documents",
+            "Documents/a.md",
+            "Documents/Sub",
+            "Documents/Sub/b.md",
+        }
+
+    @pytest.mark.asyncio
     async def test_etag_is_stable_across_calls(self):
         # External-mod detection compares baseline vs. live etags, so a
         # re-list of an unchanged file must yield the same etag.
