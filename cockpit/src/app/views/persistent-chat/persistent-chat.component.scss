@@ -1961,6 +1961,29 @@
           display: none;
         }
 
+        /* The dot alone carries connection state; the text label is what
+           pushed the header buttons into each other on a phone. */
+        .status-label {
+          display: none;
+        }
+
+        /* Decorative — the title needs those pixels more. */
+        .header-icon {
+          display: none;
+        }
+
+        .header-right {
+          flex-shrink: 0;
+        }
+
+        /* Badges (model · turn · mode …) keep their width; scroll instead of
+           spilling out of the viewport. */
+        .status-bar {
+          overflow-x: auto;
+          scrollbar-width: none;
+          &::-webkit-scrollbar { display: none; }
+        }
+
         .messages {
           padding: 10px;
         }
@@ -2271,5 +2294,28 @@
   &.lvl-danger {
     .usage-gauge-fill { background: var(--danger, #cc4647); }
     .usage-ctx-pct { color: var(--danger, #cc4647); }
+  }
+
+  // Phone: collapse to one compact line — output tokens + the context gauge.
+  // The full breakdown was clipping off the left edge of the viewport.
+  @media (max-width: 768px) {
+    justify-content: space-between;
+    gap: v.$space-sm;
+    min-width: 0;
+
+    .usage-tokens {
+      min-width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+
+    .usage-chip--input,
+    .usage-chip--reasoning {
+      display: none;
+    }
+
+    .usage-ctx {
+      flex-shrink: 0;
+    }
   }
 }

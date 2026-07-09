@@ -463,6 +463,27 @@ class VMProvisioner:
 
         return None
 
+    async def list_vms(self) -> Optional[list]:
+        """Enumerate the VMs the backend is actually running.
+
+        Inventory source for the lifecycle VM orphan sweep — the DB-derived
+        instance view can't see a VM whose owning row was deleted. Returns a
+        list of ``{vm_name, entity_id, created_at, phase}`` dicts, or None
+        when no transport can answer (docker pool has no dynamic VMs; an old
+        controller without the list op times out / 404s). None means
+        "unknown", never "no VMs" — callers must not reap on it.
+        """
+        if nats_bridge.is_available:
+            return await nats_bridge.request_vm_list()
+
+        if self._http_available:
+            return await self._list_http()
+
+        if self._k8s_available:
+            return await self._list_direct()
+
+        return None
+
     async def send_control(self, job_id: str, action: str) -> bool:
         """Send a control command to the management daemon in a VM.
 
@@ -718,6 +739,59 @@ class VMProvisioner:
         except Exception as e:
             logger.debug("HTTP status query failed for job %s: %s", job_id, e)
             return None
+
+    async def _list_http(self) -> Optional[list]:
+        """List managed VMs via the co-located VM controller.
+
+        A 404 means the controller predates the list op — unknown, not empty.
+        """
+        if self._http_client is None:
+            return None
+
+        try:
+            resp = await self._http_client.get("/vms")
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            vms = resp.json().get("vms")
+            return vms if isinstance(vms, list) else None
+        except Exception as e:
+            logger.debug("HTTP VM list failed: %s", e)
+            return None
+
+    async def _list_direct(self) -> Optional[list]:
+        """List managed VMs via direct Kubernetes API call.
+
+        Mirrors the controller's ``_do_list``: agent VMs only, golden
+        DataVolume names excluded as defense-in-depth.
+        """
+        try:
+            vms = await asyncio.to_thread(
+                self._k8s.list_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=self._vm_namespace,
+                plural=KUBEVIRT_PLURAL,
+            )
+        except Exception as e:
+            logger.debug("Direct VM list failed: %s", e)
+            return None
+
+        out = []
+        for item in vms.get("items", []):
+            meta = item.get("metadata", {})
+            name = meta.get("name", "")
+            if not name.startswith("agent-vm-") or name.startswith("agent-vm-golden-"):
+                continue
+            out.append(
+                {
+                    "vm_name": name,
+                    "entity_id": name[len("agent-vm-") :],
+                    "created_at": meta.get("creationTimestamp"),
+                    "phase": item.get("status", {}).get("printableStatus", "Unknown"),
+                }
+            )
+        return out
 
     async def _set_context(
         self, entity_type: str, entity_id: str, updates: dict

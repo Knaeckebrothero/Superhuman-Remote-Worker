@@ -982,6 +982,7 @@
       "ideLoadingTooltip": "Workspace starting...",
       "citationsButton": "Citations",
       "citationsTooltip": "Show this session's citations",
+      "moreActions": "More actions",
       "disconnect": "Disconnect"
     },
     "citations": {
@@ -1132,7 +1133,8 @@
       "working": "Agent is working...",
       "reconnecting": "Disconnected — reconnecting…",
       "uploading": "Uploading attachments…",
-      "default": "Type a message... (Enter to send, Shift+Enter for newline)"
+      "default": "Type a message... (Enter to send, Shift+Enter for newline)",
+      "defaultMobile": "Type a message..."
     },
     "composer": {
       "attach": "Attach",

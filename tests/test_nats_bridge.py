@@ -1819,3 +1819,53 @@ class TestSubjectScoping:
         assert b._url is None
         assert b._orchestrator_id == ""
         assert b.is_available is False
+
+
+# =============================================================================
+# request_vm_list() — orphan-sweep inventory over NATS
+# =============================================================================
+
+
+class TestRequestVmList:
+    """Tests for NatsBridge.request_vm_list()."""
+
+    @staticmethod
+    def _reply(data: dict) -> MagicMock:
+        msg = MagicMock()
+        msg.data = json.dumps(data).encode()
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_returns_vm_list(self, bridge, mock_nc):
+        vms = [{"vm_name": "agent-vm-j1", "entity_id": "j1"}]
+        mock_nc.request = AsyncMock(return_value=self._reply({"vms": vms}))
+
+        assert await bridge.request_vm_list() == vms
+        call_args = mock_nc.request.call_args
+        assert call_args.args[0] == "vm.lifecycle.list.srw-test"
+        assert json.loads(call_args.args[1].decode()) == {"orchestrator_id": "srw-test"}
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_none(self, bridge, mock_nc):
+        # Includes the old-controller case: no subscriber on the list subject.
+        mock_nc.request = AsyncMock(side_effect=TimeoutError("no responders"))
+        assert await bridge.request_vm_list() is None
+
+    @pytest.mark.asyncio
+    async def test_unavailable_returns_none(self, disconnected_bridge):
+        assert await disconnected_bridge.request_vm_list() is None
+
+    @pytest.mark.asyncio
+    async def test_jetstream_ack_returns_none(self, bridge, mock_nc):
+        # A stream shadowing the request subject answers with its publish-ack.
+        mock_nc.request = AsyncMock(
+            return_value=self._reply({"stream": "vm-events", "seq": 42})
+        )
+        assert await bridge.request_vm_list() is None
+
+    @pytest.mark.asyncio
+    async def test_list_failed_reply_returns_none(self, bridge, mock_nc):
+        mock_nc.request = AsyncMock(
+            return_value=self._reply({"status": "list_failed", "error": "boom"})
+        )
+        assert await bridge.request_vm_list() is None

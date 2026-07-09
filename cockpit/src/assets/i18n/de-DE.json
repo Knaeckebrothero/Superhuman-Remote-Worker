@@ -982,6 +982,7 @@
       "ideLoadingTooltip": "Arbeitsbereich wird gestartet...",
       "citationsButton": "Quellen",
       "citationsTooltip": "Quellen dieser Sitzung anzeigen",
+      "moreActions": "Weitere Aktionen",
       "disconnect": "Trennen"
     },
     "citations": {
@@ -1132,7 +1133,8 @@
       "working": "Agent arbeitet...",
       "reconnecting": "Getrennt — verbinde erneut…",
       "uploading": "Anhänge werden hochgeladen…",
-      "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)"
+      "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",
+      "defaultMobile": "Nachricht eingeben..."
     },
     "composer": {
       "attach": "Anhängen",

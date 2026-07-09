@@ -44,11 +44,17 @@ LABEL description="Cockpit Angular Frontend"
 # Copy built static assets from builder
 COPY --from=builder /app/dist/cockpit/browser /usr/share/nginx/html
 
-# Nginx config: SPA fallback + port 4000
+# Nginx config: SPA fallback + port 4000. Stock mime.types has no
+# .webmanifest mapping, so without the explicit location the manifest is
+# served as application/octet-stream and Android installs degrade to a
+# bookmark shortcut instead of a standalone PWA.
 RUN printf 'server {\n\
     listen 4000;\n\
     root /usr/share/nginx/html;\n\
     index index.html;\n\
+    location = /manifest.webmanifest {\n\
+        default_type application/manifest+json;\n\
+    }\n\
     location / {\n\
         try_files $uri $uri/ /index.html;\n\
     }\n\

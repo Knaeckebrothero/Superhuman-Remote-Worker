@@ -326,6 +326,40 @@ class VMController:
         log.info("VM deleted: %s (job %s)", vm_name, job_id)
         return {"job_id": job_id, "status": "deleted", "vm_name": vm_name}
 
+    async def _do_list(self) -> dict:
+        """Enumerate the agent VMs this controller manages.
+
+        Inventory source for the orchestrator's VM orphan sweep
+        (``VMInstanceManager.reap_orphans``): the orchestrator's own view is
+        derived from jobs/threads rows, so a VM whose row was deleted is
+        invisible to it — only the controller can still see it. Names encode
+        the owning entity (``agent-vm-<job-or-thread-uuid>``); golden
+        DataVolumes are a different plural and never appear here, but the
+        prefix is excluded anyway as defense-in-depth.
+        """
+        vms = await asyncio.to_thread(
+            self.k8s_client.list_namespaced_custom_object,
+            group=KUBEVIRT_GROUP,
+            version=KUBEVIRT_VERSION,
+            namespace=VM_NAMESPACE,
+            plural=KUBEVIRT_PLURAL,
+        )
+        out = []
+        for item in vms.get("items", []):
+            meta = item.get("metadata", {})
+            name = meta.get("name", "")
+            if not name.startswith("agent-vm-") or name.startswith("agent-vm-golden-"):
+                continue
+            out.append(
+                {
+                    "vm_name": name,
+                    "entity_id": name[len("agent-vm-") :],
+                    "created_at": meta.get("creationTimestamp"),
+                    "phase": item.get("status", {}).get("printableStatus", "Unknown"),
+                }
+            )
+        return {"vms": out}
+
     async def _do_status(self, job_id: str) -> dict:
         """Query KubeVirt for a VM's current status."""
         vm_name = f"agent-vm-{job_id}"
@@ -631,6 +665,20 @@ class VMController:
             else:
                 await self._publish_status(job_id, error_response)
 
+    async def handle_list(self, msg):
+        """vm.lifecycle.list → _do_list (request/reply only).
+
+        A list is only meaningful as a reply to the asker; there is no
+        status-publish fallback like the other handlers have.
+        """
+        try:
+            response = await self._do_list()
+        except Exception as e:
+            log.exception("Failed to list VMs")
+            response = {"status": "list_failed", "error": str(e)}
+        if msg.reply:
+            await self.nc.publish(msg.reply, json.dumps(response).encode())
+
     # =========================================================================
     # HTTP transport (aiohttp)
     # =========================================================================
@@ -703,6 +751,19 @@ class VMController:
                 status=500,
             )
 
+    async def http_list(self, _request):
+        """GET /vms — enumerate managed agent VMs (orphan-sweep inventory)."""
+        from aiohttp import web
+
+        try:
+            result = await self._do_list()
+            return web.json_response(result, status=200)
+        except Exception as e:
+            log.exception("HTTP list failed")
+            return web.json_response(
+                {"status": "list_failed", "error": str(e)}, status=500
+            )
+
     async def http_health(self, _request):
         """GET /healthz — liveness probe target."""
         from aiohttp import web
@@ -728,6 +789,7 @@ class VMController:
 
         app = web.Application()
         app.router.add_post("/vms", self.http_create)
+        app.router.add_get("/vms", self.http_list)
         app.router.add_delete("/vms/{job_id}", self.http_delete)
         app.router.add_get("/vms/{job_id}", self.http_status)
         app.router.add_get("/healthz", self.http_health)
@@ -774,8 +836,9 @@ class VMController:
             await self.nc.subscribe(
                 f"vm.lifecycle.get{suffix}", cb=self.handle_status_query
             )
+            await self.nc.subscribe(f"vm.lifecycle.list{suffix}", cb=self.handle_list)
             log.info(
-                "Subscribed to vm.lifecycle.{create,delete,get}.%s — waiting for NATS requests",
+                "Subscribed to vm.lifecycle.{create,delete,get,list}.%s — waiting for NATS requests",
                 ORCHESTRATOR_ID,
             )
 
