@@ -267,6 +267,33 @@ class FakeNextcloud:
         )
 
 
+class TestRemoveUserFromGroup:
+    @pytest.mark.asyncio
+    async def test_issues_delete_with_body_without_typeerror(self):
+        # Regression: httpx's AsyncClient.delete() rejects a request body, so
+        # the old `delete(..., data=...)` raised TypeError. It must send the
+        # groupid via a DELETE request body.
+        seen: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["method"] = request.method
+            seen["path"] = request.url.path
+            seen["content"] = request.content
+            return httpx.Response(200, json={"ocs": {"meta": {"statuscode": 100}}})
+
+        be = NextcloudBackend(_nc_test_settings())
+        be._client = httpx.AsyncClient(
+            base_url=NEXTCLOUD_BASE, transport=httpx.MockTransport(handler)
+        )
+        be._initialized = True
+
+        await be.remove_user_from_group("srw-reader-a", "grp1")  # must not raise
+
+        assert seen["method"] == "DELETE"
+        assert seen["path"] == "/ocs/v2.php/cloud/users/srw-reader-a/groups"
+        assert b"grp1" in seen["content"]  # groupid sent in the request body
+
+
 def _install_fake(backend: NextcloudBackend, fake: FakeNextcloud) -> None:
     """Wire a pre-initialized adapter up to the fake server."""
     backend._client = httpx.AsyncClient(

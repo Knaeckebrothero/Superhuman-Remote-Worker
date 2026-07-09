@@ -126,7 +126,9 @@ class OpenCloudBackend:
         self._token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
 
-        self._role_cache: dict[str, str] = {}
+        # Keyed by (displayName, weight) — OpenCloud has duplicate role display
+        # names distinguished only by @libre.graph.weight.
+        self._role_cache: dict[tuple[str, int], str] = {}
 
         # Populated by ensure_initialized once the agent-home Space exists.
         self._agent_home_drive_id: Optional[str] = None
@@ -1615,7 +1617,7 @@ class OpenCloudBackend:
                 f"role {display_name!r} not in OpenCloud role catalog",
                 backend=self.backend_id,
             )
-        return self._role_cache[display_name]
+        return self._role_cache[key]
 
     # ---------------------------------------------------------------- Group lookup
 

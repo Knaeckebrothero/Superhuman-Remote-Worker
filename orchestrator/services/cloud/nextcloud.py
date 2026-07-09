@@ -479,7 +479,10 @@ class NextcloudBackend:
     async def remove_user_from_group(self, user_id: UserId, group_id: GroupId) -> None:
         self._ensure_ready()
         try:
-            resp = await self._client.delete(
+            # httpx's delete() convenience method rejects a request body, so the
+            # groupid must go through request("DELETE", ..., data=...).
+            resp = await self._client.request(
+                "DELETE",
                 f"/ocs/v2.php/cloud/users/{user_id}/groups",
                 params={"format": "json"},
                 data={"groupid": str(group_id)},
@@ -1370,10 +1373,9 @@ class NextcloudBackend:
         (the reader is left with no group → no folder access). The reader
         account itself is left intact for reuse. Idempotent.
 
-        Deleting the group is the whole revoke — we deliberately do NOT call
-        ``remove_user_from_group`` first (it is a no-op once the group is gone,
-        and that helper is currently broken: httpx's ``delete()`` convenience
-        method rejects a request body, so its ``data=`` kwarg raises).
+        Deleting the group is the whole revoke — calling
+        ``remove_user_from_group`` first would be a redundant no-op once the
+        group is gone.
         """
         self._ensure_ready()
         data = json.loads(grant_handle)
