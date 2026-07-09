@@ -183,6 +183,10 @@ agent:
   # (prod-safe); the dev/experimental values file turns it on. Mirrors
   # expertsDbEnabled.
   skillsDbEnabled: "false"
+  # -- Enable protected cloud mode: RO-reader provisioning + capture overlay.
+  # Default OFF (prod-safe); the dev/experimental values file turns it on.
+  # See docs/design/cloud_access_unification.md §8 Phase 1.
+  protectedCloudModeEnabled: "false"
   resources:
     requests:
       memory: "512Mi"
