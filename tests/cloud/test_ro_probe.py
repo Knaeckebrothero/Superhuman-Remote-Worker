@@ -386,3 +386,113 @@ async def test_side_channel_201_flips_ok_false():
     )
     assert res.ok is False
     assert any("201" in f for f in res.failures)
+
+
+# ---------------------------------------------------------------------------
+# Live-k3d validation findings (2026-07-09) — three real ro_probe bugs the
+# httpx fakes couldn't surface; each reproduces the exact real-Nextcloud shape.
+# ---------------------------------------------------------------------------
+
+
+class _TextResp:
+    """A response exposing .text (for the PROPPATCH multistatus body)."""
+
+    def __init__(self, status, text=""):
+        self.status_code = status
+        self.text = text
+
+
+# --- Finding A: groupfolders version lives under `appVersion`, not `version` ---
+
+
+@pytest.mark.asyncio
+async def test_groupfolders_appversion_at_floor_is_ok():
+    # Real NC exposes capabilities.groupfolders = {"appVersion": "20.1.2", ...}.
+    client = _FakeCapabilitiesClient(
+        _nc_capabilities(31, 0, 14, groupfolders={"appVersion": "20.1.2", "hasGroupFolders": False})
+    )
+    res = await check_version_floors(
+        client, "https://cloud/remote.php/dav", backend="nextcloud"
+    )
+    assert res.ok, res.failures
+
+
+@pytest.mark.asyncio
+async def test_groupfolders_appversion_below_floor_reports_the_real_version():
+    # 19.1.18 is what dev actually runs — must be READ (not "unverifiable")
+    # and reported as below the floor.
+    client = _FakeCapabilitiesClient(
+        _nc_capabilities(31, 0, 14, groupfolders={"appVersion": "19.1.18"})
+    )
+    res = await check_version_floors(
+        client, "https://cloud/remote.php/dav", backend="nextcloud"
+    )
+    assert res.ok is False
+    assert any("19.1.18" in f and "below" in f for f in res.failures), res.failures
+    assert not any("unverifiable" in f for f in res.failures), res.failures
+
+
+# --- Finding B: PROPPATCH 207 is the multistatus envelope; read inner status ---
+
+
+class _ProppatchClient:
+    def __init__(self, inner_status: int):
+        self._inner = inner_status
+
+    async def request(self, method, url, **kw):
+        if method == "PROPFIND":
+            return _TextResp(207)
+        if method == "PROPPATCH":
+            body = (
+                '<?xml version="1.0"?>'
+                '<d:multistatus xmlns:d="DAV:"><d:response>'
+                '<d:href>/f</d:href><d:propstat><d:prop><d:displayname/></d:prop>'
+                f'<d:status>HTTP/1.1 {self._inner} X</d:status>'
+                '</d:propstat></d:response></d:multistatus>'
+            )
+            return _TextResp(207, body)
+        return _TextResp(403)
+
+
+@pytest.mark.asyncio
+async def test_proppatch_207_with_inner_403_is_rejected_not_a_failure():
+    res = await probe_read_only(
+        _ProppatchClient(403), "https://cloud/dav/files/reader/proj/", "hello.txt"
+    )
+    assert not any("PROPPATCH" in f for f in res.failures), res.failures
+
+
+@pytest.mark.asyncio
+async def test_proppatch_207_with_inner_2xx_is_an_open_write():
+    # A property actually got written -> a real RO bypass -> must fail.
+    res = await probe_read_only(
+        _ProppatchClient(200), "https://cloud/dav/files/reader/proj/", "hello.txt"
+    )
+    assert any("PROPPATCH" in f for f in res.failures), res.failures
+
+
+# --- Finding C: COPY needs a Destination header, else NC 400s (masks 403) ---
+
+
+class _CopyRecorderClient:
+    def __init__(self):
+        self.copy_headers = None
+
+    async def request(self, method, url, **kw):
+        if method == "PROPFIND":
+            return _TextResp(207)
+        if method == "COPY":
+            self.copy_headers = kw.get("headers") or {}
+            # NC: 403 when Destination present (authz reached), 400 when absent.
+            return _TextResp(403 if "Destination" in self.copy_headers else 400)
+        return _TextResp(403)
+
+
+@pytest.mark.asyncio
+async def test_copy_probe_sends_destination_and_reads_403():
+    client = _CopyRecorderClient()
+    res = await probe_read_only(
+        client, "https://cloud/dav/files/reader/proj/", "hello.txt"
+    )
+    assert client.copy_headers and "Destination" in client.copy_headers
+    assert not any("COPY" in f for f in res.failures), res.failures

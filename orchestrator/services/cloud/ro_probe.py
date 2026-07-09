@@ -67,6 +67,7 @@ other.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -297,16 +298,31 @@ async def probe_read_only(
         kwargs: dict[str, Any] = {}
         if body is not None:
             kwargs["content"] = body
-        if verb == "MOVE":
+        # MOVE and COPY are WebDAV write verbs that REQUIRE a Destination
+        # header; without it Nextcloud returns 400 (malformed) before the
+        # authz layer, masking the real 403 (live k3d validation 2026-07-09).
+        if verb in ("MOVE", "COPY"):
             kwargs["headers"] = {"Destination": target + ".moved"}
         try:
             resp = await client.request(verb, target, **kwargs)
         except Exception as e:
-            # Finding 1: a transport failure (timeout, connection error,
-            # ...) must refuse, not crash the probe or silently skip the
-            # verb. Continue probing the remaining verbs regardless.
+            # A transport failure (timeout, connection error, ...) must
+            # refuse, not crash the probe or silently skip the verb.
+            # Continue probing the remaining verbs regardless.
             failures.append(
                 f"{label} -> transport error {type(e).__name__} (fail-closed)"
+            )
+            continue
+        if verb == "PROPPATCH" and resp.status_code == 207:
+            # PROPPATCH ALWAYS returns a 207 multistatus envelope; the real
+            # authz decision is the inner propstat status. A read-only reader
+            # gets an inner 4xx (denied); a 2xx inner status means a property
+            # was actually written — a real RO bypass (live k3d validation
+            # 2026-07-09 saw inner 403 on a correctly-RO reader).
+            if _proppatch_all_denied(getattr(resp, "text", "")):
+                continue
+            failures.append(
+                f"{label} -> 207 with a non-4xx inner status (property write open)"
             )
             continue
         if resp.status_code not in REJECTED_STATUSES:
@@ -360,18 +376,37 @@ async def probe_read_only(
     )
 
 
+_PROPSTAT_STATUS_RE = re.compile(r"HTTP/\d\.\d\s+(\d{3})", re.IGNORECASE)
+
+
+def _proppatch_all_denied(body: str) -> bool:
+    """Whether a PROPPATCH 207 multistatus body denied every property.
+
+    PROPPATCH returns a 207 envelope wrapping one ``<d:status>HTTP/1.1 NNN``
+    per property. Read-only => every inner status is 4xx. Returns True only
+    when at least one inner status was found AND all are 4xx; an empty/
+    unparseable body returns False (fail-closed — the write can't be
+    verified as rejected).
+    """
+    codes = [int(c) for c in _PROPSTAT_STATUS_RE.findall(body or "")]
+    if not codes:
+        return False
+    return all(400 <= c < 500 for c in codes)
+
+
 def _parse_version_tuple(value: Any) -> tuple[int, int, int] | None:
     """Parse a dotted version out of a capabilities value.
 
     Defensive by design (module docstring / spec note): the value may be
-    a plain ``"20.1.2"`` string, a dict with a ``"version"`` key, or
-    simply absent — different Nextcloud versions expose the groupfolders
-    app version under ``capabilities.groupfolders`` inconsistently.
-    Anything that doesn't cleanly parse to three ints returns ``None``
-    (caller treats that as fail-closed "unverifiable").
+    a plain ``"20.1.2"`` string, or a dict — different Nextcloud versions
+    expose the groupfolders app version under ``capabilities.groupfolders``
+    inconsistently: real NC 31 uses ``{"appVersion": "20.1.2", ...}`` (live
+    k3d validation 2026-07-09), older shapes used ``{"version": "..."}``.
+    Both keys are honored. Anything that doesn't cleanly parse to three ints
+    returns ``None`` (caller treats that as fail-closed "unverifiable").
     """
     if isinstance(value, dict):
-        value = value.get("version")
+        value = value.get("version") or value.get("appVersion")
     if not isinstance(value, str):
         return None
     parts = value.split(".")
