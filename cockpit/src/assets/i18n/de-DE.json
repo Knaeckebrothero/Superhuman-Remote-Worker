@@ -1291,6 +1291,7 @@
       "delegation": "Arbeit delegieren",
       "orchestrator": "Flottenverwaltung",
       "agent_catalog": "Experten und Skills verwalten",
+      "workflows": "Automatisierungen und Loops verwalten",
       "evaluation": "Auswertung"
     },
     "toolContext": {
@@ -1993,6 +1994,10 @@
       "agent_catalog": {
         "label": "Experten & Skills",
         "description": "Kann Experten und Skills verwalten"
+      },
+      "workflows": {
+        "label": "Automatisierungen & Loops",
+        "description": "Kann Automatisierungen und Projekt-Loops einsehen und deaktivierte Automatisierungen entwerfen"
       },
       "knowledge": {
         "label": "Wissen",

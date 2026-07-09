@@ -399,6 +399,24 @@
               "get_skill"
             ]
           ]
+        },
+        "workflows": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/tools/orchestrator/workflows.py)",
+          "examples": [
+            [
+              "list_automations",
+              "get_automation",
+              "list_automation_runs",
+              "propose_automation",
+              "get_project_loop",
+              "list_project_loop_jobs",
+              "explain_project_loop"
+            ]
+          ]
         }
       }
     },

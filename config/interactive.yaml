@@ -28,6 +28,7 @@ tools:
     - git_diff
   orchestrator: [ ]
   agent_catalog: [ ]
+  workflows: [ ]
   core: [ ]
   citation: [ ]
   graph: [ ]

@@ -115,6 +115,7 @@ _EXCLUDED_TOOLS = frozenset(
 
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
+_WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
 _FLEET_MANAGEMENT_CONTROL_TOOLS = {"request_workspace_upgrade"}
 
 
@@ -135,6 +136,12 @@ def _agent_catalog_enabled(config: Any) -> bool:
     """Return whether expert/skill catalog tools should be exposed."""
     extra = getattr(config, "extra", {}) or {}
     return extra.get(_AGENT_CATALOG_DISABLED_KEY) is not True
+
+
+def _workflows_enabled(config: Any) -> bool:
+    """Return whether automation/project-loop workflow tools should be exposed."""
+    extra = getattr(config, "extra", {}) or {}
+    return extra.get(_WORKFLOWS_DISABLED_KEY) is not True
 
 
 @dataclass
@@ -708,17 +715,18 @@ class PersistentSession:
             if name not in tool_names:
                 tool_names.append(name)
 
-        # Fleet Management is the UI-facing group for SRW control-plane tools:
-        # session context, jobs, projects, project repositories, and workspace
-        # upgrade requests. Experts & Skills is a separate default-on catalog
-        # group keyed by ``tools.agent_catalog``.
+        # Fleet Management is the UI-facing group for SRW control-plane tools.
+        # Experts & Skills and Automations & Loops are separate default-on
+        # groups keyed by ``tools.agent_catalog`` and ``tools.workflows``.
         from ..tools.registry import get_tools_by_category
 
         fleet_management_enabled = _fleet_management_enabled(self.config)
         agent_catalog_enabled = _agent_catalog_enabled(self.config)
+        workflows_enabled = _workflows_enabled(self.config)
         fleet_management_tools = set(get_tools_by_category("orchestrator"))
         fleet_management_tools.update(_FLEET_MANAGEMENT_CONTROL_TOOLS)
         agent_catalog_tools = set(get_tools_by_category("agent_catalog"))
+        workflow_tools = set(get_tools_by_category("workflows"))
 
         if not fleet_management_enabled:
             tool_names = [
@@ -757,6 +765,22 @@ class PersistentSession:
                 "get_skill",
             ]
             for name in _AGENT_CATALOG_TOOLS:
+                if name not in tool_names:
+                    tool_names.append(name)
+
+        if not workflows_enabled:
+            tool_names = [name for name in tool_names if name not in workflow_tools]
+        else:
+            _WORKFLOW_DEFAULT_TOOLS = [
+                "list_automations",
+                "get_automation",
+                "list_automation_runs",
+                "propose_automation",
+                "get_project_loop",
+                "list_project_loop_jobs",
+                "explain_project_loop",
+            ]
+            for name in _WORKFLOW_DEFAULT_TOOLS:
                 if name not in tool_names:
                     tool_names.append(name)
 
