@@ -765,8 +765,16 @@ CREATE TABLE public.project_loops (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     workspace_backend text,
     current_stage_jobs jsonb DEFAULT '[]'::jsonb NOT NULL,
+    scheduling text DEFAULT 'rotation'::text NOT NULL,
+    campaign jsonb,
+    campaign_history jsonb DEFAULT '[]'::jsonb NOT NULL,
+    campaign_caps jsonb,
+    CONSTRAINT project_loop_campaign_caps_is_object CHECK (((campaign_caps IS NULL) OR (jsonb_typeof(campaign_caps) = 'object'::text))),
+    CONSTRAINT project_loop_campaign_history_is_array CHECK ((jsonb_typeof(campaign_history) = 'array'::text)),
+    CONSTRAINT project_loop_campaign_is_object CHECK (((campaign IS NULL) OR (jsonb_typeof(campaign) = 'object'::text))),
     CONSTRAINT project_loop_has_budget CHECK (((max_iterations IS NOT NULL) OR (run_until IS NOT NULL))),
     CONSTRAINT project_loop_role_sequence_nonempty CHECK (((jsonb_typeof(role_sequence) = 'array'::text) AND (jsonb_array_length(role_sequence) >= 1))),
+    CONSTRAINT project_loop_scheduling_known CHECK ((scheduling = ANY (ARRAY['rotation'::text, 'planner'::text]))),
     CONSTRAINT project_loop_stage_jobs_is_array CHECK ((jsonb_typeof(current_stage_jobs) = 'array'::text)),
     CONSTRAINT project_loop_workspace_backend_valid CHECK (((workspace_backend IS NULL) OR (workspace_backend = ANY (ARRAY['sandbox'::text, 'vm'::text, 'virtual'::text, 'none'::text])))),
     CONSTRAINT project_loops_status_check CHECK ((status = ANY (ARRAY['running'::text, 'paused'::text, 'stopped'::text, 'completed'::text, 'failed'::text])))
@@ -813,6 +821,34 @@ COMMENT ON COLUMN public.project_loops.workspace_backend IS 'Optional per-loop w
 --
 
 COMMENT ON COLUMN public.project_loops.current_stage_jobs IS 'In-flight members of a parallel (fan-out) role_sequence stage — the jobs the loop barriers on before rotating. Empty for single-role stages, which use current_job_id instead. Populated by the advance/start spawn; drained to [] by the atomic last-member barrier. docs/features/loop_parallel_stages.md.';
+
+
+--
+-- Name: COLUMN project_loops.scheduling; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_loops.scheduling IS 'Execution-slot scheduling mode: rotation (fixed one-job slot, the default — byte-identical to pre-0050 behavior) or planner (a checkpoint Critic may expand the slot into a multi-stage campaign via a filed plan). Start-time-only. docs/features/loop_campaign_scheduling.md.';
+
+
+--
+-- Name: COLUMN project_loops.campaign; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_loops.campaign IS 'Active campaign control state (planner loops only): stages, cursor, counters, acceptance evidence, status active|review|aborted. Recovery truth lives in member-job context stamps (loop_campaign_id/_index), not here. NULL when no campaign has been planned.';
+
+
+--
+-- Name: COLUMN project_loops.campaign_history; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_loops.campaign_history IS 'Bounded archive of disposed campaigns (outcome ship|kill|abort + counters), newest last, capped app-side.';
+
+
+--
+-- Name: COLUMN project_loops.campaign_caps; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_loops.campaign_caps IS 'Optional per-loop guardrail overrides: {max_stages, max_extensions, abort_failures}. NULL = config defaults. Validated against hard ceilings at loop start.';
 
 
 --
@@ -1575,7 +1611,8 @@ CREATE TABLE public.users (
     is_approved boolean DEFAULT false NOT NULL,
     approved_at timestamp with time zone,
     approved_by uuid,
-    preferred_username text
+    preferred_username text,
+    cloud_identity jsonb DEFAULT '{}'::jsonb NOT NULL
 );
 
 
@@ -1591,6 +1628,13 @@ COMMENT ON COLUMN public.users.is_approved IS 'App-side admission flag. Checked 
 --
 
 COMMENT ON COLUMN public.users.approved_by IS 'Admin who approved this user. NULL + approved_at set = migrated from Keycloak role / system; a real UUID = a human clicked approve.';
+
+
+--
+-- Name: COLUMN users.cloud_identity; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.users.cloud_identity IS 'Per-backend cloud identity cache: {"<backend_id>": {"user_id", "home_browser_url", "resolved_at"}}. Positive results only; maintained by services/cloud/identity.py.';
 
 
 --

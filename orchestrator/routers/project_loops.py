@@ -59,6 +59,15 @@ class ProjectLoopStart(BaseModel):
     # Optional per-loop workspace tier for every spawned job (mirrors `model`).
     # Blank/None = default sandbox; "vm" gives every role a root VM.
     workspace_backend: str | None = Field(None, max_length=20)
+    # Execution-slot scheduling: 'rotation' (default, byte-identical to
+    # pre-campaign behavior) or 'planner' (the checkpoint critic may expand the
+    # execution slot into a multi-stage campaign via a filed plan). Start-time
+    # only. docs/features/loop_campaign_scheduling.md.
+    scheduling: str = Field("rotation", pattern="^(rotation|planner)$")
+    # Optional per-loop campaign guardrail overrides ({max_stages,
+    # max_extensions, abort_failures}); values above the config hard ceilings
+    # are rejected, not clamped — fail loud at start.
+    campaign_caps: dict[str, int] | None = None
 
 
 @router.post("/{project_id}/loop", status_code=status.HTTP_201_CREATED)
@@ -106,6 +115,29 @@ async def start_project_loop(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # Planner scheduling: the template additionally needs exactly one
+    # single-role critic checkpoint followed (cyclically) by a single-role
+    # execution slot, and any cap overrides must sit under the hard ceilings.
+    # Fail loud at start — a doomed planner loop must not degrade silently.
+    campaign_caps: dict[str, int] | None = None
+    if body.scheduling == "planner":
+        from services.project_loops import (
+            planner_slots,
+            validate_campaign_caps,
+        )
+
+        try:
+            planner_slots(roles)
+            if body.campaign_caps is not None:
+                campaign_caps = validate_campaign_caps(body.campaign_caps)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    elif body.campaign_caps is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="campaign_caps only applies to scheduling='planner'",
+        )
+
     # Workspace tier override (mirrors `model`). Normalise blank → None; reject
     # unknown tiers up front. If `vm`, enforce the same VM permission the
     # dispatcher would (kill-switch + can_use_vm) so a doomed loop fails loud at
@@ -148,6 +180,8 @@ async def start_project_loop(
         run_until=run_until,
         max_consecutive_failures=body.max_consecutive_failures,
         workspace_backend=workspace_backend,
+        scheduling=body.scheduling,
+        campaign_caps=campaign_caps,
     )
 
     # Spawn the first stage (1 job for a single-role entry, N concurrent jobs

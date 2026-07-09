@@ -47,6 +47,15 @@ VM_PARKED = "parked"  # already 'failed' → leave parked (no hot-retry)
 VM_WAIT = "wait"  # provisioning/creating/deleting in flight → wait
 VM_RECYCLE = "recycle"  # stuck past budget → tear down so it re-provisions
 VM_READY = "ready"  # VM booted → proceed to claim/dispatch
+VM_GOLDEN_POLL = "golden_poll"  # golden image importing → re-poll create, free
+VM_PARK_GOLDEN = "park_golden"  # golden import never finished → fail + park
+
+# Bounded patience for a cold golden-image import (an agent-vm-base bump).
+# Observed cold import on the shared VM cluster: ~30 min — deliberately above
+# both VM_PROVISION_TIMEOUT_S (600) and the controller's VM_GOLDEN_POLL_TIMEOUT
+# (900), which is the misalignment that burned a loop iteration (see
+# docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md).
+DEFAULT_GOLDEN_WAIT_TIMEOUT_S = 2700.0
 
 
 def vm_provisioning_decision(
@@ -56,6 +65,7 @@ def vm_provisioning_decision(
     max_provision_attempts: int,
     now: float,
     timeout_s: float,
+    golden_timeout_s: float = DEFAULT_GOLDEN_WAIT_TIMEOUT_S,
 ) -> str:
     """Decide what the dispatcher should do with a VM-backed job's VM.
 
@@ -73,6 +83,18 @@ def vm_provisioning_decision(
       absent / 'deleted' → PROVISION, or PARK_EXHAUSTED once retries are used up
       'failed'           → PARKED (don't hot-retry the shared VM cluster)
       'deleting'         → WAIT (teardown in flight)
+      'waiting_golden'   → GOLDEN_POLL within ``golden_timeout_s`` of
+                           ``golden_wait_started_at``, else PARK_GOLDEN. The
+                           controller has NOT created a VM yet — it is waiting
+                           on a shared golden-image import (a cold import after
+                           an agent-vm-base bump takes ~30 min, longer than
+                           ``timeout_s``). Polling re-issues create WITHOUT
+                           consuming a provision attempt: the attempt budget
+                           bounds VM boots, and no boot is happening. RECYCLE
+                           would be meaningless here (nothing to tear down) and
+                           counting attempts would park every job dispatched
+                           into the import window — the exact failure this
+                           branch removes.
       not-yet-'ready'    → RECYCLE if stuck past ``timeout_s``, else WAIT
       'ready'            → READY (proceed to claim)
     """
@@ -85,6 +107,11 @@ def vm_provisioning_decision(
         return VM_PARKED
     if status == "deleting":
         return VM_WAIT
+    if status == "waiting_golden":
+        started = vm_ctx.get("golden_wait_started_at")
+        if started and (now - float(started)) > golden_timeout_s:
+            return VM_PARK_GOLDEN
+        return VM_GOLDEN_POLL
     if status != "ready":
         provisioned_at = vm_ctx.get("provisioned_at")
         if provisioned_at and (now - float(provisioned_at)) > timeout_s:

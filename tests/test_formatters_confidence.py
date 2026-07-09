@@ -1,0 +1,128 @@
+"""Confidence rendering in knowledge-note and frozen-job formatters.
+
+Regression coverage for the MCP `list_knowledge_notes` crash: confidence is a
+Postgres enum string (`'high'`/`'medium'`/`'low'`), but the formatters applied a
+`%` float format spec, raising `Unknown format code '%' for object of type 'str'`.
+See docs/issues/mcp_knowledge_notes_confidence_percent_format_crash.md.
+"""
+
+import pytest
+
+from orchestrator.services.formatters import (
+    _fmt_confidence,
+    format_frozen_job,
+    format_knowledge_note_detail,
+    format_knowledge_notes,
+)
+
+
+class TestFmtConfidence:
+    def test_enum_string_passthrough(self):
+        assert _fmt_confidence("high") == "high"
+        assert _fmt_confidence("medium") == "medium"
+        assert _fmt_confidence("low") == "low"
+
+    def test_float_in_unit_range_is_percent(self):
+        assert _fmt_confidence(0.82) == "82%"
+        assert _fmt_confidence(0.0) == "0%"
+        assert _fmt_confidence(1.0) == "100%"
+
+    def test_int_zero_one_is_percent(self):
+        assert _fmt_confidence(0) == "0%"
+        assert _fmt_confidence(1) == "100%"
+
+    def test_out_of_range_numeric_is_plain(self):
+        assert _fmt_confidence(82) == "82"
+        assert _fmt_confidence(-1) == "-1"
+        assert _fmt_confidence(3.5) == "3.5"
+
+    def test_bool_is_not_percent(self):
+        # bool is an int subclass; guard so True doesn't render as "100%".
+        assert _fmt_confidence(True) == "True"
+        assert _fmt_confidence(False) == "False"
+
+
+class TestFormatKnowledgeNotes:
+    def _note(self, confidence):
+        return {
+            "notes": [
+                {
+                    "note_id": "n1",
+                    "title": "A note",
+                    "note_type": "insight",
+                    "status": "active",
+                    "confidence": confidence,
+                    "content_preview": "preview",
+                }
+            ],
+            "total": 1,
+            "offset": 0,
+            "limit": 50,
+        }
+
+    @pytest.mark.parametrize(
+        "confidence,expected",
+        [
+            ("high", "confidence: high"),
+            (0.82, "confidence: 82%"),
+            (82, "confidence: 82"),
+        ],
+    )
+    def test_renders_confidence_without_crashing(self, confidence, expected):
+        out = format_knowledge_notes(self._note(confidence))
+        assert expected in out
+
+    def test_string_confidence_does_not_raise(self):
+        # The original bug: f"{'high':.0%}" -> ValueError.
+        out = format_knowledge_notes(self._note("high"))
+        assert "A note" in out
+
+    def test_none_confidence_omits_line(self):
+        out = format_knowledge_notes(self._note(None))
+        assert "confidence:" not in out
+
+
+class TestFormatKnowledgeNoteDetail:
+    def _detail(self, confidence):
+        return {
+            "note_id": "n1",
+            "title": "A note",
+            "note_type": "insight",
+            "status": "active",
+            "confidence": confidence,
+            "content": "body",
+        }
+
+    @pytest.mark.parametrize(
+        "confidence,expected",
+        [
+            ("high", "Confidence: high"),
+            (0.82, "Confidence: 82%"),
+            (82, "Confidence: 82"),
+        ],
+    )
+    def test_renders_confidence_without_crashing(self, confidence, expected):
+        out = format_knowledge_note_detail(self._detail(confidence))
+        assert expected in out
+
+    def test_none_confidence_omits_line(self):
+        out = format_knowledge_note_detail(self._detail(None))
+        assert "Confidence:" not in out
+
+
+class TestFormatFrozenJob:
+    @pytest.mark.parametrize(
+        "confidence,expected",
+        [
+            ("high", "Confidence: high"),
+            (0.82, "Confidence: 82%"),
+            (82, "Confidence: 82"),
+        ],
+    )
+    def test_renders_confidence_without_crashing(self, confidence, expected):
+        out = format_frozen_job("job1", {"summary": "s", "confidence": confidence})
+        assert expected in out
+
+    def test_none_confidence_omits_line(self):
+        out = format_frozen_job("job1", {"summary": "s"})
+        assert "Confidence:" not in out

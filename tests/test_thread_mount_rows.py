@@ -69,6 +69,17 @@ def _owner_user_record(*, keycloak_sub: str = "alice-keycloak-sub") -> dict:
     return {"id": "owner-uuid", "keycloak_sub": keycloak_sub}
 
 
+def _fake_db() -> MagicMock:
+    """Base postgres_db stand-in. The identity-cache methods always exist on
+    the real Database (services/cloud/identity.py reads them on every
+    resolve), so every fake needs awaitable stubs; tests override the rest.
+    """
+    db = MagicMock()
+    db.get_user_cloud_identity = AsyncMock(return_value={})
+    db.merge_user_cloud_identity = AsyncMock(return_value=True)
+    return db
+
+
 @pytest.mark.asyncio
 async def test_default_project_emits_user_home_row():
     """Default project → ``project_default`` row with target_path='' and
@@ -80,7 +91,7 @@ async def test_default_project_emits_user_home_row():
     project = _project(project_id="p-default", is_default=True, name="Default")
     backend = _backend()
 
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
     fake_db.get_user = AsyncMock(return_value=_owner_user_record())
     router = MagicMock()
@@ -111,7 +122,7 @@ async def test_default_project_no_owner_returns_none():
     from main import _build_default_project_mount_row
 
     project = _project(project_id="p", is_default=True)
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(return_value=[])
     fake_db.get_user = AsyncMock(return_value=None)
     router = MagicMock()
@@ -134,7 +145,7 @@ async def test_default_project_owner_missing_keycloak_sub_returns_none():
     from main import _build_default_project_mount_row
 
     project = _project(project_id="p", is_default=True)
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
     fake_db.get_user = AsyncMock(
         return_value={"id": "owner-uuid", "keycloak_sub": None}
@@ -161,7 +172,7 @@ async def test_default_project_user_home_unresolvable_returns_none():
     backend = _backend()
     backend.get_user_home = AsyncMock(return_value=None)
 
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(
         return_value=[_owner_member(email="bob@example.com", display_name="Bob")]
     )
@@ -183,7 +194,7 @@ async def test_default_project_backend_uninitialized_returns_none():
 
     project = _project(project_id="p", is_default=True)
     backend = _backend(initialized=False)
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     fake_db.get_project_members = AsyncMock(return_value=[])
     fake_db.get_user = AsyncMock(return_value=None)
     router = MagicMock()
@@ -207,7 +218,7 @@ async def test_build_thread_mount_rows_mixes_default_and_non_default():
 
     default_project = _project(project_id="p-default", is_default=True, name="My Home")
     other_project = _project(project_id="p-other", is_default=False, name="Alpha")
-    fake_db = MagicMock()
+    fake_db = _fake_db()
 
     async def get_project(pid: str):
         return {"p-default": default_project, "p-other": other_project}.get(pid)
@@ -689,7 +700,7 @@ async def test_build_agent_cloud_mount_container_runtime_can_be_disabled(monkeyp
 
 def _multi_project_db(projects: list[dict]) -> MagicMock:
     """Build a fake postgres_db that resolves each project_id to a row."""
-    fake_db = MagicMock()
+    fake_db = _fake_db()
     table = {p["id"]: p for p in projects}
 
     async def get_project(pid: str):

@@ -262,11 +262,25 @@ class VMProvisioner:
         cpu_cores: int = 8,
         memory: str = "16Gi",
         description: str = "",
+        fresh: bool = True,
     ) -> bool:
         """Create a VM for a job.
 
         Picks the highest-priority transport that is available
         (NATS > HTTP > direct > docker).
+
+        Args:
+            fresh: True (default) for a genuine (re)provision. False for a
+                golden-poll re-issue — the controller answered ``waiting_golden``
+                (no VM exists yet, a shared golden image is importing) and the
+                dispatcher re-sends create as the poll. A poll must NOT reset
+                the provision context: ``golden_wait_started_at`` anchors the
+                golden budget across polls, and the context status must stay
+                ``waiting_golden`` (not flip to 'provisioning') so the decision
+                logic keeps polling instead of burning boot-budget waits.
+                ``provisioned_at`` alone is rolled forward so that when the
+                golden completes and the create finally builds the VM, the boot
+                budget starts from ≈ that moment, not from the first poll.
 
         Returns:
             True if the request was accepted, False otherwise.
@@ -278,7 +292,10 @@ class VMProvisioner:
         # VM on its first tick — and its dead ssh_host would otherwise leak into
         # this fresh VM. provisioned_at anchors the dispatcher's provisioning
         # timeout. Runs before backend dispatch so every transport inherits it.
-        await self._set_vm_context(job_id, self._fresh_provision_ctx())
+        if fresh:
+            await self._set_vm_context(job_id, self._fresh_provision_ctx())
+        else:
+            await self._set_vm_context(job_id, {"provisioned_at": time.time()})
         if nats_bridge.is_available:
             return await nats_bridge.request_vm_create(
                 job_id=job_id,
@@ -287,6 +304,7 @@ class VMProvisioner:
                 cpu_cores=cpu_cores,
                 memory=memory,
                 description=description,
+                set_provisioning=fresh,
             )
 
         if self._http_available:
@@ -298,6 +316,7 @@ class VMProvisioner:
                 memory=memory,
                 description=description,
                 entity_type="job",
+                set_provisioning=fresh,
             )
 
         if self._k8s_available:
@@ -635,8 +654,15 @@ class VMProvisioner:
         memory: str,
         description: str,
         entity_type: str = "job",
+        set_provisioning: bool = True,
     ) -> bool:
-        """Create a VM by POSTing to the co-located VM controller."""
+        """Create a VM by POSTing to the co-located VM controller.
+
+        ``set_provisioning=False`` marks a golden-poll re-issue: skip the
+        interim 'provisioning' context write so the status stays
+        ``waiting_golden`` between polls (the response merge below still
+        records whatever the controller answered).
+        """
         if self._http_client is None:
             return False
 
@@ -652,27 +678,38 @@ class VMProvisioner:
             payload["vm_image"] = vm_image
 
         try:
-            await self._set_context(entity_type, job_id, {"status": "provisioning"})
+            if set_provisioning:
+                await self._set_context(entity_type, job_id, {"status": "provisioning"})
             resp = await self._http_client.post("/vms", json=payload)
             resp.raise_for_status()
             data = resp.json()
 
-            await self._set_context(
-                entity_type,
-                job_id,
-                {
-                    "status": data.get("status", "created"),
-                    "vm_name": data.get("vm_name"),
-                    "namespace": data.get("namespace"),
-                    "provisioned_by": "http",
-                },
-            )
-            logger.info(
-                "VM created (http): %s (%s %s)",
-                data.get("vm_name"),
-                entity_type,
-                job_id,
-            )
+            updates = {
+                "status": data.get("status", "created"),
+                "vm_name": data.get("vm_name"),
+                "namespace": data.get("namespace"),
+                "provisioned_by": "http",
+            }
+            # waiting_golden responses carry golden import telemetry instead
+            # of a VM name; surface it for the dispatcher's poll logging.
+            for key in ("golden", "golden_phase", "golden_progress"):
+                if data.get(key) is not None:
+                    updates[key] = data[key]
+            await self._set_context(entity_type, job_id, updates)
+            if data.get("status") == "waiting_golden":
+                logger.info(
+                    "VM create deferred (http): golden %s importing (%s %s)",
+                    data.get("golden"),
+                    entity_type,
+                    job_id,
+                )
+            else:
+                logger.info(
+                    "VM created (http): %s (%s %s)",
+                    data.get("vm_name"),
+                    entity_type,
+                    job_id,
+                )
             return True
         except httpx.HTTPStatusError as e:
             error = _extract_http_error(e.response)
@@ -826,6 +863,10 @@ class VMProvisioner:
             "ssh_probe_attempts": 0,
             "ssh_probe_error": None,
             "ssh_probe_failed_at": None,
+            # Golden-wait anchor from a previous incarnation must not cap this
+            # provision's patience for a cold golden import (dispatcher stamps
+            # it again on the first waiting_golden it sees).
+            "golden_wait_started_at": None,
             "provisioned_at": time.time(),
         }
 

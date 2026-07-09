@@ -6878,6 +6878,54 @@ class PostgresDB:
             )
             return result == "UPDATE 1"
 
+    async def get_user_cloud_identity(self, user_id: str) -> Dict[str, Any]:
+        """Get a user's per-backend cloud identity cache. Empty dict if unset.
+
+        Shape: ``{"<backend_id>": {"user_id", "home_browser_url", "resolved_at"}}``.
+        Maintained by services/cloud/identity.py — positive resolutions only.
+        """
+        try:
+            uuid_val = UUID(user_id)
+        except (ValueError, TypeError):
+            return {}
+        async with self.acquire() as conn:
+            val = await conn.fetchval(
+                "SELECT COALESCE(cloud_identity, '{}') FROM users WHERE id = $1",
+                uuid_val,
+            )
+            if val is None:
+                return {}
+            return json.loads(val) if isinstance(val, str) else val
+
+    async def merge_user_cloud_identity(
+        self, user_id: str, backend_id: str, entry: Dict[str, Any]
+    ) -> bool:
+        """Merge fields into one backend's entry in users.cloud_identity.
+
+        Single-statement ``jsonb_set(..., existing || $3)`` so concurrent
+        resolvers (e.g. member sync fan-out) can't lose each other's fields.
+        """
+        try:
+            uuid_val = UUID(user_id)
+        except (ValueError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE users
+                SET cloud_identity = jsonb_set(
+                    COALESCE(cloud_identity, '{}'::jsonb),
+                    ARRAY[$2],
+                    COALESCE(cloud_identity -> $2, '{}'::jsonb) || $3::jsonb
+                )
+                WHERE id = $1
+                """,
+                uuid_val,
+                backend_id,
+                json.dumps(entry),
+            )
+            return result == "UPDATE 1"
+
     async def list_active_ide_workspaces(self) -> List[Dict[str, Any]]:
         """Return active IDE-enabled workspaces (jobs + threads).
 
@@ -9603,13 +9651,20 @@ class PostgresDB:
         """Normalize a project_loops asyncpg Record into a serializable dict.
 
         Decodes the ``role_sequence`` and ``current_stage_jobs`` JSONB columns
-        to lists; everything else passes through. Returns None on a None row so
-        callers can chain.
+        to lists (plus the 0050 campaign columns — ``campaign`` /
+        ``campaign_caps`` to dicts, ``campaign_history`` to a list); everything
+        else passes through. Returns None on a None row so callers can chain.
         """
         if row is None:
             return None
         out = dict(row)
-        for jsonb_col in ("role_sequence", "current_stage_jobs"):
+        for jsonb_col in (
+            "role_sequence",
+            "current_stage_jobs",
+            "campaign",
+            "campaign_history",
+            "campaign_caps",
+        ):
             val = out.get(jsonb_col)
             if isinstance(val, str):
                 try:
@@ -9632,6 +9687,8 @@ class PostgresDB:
         run_until: datetime | None = None,
         max_consecutive_failures: int = 3,
         workspace_backend: str | None = None,
+        scheduling: str = "rotation",
+        campaign_caps: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Insert a project_loop control row in 'running' status.
 
@@ -9640,6 +9697,9 @@ class PostgresDB:
         too). The caller (router) validates the budget before calling.
         ``workspace_backend`` (optional) is the per-loop workspace tier override
         injected into every spawned job's config_override (mirrors ``model``).
+        ``scheduling`` / ``campaign_caps`` (0050) opt the loop into planner-mode
+        campaign scheduling; both are start-time-only and validated by the
+        router (docs/features/loop_campaign_scheduling.md).
         """
         roles = role_sequence or ["scholar", "critic", "developer"]
         async with self.acquire() as conn:
@@ -9650,14 +9710,16 @@ class PostgresDB:
                     goal, acceptance_criteria, user_prompt, model,
                     role_sequence, seq_index,
                     max_iterations, remaining_iterations, run_until,
-                    max_consecutive_failures, workspace_backend
+                    max_consecutive_failures, workspace_backend,
+                    scheduling, campaign_caps
                 )
                 VALUES (
                     $1, $2, 'running',
                     $3, $4, $5, $6,
                     $7::jsonb, 0,
                     $8, $8, $9,
-                    $10, $11
+                    $10, $11,
+                    $12, $13::jsonb
                 )
                 RETURNING *
                 """,
@@ -9672,6 +9734,8 @@ class PostgresDB:
                 run_until,
                 max_consecutive_failures,
                 workspace_backend,
+                scheduling,
+                json.dumps(campaign_caps) if campaign_caps is not None else None,
             )
         return self._project_loop_row_to_dict(row)
 
@@ -9747,6 +9811,11 @@ class PostgresDB:
             "consecutive_failures",
             "last_error",
             "stop_reason",
+            # Planner-mode campaign state (0050). `scheduling` / `campaign_caps`
+            # are deliberately NOT updatable — start-time-only (flipping a live
+            # loop's mode would orphan in-flight campaign state).
+            "campaign",
+            "campaign_history",
         }
     )
 
@@ -9758,8 +9827,10 @@ class PostgresDB:
         """Partial update of a project_loop row.
 
         Unknown fields raise ValueError to catch typos at the boundary rather
-        than silently no-op. ``role_sequence`` and ``current_stage_jobs`` are
-        JSONB-encoded; ``current_job_id`` is coerced to UUID (None clears it).
+        than silently no-op. ``role_sequence`` / ``current_stage_jobs`` /
+        ``campaign_history`` are JSONB-encoded lists; ``campaign`` is a
+        JSONB-encoded object where None means SQL NULL (no active campaign);
+        ``current_job_id`` is coerced to UUID (None clears it).
         """
         unknown = set(fields) - self._PROJECT_LOOP_UPDATABLE_FIELDS
         if unknown:
@@ -9770,8 +9841,11 @@ class PostgresDB:
         sets: list[str] = []
         params: list[Any] = []
         for key, value in fields.items():
-            if key in ("role_sequence", "current_stage_jobs"):
+            if key in ("role_sequence", "current_stage_jobs", "campaign_history"):
                 params.append(json.dumps(value or []))
+                sets.append(f"{key} = ${len(params)}::jsonb")
+            elif key == "campaign":
+                params.append(json.dumps(value) if value is not None else None)
                 sets.append(f"{key} = ${len(params)}::jsonb")
             elif key == "current_job_id":
                 params.append(UUID(value) if value else None)

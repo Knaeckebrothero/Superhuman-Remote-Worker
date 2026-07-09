@@ -224,6 +224,7 @@ class NatsBridge:
         memory: str = "16Gi",
         description: str = "",
         entity_type: str = "job",
+        set_provisioning: bool = True,
     ) -> bool:
         """Publish a VM creation request.
 
@@ -236,6 +237,11 @@ class NatsBridge:
             description: Job description passed to the agent.
             entity_type: "job" (default) or "thread" — controls which DB
                 table receives context updates when the daemon registers.
+            set_provisioning: False for a golden-poll re-issue — the context
+                status must stay ``waiting_golden`` between polls so the
+                dispatcher keeps polling instead of treating the job as a
+                booting VM (the controller's status publish overwrites it
+                with the truth on every poll response).
 
         Returns:
             True if published, False if NATS unavailable.
@@ -276,10 +282,13 @@ class NatsBridge:
             logger.info("Published %s for %s %s", subject, entity_type, job_id)
 
             # Update context to reflect provisioning state
-            if entity_type == "thread":
-                await self._set_thread_vm_context(job_id, {"status": "provisioning"})
-            else:
-                await self._set_vm_context(job_id, {"status": "provisioning"})
+            if set_provisioning:
+                if entity_type == "thread":
+                    await self._set_thread_vm_context(
+                        job_id, {"status": "provisioning"}
+                    )
+                else:
+                    await self._set_vm_context(job_id, {"status": "provisioning"})
             return True
         except Exception as e:
             logger.error(
@@ -475,6 +484,11 @@ class NatsBridge:
                 updates["pod_ip"] = data["pod_ip"]
             if data.get("ssh_nodeport"):
                 updates["ssh_nodeport"] = data["ssh_nodeport"]
+            # waiting_golden telemetry — golden DV name + import progress, used
+            # by the dispatcher's poll logging and park error message.
+            for key in ("golden", "golden_phase", "golden_progress"):
+                if data.get(key) is not None:
+                    updates[key] = data[key]
 
             logger.info(
                 "VM lifecycle status for %s %s: %s",
