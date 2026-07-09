@@ -79,3 +79,25 @@ def test_is_whiteout_rejects_bare_and_sentinel_names():
     assert not is_whiteout(".wh.")          # marker with no target is not valid
     assert not is_whiteout(".wh..wh..opq")  # opaque sentinel, not a whiteout
     assert not is_whiteout("regular.txt")
+
+
+def test_char_device_named_dotwh_opq_is_engine_bookkeeping_not_deletion(tmp_path):
+    # Live-discovered fuse-overlayfs artifact: after `mv lowerdir newdir`, the
+    # renamed dir's upperdir gets a char(0,0) node literally named `.wh..opq`
+    # — a whiteout OF the opaque-sentinel name, i.e. engine bookkeeping, not
+    # a deleted user file (overlay-reserved names can never be real files).
+    sub = tmp_path / "newdir"
+    sub.mkdir()
+    _mkchardev_or_skip(sub / ".wh..opq")
+    (sub / "kept.txt").write_text("x")
+    got = enumerate_diff(str(tmp_path))
+    assert got == [DiffEntry("newdir/kept.txt", "present")]
+
+
+def test_char_device_named_dotwh_foo_is_engine_bookkeeping_not_deletion(tmp_path):
+    # Generic rule, not just the `.opq` special case: ANY char(0,0) node
+    # whose name starts with `.wh.` is bookkeeping and must be skipped.
+    _mkchardev_or_skip(tmp_path / ".wh.foo")
+    (tmp_path / "kept.txt").write_text("x")
+    got = enumerate_diff(str(tmp_path))
+    assert got == [DiffEntry("kept.txt", "present")]
