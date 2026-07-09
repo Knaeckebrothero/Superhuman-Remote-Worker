@@ -18,6 +18,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
+    from .catalog import create_catalog_tools
     from .jobs import create_orchestrator_tools as _create_jobs
     from .projects import create_project_tools
     from .repositories import create_repository_tools
@@ -26,11 +27,13 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         *_create_jobs(context),
         *create_project_tools(context),
         *create_repository_tools(context),
+        *create_catalog_tools(context),
     ]
 
 
 def get_orchestrator_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all orchestrator tools."""
+    from .catalog import CATALOG_TOOLS_METADATA
     from .jobs import ORCHESTRATOR_TOOLS_METADATA
     from .projects import PROJECT_TOOLS_METADATA
     from .repositories import REPOSITORY_TOOLS_METADATA
@@ -39,4 +42,5 @@ def get_orchestrator_metadata() -> Dict[str, Dict[str, Any]]:
         **ORCHESTRATOR_TOOLS_METADATA,
         **PROJECT_TOOLS_METADATA,
         **REPOSITORY_TOOLS_METADATA,
+        **CATALOG_TOOLS_METADATA,
     }
