@@ -261,12 +261,23 @@ async def list_project_loop_jobs(
     project_id: str,
     limit: int = Query(100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List the active loop's spawned jobs, newest first."""
+    """List the loop's spawned jobs, newest first.
+
+    Prefers the active (running|paused) loop but falls back to the most recent
+    terminal one — the cockpit polls this during the graceful-stop wind-down
+    window (loop stopped, last job still finishing) to drive the wind-down
+    notice, so a stopped loop must still return its jobs. Mirrors the
+    active-or-most-recent fallback in ``get_project_loop``. 404 only if the
+    project never had a loop.
+    """
     from main import postgres_db  # late import: avoid circular
 
     await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="viewer")
     loop = await postgres_db.get_active_project_loop(project_id)
     if not loop:
-        raise HTTPException(status_code=404, detail="No active loop for this project")
+        recent = await postgres_db.list_project_loops(project_id=project_id)
+        loop = recent[0] if recent else None
+    if not loop:
+        raise HTTPException(status_code=404, detail="No loop for this project")
     return await postgres_db.list_project_loop_jobs(str(loop["id"]), limit=limit)

@@ -302,6 +302,11 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
             logger.info(
                 "Updated user %s from OIDC claims: %s", sub, list(needs_update.keys())
             )
+            if needs_update.get("is_admin"):
+                # Promotion to admin: seed max-level grants so the grants data
+                # (and UI) reflect the bypass instead of an empty list that
+                # reads as "no permission". Existing admins: migration 0049.
+                await db.seed_admin_grants(str(user["id"]))
         user["is_approved"] = db_approved or role_approved
         user["preferred_username"] = preferred_username
         return user
@@ -315,6 +320,9 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
         is_approved=role_approved,
         preferred_username=preferred_username,
     )
+    if is_admin and user.get("id"):
+        # First login of an admin: seed max-level grants (see promotion path).
+        await db.seed_admin_grants(str(user["id"]))
     # Effective approval reflects the OR-merge inside upsert: an admin-created
     # or pre-seeded row can already be approved without carrying the role.
     effective_approved = bool(user.get("is_approved"))

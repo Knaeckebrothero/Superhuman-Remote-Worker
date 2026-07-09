@@ -180,9 +180,15 @@ interface JobRow {
                   </td>
                   <td>
                     <div class="status-cell-inner">
-                      <app-badge [tone]="jobStatusTone(row.job.status)" size="sm">
-                        {{ 'jobs.status.' + row.job.status | transloco }}
-                      </app-badge>
+                      @if (row.job.pending_approval) {
+                        <app-badge tone="warning" size="sm">
+                          {{ 'jobs.status.waiting_approval' | transloco }}
+                        </app-badge>
+                      } @else {
+                        <app-badge [tone]="jobStatusTone(row.job.status)" size="sm">
+                          {{ 'jobs.status.' + row.job.status | transloco }}
+                        </app-badge>
+                      }
                       @if (row.job.status === 'waiting' && row.hasChildren) {
                         <span class="delegation-badge" [title]="'jobs.tooltip.delegationWaiting' | transloco">
                           {{ 'jobs.delegationChildren' | transloco:{ count: getChildCount(row.job.id) } }}
@@ -216,7 +222,9 @@ interface JobRow {
                       </app-icon-button>
                       <app-menu #rowMenu>
                         <app-menu-item (activated)="viewJob(row.job.id)">{{ 'jobs.action.view' | transloco }}</app-menu-item>
-                        @if (row.job.status === 'pending_review') {
+                        @if (row.job.pending_approval) {
+                          <app-menu-item (activated)="goToApproveRequest(row.job)">{{ 'jobs.action.approveRequest' | transloco }}</app-menu-item>
+                        } @else if (row.job.status === 'pending_review') {
                           <app-menu-item (activated)="reviewJob(row.job.id)">{{ 'jobs.action.review' | transloco }}</app-menu-item>
                         } @else if (row.job.status === 'processing') {
                           <app-menu-item (activated)="pauseJob(row.job.id)">{{ 'jobs.action.pause' | transloco }}</app-menu-item>
@@ -302,7 +310,18 @@ interface JobRow {
                         {{ 'jobs.action.review' | transloco }}
                       </app-button>
                     }
-                    @if (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created') {
+                    @if (row.job.pending_approval) {
+                      <!-- The job is blocked on a sudo/VM-upgrade decision:
+                           Resume would do nothing — route to the request. -->
+                      <app-button
+                        variant="warning"
+                        size="sm"
+                        [ariaLabel]="'jobs.tooltip.approveRequest' | transloco"
+                        (clicked)="goToApproveRequest(row.job); $event.stopPropagation()"
+                      >
+                        {{ 'jobs.action.approveRequest' | transloco }}
+                      </app-button>
+                    } @else if (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created') {
                       <app-button
                         variant="success"
                         size="sm"
@@ -1282,6 +1301,19 @@ export class JobListComponent implements OnInit, OnDestroy {
     this.data.setCurrentJob(jobId);
     this.selectedJobId.set(jobId);
     this.router.navigate(['/jobs/review']);
+  }
+
+  /**
+   * Jump to the job's open sudo/VM-upgrade request in the inbox (same
+   * deep-link the notification email uses). Shown in place of Resume while
+   * an approval is pending — resuming an approval-blocked job does nothing;
+   * the approve/deny decision is what drives it.
+   */
+  goToApproveRequest(job: JobSummary): void {
+    const queryParams = job.pending_approval_request_id
+      ? { sudo: job.pending_approval_request_id }
+      : undefined;
+    this.router.navigate(['/inbox'], { queryParams });
   }
 
   pauseJob(jobId: string): void {

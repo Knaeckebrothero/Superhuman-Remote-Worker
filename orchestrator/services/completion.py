@@ -285,7 +285,7 @@ AUTO_REDISPATCH_FREEZE_TYPES: frozenset[str] = frozenset(
 # ceiling), so guarding the short-circuit does not turn a genuine give-up into a
 # pause. ``llm_unavailable`` is included alongside the auto-redispatch set (same
 # failure class — the outage sweeper re-dispatches it).
-# docs/issues/version_upgrade_drain_masked_by_coincident_error.md
+# docs/done/version_upgrade_drain_masked_by_coincident_error.md
 ERROR_IMMUNE_FREEZE_TYPES: frozenset[str] = AUTO_REDISPATCH_FREEZE_TYPES | frozenset(
     {"llm_unavailable"}
 )
@@ -517,7 +517,7 @@ def determine_job_status(
         # that actually stopped: critic subjobs (parent_job_id) keep failing on
         # error as before, and a stale row freeze can't shield a crashed run
         # (should_stop is False there, so the guard falls through to failed).
-        # docs/issues/version_upgrade_drain_masked_by_coincident_error.md
+        # docs/done/version_upgrade_drain_masked_by_coincident_error.md
         if not (
             should_stop
             and job.get("parent_job_id") is None

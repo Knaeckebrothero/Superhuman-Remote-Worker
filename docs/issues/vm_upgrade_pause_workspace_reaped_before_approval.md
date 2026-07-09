@@ -14,8 +14,18 @@ tags:
 
 **Status:** investigated 2026-07-08 from a live incident on the main cluster
 (`superhuman-remote-worker`); **research-refined 2026-07-09** (4 codebase lanes + 2
-verified web-prior-art lanes) — now an implementation-ready fix spec. Root causes
-confirmed in code. Not yet implemented.
+verified web-prior-art lanes); **IMPLEMENTED 2026-07-09** — all six fixes landed
+(see "Implementation status" below for what shipped vs. what was found already
+done vs. the one explicitly deferred piece). Unit-tested
+(`tests/test_sudo_vm_upgrade_decisions.py` + updated lifecycle tests; full
+suite 8281 green) and **k3d-smoked live**: migration 0049 applied, jobs list
+returns `pending_approval` + request id, and a planted frozen job was denied
+end-to-end through `POST /deny` — request row `denied` with decider identity,
+job unwedged (freeze cleared, sticky `sudo_denial` + reasoned
+`queued_feedback` in context), repeat-deny a visible no-op, conflicting
+approve a 409. Not live-smoked (needs real agents/VM provisioner): the
+approve→VM arm, the /complete auto-deny + freeze-capture, and the 30-min
+grace-reap timing. Uncommitted.
 **Severity:** high — the job is unrecoverable and the loss is silent. Any job that
 hits the sudo/VM-upgrade gate and isn't decided within the reaper's window (next
 tick, ~60 s) dies on decision/resume, even though the approval request itself is
@@ -369,6 +379,86 @@ work needed.
 (`sudo.service.ts:180`) so the chip clears instantly; carry `request_type` +
 `expires_at` for a countdown; a "Waiting · approval" filter chip; reword the email
 button "Reply in Cockpit" → "Approve in Cockpit".
+
+## Implementation status (2026-07-09)
+
+All six fixes are implemented; unit suites green. What actually shipped:
+
+- **Fix 1 (capture at pause):** `/complete`'s `vm_upgrade_required` branch now
+  fires a background `_capture_workspace_snapshot_for_freeze` (main.py) —
+  SSH-tar → S3 while the workspace is certainly alive; unreachable tailnet
+  targets skip visibly inside the snapshot service. **Fix 1.2 was already
+  done upstream:** the chart defaults `checkpointer.backend: "postgres"`
+  (`helm/values.yaml:475`), so reasoning state no longer lives inside the
+  workspace on chart deploys; `db_url.py`'s sqlite default only applies to
+  bare-metal runs.
+- **Fix 2 (warm grace):** `paused_grace_seconds()` / `paused_within_grace()`
+  in `workspace_manager.py`, gating `is_idle`/`is_reapable` in BOTH managers;
+  `job_updated_at` plumbed into `Instance.metadata` (pods via the bound row,
+  VMs via `_fetch_vm_rows`). Env: `WORKSPACE_PAUSED_REAP_GRACE_S`, defaulting
+  to `WORKSPACE_IDLE_TIMEOUT` (minutes, default 30) so the suspension sweep
+  gets first claim. Unknown pause age = inside grace (never destroy on
+  missing data).
+- **Fix 3 (restore-and-decide):** the endpoint bodies were extracted into
+  request-free internals — and in the process a **third live bug** surfaced:
+  `/approve-upgrade` called `upgrade_job_to_vm(str(job_id))` and
+  `/resume-without-vm` called `approve_job(str(job_id))` with the FastAPI
+  `Request` parameter missing → TypeError→500 *after* flipping the row (and
+  `approve_job` would 400 on a paused job anyway). Now:
+  `_apply_vm_upgrade_decision()` is the single driver behind all four
+  endpoints (and the MCP tools via REST): first-decider-wins on the row flip,
+  expired-rejects-late-decisions, and an idempotent re-drive when the same
+  decision is repeated while the job is still frozen (this also **recovers
+  historically wedged jobs**). Deny/resume-without-vm →
+  `_resume_job_without_vm_internal()`: sticky `context.sudo_denial` +
+  reasoned `queued_feedback`, freeze cleared, unassigned, `paused`,
+  dispatch triggered. Both dispatch paths apply `_apply_sticky_sudo_denial`,
+  which flips the agent's sudo gate to `block` with a reasoned
+  `shell.sudo_block_message` (new config key threaded through
+  `RemoteBackend` + `ShellManager`) so the replayed command can't re-freeze.
+  Same-tier restore-after-reap: `WorkspaceInstanceManager.delete()` now marks
+  a reaped non-terminal emptyDir workspace with an available snapshot as
+  `'suspended'` instead of `'deleted'`, so `ensure_workspace` routes the next
+  dispatch through the S3 restore instead of a blank re-create.
+  **Deferred:** extracting the S3 archive *into a fresh VM* on cross-tier
+  approve — needs the presigned-pull/cloud-init transport or
+  persistent-rootdisk (fix 1.3/1.4); until then the approve arm rides on the
+  postgres checkpoint + Gitea phase-boundary seed, same as before, with the
+  archive already captured for when the transport lands.
+- **Fix 3.5 (expiry):** `_fail_expired_vm_upgrade_jobs()` runs in the sudo
+  expiration sweeper: any paused vm_upgrade-frozen job whose requests are all
+  expired (none pending) fails loudly with a `vm_upgrade_expired` message and
+  cleared freeze (so Resume raises a FRESH request) — and it heals historical
+  expired-wedges, not just new ones.
+- **Fix 4 (auto-deny):** `/complete` pre-checks the owner via
+  `_check_vm_permission` (kill-switch + admin + grant); an unsatisfiable
+  request writes an `auto_denied` row (extended
+  `insert_vm_upgrade_request(status=, decision_reason=)`, no SSE/no email)
+  and routes straight to the deny arm. Infra failure during the pre-check →
+  raise the approval normally (never guess). If the auto-deny resume fails,
+  the job stays paused and the `auto_denied` row is re-drivable via the deny
+  endpoint.
+- **Fix 5 (admin):** `user_can_use_vm` now short-circuits on `is_admin`;
+  migration `0049_backfill_admin_grants.sql` seeds max-level rows for
+  existing admins (idempotent, 0030 pattern; demotion caveat documented in
+  the header); `auth.py` seeds on first admin login / promotion
+  (`seed_admin_grants`); the Admin→Grants page shows an "Admin —
+  unrestricted" banner for admin users and marks them in the user picker
+  (`/api/users/me/capabilities` already returned `grants: null` for admins).
+- **Bonus fix (found during the k3d smoke):** the sudo gate was only
+  DB-connected inside the NATS bridge (`nats_bridge.py:181`), so on any
+  deployment without NATS every `/api/sudo/*` endpoint 404'd and the
+  vm_upgrade freeze never even created its approval row. The gate now
+  DB-connects unconditionally at startup (`main.py` lifespan); the NATS
+  bridge re-connects it with the NATS handle when available (live
+  sudo_command daemon requests still need that).
+- **Fix 6 (job list):** both jobs-list builders carry
+  `pending_approval` + `pending_approval_request_id` via a `LEFT JOIN
+  LATERAL` on open, unexpired `sudo_approval_requests`; `JobSummary` gained
+  both fields; the status cell shows a warning `Waiting · approval` chip in
+  place of the bland status chip; Resume is unreachable while an approval is
+  pending and an **Approve request** button/menu-item deep-links to
+  `/inbox?sudo=<id>` (desktop + mobile kebab); en + de strings added.
 
 ### Suggested sequencing
 

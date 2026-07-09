@@ -310,6 +310,7 @@ class ShellManager:
         sandbox_cwd: Optional[str] = None,
         backend: Optional[Any] = None,
         sudo_action: str = "freeze",
+        sudo_block_message: Optional[str] = None,
     ):
         """Initialize ShellManager over a shell-capable workspace backend.
 
@@ -329,6 +330,10 @@ class ShellManager:
             sudo_action: How to handle sudo commands. "freeze" returns a sentinel
                          for the tool layer to trigger a job freeze (VM upgrade prompt).
                          "block" hard-rejects. "allow" passes through (VM-backed agents).
+            sudo_block_message: Optional custom message for the "block" action —
+                         the orchestrator injects the operator's denial reason here
+                         after a vm_upgrade request is denied, so the agent gets a
+                         reasoned rejection instead of the generic block text.
 
         Raises:
             RuntimeError: If no backend is given or it does not declare shell
@@ -351,6 +356,7 @@ class ShellManager:
         self.sandbox_cwd = sandbox_cwd
         self._backend = backend
         self.sudo_action = sudo_action
+        self.sudo_block_message = sudo_block_message
 
         if blocked_commands is None:
             self.blocked_commands = DEFAULT_BLOCKED_COMMANDS
@@ -582,7 +588,7 @@ class ShellManager:
             elif self.sudo_action == "freeze":
                 return SUDO_FREEZE_SENTINEL
             else:  # "block"
-                return (
+                return self.sudo_block_message or (
                     "Command blocked: 'sudo' is not available in this container. "
                     "System package installation requires a VM runtime."
                 )

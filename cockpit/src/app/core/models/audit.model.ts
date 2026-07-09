@@ -124,4 +124,12 @@ export interface JobSummary {
    * folder" button; `'diff'` jobs route to the Mode A diff-review instead.
    */
   cloud_review_mode?: 'diff' | 'open_folder' | null;
+  /**
+   * True while a sudo/VM-upgrade approval request is open for this job — the
+   * job is blocked on a human decision in the inbox, not resumable (Resume
+   * would reconnect nothing; the decision drives the job).
+   */
+  pending_approval?: boolean;
+  /** Newest open request id, for the inbox deep-link (`/inbox?sudo=<id>`). */
+  pending_approval_request_id?: string | null;
 }

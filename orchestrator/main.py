@@ -747,11 +747,64 @@ async def lifecycle_reconciler_loop(
     logger.info("Lifecycle reconciler loop stopped")
 
 
+async def _fail_expired_vm_upgrade_jobs() -> int:
+    """Fail-loud arm for vm_upgrade freezes whose approval window closed.
+
+    A ``vm_upgrade_required`` freeze parks the job invisible to the dispatcher
+    (``freeze_data`` set) while its 24 h approval request is open. When the
+    request expires undecided, nothing else ever touches the job — pre-fix it
+    stayed wedged forever behind an expired request. Fail it with an explicit
+    ``vm_upgrade_expired`` message (never the generic ``workspace_unavailable``
+    recovery arm) and clear ``freeze_data`` so a manual Resume is viable again
+    (the replayed sudo command then raises a FRESH approval request).
+
+    Also heals historical wedges: any paused vm_upgrade-frozen job whose
+    vm_upgrade requests are all decided/expired (none pending) is picked up
+    regardless of when the window closed. Returns the number of jobs failed.
+    """
+    async with postgres_db.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT j.id
+            FROM jobs j
+            WHERE j.status = 'paused'
+              AND j.freeze_data->>'freeze_type' = 'vm_upgrade_required'
+              AND EXISTS (
+                  SELECT 1 FROM sudo_approval_requests s
+                  WHERE s.job_id = j.id AND s.request_type = 'vm_upgrade'
+                    AND s.status = 'expired'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM sudo_approval_requests s
+                  WHERE s.job_id = j.id AND s.request_type = 'vm_upgrade'
+                    AND s.status = 'pending'
+              )
+            """
+        )
+        for row in rows:
+            await conn.execute(
+                "UPDATE jobs SET status = 'failed', freeze_data = NULL, "
+                "error_message = $2, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = $1 AND status = 'paused'",
+                row["id"],
+                "vm_upgrade_expired: the VM-upgrade approval window (24h) "
+                "closed with no decision. Re-run or resume the job — the sudo "
+                "command will raise a fresh approval request.",
+            )
+            logger.warning(
+                "Job %s failed: vm_upgrade approval window expired undecided",
+                row["id"],
+            )
+    return len(rows)
+
+
 async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
     """Background task that denies expired sudo approval requests.
 
     Runs every 15 seconds. For each expired request, publishes a denial
-    to the stored NATS reply subject so the daemon unblocks.
+    to the stored NATS reply subject so the daemon unblocks. Expired
+    vm_upgrade requests additionally fail their frozen job loudly
+    (``vm_upgrade_expired``) instead of leaving it invisibly wedged.
     """
     from services.sudo_gate import sudo_gate  # noqa: E402
 
@@ -761,6 +814,11 @@ async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
             await sudo_gate.sweep_expired()
         except Exception as e:
             logger.error("Error in sudo expiration sweeper: %s", e)
+
+        try:
+            await _fail_expired_vm_upgrade_jobs()
+        except Exception as e:
+            logger.error("Error failing expired vm_upgrade jobs: %s", e)
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=15.0)
@@ -1904,6 +1962,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 f"provisioner={container_ctx.get('provisioner', 'k8s')})"
             )
 
+        # Sticky sudo denial (vm_upgrade denied / resumed without VM): block
+        # sudo with the operator's reason instead of re-freezing into a new
+        # approval loop.
+        config_override = _apply_sticky_sudo_denial(job, config_override)
+
         # Inject lite workspace config (virtual/none — no SSH, no provisioning).
         # The user's config_override already names the backend; here we attach
         # the object-store mounts (virtual) with deployment-sourced credentials,
@@ -2275,6 +2338,11 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 container_host,
                 container_ctx.get("port", 22),
             )
+
+        # Sticky sudo denial (vm_upgrade denied / resumed without VM): block
+        # sudo with the operator's reason instead of re-freezing into a new
+        # approval loop.
+        config_override = _apply_sticky_sudo_denial(job, config_override)
 
         # Re-inject lite workspace config on resume. Mounts + credentials are
         # injected in-flight and never persisted to jobs.config_override, so the
@@ -3032,6 +3100,46 @@ def _get_container_context(job: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             ctx = {}
     return ctx.get("workspace_container", {})
+
+
+def _apply_sticky_sudo_denial(job: dict, config_override: dict | None) -> dict | None:
+    """Flip the agent's sudo gate to a reasoned block when the job carries a
+    sudo/VM-upgrade denial (``context.sudo_denial``, written by
+    ``_resume_job_without_vm_internal``).
+
+    Without this, the agent resuming from its checkpoint replays the gated
+    command, hits ``sudo_action="freeze"`` again, and re-freezes into a brand
+    new approval loop the operator just declined. Applies to non-VM backends
+    only — a VM owns its own sudo gate, and reaching one means the upgrade was
+    approved after all.
+
+    Returns the (possibly newly created) config_override.
+    """
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    denial = ctx.get("sudo_denial")
+    if not isinstance(denial, dict):
+        return config_override
+    if ((config_override or {}).get("workspace") or {}).get("backend") == "vm":
+        return config_override
+    config_override = config_override or {}
+    shell_cfg = config_override.setdefault("shell", {})
+    shell_cfg["sudo_action"] = "block"
+    decided_by = denial.get("decided_by") or "the operator"
+    reason = denial.get("reason") or ""
+    shell_cfg["sudo_block_message"] = (
+        "Command blocked: sudo was "
+        + ("denied" if denial.get("denied", True) else "waived (resume without VM)")
+        + f" for this job by {decided_by}"
+        + (f" — {reason}" if reason else "")
+        + ". Do not re-attempt sudo; use a rootless alternative or record the "
+        "limitation in your results."
+    )
+    return config_override
 
 
 # =============================================================================
@@ -5443,6 +5551,14 @@ async def lifespan(app: FastAPI):
             )
     except Exception as _e:
         logger.debug("Main cloud secret presence check skipped at startup: %s", _e)
+
+    # Sudo gate: DB-connect UNCONDITIONALLY — vm_upgrade approval requests are
+    # pure DB rows (NULL reply subject) and their REST decision surface must
+    # work without NATS. The NATS bridge below re-connects the gate WITH the
+    # NATS handle when available (live sudo_command daemon requests need it).
+    # Pre-fix, no NATS meant every /api/sudo/* endpoint 404'd and the
+    # vm_upgrade freeze never even created its approval row.
+    sudo_gate.connect(db=postgres_db)
 
     # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
     await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
@@ -8099,18 +8215,147 @@ async def get_sudo_request(request: Request, request_id: str) -> dict:
     return result
 
 
+def _job_frozen_for_vm_upgrade(job: dict | None) -> bool:
+    """Whether a job is still parked on a ``vm_upgrade_required`` freeze."""
+    if not job:
+        return False
+    fd = job.get("freeze_data")
+    if isinstance(fd, str):
+        try:
+            fd = json.loads(fd)
+        except (TypeError, ValueError):
+            return False
+    return bool(fd) and fd.get("freeze_type") == "vm_upgrade_required"
+
+
+def _decider_name(user: dict | None) -> str:
+    """Human-readable decider identity for audit rows and agent feedback."""
+    if not user:
+        return "operator"
+    return user.get("username") or user.get("email") or "operator"
+
+
+async def _apply_vm_upgrade_decision(
+    request_id: str,
+    row: dict,
+    *,
+    approve: bool,
+    upgrade: bool,
+    reason: str,
+    decided_by: str = "operator",
+) -> dict[str, Any]:
+    """Decide a ``request_type='vm_upgrade'`` approval request AND drive the job.
+
+    vm_upgrade rows have no NATS reply subject — flipping the row alone does
+    nothing to the job: ``freeze_data`` stays set, the job stays invisible to
+    the dispatcher, wedged forever. Every decision surface (generic
+    approve/deny, approve-upgrade, resume-without-vm, MCP tools via REST)
+    routes here so the decision always drives the job:
+
+      - ``approve=True, upgrade=True``  → provision a VM, Continue-as-New
+      - ``approve=True, upgrade=False`` → Continue-as-New on the original tier
+        (operator chose "resume without VM")
+      - ``approve=False``               → Continue-as-New on the original tier
+        with a sticky, reasoned denial (the agent's sudo gate flips to a
+        reasoned block, so the replayed command can't re-freeze)
+
+    Decision hygiene: bound to the immutable request id, first-decider-wins
+    (the ``status='pending'`` row flip is the claim), expired requests reject
+    late decisions, and a repeat of the SAME decision re-drives the job only
+    while it is still frozen (recovers jobs wedged by the historical
+    row-flip-only endpoints, and jobs whose upgrade failed transiently after
+    the flip) — otherwise it is a visible no-op.
+    """
+    job_id = str(row["job_id"]) if row.get("job_id") else None
+    if not job_id:
+        raise HTTPException(status_code=400, detail="No job_id in sudo request")
+
+    status = row.get("status")
+    target_status = "approved" if approve else "denied"
+    # A deny may also re-drive a row the system already auto-denied (covers
+    # the fallback where the auto-deny resume failed and left the job frozen).
+    redrivable_statuses = {target_status} | ({"auto_denied"} if not approve else set())
+
+    if status == "pending":
+        expires_at = row.get("expires_at")
+        if expires_at is not None and expires_at < datetime.now(timezone.utc):
+            # The sweeper will flip it to 'expired' shortly; reject the late
+            # decision now (stale-token model) rather than racing the sweep.
+            raise HTTPException(
+                status_code=409,
+                detail="Approval window has expired — re-run the job to raise "
+                "a new request",
+            )
+        decide = sudo_gate.approve_request if approve else sudo_gate.deny_request
+        result = await decide(request_id, reason=reason, decided_by=decided_by)
+        if not result:
+            raise HTTPException(
+                status_code=404, detail=f"Sudo request '{request_id}' not found"
+            )
+        if "error" in result:
+            # Lost the first-decider race between our read and the flip.
+            raise HTTPException(status_code=409, detail=result["error"])
+    elif status in redrivable_statuses:
+        job = await postgres_db.get_job(job_id)
+        if not _job_frozen_for_vm_upgrade(job):
+            return {
+                "id": request_id,
+                "status": status,
+                "job_id": job_id,
+                "note": "already decided and job already driven — no-op",
+            }
+        # Same decision repeated while the job is still frozen → re-drive it.
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Request already '{status}' — decisions are "
+            "first-decider-wins and bound to the request id",
+        )
+
+    if approve and upgrade:
+        job_action = await _upgrade_job_to_vm_internal(job_id)
+    else:
+        job_action = await _resume_job_without_vm_internal(
+            job_id, decided_by=decided_by, reason=reason, denied=not approve
+        )
+
+    return {
+        "id": request_id,
+        "status": target_status,
+        "job_id": job_id,
+        "job_action": job_action,
+    }
+
+
 @app.post("/api/sudo/requests/{request_id}/approve")
 async def approve_sudo_request(
     request_id: str,
     request: Request,
     body: SudoApproveRequest | None = None,
 ) -> dict:
-    """Approve a pending sudo request. Caller must be project owner of the related job, or admin."""
+    """Approve a pending sudo request. Caller must be project owner of the related job, or admin.
+
+    For ``request_type='vm_upgrade'`` rows the approval also provisions a VM
+    and re-dispatches the job — a bare row flip would leave ``freeze_data``
+    set and park the job forever.
+    """
     # H4: pre-fix, any authenticated user could approve any job's
     # privileged shell command — a trust escalation, not just info leak.
-    await require_sudo_request_authority(request, postgres_db, request_id)
+    caller = await require_approved_user(request, postgres_db)
+    row = await require_sudo_request_authority(request, postgres_db, request_id)
     reason = body.reason if body else ""
-    result = await sudo_gate.approve_request(request_id, reason=reason)
+    if row.get("request_type") == "vm_upgrade":
+        return await _apply_vm_upgrade_decision(
+            request_id,
+            row,
+            approve=True,
+            upgrade=True,
+            reason=reason or "VM upgrade approved",
+            decided_by=_decider_name(caller),
+        )
+    result = await sudo_gate.approve_request(
+        request_id, reason=reason, decided_by=_decider_name(caller)
+    )
     if not result:
         raise HTTPException(
             status_code=404, detail=f"Sudo request '{request_id}' not found"
@@ -8124,9 +8369,26 @@ async def approve_sudo_request(
 async def deny_sudo_request(
     request_id: str, body: SudoDenyRequest, request: Request
 ) -> dict:
-    """Deny a pending sudo request. Caller must be project owner of the related job, or admin."""
-    await require_sudo_request_authority(request, postgres_db, request_id)
-    result = await sudo_gate.deny_request(request_id, reason=body.reason)
+    """Deny a pending sudo request. Caller must be project owner of the related job, or admin.
+
+    For ``request_type='vm_upgrade'`` rows the denial also re-dispatches the
+    job on its original tier with a sticky, reasoned denial — previously no
+    deny path acted on the job at all (row flip only → wedged forever).
+    """
+    caller = await require_approved_user(request, postgres_db)
+    row = await require_sudo_request_authority(request, postgres_db, request_id)
+    if row.get("request_type") == "vm_upgrade":
+        return await _apply_vm_upgrade_decision(
+            request_id,
+            row,
+            approve=False,
+            upgrade=False,
+            reason=body.reason,
+            decided_by=_decider_name(caller),
+        )
+    result = await sudo_gate.deny_request(
+        request_id, reason=body.reason, decided_by=_decider_name(caller)
+    )
     if not result:
         raise HTTPException(
             status_code=404, detail=f"Sudo request '{request_id}' not found"
@@ -8143,19 +8405,22 @@ async def approve_sudo_vm_upgrade(
     body: SudoApproveRequest | None = None,
 ) -> dict:
     """Approve a vm_upgrade sudo request — provisions a VM and resumes the job. Caller must be project owner of the related job, or admin."""
-    await require_sudo_request_authority(request, postgres_db, request_id)
-    reason = body.reason if body else "VM upgrade approved"
-    result = await sudo_gate.approve_request(request_id, reason=reason)
-    if not result:
+    caller = await require_approved_user(request, postgres_db)
+    row = await require_sudo_request_authority(request, postgres_db, request_id)
+    if row.get("request_type") != "vm_upgrade":
         raise HTTPException(
-            status_code=404, detail=f"Sudo request '{request_id}' not found"
+            status_code=400,
+            detail=f"Request is '{row.get('request_type')}', not a vm_upgrade "
+            "request. Use POST /approve instead.",
         )
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    job_id = result.get("job_id")
-    if not job_id:
-        raise HTTPException(status_code=400, detail="No job_id in sudo request")
-    return await upgrade_job_to_vm(str(job_id))
+    return await _apply_vm_upgrade_decision(
+        request_id,
+        row,
+        approve=True,
+        upgrade=True,
+        reason=(body.reason if body else "") or "VM upgrade approved",
+        decided_by=_decider_name(caller),
+    )
 
 
 @app.post("/api/sudo/requests/{request_id}/resume-without-vm")
@@ -8164,20 +8429,29 @@ async def resume_sudo_without_vm(
     request: Request,
     body: SudoApproveRequest | None = None,
 ) -> dict:
-    """Approve a vm_upgrade request but resume without provisioning a VM. Caller must be project owner of the related job, or admin."""
-    await require_sudo_request_authority(request, postgres_db, request_id)
-    reason = body.reason if body else "Resume without VM"
-    result = await sudo_gate.approve_request(request_id, reason=reason)
-    if not result:
+    """Approve a vm_upgrade request but resume without provisioning a VM. Caller must be project owner of the related job, or admin.
+
+    The job Continues-as-New on its original workspace tier with the sudo
+    gate flipped to a reasoned block (previously this route called the
+    pending_review-only job-approve path, which 400s on a paused job and
+    never re-provisioned anything).
+    """
+    caller = await require_approved_user(request, postgres_db)
+    row = await require_sudo_request_authority(request, postgres_db, request_id)
+    if row.get("request_type") != "vm_upgrade":
         raise HTTPException(
-            status_code=404, detail=f"Sudo request '{request_id}' not found"
+            status_code=400,
+            detail=f"Request is '{row.get('request_type')}', not a vm_upgrade "
+            "request. Use POST /approve instead.",
         )
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    job_id = result.get("job_id")
-    if not job_id:
-        raise HTTPException(status_code=400, detail="No job_id in sudo request")
-    return await approve_job(str(job_id))
+    return await _apply_vm_upgrade_decision(
+        request_id,
+        row,
+        approve=True,
+        upgrade=False,
+        reason=(body.reason if body else "") or "Resume without VM",
+        decided_by=_decider_name(caller),
+    )
 
 
 @app.get("/api/sudo/rules")
@@ -8703,7 +8977,16 @@ async def upgrade_job_to_vm(request: Request, job_id: str) -> dict[str, Any]:
     """Upgrade a frozen job from container workspace to a VM.
 
     This endpoint is used when a job freezes with ``freeze_type: vm_upgrade_required``
-    (i.e. the agent attempted a sudo command in a hardened container). It:
+    (i.e. the agent attempted a sudo command in a hardened container). See
+    :func:`_upgrade_job_to_vm_internal` for the mechanics.
+    """
+    await require_job_access(request, postgres_db, job_id)
+    return await _upgrade_job_to_vm_internal(job_id)
+
+
+async def _upgrade_job_to_vm_internal(job_id: str) -> dict[str, Any]:
+    """Core of the VM upgrade — request-free so the sudo decision paths can
+    call it directly (the endpoint wrapper handles auth). It:
 
     1. Validates the job is frozen with the correct freeze type
     2. Sets ``context.vm.requested = true`` so the dispatcher provisions a VM
@@ -8719,7 +9002,6 @@ async def upgrade_job_to_vm(request: Request, job_id: str) -> dict[str, Any]:
     The original workspace container is NOT deleted immediately — it is cleaned up
     when the job eventually completes or is cancelled (existing cleanup logic).
     """
-    await require_job_access(request, postgres_db, job_id)
     try:
         # 1. Validate job
         job = await postgres_db.get_job(job_id)
@@ -8825,6 +9107,144 @@ async def upgrade_job_to_vm(request: Request, job_id: str) -> dict[str, Any]:
     except Exception as e:
         logger.exception(f"Failed to upgrade job {job_id} to VM: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> None:
+    """Force a durable capture when a job parks on a vm_upgrade approval.
+
+    The pause that follows is a human-wait (24 h approval TTL) while the
+    workspace may be legitimately reclaimed after the warm grace — the S3
+    archive (plus the cross-pod checkpointer) is what makes that reclaim
+    non-destructive. Runs as a background task: a tar + upload can take tens
+    of seconds and must not block the agent's /complete POST. Unreachable
+    targets (tailnet VMs) skip visibly inside the snapshot service; the
+    reconciler's snapshot-before-reap remains the backstop.
+    """
+    if not getattr(snapshot_service, "is_available", False):
+        return
+    container_ctx = _get_container_context(job)
+    vm_ctx = _get_vm_context(job)
+    container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
+    if container_ctx.get("status") == "ready" and container_host:
+        ssh_host, ssh_port, source = container_host, 30022, "pod"
+    elif vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
+        ssh_host = vm_ctx["ssh_host"]
+        ssh_port, source = int(vm_ctx.get("ssh_port") or 22), "vm"
+    else:
+        logger.info(f"Freeze capture skipped for {job_id}: no live workspace endpoint")
+        return
+    try:
+        ok = await snapshot_service.capture_vm_snapshot(
+            job_id=job_id,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            source_type=source,
+            agent_config=job.get("config_name") or "defaults",
+        )
+        logger.info(
+            f"Freeze capture for {job_id} ({source} {ssh_host}:{ssh_port}): "
+            f"{'ok' if ok else 'failed/skipped'}"
+        )
+    except Exception:
+        logger.exception(f"Freeze capture failed for {job_id}")
+
+
+async def _resume_job_without_vm_internal(
+    job_id: str,
+    *,
+    decided_by: str = "operator",
+    reason: str = "",
+    denied: bool = True,
+) -> dict[str, Any]:
+    """Continue-as-New on the original workspace tier after a vm_upgrade
+    decision that does NOT provision a VM (operator deny, resume-without-vm,
+    or the auto-deny for owners who can never be granted one).
+
+    Mirrors :func:`_upgrade_job_to_vm_internal`'s skeleton — clear
+    ``freeze_data``, unassign, ``status='paused'`` (dispatchable), trigger
+    dispatch — but instead of ``context.vm.requested`` it records a STICKY
+    denial in ``context.sudo_denial`` (dispatch flips the agent's sudo gate
+    from "freeze" to a reasoned "block", so the replayed command returns an
+    explanation instead of re-freezing into a new approval loop) and queues
+    reasoned feedback so the agent knows who decided, why, and what to do
+    instead. Reason-less denials demonstrably cause agent retry loops.
+    """
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    if job["status"] not in ("pending_review", "reviewing", "paused"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job cannot be resumed without VM (status: {job['status']}).",
+        )
+
+    frozen_data = job.get("freeze_data")
+    if isinstance(frozen_data, str):
+        try:
+            frozen_data = json.loads(frozen_data)
+        except (TypeError, ValueError):
+            frozen_data = None
+    command = (frozen_data or {}).get("command", "")
+
+    reason_suffix = f": {reason}" if reason else "."
+    if denied:
+        feedback = (
+            f"Your VM-upgrade request for `{command or 'a sudo command'}` was "
+            f"DENIED by {decided_by}{reason_suffix} Continue the job WITHOUT "
+            "elevated privileges. Do not re-attempt sudo commands — they will "
+            "be blocked. Use a rootless alternative, or record the limitation "
+            "in your results and move on."
+        )
+    else:
+        feedback = (
+            f"The operator ({decided_by}) chose to resume this job WITHOUT a "
+            f"VM{reason_suffix} `{command or 'sudo'}` will not run with "
+            "elevated privileges, and further sudo commands will be blocked. "
+            "Use a rootless alternative, or record the limitation in your "
+            "results and move on."
+        )
+
+    sudo_denial = {
+        "denied": denied,
+        "decided_by": decided_by,
+        "reason": reason,
+        "command": command,
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Remove local freeze artifact (parity with the upgrade arm)
+    local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
+    if local_frozen.exists():
+        local_frozen.unlink()
+
+    # ONE statement: sticky denial + queued feedback + clear freeze + unassign
+    # + paused (dispatchable) — fused so the dispatcher can never observe a
+    # half-written decision.
+    async with postgres_db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
+            "status = 'paused', freeze_data = NULL, "
+            "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2::uuid",
+            json.dumps({"sudo_denial": sudo_denial, "queued_feedback": feedback}),
+            job_id,
+        )
+
+    logger.info(
+        f"Job {job_id} resumed without VM "
+        f"({'denied' if denied else 'no-vm approve'} by {decided_by}, "
+        f"command={command!r})"
+    )
+    _trigger_dispatch()
+
+    return {
+        "status": "denied_vm_upgrade" if denied else "resumed_without_vm",
+        "job_id": job_id,
+        "command": command,
+        "decided_by": decided_by,
+        "reason": reason,
+    }
 
 
 # =============================================================================
@@ -11013,39 +11433,97 @@ async def complete_job(
             ft = fd.get("freeze_type")
             if ft in _NOTIFIABLE_FREEZE_TYPES:
                 sudo_request_id = None
+                auto_denied = False
 
                 # For vm_upgrade freezes, create a sudo_approval_requests record
                 # so the operator can approve/deny from the Cockpit Sudo tab.
                 if ft == "vm_upgrade_required":
+                    # Auto-deny an approval the job owner can never satisfy
+                    # (Teleport / GCP-PAM model: unsatisfiable requests are
+                    # rejected at creation). Raising it anyway would park the
+                    # job for 24 h on a decision no human is entitled to make.
+                    # An auto_denied row is still written for audit parity.
+                    denial_detail: str | None = None
+                    try:
+                        owner = (
+                            await postgres_db.get_user(str(job["user_id"]))
+                            if job.get("user_id")
+                            else None
+                        )
+                        try:
+                            await _check_vm_permission(owner, job_needs_vm=True)
+                        except HTTPException as he:
+                            denial_detail = str(he.detail)
+                    except Exception:
+                        # Infra failure — don't guess; raise the approval normally.
+                        logger.exception(
+                            f"VM permission pre-check failed for {job_id}; "
+                            "raising the approval request normally"
+                        )
+
                     try:
                         sudo_request_id = await sudo_gate.insert_vm_upgrade_request(
                             job_id=job_id,
                             command=fd.get("command", "unknown"),
                             reason=fd.get("reason", ""),
                             config_name=job.get("config_name", ""),
+                            status="auto_denied" if denial_detail else "pending",
+                            decision_reason=denial_detail or "",
                         )
                         if sudo_request_id:
                             actions.append(
                                 f"sudo request created ({sudo_request_id[:8]})"
+                                + (" [auto-denied]" if denial_detail else "")
                             )
                     except Exception as e:
                         logger.warning(
                             f"Failed to create sudo request for {job_id}: {e}"
                         )
 
-                try:
-                    await _notify_operator_freeze(
-                        job,
-                        job_id,
-                        ft,
-                        fd,
-                        sudo_request_id=sudo_request_id,
-                    )
-                    actions.append(f"notification sent ({ft})")
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to send freeze notification for {job_id}: {e}"
-                    )
+                    if denial_detail:
+                        try:
+                            await _resume_job_without_vm_internal(
+                                job_id,
+                                decided_by="system",
+                                reason=denial_detail,
+                                denied=True,
+                            )
+                            auto_denied = True
+                            actions.append(
+                                "vm upgrade auto-denied — job continues on its "
+                                "original tier"
+                            )
+                        except Exception:
+                            # Fall back to the normal operator flow: the job
+                            # stays paused with freeze_data and the (auto-denied)
+                            # request can be re-driven via the deny endpoint.
+                            logger.exception(
+                                f"Auto-deny resume failed for {job_id}; leaving "
+                                "the job paused for a manual decision"
+                            )
+
+                if not auto_denied:
+                    if ft == "vm_upgrade_required":
+                        # Durable capture while the workspace is certainly
+                        # alive — the job now parks on a 24h human decision and
+                        # the workspace only stays warm for the reap grace.
+                        asyncio.create_task(
+                            _capture_workspace_snapshot_for_freeze(job, job_id),
+                            name=f"freeze-capture-{job_id[:8]}",
+                        )
+                    try:
+                        await _notify_operator_freeze(
+                            job,
+                            job_id,
+                            ft,
+                            fd,
+                            sudo_request_id=sudo_request_id,
+                        )
+                        actions.append(f"notification sent ({ft})")
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to send freeze notification for {job_id}: {e}"
+                        )
 
         # 2. Subjob output graft (uniform for all subjob types; critic skipped inside)
         if job.get("parent_job_id"):

@@ -47,7 +47,7 @@ const INHERIT = '__inherit__';
                 <select [ngModel]="scopeId()" (ngModelChange)="onScopeId($event)">
                   <option [ngValue]="null">— select —</option>
                   @for (u of users.users(); track u.id) {
-                    <option [ngValue]="u.id">{{ u.display_name }} ({{ u.email }})</option>
+                    <option [ngValue]="u.id">{{ u.display_name }} ({{ u.email }}){{ u.is_admin ? ' — admin' : '' }}</option>
                   }
                 </select>
               </label>
@@ -63,6 +63,15 @@ const INHERIT = '__inherit__';
               </label>
             }
           </div>
+
+          @if (selectedUserIsAdmin()) {
+            <div class="banner info">
+              Admin — unrestricted. This user bypasses all capability checks;
+              the grants below are informational (they only take effect if the
+              user is ever demoted). An empty list would NOT mean "no
+              permission".
+            </div>
+          }
 
           @if (scopeReady()) {
             <table class="grid">
@@ -127,6 +136,10 @@ const INHERIT = '__inherit__';
     .grid .muted, .muted { color: var(--text-muted); }
     .banner { margin-top: 1rem; padding: 0.5rem 0.75rem; border-radius: 6px; }
     .banner.err { background: var(--danger-tint); color: var(--danger); }
+    .banner.info {
+      margin: 0 0 1rem; background: var(--surface-0);
+      border: 1px solid var(--border-color); color: var(--text-muted);
+    }
 
     @media (max-width: 560px) {
       /* Scope bar: stack each control full-width (bigger tap targets; also caps
@@ -163,6 +176,12 @@ export class AdminGrantsComponent implements OnInit {
 
   catalogKeys = computed(() => Object.keys(this.svc.catalog()));
   scopeReady = computed(() => this.scopeKind() === 'global' || !!this.scopeId());
+  /** Admins bypass the PDP everywhere — surface that instead of letting an
+   *  empty grant list read as "no permission" (the vm_upgrade incident). */
+  selectedUserIsAdmin = computed(() =>
+    this.scopeKind() === 'user' &&
+    !!this.users.users().find((u) => u.id === this.scopeId())?.is_admin,
+  );
 
   ngOnInit(): void {
     this.users.loadUsers();

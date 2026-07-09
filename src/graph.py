@@ -3281,7 +3281,7 @@ def create_handle_transition_node(
             # boundary is clean and the resume continues from the checkpoint, so
             # a residual error must not ride out with the freeze and get the
             # orchestrator to fail (instead of pause) this re-dispatchable job.
-            # docs/issues/version_upgrade_drain_masked_by_coincident_error.md
+            # docs/done/version_upgrade_drain_masked_by_coincident_error.md
             updates["error"] = None
             logger.info(
                 f"[{job_id}] Drain intent at phase boundary — "
