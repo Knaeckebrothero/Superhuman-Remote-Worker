@@ -260,6 +260,35 @@ export function canComposeDuringSession(isConnected: boolean, isStartingSession:
     return isConnected || isStartingSession;
 }
 
+export function canSendMessage(canCompose: boolean, text: string, attachmentCount: number): boolean {
+    return canCompose && (text.trim().length > 0 || attachmentCount > 0);
+}
+
+/**
+ * Empty-composer morph (messenger convention): the round action button offers
+ * dictation while there is nothing to send yet, and flips to send on the
+ * first keystroke or queued attachment. Suppressed while a turn is in flight
+ * so the stop/spinner states keep the button.
+ */
+export function isMicMode(
+    hasAudioInput: boolean,
+    turnInFlight: boolean,
+    text: string,
+    attachmentCount: number,
+): boolean {
+    return hasAudioInput && !turnInFlight && text.trim().length === 0 && attachmentCount === 0;
+}
+
+/**
+ * Enter-key semantics: physical keyboards send on plain Enter (Shift+Enter
+ * for a newline); on touch devices Enter always inserts a newline — the
+ * virtual-keyboard Enter sits where a thumb expects "new line", and the send
+ * button is the send affordance.
+ */
+export function shouldSendOnEnter(shiftKey: boolean, isMobileDevice: boolean): boolean {
+    return !shiftKey && !isMobileDevice;
+}
+
 /**
  * The startup step to surface in the banner: the active one, or the last
  * step as a fallback when none is active (the brief gap where every phase is
@@ -1406,43 +1435,43 @@ export function clearDraft(threadId: string | null): void {
 
             <span class="spacer"></span>
 
-            <!-- Mic button: shown only when no text/attachments queued and not streaming -->
-            @if (
-              hasAudioInput()
-              && inputText.trim().length === 0
-              && chat.pendingAttachments().length === 0
-              && !chat.isStreaming()
-              && !isPendingSend()
-            ) {
+            <!-- Action button: mic while the composer is empty, send once there is
+                 something to send, stop/spinner while a turn is in flight.
+                 pointerdown.preventDefault keeps the textarea focused, so tapping
+                 the button doesn't dismiss the on-screen keyboard (and with
+                 resizes-content, doesn't reflow the whole column mid-tap). -->
+            @if (micMode()) {
               <button
                 type="button"
-                class="ctrl mic"
+                class="send mic"
                 [disabled]="!chat.isConnected() || isTranscribing() || sttUnavailable()"
                 [title]="(sttUnavailable() ? 'chat.composer.sttNotConfigured' : 'chat.composer.recordVoice') | transloco"
+                (pointerdown)="$event.preventDefault()"
                 (click)="startRecording()"
               >
-                <app-icon size="sm" class="ctrl-icon">mic</app-icon>
+                <app-icon size="sm" class="action-icon">mic</app-icon>
+              </button>
+            } @else {
+              <button
+                type="button"
+                class="send"
+                [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
+                [class.interrupting]="chat.isInterrupting()"
+                [class.pending]="isPendingSend()"
+                [title]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
+                (pointerdown)="$event.preventDefault()"
+                (click)="chat.isStreaming() ? chat.interrupt() : send()"
+                [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
+              >
+                @if (isPendingSend() || chat.isInterrupting()) {
+                  <span class="action-spinner"></span>
+                } @else if (chat.isStreaming()) {
+                  <app-icon size="sm" class="action-icon">stop</app-icon>
+                } @else {
+                  <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
+                }
               </button>
             }
-
-            <button
-              type="button"
-              class="send"
-              [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
-              [class.interrupting]="chat.isInterrupting()"
-              [class.pending]="isPendingSend()"
-              [title]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
-              (click)="chat.isStreaming() ? chat.interrupt() : send()"
-              [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
-            >
-              @if (isPendingSend() || chat.isInterrupting()) {
-                <span class="action-spinner"></span>
-              } @else if (chat.isStreaming()) {
-                <app-icon size="sm" class="action-icon">stop</app-icon>
-              } @else {
-                <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
-              }
-            </button>
           </div>
           }
         </div>
@@ -1985,13 +2014,31 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     );
 
     // Note: queueing is now supported, so canSend no longer blocks on a pending
-    // send — the user can line up a second message while the first is in flight
-    // (Enter already bypassed the old block anyway).
-    readonly canSend = computed(
-        () =>
-            this.canCompose() &&
-            (this.inputText.trim().length > 0 || this.chat.pendingAttachments().length > 0),
-    );
+    // send — the user can line up a second message while the first is in flight.
+    // A method, NOT a computed: `inputText` is a plain ngModel field, so a
+    // computed only re-evaluated when an unrelated signal dep happened to
+    // change — on an otherwise-idle session the send button stayed disabled
+    // while typing (Enter still worked; send() checks the field directly).
+    // The (input)/(ngModelChange) bindings schedule CD, so a method re-reads
+    // the field on every keystroke.
+    canSend(): boolean {
+        return canSendMessage(
+            this.canCompose(),
+            this.inputText,
+            this.chat.pendingAttachments().length,
+        );
+    }
+
+    /** Empty composer → the action button offers dictation (method, not
+     *  computed, for the same `inputText` reason as canSend). */
+    micMode(): boolean {
+        return isMicMode(
+            this.hasAudioInput(),
+            this.chat.isStreaming() || this.chat.isInterrupting() || this.isPendingSend(),
+            this.inputText,
+            this.chat.pendingAttachments().length,
+        );
+    }
 
     // With interactive-widget=resizes-content the on-screen keyboard shrinks
     // the layout viewport, so .messages loses ~40% of its height and the
@@ -2170,7 +2217,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.imagePreviewName.set('');
     }
 
-    /** Begin a hold-to-record voice message session. */
+    /** Begin a voice recording (tap to start; the strip's ✓/✕ ends it). */
     async startRecording(): Promise<void> {
         if (this.isRecording()) return;
         this.capStopTriggered = false;
@@ -2200,10 +2247,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      *
      * The transcript is appended into `inputText` (never clobbering a typed
      * draft). Reactivity note: `inputText` is a plain field, so assigning it
-     * does NOT re-evaluate the `canSend` computed on its own — the
-     * `addAttachments` call below writes the `pendingAttachments` signal, which
-     * both enables Send and triggers the change-detection pass that re-syncs the
-     * textarea to show the transcript. Keep `addAttachments` as the last step.
+     * does not schedule change detection on its own — the `addAttachments`
+     * call below writes the `pendingAttachments` signal, which triggers the
+     * pass that re-syncs the textarea to show the transcript. Keep
+     * `addAttachments` as the last step.
      */
     async stopRecording(): Promise<void> {
         if (!this.isRecording()) return;
@@ -2495,7 +2542,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             }
         }
 
-        if (event.key === 'Enter' && !event.shiftKey) {
+        if (event.key === 'Enter') {
+            // Touch devices: let Enter fall through as a newline — the send
+            // button is the send affordance there (see shouldSendOnEnter).
+            if (!shouldSendOnEnter(event.shiftKey, this.isMobileDevice())) return;
             event.preventDefault();
             this.send();
         }
