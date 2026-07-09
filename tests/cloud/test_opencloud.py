@@ -328,6 +328,22 @@ def _install_fake(backend: OpenCloudBackend, fake: FakeOpenCloud) -> None:
     }
 
 
+class TestRoleId:
+    @pytest.mark.asyncio
+    async def test_resolves_on_cold_cache_refresh_path(self):
+        # Regression: on a cache miss the refresh path indexed the tuple-keyed
+        # _role_cache with a bare display_name string, raising KeyError. Force
+        # the cold path by clearing the pre-warmed cache.
+        backend = OpenCloudBackend(_settings())
+        fake = FakeOpenCloud()
+        _install_fake(backend, fake)
+        backend._role_cache = {}  # force the _load_role_catalog refresh
+
+        role_id = await backend._role_id("Can view", 40)
+
+        assert role_id == "bb22-viewer-role-id"
+
+
 # ----------------------------------------------------------------- Settings tests
 
 
