@@ -300,6 +300,12 @@ class FakeMainCloudBackend:
         entries.sort(key=lambda e: e.path)
         return entries
 
+    async def capture_etag_baseline(
+        self, handle: ProjectFolderHandle
+    ) -> dict[str, str]:
+        entries = await self.list_project_folder(handle)
+        return {e.path: e.etag for e in entries if not e.is_dir}
+
     async def get_project_folder_file_bytes(
         self,
         handle: ProjectFolderHandle,

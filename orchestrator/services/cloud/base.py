@@ -360,3 +360,74 @@ class SupportsRcloneMount(Protocol):
         Same-cluster workspace pods leave it ``False`` (no public-edge hairpin).
         """
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class RoReaderGrant:
+    """One minted per-mount read-only grant for protected cloud mode.
+
+    ``credentials`` is the reader's per-provision app-password (Nextcloud) or
+    ``None`` when the reader authenticates with a short-TTL bearer (OpenCloud).
+    ``grant_handle`` is opaque JSON the same backend later passes to
+    ``revoke_ro_grant`` to undo exactly this grant (design §8.1.4).
+    """
+
+    reader_id: str
+    grant_handle: str
+    webdav_url: str
+    credentials: Optional[str]
+    auth_kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanaryFixture:
+    """A real file the write identity seeds so the RO probe's CVE-side-channel
+    checks target real ids instead of synthetic ones (design §11.4).
+
+    ``version_ref``/``trash_ref`` are populated only where the backend can
+    enumerate a real version/trash id; ``None`` leaves that side channel
+    inconclusive, which — under the strict engage gate — keeps it fail-closed
+    until the §11.4 live-validation step wires + tunes them.
+    """
+
+    path: str
+    version_ref: Optional[str] = None
+    trash_ref: Optional[str] = None
+
+
+@runtime_checkable
+class SupportsRoReader(Protocol):
+    """Optional capability: provision a dedicated low-privilege read-only
+    reader identity + per-mount grant for protected cloud mode (design §3.3,
+    §8.1.4). Kept separate from ``MainCloudBackend`` so a backend that cannot
+    provide it simply does not implement these methods."""
+
+    backend_id: str
+
+    async def ensure_ro_reader(self, *, user_key: str) -> str:
+        """Idempotently ensure the ``srw-reader-<user_key>`` account exists with
+        no standing folder access. Returns its native id."""
+        ...
+
+    async def mint_ro_grant(
+        self, handle: ProjectFolderHandle, *, user_key: str, grant_key: str
+    ) -> RoReaderGrant:
+        """Grant the reader read-only access to ``handle`` for one mount
+        (``grant_key`` uniquely identifies the mount, e.g. the thread id)."""
+        ...
+
+    async def revoke_ro_grant(self, grant_handle: str, *, user_key: str) -> None:
+        """Undo a grant minted by ``mint_ro_grant``. Idempotent — a
+        double-revoke or already-gone grant is not an error."""
+        ...
+
+    async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
+        """Write a real canary file with the WRITE identity so the RO probe can
+        target real ids (design §11.4)."""
+        ...
+
+    async def remove_canary_fixture(
+        self, handle: ProjectFolderHandle, fixture: CanaryFixture
+    ) -> None:
+        """Remove the canary file seeded by ``seed_canary_fixture``."""
+        ...

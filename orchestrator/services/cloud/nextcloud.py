@@ -26,9 +26,11 @@ Uses two Nextcloud APIs:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import secrets
 import time
 from typing import Any, Optional
 from urllib.parse import quote
@@ -36,7 +38,14 @@ from urllib.parse import quote
 import httpx
 
 from ._propfind import parse_propfind_entries
-from .base import CloudMountSubject, HealthStatus, RcloneMountSpec, UserHome
+from .base import (
+    CanaryFixture,
+    CloudMountSubject,
+    HealthStatus,
+    RcloneMountSpec,
+    RoReaderGrant,
+    UserHome,
+)
 from .config import NextcloudSettings
 from .etag_baseline import PropfindError, capture_etag_baseline
 from .errors import CloudBackendError, CloudBackendErrorKind
@@ -57,6 +66,7 @@ BACKEND_ID = "nextcloud"
 
 _ALL_PERMISSIONS = 31  # read(1) + update(2) + create(4) + delete(8) + share(16)
 _SESSION_SHARE_PERMISSIONS = 15  # same minus share
+_READ_PERMISSION = 1  # read only — the protected-mode RO reader grant
 
 # Nextcloud 30.0.10+ enforces 20 new user shares per 10 minutes per user on
 # /ocs/v2.php/apps/files_sharing/api/v1/shares. The client-side bucket sits
@@ -1246,3 +1256,147 @@ class NextcloudBackend:
             data={"permissions": str(permissions)},
         )
         resp.raise_for_status()
+
+    # ------------------------------------------------ protected cloud mode: RO reader
+
+    @staticmethod
+    def _ocs_statuscode(resp: httpx.Response) -> Optional[int]:
+        try:
+            return resp.json().get("ocs", {}).get("meta", {}).get("statuscode")
+        except ValueError:
+            return None
+
+    def _require_ocs_status(
+        self, resp: httpx.Response, *, ok: set[int], op: str
+    ) -> None:
+        """Assert an OCS response is one of ``ok`` (by envelope statuscode), else
+        raise. A 200 with an unparseable envelope is treated as success."""
+        code = self._ocs_statuscode(resp)
+        if code in ok:
+            return
+        if code is None and resp.status_code == 200:
+            return
+        raise CloudBackendError(
+            CloudBackendErrorKind.UNKNOWN,
+            f"{op} failed: HTTP {resp.status_code}, ocs statuscode {code}",
+            backend=self.backend_id,
+            status_code=resp.status_code,
+        )
+
+    async def _delete_group(self, group_id: str) -> None:
+        resp = await self._client.delete(
+            f"/ocs/v2.php/cloud/groups/{group_id}", params={"format": "json"}
+        )
+        # 100/200 = deleted; 998/404 = already gone — revoke is idempotent.
+        code = self._ocs_statuscode(resp)
+        if resp.status_code in (200,) or code in (100, 200, 998):
+            return
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+
+    async def ensure_ro_reader(self, *, user_key: str) -> str:
+        """Idempotently ensure a dedicated low-privilege reader account.
+
+        Creates no group memberships, so the account has zero folder access
+        until a grant is minted. Tolerates OCS 102 (user already exists).
+        """
+        self._ensure_ready()
+        reader_id = f"srw-reader-{user_key}"
+        try:
+            resp = await self._client.post(
+                "/ocs/v2.php/cloud/users",
+                params={"format": "json"},
+                data={"userid": reader_id, "password": secrets.token_urlsafe(24)},
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        # 100/200 = created, 102 = already exists — both fine.
+        self._require_ocs_status(resp, ok={100, 200, 102}, op="create RO reader")
+        return reader_id
+
+    async def mint_ro_grant(
+        self, handle: ProjectFolderHandle, *, user_key: str, grant_key: str
+    ) -> RoReaderGrant:
+        """Mint a per-mount READ-ONLY grant: a dedicated group with permission=1
+        on the target Group Folder, the reader added to it, and a freshly
+        rotated app-password as the mount credential (design §8.1.4)."""
+        self._ensure_ready()
+        reader_id = f"srw-reader-{user_key}"
+        folder_id = handle.native_id
+        mountpoint = handle.vendor_meta.get("mountpoint")
+        if not mountpoint:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                f"project folder handle has no mountpoint (native_id={folder_id!r})",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        group_id = f"srw-rog-{grant_key[:16]}"
+        await self.ensure_group(group_id)
+        # READ ONLY — never _ALL_PERMISSIONS. This is the whole security point.
+        await self._grant_group_access(int(folder_id), group_id, _READ_PERMISSION)
+        await self.add_user_to_group(reader_id, group_id)
+        # Rotate the reader credential per provision (a leaked old password stops
+        # working after the next mount).
+        app_password = secrets.token_urlsafe(24)
+        try:
+            pw_resp = await self._client.put(
+                f"/ocs/v2.php/cloud/users/{reader_id}",
+                params={"format": "json"},
+                data={"key": "password", "value": app_password},
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        self._require_ocs_status(pw_resp, ok={100, 200}, op="rotate RO reader password")
+        webdav_url = (
+            f"{self._base_url}/remote.php/dav/files/{reader_id}/"
+            f"{quote(mountpoint, safe='')}/"
+        )
+        grant_handle = json.dumps(
+            {"group_id": group_id, "folder_id": str(folder_id), "reader_id": reader_id}
+        )
+        return RoReaderGrant(
+            reader_id=reader_id,
+            grant_handle=grant_handle,
+            webdav_url=webdav_url,
+            credentials=app_password,
+            auth_kind="basic",
+        )
+
+    async def revoke_ro_grant(self, grant_handle: str, *, user_key: str) -> None:
+        """Undo a grant minted by ``mint_ro_grant`` by deleting the per-mount
+        group, which drops both the group and its Group Folder ACL in one step
+        (the reader is left with no group → no folder access). The reader
+        account itself is left intact for reuse. Idempotent.
+
+        Deleting the group is the whole revoke — we deliberately do NOT call
+        ``remove_user_from_group`` first (it is a no-op once the group is gone,
+        and that helper is currently broken: httpx's ``delete()`` convenience
+        method rejects a request body, so its ``data=`` kwarg raises).
+        """
+        self._ensure_ready()
+        data = json.loads(grant_handle)
+        group_id = data["group_id"]
+        await self._delete_group(group_id)
+
+    async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
+        """Write a real canary file with the WRITE identity so the RO probe's
+        CVE side channels can target a real path (design §11.4)."""
+        path = ".srw-ro-canary/probe.txt"
+        await self.put_project_folder_file_bytes(handle, path=path, content=b"canary")
+        # version_ref/trash_ref require live NC version/trash APIs to enumerate
+        # real ids; wired + tuned during the §11.4 live-validation step. Until
+        # then they stay None and those side channels remain inconclusive → the
+        # strict engage gate refuses (fail-closed).
+        return CanaryFixture(path=path, version_ref=None, trash_ref=None)
+
+    async def remove_canary_fixture(
+        self, handle: ProjectFolderHandle, fixture: CanaryFixture
+    ) -> None:
+        try:
+            await self.delete_project_folder_file(
+                handle, path=fixture.path, if_exists=True
+            )
+        except CloudBackendError:
+            pass
