@@ -616,6 +616,11 @@ class TestSetupTools:
             "list_project_jobs",
             "list_project_repositories",
             "get_default_project_repository",
+            "list_experts",
+            "get_expert",
+            "list_skills",
+            "search_skills",
+            "get_skill",
         ]
 
         with (
@@ -687,6 +692,7 @@ class TestSetupTools:
                     "web_search",
                     "create_worker_job",
                     "list_project_repositories",
+                    "list_skills",
                     "request_workspace_upgrade",
                 ],
             ),
@@ -710,6 +716,7 @@ class TestSetupTools:
         assert "task_add" in loaded_names
         assert "create_worker_job" not in loaded_names
         assert "list_project_repositories" not in loaded_names
+        assert "list_skills" not in loaded_names
         assert "request_workspace_upgrade" not in loaded_names
 
     def test_no_duplicate_orchestrator_tools(self):
