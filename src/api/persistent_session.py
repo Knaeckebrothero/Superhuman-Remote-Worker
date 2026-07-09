@@ -114,19 +114,27 @@ _EXCLUDED_TOOLS = frozenset(
 )
 
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
+_AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _FLEET_MANAGEMENT_CONTROL_TOOLS = {"request_workspace_upgrade"}
 
 
 def _fleet_management_enabled(config: Any) -> bool:
     """Return whether SRW control-plane tools should be exposed.
 
-    Existing session configs predate a UI toggle for these app-control tools, so
-    absence of the marker means enabled. The marker is written only when the
+    Existing session configs predate a UI toggle for these app-control tools,
+    so absence of the marker means enabled. The marker is written only when the
     user explicitly disables ``tools.orchestrator`` in the session config
-    override.
+    override. Expert/skill catalog visibility is controlled separately by
+    ``tools.agent_catalog``.
     """
     extra = getattr(config, "extra", {}) or {}
     return extra.get(_FLEET_MANAGEMENT_DISABLED_KEY) is not True
+
+
+def _agent_catalog_enabled(config: Any) -> bool:
+    """Return whether expert/skill catalog tools should be exposed."""
+    extra = getattr(config, "extra", {}) or {}
+    return extra.get(_AGENT_CATALOG_DISABLED_KEY) is not True
 
 
 @dataclass
@@ -701,15 +709,16 @@ class PersistentSession:
                 tool_names.append(name)
 
         # Fleet Management is the UI-facing group for SRW control-plane tools:
-        # session context, jobs, projects, project repositories, and future
-        # app-management readers. It defaults ON for compatibility, but an
-        # explicit ``tools.orchestrator: []`` override marks it disabled so
-        # untrusted-provider sessions can run with only work tools.
+        # session context, jobs, projects, project repositories, and workspace
+        # upgrade requests. Experts & Skills is a separate default-on catalog
+        # group keyed by ``tools.agent_catalog``.
         from ..tools.registry import get_tools_by_category
 
         fleet_management_enabled = _fleet_management_enabled(self.config)
+        agent_catalog_enabled = _agent_catalog_enabled(self.config)
         fleet_management_tools = set(get_tools_by_category("orchestrator"))
         fleet_management_tools.update(_FLEET_MANAGEMENT_CONTROL_TOOLS)
+        agent_catalog_tools = set(get_tools_by_category("agent_catalog"))
 
         if not fleet_management_enabled:
             tool_names = [
@@ -730,13 +739,24 @@ class PersistentSession:
                 "list_project_jobs",
                 "list_project_repositories",
                 "get_default_project_repository",
+            ]
+            for name in _ORCHESTRATOR_TOOLS:
+                if name not in tool_names:
+                    tool_names.append(name)
+
+        if not agent_catalog_enabled:
+            tool_names = [
+                name for name in tool_names if name not in agent_catalog_tools
+            ]
+        else:
+            _AGENT_CATALOG_TOOLS = [
                 "list_experts",
                 "get_expert",
                 "list_skills",
                 "search_skills",
                 "get_skill",
             ]
-            for name in _ORCHESTRATOR_TOOLS:
+            for name in _AGENT_CATALOG_TOOLS:
                 if name not in tool_names:
                     tool_names.append(name)
 

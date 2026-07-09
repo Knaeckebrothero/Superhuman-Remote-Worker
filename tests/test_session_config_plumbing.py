@@ -132,6 +132,12 @@ class TestSessionWorkspaceBackendOverride:
         )
         assert tools == []
 
+    def test_session_tool_group_overrides_pass_through(self):
+        tools = orch_main._validated_session_tool_overrides(
+            {"tools": {"orchestrator": [], "agent_catalog": []}}
+        )
+        assert tools == {"orchestrator": [], "agent_catalog": []}
+
     def test_absent_fleet_management_tools_override_returns_none(self):
         assert orch_main._validated_session_fleet_tools_override(None) is None
         assert orch_main._validated_session_fleet_tools_override({}) is None
@@ -149,6 +155,14 @@ class TestSessionWorkspaceBackendOverride:
             )
         assert exc.value.status_code == 400
 
+    def test_invalid_agent_catalog_tools_override_rejected(self):
+        with pytest.raises(orch_main.HTTPException) as exc:
+            orch_main._validated_session_tool_overrides(
+                {"tools": {"agent_catalog": "disabled"}}
+            )
+        assert exc.value.status_code == 400
+        assert "agent_catalog" in exc.value.detail
+
     def test_fleet_management_disabled_detection(self):
         assert orch_main._fleet_management_explicitly_disabled(
             {"tools": {"orchestrator": []}}
@@ -157,6 +171,24 @@ class TestSessionWorkspaceBackendOverride:
             {"tools": {"orchestrator": ["get_session_context"]}}
         )
         assert not orch_main._fleet_management_explicitly_disabled({})
+
+    def test_agent_catalog_disabled_detection(self):
+        assert orch_main._agent_catalog_explicitly_disabled(
+            {"tools": {"agent_catalog": []}}
+        )
+        assert not orch_main._agent_catalog_explicitly_disabled(
+            {"tools": {"agent_catalog": ["list_skills"]}}
+        )
+        assert not orch_main._agent_catalog_explicitly_disabled({})
+
+    def test_session_tool_group_disabled_markers(self):
+        markers = orch_main._session_tool_group_disabled_markers(
+            {"tools": {"orchestrator": [], "agent_catalog": []}}
+        )
+        assert markers == {
+            "_fleet_management_disabled": True,
+            "_agent_catalog_disabled": True,
+        }
 
 
 class TestSendSessionAttachPayload:

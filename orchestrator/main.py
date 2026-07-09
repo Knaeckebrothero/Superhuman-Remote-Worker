@@ -1155,8 +1155,9 @@ async def _resolve_session_config(
         from src.core.skill_resolution import filter_bound_skills
 
         filter_bound_skills(resolved)
-        if _fleet_management_explicitly_disabled(request_override):
-            resolved.setdefault("agent", {})["_fleet_management_disabled"] = True
+        session_tool_markers = _session_tool_group_disabled_markers(request_override)
+        if session_tool_markers:
+            resolved.setdefault("agent", {}).update(session_tool_markers)
         # Session dispatch PEP (decision 9): the merged config — including
         # interactive.permission_mode and any persistent_agent keys baked into
         # config_override — must fit the runner's grants. GrantDenied escapes the
@@ -2684,25 +2685,43 @@ def _validated_session_workspace_override(
     return ws
 
 
+_SESSION_CREATE_TOOL_OVERRIDE_KEYS = frozenset({"orchestrator", "agent_catalog"})
+_SESSION_TOOL_DISABLED_MARKERS = {
+    "orchestrator": "_fleet_management_disabled",
+    "agent_catalog": "_agent_catalog_disabled",
+}
+
+
+def _validated_session_tool_overrides(
+    config_override: Any,
+) -> dict[str, list[str]]:
+    """Extract allowed New Session tool group toggles.
+
+    At session creation we intentionally honor only the SRW session-facing
+    control groups, not arbitrary tool grants from the request.
+    """
+    tools = config_override.get("tools") if isinstance(config_override, dict) else None
+    if not isinstance(tools, dict):
+        return {}
+    accepted: dict[str, list[str]] = {}
+    for key in _SESSION_CREATE_TOOL_OVERRIDE_KEYS:
+        if key not in tools:
+            continue
+        value = tools.get(key)
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid tools.{key} override; expected a string list.",
+            )
+        accepted[key] = value
+    return accepted
+
+
 def _validated_session_fleet_tools_override(
     config_override: Any,
 ) -> Optional[list[str]]:
-    """Extract the New Session Fleet Management tool toggle.
-
-    The Cockpit tool group writes the existing registry category key
-    ``tools.orchestrator``. At session creation we intentionally honor only this
-    SRW control-plane category, not arbitrary tool grants from the request.
-    """
-    tools = config_override.get("tools") if isinstance(config_override, dict) else None
-    if not isinstance(tools, dict) or "orchestrator" not in tools:
-        return None
-    value = tools.get("orchestrator")
-    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid tools.orchestrator override; expected a string list.",
-        )
-    return value
+    """Extract the New Session Fleet Management tool toggle."""
+    return _validated_session_tool_overrides(config_override).get("orchestrator")
 
 
 def _fleet_management_explicitly_disabled(
@@ -2710,6 +2729,26 @@ def _fleet_management_explicitly_disabled(
 ) -> bool:
     tools = (config_override or {}).get("tools")
     return isinstance(tools, dict) and tools.get("orchestrator") == []
+
+
+def _agent_catalog_explicitly_disabled(
+    config_override: dict[str, Any] | None,
+) -> bool:
+    tools = (config_override or {}).get("tools")
+    return isinstance(tools, dict) and tools.get("agent_catalog") == []
+
+
+def _session_tool_group_disabled_markers(
+    config_override: dict[str, Any] | None,
+) -> dict[str, bool]:
+    tools = (config_override or {}).get("tools")
+    if not isinstance(tools, dict):
+        return {}
+    return {
+        marker: True
+        for group, marker in _SESSION_TOOL_DISABLED_MARKERS.items()
+        if tools.get(group) == []
+    }
 
 
 def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
@@ -15965,8 +16004,8 @@ class ThreadCreateRequest(BaseModel):
             "selects the tier (sandbox | virtual | none) and MUST be set here "
             "because the workspace is provisioned at creation. vm is not "
             "creatable directly — start on a lite tier and upgrade. The "
-            "tools.orchestrator category is also honored as the Fleet "
-            "Management toggle."
+            "tools.orchestrator and tools.agent_catalog categories are also "
+            "honored as session tool group toggles."
         ),
     )
 
@@ -16060,18 +16099,18 @@ async def create_thread(
         # validated workspace sub-dict here (no creds); the backend must land in
         # config_override now because the workspace is provisioned synchronously
         # at create — unlike the other Advanced settings it can't be a runtime
-        # PATCH. Fleet Management's tools.orchestrator toggle is the only
-        # tool-category override accepted at create time below.
+        # PATCH. Only the SRW session-facing tool group toggles are accepted at
+        # create time below.
         req_workspace = _validated_session_workspace_override(
             request_body.config_override
         )
         if req_workspace:
             config_override.setdefault("workspace", {}).update(req_workspace)
-        req_fleet_tools = _validated_session_fleet_tools_override(
+        req_tool_groups = _validated_session_tool_overrides(
             request_body.config_override
         )
-        if req_fleet_tools is not None:
-            config_override.setdefault("tools", {})["orchestrator"] = req_fleet_tools
+        if req_tool_groups:
+            config_override.setdefault("tools", {}).update(req_tool_groups)
 
         # Normalize project_ids (backward compat: project_id → [project_id])
         effective_project_ids = request_body.project_ids or (

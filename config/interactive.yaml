@@ -27,6 +27,7 @@ tools:
     - git_status
     - git_diff
   orchestrator: [ ]
+  agent_catalog: [ ]
   core: [ ]
   citation: [ ]
   graph: [ ]

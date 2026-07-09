@@ -122,8 +122,8 @@ workspace tiers:
 - `knowledge`: `kb_write`, `kb_update`, `kb_read`, `kb_list`, `kb_search`,
   `kb_related`, `kb_contradictions`, `kb_provenance`, `kb_unanswered`,
   `kb_export`
-- Empty by default: `orchestrator`, `core`, `graph`, `sql`, `mongodb`,
-  `evaluation`, `delegation`, `communication`
+- Empty by default: `orchestrator`, `agent_catalog`, `core`, `graph`, `sql`,
+  `mongodb`, `evaluation`, `delegation`, `communication`
 
 `request_workspace_upgrade` is also injected for lite tiers that do not support
 shell execution.
@@ -143,7 +143,8 @@ not necessarily application actions.
 | `workspace` | `read_file`, `write_file`, `edit_file`, `list_files`, `delete_file`, `search_files`, `file_exists`, `move_file`, `rename_file`, `copy_file`, `get_document_info`, `create_directory`, `delete_directory`, `use_skill` |
 | `core` | `next_phase_todos`, `todo_complete`, `todo_list`, `todo_rewind`, `mark_complete`, `job_complete`, `request_workspace_upgrade` |
 | `session_task` | `task_add`, `task_complete`, `task_list` |
-| `orchestrator` | `create_worker_job`, `list_worker_jobs`, `get_worker_job`, `get_job_workspace_file`, `approve_worker_job`, `resume_worker_job`, `cancel_worker_job`, `pause_worker_job` |
+| `orchestrator` | `get_session_context`, `create_worker_job`, `list_worker_jobs`, `get_worker_job`, `get_job_workspace_file`, `approve_worker_job`, `resume_worker_job`, `cancel_worker_job`, `pause_worker_job`, `get_current_project`, `list_project_jobs`, `list_project_repositories`, `get_default_project_repository`, `checkout_project_repository` |
+| `agent_catalog` | `list_experts`, `get_expert`, `list_skills`, `search_skills`, `get_skill` |
 | `research` | `web_search`, `extract_webpage`, `crawl_website`, `map_website`, `search_papers`, `download_paper`, `get_paper_info`, `research_topic` |
 | `browser_direct` | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select`, `browser_scroll`, `browser_screenshot`, `browser_back`, `browser_close` |
 | `citation` | `cite_document`, `cite_web`, `list_sources`, `get_citation`, `list_citations`, `edit_citation`, `annotate_source`, `get_annotations`, `tag_source`, `search_library`, `generate_bibliography` |
@@ -499,7 +500,8 @@ Current app capabilities:
 Current tools:
 
 - MCP only has list/get/reload and project expert reads.
-- Sessions have no expert management tools.
+- Sessions have read-only expert catalog tools under the **Experts & Skills**
+  tool group. They have no expert authoring tools.
 
 Candidate shared actions:
 
@@ -530,8 +532,9 @@ Current app capabilities:
 Current tools:
 
 - MCP only has list/get/reload.
-- Sessions only have `use_skill` for already-resolved workspace skills, not
-  application-level skill authoring.
+- Sessions have `use_skill` for already-resolved workspace skills and read-only
+  skill catalog tools under **Experts & Skills**. They have no
+  application-level skill authoring tools.
 
 Candidate shared actions:
 
@@ -915,17 +918,28 @@ understand and steer work.
 
 ### Fleet Management Tool Group
 
-All SRW control-plane/session-management tools are exposed to the UI as one
-session tool group named **Fleet Management**. The backing config key remains
+SRW control-plane/session-management tools are exposed to the UI as one session
+tool group named **Fleet Management**. The backing config key remains
 `tools.orchestrator` for compatibility with the existing registry category.
 
 Fleet Management defaults on for existing sessions and configs. A session
 explicitly disables it by setting `tools.orchestrator: []`; in that mode the
 persistent agent must not receive SRW app-control tools such as job/project
-management, repository checkout through SRW, loop inspection, expert/skill
-catalog inspection, or `request_workspace_upgrade`. This supports sessions for
-untrusted LLM providers that should only receive ordinary work tools like shell,
-files, browser, research, citation, git, and local task tracking.
+management, repository checkout through SRW, loop inspection, or
+`request_workspace_upgrade`. This supports sessions for untrusted LLM providers
+that should only receive ordinary work tools like shell, files, browser,
+research, citation, git, and local task tracking.
+
+### Experts & Skills Tool Group
+
+Expert and skill catalog inspection is exposed as a separate session tool group
+named **Experts & Skills**. The backing config key is `tools.agent_catalog`.
+
+Experts & Skills defaults on for existing sessions and configs. A session
+explicitly disables it by setting `tools.agent_catalog: []`; in that mode the
+persistent agent must not receive `list_experts`, `get_expert`, `list_skills`,
+`search_skills`, or `get_skill`. This keeps read-only agent catalog visibility
+independent from Fleet Management's job/project/repository controls.
 
 ### Session Always-On Direct Tools
 
