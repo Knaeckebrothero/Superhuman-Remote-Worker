@@ -30,6 +30,7 @@ import time
 from typing import Any
 
 from .types import Instance
+from .workspace_manager import paused_within_grace
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,12 @@ class VMInstanceManager:
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
+            # Warm grace for 'paused' (often a human-wait — sudo/VM-upgrade
+            # approval with a 24h TTL); VM reaps are destructive (no volume
+            # reattach), so acting on the next tick loses the workspace
+            # minutes into that window. Mirrors WorkspaceInstanceManager.
+            if paused_within_grace(inst.metadata):
+                return False
             return job_status in _IDLE_JOB_STATUSES
         if thread_status:
             return thread_status in _IDLE_THREAD_STATUSES
@@ -219,6 +226,9 @@ class VMInstanceManager:
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
+            # Warm grace for 'paused' — see is_idle.
+            if paused_within_grace(inst.metadata):
+                return False
             return job_status in _REAPABLE_JOB_STATUSES
         if thread_status:
             return thread_status in _REAPABLE_THREAD_STATUSES
@@ -418,7 +428,7 @@ class VMInstanceManager:
             async with self._db.acquire() as conn:
                 job_rows = await conn.fetch(
                     """
-                    SELECT id, status, context,
+                    SELECT id, status, context, updated_at,
                            (assigned_agent_id IS NULL) AS unassigned,
                            (freeze_data IS NULL) AS freeze_free
                     FROM jobs
@@ -456,6 +466,7 @@ class VMInstanceManager:
                     "scope": "job",
                     "bound_id": str(r["id"]),
                     "owner_status": r.get("status"),
+                    "owner_updated_at": r.get("updated_at"),
                     "job_dispatchable": dispatchable,
                     "vm_ctx": vm_ctx,
                     "snapshot_status": _coerce_jsonb(ctx.get("snapshot")).get("status"),
@@ -515,6 +526,7 @@ class VMInstanceManager:
         }
         if scope == "job":
             metadata["job_status"] = row.get("owner_status")
+            metadata["job_updated_at"] = row.get("owner_updated_at")
             metadata["job_dispatchable"] = bool(row.get("job_dispatchable"))
         else:
             metadata["thread_status"] = row.get("owner_status")

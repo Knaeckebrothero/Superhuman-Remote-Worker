@@ -89,6 +89,55 @@ def _pod_age_seconds(pod: Any) -> float | None:
         return None
 
 
+def paused_grace_seconds() -> float:
+    """Warm-grace window before a ``paused`` job's workspace becomes reapable.
+
+    A pause is frequently a human-wait (sudo/VM-upgrade approval: 24 h TTL;
+    review pauses) — reaping on the very next tick destroys the workspace
+    minutes into that window (see
+    docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md). Keep it
+    warm for the grace so a fast decision resumes losslessly; a slow one pays
+    a snapshot-restore. Defaults to the suspension sweep's
+    ``WORKSPACE_IDLE_TIMEOUT`` (minutes, default 30) so the graceful
+    snapshot-then-free path gets first claim on the workspace.
+    """
+    try:
+        return float(os.environ["WORKSPACE_PAUSED_REAP_GRACE_S"])
+    except (KeyError, ValueError):
+        pass
+    try:
+        return float(os.environ.get("WORKSPACE_IDLE_TIMEOUT", "30")) * 60.0
+    except ValueError:
+        return 1800.0
+
+
+def _paused_age_seconds(metadata: dict[str, Any]) -> float | None:
+    """Seconds since the bound job's last row update (pause-time proxy).
+
+    ``jobs.updated_at`` is bumped by the status flip that paused the job;
+    later bookkeeping merges bump it too, which only ever EXTENDS the grace
+    (activity-bumped, Coder-style). None when the timestamp is unavailable.
+    """
+    ts = metadata.get("job_updated_at")
+    if not isinstance(ts, datetime):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
+
+
+def paused_within_grace(metadata: dict[str, Any]) -> bool:
+    """True while a ``paused`` job's workspace is still inside the warm grace.
+
+    An unknown pause age counts as inside the grace (conservative: never
+    destroy on missing data — mirrors the ``_FETCH_FAILED`` stance).
+    """
+    if metadata.get("job_status") != "paused":
+        return False
+    age = _paused_age_seconds(metadata)
+    return age is None or age < paused_grace_seconds()
+
+
 def _pod_volume_is_ephemeral(pod: Any) -> bool:
     """True if the pod's workspace-data volume is emptyDir (vs a PVC).
 
@@ -190,6 +239,7 @@ class WorkspaceInstanceManager:
                     metadata["bound_row_missing"] = True
                 else:
                     metadata["job_status"] = row.get("status")
+                    metadata["job_updated_at"] = row.get("updated_at")
                     ctx = row.get("context") or {}
                     if isinstance(ctx, str):
                         try:
@@ -242,6 +292,11 @@ class WorkspaceInstanceManager:
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
+            # 'paused' gets a warm grace: it is often a human-wait (sudo/VM
+            # approval, 24h TTL) and acting on the next tick destroys the
+            # workspace minutes into that window.
+            if paused_within_grace(inst.metadata):
+                return False
             return job_status in _IDLE_JOB_STATUSES
         if thread_status:
             return thread_status in _IDLE_THREAD_STATUSES
@@ -276,6 +331,9 @@ class WorkspaceInstanceManager:
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
+            # Warm grace for 'paused' — see is_idle.
+            if paused_within_grace(inst.metadata):
+                return False
             return job_status in _REAPABLE_JOB_STATUSES
         if thread_status:
             return thread_status in _REAPABLE_THREAD_STATUSES
@@ -467,6 +525,10 @@ class WorkspaceInstanceManager:
                 work_marker=inst.metadata.get("total_turns"),
             )
             if ok:
+                # Mark the in-memory instance too — the reconciler calls
+                # delete() right after a successful snapshot(), and delete()
+                # reads this to decide the reap-and-restore handoff below.
+                inst.metadata["snapshot_status"] = "available"
                 # Success clears the escape-hatch retry counter.
                 labels = inst.metadata.get("labels") or {}
                 try:
@@ -540,6 +602,36 @@ class WorkspaceInstanceManager:
         except Exception:
             logger.exception("Failed to delete workspace pod %s", inst.id)
             return
+        # Reap-and-restore handoff: a NON-terminal emptyDir workspace whose
+        # state was captured to S3 is 'suspended', not 'deleted' — the next
+        # dispatch then routes through the suspension restore
+        # (ensure_workspace: 'suspended' → restore) instead of re-creating a
+        # blank pod, so a paused job (e.g. waiting on a sudo/VM-upgrade
+        # decision) resumes with its files. PVC-backed pods skip this: their
+        # state survives on the volume and an S3 extract could roll newer
+        # files back. The provisioner wrote 'deleted' above; overwrite it.
+        # See docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md.
+        if (
+            not self._is_terminal(inst)
+            and inst.metadata.get("volume_ephemeral", True)
+            and inst.metadata.get("snapshot_status") == "available"
+        ):
+            try:
+                if "srw/thread-id" in labels:
+                    await self._db.merge_thread_workspace_context(
+                        bound, {"status": "suspended"}
+                    )
+                else:
+                    await self._db.merge_workspace_container_context(
+                        bound, {"status": "suspended"}
+                    )
+                logger.info(
+                    "Reaped workspace %s marked 'suspended' (snapshot in S3) — "
+                    "next dispatch restores instead of recreating blank",
+                    inst.id,
+                )
+            except Exception:
+                logger.exception("Failed to mark %s suspended after reap", inst.id)
         # PVC GC (Branch a leak guard): a PVC-backed workspace keeps its volume
         # across pod recreates (suspend/restore, drift recovery, give_up
         # reattach), so we reclaim it ONLY when the bound work is terminal —

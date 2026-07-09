@@ -326,10 +326,41 @@ class TestLiveSharedChildGuard:
 
 class TestIsIdle:
     @pytest.mark.asyncio
-    async def test_paused_job_is_idle(self):
+    async def test_paused_job_is_idle_after_grace(self):
+        # 'paused' is idle only once the warm grace has passed — a fresh pause
+        # is often a human-wait (sudo/VM approval) and must stay warm. See
+        # docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc) - timedelta(hours=2),
+            },
+        )
+        assert await mgr.is_idle(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_freshly_paused_job_is_not_idle(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc),
+            },
+        )
+        assert await mgr.is_idle(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_paused_job_with_unknown_age_is_not_idle(self):
+        # Conservative: no timestamp → treat as inside the grace (never
+        # destroy on missing data).
         mgr, *_ = _make_manager()
         inst = Instance(kind="workspace", id="x", metadata={"job_status": "paused"})
-        assert await mgr.is_idle(inst) is True
+        assert await mgr.is_idle(inst) is False
 
     @pytest.mark.asyncio
     async def test_pending_review_is_idle(self):
@@ -420,9 +451,47 @@ class TestIsReapable:
         assert await mgr.is_reapable(inst) is True
 
     @pytest.mark.asyncio
-    async def test_paused_job_is_reapable(self):
+    async def test_paused_job_is_reapable_after_grace(self):
         mgr, *_ = _make_manager()
-        inst = Instance(kind="workspace", id="x", metadata={"job_status": "paused"})
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc) - timedelta(hours=2),
+            },
+        )
+        assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_freshly_paused_job_is_not_reapable(self):
+        # The incident shape: a job pauses on a vm_upgrade approval (24h TTL)
+        # and the reaper destroyed the workspace on the next tick. Within the
+        # warm grace the pod must survive.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc),
+            },
+        )
+        assert await mgr.is_reapable(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_paused_grace_env_override(self, monkeypatch):
+        # WORKSPACE_PAUSED_REAP_GRACE_S=0 disables the grace (old behavior).
+        monkeypatch.setenv("WORKSPACE_PAUSED_REAP_GRACE_S", "0")
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc),
+            },
+        )
         assert await mgr.is_reapable(inst) is True
 
     @pytest.mark.asyncio
@@ -946,6 +1015,97 @@ class TestDeleteTerminalPvc:
         )
         # The stable-DNS Service shares the PVC lifecycle — reclaimed on terminal.
         container._delete_service.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+
+    @pytest.mark.asyncio
+    async def test_reaped_emptydir_with_snapshot_marked_suspended(self):
+        # Reap-and-restore: a NON-terminal emptyDir pod whose state made it to
+        # S3 flips to 'suspended' so the next dispatch restores instead of
+        # re-creating a blank pod.
+        mgr, container, _, _, db = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "paused",
+                "volume_ephemeral": True,
+                "snapshot_status": "available",
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(WorkspaceOwner.job("j1"))
+        db.merge_workspace_container_context.assert_awaited_once_with(
+            "j1", {"status": "suspended"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_reaped_emptydir_without_snapshot_not_marked_suspended(self):
+        mgr, container, _, _, db = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "paused",
+                "volume_ephemeral": True,
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        db.merge_workspace_container_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reaped_pvc_backed_not_marked_suspended(self):
+        # PVC state survives on the volume; an S3 extract could roll newer
+        # files back — the restore arm must not fire.
+        mgr, container, _, _, db = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "paused",
+                "volume_ephemeral": False,
+                "snapshot_status": "available",
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        db.merge_workspace_container_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_not_marked_suspended(self):
+        mgr, container, _, _, db = _make_manager()
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={
+                "labels": {"srw/job-id": "j1"},
+                "job_status": "completed",
+                "volume_ephemeral": True,
+                "snapshot_status": "available",
+            },
+        )
+        await mgr.delete(inst, grace_s=0)
+        db.merge_workspace_container_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_success_stamps_instance_metadata(self):
+        # The reconciler calls delete() right after snapshot(); delete() reads
+        # the in-memory snapshot_status to decide the suspended handoff.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="workspace",
+            id="workspace-a",
+            bound_to="j1",
+            metadata={"labels": {"srw/job-id": "j1"}, "pod_ip": "10.0.0.7"},
+        )
+        ref = await mgr.snapshot(inst)
+        assert ref == "j1"
+        assert inst.metadata["snapshot_status"] == "available"
 
     @pytest.mark.asyncio
     async def test_idle_job_pvc_backed_keeps_pvc(self):

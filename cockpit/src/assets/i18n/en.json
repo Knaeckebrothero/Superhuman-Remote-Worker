@@ -294,7 +294,8 @@
       "completed": "Completed",
       "paused": "Paused",
       "failed": "Failed",
-      "cancelled": "Cancelled"
+      "cancelled": "Cancelled",
+      "waiting_approval": "Waiting · approval"
     },
     "action": {
       "view": "View",
@@ -312,7 +313,8 @@
       "promote": "Promote",
       "createProject": "Create Project",
       "exportToCloud": "Open cloud folder",
-      "exported": "Exported"
+      "exported": "Exported",
+      "approveRequest": "Approve request"
     },
     "tooltip": {
       "collapse": "Collapse sub-jobs",
@@ -338,7 +340,8 @@
       "snapshotStats": "S3 snapshot storage",
       "snapshotAvailable": "Environment snapshot available",
       "delegationWaiting": "Waiting for delegation children to complete",
-      "delegationChild": "Delegation child (creation order {{order}})"
+      "delegationChild": "Delegation child (creation order {{order}})",
+      "approveRequest": "This job is waiting on a sudo/VM-upgrade decision — open the request in the inbox"
     },
     "delegationChildren": "{{count}} children",
     "promote": {
