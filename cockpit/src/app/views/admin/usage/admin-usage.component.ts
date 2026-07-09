@@ -636,6 +636,9 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
       }
       .ts-side {
         flex: 0 0 200px;
+        /* Long unbreakable model slugs in the legend must not set this
+           column's min-content — let the label ellipsis do its job. */
+        min-width: 0;
         display: flex;
         flex-direction: column;
         gap: 16px;
@@ -685,6 +688,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         align-items: center;
         gap: 8px;
         font-size: 12px;
+        min-width: 0;
       }
       .swatch {
         width: 10px;
@@ -702,6 +706,60 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
       .lg-val {
         color: var(--text-muted);
         font-variant-numeric: tabular-nums;
+      }
+
+      @media (max-width: 768px) {
+        .admin-page {
+          padding: 16px;
+        }
+        .page-desc {
+          margin-bottom: 20px;
+        }
+        .admin-section {
+          padding: 14px;
+          margin-bottom: 16px;
+        }
+        /* Controls flow under the title at their natural size instead of
+           right-aligning into overlap. */
+        .page-controls {
+          margin-left: 0;
+          width: 100%;
+          justify-content: flex-start;
+        }
+        .explorer-toggles {
+          flex-wrap: wrap;
+        }
+        .kpi-card {
+          padding: 12px 14px;
+        }
+        .kpi-value {
+          font-size: 18px;
+        }
+        /* Grid tables keep their column widths and scroll horizontally inside
+           their own border instead of crushing at phone width. */
+        .usage-table,
+        .breakdown-table {
+          overflow-x: auto;
+        }
+        .usage-header,
+        .usage-row {
+          min-width: 520px;
+        }
+        .breakdown-header,
+        .breakdown-row {
+          min-width: 680px;
+        }
+        .ts-side {
+          flex: 1 1 100%;
+        }
+        /* The nowrap date labels set each bar's min width, so two weeks of
+           bars can't fit — scroll the chart like the tables. */
+        .bar-chart {
+          overflow-x: auto;
+        }
+        .bar-col {
+          min-width: 34px;
+        }
       }
     `,
   ],

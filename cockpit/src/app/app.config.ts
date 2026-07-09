@@ -118,9 +118,10 @@ export const appConfig: ApplicationConfig = {
       // Only register in production builds. Dev mode reloads frequently and
       // a stale SW would shadow code changes.
       enabled: !isDevMode(),
-      // Defer registration until the app stabilises so SW install doesn't
-      // contend with hydration / first-paint work.
-      registrationStrategy: 'registerWhenStable:30000',
+      // Register immediately: Chrome decides install-as-app vs. bookmark
+      // shortcut based on whether a SW controls the page at install time, so
+      // a deferred registration loses the standalone-window install.
+      registrationStrategy: 'registerImmediately',
     }),
   ]
 };

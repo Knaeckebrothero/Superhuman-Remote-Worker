@@ -1148,6 +1148,110 @@ class TestHandleStatusQuery:
 
 
 # =============================================================================
+# Tests: handle_list() / http_list() — orphan-sweep inventory
+# =============================================================================
+
+
+class TestHandleList:
+    """vm.lifecycle.list request/reply — inventory for the VM orphan sweep."""
+
+    @staticmethod
+    def _wire_vms(controller, items):
+        controller.k8s_client.list_namespaced_custom_object.return_value = {
+            "items": items
+        }
+
+    @staticmethod
+    def _vm_item(name: str, created: str = "2026-07-09T10:00:00Z", phase="Running"):
+        return {
+            "metadata": {"name": name, "creationTimestamp": created},
+            "status": {"printableStatus": phase},
+        }
+
+    @pytest.mark.asyncio
+    async def test_lists_agent_vms_only(self, controller):
+        """Golden DataVolume names and foreign objects are filtered out."""
+        self._wire_vms(
+            controller,
+            [
+                self._vm_item("agent-vm-job-uuid-1"),
+                self._vm_item("agent-vm-golden-abc123"),  # golden — excluded
+                self._vm_item("some-other-vm"),  # foreign — excluded
+            ],
+        )
+        msg = make_nats_msg({"orchestrator_id": "test"}, reply="reply.inbox.list")
+        await controller.handle_list(msg)
+
+        subject, raw = controller.nc.publish.call_args[0]
+        assert subject == "reply.inbox.list"
+        payload = json.loads(raw.decode())
+        assert len(payload["vms"]) == 1
+        vm = payload["vms"][0]
+        assert vm["vm_name"] == "agent-vm-job-uuid-1"
+        assert vm["entity_id"] == "job-uuid-1"
+        assert vm["created_at"] == "2026-07-09T10:00:00Z"
+        assert vm["phase"] == "Running"
+
+    @pytest.mark.asyncio
+    async def test_empty_cluster_replies_empty_list(self, controller):
+        self._wire_vms(controller, [])
+        msg = make_nats_msg({}, reply="reply.inbox.empty")
+        await controller.handle_list(msg)
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload == {"vms": []}
+
+    @pytest.mark.asyncio
+    async def test_k8s_error_replies_list_failed(self, controller):
+        controller.k8s_client.list_namespaced_custom_object.side_effect = RuntimeError(
+            "api down"
+        )
+        msg = make_nats_msg({}, reply="reply.inbox.err")
+        await controller.handle_list(msg)
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "list_failed"
+        assert "vms" not in payload
+
+    @pytest.mark.asyncio
+    async def test_no_reply_subject_publishes_nothing(self, controller):
+        """A list is only meaningful request/reply — no status fallback."""
+        self._wire_vms(controller, [self._vm_item("agent-vm-x")])
+        msg = make_nats_msg({}, reply=None)
+        await controller.handle_list(msg)
+        controller.nc.publish.assert_not_called()
+
+
+class TestHttpList:
+    """GET /vms — same inventory over the HTTP transport."""
+
+    @pytest.mark.asyncio
+    async def test_http_list_returns_vms(self, controller):
+        controller.k8s_client.list_namespaced_custom_object.return_value = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "agent-vm-j1",
+                        "creationTimestamp": "2026-07-09T09:00:00Z",
+                    },
+                    "status": {"printableStatus": "Running"},
+                }
+            ]
+        }
+        resp = await controller.http_list(MagicMock())
+        assert resp.status == 200
+        payload = json.loads(resp.body.decode())
+        assert payload["vms"][0]["entity_id"] == "j1"
+
+    @pytest.mark.asyncio
+    async def test_http_list_k8s_error_500s(self, controller):
+        controller.k8s_client.list_namespaced_custom_object.side_effect = RuntimeError(
+            "api down"
+        )
+        resp = await controller.http_list(MagicMock())
+        assert resp.status == 500
+        assert json.loads(resp.body.decode())["status"] == "list_failed"
+
+
+# =============================================================================
 # Tests: _publish_status()
 # =============================================================================
 

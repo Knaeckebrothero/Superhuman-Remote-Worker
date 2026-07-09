@@ -377,6 +377,48 @@ class NatsBridge:
             logger.debug("VM status query failed for job %s: %s", job_id, e)
             return None
 
+    async def request_vm_list(self, timeout: float = 5.0) -> Optional[list]:
+        """List the controller's managed VMs via NATS request/reply.
+
+        Inventory source for the lifecycle VM orphan sweep. Returns the list
+        of ``{vm_name, entity_id, created_at, phase}`` dicts, or None when
+        unavailable — which includes an old controller that doesn't subscribe
+        to ``vm.lifecycle.list`` yet (the request simply times out). Callers
+        must treat None as "unknown", never as "no VMs".
+        """
+        if not self._available:
+            return None
+
+        subject = self._subj("vm.lifecycle.list")
+        if subject is None:
+            logger.error("Refusing vm.lifecycle.list — ORCHESTRATOR_ID unset")
+            return None
+
+        payload = {"orchestrator_id": self._orchestrator_id}
+        try:
+            response = await self._nc.request(
+                subject,
+                json.dumps(payload).encode(),
+                timeout=timeout,
+            )
+            data = json.loads(response.data.decode())
+            # Same JetStream-ack guard as query_vm_status: a stream shadowing
+            # the request subject answers with its publish-ack before the
+            # controller's real reply. See
+            # docs/issues/vm_live_status_query_shadowed_by_jetstream_stream.md
+            if isinstance(data, dict) and "stream" in data and "seq" in data:
+                logger.warning(
+                    "vm.lifecycle.list received a JetStream ack (%s) instead of "
+                    "a controller reply — treating as no response",
+                    data,
+                )
+                return None
+            vms = data.get("vms") if isinstance(data, dict) else None
+            return vms if isinstance(vms, list) else None
+        except Exception as e:
+            logger.debug("VM list request failed: %s", e)
+            return None
+
     async def send_control(self, job_id: str, action: str) -> bool:
         """Send a control command to the management daemon in a VM.
 

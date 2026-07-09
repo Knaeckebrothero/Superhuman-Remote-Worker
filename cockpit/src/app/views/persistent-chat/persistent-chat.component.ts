@@ -58,7 +58,10 @@ import {FilePreview, FileType} from '../../core/models/file.model';
 import {RecordingConfig} from '../../core/models/recording.model';
 import {environment} from '../../core/environment';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {ViewportService} from '../../core/services/viewport.service';
 import {AppButtonComponent} from '../../ui/button';
+import {AppIconButtonComponent} from '../../ui/icon-button';
+import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {AppBadgeComponent} from '../../ui/badge';
 import {CitationsPanelComponent} from './citations-panel/citations-panel.component';
 import {AppSelectComponent} from '../../ui/select';
@@ -411,6 +414,10 @@ export function clearDraft(threadId: string | null): void {
         SidebarToggleComponent,
         TranslocoPipe,
         AppButtonComponent,
+        AppIconButtonComponent,
+        AppMenuComponent,
+        AppMenuItemComponent,
+        AppMenuTriggerDirective,
         AppBadgeComponent,
         AppSelectComponent,
         AppIconComponent,
@@ -462,43 +469,73 @@ export function clearDraft(threadId: string | null): void {
         </div>
         <div class="header-right">
           @if (chat.isConnected()) {
-            <button class="settings-btn" (click)="showSettings.update(v => !v)"
-                    [class.active]="showSettings()" [title]="'chat.header.settingsTooltip' | transloco">
-              <app-icon size="sm" class="settings-icon">tune</app-icon>
-            </button>
-          }
-
-          @if (chat.isConnected() && chat.citationsByCid().size > 0) {
-            <button class="settings-btn" (click)="showCitations.update(v => !v)"
-                    [class.active]="showCitations()" [title]="'chat.header.citationsTooltip' | transloco">
-              <app-icon size="sm" class="settings-icon">format_quote</app-icon>
-            </button>
-          }
-
-          @if (chat.isConnected()) {
-            @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
-              <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
-                <app-icon size="sm" class="ide-icon">cloud</app-icon>
-                {{ 'chat.header.filesButton' | transloco }}
+            @if (viewport.isMobile()) {
+              <!-- Mobile: fold the secondary controls into one overflow menu so
+                   the header stays a single row; Disconnect stays reachable. -->
+              <app-icon-button
+                size="sm"
+                [ariaLabel]="'chat.header.moreActions' | transloco"
+                [appMenuTrigger]="headerMenu"
+                menuPlacement="bottom-end"
+              >
+                <app-icon size="sm">more_vert</app-icon>
+              </app-icon-button>
+              <app-menu #headerMenu>
+                <app-menu-item (activated)="showSettings.update(v => !v)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
+                @if (chat.citationsByCid().size > 0) {
+                  <app-menu-item (activated)="showCitations.update(v => !v)">{{ 'chat.header.citationsButton' | transloco }}</app-menu-item>
+                }
+                @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
+                  <app-menu-item (activated)="openSessionFiles()">{{ 'chat.header.filesButton' | transloco }}</app-menu-item>
+                }
+                @if (ideStatus(); as ide) {
+                  @if (ide.gitea_url) {
+                    <app-menu-item (activated)="openIde(ide.gitea_url!)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
+                  }
+                  @if (ide.status === 'active' && ide.code_server_url) {
+                    <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
+                  } @else if (ide.status === 'restoring') {
+                    <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
+                  }
+                }
+              </app-menu>
+            } @else {
+              <button class="settings-btn" (click)="showSettings.update(v => !v)"
+                      [class.active]="showSettings()" [title]="'chat.header.settingsTooltip' | transloco">
+                <app-icon size="sm" class="settings-icon">tune</app-icon>
               </button>
-            }
-            @if (ideStatus(); as ide) {
-              @if (ide.gitea_url) {
-                <button class="ide-btn gitea-btn" (click)="openIde(ide.gitea_url!)" [title]="'chat.header.gitTooltip' | transloco">
-                  <app-icon size="sm" class="ide-icon">history</app-icon>
-                  {{ 'chat.header.gitButton' | transloco }}
+
+              @if (chat.citationsByCid().size > 0) {
+                <button class="settings-btn" (click)="showCitations.update(v => !v)"
+                        [class.active]="showCitations()" [title]="'chat.header.citationsTooltip' | transloco">
+                  <app-icon size="sm" class="settings-icon">format_quote</app-icon>
                 </button>
               }
-              @if (ide.status === 'active' && ide.code_server_url) {
-                <button class="ide-btn" (click)="openCodeServer()" [title]="'chat.header.ideActiveTooltip' | transloco">
-                  <app-icon size="sm" class="ide-icon">code</app-icon>
-                  {{ 'chat.header.ideButton' | transloco }}
+
+              @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
+                <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
+                  <app-icon size="sm" class="ide-icon">cloud</app-icon>
+                  {{ 'chat.header.filesButton' | transloco }}
                 </button>
-              } @else if (ide.status === 'restoring') {
-                <button class="ide-btn ide-loading" disabled [title]="'chat.header.ideLoadingTooltip' | transloco">
-                  <span class="ide-spinner"></span>
-                  {{ 'chat.header.ideButton' | transloco }}
-                </button>
+              }
+              @if (ideStatus(); as ide) {
+                @if (ide.gitea_url) {
+                  <button class="ide-btn gitea-btn" (click)="openIde(ide.gitea_url!)" [title]="'chat.header.gitTooltip' | transloco">
+                    <app-icon size="sm" class="ide-icon">history</app-icon>
+                    {{ 'chat.header.gitButton' | transloco }}
+                  </button>
+                }
+                @if (ide.status === 'active' && ide.code_server_url) {
+                  <button class="ide-btn" (click)="openCodeServer()" [title]="'chat.header.ideActiveTooltip' | transloco">
+                    <app-icon size="sm" class="ide-icon">code</app-icon>
+                    {{ 'chat.header.ideButton' | transloco }}
+                  </button>
+                } @else if (ide.status === 'restoring') {
+                  <button class="ide-btn ide-loading" disabled [title]="'chat.header.ideLoadingTooltip' | transloco">
+                    <span class="ide-spinner"></span>
+                    {{ 'chat.header.ideButton' | transloco }}
+                  </button>
+                }
               }
             }
             <app-button variant="ghost" size="sm" (clicked)="disconnectAndLeave()">
@@ -1177,11 +1214,11 @@ export function clearDraft(threadId: string | null): void {
             <!-- secondary: per-turn token breakdown (compact chips) -->
             <span class="usage-tokens">
               @if (u.inputTokens != null) {
-                <span class="usage-chip"><span class="usage-k">{{ 'chat.usage.input' | transloco }}</span>{{ formatTokens(u.inputTokens) }}</span>
+                <span class="usage-chip usage-chip--input"><span class="usage-k">{{ 'chat.usage.input' | transloco }}</span>{{ formatTokens(u.inputTokens) }}</span>
               }
               <span class="usage-chip"><span class="usage-k">{{ 'chat.usage.output' | transloco }}</span>{{ formatTokens(u.outputTokensTurn) }}</span>
               @if (u.reasoningTokensTurn > 0) {
-                <span class="usage-chip" [title]="u.reasoningEstimated ? ('chat.usage.reasoningEstimatedHint' | transloco) : ''">
+                <span class="usage-chip usage-chip--reasoning" [title]="u.reasoningEstimated ? ('chat.usage.reasoningEstimatedHint' | transloco) : ''">
                   <span class="usage-k">{{ 'chat.usage.reasoning' | transloco }}</span>{{ u.reasoningEstimated ? '~' : '' }}{{ formatTokens(u.reasoningTokensTurn) }}
                 </span>
               }
@@ -1448,6 +1485,7 @@ export function clearDraft(threadId: string | null): void {
 })
 export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDestroy {
     readonly chat = inject(PersistentChatService);
+    readonly viewport = inject(ViewportService);
     private readonly api = inject(ApiService);
     readonly modelService = inject(ModelService);
     private readonly transloco = inject(TranslocoService);
@@ -1923,7 +1961,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
         if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
         if (this.chat.isUploadingAttachments()) return this.transloco.translate('chat.input.uploading');
-        return this.transloco.translate('chat.input.default');
+        // Mobile keyboards send newline on Enter, so the desktop key hints are wrong there.
+        return this.transloco.translate(
+            this.viewport.isMobile() ? 'chat.input.defaultMobile' : 'chat.input.default',
+        );
     });
 
     /** True while sends are queued (waiting for readiness / flushing) or files

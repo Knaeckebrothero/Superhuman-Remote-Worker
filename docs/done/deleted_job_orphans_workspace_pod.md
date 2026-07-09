@@ -1,6 +1,6 @@
 # Deleting a job orphans its workspace pod forever (no-bound-row = never reapable)
 
-**Status:** RESOLVED — investigated 2026-07-05 from a live orphan on the main cluster; both fixes implemented + k3d-verified 2026-07-05 (see "Fix directions" — teardown-in-delete verified end-to-end via API delete of a pod-backed job row; reaper verified via planted orphan pod: spared while under grace, reaped after); shipped in `af5cb4af`. **Confirmed on the main cluster 2026-07-09:** the original orphan pod and its ConfigMap are gone post-deploy, and every remaining workspace pod is bound to a live job/thread row (paused/processing/reviewing) — zero orphans. Only the VM-manager backstop parity (see NOTE at the bottom) remains as a potential follow-up, if a VM orphan is ever observed.
+**Status:** RESOLVED — investigated 2026-07-05 from a live orphan on the main cluster; both fixes implemented + k3d-verified 2026-07-05 (see "Fix directions" — teardown-in-delete verified end-to-end via API delete of a pod-backed job row; reaper verified via planted orphan pod: spared while under grace, reaped after); shipped in `af5cb4af`. **Confirmed on the main cluster 2026-07-09:** the original orphan pod and its ConfigMap are gone post-deploy, and every remaining workspace pod is bound to a live job/thread row (paused/processing/reviewing) — zero orphans. VM backstop parity built 2026-07-09 (see section at the bottom), uncommitted; its live verification rides the next VM-controller rollout.
 **Severity:** low urgency (leaks one pod's worth of node resources per occurrence) but unbounded — every orphan persists until someone hand-deletes it, and nothing surfaces it
 **Component:** `orchestrator/main.py` `delete_job` (`DELETE /api/jobs/{job_id}`), `orchestrator/services/lifecycle/workspace_manager.py` (`is_reapable`/`is_idle`/`reap_orphans`)
 **Observed on:** main cluster (`superhuman-remote-worker`), pod `workspace-a9ad385d-0ed` (job `a9ad385d-0edd-4bc3-8407-4e0523a0d35f`), alive 7d22h at investigation
@@ -104,9 +104,37 @@ user → `{"status":"deleted"}`, row gone, pod Terminating inline; planted a
 second pod with a nonexistent job id → reconciler listed it every tick,
 spared it under the grace age, reaped it after.
 
-NOTE: the VM manager (`vm_manager.py`) has the same no-bound-row-never-reapable
-stance; fix (1) covers deleted jobs' VMs (release via the shared helper), but
-the reconciler backstop for VM orphans is a follow-up if ever observed.
+## VM backstop parity (built 2026-07-09, uncommitted)
+
+The VM analogue of the gap is worse than "never reapable": the VM manager
+enumerates instances FROM the jobs/threads rows (`_fetch_vm_rows`), so a VM
+whose row was deleted never surfaces as an `Instance` at all — invisible, not
+just protected. Fix (1) covers deleted jobs' VMs (release via the shared
+helper); the reconciler backstop needed a backend inventory and is now built:
+
+- **Controller** (`vm/controller/controller.py`): `_do_list()` enumerates the
+  managed KubeVirt VMs (`agent-vm-<uuid>` names encode the owning job/thread;
+  goldens excluded), exposed as NATS `vm.lifecycle.list.{ORCHESTRATOR_ID}`
+  (request/reply) and HTTP `GET /vms`.
+- **Provisioner** (`vm_provisioner.list_vms()` + `nats_bridge.request_vm_list()`):
+  NATS > HTTP > direct-KubeVirt dispatch. Returns None for "unknown" (docker
+  pool; an OLD controller without the op times out / 404s) — distinct from
+  `[]`, so the sweep never treats a mute inventory as an empty cluster.
+- **Sweep** (`VMInstanceManager.reap_orphans()`, picked up by the reconciler's
+  existing optional once-per-tick hook): reaps a listed VM only when its name
+  parses as a UUID, it is older than the shared orphan grace
+  (`WORKSPACE_ORPHAN_GRACE_SECONDS`, extracted to
+  `workspace_manager.orphan_grace_seconds()`), and the id has NO row in jobs
+  NOR threads (VM names don't encode the entity type, so both tables are
+  checked; a row of ANY status leaves the VM to the instance path/dispatcher).
+  DB error → skip. Deletes via the id-keyed controller path, which also
+  removes the Headscale mesh node.
+
+Tests: `TestHandleList`/`TestHttpList` (controller), `TestRequestVmList`
+(bridge), `TestListVms` (provisioner), `TestReapOrphans` incl. a
+reconciler-tick end-to-end (manager). Live verification requires a controller
+rollout (CI builds `vm/controller/` on change); until the new controller is
+deployed, NATS list requests time out and the sweep no-ops by design.
 
 ## Cleanup for the live orphan
 
