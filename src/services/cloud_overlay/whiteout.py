@@ -14,6 +14,20 @@ Everything else is a real added/modified path (reported as "present";
 add-vs-modify is resolved by the caller against the lower to avoid an
 rclone round-trip per file).
 
+Phase-0-spike finding (docs/design/cloud_access_unification.md §11.1 /
+§11.6): a ``"deleted"`` ``DiffEntry`` for a directory does NOT imply the
+directory existed in the lower. fuse-overlayfs marks EVERY directory
+created through the merged view opaque — including brand-new,
+never-in-the-lower directories — so a freshly ADDED tree surfaces as a
+"deleted" opaque-dir entry paired with "present" entries for its
+contents (a DELETE+PUT pair once the caller resolves add-vs-modify), and
+an added *empty* directory surfaces as a bare "deleted" entry with no
+paired "present" entry at all. The caller resolving `present` into
+`added`/`modified`, and applying `"deleted"` entries as deletions, MUST
+check lower existence before treating an opaque-marked directory as an
+actual deletion — this walker reports the raw overlay signal only, it
+does not consult the lower itself.
+
 Contract note: lower/user files whose own names start with ``.wh.`` are
 OUT OF CONTRACT — kernel overlayfs does not reserve that namespace, so a
 real lower file named ``.wh.foo`` deleted through a kernel overlay leaves
@@ -22,6 +36,17 @@ deletion), and an ADDED regular ``.wh.foo`` misreads as a whiteout of
 ``foo`` — both pre-existing, accepted limitations. A user-created regular
 ``.wh..wh.x`` under kernel overlayfs hard-fails via the reserved-name
 RuntimeError guard below (fail-loud by design).
+
+Raises:
+    ValueError: a malformed whiteout marker — the bare prefix ``.wh.``
+        with an empty remainder (names no target, so it cannot be
+        resolved to a real deleted path).
+    RuntimeError: the final invariant guard below — any overlay-reserved
+        name (basename starting with ``.wh.``) that leaks into the
+        result. Under kernel overlayfs this is out-of-contract user input
+        (a real file/dir whose own basename starts with ``.wh.``, e.g.
+        ``.wh..wh.x``); the guard fails loudly rather than letting engine
+        bookkeeping masquerade as a user-visible change.
 """
 from __future__ import annotations
 

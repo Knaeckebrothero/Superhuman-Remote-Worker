@@ -9,6 +9,20 @@ cloud mode must refuse to engage unless every one is rejected.
 This module is a permanent Phase-1 artifact (not spike-only code), so it
 is held to fail-closed standards throughout:
 
+* **A positive read control gates every verdict** (whole-branch-review
+  Finding 1). Before any mutating verb is probed, ``probe_read_only``
+  issues an authenticated ``PROPFIND`` with ``Depth: 0`` against the
+  target and requires a 2xx (200/207) response. Without this, a
+  wrong/expired RO credential 401s on every mutating verb too — every
+  verb comes back "rejected", ``ok`` reads True, and the probe has
+  verified nothing (it never proved the credential could even
+  authenticate, let alone read). A non-2xx or transport error on this
+  check is appended to ``failures``, the same fail-closed bucket as any
+  other unrecoverable check. The rejection set for the verb/side-channel
+  loops is ``{403, 405}`` only — **401 is deliberately excluded**: once
+  the read control has proven the credential live, a genuine RO identity
+  should only ever see 403/405 on a write attempt, so a 401 at that point
+  is anomalous and must fail closed rather than count as "rejected".
 * **Transport errors fail closed.** A timeout or connection error while
   probing a verb is recorded as a failure, not swallowed — an
   unreachable server must never be read as "read-only verified".
@@ -56,7 +70,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-REJECTED_STATUSES = frozenset({401, 403, 405})
+# Whole-branch-review Finding 1: 401 was dropped from this set. Without a
+# positive read control, a wrong/expired RO credential 401s on every
+# mutating verb too, so the old {401, 403, 405} treated "the credential
+# doesn't even work" as "verified read-only". Once ``probe_read_only``'s
+# positive read control has proven the credential is LIVE and can READ
+# the target (see below), a genuine RO identity should only ever see
+# 403/405 on a mutation attempt — a 401 at that point is anomalous
+# (unauthenticated on a write, after successfully authenticating on a
+# read moments earlier) and must fail closed, not count as rejected.
+REJECTED_STATUSES = frozenset({403, 405})
 
 # Status codes for side-channel probes that mean "the request didn't reach
 # far enough to prove anything" (synthetic ids are expected to 404/409 on a
@@ -222,10 +245,52 @@ async def probe_read_only(
     dav_root: str | None = None,
     username: str | None = None,
 ) -> RoProbeResult:
+    """Verify a mount identity is read-only against ``base_url``+``path``.
+
+    Whole-branch-review Finding 1: before probing a single mutating verb,
+    run a POSITIVE READ CONTROL — an authenticated ``PROPFIND`` with
+    ``Depth: 0`` on the target path, requiring a 2xx (200/207) response.
+    This proves the credential is LIVE and can actually READ the target.
+    Without it, a wrong/expired RO credential 401s on every mutating verb
+    too, and every verb would come back "rejected" while the probe had
+    authenticated nothing — "read-only verified" for a credential that
+    cannot read at all. A read-control failure (non-2xx, or a transport
+    error) is appended to ``failures`` — not a separate list — so the
+    existing ``RoProbeResult.ok`` property already refuses the gate on it;
+    see the module docstring for why ``failures`` (not curable by config)
+    is the right bucket.
+
+    The read control runs FIRST but does not short-circuit: the verb loop
+    and side-channel probes still run afterward regardless of its outcome,
+    and everything aggregates into one ``RoProbeResult``.
+
+    Rejection set: ``REJECTED_STATUSES = {403, 405}`` (401 excluded — see
+    the constant's comment). A verb/side-channel response of 401 therefore
+    now falls through to the generic "write path open" failure branch,
+    same as any other unexpected status; it is never classified as
+    ``inconclusive`` (401 is not in ``_INCONCLUSIVE_STATUSES``) or silently
+    dropped.
+    """
     target = base_url.rstrip("/") + "/" + path.lstrip("/")
     failures: list[str] = []
     inconclusive: list[str] = []
     skipped: list[str] = []
+
+    try:
+        read_resp = await client.request("PROPFIND", target, headers={"Depth": "0"})
+    except Exception as e:
+        failures.append(
+            "read control failed: PROPFIND Depth:0 -> transport error "
+            f"{type(e).__name__} (credential not live/authorized; cannot "
+            "verify read-only)"
+        )
+    else:
+        if not (200 <= read_resp.status_code < 300):
+            failures.append(
+                "read control failed: PROPFIND Depth:0 -> "
+                f"{read_resp.status_code} (credential not live/authorized; "
+                "cannot verify read-only)"
+            )
 
     for verb, note, body in MUTATING_VERBS:
         label = verb if not note else f"{verb} ({note})"
@@ -245,7 +310,7 @@ async def probe_read_only(
             )
             continue
         if resp.status_code not in REJECTED_STATUSES:
-            failures.append(f"{label} -> {resp.status_code} (expected 401/403/405)")
+            failures.append(f"{label} -> {resp.status_code} (expected 403/405)")
 
     if dav_root is not None and username is not None:
         for verb, note, req in side_channel_probes(dav_root, username):
@@ -268,8 +333,13 @@ async def probe_read_only(
                     "have been reached — inconclusive, not verified rejected)"
                 )
                 continue
+            # 401 falls through to here too (no longer in REJECTED_STATUSES
+            # or _INCONCLUSIVE_STATUSES): a mutating side channel 401'ing
+            # against a credential the read control just proved live is
+            # anomalous, and must fail closed rather than land in
+            # `inconclusive` or go unclassified.
             failures.append(
-                f"{label} -> {status} (expected 401/403/405; write path open)"
+                f"{label} -> {status} (expected 403/405; write path open)"
             )
     else:
         # dav_root/username weren't supplied — the side channels were
