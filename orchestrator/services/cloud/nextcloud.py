@@ -668,20 +668,20 @@ class NextcloudBackend:
             seen.add(current)
             safe_sub = quote(current, safe="/")
             url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
-            entries = await self._propfind_depth_one(url_path, href_prefix)
+            # Pass self_path=current so the subdir's own self-entry is dropped
+            # by the parser (it was already emitted as a child of its parent);
+            # without it, every subdirectory is counted twice (design §11.5).
+            entries = await self._propfind_depth_one(
+                url_path, href_prefix, self_path=current
+            )
             for entry in entries:
-                # Depth=1 only returns immediate children; defensive guard
-                # against an entry that falls outside ``current``.
-                if current and not entry.path.startswith(current.rstrip("/") + "/"):
-                    if entry.path != current:
-                        continue
                 all_entries.append(entry)
                 if entry.is_dir and entry.path not in seen:
                     queue.append(entry.path)
         return all_entries
 
     async def _propfind_depth_one(
-        self, url_path: str, href_prefix: str
+        self, url_path: str, href_prefix: str, *, self_path: str = ""
     ) -> list[ProjectFolderEntry]:
         """Single ``Depth: 1`` PROPFIND that returns one folder's children.
 
@@ -714,7 +714,9 @@ class NextcloudBackend:
                 status_code=resp.status_code,
                 raw={"body": resp.text[:500]},
             )
-        return parse_propfind_entries(resp.text, href_prefix=href_prefix)
+        return parse_propfind_entries(
+            resp.text, href_prefix=href_prefix, self_path=self_path
+        )
 
     @instrument_backend_op("get_project_folder_file_bytes")
     async def get_project_folder_file_bytes(
