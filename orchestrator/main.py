@@ -862,6 +862,33 @@ async def ide_session_ttl_sweeper(shutdown_event: asyncio.Event) -> None:
     logger.info("IDE session TTL sweeper stopped")
 
 
+async def ro_reader_reconciler_loop(shutdown_event: asyncio.Event) -> None:
+    """Leader-gated periodic sweep of orphaned protected-mode RO grants.
+
+    Revoke-on-teardown alone is not enough (a crash/killed pod can skip it), so
+    this independently revokes any active ``cloud_ro_mounts`` grant whose thread
+    is gone/ended (design §8.1.4). Runs every 15 minutes.
+    """
+    from services.ro_reader_reconciler import reconcile_orphaned_ro_mounts
+
+    logger.info("RO reader reconciler started")
+    while not shutdown_event.is_set():
+        try:
+            await reconcile_orphaned_ro_mounts(
+                postgres_db=postgres_db, router=main_cloud_router
+            )
+        except Exception as e:
+            logger.error("Error in RO reader reconciler: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=900.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("RO reader reconciler stopped")
+
+
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
     """Background loop: reconciles failed/missing session workspaces.
 
@@ -5821,6 +5848,13 @@ async def lifespan(app: FastAPI):
     pool_reconciler_task = asyncio.create_task(
         run_when_leader(agent_pool_reconciler, _shutdown_event)
     )
+    # Protected cloud mode: leader-gated sweep of orphaned RO reader grants
+    # (design §8.1.4). Only when the feature is enabled for this deployment.
+    ro_reader_reconciler_task = None
+    if _is_protected_cloud_mode_enabled():
+        ro_reader_reconciler_task = asyncio.create_task(
+            run_when_leader(ro_reader_reconciler_loop, _shutdown_event)
+        )
     automation_cron_task = asyncio.create_task(
         cron_dispatcher_loop(
             postgres_db, _shutdown_event, on_job_created=_trigger_dispatch
@@ -5980,6 +6014,8 @@ async def lifespan(app: FastAPI):
     await delegation_timeout_task
     await llm_outage_task
     await pool_reconciler_task
+    if ro_reader_reconciler_task is not None:
+        await ro_reader_reconciler_task
     await lifecycle_reconciler_task
     await main_cloud_listen_task
     await automation_cron_task
