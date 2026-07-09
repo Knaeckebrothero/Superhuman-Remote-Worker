@@ -3,7 +3,9 @@
 SRW Management Daemon — runs inside KubeVirt agent VMs.
 
 Bridges the in-VM agent process to the orchestrator via NATS:
-  - Registers the VM (IP, hostname) so the orchestrator can inject SSH config
+  - Registers the VM (IP, hostname, ssh_ready) so the orchestrator can inject
+    SSH config; ssh_ready (local sshd up + tailnet IP) is the readiness
+    evidence that promotes the VM to dispatchable
   - Sends periodic heartbeats with resource usage
   - Relays control commands (freeze/resume/terminate) to the agent process
   - Reports agent process exit status
@@ -16,6 +18,7 @@ See docs/features/nats.md for the NATS subject design.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -49,6 +52,9 @@ AGENT_POLL_INTERVAL = 10  # seconds
 NATS_RETRY_INTERVAL = 5  # seconds
 TAILSCALE_WAIT_TIMEOUT = 60  # seconds to wait for Tailscale before registering
 IP_RECHECK_INTERVAL = 15  # seconds between IP re-checks
+
+# Headscale/Tailscale mesh address space (CGNAT range)
+TAILNET_NET = ipaddress.ip_network("100.64.0.0/10")
 
 
 def load_config() -> dict:
@@ -131,6 +137,28 @@ def detect_ip() -> str:
     return socket.gethostname()
 
 
+def check_ssh_ready(ip: str) -> bool:
+    """Whether this VM is SSH-reachable by agent pods.
+
+    True when local sshd accepts connections AND the detected IP is a tailnet
+    address (100.64.x.y) — the only address agent pods can route to. Reported
+    to the orchestrator as ``ssh_ready`` in the register payload; the
+    orchestrator itself has no tailnet route and cannot probe this (see
+    docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+    """
+    try:
+        if ipaddress.ip_address(ip) not in TAILNET_NET:
+            return False
+    except ValueError:
+        return False  # hostname fallback — not a routable tailnet address
+
+    try:
+        with socket.create_connection(("127.0.0.1", 22), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
 def read_agent_pid() -> int | None:
     """Read the agent process PID from the PID file."""
     try:
@@ -172,6 +200,8 @@ class ManagementDaemon:
         self.nc = None
         self._shutdown = asyncio.Event()
         self._agent_exit_reported = False
+        self._registered_ip = None
+        self._registered_ssh_ready = None
 
     # =========================================================================
     # NATS connection
@@ -221,9 +251,16 @@ class ManagementDaemon:
     # =========================================================================
 
     async def register(self):
-        """Announce this VM to the orchestrator."""
+        """Announce this VM to the orchestrator.
+
+        ``ssh_ready`` is this VM's own readiness evidence (local sshd up +
+        tailnet IP held) — the orchestrator promotes the VM to dispatchable
+        on it. The readiness_update_loop re-registers when it flips.
+        """
         ip = detect_ip()
+        ssh_ready = check_ssh_ready(ip)
         self._registered_ip = ip
+        self._registered_ssh_ready = ssh_ready
         hostname = socket.gethostname()
 
         payload = {
@@ -231,11 +268,18 @@ class ManagementDaemon:
             "hostname": hostname,
             "ip": ip,
             "pid": os.getpid(),
+            "ssh_ready": ssh_ready,
         }
 
         subject = f"agent.vm.{self.orchestrator_id}.{self.job_id}.register"
         await self.nc.publish(subject, json.dumps(payload).encode())
-        log.info("Registered: subject=%s, ip=%s, hostname=%s", subject, ip, hostname)
+        log.info(
+            "Registered: subject=%s, ip=%s, hostname=%s, ssh_ready=%s",
+            subject,
+            ip,
+            hostname,
+            ssh_ready,
+        )
 
     # =========================================================================
     # Control commands
@@ -363,21 +407,29 @@ class ManagementDaemon:
     # =========================================================================
 
     async def ip_update_loop(self):
-        """Periodically re-check IP and re-register if it changes.
+        """Periodically re-check IP + SSH readiness and re-register on change.
 
         Tailscale runs in the background (cloud-init runcmd). The daemon
         may register before Tailscale connects, using the QEMU NAT IP.
-        Once Tailscale gets a 100.64.x.y address, re-register so the
-        orchestrator can route SSH through the mesh VPN.
+        Once Tailscale gets a 100.64.x.y address (and local sshd accepts),
+        re-register so the orchestrator sees ``ssh_ready`` flip and promotes
+        the VM to dispatchable.
         """
         while not self._shutdown.is_set():
             try:
                 current_ip = detect_ip()
-                if current_ip != self._registered_ip:
+                current_ssh_ready = check_ssh_ready(current_ip)
+                if (
+                    current_ip != self._registered_ip
+                    or current_ssh_ready != self._registered_ssh_ready
+                ):
                     log.info(
-                        "IP changed: %s -> %s, re-registering",
+                        "IP/readiness changed: %s (ssh_ready=%s) -> %s "
+                        "(ssh_ready=%s), re-registering",
                         self._registered_ip,
+                        self._registered_ssh_ready,
                         current_ip,
+                        current_ssh_ready,
                     )
                     await self.register()
             except Exception:
@@ -463,6 +515,7 @@ class ManagementDaemon:
 
         # Register with orchestrator
         self._registered_ip = None
+        self._registered_ssh_ready = None
         await self.register()
 
         # Subscribe to control commands

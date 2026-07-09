@@ -389,7 +389,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Agent catalog tools: read-only expert and skill catalog inspection. Primarily for persistent agents (src/tools/orchestrator/catalog.py)",
+          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/tools/orchestrator/catalog.py)",
           "examples": [
             [
               "list_experts",

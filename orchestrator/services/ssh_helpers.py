@@ -15,12 +15,51 @@ DB), so it is safe to import from tests and any service module.
 """
 
 import asyncio
+import ipaddress
+import logging
+import os
 from typing import Optional
 
 from services import resolve_ssh_key_path
 
+logger = logging.getLogger(__name__)
+
 # Remote command run on the agent host to inflate + unpack a snapshot.
 EXTRACT_REMOTE_CMD = "zstd -d | tar -xf - -C /"
+
+# Headscale/Tailscale mesh address space (CGNAT range). VM workspaces get
+# their SSH host from this range; only tailnet members (agent-pod sidecars)
+# can route to it.
+_TAILNET_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def is_tailnet_addr(host: Optional[str]) -> bool:
+    """True when ``host`` is an IP inside the tailnet range (100.64.0.0/10).
+
+    Hostnames and non-tailnet IPs return False.
+    """
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host) in _TAILNET_NET
+    except ValueError:
+        return False
+
+
+def orchestrator_can_reach(host: Optional[str]) -> bool:
+    """Whether the orchestrator process can open a TCP/SSH connection to ``host``.
+
+    The orchestrator pod is NOT a tailnet member — it has no route to
+    100.64.0.0/10, so SSH to VM workspaces from here black-holes (see
+    docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+    Callers must skip tailnet targets visibly instead of timing out quietly.
+
+    Escape hatch: set ORCHESTRATOR_HAS_TAILNET_ROUTE=true on deployments that
+    give the orchestrator tailnet membership (e.g. a future tailscale sidecar).
+    """
+    if not is_tailnet_addr(host):
+        return True
+    return os.getenv("ORCHESTRATOR_HAS_TAILNET_ROUTE", "").lower() == "true"
 
 
 def build_agent_ssh_cmd(
@@ -73,6 +112,18 @@ async def stream_extract_snapshot(
 
     Returns ``(returncode, stderr_bytes)``; callers handle logging.
     """
+    if not orchestrator_can_reach(ssh_host):
+        # Tailnet target — SSH from the orchestrator would black-hole. Fail
+        # fast and visibly instead of hanging on a doomed connect (see
+        # docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+        logger.info(
+            "Skipping snapshot restore to %s:%d: orchestrator has no route "
+            "to tailnet targets",
+            ssh_host,
+            ssh_port,
+        )
+        return 255, b"skipped: unroutable tailnet target from orchestrator"
+
     ssh_cmd = build_agent_ssh_cmd(
         ssh_host, ssh_port, EXTRACT_REMOTE_CMD, key_path=key_path
     )

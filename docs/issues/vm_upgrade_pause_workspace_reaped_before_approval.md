@@ -146,27 +146,54 @@ approval was pending).
 - **`PENDING`-forever display.** Because the request TTL is 24 h, `list_sudo_requests`
   keeps showing `PENDING` even after the workspace it depends on is gone — the operator
   cannot tell from the request that approving it is now hopeless. → addressed by
-  **directions 1 (don't reap under an open request)** + **3 (expire loudly)**.
+  **directions 1 (durable capture)** + **3 (restore-and-decide / expire loudly)** — the
+  request stays valid because the workspace becomes restorable, not because it's held.
 
 ## Fix directions
 
+The correct model is **reap-and-restore, not hold-alive.** Holding an idle workspace
+warm for the full 24 h approval window wastes resources; the workspace should be
+disposable. What makes today's behaviour a *bug* is not that it reaps — it's that the
+reap is **destructive** and the decision path can't recover from it. Make the reap
+non-destructive and the decision trigger a restore, then reap freely.
+
 Primary (fixes the class):
 
-1. **Don't reap a workspace that has an open, unexpired sudo/VM-upgrade approval.**
-   Add a guard to `is_idle`/`is_reapable` (mirroring `has_live_shared_child`): when the
-   bound job has a `pending` row in `sudo_approval_requests` whose `expires_at` is in
-   the future, the workspace is **not** drainable. Surface this as an
-   `awaiting_approval` metadata flag set alongside `job_status` so the predicates stay
-   cheap. This makes the workspace lifetime track the approval TTL instead of the idle
-   timeout.
-2. **Bound the approval window to what the workspace can survive.** If a 24 h TTL is
-   the intended UX, the workspace must be either (a) held for up to 24 h, or (b)
-   snapshot+suspended and reliably restorable on approval — including for VM-tier jobs
-   (needs the persistent-rootdisk work). Pick one; today it silently does neither.
-3. **On expiry, fail loudly and specifically.** When a `vm_upgrade` request expires
-   (or its workspace is confirmed gone), transition the job with an explicit
-   `vm_upgrade_expired` reason — "the approval window closed; re-run the job" — not the
-   generic `workspace_unavailable`.
+1. **Durably capture workspace state at the moment of the gate pause — the precondition
+   everything else rests on.** Before the job goes `paused` for `vm_upgrade_required`,
+   force a snapshot/commit of the workspace to durable storage and confirm the graph
+   checkpoint is persisted (cross-pod Postgres saver). Today this does *not* reliably
+   happen: emptyDir pod workspaces have no retained volume and rootdisk-less VM
+   workspaces have no persistent disk, so `drain()` deletes the only copy — which is
+   exactly why `b5b0c0d0` returned `workspace_unavailable`. Without durable capture,
+   "restart the container and tell the agent the outcome" has nothing to restart from.
+   Persistent VM rootdisk ([`../features/vm_persistent_rootdisk.md`](../features/vm_persistent_rootdisk.md),
+   proposed) is on this critical path for VM-tier jobs.
+2. **Reap on a short warm grace, not the 24 h window; decouple the request TTL from the
+   workspace lifetime.** Keep the workspace warm only for the standard
+   persistent-session idle-sweep period, so a fast approver gets an instant, lossless
+   resume off the live container; after that, snapshot-and-reap. The
+   `sudo_approval_requests` row keeps its 24 h TTL independently — the operator still has
+   24 h to decide, they just pay a restore on resume instead of getting a warm
+   container. (Note `is_idle` currently does *not* gate on `last_activity` for `paused`,
+   so a paused job is drained on the very next tick; this adds that grace.) Requires #1
+   so the post-grace reap is non-destructive.
+3. **Restore-and-decide on approve/deny; fail loudly only on true expiry.** When the
+   operator acts — even hours later, workspace long reaped — re-dispatch the job:
+   - **approve** → provision the VM (tier upgrade), restore the snapshot/commit into it,
+     re-run the gated command, continue;
+   - **deny** → re-provision the original tier, restore, and hand the agent a *denied*
+     tool result so it adapts and continues without the privilege.
+
+   This is the same Continue-as-New re-dispatch the `version_upgrade` freeze already uses
+   (`completion.py` → `paused` → auto-assign dispatcher re-runs a fresh agent on the
+   preserved context). Only if the 24 h TTL lapses with no decision does the job fail —
+   with an explicit `vm_upgrade_expired` reason ("approval window closed; re-run"), never
+   the generic `workspace_unavailable`.
+
+*(This supersedes the earlier "don't reap while a request is open / hold the workspace
+for 24 h" framing — reaping is fine and desirable; the workspace just has to be
+restorable and the decision has to trigger the restore.)*
 
 Secondary — capability model + UX (decided 2026-07-09):
 
