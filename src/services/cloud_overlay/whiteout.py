@@ -7,6 +7,9 @@ unification.md §3.1) and yields one DiffEntry per changed path.
 Deletions surface as EITHER a char(0,0) device node at the deleted name
 OR a `.wh.<name>` regular file. Directory replacement is an "opaque"
 dir, marked by any of three xattrs or a `.wh..wh..opq` sentinel file.
+A char(0,0) node whose OWN name starts with `.wh.` (e.g. `.wh..opq`,
+observed from fuse-overlayfs after a directory rename) is engine
+bookkeeping rather than a deletion, and is skipped rather than surfaced.
 Everything else is a real added/modified path (reported as "present";
 add-vs-modify is resolved by the caller against the lower to avoid an
 rclone round-trip per file).
@@ -84,6 +87,17 @@ def enumerate_diff(upperdir: str) -> list[DiffEntry]:
                     continue
                 st = entry.stat(follow_symlinks=False)
                 if _is_char_whiteout(st):
+                    if name.startswith(_WH_PREFIX):
+                        # Engine bookkeeping, not a deletion: e.g.
+                        # fuse-overlayfs leaves a char(0,0) node named
+                        # `.wh..opq` (a whiteout OF the opaque-sentinel
+                        # name) in a renamed dir's upperdir after `mv
+                        # lowerdir newdir`. Overlay-reserved names can
+                        # never be real user files/dirs in a merged view,
+                        # so this can only be internal bookkeeping —
+                        # skip silently rather than emit a phantom
+                        # deletion of the reserved name itself.
+                        continue
                     out.append(DiffEntry(rel(entry.path), "deleted"))
                     continue
                 if name.startswith(_WH_PREFIX):
@@ -104,4 +118,15 @@ def enumerate_diff(upperdir: str) -> list[DiffEntry]:
                     out.append(DiffEntry(rel(entry.path), "present"))
 
     walk(root)
-    return sorted(out, key=lambda e: e.path)
+    result = sorted(out, key=lambda e: e.path)
+    # Defensive final guarantee: overlay-reserved names (anything whose
+    # basename starts with `.wh.`) can never be a legitimate diff entry —
+    # if any branch above ever leaks one, fail loudly instead of letting
+    # engine bookkeeping masquerade as a user-visible change.
+    for e in result:
+        if os.path.basename(e.path).startswith(_WH_PREFIX):
+            raise RuntimeError(
+                f"invariant violated: overlay-reserved name leaked into "
+                f"diff output: {e.path!r}"
+            )
+    return result
