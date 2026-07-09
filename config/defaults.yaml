@@ -174,7 +174,7 @@ tools:
   # Orchestrator tools - job delegation for persistent agents (src/tools/orchestrator/)
   # Empty by default; persistent agents auto-load these via PersistentSession
   orchestrator: [ ]
-  # Agent catalog tools - read-only expert/skill catalog inspection
+  # Agent catalog tools - expert/skill management
   # Empty by default; persistent agents auto-load these via PersistentSession
   agent_catalog: [ ]
   # Git tools - workspace version control (src/tools/git/)

@@ -422,6 +422,32 @@ class TestDetectIp:
 # =============================================================================
 
 
+class TestCheckSshReady:
+    """Tests for check_ssh_ready() — the daemon's own readiness evidence."""
+
+    def test_non_tailnet_ip_false_without_socket_probe(self):
+        """A non-tailnet IP short-circuits False — no sshd probe attempted."""
+        with patch("socket.create_connection") as mock_conn:
+            assert daemon_mod.check_ssh_ready("10.0.2.15") is False
+        mock_conn.assert_not_called()
+
+    def test_hostname_false(self):
+        with patch("socket.create_connection") as mock_conn:
+            assert daemon_mod.check_ssh_ready("vm-agent-42") is False
+        mock_conn.assert_not_called()
+
+    def test_tailnet_ip_with_sshd_listening_true(self):
+        with patch("socket.create_connection") as mock_conn:
+            mock_conn.return_value.__enter__ = MagicMock()
+            mock_conn.return_value.__exit__ = MagicMock(return_value=False)
+            assert daemon_mod.check_ssh_ready("100.64.1.10") is True
+        mock_conn.assert_called_once_with(("127.0.0.1", 22), timeout=2)
+
+    def test_tailnet_ip_with_sshd_down_false(self):
+        with patch("socket.create_connection", side_effect=ConnectionRefusedError):
+            assert daemon_mod.check_ssh_ready("100.64.1.10") is False
+
+
 class TestReadAgentPid:
     """Tests for read_agent_pid() — PID file reading, alive check."""
 
@@ -694,6 +720,7 @@ class TestRegister:
         """register publishes a JSON payload with job_id, hostname, ip, pid."""
         with (
             patch.object(daemon_mod, "detect_ip", return_value="100.64.1.10"),
+            patch.object(daemon_mod, "check_ssh_ready", return_value=True),
             patch("socket.gethostname", return_value="vm-agent-42"),
             patch("os.getpid", return_value=1234),
         ):
@@ -709,18 +736,21 @@ class TestRegister:
         assert payload["hostname"] == "vm-agent-42"
         assert payload["ip"] == "100.64.1.10"
         assert payload["pid"] == 1234
+        assert payload["ssh_ready"] is True
 
     @pytest.mark.asyncio
     async def test_stores_registered_ip(self, connected_daemon):
         """register stores the detected IP in _registered_ip for ip_update_loop."""
         with (
             patch.object(daemon_mod, "detect_ip", return_value="10.0.0.5"),
+            patch.object(daemon_mod, "check_ssh_ready", return_value=False),
             patch("socket.gethostname", return_value="host"),
             patch("os.getpid", return_value=1),
         ):
             await connected_daemon.register()
 
         assert connected_daemon._registered_ip == "10.0.0.5"
+        assert connected_daemon._registered_ssh_ready is False
 
     @pytest.mark.asyncio
     async def test_uses_correct_nats_subject(self, connected_daemon):
@@ -729,6 +759,7 @@ class TestRegister:
 
         with (
             patch.object(daemon_mod, "detect_ip", return_value="1.2.3.4"),
+            patch.object(daemon_mod, "check_ssh_ready", return_value=False),
             patch("socket.gethostname", return_value="h"),
             patch("os.getpid", return_value=1),
         ):
@@ -1312,8 +1343,36 @@ class TestIpUpdateLoop:
                 return "100.64.1.50"  # Changed
             return "100.64.1.50"
 
+        connected_daemon._registered_ssh_ready = True
         with (
             patch.object(daemon_mod, "detect_ip", side_effect=changing_ip),
+            patch.object(daemon_mod, "check_ssh_ready", return_value=True),
+            patch.object(
+                connected_daemon, "register", new_callable=AsyncMock
+            ) as mock_register,
+        ):
+
+            async def shutdown_after_reregister():
+                while not mock_register.called:
+                    await asyncio.sleep(0.01)
+                connected_daemon.request_shutdown()
+
+            await asyncio.gather(
+                connected_daemon.ip_update_loop(),
+                shutdown_after_reregister(),
+            )
+
+        mock_register.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_re_registers_when_ssh_readiness_flips(self, connected_daemon):
+        """ip_update_loop re-registers when ssh_ready flips (same IP)."""
+        connected_daemon._registered_ip = "100.64.1.50"
+        connected_daemon._registered_ssh_ready = False
+
+        with (
+            patch.object(daemon_mod, "detect_ip", return_value="100.64.1.50"),
+            patch.object(daemon_mod, "check_ssh_ready", return_value=True),
             patch.object(
                 connected_daemon, "register", new_callable=AsyncMock
             ) as mock_register,
@@ -1342,8 +1401,10 @@ class TestIpUpdateLoop:
             check_count += 1
             return "10.0.0.1"
 
+        connected_daemon._registered_ssh_ready = False
         with (
             patch.object(daemon_mod, "detect_ip", side_effect=same_ip),
+            patch.object(daemon_mod, "check_ssh_ready", return_value=False),
             patch.object(
                 connected_daemon, "register", new_callable=AsyncMock
             ) as mock_register,
@@ -1383,8 +1444,10 @@ class TestIpUpdateLoop:
                 raise RuntimeError("network flake")
             return "10.0.0.1"
 
+        connected_daemon._registered_ssh_ready = False
         with (
             patch.object(daemon_mod, "detect_ip", side_effect=flaky_detect),
+            patch.object(daemon_mod, "check_ssh_ready", return_value=False),
             patch.object(
                 connected_daemon, "register", new_callable=AsyncMock
             ) as mock_register,

@@ -328,6 +328,31 @@ class SnapshotService:
         if not self._available:
             return False
 
+        from services.ssh_helpers import orchestrator_can_reach
+
+        if not orchestrator_can_reach(ssh_host):
+            # Tailnet target (VM workspace) — SSH from the orchestrator would
+            # black-hole. Skip visibly instead of hanging on a doomed connect;
+            # snapshots are not supported on the VM backend (see docs/issues/
+            # vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+            logger.info(
+                "Skipping snapshot capture for %s %s (%s:%d): orchestrator "
+                "has no route to tailnet targets",
+                entity_type,
+                job_id,
+                ssh_host,
+                ssh_port,
+            )
+            await self._set_snapshot_context(
+                job_id,
+                {
+                    "status": "capture_skipped",
+                    "error": "unroutable tailnet target from orchestrator",
+                },
+                entity_type=entity_type,
+            )
+            return False
+
         import tempfile
 
         await self._set_snapshot_context(

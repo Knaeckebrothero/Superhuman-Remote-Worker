@@ -1,8 +1,10 @@
 """VM-ready IDE seed is leader-gated (HA / M2-L4).
 
 agent.vm.*.register fans out to both replicas (no queue group). The IDE-config
-SSH seed must run on exactly one, after the leader's SSH-readiness probe
-promotes the VM to ready. Mock-only.
+seed task must be spawned on exactly one replica, when the leader promotes the
+VM to ready on the daemon's readiness evidence (there is no orchestrator-side
+SSH probe — the orchestrator has no tailnet route; see docs/issues/
+vm_ssh_readiness_probe_unroutable_from_orchestrator.md). Mock-only.
 
 Imports the FLATTENED is_leader (from services.leader_election) so the test
 toggles the same Event _on_daemon_register reads — conftest puts orchestrator/
@@ -26,7 +28,13 @@ class FakeMsg:
 
 
 def _payload():
-    return {"job_id": "job-1", "ip": "100.64.0.9", "hostname": "vm1", "pid": 42}
+    return {
+        "job_id": "job-1",
+        "ip": "100.64.0.9",
+        "hostname": "vm1",
+        "pid": 42,
+        "ssh_ready": True,
+    }
 
 
 @pytest.fixture
@@ -34,10 +42,8 @@ def bridge():
     b = NatsBridge()
     b._db = AsyncMock()
     b._db.merge_vm_context = AsyncMock(return_value=True)
-    b._db.merge_vm_context_if_current = AsyncMock(return_value=True)
     b._on_vm_ready = None  # skip the dispatch poke
     b._thread_vm_ids = set()  # job-1 takes the job (not thread) path
-    b._wait_for_agent_ssh = AsyncMock(return_value=(True, 1, ""))
     return b
 
 
@@ -47,7 +53,6 @@ async def test_seeds_on_leader(bridge):
     is_leader.set()
     try:
         await bridge._on_daemon_register(FakeMsg(_payload()))
-        await asyncio.sleep(0)  # let the probe task run
         await asyncio.sleep(0)  # let the seed task run
     finally:
         is_leader.clear()
@@ -62,3 +67,17 @@ async def test_skips_seed_on_follower(bridge):
     await asyncio.sleep(0)
     bridge._seed_vm_ide_config.assert_not_called()
     bridge._db.merge_vm_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_seed_while_not_ready(bridge):
+    """A not-ready register (ssh_ready=False) must not spawn the seed task."""
+    bridge._seed_vm_ide_config = AsyncMock()
+    is_leader.set()
+    try:
+        await bridge._on_daemon_register(FakeMsg({**_payload(), "ssh_ready": False}))
+        await asyncio.sleep(0)
+    finally:
+        is_leader.clear()
+    bridge._seed_vm_ide_config.assert_not_called()
+    bridge._db.merge_vm_context.assert_awaited_once()  # context still recorded
