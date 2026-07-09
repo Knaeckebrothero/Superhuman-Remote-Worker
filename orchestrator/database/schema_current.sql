@@ -323,6 +323,33 @@ COMMENT ON TABLE public.capability_grants IS 'Scoped capability entitlements (Sl
 
 
 --
+-- Name: cloud_ro_mounts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.cloud_ro_mounts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    thread_id uuid NOT NULL,
+    user_id uuid NOT NULL,
+    backend text NOT NULL,
+    reader_id text NOT NULL,
+    grant_handle text NOT NULL,
+    credentials text,
+    webdav_url text NOT NULL,
+    auth_kind text NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    revoked_at timestamp with time zone
+);
+
+
+--
+-- Name: TABLE cloud_ro_mounts; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.cloud_ro_mounts IS 'Per-mount read-only reader grants for protected cloud mode. One row per protected session mount; the reconciler revokes active grants whose thread is gone. Credentials are encrypted at rest (postgres._encrypt_optional).';
+
+
+--
 -- Name: config_overrides; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1720,6 +1747,14 @@ ALTER TABLE ONLY public.capability_grants
 
 
 --
+-- Name: cloud_ro_mounts cloud_ro_mounts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.cloud_ro_mounts
+    ADD CONSTRAINT cloud_ro_mounts_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: datasources datasources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2101,6 +2136,27 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.workspace_intervals
     ADD CONSTRAINT workspace_intervals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: cloud_ro_mounts_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX cloud_ro_mounts_status_idx ON public.cloud_ro_mounts USING btree (status);
+
+
+--
+-- Name: cloud_ro_mounts_thread_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX cloud_ro_mounts_thread_idx ON public.cloud_ro_mounts USING btree (thread_id);
+
+
+--
+-- Name: cloud_ro_mounts_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX cloud_ro_mounts_user_idx ON public.cloud_ro_mounts USING btree (user_id);
 
 
 --
