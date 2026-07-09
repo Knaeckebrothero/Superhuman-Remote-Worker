@@ -1,6 +1,8 @@
 # Cache-token usage & cost accounting
 
-**Status:** Implemented · 2026-07-08
+**Status:** Implemented · 2026-07-08 · shipped in `0a52b4c1` (develop), tests
+across all layers (`test_audit_usage.py`, `test_openrouter_pricing.py`,
+`test_usage_rollup.py`, cockpit specs), no DB migration.
 **Related:** `docs/features/observability_and_quotas.md` (the ledger spine),
 [[project_prompt_cache_tail_injection]] (the optimization that created the blind
 spot), `docs/issues/remove_litellm_proxy_and_gateway_concept.md` (why cost is now
