@@ -182,8 +182,15 @@ rclone version
 # docs/superpowers/plans/2026-07-09-protected-cloud-mode-phase0-spike.md)
 # needs the big-dir/readdir fixes that landed in 1.13. Fail the build loudly
 # rather than silently shipping a too-old binary.
+#
+# The sed must be anchored to the tool's own "fuse-overlayfs: version X"
+# line: `--version` also prints the FUSE library version and the FUSE
+# kernel interface version, each on their own "... version N.N" line, so
+# an unanchored `.*version \(...\)` pattern matches all three lines and
+# `$v` becomes a multi-line string that makes `dpkg --compare-versions`
+# print "bad syntax" on every build.
 fuse-overlayfs --version
-v="$(fuse-overlayfs --version | sed -n 's/.*version \([0-9.]*\).*/\1/p')"
+v="$(fuse-overlayfs --version | sed -n 's/^fuse-overlayfs: version \([0-9.]*\).*/\1/p')"
 dpkg --compare-versions "$v" ge 1.13 \
     || { echo "fuse-overlayfs $v < 1.13"; exit 1; }
 
