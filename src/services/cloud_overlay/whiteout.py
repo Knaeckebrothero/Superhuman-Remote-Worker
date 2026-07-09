@@ -40,10 +40,21 @@ def _is_char_whiteout(st: os.stat_result) -> bool:
 
 
 def is_whiteout(name: str) -> bool:
-    return name.startswith(_WH_PREFIX) and name != _OPAQUE_SENTINEL
+    """Whether ``name`` — a bare basename, not a path — is a whiteout marker.
+
+    The bare prefix ``.wh.`` (empty remainder) names no target and is NOT a
+    valid whiteout; neither is the opaque sentinel.
+    """
+    return (
+        name.startswith(_WH_PREFIX)
+        and name != _OPAQUE_SENTINEL
+        and name != _WH_PREFIX
+    )
 
 
 def is_opaque_dir(dirpath: str) -> bool:
+    """Whether ``dirpath`` — a real, stat-able directory path — is opaque
+    (reads the sentinel file / xattrs from disk)."""
     if os.path.exists(os.path.join(dirpath, _OPAQUE_SENTINEL)):
         return True
     for attr in _OPAQUE_XATTRS:
@@ -75,8 +86,16 @@ def enumerate_diff(upperdir: str) -> list[DiffEntry]:
                 if _is_char_whiteout(st):
                     out.append(DiffEntry(rel(entry.path), "deleted"))
                     continue
-                if is_whiteout(name):
-                    real = os.path.join(dirpath, name[len(_WH_PREFIX):])
+                if name.startswith(_WH_PREFIX):
+                    # Prefix first, then validate the remainder: a bare
+                    # `.wh.` must fail loudly, not alias to the parent dir
+                    # or slip through as a "present" file.
+                    remainder = name[len(_WH_PREFIX):]
+                    if not remainder:
+                        raise ValueError(
+                            f"malformed whiteout marker: {entry.path!r}"
+                        )
+                    real = os.path.join(dirpath, remainder)
                     out.append(DiffEntry(rel(real), "deleted"))
                     continue
                 if stat.S_ISDIR(st.st_mode):

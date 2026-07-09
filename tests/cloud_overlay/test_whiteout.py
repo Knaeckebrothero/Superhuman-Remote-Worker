@@ -2,7 +2,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from src.services.cloud_overlay.whiteout import enumerate_diff, DiffEntry
+import pytest
+
+from src.services.cloud_overlay.whiteout import enumerate_diff, DiffEntry, is_whiteout
 
 
 def _mkchardev_or_skip(p: Path):
@@ -46,8 +48,34 @@ def test_opaque_dir_sentinel_marks_dir_replaced(tmp_path):
 
 
 def test_metadata_xattr_files_never_leak_as_paths(tmp_path):
-    # fuse-overlayfs bookkeeping must not appear as diff entries
-    (tmp_path / "real.txt").write_text("x")
+    # fuse-overlayfs bookkeeping lives in xattrs, not extra files — it must
+    # not appear as diff entries nor duplicate the real path
+    f = tmp_path / "real.txt"
+    f.write_text("x")
+    try:
+        os.setxattr(f, "user.fuseoverlayfs.origin", b"x")
+        os.setxattr(f, "user.containers.override_stat", b"0:0:0755")
+    except OSError:
+        pytest.skip("xattrs unsupported on this filesystem")
     got = enumerate_diff(str(tmp_path))
-    assert [e for e in got if e.path == "real.txt"]
-    assert all(not e.path.startswith(".wh") for e in got)
+    assert got == [DiffEntry("real.txt", "present")]
+
+
+def test_bare_whiteout_marker_at_root_raises(tmp_path):
+    (tmp_path / ".wh.").write_text("")  # prefix with empty remainder: malformed
+    with pytest.raises(ValueError, match="malformed whiteout marker"):
+        enumerate_diff(str(tmp_path))
+
+
+def test_bare_whiteout_marker_nested_raises(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / ".wh.").write_text("")  # must not alias to 'sub' itself
+    with pytest.raises(ValueError, match="malformed whiteout marker"):
+        enumerate_diff(str(tmp_path))
+
+
+def test_is_whiteout_rejects_bare_and_sentinel_names():
+    assert is_whiteout(".wh.gone.txt")
+    assert not is_whiteout(".wh.")          # marker with no target is not valid
+    assert not is_whiteout(".wh..wh..opq")  # opaque sentinel, not a whiteout
+    assert not is_whiteout("regular.txt")
