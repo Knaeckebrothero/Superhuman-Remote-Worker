@@ -13,6 +13,15 @@ bookkeeping rather than a deletion, and is skipped rather than surfaced.
 Everything else is a real added/modified path (reported as "present";
 add-vs-modify is resolved by the caller against the lower to avoid an
 rclone round-trip per file).
+
+Contract note: lower/user files whose own names start with ``.wh.`` are
+OUT OF CONTRACT — kernel overlayfs does not reserve that namespace, so a
+real lower file named ``.wh.foo`` deleted through a kernel overlay leaves
+a char(0,0) node named ``.wh.foo`` that this walker skips (a missed
+deletion), and an ADDED regular ``.wh.foo`` misreads as a whiteout of
+``foo`` — both pre-existing, accepted limitations. A user-created regular
+``.wh..wh.x`` under kernel overlayfs hard-fails via the reserved-name
+RuntimeError guard below (fail-loud by design).
 """
 from __future__ import annotations
 
