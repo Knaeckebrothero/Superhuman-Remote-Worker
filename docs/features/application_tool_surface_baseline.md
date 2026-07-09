@@ -50,7 +50,7 @@ baseline for choosing the right bundles.
 - Persistent sessions currently get only **8 application-control tools** by
   default, all focused on worker-job delegation and control.
 - Persistent sessions also get **3 lightweight task tools** by default.
-- The agent registry contains **103 agent-runtime tools** across workspace,
+- The agent registry contains **118 agent-runtime tools** across workspace,
   shell, research, citation, datasource, knowledge, git, todo, delegation, and
   evaluation categories.
 - The MCP server currently exposes **103 MCP tools**. It mixes product actions,
@@ -61,8 +61,8 @@ baseline for choosing the right bundles.
 - The former builder history also included cross-job workspace edit proposal
   schemas and a large set of operator/API inspection tools. Those are not live
   today and should not be recreated as a separate builder toolset.
-- Major app capabilities that are missing from sessions include project
-  repositories, experts/skills authoring, automations, project loops, rich job
+- Major app capabilities that are missing from session defaults include
+  expert/skill authoring grants, automations, project loops, rich job
   inspection, diff accept/reject, project/datasource management, notifications,
   and session lifecycle introspection.
 - Major MCP gaps include automations, project repositories, experts/skills CRUD,
@@ -144,7 +144,7 @@ not necessarily application actions.
 | `core` | `next_phase_todos`, `todo_complete`, `todo_list`, `todo_rewind`, `mark_complete`, `job_complete`, `request_workspace_upgrade` |
 | `session_task` | `task_add`, `task_complete`, `task_list` |
 | `orchestrator` | `get_session_context`, `create_worker_job`, `list_worker_jobs`, `get_worker_job`, `get_job_workspace_file`, `approve_worker_job`, `resume_worker_job`, `cancel_worker_job`, `pause_worker_job`, `get_current_project`, `list_project_jobs`, `list_project_repositories`, `get_default_project_repository`, `checkout_project_repository` |
-| `agent_catalog` | `list_experts`, `get_expert`, `list_skills`, `search_skills`, `get_skill` |
+| `agent_catalog` | `list_experts`, `get_expert`, `get_expert_bundle`, `set_expert_bundle`, `list_skills`, `search_skills`, `get_skill`, `get_skill_bundle`, `set_skill_bundle` |
 | `research` | `web_search`, `extract_webpage`, `crawl_website`, `map_website`, `search_papers`, `download_paper`, `get_paper_info`, `research_topic` |
 | `browser_direct` | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select`, `browser_scroll`, `browser_screenshot`, `browser_back`, `browser_close` |
 | `citation` | `cite_document`, `cite_web`, `list_sources`, `get_citation`, `list_citations`, `edit_citation`, `annotate_source`, `get_annotations`, `tag_source`, `search_library`, `generate_bibliography` |
@@ -501,11 +501,15 @@ Current tools:
 
 - MCP only has list/get/reload and project expert reads.
 - Sessions have read-only expert catalog tools under the **Experts & Skills**
-  tool group. They have no expert authoring tools.
+  tool group by default.
+- Sessions also have explicit-grant expert bundle authoring tools:
+  `get_expert_bundle` and `set_expert_bundle`. These are registered under
+  `tools.agent_catalog` but are not auto-injected into existing sessions.
 
 Candidate shared actions:
 
 - `experts.list`, `experts.get`, `experts.get_project_version`
+- `experts.get_bundle`, `experts.set_bundle`
 - `experts.create`, `experts.update`, `experts.delete`
 - `experts.duplicate`, `experts.export`, `experts.import`
 - `experts.reload`
@@ -516,8 +520,9 @@ Candidate shared actions:
 Recommended default:
 
 - Sessions should get read-only expert discovery by default.
-- Expert authoring belongs in a grant-gated `experts.authoring` bundle, likely
-  tied to canvas/session collaboration.
+- Expert authoring should use JSON bundle get/set tools with `dry_run` defaulting
+  true, optional `expected_hash`, and an explicit authoring grant. Delete stays
+  out of the first session authoring bundle.
 
 ### Skills
 
@@ -533,12 +538,15 @@ Current tools:
 
 - MCP only has list/get/reload.
 - Sessions have `use_skill` for already-resolved workspace skills and read-only
-  skill catalog tools under **Experts & Skills**. They have no
-  application-level skill authoring tools.
+  skill catalog tools under **Experts & Skills**.
+- Sessions also have explicit-grant skill bundle authoring tools:
+  `get_skill_bundle` and `set_skill_bundle`. These expose a JSON file tree, not
+  base64 zip content, and are not auto-injected into existing sessions.
 
 Candidate shared actions:
 
 - `skills.list`, `skills.get`
+- `skills.get_bundle`, `skills.set_bundle`
 - `skills.create`, `skills.update`, `skills.delete`
 - `skills.duplicate`, `skills.export`, `skills.import`
 - `skills.reload`
@@ -551,7 +559,8 @@ Recommended default:
 
 - Sessions should get skill discovery and maybe `skills.get` for available
   product skills.
-- Creating or editing skills should require a clear authoring grant.
+- Creating or editing skills should require a clear authoring grant. Delete
+  remains out of the first session authoring bundle.
 
 ### Builder Replacement And Canvas Authoring
 
@@ -938,9 +947,12 @@ Expert and skill management is exposed as a separate session tool group named
 Experts & Skills defaults on for existing sessions and configs. A session
 explicitly disables it by setting `tools.agent_catalog: []`; in that mode the
 persistent agent must not receive `list_experts`, `get_expert`, `list_skills`,
-`search_skills`, `get_skill`, or future expert/skill authoring tools. This keeps
-expert/skill management independent from Fleet Management's
-job/project/repository controls.
+`search_skills`, `get_skill`, `get_expert_bundle`, `set_expert_bundle`,
+`get_skill_bundle`, `set_skill_bundle`, or future expert/skill authoring tools.
+Only the read-only catalog tools are auto-injected. The bundle authoring tools
+must be explicitly listed or granted by a future manage-mode UI, so existing
+sessions do not silently gain write access. This keeps expert/skill management
+independent from Fleet Management's job/project/repository controls.
 
 ### Session Always-On Direct Tools
 

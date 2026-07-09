@@ -650,6 +650,13 @@ class TestSetupTools:
             assert name in loaded_names
         for name in catalog_tools:
             assert name in loaded_names
+        for name in (
+            "get_expert_bundle",
+            "set_expert_bundle",
+            "get_skill_bundle",
+            "set_skill_bundle",
+        ):
+            assert name not in loaded_names
         assert "checkout_project_repository" not in loaded_names
 
     def test_repository_checkout_tool_included_for_shell_workspace(self):
@@ -737,6 +744,7 @@ class TestSetupTools:
                     "web_search",
                     "create_worker_job",
                     "list_skills",
+                    "set_skill_bundle",
                     "request_workspace_upgrade",
                 ],
             ),
@@ -760,6 +768,7 @@ class TestSetupTools:
         assert "create_worker_job" in loaded_names
         assert "request_workspace_upgrade" in loaded_names
         assert "list_skills" not in loaded_names
+        assert "set_skill_bundle" not in loaded_names
 
     def test_no_duplicate_orchestrator_tools(self):
         """Orchestrator tools not duplicated if already in config."""
