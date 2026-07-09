@@ -84,6 +84,9 @@ data:
   # DB-backed Agent Skills (skills + skill_files). Read by the orchestrator's
   # skill CRUD/list endpoints. Default-off chart-wide (prod-safe); dev turns it on.
   SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}
+  # Protected cloud mode: RO-reader provisioning + capture overlay. Read by the
+  # orchestrator's RO engage gate + reader reconciler. Default-off (prod-safe).
+  PROTECTED_CLOUD_MODE_ENABLED: {{ .Values.agent.protectedCloudModeEnabled | default "false" | quote }}
 
   # OIDC / SSO — works with internal Keycloak or external OIDC provider
   KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}

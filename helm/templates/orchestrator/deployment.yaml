@@ -116,6 +116,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SKILLS_DB_ENABLED
+            - name: PROTECTED_CLOUD_MODE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PROTECTED_CLOUD_MODE_ENABLED
             - name: VECTOR_POSTGRES_USER
               valueFrom:
                 secretKeyRef:

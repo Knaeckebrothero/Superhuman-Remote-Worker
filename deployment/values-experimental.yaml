@@ -259,6 +259,8 @@ agent:
   expertsDbEnabled: "true"
   # DB-backed Agent Skills (skills + skill_files) — ON in dev for the skills feature.
   skillsDbEnabled: "true"
+  # Protected cloud mode (RO-reader + capture overlay) — ON in dev.
+  protectedCloudModeEnabled: "true"
   tailscale:
     enabled: true
 # -----------------------------------------------------------------------------

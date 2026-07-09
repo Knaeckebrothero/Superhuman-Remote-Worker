@@ -1128,6 +1128,18 @@ def _is_skills_db_enabled() -> bool:
     return os.getenv("SKILLS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
 
 
+def _is_protected_cloud_mode_enabled() -> bool:
+    """Whether protected cloud mode (RO-reader provisioning + capture overlay)
+    is enabled for this deployment. Dev-ON / prod-OFF via the helm
+    ``agent.protectedCloudModeEnabled`` flag
+    (docs/design/cloud_access_unification.md §8 Phase 1)."""
+    return os.getenv("PROTECTED_CLOUD_MODE_ENABLED", "").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
 async def _resolve_default_models(user_id: str | None) -> dict[str, Any]:
     """Effective default chat + auxiliary MODEL NAMES for a user (no transport).
 
