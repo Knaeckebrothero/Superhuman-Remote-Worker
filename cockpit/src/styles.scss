@@ -81,6 +81,15 @@ html {
   scrollbar-color: var(--surface-1) var(--panel-bg);
 }
 
+// Android renders styled scrollbars as permanent (no overlay auto-hide), so
+// every scrollable pane grows a full-height themed track column. Keep the
+// thumb as the affordance but drop the track so it stops reading as chrome.
+@media (max-width: v.$breakpoint-md) {
+  html {
+    scrollbar-color: var(--surface-1) transparent;
+  }
+}
+
 // --- Focus indicators (keyboard navigation) ---
 :focus-visible {
   outline: 2px solid var(--accent-color);

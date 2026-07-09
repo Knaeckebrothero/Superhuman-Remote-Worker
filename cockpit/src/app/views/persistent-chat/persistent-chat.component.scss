@@ -1274,6 +1274,7 @@
         line-height: 1.55;
         resize: none;
         display: block;
+        overflow-y: auto;
       }
 
       .chat-input:focus,
@@ -1717,6 +1718,27 @@
 
       /* Markdown content styling */
 
+      /* Headings: without rules the UA default applies and a `# Title`
+         renders at 2em (30px) — billboard-sized inside a chat column,
+         comically so at phone width. Em-based so the per-device text-size
+         preference carries through. */
+      .message-body ::ng-deep h1,
+      .message-body ::ng-deep h2,
+      .message-body ::ng-deep h3,
+      .message-body ::ng-deep h4,
+      .message-body ::ng-deep h5,
+      .message-body ::ng-deep h6 {
+        margin: 14px 0 6px;
+        line-height: 1.3;
+      }
+
+      .message-body ::ng-deep h1 { font-size: 1.3em; }
+      .message-body ::ng-deep h2 { font-size: 1.2em; }
+      .message-body ::ng-deep h3 { font-size: 1.1em; }
+      .message-body ::ng-deep h4,
+      .message-body ::ng-deep h5,
+      .message-body ::ng-deep h6 { font-size: 1em; }
+
       .message-body ::ng-deep pre {
         background: var(--panel-bg);
         border-radius: var(--radius-surface);
@@ -1994,6 +2016,17 @@
 
         .chat-input {
           font-size: 16px;
+          // With the keyboard open the layout viewport is ~350-420px tall
+          // (interactive-widget=resizes-content), so a 180px draft box would
+          // leave almost no transcript visible. dvh tracks the shrunk viewport.
+          max-height: min(180px, 30dvh);
+          // Android renders the app's styled (non-overlay) scrollbars, so a
+          // capped draft shows a permanent track inside the box. Touch
+          // scrolling doesn't need the bar.
+          scrollbar-width: none;
+          &::-webkit-scrollbar {
+            display: none;
+          }
         }
 
         .composer-wrap {
@@ -2007,6 +2040,21 @@
 
         .ctrl-label {
           display: none;
+        }
+
+        // Touch targets: the desktop composer controls are 26/30px tall,
+        // well under the ~44px a thumb needs. Labels are hidden above, so
+        // the ctrl buttons become square icon targets.
+        .ctrl {
+          height: 40px;
+          min-width: 40px;
+          justify-content: center;
+          padding: 0;
+        }
+
+        .send {
+          width: 44px;
+          height: 44px;
         }
       }
 

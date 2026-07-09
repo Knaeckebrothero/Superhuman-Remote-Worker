@@ -15,7 +15,7 @@ import {
     ViewChild,
     ViewChildren,
 } from '@angular/core';
-import {DecimalPipe, NgTemplateOutlet, TitleCasePipe} from '@angular/common';
+import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {Router, RouterLink} from '@angular/router';
@@ -406,7 +406,6 @@ export function clearDraft(threadId: string | null): void {
         FormsModule,
         NgTemplateOutlet,
         TitleCasePipe,
-        DecimalPipe,
         RouterLink,
         MarkdownComponent,
         CitationRefDirective,
@@ -1821,6 +1820,16 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             }
         });
 
+        // The placeholder renders inside the textarea's scroll area, so a
+        // state swap to a longer string ("Type your message while the session
+        // starts...") overflows the empty 56px box — and with the app's styled
+        // scrollbars that shows a permanent track. Re-run the autosize when
+        // the placeholder changes so the box grows to fit it.
+        effect(() => {
+            this.inputPlaceholder();
+            queueMicrotask(() => this.autoResizeInput());
+        });
+
         // Attachment chips grow the composer the same way a multi-line draft
         // does, shrinking the .messages viewport. Re-pin to the latest turn when
         // the queue changes (Attach button, paste, or drag-drop) so adding a
@@ -1984,7 +1993,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             (this.inputText.trim().length > 0 || this.chat.pendingAttachments().length > 0),
     );
 
+    // With interactive-widget=resizes-content the on-screen keyboard shrinks
+    // the layout viewport, so .messages loses ~40% of its height and the
+    // newest turn slides under the fold. Re-pin while following the bottom.
+    private readonly onViewportResize = () => {
+        if (this.autoScroll) this.scrollToBottom();
+    };
+
     ngOnInit(): void {
+        window.addEventListener('resize', this.onViewportResize);
         this.capabilitiesSub = this.deviceCapabilities.getCapabilities().subscribe((caps) => {
             this.hasCamera.set(caps.hasCamera);
             this.hasAudioInput.set(caps.hasAudioInput);
@@ -2015,6 +2032,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     ngOnDestroy(): void {
         // Don't disconnect — keep session alive across navigation
+        window.removeEventListener('resize', this.onViewportResize);
         this.stopIdePolling();
         if (this.startupTickInterval) {
             clearInterval(this.startupTickInterval);
