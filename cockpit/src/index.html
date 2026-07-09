@@ -4,7 +4,12 @@
   <meta charset="utf-8">
   <title>Cockpit</title>
   <base href="/">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- interactive-widget=resizes-content: since Chrome 108 the Android keyboard
+       only shrinks the *visual* viewport by default, so the flex column (100dvh)
+       keeps the composer underneath the keyboard and the browser scroll-hacks the
+       focused textarea alone into view. resizes-content shrinks the layout
+       viewport instead, re-laying the whole column above the keyboard. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#9c2832" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#141418" media="(prefers-color-scheme: dark)">

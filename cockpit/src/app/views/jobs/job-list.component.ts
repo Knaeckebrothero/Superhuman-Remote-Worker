@@ -854,6 +854,15 @@ interface JobRow {
           width: 14%;
         }
 
+        /* The column is a lone kebab on mobile; the "ACTIONS" label doesn't
+           fit its 14% share and clipped mid-word at the screen edge. (Full
+           .job-table prefix: emulated encapsulation stamps [_ngcontent] on
+           every selector part, so a bare th.col-actions loses to the base
+           .job-table th font-size on specificity.) */
+        .job-table th.col-actions {
+          font-size: 0;
+        }
+
         /* In the narrower status column, let a secondary badge (delegation
            "N children", snapshot "S", child "#N") wrap under the status pill
            rather than drift right toward the kebab. */
