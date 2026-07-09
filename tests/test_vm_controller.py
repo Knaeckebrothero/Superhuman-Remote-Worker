@@ -706,8 +706,14 @@ class TestHandleCreate:
         assert payload["status"] == "failed"
 
     @pytest.mark.asyncio
-    async def test_create_vm_409_not_being_deleted_raises_immediately(self, controller):
-        """409 without 'is being deleted' body raises immediately (no retry)."""
+    async def test_create_vm_409_already_exists_is_idempotent_success(self, controller):
+        """Plain 409 AlreadyExists is idempotent success, not a failure.
+
+        The VM name is agent-vm-<job_id>, so an existing live VM IS this
+        job's VM (a duplicate/racing create lost to one that succeeded).
+        Propagating the 409 as 'failed' parked two healthy loop jobs — see
+        docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md §B.
+        """
         conflict = _FakeApiException(status=409, body="already exists")
 
         controller.k8s_client.create_namespaced_custom_object.side_effect = conflict
@@ -716,10 +722,12 @@ class TestHandleCreate:
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             await controller.handle_create(msg)
 
-        # No sleep = no retry
+        # No sleep = no retry loop; single create call
         mock_sleep.assert_not_awaited()
+        assert controller.k8s_client.create_namespaced_custom_object.call_count == 1
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
-        assert payload["status"] == "failed"
+        assert payload["status"] == "created"
+        assert payload["vm_name"] == f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"
 
     @pytest.mark.asyncio
     async def test_create_vm_malformed_json(self, controller):
@@ -1867,6 +1875,146 @@ class TestEnsureGolden:
         assert name is None
 
 
+class TestGoldenStateNowait:
+    """Non-blocking golden check for the create path.
+
+    Unlike _ensure_golden (kept for pre-warm), this must NEVER sleep waiting
+    for CDI: a create handler blocked for a cold import (~30 min) outlives
+    every orchestrator budget and races later creates into 409 collisions —
+    see docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md.
+    """
+
+    @staticmethod
+    def _get(c):
+        return c.k8s_client.get_namespaced_custom_object
+
+    @staticmethod
+    def _create(c):
+        return c.k8s_client.create_namespaced_custom_object
+
+    @pytest.mark.asyncio
+    async def test_succeeded_returns_name_no_waiting(self, controller):
+        self._get(controller).return_value = {"status": {"phase": "Succeeded"}}
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name == _golden_name("img:sha-a")
+        assert waiting is None
+        self._create(controller).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_importing_returns_waiting_without_sleeping(self, controller):
+        self._get(controller).return_value = {
+            "status": {"phase": "ImportInProgress", "progress": "68.19%"}
+        }
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            name, waiting = await controller._golden_state_nowait("img:sha-a")
+        mock_sleep.assert_not_awaited()
+        assert name is None
+        assert waiting == {
+            "golden": _golden_name("img:sha-a"),
+            "golden_phase": "ImportInProgress",
+            "golden_progress": "68.19%",
+        }
+        self._create(controller).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_creates_dv_and_returns_waiting(self, controller):
+        self._get(controller).side_effect = _FakeApiException(status=404)
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name is None
+        assert waiting["golden"] == _golden_name("img:sha-a")
+        assert waiting["golden_phase"] == "Pending"
+        create = self._create(controller)
+        create.assert_called_once()
+        assert create.call_args.kwargs["group"] == "cdi.kubevirt.io"
+
+    @pytest.mark.asyncio
+    async def test_absent_create_409_racer_still_waits(self, controller):
+        self._get(controller).side_effect = _FakeApiException(status=404)
+        self._create(controller).side_effect = _FakeApiException(status=409)
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name is None
+        assert waiting is not None
+
+    @pytest.mark.asyncio
+    async def test_absent_create_error_falls_back_to_registry(self, controller):
+        self._get(controller).side_effect = _FakeApiException(status=404)
+        self._create(controller).side_effect = _FakeApiException(status=500)
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name is None
+        assert waiting is None
+
+    @pytest.mark.asyncio
+    async def test_failed_golden_recreated_then_waits(self, controller):
+        self._get(controller).return_value = {"status": {"phase": "Failed"}}
+        name, waiting = await controller._golden_state_nowait("img:sha-a")
+        assert name is None
+        assert waiting is not None
+        controller.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        self._create(controller).assert_called_once()
+
+
+class TestDoCreateWaitingGolden:
+    """_do_create defers (no VM, no Headscale key) while the golden imports."""
+
+    @pytest.mark.asyncio
+    async def test_importing_golden_defers_vm_create(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "status": {"phase": "ImportInProgress", "progress": "42.0%"}
+        }
+        msg = make_nats_msg(SAMPLE_JOB_CONFIG)
+        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+            await controller.handle_create(msg)
+
+        # No VM object, no Headscale key minted per poll
+        controller.k8s_client.create_namespaced_custom_object.assert_not_called()
+        controller.headscale.create_auth_key.assert_not_awaited()
+
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "waiting_golden"
+        assert payload["job_id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert payload["golden_progress"] == "42.0%"
+        assert payload["golden"].startswith("agent-vm-golden-")
+
+    @pytest.mark.asyncio
+    async def test_succeeded_golden_creates_vm_with_clone_source(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "status": {"phase": "Succeeded"}
+        }
+        msg = make_nats_msg(SAMPLE_JOB_CONFIG)
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+        ):
+            await controller.handle_create(msg)
+
+        create = controller.k8s_client.create_namespaced_custom_object
+        create.assert_called_once()
+        body = create.call_args.kwargs["body"]
+        dv = body["spec"]["dataVolumeTemplates"][0]["spec"]
+        assert "pvc" in dv["source"]  # clone, not registry import
+
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "created"
+
+    @pytest.mark.asyncio
+    async def test_golden_infra_error_falls_back_to_registry_create(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = (
+            _FakeApiException(status=404)
+        )
+        # golden DV create rejected (CDI infra down) → registry fallback;
+        # VM create (2nd create call) succeeds.
+        controller.k8s_client.create_namespaced_custom_object.side_effect = [
+            _FakeApiException(status=500),
+            MagicMock(),
+        ]
+        msg = make_nats_msg(SAMPLE_JOB_CONFIG)
+        with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
+            await controller.handle_create(msg)
+
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "created"
+
+
 class TestGcGoldens:
     """Keep the newest N; never GC the current, in-use, or too-young goldens."""
 
@@ -1940,8 +2088,8 @@ class TestDoCreateGoldenIntegration:
 
     @pytest.mark.asyncio
     async def test_enabled_applies_clone_source(self, controller):
-        controller._ensure_golden = AsyncMock(
-            return_value="agent-vm-golden-abc123def456"
+        controller._golden_state_nowait = AsyncMock(
+            return_value=("agent-vm-golden-abc123def456", None)
         )
         with (
             patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
@@ -1967,7 +2115,7 @@ class TestDoCreateGoldenIntegration:
 
     @pytest.mark.asyncio
     async def test_golden_failure_falls_back_to_registry(self, controller):
-        controller._ensure_golden = AsyncMock(return_value=None)
+        controller._golden_state_nowait = AsyncMock(return_value=(None, None))
         with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
             await controller._do_create(SAMPLE_JOB_CONFIG)
         body = controller.k8s_client.create_namespaced_custom_object.call_args.kwargs[

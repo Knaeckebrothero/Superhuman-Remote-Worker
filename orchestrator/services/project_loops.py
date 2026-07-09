@@ -121,6 +121,229 @@ def validate_role_sequence(role_sequence: list[Any]) -> None:
                 )
 
 
+# --- Campaign scheduling (docs/features/loop_campaign_scheduling.md, P0) ---
+#
+# Guardrail defaults for planner-mode loops. Per-loop overrides live in the
+# loop row's `campaign_caps` and are validated against the hard ceilings at
+# loop start — the ceilings are the non-negotiable runaway floor.
+LOOP_CAMPAIGN_DEFAULT_CAPS: dict[str, int] = {
+    "max_stages": 5,  # stages one plan may schedule
+    "max_extensions": 2,  # times one campaign may be extended
+    "abort_failures": 2,  # consecutive member failures before early abort
+}
+LOOP_CAMPAIGN_CAPS_CEILING: dict[str, int] = {
+    "max_stages": 10,
+    "max_extensions": 5,
+    "abort_failures": 5,
+}
+# A plan may never spend the loop's whole remaining budget — room must remain
+# for the closing analysis stage + critic checkpoint after the campaign.
+LOOP_CAMPAIGN_BUDGET_RESERVE = 2
+# Bounded archive of disposed campaigns on the loop row (newest last).
+LOOP_CAMPAIGN_HISTORY_LIMIT = 20
+
+_PLAN_OUTCOMES = frozenset({"ship", "extend", "kill"})
+
+
+def resolve_campaign_caps(loop: dict[str, Any]) -> dict[str, int]:
+    """Effective campaign guardrails for a loop: defaults + per-loop overrides.
+
+    Overrides come pre-validated from loop start (``validate_campaign_caps``),
+    but re-clamp against the ceilings anyway — the caps gate spawning, so a
+    hand-edited row must not be able to exceed the runaway floor.
+    """
+    caps = dict(LOOP_CAMPAIGN_DEFAULT_CAPS)
+    overrides = loop.get("campaign_caps") or {}
+    if isinstance(overrides, dict):
+        for key in caps:
+            val = overrides.get(key)
+            if isinstance(val, int) and val >= 1:
+                caps[key] = min(val, LOOP_CAMPAIGN_CAPS_CEILING[key])
+    return caps
+
+
+def validate_campaign_caps(overrides: dict[str, Any]) -> dict[str, int]:
+    """Validate per-loop cap overrides at loop start; raise ValueError.
+
+    Explicit rejection beats silent clamping at the API boundary: a caller who
+    asks for max_stages=50 should learn the ceiling, not silently get 10.
+    """
+    if not isinstance(overrides, dict):
+        raise ValueError("campaign_caps must be an object")
+    unknown = set(overrides) - set(LOOP_CAMPAIGN_DEFAULT_CAPS)
+    if unknown:
+        raise ValueError(
+            f"unknown campaign_caps key(s) {sorted(unknown)}; "
+            f"allowed: {sorted(LOOP_CAMPAIGN_DEFAULT_CAPS)}"
+        )
+    out: dict[str, int] = {}
+    for key, val in overrides.items():
+        if not isinstance(val, int) or isinstance(val, bool) or val < 1:
+            raise ValueError(f"campaign_caps.{key} must be an integer >= 1")
+        ceiling = LOOP_CAMPAIGN_CAPS_CEILING[key]
+        if val > ceiling:
+            raise ValueError(
+                f"campaign_caps.{key}={val} exceeds the hard ceiling {ceiling}"
+            )
+        out[key] = val
+    return out
+
+
+def planner_slots(role_sequence: list[Any]) -> tuple[int, int]:
+    """Locate a planner loop's (critic_slot, execution_slot) in the template.
+
+    Planner grammar on top of ``validate_role_sequence``: the critic must
+    appear exactly once, as a single-role stage (the checkpoint — a fan-out
+    member could never own plan-filing), and the stage after it (cyclically)
+    must be single-role — that stage is the execution slot a filed plan
+    expands into a campaign. Raises ValueError with the first problem.
+    """
+    critic_slots = [
+        i
+        for i, entry in enumerate(role_sequence)
+        if normalize_stage(entry) == ["critic"]
+    ]
+    for i, entry in enumerate(role_sequence):
+        roles = normalize_stage(entry)
+        if "critic" in roles and len(roles) > 1:
+            raise ValueError(
+                "planner scheduling requires the critic to be a single-role "
+                f"checkpoint stage, not a fan-out member (stage {i}: {roles})"
+            )
+    if len(critic_slots) != 1:
+        raise ValueError(
+            "planner scheduling requires exactly one 'critic' stage in "
+            f"role_sequence (found {len(critic_slots)})"
+        )
+    if len(role_sequence) < 2:
+        raise ValueError(
+            "planner scheduling requires at least one non-critic stage — the "
+            "execution slot after the critic checkpoint"
+        )
+    critic_slot = critic_slots[0]
+    execution_slot = (critic_slot + 1) % len(role_sequence)
+    if len(normalize_stage(role_sequence[execution_slot])) > 1:
+        raise ValueError(
+            "planner scheduling requires the stage after the critic (the "
+            "execution slot a plan expands) to be single-role, got fan-out "
+            f"stage {role_sequence[execution_slot]!r}"
+        )
+    return critic_slot, execution_slot
+
+
+def validate_loop_plan(plan: Any, loop: dict[str, Any]) -> dict[str, Any]:
+    """Validate + normalize a Critic-filed campaign plan; raise ValueError.
+
+    Shared by the intake endpoint (so the agent gets actionable feedback while
+    it can still fix the plan) and the advance path (re-validated at apply time
+    — never trust stored input). Roster laxity matches ``role_sequence``: any
+    non-empty role string is accepted, the same contract rotation mode has for
+    its entries (unknown roles fall to the default role block downstream).
+
+    Returns the normalized plan:
+    ``{initiative: {kb_note_id, title}, stages: [{role}...],
+    acceptance: [str...], disposition: {outcome, notes} | None}``.
+    """
+    if not isinstance(plan, dict):
+        raise ValueError("plan must be a JSON object")
+    caps = resolve_campaign_caps(loop)
+
+    initiative = plan.get("initiative")
+    if not isinstance(initiative, dict):
+        raise ValueError("plan.initiative must be an object with kb_note_id")
+    kb_note_id = str(initiative.get("kb_note_id") or "").strip()
+    if not kb_note_id:
+        raise ValueError("plan.initiative.kb_note_id is required")
+    if len(kb_note_id) > 100:
+        raise ValueError("plan.initiative.kb_note_id exceeds 100 chars")
+    title = str(initiative.get("title") or "").strip()[:300]
+
+    raw_stages = plan.get("stages")
+    if not isinstance(raw_stages, list) or not raw_stages:
+        raise ValueError("plan.stages must be a non-empty list")
+    if len(raw_stages) > caps["max_stages"]:
+        raise ValueError(
+            f"plan.stages has {len(raw_stages)} stages; this loop's cap is "
+            f"{caps['max_stages']}"
+        )
+    stages: list[dict[str, str]] = []
+    for i, entry in enumerate(raw_stages):
+        role = entry.get("role") if isinstance(entry, dict) else entry
+        role = str(role or "").strip()
+        if not role:
+            raise ValueError(f"plan.stages[{i}] has no role")
+        if len(role) > 100:
+            raise ValueError(f"plan.stages[{i}].role exceeds 100 chars")
+        stages.append({"role": role})
+
+    remaining = loop.get("remaining_iterations")
+    if remaining is not None:
+        affordable = int(remaining) - LOOP_CAMPAIGN_BUDGET_RESERVE
+        if len(stages) > affordable:
+            raise ValueError(
+                f"plan costs {len(stages)} iterations but the loop can only "
+                f"afford {max(0, affordable)} (remaining {remaining} minus a "
+                f"reserve of {LOOP_CAMPAIGN_BUDGET_RESERVE} for the closing "
+                "analysis + critic stages) — file a shorter plan"
+            )
+
+    raw_acceptance = plan.get("acceptance") or []
+    if not isinstance(raw_acceptance, list):
+        raise ValueError("plan.acceptance must be a list of strings")
+    if len(raw_acceptance) > 10:
+        raise ValueError("plan.acceptance is capped at 10 entries")
+    acceptance = [str(a).strip()[:2000] for a in raw_acceptance if str(a).strip()]
+
+    campaign = loop.get("campaign") or None
+    pending_review = bool(campaign) and campaign.get("status") in ("review", "aborted")
+    raw_disposition = plan.get("disposition")
+    disposition: dict[str, Any] | None = None
+    if raw_disposition is not None:
+        if not isinstance(raw_disposition, dict):
+            raise ValueError("plan.disposition must be an object")
+        outcome = str(raw_disposition.get("outcome") or "").strip()
+        if outcome not in _PLAN_OUTCOMES:
+            raise ValueError(
+                f"plan.disposition.outcome must be one of {sorted(_PLAN_OUTCOMES)}"
+            )
+        if not pending_review:
+            raise ValueError(
+                "plan.disposition given but no campaign is awaiting review — "
+                "omit disposition"
+            )
+        disposition = {
+            "outcome": outcome,
+            "notes": str(raw_disposition.get("notes") or "").strip()[:2000],
+        }
+    elif pending_review:
+        raise ValueError(
+            f"campaign '{campaign.get('title') or campaign.get('id')}' is in "
+            f"status {campaign.get('status')} and must be disposed first — "
+            "include plan.disposition with outcome ship|extend|kill"
+        )
+
+    if disposition and disposition["outcome"] == "extend":
+        if int(campaign.get("extensions_used") or 0) >= caps["max_extensions"]:
+            raise ValueError(
+                "campaign has already used its "
+                f"{caps['max_extensions']} extension(s) — outcome must be "
+                "ship or kill"
+            )
+        if kb_note_id != str(campaign.get("initiative_note_id") or ""):
+            raise ValueError(
+                "extend must continue the same initiative "
+                f"({campaign.get('initiative_note_id')!r}); to switch "
+                "initiatives, dispose with ship or kill"
+            )
+
+    return {
+        "initiative": {"kb_note_id": kb_note_id, "title": title},
+        "stages": stages,
+        "acceptance": acceptance,
+        "disposition": disposition,
+    }
+
+
 # Role-specific task blocks. Keyed by expert config name; unknown roles fall to
 # _ROLE_BLOCK_DEFAULT so the loop stays domain-agnostic (swap `developer` for a
 # `writer` / `default` execution role without code changes). Research-tuned:
@@ -342,6 +565,7 @@ async def create_loop_job(
     seq_index: int | None = None,
     remaining_iterations: int | None = None,
     disable_memory_assembler: bool = False,
+    extra_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Materialize ONE bare loop job for the given role + iteration.
 
@@ -436,6 +660,13 @@ async def create_loop_job(
     if seq_index is not None:
         context["loop_seq_index"] = int(seq_index)
         context["loop_remaining"] = remaining_iterations
+    # Campaign member stamps (loop_campaign_id / loop_campaign_index) and any
+    # other spawn-time truth the caller needs read back by the advance/heal.
+    # Reserved keys above win — extra context can never shadow the loop join
+    # key or the counter stamps.
+    if extra_context:
+        for key, value in extra_context.items():
+            context.setdefault(key, value)
 
     # Resolve the role NAME to a DB expert_id when DB-backed experts are on, so a
     # custom expert in the rotation pulls its OWN overlay (model, prompts, tools)

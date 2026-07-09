@@ -509,6 +509,76 @@ class TestSnapshot:
         snapshot.capture_vm_snapshot.assert_not_called()
 
 
+class TestAttemptsExhausted:
+    """Bounded snapshot retries — except when the target is provably
+    unroutable.
+
+    A tailnet-addressed VM (100.64.0.0/10) cannot be snapshotted from the
+    orchestrator's vantage (no tailnet route — see
+    vm_ssh_readiness_probe_unroutable_from_orchestrator.md), so waiting out
+    max_attempts × tick (~5 min observed) only delays the force-delete while
+    a dead VM holds shared cluster capacity. See
+    docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md §C.
+    """
+
+    @pytest.mark.asyncio
+    async def test_counter_below_max_not_exhausted(self, monkeypatch):
+        monkeypatch.delenv("ORCHESTRATOR_HAS_TAILNET_ROUTE", raising=False)
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            bound_to="job-1",
+            metadata={"ssh_host": "10.0.0.5", "snapshot_attempts": 2},
+        )
+        assert await mgr.attempts_exhausted(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_counter_at_max_exhausted(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            bound_to="job-1",
+            metadata={"ssh_host": "10.0.0.5", "snapshot_attempts": 5},
+        )
+        assert await mgr.attempts_exhausted(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_unroutable_tailnet_host_instantly_exhausted(self, monkeypatch):
+        monkeypatch.delenv("ORCHESTRATOR_HAS_TAILNET_ROUTE", raising=False)
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            bound_to="job-1",
+            metadata={"ssh_host": "100.64.23.194", "snapshot_attempts": 0},
+        )
+        assert await mgr.attempts_exhausted(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_tailnet_host_with_route_uses_counter(self, monkeypatch):
+        # ORCHESTRATOR_HAS_TAILNET_ROUTE escape hatch: snapshot CAN succeed,
+        # so the bounded retry applies as usual.
+        monkeypatch.setenv("ORCHESTRATOR_HAS_TAILNET_ROUTE", "true")
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            bound_to="job-1",
+            metadata={"ssh_host": "100.64.23.194", "snapshot_attempts": 0},
+        )
+        assert await mgr.attempts_exhausted(inst) is False
+
+    @pytest.mark.asyncio
+    async def test_missing_host_uses_counter(self):
+        # No endpoint at all → keep the bounded-attempt behaviour (unknown
+        # ≠ provably unroutable).
+        mgr, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={})
+        assert await mgr.attempts_exhausted(inst) is False
+
+
 class TestRestore:
     @pytest.mark.asyncio
     async def test_job_scope_restores_via_workspace(self):

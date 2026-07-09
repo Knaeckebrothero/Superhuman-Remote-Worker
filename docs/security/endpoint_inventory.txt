@@ -135,6 +135,7 @@ GET    /api/jobs/{job_id}/ide                                                   
 POST   /api/jobs/{job_id}/ide                                                           gated:require_job_access
 GET    /api/jobs/{job_id}/llm-requests                                                  gated:require_job_access
 GET    /api/jobs/{job_id}/logs                                                          gated:require_job_access
+POST   /api/jobs/{job_id}/loop-plan                                                     internal:require_internal
 GET    /api/jobs/{job_id}/memories                                                      gated:require_job_access
 GET    /api/jobs/{job_id}/memory/stats                                                  gated:require_job_access
 GET    /api/jobs/{job_id}/messages                                                      gated:require_job_access

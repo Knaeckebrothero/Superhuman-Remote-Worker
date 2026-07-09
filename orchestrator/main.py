@@ -68,6 +68,7 @@ configure_logging(
 
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
+from collections.abc import Coroutine  # noqa: E402
 from typing import Any, Literal, Optional  # noqa: E402
 from uuid import UUID  # noqa: E402
 
@@ -154,7 +155,9 @@ from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
 from services.dispatch_guards import (  # noqa: E402
+    VM_GOLDEN_POLL,
     VM_PARK_EXHAUSTED,
+    VM_PARK_GOLDEN,
     VM_PARKED,
     VM_PROVISION,
     VM_RECYCLE,
@@ -186,6 +189,11 @@ from services.cloud import (  # noqa: E402
     SupportsRcloneMount,
     UserId,
     build_backend,
+)
+from services.cloud.identity import (  # noqa: E402
+    get_home_browser_url_cached,
+    peek_home_browser_url,
+    resolve_user_identity_cached,
 )
 from services.cloud.reload import (  # noqa: E402
     _reload_from_db_and_swap,
@@ -4048,12 +4056,16 @@ async def _try_dispatch_pending_jobs() -> None:
                         os.environ.get("VM_PROVISION_MAX_ATTEMPTS", "3")
                     )
                     timeout_s = int(os.environ.get("VM_PROVISION_TIMEOUT_S", "600"))
+                    golden_timeout_s = int(
+                        os.environ.get("VM_GOLDEN_WAIT_TIMEOUT_S", "2700")
+                    )
                     vm_decision = vm_provisioning_decision(
                         vm_ctx,
                         provision_attempts=provision_attempts,
                         max_provision_attempts=max_provision_attempts,
                         now=time.time(),
                         timeout_s=timeout_s,
+                        golden_timeout_s=golden_timeout_s,
                     )
                     if vm_decision == VM_PARK_EXHAUSTED:
                         # Retries used up — park the VM context AND fail the job.
@@ -4155,6 +4167,75 @@ async def _try_dispatch_pending_jobs() -> None:
                             vm_error,
                         )
                         await _fail_vm_parked_job(job_id, vm_error)
+                        continue
+                    if vm_decision == VM_GOLDEN_POLL:
+                        # No VM exists yet — the controller is waiting on a
+                        # shared golden-image import (cold import after an
+                        # agent-vm-base bump: ~30 min, longer than timeout_s).
+                        # Re-issue create as the poll: the controller answers
+                        # waiting_golden (cheap DV GET) until the golden is
+                        # Succeeded, then actually builds the VM. fresh=False
+                        # keeps the golden budget anchor + counters and does
+                        # NOT consume a provision attempt — the attempt budget
+                        # bounds VM boots, and no boot is happening. See
+                        # docs/issues/
+                        # golden_image_cold_import_fails_inflight_vm_jobs.md.
+                        if not vm_ctx.get("golden_wait_started_at"):
+                            await postgres_db.merge_vm_context(
+                                job_id,
+                                {"golden_wait_started_at": time.time()},
+                            )
+                        config_override = job.get("config_override") or {}
+                        if isinstance(config_override, str):
+                            config_override = json.loads(config_override)
+                        vm_cfg = config_override.get("workspace", {}).get("vm", {})
+                        await vm_provisioner.create_vm(
+                            job_id=job_id,
+                            agent_config=job.get("config_name", "defaults"),
+                            vm_image=vm_cfg.get("image"),
+                            cpu_cores=vm_cfg.get("cpu_cores", 8),
+                            memory=vm_cfg.get("memory", "16Gi"),
+                            description=job.get("description", ""),
+                            fresh=False,
+                        )
+                        logger.info(
+                            "Dispatcher: job %s waiting on golden image %s "
+                            "(%s) — polling",
+                            job_id,
+                            vm_ctx.get("golden") or "?",
+                            vm_ctx.get("golden_progress")
+                            or vm_ctx.get("golden_phase")
+                            or "importing",
+                        )
+                        continue
+                    if vm_decision == VM_PARK_GOLDEN:
+                        # The golden import outlived even the golden budget —
+                        # CDI is wedged or the registry is unreachable. No VM
+                        # was ever created, so there is nothing to recycle;
+                        # fail the job with the truth (not the misleading
+                        # "provisioning exhausted after N attempts").
+                        elapsed = int(
+                            time.time()
+                            - float(vm_ctx.get("golden_wait_started_at") or 0)
+                        )
+                        park_error = (
+                            f"golden image import did not complete within "
+                            f"{golden_timeout_s}s (golden "
+                            f"{vm_ctx.get('golden') or 'unknown'}, last progress "
+                            f"{vm_ctx.get('golden_progress') or 'unknown'}, "
+                            f"waited {elapsed}s) — VM never created"
+                        )
+                        logger.warning(
+                            "Dispatcher: job %s golden wait exhausted — "
+                            "failing job (%s)",
+                            job_id,
+                            park_error,
+                        )
+                        await postgres_db.merge_vm_context(
+                            job_id,
+                            {"status": "failed", "error": park_error},
+                        )
+                        await _fail_vm_parked_job(job_id, park_error)
                         continue
                     if vm_decision == VM_RECYCLE:
                         # Stuck short of 'ready' past the budget — tear it down so
@@ -10290,6 +10371,7 @@ async def _spawn_loop_job(
     seq_index: int | None = None,
     remaining_iterations: int | None = None,
     disable_memory_assembler: bool = False,
+    extra_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create + provision + dispatch one bare project-loop job.
 
@@ -10315,6 +10397,7 @@ async def _spawn_loop_job(
         seq_index=seq_index,
         remaining_iterations=remaining_iterations,
         disable_memory_assembler=disable_memory_assembler,
+        extra_context=extra_context,
     )
 
     try:
@@ -10349,6 +10432,7 @@ async def _spawn_loop_stage(
     seq_index: int,
     base_total: int,
     remaining: int | None,
+    extra_context: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Spawn every role in ONE loop stage and return (jobs, new_total_jobs_run).
 
@@ -10377,9 +10461,15 @@ async def _spawn_loop_stage(
             seq_index=seq_index,
             remaining_iterations=remaining,
             disable_memory_assembler=is_fan_out,
+            extra_context=extra_context,
         )
         jobs.append(job)
     return jobs, new_total
+
+
+# Sentinel: "leave the campaign column untouched" for _writeback_loop_stage —
+# None is a meaningful value there (clear the active campaign).
+_WB_UNSET: Any = object()
 
 
 async def _writeback_loop_stage(
@@ -10391,6 +10481,7 @@ async def _writeback_loop_stage(
     total: int,
     consecutive: int,
     last_error: str | None,
+    campaign: Any = _WB_UNSET,
 ) -> dict[str, Any] | None:
     """Point a loop at a freshly-spawned stage.
 
@@ -10398,6 +10489,10 @@ async def _writeback_loop_stage(
     cleared to []). Multiple jobs → ``current_stage_jobs`` holds the members and
     ``current_job_id`` stays NULL — the barrier tracks them until the last one
     finishes. Mirrors the counters the single-role advance always wrote.
+
+    ``campaign`` (planner loops) rides the SAME row update as the pointer, so
+    the queue-cursor/status mutation and the stage pointer can never tear
+    apart from each other (docs/features/loop_campaign_scheduling.md).
     """
     ids = [str(j["id"]) for j in jobs]
     common = dict(
@@ -10407,6 +10502,8 @@ async def _writeback_loop_stage(
         total_jobs_run=total,
         last_error=last_error,
     )
+    if campaign is not _WB_UNSET:
+        common["campaign"] = campaign
     if len(ids) == 1:
         return await postgres_db.update_project_loop(
             loop_id, current_job_id=ids[0], current_stage_jobs=[], **common
@@ -10551,6 +10648,309 @@ def _loop_stop_reason(
     return None
 
 
+async def _spawn_campaign_member(
+    loop: dict[str, Any],
+    *,
+    campaign: dict[str, Any],
+    stage_index: int,
+    execution_slot: int,
+    base_total: int,
+    next_remaining: int | None,
+    consecutive: int,
+    last_error: str | None,
+    actions: list[str],
+) -> bool:
+    """Spawn ONE campaign stage and point the loop at it (planner mode).
+
+    The member is stamped with ``loop_campaign_id`` / ``loop_campaign_index``
+    (spawn-time truth: the advance derives "next stage" from the completed
+    member's stamp, so a lost write-back heals through the existing re-point
+    path without double-spawning). The passed ``campaign`` already carries the
+    post-spawn cursor and rides the same row update as the stage pointer.
+    On a spawn failure the loop is marked failed — same policy as the
+    rotation path (a running loop with nothing in flight would never advance).
+    Always returns True: the completed advance is fully handled either way.
+    """
+    loop_id = str(loop["id"])
+    stages = campaign.get("stages") or []
+    entry = stages[stage_index]
+    role = str(entry.get("role") if isinstance(entry, dict) else entry)
+    label = campaign.get("title") or campaign.get("initiative_note_id") or "?"
+
+    loop_for_spawn = dict(loop)
+    loop_for_spawn["remaining_iterations"] = next_remaining
+    try:
+        jobs, new_total = await _spawn_loop_stage(
+            loop_for_spawn,
+            stage=role,
+            seq_index=execution_slot,
+            base_total=base_total,
+            remaining=next_remaining,
+            extra_context={
+                "loop_campaign_id": str(campaign["id"]),
+                "loop_campaign_index": int(stage_index),
+            },
+        )
+    except Exception as e:
+        logger.exception(
+            "project loop %s: failed to spawn campaign stage %d", loop_id, stage_index
+        )
+        await postgres_db.update_project_loop(
+            loop_id,
+            status="failed",
+            remaining_iterations=next_remaining,
+            consecutive_failures=consecutive,
+            last_error=f"campaign spawn failed: {e}",
+            stop_reason="failures",
+            current_job_id=None,
+            current_stage_jobs=[],
+            campaign=campaign,
+        )
+        actions.append(f"project loop {loop_id[:8]} stopped (campaign spawn failed)")
+        return True
+
+    await _writeback_loop_stage(
+        loop_id,
+        jobs=jobs,
+        seq_index=execution_slot,
+        remaining=next_remaining,
+        total=new_total,
+        consecutive=consecutive,
+        last_error=last_error,
+        campaign=campaign,
+    )
+    actions.append(
+        f"project loop {loop_id[:8]} → campaign '{label}' stage "
+        f"{stage_index + 1}/{len(stages)} ({role} job {str(jobs[0]['id'])[:8]})"
+    )
+    return True
+
+
+async def _advance_planner_campaign(
+    loop: dict[str, Any],
+    *,
+    completed_job: dict[str, Any],
+    completed_ctx: dict[str, Any],
+    completed_failed: bool,
+    base_total: int,
+    next_remaining: int | None,
+    consecutive: int,
+    last_error: str | None,
+    actions: list[str],
+) -> tuple[bool, Any]:
+    """Planner-mode campaign step for a completed single-role loop job.
+
+    Returns ``(handled, campaign_update)``:
+
+      * ``(True, …)`` — a campaign stage was spawned (or the loop was marked
+        failed on a spawn error); the caller must NOT rotate.
+      * ``(False, campaign_update)`` — fall through to normal rotation;
+        ``campaign_update`` (unless ``_WB_UNSET``) is a campaign mutation
+        (complete → ``review``, abort → ``aborted``) that must ride the
+        rotation's write-back so status and pointer can't tear apart.
+
+    Everything here is idempotent under the sweeper's re-point-and-re-advance
+    recovery: member steps derive "next stage" from the completed member's
+    spawn-time stamps, and plan application is guarded on
+    ``campaign.plan_job_id`` (a healed re-run of the same critic job resumes
+    at the persisted cursor instead of re-applying the plan).
+    docs/features/loop_campaign_scheduling.md (P0).
+    """
+    from services.project_loops import (
+        LOOP_CAMPAIGN_HISTORY_LIMIT,
+        planner_slots,
+        resolve_campaign_caps,
+        validate_loop_plan,
+    )
+
+    loop_id = str(loop["id"])
+    try:
+        critic_slot, execution_slot = planner_slots(loop.get("role_sequence") or [])
+    except ValueError:
+        # Malformed planner template (should be rejected at start) — degrade
+        # to plain rotation rather than wedging the loop.
+        logger.warning(
+            "project loop %s: planner scheduling with invalid role_sequence — "
+            "falling back to rotation",
+            loop_id[:8],
+        )
+        return False, _WB_UNSET
+
+    campaign = loop.get("campaign") or None
+    caps = resolve_campaign_caps(loop)
+
+    # ---- A completed CAMPAIGN MEMBER: continue / finish / abort the queue.
+    member_campaign_id = completed_ctx.get("loop_campaign_id")
+    if member_campaign_id:
+        if not campaign or str(campaign.get("id")) != str(member_campaign_id):
+            return False, _WB_UNSET  # member of an already-disposed campaign
+        try:
+            member_index = int(completed_ctx.get("loop_campaign_index"))
+        except (TypeError, ValueError):
+            return False, _WB_UNSET
+        stages = campaign.get("stages") or []
+        stages_done = max(int(campaign.get("stages_done") or 0), member_index + 1)
+        member_failures = (
+            (int(campaign.get("member_failures") or 0) + 1) if completed_failed else 0
+        )
+        label = campaign.get("title") or campaign.get("initiative_note_id") or "?"
+
+        if completed_failed and member_failures >= caps["abort_failures"]:
+            actions.append(
+                f"project loop {loop_id[:8]}: campaign '{label}' ABORTED after "
+                f"{member_failures} consecutive member failures — returning to "
+                "the critic checkpoint"
+            )
+            return False, {
+                **campaign,
+                "status": "aborted",
+                "member_failures": member_failures,
+                "stages_done": stages_done,
+            }
+
+        next_index = member_index + 1
+        if next_index >= len(stages):
+            actions.append(
+                f"project loop {loop_id[:8]}: campaign '{label}' complete "
+                f"({len(stages)} stages) — awaiting critic review"
+            )
+            return False, {
+                **campaign,
+                "status": "review",
+                "member_failures": member_failures,
+                "stages_done": len(stages),
+                "cursor": len(stages),
+            }
+
+        handled = await _spawn_campaign_member(
+            loop,
+            campaign={
+                **campaign,
+                "member_failures": member_failures,
+                "stages_done": stages_done,
+                "cursor": next_index + 1,
+            },
+            stage_index=next_index,
+            execution_slot=execution_slot,
+            base_total=base_total,
+            next_remaining=next_remaining,
+            consecutive=consecutive,
+            last_error=last_error,
+            actions=actions,
+        )
+        return handled, _WB_UNSET
+
+    # ---- The CHECKPOINT CRITIC completed: apply its filed plan (if any).
+    stamped_seq = completed_ctx.get("loop_seq_index")
+    is_checkpoint_critic = completed_ctx.get("loop_role") == "critic" and (
+        stamped_seq is None or int(stamped_seq) == critic_slot
+    )
+    if not is_checkpoint_critic:
+        return False, _WB_UNSET
+
+    plan = completed_ctx.get("loop_plan")
+    if not isinstance(plan, dict):
+        return False, _WB_UNSET  # no plan filed → implicit K=1 rotation fallback
+
+    # Idempotency (healed re-run of the same critic advance): the plan was
+    # already applied — resume spawning at the persisted cursor instead.
+    if campaign and str(campaign.get("plan_job_id")) == str(completed_job["id"]):
+        cursor = int(campaign.get("cursor") or 0)
+        stages = campaign.get("stages") or []
+        if cursor >= len(stages):
+            return False, _WB_UNSET
+        handled = await _spawn_campaign_member(
+            loop,
+            campaign={**campaign, "cursor": cursor + 1},
+            stage_index=cursor,
+            execution_slot=execution_slot,
+            base_total=base_total,
+            next_remaining=next_remaining,
+            consecutive=consecutive,
+            last_error=last_error,
+            actions=actions,
+        )
+        return handled, _WB_UNSET
+
+    # Re-validate at apply time — never trust stored input, and the budget may
+    # have moved since intake. A rejected plan degrades to rotation (K=1).
+    try:
+        normalized = validate_loop_plan(plan, loop)
+    except ValueError as e:
+        logger.warning(
+            "project loop %s: filed plan rejected at apply time: %s", loop_id[:8], e
+        )
+        actions.append(
+            f"project loop {loop_id[:8]}: filed plan rejected at apply time "
+            f"({e}) — falling back to rotation"
+        )
+        return False, _WB_UNSET
+
+    # Dispose the finished/aborted campaign (validated present when required).
+    history = list(loop.get("campaign_history") or [])
+    extensions_used = 0
+    disposition = normalized.get("disposition")
+    if campaign and disposition:
+        outcome = disposition["outcome"]
+        if outcome == "extend":
+            extensions_used = int(campaign.get("extensions_used") or 0) + 1
+        history.append(
+            {
+                "id": campaign.get("id"),
+                "initiative_note_id": campaign.get("initiative_note_id"),
+                "title": campaign.get("title"),
+                "stages_total": len(campaign.get("stages") or []),
+                "stages_done": campaign.get("stages_done"),
+                "extensions_used": campaign.get("extensions_used"),
+                "status_at_close": campaign.get("status"),
+                "outcome": outcome,
+                "notes": disposition.get("notes"),
+                "disposed_by": str(completed_job["id"]),
+            }
+        )
+        history = history[-LOOP_CAMPAIGN_HISTORY_LIMIT:]
+        actions.append(
+            f"project loop {loop_id[:8]}: campaign "
+            f"'{campaign.get('title') or campaign.get('initiative_note_id')}' "
+            f"disposed ({outcome})"
+        )
+
+    new_campaign = {
+        # Deterministic id = the plan job — a healed re-run recreates the SAME
+        # campaign and is caught by the plan_job_id guard above.
+        "id": str(completed_job["id"]),
+        "plan_job_id": str(completed_job["id"]),
+        "initiative_note_id": normalized["initiative"]["kb_note_id"],
+        "title": normalized["initiative"]["title"],
+        "stages": normalized["stages"],
+        "acceptance": normalized["acceptance"],
+        "cursor": 0,
+        "stages_done": 0,
+        "member_failures": 0,
+        "extensions_used": extensions_used,
+        "status": "active",
+    }
+    # Persist the campaign BEFORE spawning (own transaction): a tear between
+    # this write and the spawn heals via the plan_job_id re-run above — the
+    # reverse order would strand a spawned member with no campaign to join.
+    await postgres_db.update_project_loop(
+        loop_id, campaign=new_campaign, campaign_history=history
+    )
+
+    handled = await _spawn_campaign_member(
+        loop,
+        campaign={**new_campaign, "cursor": 1},
+        stage_index=0,
+        execution_slot=execution_slot,
+        base_total=base_total,
+        next_remaining=next_remaining,
+        consecutive=consecutive,
+        last_error=last_error,
+        actions=actions,
+    )
+    return handled, _WB_UNSET
+
+
 async def _rotate_loop_to_next_stage(
     loop: dict[str, Any],
     *,
@@ -10560,6 +10960,9 @@ async def _rotate_loop_to_next_stage(
     consecutive: int,
     last_error: str | None,
     actions: list[str],
+    completed_job: dict[str, Any] | None = None,
+    completed_ctx: dict[str, Any] | None = None,
+    completed_failed: bool = False,
 ) -> None:
     """Rotate a loop past the just-finished stage and spawn the next one.
 
@@ -10568,11 +10971,35 @@ async def _rotate_loop_to_next_stage(
     jobs), and points the loop at it (``current_job_id`` or
     ``current_stage_jobs``). On a spawn failure the loop is marked failed — a
     running loop with no in-flight job/stage would never advance.
+
+    Planner-scheduled loops (docs/features/loop_campaign_scheduling.md) get a
+    campaign step first: a checkpoint critic's filed plan expands the execution
+    slot into a stage queue, and a completed campaign member spawns its
+    successor instead of rotating. When the campaign step falls through
+    (no plan / queue drained / abort), rotation proceeds as always — with any
+    campaign status mutation riding the same write-back as the pointer.
     """
     from services.project_loops import normalize_stage
 
     loop_id = str(loop["id"])
     roles = loop.get("role_sequence") or ["scholar", "critic", "developer"]
+
+    campaign_update: Any = _WB_UNSET
+    if (loop.get("scheduling") or "rotation") == "planner" and completed_job:
+        handled, campaign_update = await _advance_planner_campaign(
+            loop,
+            completed_job=completed_job,
+            completed_ctx=completed_ctx or {},
+            completed_failed=completed_failed,
+            base_total=base_total,
+            next_remaining=next_remaining,
+            consecutive=consecutive,
+            last_error=last_error,
+            actions=actions,
+        )
+        if handled:
+            return
+
     next_index = (int(seq_index_completed) + 1) % len(roles)
 
     # KB convergence (docs/features/kb_convergence_ttl_reverification.md, F13): a
@@ -10614,8 +11041,7 @@ async def _rotate_loop_to_next_stage(
         )
     except Exception as e:
         logger.exception("project loop %s: failed to spawn next stage", loop_id)
-        await postgres_db.update_project_loop(
-            str(loop_id),
+        fail_fields: dict[str, Any] = dict(
             status="failed",
             remaining_iterations=next_remaining,
             consecutive_failures=consecutive,
@@ -10624,6 +11050,9 @@ async def _rotate_loop_to_next_stage(
             current_job_id=None,
             current_stage_jobs=[],
         )
+        if campaign_update is not _WB_UNSET:
+            fail_fields["campaign"] = campaign_update
+        await postgres_db.update_project_loop(str(loop_id), **fail_fields)
         actions.append(f"project loop {str(loop_id)[:8]} stopped (spawn failed)")
         return
 
@@ -10635,6 +11064,7 @@ async def _rotate_loop_to_next_stage(
         total=new_total,
         consecutive=consecutive,
         last_error=last_error,
+        campaign=campaign_update,
     )
     if len(jobs) == 1:
         actions.append(
@@ -10738,7 +11168,12 @@ async def _advance_project_loop(
         actions.append(f"project loop {str(loop_id)[:8]} stopped ({stop_reason})")
         return
 
-    # Rotate to the next stage and spawn it (1 or N jobs).
+    # Rotate to the next stage and spawn it (1 or N jobs). The completed job +
+    # its decoded context feed the planner campaign step (no-op for
+    # rotation-scheduled loops); the parallel-member path below deliberately
+    # passes neither — campaign plans are only ever read off single-role
+    # completions (the checkpoint critic and campaign members are single-role
+    # by grammar).
     await _rotate_loop_to_next_stage(
         loop,
         seq_index_completed=int(loop.get("seq_index") or 0),
@@ -10747,6 +11182,9 @@ async def _advance_project_loop(
         consecutive=consecutive,
         last_error=last_error,
         actions=actions,
+        completed_job=job,
+        completed_ctx=ctx or {},
+        completed_failed=failed,
     )
 
 
@@ -10923,6 +11361,136 @@ async def _trigger_curation_final_pass(
             "Link all notes. Then call job_complete."
         ),
     )
+
+
+class LoopPlanRequest(BaseModel):
+    """Body for ``POST /api/jobs/{job_id}/loop-plan`` — a Critic-filed campaign
+    plan (docs/features/loop_campaign_scheduling.md). Validated structurally by
+    ``validate_loop_plan``; kept as a free dict here so the agent gets ONE
+    consolidated, actionable error message from the domain validator instead of
+    a pydantic field soup."""
+
+    plan: dict[str, Any]
+
+
+@app.post("/api/jobs/{job_id}/loop-plan")
+async def file_loop_plan(
+    request: Request,
+    job_id: str,
+    body: LoopPlanRequest,
+) -> dict[str, Any]:
+    """File a campaign plan from a planner loop's checkpoint critic. **Internal**
+    (P4b) — requires ``X-Internal-Key``. Ingress strips this path.
+
+    Validated at call time so the critic learns about a malformed plan while it
+    can still fix it (the whole point of tool-transport over freeze_data). The
+    normalized plan is stored in the job's context (``loop_plan``) via the
+    atomic context merge; the loop's advance applies it when the critic job
+    completes. Idempotent: re-filing replaces the stored plan.
+
+    Gating (defense in depth with the P1 spawn-time tool injection): only the
+    loop's in-flight job may file, only on a running planner-scheduled loop,
+    and only from the checkpoint-critic stage — a campaign member occupies the
+    execution slot, so it is rejected structurally, not by role-string check.
+    """
+    await require_internal(request)
+    from services.project_loops import (
+        job_loop_id,
+        planner_slots,
+        validate_loop_plan,
+    )
+
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    ctx = job.get("context")
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            ctx = {}
+    ctx = ctx or {}
+
+    loop_id = job_loop_id(job)
+    if not loop_id:
+        raise HTTPException(status_code=400, detail="Not a project-loop job")
+    loop = await postgres_db.get_project_loop(loop_id)
+    if not loop:
+        raise HTTPException(status_code=404, detail="Loop not found")
+    if (loop.get("scheduling") or "rotation") != "planner":
+        raise HTTPException(
+            status_code=409,
+            detail="This loop uses rotation scheduling — plans are only "
+            "accepted on planner-scheduled loops",
+        )
+    if loop.get("status") != "running":
+        raise HTTPException(
+            status_code=409, detail=f"Loop is {loop.get('status')}, not running"
+        )
+    if str(loop.get("current_job_id") or "") != str(job["id"]):
+        raise HTTPException(
+            status_code=409, detail="Job is not the loop's in-flight job"
+        )
+    if ctx.get("loop_role") != "critic":
+        raise HTTPException(
+            status_code=403, detail="Only the checkpoint critic files plans"
+        )
+    try:
+        critic_slot, _execution_slot = planner_slots(loop.get("role_sequence") or [])
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    stamped_seq = ctx.get("loop_seq_index")
+    if stamped_seq is not None and int(stamped_seq) != critic_slot:
+        raise HTTPException(
+            status_code=403,
+            detail="Campaign members cannot file plans — only the loop's "
+            "checkpoint critic stage can (sub-critic rule)",
+        )
+
+    try:
+        normalized = validate_loop_plan(body.plan, loop)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    # The initiative must be a real KB note in the loop's project. Best-effort:
+    # a down/absent vector store accepts the plan (KB failures are non-fatal by
+    # convention) — a present store that can't find the note rejects it.
+    project_id = loop.get("project_id")
+    if project_id and vector_db is not None:
+        note_id = normalized["initiative"]["kb_note_id"]
+        try:
+            async with vector_db.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT 1 FROM knowledge_index "
+                    "WHERE project_id = $1::uuid AND note_id = $2 LIMIT 1",
+                    str(project_id),
+                    note_id,
+                )
+        except Exception:
+            logger.warning(
+                "loop-plan: KB existence check unavailable — accepting plan "
+                "for job %s without it",
+                job_id,
+                exc_info=True,
+            )
+            row = True
+        if not row:
+            raise HTTPException(
+                status_code=400,
+                detail=f"initiative note '{note_id}' not found in the project "
+                "KB — kb_write it first, or fix the id",
+            )
+
+    if not await postgres_db.merge_job_context(job_id, {"loop_plan": normalized}):
+        raise HTTPException(status_code=500, detail="Failed to store the plan")
+    logger.info(
+        "project loop %s: critic job %s filed a %d-stage campaign plan (%s)",
+        str(loop_id)[:8],
+        job_id[:8],
+        len(normalized["stages"]),
+        normalized["initiative"]["kb_note_id"],
+    )
+    return {"status": "accepted", "plan": normalized}
 
 
 @app.post("/api/jobs/{job_id}/complete")
@@ -14551,10 +15119,7 @@ async def get_citation_drift(request: Request, citation_id: int) -> dict[str, An
         # Best-effort live re-fetch via the viewing user's own cloud home.
         try:
             backend = main_cloud_router.for_owner(caller)
-            user_id = await backend.resolve_user_identity(
-                email=caller.get("email"),
-                display_name=caller.get("display_name"),
-            )
+            user_id = await resolve_user_identity_cached(postgres_db, caller, backend)
             home = await backend.get_user_home(user_id) if user_id else None
             rel = (
                 _home_relative_path(
@@ -15338,8 +15903,14 @@ async def _build_default_project_mount_row(
         # Keycloak sub yet. Token-exchange impersonation needs a real sub —
         # bail out and let the caller fall back to the legacy session folder.
         return None
-    owner_display = (owner.get("display_name") or "").lower()
-    resolved = await backend.resolve_user_identity(owner_email, owner_display)
+    # Identity args come from the member row (email + display_name); the
+    # users row fetched above only vouches for the keycloak_sub.
+    owner_identity = {
+        "id": owner["user_id"],
+        "email": owner_email,
+        "display_name": owner.get("display_name"),
+    }
+    resolved = await resolve_user_identity_cached(postgres_db, owner_identity, backend)
     if not resolved:
         return None
     home = await backend.get_user_home(resolved)
@@ -17624,9 +18195,8 @@ async def resume_thread(
                         session_id=tid[:8]
                     )
                 share_handle = None
-                resolved_user_id = await backend.resolve_user_identity(
-                    usr.get("email"),
-                    usr.get("display_name", "").lower(),
+                resolved_user_id = await resolve_user_identity_cached(
+                    postgres_db, usr, backend
                 )
                 if resolved_user_id:
                     share_handle = await backend.share_session_folder(
@@ -24662,6 +25232,32 @@ async def admin_list_security_events(
 # Spaces (ensure_project_folder is not idempotent — each call makes a new drive).
 _project_heal_locks: dict[str, asyncio.Lock] = {}
 
+# Fire-and-forget repair tasks spawned off the project-GET read path (see
+# docs/issues/project_page_open_blocks_on_cloud_heal.md part 1). The task set
+# holds strong references (bare create_task results are GC-able); the
+# last-fired map throttles per key so page views don't hammer Keycloak/the
+# cloud backend. Both are bounded by the number of live projects/users.
+_bg_repair_tasks: set[asyncio.Task] = set()
+_bg_repair_last: dict[str, float] = {}
+_BG_REPAIR_COOLDOWN_S = 3600.0
+
+
+def _fire_background_repair(key: str, coro: Coroutine[Any, Any, Any]) -> bool:
+    """Run ``coro`` as a fire-and-forget task, at most once per cooldown per key.
+
+    Returns True if the task was scheduled, False if throttled (the coroutine
+    is closed so it never warns "never awaited").
+    """
+    now = time.monotonic()
+    if now - _bg_repair_last.get(key, 0.0) < _BG_REPAIR_COOLDOWN_S:
+        coro.close()
+        return False
+    _bg_repair_last[key] = now
+    task = asyncio.create_task(coro)
+    _bg_repair_tasks.add(task)
+    task.add_done_callback(_bg_repair_tasks.discard)
+    return True
+
 
 async def _sync_project_member_to_groups(
     project_id_str: str,
@@ -24682,10 +25278,7 @@ async def _sync_project_member_to_groups(
         )
     if backend.is_initialized:
         try:
-            resolved = await backend.resolve_user_identity(
-                user.get("email"),
-                (user.get("display_name") or "").lower(),
-            )
+            resolved = await resolve_user_identity_cached(postgres_db, user, backend)
             if resolved:
                 await backend.add_user_to_group(resolved, group_name)
         except Exception as e:
@@ -24710,6 +25303,11 @@ async def _ensure_project_cloud_resources(
       are idempotent). This repairs the common case where the Space already
       exists but the user was never added to the groups — e.g. project created
       while Keycloak admin auth was broken, or a Space adopted out-of-band.
+      Primary membership writes happen at mutation time (add_project_member);
+      this is pure drift repair, which is why get_project runs it as a
+      throttled background task rather than on the request path (it costs
+      several external HTTP round-trips — see
+      docs/issues/project_page_open_blocks_on_cloud_heal.md).
 
     Default projects skip both: they piggyback on the owner's personal home
     Space (already attached as a datasource by the user-creation flow), so a
@@ -24781,10 +25379,10 @@ async def _ensure_project_cloud_resources(
                         f"{project_id_str}: {e}"
                     )
 
-    # Member sync — always runs. Idempotent add in both Keycloak and the
-    # backend; cheap enough to include in every GET and essential for
-    # self-healing projects whose Space exists but whose members were never
-    # added to the groups.
+    # Member sync — always runs when this helper does. Idempotent add in both
+    # Keycloak and the backend; essential for self-healing projects whose
+    # Space exists but whose members were never added to the groups. Callers
+    # keep it off latency-sensitive paths (_fire_background_repair).
     if keycloak_groups.is_initialized or backend.is_initialized:
         try:
             if keycloak_groups.is_initialized:
@@ -24925,12 +25523,24 @@ async def list_projects(
 
 @app.get("/api/projects/{project_id}")
 async def get_project(request: Request, project_id: str) -> dict[str, Any]:
-    """Get a single project by ID."""
+    """Get a single project by ID.
+
+    The warm path is pure Postgres — cloud/Keycloak reconciliation and
+    identity resolution run as throttled background repairs, never on the
+    request (docs/issues/project_page_open_blocks_on_cloud_heal.md
+    measured 2.3-5s per page open when they were inline).
+    """
     _, project = await require_project_member(request, postgres_db, project_id)
 
-    # Lazy-heal: projects created before the cloud-resource fix have no
-    # folder handle. The helper is a no-op if the Space already exists.
-    project = await _ensure_project_cloud_resources(project)
+    # Lazy-heal (folder for pre-fix projects + member-group drift repair) —
+    # fire-and-forget with a per-project cooldown. A legacy project without a
+    # folder handle serves cloud_storage_url=None on this first open and gets
+    # the deep-link once the background heal lands; the cockpit hides the
+    # button for None. create_project keeps its blocking call — creation is
+    # the primary provisioning path.
+    _fire_background_repair(
+        f"project-heal:{project_id}", _ensure_project_cloud_resources(project)
+    )
 
     # Compute cloud_storage_url for cockpit deep-links
     project["cloud_storage_url"] = None
@@ -24945,16 +25555,26 @@ async def get_project(request: Request, project_id: str) -> dict[str, Any]:
             try:
                 members = await postgres_db.get_project_members(project_id)
                 owner = next((m for m in members if m.get("role") == "owner"), None)
-                owner_email = (owner or {}).get("email")
-                owner_display = (owner or {}).get("display_name") or ""
-                if owner_email:
-                    resolved = await backend.resolve_user_identity(
-                        owner_email, owner_display.lower()
+                if owner and owner.get("email"):
+                    url = await peek_home_browser_url(
+                        postgres_db, str(owner["user_id"]), backend.backend_id
                     )
-                    if resolved:
-                        home = await backend.get_user_home(resolved)
-                        if home and home.browser_url:
-                            project["cloud_storage_url"] = home.browser_url
+                    if url:
+                        project["cloud_storage_url"] = url
+                    else:
+                        # Cache miss: resolve+persist off the request path;
+                        # this open falls back to the generic home URL.
+                        owner_user = {
+                            "id": owner["user_id"],
+                            "email": owner.get("email"),
+                            "display_name": owner.get("display_name"),
+                        }
+                        _fire_background_repair(
+                            f"home-url:{owner['user_id']}:{backend.backend_id}",
+                            get_home_browser_url_cached(
+                                postgres_db, owner_user, backend
+                            ),
+                        )
             except Exception as e:
                 logger.warning(
                     f"Failed to resolve user-home URL for default project "

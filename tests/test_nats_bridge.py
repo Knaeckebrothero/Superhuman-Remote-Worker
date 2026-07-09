@@ -464,6 +464,22 @@ class TestRequestVmCreate:
         )
 
     @pytest.mark.asyncio
+    async def test_golden_poll_skips_provisioning_status(
+        self, bridge_with_db, mock_nc, mock_db
+    ):
+        """set_provisioning=False (dispatcher golden poll) must not overwrite
+        the context status — it must stay ``waiting_golden`` between polls so
+        the decision logic keeps polling instead of treating the job as a
+        booting VM."""
+        result = await bridge_with_db.request_vm_create(
+            job_id="test-job-123", set_provisioning=False
+        )
+
+        assert result is True
+        mock_nc.publish.assert_awaited_once()  # the create IS still published
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_create_returns_false_when_unavailable(self, disconnected_bridge):
         result = await disconnected_bridge.request_vm_create(job_id="test-job-123")
         assert result is False
@@ -749,6 +765,48 @@ class TestOnVmLifecycleStatus:
 
         updates = mock_db.merge_vm_context.call_args.args[1]
         assert updates["pod_ip"] == "10.0.0.42"
+
+    @pytest.mark.asyncio
+    async def test_waiting_golden_passes_import_telemetry(
+        self, bridge_with_db, mock_db
+    ):
+        """waiting_golden statuses carry golden DV name + import progress —
+        the dispatcher's poll logging and park error message read them from
+        context.vm."""
+        msg = make_msg(
+            {
+                "job_id": "job-golden",
+                "status": "waiting_golden",
+                "golden": "agent-vm-golden-9ca967a4ca08",
+                "golden_phase": "ImportInProgress",
+                "golden_progress": "68.19%",
+            }
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(msg)
+
+        updates = mock_db.merge_vm_context.call_args.args[1]
+        assert updates["status"] == "waiting_golden"
+        assert updates["golden"] == "agent-vm-golden-9ca967a4ca08"
+        assert updates["golden_phase"] == "ImportInProgress"
+        assert updates["golden_progress"] == "68.19%"
+
+    @pytest.mark.asyncio
+    async def test_non_golden_status_has_no_golden_keys(self, bridge_with_db, mock_db):
+        msg = make_msg(
+            {
+                "job_id": "job-005",
+                "status": "created",
+                "vm_name": "vm-job-005",
+                "namespace": "agent-vms",
+            }
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(msg)
+
+        updates = mock_db.merge_vm_context.call_args.args[1]
+        assert "golden" not in updates
+        assert "golden_progress" not in updates
 
     @pytest.mark.asyncio
     async def test_status_with_ssh_nodeport(self, bridge_with_db, mock_db):

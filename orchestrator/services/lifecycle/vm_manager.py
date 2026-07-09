@@ -31,6 +31,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from services.ssh_helpers import orchestrator_can_reach
+
 from .types import Instance
 from .workspace_manager import orphan_grace_seconds, paused_within_grace
 
@@ -320,6 +322,17 @@ class VMInstanceManager:
             return 5
 
     async def attempts_exhausted(self, inst: Instance) -> bool:
+        # A tailnet-addressed VM the orchestrator has no route to can NEVER be
+        # snapshotted from this vantage — every attempt is a guaranteed miss,
+        # and the bounded retry just delays the force-delete by
+        # max_attempts × tick (~5 min observed) while the dead VM holds cluster
+        # capacity. Skip straight to exhausted. Honors the
+        # ORCHESTRATOR_HAS_TAILNET_ROUTE escape hatch via orchestrator_can_reach
+        # (see docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md §C
+        # and vm_ssh_readiness_probe_unroutable_from_orchestrator.md §F4).
+        host = inst.metadata.get("ssh_host")
+        if host and not orchestrator_can_reach(host):
+            return True
         return (inst.metadata.get("snapshot_attempts") or 0) >= self._max_attempts()
 
     async def record_attempt(self, inst: Instance) -> None:

@@ -643,6 +643,7 @@ class TestCreateVm:
             cpu_cores=4,
             memory="8Gi",
             description="Build feature",
+            set_provisioning=True,
         )
 
     @pytest.mark.asyncio
@@ -797,6 +798,7 @@ class TestFreshProvisionReset:
         assert ctx["ssh_probe_attempts"] == 0
         assert ctx["ssh_probe_error"] is None
         assert ctx["ssh_probe_failed_at"] is None
+        assert ctx["golden_wait_started_at"] is None
         assert isinstance(ctx["provisioned_at"], float)
 
     @pytest.mark.asyncio
@@ -843,6 +845,52 @@ class TestFreshProvisionReset:
         assert first[0][0] == "reset-thread"
         assert first[0][1]["snapshot_attempts"] == 0
         assert first[0][1]["ssh_host"] is None
+
+
+# =============================================================================
+# Test: golden-poll re-issue (fresh=False)
+# (docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md)
+# =============================================================================
+
+
+class TestGoldenPollCreate:
+    """create_vm(fresh=False) — the dispatcher's waiting_golden poll.
+
+    A poll must NOT reset the provision context (golden_wait_started_at
+    anchors the golden budget across polls) and must not flip the context
+    status to 'provisioning' (it must stay waiting_golden so the decision
+    logic keeps polling). Only provisioned_at rolls forward, so the boot
+    budget starts ≈ when the golden completes and the VM is actually built.
+    """
+
+    @pytest.mark.asyncio
+    async def test_poll_rolls_only_provisioned_at(
+        self, provisioner_with_nats, mock_nats_bridge, mock_db
+    ):
+        await provisioner_with_nats.create_vm(job_id="poll-1", fresh=False)
+        first = mock_db.merge_vm_context.await_args_list[0]
+        assert first[0][0] == "poll-1"
+        ctx = first[0][1]
+        assert set(ctx.keys()) == {"provisioned_at"}
+
+    @pytest.mark.asyncio
+    async def test_poll_passes_set_provisioning_false(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
+        await provisioner_with_nats.create_vm(job_id="poll-2", fresh=False)
+        kwargs = mock_nats_bridge.request_vm_create.await_args.kwargs
+        assert kwargs["set_provisioning"] is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_default_resets_and_sets_provisioning(
+        self, provisioner_with_nats, mock_nats_bridge, mock_db
+    ):
+        await provisioner_with_nats.create_vm(job_id="fresh-1")
+        ctx = mock_db.merge_vm_context.await_args_list[0][0][1]
+        assert ctx["snapshot_attempts"] == 0
+        assert ctx["golden_wait_started_at"] is None
+        kwargs = mock_nats_bridge.request_vm_create.await_args.kwargs
+        assert kwargs["set_provisioning"] is True
 
 
 # =============================================================================

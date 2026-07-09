@@ -1,7 +1,7 @@
 ---
 tags:
   - issue
-  - investigation
+  - fix-spec
   - jobs
   - workspace-lifecycle
   - vm-backend
@@ -12,8 +12,34 @@ tags:
 
 # Investigation — a cold golden-image import (triggered by any `agent-vm-base` image bump) fails every in-flight VM job of the current loop iteration
 
-**Status: INVESTIGATION — findings confirmed live (2026-07-09, `main` cluster);
-fixes proposed below, not yet built.** Surfaced while watching the first VM
+**Status: IMPLEMENTED (2026-07-09, uncommitted on `develop`) — root cause confirmed
+live, fixes built per §Chosen fix below.** All three findings addressed: (A)
+controller `_do_create` no longer blocks on the golden import — it returns a new
+`waiting_golden` status and the dispatcher polls create without consuming provision
+attempts (`VM_GOLDEN_POLL`, bounded by `VM_GOLDEN_WAIT_TIMEOUT_S=2700` →
+`VM_PARK_GOLDEN` fails the job with a truthful error); (B) a plain VM-create 409
+AlreadyExists is idempotent success in the controller (deterministic name
+`agent-vm-<job_id>` ⇒ the existing VM IS this job's VM); (C) the lifecycle reaper's
+`attempts_exhausted` is instantly true for tailnet hosts the orchestrator provably
+cannot reach — force-delete on the first tick instead of a ~5-min snapshot-retry
+stall. 446 tests green across the five affected suites
+(`test_vm_controller`, `test_dispatch_guards`, `test_vm_provisioner`,
+`test_nats_bridge`, `test_lifecycle_vm_manager`), ruff clean. Remaining: deploy →
+live smoke on the next `agent-vm-base` bump (§Acceptance criteria).
+
+**Mechanism refinement discovered during implementation:** Findings A and B share
+one root — the controller's `handle_create` *blocked up to 900 s* inside
+`_ensure_golden` before creating the VM. While attempt N's handler was parked in
+that wait, the orchestrator recycled and issued attempt N+1; when the golden
+finally succeeded, the stale and fresh handlers raced to create the same VM and
+the loser's 409 was published as `failed`. Making create non-blocking dissolves
+the race *and* provides the `waiting_golden` signal the dispatcher needs — one
+change fixes both. (The 10:05:05 `created` status in the timeline below was in
+fact attempt 1's stale handler completing its registry fallback, and the 10:17:56
+`failed` was attempt 2's stale handler hitting AlreadyExists against attempt 3's
+VM.)
+
+Surfaced while watching the first VM
 provisioning round after the "VMs not reachable" fix
 ([`vm_ssh_readiness_probe_unroutable_from_orchestrator.md`](vm_ssh_readiness_probe_unroutable_from_orchestrator.md))
 rolled out. That fix shipped a **new `agent-vm-base` image (`sha-e375179`)**, which
@@ -149,31 +175,116 @@ reach should skip the snapshot and force-delete immediately (or after a short bo
 
 ---
 
-## Proposed fixes (menu — not yet built)
+## Chosen fix (BUILT 2026-07-09)
 
-1. **Golden-aware provisioning (addresses A, highest value).** Before recycling a
-   not-`ready` VM, have the dispatcher check whether the job's golden DV is still
-   `ImportInProgress` and **WAIT** instead of RECYCLE (surface golden import state from the
-   controller over NATS / `GET /vms`). Equivalently: make the orchestrator per-attempt
-   budget ≥ the controller golden budget, and make both ≥ a realistic cold-import bound.
-2. **Pre-warm gate on image rollout (also A).** Hold loop VM dispatch (or pause new VM
-   jobs) until the new golden is `Succeeded` after an `agent-vm-base` bump — the pre-warm
-   already exists (`golden pre-warm …`) but is non-blocking, so the loop dispatches straight
-   into the cold window. Gate on it, or block the first VM create until golden ready rather
-   than falling back to the (also-slow) per-VM registry import.
-3. **Delete-before-create / transient-failed handling (B).** On re-provision, delete any
-   existing VM object first, or map a controller `failed` on an in-flight VM to `RECYCLE`
-   rather than a fresh `VM_PROVISION` that races into `409 AlreadyExists`.
-4. **Skip pre-delete snapshot for unreachable VMs (C).** When the orchestrator has no route
-   to the VM (reuse the SSH doc's `orchestrator_can_reach`/`is_tailnet_addr` /
-   `ORCHESTRATOR_HAS_TAILNET_ROUTE` guard), the reaper should force-delete immediately
-   instead of burning ~5 min on snapshot attempts that cannot succeed.
+**Principle: never block a create handler on a shared import, and never spend
+boot budget on a wait that isn't a boot.** The controller reports golden state
+honestly; the orchestrator polls patiently on a *golden* budget and keeps the
+*boot* budget for actual boots.
+
+### F1 — Controller: non-blocking golden check + `waiting_golden` status
+
+`_do_create` (`vm/controller/controller.py`) calls the new
+`_golden_state_nowait(image)` instead of the blocking `_ensure_golden` (which
+remains, but only for the `_prewarm_golden` background task):
+
+- Golden DV `Succeeded` → `(name, None)` → clone rootdisk from it (unchanged fast
+  path).
+- DV importing / just-created / `Failed`-and-recreated → return
+  `{"status": "waiting_golden", golden, golden_phase, golden_progress}`
+  **without creating the VM** (and before minting a Headscale auth key, so polls
+  don't churn keys).
+- Golden DV create rejected (CDI infra error, non-409) → `(None, None)` → legacy
+  registry fallback, byte-for-byte pre-golden behaviour.
+
+### F2 — Controller: plain 409 AlreadyExists is idempotent success
+
+In the VM-create retry loop, a 409 whose body is not "is being deleted" now logs
+`idempotent create` and returns `created` instead of raising. The VM name is
+deterministic (`agent-vm-<job_id>`), so an existing live VM IS this job's VM. This
+is the direct fix for §B — the propagated 409 that parked both jobs.
+
+### F3 — Orchestrator: `VM_GOLDEN_POLL` / `VM_PARK_GOLDEN` decision states
+
+`dispatch_guards.vm_provisioning_decision` gains a `waiting_golden` branch: poll
+while `now - golden_wait_started_at ≤ golden_timeout_s`
+(`VM_GOLDEN_WAIT_TIMEOUT_S`, default 2700 s > observed ~30 min import), park past
+it. The dispatcher (`main.py`):
+
+- `VM_GOLDEN_POLL` → stamp `golden_wait_started_at` (once), re-issue
+  `create_vm(fresh=False)` as the poll — **no `provision_attempts` increment**
+  (attempts bound VM boots; polling is not a boot), no fresh-context reset (the
+  golden anchor must survive), no `provisioning` status overwrite (status stays
+  `waiting_golden` between controller responses), only `provisioned_at` rolls
+  forward so the boot budget starts ≈ when the golden completes and the VM is
+  actually built.
+- `VM_PARK_GOLDEN` → fail the job with the truth: *"golden image import did not
+  complete within Ns (golden <name>, last progress <p>) — VM never created"* —
+  not the misleading "provisioning exhausted after N attempts".
+
+`nats_bridge` passes `golden`/`golden_phase`/`golden_progress` through to
+`context.vm`; `_fresh_provision_ctx` clears `golden_wait_started_at` on genuine
+re-provisions.
+
+### F4 — Reaper: skip futile snapshot wait for unroutable VMs (§C)
+
+`VMInstanceManager.attempts_exhausted` returns true immediately when the
+instance's `ssh_host` is a tailnet address the orchestrator provably cannot reach
+(`ssh_helpers.orchestrator_can_reach`, honoring `ORCHESTRATOR_HAS_TAILNET_ROUTE`)
+— the dirty-unreachable reap force-deletes on the first tick instead of waiting
+out `WORKSPACE_SNAPSHOT_MAX_ATTEMPTS × tick` (~5 min) on snapshots that cannot
+succeed. Missing/hostname/pod-network hosts keep the bounded-attempt behaviour.
+
+### Rollout / version skew
+
+No flag-day. Orchestrator (develop pipeline) and controller (VM-cluster Fleet
+bundle) can roll in either order:
+- **New orchestrator + old controller**: the old controller still blocks in
+  `_ensure_golden` and never emits `waiting_golden` → dispatcher behaves exactly
+  as today.
+- **New controller + old orchestrator**: `waiting_golden` lands in `context.vm`;
+  the old decision logic treats it as generic not-ready → WAIT/RECYCLE as today
+  (cold-import jobs still fail after 3 attempts until the orchestrator side
+  lands, but the delete/recreate churn is now harmless — no stale blocked
+  handlers, no 409 race).
+Full benefit requires both; ship together on the same develop push.
+
+### Not built (recorded)
+
+- **Pre-warm gate on image rollout**: with F1/F3, dispatching into the cold
+  window is harmless (jobs wait on the golden budget instead of failing), so
+  holding dispatch is no longer needed.
+- **Thread VMs**: `create_thread_vm` still uses the fresh path only; a thread
+  provisioned during a cold import will see `waiting_golden` in its metadata and
+  time out at the session-attach layer as before (no worse than the old blocking
+  behaviour — the controller now just doesn't hold its handler hostage). Wire
+  thread-side polling if VM-backed sessions start mattering during image bumps.
+
+## Test plan (written, green)
+
+- `test_vm_controller.py` — `TestGoldenStateNowait` (Succeeded/importing/absent/
+  409-racer/infra-error/Failed-recreate, never sleeps), `TestDoCreateWaitingGolden`
+  (defers VM create + Headscale key, publishes telemetry; Succeeded → clone
+  source; infra error → registry fallback), idempotent-409 test replaces the old
+  409→failed assertion.
+- `test_dispatch_guards.py` — `TestVmGoldenWaitDecision`: polls within budget,
+  polls before anchor stamped, **outlives the boot budget without recycling**,
+  **ignores attempt exhaustion**, parks past the golden budget.
+- `test_vm_provisioner.py` — `TestGoldenPollCreate`: `fresh=False` merges only
+  `provisioned_at`, passes `set_provisioning=False`; fresh default resets ctx
+  (incl. `golden_wait_started_at`).
+- `test_nats_bridge.py` — golden telemetry passthrough; poll skips the
+  `provisioning` status overwrite but still publishes.
+- `test_lifecycle_vm_manager.py` — `TestAttemptsExhausted`: counter semantics for
+  routable/missing hosts, instant exhaustion for unroutable tailnet hosts,
+  escape-hatch env restores counter behaviour.
 
 ## Acceptance criteria
 
 - A VM job dispatched while its golden DV is `ImportInProgress` **waits** (does not consume
-  provision attempts) and dispatches within seconds of the golden reaching `Succeeded` —
-  demonstrated on the next `agent-vm-base` image bump.
+  provision attempts; `context.vm.status='waiting_golden'` with import progress visible)
+  and its VM create issues within one dispatcher tick (~30 s) of the golden reaching
+  `Succeeded` — demonstrated on the next `agent-vm-base` image bump.
 - No `409 AlreadyExists` appears in the dispatcher VM path; a re-provision after a
   controller-reported `failed` tears down the old VM object first.
 - An orphaned VM the orchestrator cannot reach is force-deleted within one reconciler tick

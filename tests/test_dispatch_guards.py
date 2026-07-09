@@ -9,7 +9,9 @@ docs/done/preemption_before_first_checkpoint_replays_job_opening.md.
 from __future__ import annotations
 
 from orchestrator.services.dispatch_guards import (
+    VM_GOLDEN_POLL,
     VM_PARK_EXHAUSTED,
+    VM_PARK_GOLDEN,
     VM_PARKED,
     VM_PROVISION,
     VM_READY,
@@ -115,3 +117,67 @@ class TestVmProvisioningDecision:
         # 'ready' is never recycled even with an old timestamp.
         ctx = {"status": "ready", "provisioned_at": 1.0}
         assert self._decide(ctx, now=10_000.0, timeout_s=600.0) == VM_READY
+
+
+class TestVmGoldenWaitDecision:
+    """waiting_golden — a cold golden-image import must not burn boot budget.
+
+    The controller has NOT created a VM: it is waiting on a shared golden
+    DataVolume import (~30 min after an agent-vm-base bump — longer than
+    timeout_s). Polling must not consume provision attempts, and recycling is
+    meaningless (nothing exists to tear down). See
+    docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md.
+    """
+
+    def _decide(
+        self,
+        vm_ctx,
+        *,
+        attempts=0,
+        cap=3,
+        now=1000.0,
+        timeout_s=600.0,
+        golden_timeout_s=2700.0,
+    ):
+        return vm_provisioning_decision(
+            vm_ctx,
+            provision_attempts=attempts,
+            max_provision_attempts=cap,
+            now=now,
+            timeout_s=timeout_s,
+            golden_timeout_s=golden_timeout_s,
+        )
+
+    def test_waiting_golden_polls_within_budget(self):
+        ctx = {"status": "waiting_golden", "golden_wait_started_at": 900.0}
+        assert self._decide(ctx, now=1000.0) == VM_GOLDEN_POLL
+
+    def test_waiting_golden_polls_before_anchor_stamped(self):
+        # First sighting: dispatcher hasn't stamped golden_wait_started_at
+        # yet → poll (the dispatcher stamps it in the poll branch).
+        assert self._decide({"status": "waiting_golden"}) == VM_GOLDEN_POLL
+
+    def test_waiting_golden_outlives_boot_budget(self):
+        # 700s in with a 600s boot budget — must POLL, not RECYCLE: the boot
+        # budget does not apply while no VM is booting. This is the exact
+        # misalignment that burned loop iteration 22.
+        ctx = {
+            "status": "waiting_golden",
+            "golden_wait_started_at": 300.0,
+            "provisioned_at": 300.0,
+        }
+        assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_GOLDEN_POLL
+
+    def test_waiting_golden_ignores_attempt_exhaustion(self):
+        # Attempts bound VM boots; polling is not a boot.
+        ctx = {"status": "waiting_golden", "golden_wait_started_at": 900.0}
+        assert self._decide(ctx, attempts=3, cap=3, now=1000.0) == VM_GOLDEN_POLL
+
+    def test_waiting_golden_parks_past_golden_budget(self):
+        # CDI wedged / registry unreachable — fail decisively with the truth.
+        # started=100, budget=2700 → poll at/below 2800, park beyond it.
+        # (A non-zero anchor: like provisioned_at, the anchor is truthiness-
+        # gated, and epoch-zero never occurs in practice.)
+        ctx = {"status": "waiting_golden", "golden_wait_started_at": 100.0}
+        assert self._decide(ctx, now=2800.0, golden_timeout_s=2700.0) == VM_GOLDEN_POLL
+        assert self._decide(ctx, now=2800.1, golden_timeout_s=2700.0) == VM_PARK_GOLDEN
