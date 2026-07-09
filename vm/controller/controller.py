@@ -224,6 +224,44 @@ class VMController:
         job_id = job_config.get("job_id", "unknown")
         log.info("Creating VM for job %s", job_id)
 
+        # Golden-image acceleration: import the base image once into a shared
+        # golden PVC and clone the rootdisk from it, instead of a per-VM registry
+        # import. Runs on EVERY create (incl. crash-recovery re-dispatch).
+        #
+        # NON-BLOCKING: if the golden is still importing (a cold import after an
+        # agent-vm-base bump takes ~30 min — longer than every provisioning
+        # budget), return ``waiting_golden`` WITHOUT creating the VM. Blocking
+        # here (the old 900s wait) let the orchestrator recycle and re-create
+        # while stale handlers were still parked in the wait; when the golden
+        # finally succeeded, the racers collided in 409 AlreadyExists and failed
+        # two loop jobs. The orchestrator polls create until the golden is
+        # ready (see docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md).
+        # Checked FIRST so a poll doesn't mint a fresh Headscale auth key every
+        # ~30s for the whole import window.
+        #
+        # Golden-infra *errors* (not in-progress imports) leave golden_name
+        # None → the rendered manifest keeps its registry source (byte-for-byte
+        # legacy behaviour + fallback).
+        image = job_config.get("vm_image") or DEFAULT_VM_IMAGE
+        golden_name = None
+        if VM_GOLDEN_IMAGE_ENABLED:
+            waiting = None
+            try:
+                golden_name, waiting = await self._golden_state_nowait(image)
+            except Exception:
+                log.exception(
+                    "golden ensure failed for job %s — falling back to registry",
+                    job_id,
+                )
+            if waiting is not None:
+                log.info(
+                    "golden %s not ready for job %s (%s) — deferring VM create",
+                    waiting.get("golden"),
+                    job_id,
+                    waiting.get("golden_progress") or waiting.get("golden_phase"),
+                )
+                return {"job_id": job_id, "status": "waiting_golden", **waiting}
+
         tailscale_auth_key = ""
         if self.headscale.is_available:
             tailscale_auth_key = await self.headscale.create_auth_key(job_id) or ""
@@ -231,22 +269,6 @@ class VMController:
                 log.warning(
                     "Failed to get Headscale auth key for job %s — "
                     "VM will boot without mesh VPN",
-                    job_id,
-                )
-
-        # Golden-image acceleration: import the base image once into a shared
-        # golden PVC and clone the rootdisk from it, instead of a per-VM registry
-        # import. Runs on EVERY create (incl. crash-recovery re-dispatch). Any
-        # failure leaves golden_name None → the rendered manifest keeps its
-        # registry source (byte-for-byte legacy behaviour + fallback).
-        image = job_config.get("vm_image") or DEFAULT_VM_IMAGE
-        golden_name = None
-        if VM_GOLDEN_IMAGE_ENABLED:
-            try:
-                golden_name = await self._ensure_golden(image)
-            except Exception:
-                log.exception(
-                    "golden ensure failed for job %s — falling back to registry",
                     job_id,
                 )
 
@@ -282,6 +304,19 @@ class VMController:
                         vm_name,
                         max_retries,
                     )
+                elif e.status == 409:
+                    # Plain AlreadyExists: the name is agent-vm-<job_id>, so a
+                    # live VM with this name IS this job's VM — a duplicate or
+                    # racing create lost to one that already succeeded. Treat
+                    # as idempotent success; propagating the 409 as a 'failed'
+                    # status parked two healthy loop jobs (see docs/issues/
+                    # golden_image_cold_import_fails_inflight_vm_jobs.md §B).
+                    log.info(
+                        "VM %s already exists (job %s) — idempotent create",
+                        vm_name,
+                        job_id,
+                    )
+                    break
                 raise
 
         log.info("VM created: %s (job %s)", vm_name, job_id)
@@ -520,6 +555,66 @@ class VMController:
                 log.warning("golden %s create failed: %s", name, e)
                 return None
         return name if await self._wait_dv_succeeded(name) else None
+
+    async def _golden_state_nowait(self, image: str) -> tuple[str | None, dict | None]:
+        """Non-blocking golden check for the VM create path.
+
+        Unlike ``_ensure_golden`` (kept for the pre-warm background task), this
+        never sleeps waiting for CDI: a create handler that blocks here for the
+        duration of a cold import (~30 min) outlives every orchestrator
+        provisioning budget and races later create attempts into 409
+        AlreadyExists collisions.
+
+        Returns ``(golden_name, waiting_payload)``:
+          (name, None)    → golden Succeeded; clone the rootdisk from it.
+          (None, payload) → golden import in flight (payload has ``golden`` /
+                            ``golden_phase`` / ``golden_progress``); the caller
+                            must NOT create the VM — the orchestrator polls
+                            create until the golden is ready.
+          (None, None)    → golden infra unusable (create rejected) → caller
+                            falls back to the legacy registry source.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        name = _golden_name(image)
+        dv = await self._get_dv(name)
+        status = (dv or {}).get("status") or {}
+        phase = status.get("phase", "")
+
+        if dv and phase == "Succeeded":
+            return name, None
+        if dv and phase == "Failed":
+            log.warning("golden %s is Failed — recreating", name)
+            await self._delete_dv(name)
+            dv = None
+        if dv is not None:
+            # Importing / Pending / CloneScheduled / "" — being built.
+            return None, {
+                "golden": name,
+                "golden_phase": phase or "Pending",
+                "golden_progress": status.get("progress") or "",
+            }
+
+        # Absent → create (409 = another create won the race; both then poll).
+        try:
+            await asyncio.to_thread(
+                self.k8s_client.create_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                body=self._golden_dv_manifest(name, image),
+            )
+            log.info("golden %s: importing %s (once)", name, image)
+        except ApiException as e:
+            if e.status != 409:
+                log.warning("golden %s create failed: %s", name, e)
+                return None, None
+        return None, {
+            "golden": name,
+            "golden_phase": "Pending",
+            "golden_progress": "",
+        }
 
     def _apply_clone_source(self, manifest: dict, golden_name: str) -> None:
         """Mutate a rendered VM manifest so its rootdisk clones the golden PVC

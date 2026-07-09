@@ -18,6 +18,21 @@ def _mask_url(url: str) -> str:
     return re.sub(r"(://[^:]+:)[^@]+(@)", r"\1***\2", url)
 
 
+def _fmt_confidence(value: Any) -> str:
+    """Render a confidence value that may be a 0-1 float, another number, or an enum string.
+
+    The knowledge-notes store uses a Postgres enum (`'high'`/`'medium'`/`'low'`),
+    while freeze data emits numeric confidences. Applying a `%` float format spec
+    to a string raises `ValueError: Unknown format code '%'`, so callers must route
+    through here instead of formatting the raw value.
+    """
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{value:.0%}" if 0 <= value <= 1 else str(value)
+    return str(value)
+
+
 # =============================================================================
 # Job & Audit Formatters
 # =============================================================================
@@ -950,13 +965,7 @@ def format_frozen_job(job_id: str, data: dict[str, Any]) -> str:
         lines.append(f"Summary:\n{data['summary']}\n")
 
     if data.get("confidence") is not None:
-        conf = data["confidence"]
-        if isinstance(conf, (int, float)):
-            lines.append(
-                f"Confidence: {conf:.0%}" if conf <= 1 else f"Confidence: {conf}"
-            )
-        else:
-            lines.append(f"Confidence: {conf}")
+        lines.append(f"Confidence: {_fmt_confidence(data['confidence'])}")
 
     if data.get("deliverables"):
         lines.append("Deliverables:")
@@ -2034,7 +2043,7 @@ def format_knowledge_notes(data: dict[str, Any]) -> str:
 
         header = f"  [{ntype}] {title}"
         if confidence is not None:
-            header += f" (confidence: {confidence:.0%})"
+            header += f" (confidence: {_fmt_confidence(confidence)})"
         header += f" — {status}"
         lines.append(header)
         lines.append(f"    ID: {note_id}")
@@ -2070,7 +2079,7 @@ def format_knowledge_note_detail(data: dict[str, Any]) -> str:
 
     confidence = data.get("confidence")
     if confidence is not None:
-        lines.append(f"Confidence: {confidence:.0%}")
+        lines.append(f"Confidence: {_fmt_confidence(confidence)}")
 
     phase = data.get("phase")
     if phase:
