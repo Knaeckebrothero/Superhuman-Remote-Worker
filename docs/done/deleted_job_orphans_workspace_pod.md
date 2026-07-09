@@ -1,6 +1,6 @@
 # Deleting a job orphans its workspace pod forever (no-bound-row = never reapable)
 
-**Status:** investigated 2026-07-05 — root cause confirmed from a live orphan on the main cluster; **both fixes IMPLEMENTED + k3d-verified 2026-07-05** (see "Fix directions" — teardown-in-delete verified end-to-end via API delete of a pod-backed job row; reaper verified via planted orphan pod: spared while under grace, reaped after). Uncommitted.
+**Status:** RESOLVED — investigated 2026-07-05 from a live orphan on the main cluster; both fixes implemented + k3d-verified 2026-07-05 (see "Fix directions" — teardown-in-delete verified end-to-end via API delete of a pod-backed job row; reaper verified via planted orphan pod: spared while under grace, reaped after); shipped in `af5cb4af`. **Confirmed on the main cluster 2026-07-09:** the original orphan pod and its ConfigMap are gone post-deploy, and every remaining workspace pod is bound to a live job/thread row (paused/processing/reviewing) — zero orphans. Only the VM-manager backstop parity (see NOTE at the bottom) remains as a potential follow-up, if a VM orphan is ever observed.
 **Severity:** low urgency (leaks one pod's worth of node resources per occurrence) but unbounded — every orphan persists until someone hand-deletes it, and nothing surfaces it
 **Component:** `orchestrator/main.py` `delete_job` (`DELETE /api/jobs/{job_id}`), `orchestrator/services/lifecycle/workspace_manager.py` (`is_reapable`/`is_idle`/`reap_orphans`)
 **Observed on:** main cluster (`superhuman-remote-worker`), pod `workspace-a9ad385d-0ed` (job `a9ad385d-0edd-4bc3-8407-4e0523a0d35f`), alive 7d22h at investigation
@@ -110,9 +110,8 @@ the reconciler backstop for VM orphans is a follow-up if ever observed.
 
 ## Cleanup for the live orphan
 
-```bash
-kubectl --context=main -n superhuman-remote-worker delete pod workspace-a9ad385d-0ed
-kubectl --context=main -n superhuman-remote-worker delete configmap code-server-config-workspace-a9ad385d-0ed
-```
-
-Nothing to preserve: emptyDir volume, owning job deleted, zero agent activity ever.
+No longer needed — after the fix deployed, the pod and its
+`code-server-config-*` ConfigMap were confirmed gone from the main cluster
+(2026-07-09), which is exactly the pair `delete_workspace` removes. There was
+nothing to preserve: emptyDir volume, owning job deleted, zero agent activity
+ever.

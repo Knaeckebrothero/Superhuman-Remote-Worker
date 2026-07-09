@@ -6600,7 +6600,7 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
         # provisioners resolve them through the job's context, and once the
         # row is gone the lifecycle reconciler refuses to reap the pod
         # (no-bound-row is treated as in-flight provisioning; see
-        # docs/issues/deleted_job_orphans_workspace_pod.md).
+        # docs/done/deleted_job_orphans_workspace_pod.md).
         try:
             await _archive_and_cleanup_workspace(job_id)
         except Exception as e:
