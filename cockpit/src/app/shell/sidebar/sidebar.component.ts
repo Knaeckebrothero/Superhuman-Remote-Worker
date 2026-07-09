@@ -18,7 +18,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
   standalone: true,
   imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent],
   template: `
-    <nav class="sidebar">
+    <nav class="sidebar" (click)="onSidebarClick($event)">
       <div class="sidebar-header">
         <div class="sidebar-brand">
           <srw-legion-mark [size]="22" />
@@ -338,10 +338,58 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         color: var(--accent-color, #cba6f7);
       }
 
-      /* Larger tap target in the mobile nav drawer (links were ~36px). */
+      /* Mobile drawer sizing: the 200px/13px desktop rail reads cramped as an
+         overlay drawer. Widen it (capped below the viewport so the backdrop
+         stays tappable) and scale the type/targets for thumbs. The width:0
+         collapse still wins via :host(.collapsed) specificity, unchanged. */
       @media (max-width: 768px) {
+        :host,
+        .sidebar {
+          width: min(300px, 84vw);
+        }
+
+        .sidebar-nav {
+          padding: 14px 10px;
+          gap: 4px;
+        }
+
         .nav-link {
           min-height: 44px;
+          padding: 10px 14px;
+          gap: 12px;
+          font-size: 15px;
+        }
+
+        .nav-icon {
+          font-size: 22px;
+        }
+
+        .sidebar-logo {
+          font-size: 20px;
+        }
+
+        .sidebar-label {
+          font-size: 12px;
+        }
+
+        .user-avatar {
+          width: 32px;
+          height: 32px;
+          font-size: 12px;
+        }
+
+        .user-name {
+          font-size: 14px;
+        }
+
+        .footer-link {
+          width: 40px;
+          height: 40px;
+        }
+
+        .logout-button {
+          min-height: 40px;
+          font-size: 14px;
         }
       }
 
@@ -503,6 +551,20 @@ export class SidebarComponent {
         this.sidebar.collapse();
       }
     });
+  }
+
+  /**
+   * Close the mobile drawer on any link tap, delegated from the nav root.
+   * The NavigationEnd subscription above misses the most intuitive dismiss
+   * gesture: tapping the page you're already on — a same-URL navigation is
+   * skipped by the router and emits nothing, so the drawer just sat there.
+   * Buttons (bell, logout, collapse) are exempt on purpose.
+   */
+  onSidebarClick(event: Event): void {
+    if (!this.viewport.isMobile()) return;
+    if ((event.target as HTMLElement).closest('a[href]')) {
+      this.sidebar.collapse();
+    }
   }
 
   private readonly currentUrl = toSignal(
