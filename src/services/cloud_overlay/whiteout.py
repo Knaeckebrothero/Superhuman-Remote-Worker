@@ -1,0 +1,88 @@
+"""Engine-agnostic overlay-upperdir → diff enumerator.
+
+Walks an overlay upperdir (kernel overlayfs OR fuse-overlayfs — the two
+produce interchangeable-enough markers, see docs/design/cloud_access_
+unification.md §3.1) and yields one DiffEntry per changed path.
+
+Deletions surface as EITHER a char(0,0) device node at the deleted name
+OR a `.wh.<name>` regular file. Directory replacement is an "opaque"
+dir, marked by any of three xattrs or a `.wh..wh..opq` sentinel file.
+Everything else is a real added/modified path (reported as "present";
+add-vs-modify is resolved by the caller against the lower to avoid an
+rclone round-trip per file).
+"""
+from __future__ import annotations
+
+import os
+import stat
+from dataclasses import dataclass
+from typing import Literal
+
+Status = Literal["present", "deleted"]
+
+_WH_PREFIX = ".wh."
+_OPAQUE_SENTINEL = ".wh..wh..opq"
+_OPAQUE_XATTRS = (
+    "trusted.overlay.opaque",
+    "user.overlay.opaque",
+    "user.fuseoverlayfs.opaque",
+)
+
+
+@dataclass(frozen=True)
+class DiffEntry:
+    path: str
+    status: Status
+
+
+def _is_char_whiteout(st: os.stat_result) -> bool:
+    return stat.S_ISCHR(st.st_mode) and st.st_rdev == os.makedev(0, 0)
+
+
+def is_whiteout(name: str) -> bool:
+    return name.startswith(_WH_PREFIX) and name != _OPAQUE_SENTINEL
+
+
+def is_opaque_dir(dirpath: str) -> bool:
+    if os.path.exists(os.path.join(dirpath, _OPAQUE_SENTINEL)):
+        return True
+    for attr in _OPAQUE_XATTRS:
+        try:
+            if os.getxattr(dirpath, attr) == b"y":
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def enumerate_diff(upperdir: str) -> list[DiffEntry]:
+    out: list[DiffEntry] = []
+    root = os.path.abspath(upperdir)
+
+    def rel(p: str) -> str:
+        return os.path.relpath(p, root).replace(os.sep, "/")
+
+    def walk(dirpath: str) -> None:
+        opaque = is_opaque_dir(dirpath)
+        if opaque and dirpath != root:
+            out.append(DiffEntry(rel(dirpath), "deleted"))
+        with os.scandir(dirpath) as it:
+            for entry in it:
+                name = entry.name
+                if name == _OPAQUE_SENTINEL:
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                if _is_char_whiteout(st):
+                    out.append(DiffEntry(rel(entry.path), "deleted"))
+                    continue
+                if is_whiteout(name):
+                    real = os.path.join(dirpath, name[len(_WH_PREFIX):])
+                    out.append(DiffEntry(rel(real), "deleted"))
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    walk(entry.path)
+                else:
+                    out.append(DiffEntry(rel(entry.path), "present"))
+
+    walk(root)
+    return sorted(out, key=lambda e: e.path)
