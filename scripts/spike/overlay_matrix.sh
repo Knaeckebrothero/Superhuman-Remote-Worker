@@ -13,28 +13,54 @@
 # ALL destructive ops go through the MERGED view only; the raw rclone mount is
 # never mutated directly. Mount the rclone lower --read-only for a faithful
 # protected-mode lower (this harness does not mount rclone itself; it consumes
-# $LOWER as given). For a clean COLD readdir/copy-up number, restart the rclone
-# mount (fresh vfs dir-cache) before each run.
+# $LOWER as given).
+#
+# Cell map to design §6.1 (the design's own lettering):
+#   §6.1(a) rm -rf whiteout storm + enumeration fidelity   -> STEP A (storm),
+#           "incl. opaque-dir renames, binaries"           -> STEP A-BIN, STEP A-REN
+#   §6.1(b) copy-up timing on a ~100 MB file               -> STEP B
+#   §6.1(c) external WebDAV edit mid-session               -> STEP D
+#   §6.1(d) readdir/merge latency                          -> STEP C
+#   §6.1(e) build-like write workload                      -> STEP E
+#   (enumeration fidelity of §6.1(a))                      -> STEP F
+#
+# Physics learned in the 2026-07-09 spike runs (why the knobs below exist):
+#   * The whiteout FORM depends on the upperdir's backing filesystem, NOT on
+#     CAP_MKNOD: on kernels >=5.8 an unprivileged uid can mknod char(0,0)
+#     whiteout nodes, so an emptyDir/PVC-backed upper yields char devices,
+#     while an upper on the container's own overlayfs rootfs gets EPERM and
+#     falls back to `.wh.` files. Put $BASE where production puts it
+#     (/home/agent-host, the emptyDir).
+#   * Whiteout-ing a lower file transfers the WHOLE file through rclone
+#     (--vfs-cache-mode full opens it); deletion cost scales with bytes.
+#   * A dir-listing warm (`ls -R`) does NOT warm deletion; only content reads do.
 #
 # Output is NUMBERS + observed behaviour, not pass/fail. A failed overlay mount
 # is a valid (no-go) finding.
-#
-# Steps are ordered so each measurement is uncontaminated by the next:
-#   (c) readdir (cold, before any mutation) -> (b) copy-up (big file intact)
-#   -> (a) whiteout storm (protects the big file) -> whiteout-form inspection
-#   -> (d) external-edit hook -> (e) build workload -> (f) enumerate_diff.
 #
 # Usage:  overlay_matrix.sh <rclone-mount-point> [seeded-subdir]
 #   $1 LOWER  : active rclone mount point, e.g. /cloud/home  (required)
 #   $2 SUBDIR : subdir under LOWER holding the seeded test tree (default: .)
 #
 # Env:
-#   SRC_ROOT     : path importable as src.services.cloud_overlay.whiteout
-#                  (default /app; set to a copy dir if src is not on the image).
-#   BIG_GLOB     : find -name pattern for the ~100MB copy-up file (default big.bin)
-#   EXT_EDIT_CMD : optional command mutating $EXT_REL under the lower via the
-#                  backend directly (WebDAV), for external-edit test (d). It runs
-#                  with env EXT_REL set to the tree-relative path of the probe.
+#   SRC_ROOT    : path importable as src.services.cloud_overlay.whiteout
+#                 (default /app; set to a copy dir if src is not on the image).
+#   BIG_GLOB    : find -name pattern for the ~100MB file (default big.bin)
+#   REMOUNT_CMD : optional command that tears down and re-creates the rclone
+#                 mount at $LOWER with a FRESH vfs cache. Invoked between the
+#                 cold-raw and cold-merged readdir passes (STEP C) and before
+#                 the cold binary delete (STEP A-BIN) so neither pass warms the
+#                 other. Without it those cells are only cold-ish and say so.
+#   RC_ADDR/RC_USER/RC_PASS : rclone remote-control endpoint of the $LOWER
+#                 mount; when set, STEP A-BIN records core/stats bytes
+#                 before/after the delete (measures backend bytes moved).
+#   EXT_EDIT_CMD: optional command mutating $EXT_REL under the lower via the
+#                 backend directly (WebDAV) for STEP D. Runs with env EXT_REL
+#                 set to the tree-relative probe path.
+#                 NOTE (provenance): in the recorded 2026-07-09 spike runs this
+#                 cell was driven MANUALLY out-of-band — an `rclone rcat` to
+#                 the Nextcloud WebDAV endpoint from a second rclone config
+#                 acting as the external editor — not via EXT_EDIT_CMD.
 set -uo pipefail
 
 LOWER="${1:?rclone mount point, e.g. /cloud/home}"
@@ -49,8 +75,48 @@ MTEST="$MERGED/$SUBDIR"
 hr() { printf '\n========== %s ==========\n' "$1"; }
 ok() { printf '  -> %s\n' "$1"; }
 
+rc_stats() {  # print "bytes transfers" from rclone rc core/stats, or "-"
+  if [ -n "${RC_ADDR:-}" ]; then
+    rclone rc --rc-addr "$RC_ADDR" --rc-user "${RC_USER:-}" --rc-pass "${RC_PASS:-}" \
+      core/stats 2>/dev/null |
+      python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("bytes"), d.get("transfers"))' \
+      || echo "-"
+  else
+    echo "- (RC_ADDR unset)"
+  fi
+}
+
+mount_overlay() {  # fresh upper each call; rerun guard against leftover mounts
+  fusermount3 -u "$MERGED" 2>/dev/null || fusermount -u "$MERGED" 2>/dev/null || true
+  rm -rf "$BASE"; mkdir -p "$UP" "$WORK" "$MERGED"
+  fuse-overlayfs -o "lowerdir=$LOWER,upperdir=$UP,workdir=$WORK" "$MERGED"
+}
+
+show_markers() {
+  echo "char-device whiteouts in upper:"
+  find "$UP" -type c -exec ls -la {} \; 2>/dev/null | head -20
+  echo ".wh.* file whiteouts in upper:"
+  find "$UP" -name '.wh.*' 2>/dev/null | head -20
+  echo "opaque xattrs on upper dirs (python os.listxattr; getfattr not in image):"
+  python3 - "$UP" <<'PY'
+import os, sys
+up = sys.argv[1]; found = False
+for root, dirs, files in os.walk(up):
+    try: attrs = os.listxattr(root)
+    except OSError: attrs = []
+    for a in attrs:
+        if "opaque" in a or "overlay" in a:
+            try: v = os.getxattr(root, a)
+            except OSError: v = b"?"
+            print(f"  {root}  {a}={v!r}"); found = True
+if not found: print("  (none)")
+PY
+}
+
 hr "environment"
 echo "whoami=$(id -un) uid=$(id -u)"
+grep -E "^CapEff" /proc/self/status
+echo "upper backing fs: $(stat -f -c %T "$(dirname "$BASE")" 2>/dev/null)  (char(0,0) whiteouts need non-overlayfs backing)"
 echo "rclone: $(rclone version 2>/dev/null | head -1)"
 fuse-overlayfs --version 2>&1 | grep -i 'fuse-overlayfs\|FUSE library' || true
 echo "LOWER=$LOWER  TEST=$TEST"
@@ -58,11 +124,24 @@ echo "-- lower is a mountpoint? --"; mountpoint "$LOWER" 2>&1 || echo "  (not a 
 echo "-- lower mount line --"; mount | grep -F "$LOWER" || true
 echo "-- lower top entries --"; ls "$LOWER" 2>&1 | head
 
-rm -rf "$BASE"; mkdir -p "$UP" "$WORK" "$MERGED"
+# ===========================================================================
+# STEP C — design §6.1(d): readdir/merge latency, cold isolated from warm.
+# Cold RAW runs BEFORE any overlay exists; REMOUNT_CMD (fresh vfs cache)
+# separates it from the cold MERGED pass so neither warms the other.
+# ===========================================================================
+hr "STEP C [design 6.1(d)]: readdir latency — cold raw vs cold merged"
+echo "-- COLD ls -R on RAW lower (no overlay mounted yet) --"
+time ls -R "$TEST" >/dev/null 2>&1
+if [ -n "${REMOUNT_CMD:-}" ]; then
+  echo "-- remounting lower with fresh cache (REMOUNT_CMD) --"
+  bash -c "$REMOUNT_CMD" || echo "  (remount cmd failed; merged pass will be WARM)"
+else
+  echo "-- REMOUNT_CMD unset: merged pass below is over a WARMED lower --"
+fi
 
 hr "mount fuse-overlayfs over the rclone lower"
 set -x
-fuse-overlayfs -o "lowerdir=$LOWER,upperdir=$UP,workdir=$WORK" "$MERGED"
+mount_overlay
 rc=$?
 set +x
 if [ $rc -ne 0 ] || ! mountpoint -q "$MERGED"; then
@@ -73,37 +152,79 @@ ok "fuse-overlayfs mounted at $MERGED"
 trap 'fusermount3 -u "$MERGED" 2>/dev/null || fusermount -u "$MERGED" 2>/dev/null || true' EXIT
 echo "-- overlay mount line --"; mount | grep -F "$MERGED" || true
 
-# ---------------------------------------------------------------------------
-hr "(c) readdir latency: raw rclone lower vs merged overlay (COLD then WARM)"
-echo "NOTE: for a true cold number the rclone vfs dir-cache must be fresh"
-echo "      (restart the rclone mount before this run)."
-echo "-- COLD ls -R on RAW lower (cold cloud PROPFIND) --"
-time ls -R "$TEST" >/dev/null 2>&1
-echo "-- COLD ls -R on MERGED (overlay over the same, now-warming lower) --"
+echo "-- COLD ls -R on MERGED (fresh overlay; lower cold iff REMOUNT_CMD ran) --"
 time ls -R "$MTEST" >/dev/null 2>&1
 echo "-- WARM ls -R on RAW lower --"
 time ls -R "$TEST" >/dev/null 2>&1
 echo "-- WARM ls -R on MERGED --"
 time ls -R "$MTEST" >/dev/null 2>&1
 
-# ---------------------------------------------------------------------------
-hr "(b) copy-up timing on the ~100 MB binary (in-place edit through MERGED)"
-BIG="$(find "$MTEST" -maxdepth 2 -type f -name "$BIG_GLOB" 2>/dev/null | head -1)"
-echo "big file: ${BIG:-<none>}"
-if [ -n "${BIG:-}" ]; then
-  ls -la "$BIG"
-  bytes="$(stat -c %s "$BIG" 2>/dev/null)"
-  echo "-- 1-byte in-place edit forces full copy-up of $bytes bytes from lower --"
-  time sh -c "printf 'X' | dd of=\"$BIG\" bs=1 count=1 conv=notrunc status=none"
-  echo "-- upper now holds the copied-up file: --"
-  find "$UP" -type f -size +50M -exec ls -la {} \; 2>/dev/null | head
+# ===========================================================================
+# STEP A-BIN — design §6.1(a) "binaries": whiteout a LARGE lower file with a
+# cold VFS cache. Open question it answers: fixed round-trip, or scales with
+# file size? (Spike answer: the FULL file transfers through rclone.)
+# Runs in its OWN overlay instance so STEP B still sees the file in the lower.
+# ===========================================================================
+hr "STEP A-BIN [design 6.1(a) binaries]: cold delete of the ~100MB file"
+if [ -n "${REMOUNT_CMD:-}" ]; then
+  fusermount3 -u "$MERGED" 2>/dev/null || true
+  echo "-- remounting lower with fresh cache so the delete is COLD --"
+  bash -c "$REMOUNT_CMD" || echo "  (remount cmd failed; delete below is WARM)"
+  mount_overlay
 else
-  echo "!! no ~100MB file matched '$BIG_GLOB' under $MTEST — copy-up not measured"
+  echo "-- REMOUNT_CMD unset: file cache state is whatever prior steps left --"
+fi
+BIGM="$(find "$MTEST" -maxdepth 2 -type f -name "$BIG_GLOB" 2>/dev/null | head -1)"
+echo "big file (merged): ${BIGM:-<none>}"
+if [ -n "${BIGM:-}" ]; then
+  echo "core/stats before: $(rc_stats)"
+  time rm "$BIGM"
+  echo "core/stats after:  $(rc_stats)   (delta = bytes the DELETE moved)"
+  echo "upper size after delete (0 expected — whiteout only, no copy-up):"
+  du -sb "$UP"
+  show_markers
 fi
 
-# ---------------------------------------------------------------------------
-hr "(a) rm -rf whiteout storm (through MERGED only; protects the big file)"
-echo "-- (a1) rm -rf a whole nested subtree --"
+# ===========================================================================
+# STEP B — design §6.1(b): copy-up timing. Fresh overlay so the big file is
+# visible again (the A-BIN whiteout lived in the previous upper).
+# ===========================================================================
+hr "STEP B [design 6.1(b)]: copy-up timing on the ~100 MB binary"
+fusermount3 -u "$MERGED" 2>/dev/null || true
+mount_overlay
+BIGM="$(find "$MTEST" -maxdepth 2 -type f -name "$BIG_GLOB" 2>/dev/null | head -1)"
+echo "big file: ${BIGM:-<none>}"
+if [ -n "${BIGM:-}" ]; then
+  ls -la "$BIGM"
+  bytes="$(stat -c %s "$BIGM" 2>/dev/null)"
+  echo "-- 1-byte in-place edit forces full copy-up of $bytes bytes from lower --"
+  time sh -c "printf 'X' | dd of=\"$BIGM\" bs=1 count=1 conv=notrunc status=none"
+  echo "-- upper now holds the copied-up file: --"
+  find "$UP" -type f -size +50M -exec ls -la {} \; 2>/dev/null | head
+fi
+
+# ===========================================================================
+# STEP A-REN — design §6.1(a) "opaque-dir renames": REAL directory rename of a
+# lower dir with files (§9 item 8: renames apply as DELETE+PUT).
+# ===========================================================================
+hr "STEP A-REN [design 6.1(a) renames]: mv a lower dir with files"
+REN_SRC="$(find "$MTEST" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | head -1)"
+echo "rename source: ${REN_SRC:-<none>}"
+if [ -n "${REN_SRC:-}" ]; then
+  echo "files inside: $(find "$REN_SRC" -type f | wc -l)"
+  time mv "$REN_SRC" "${REN_SRC}-renamed"
+  echo "-- upper after rename (expect: whiteout on old name; opaque marker on new dir; children copied up) --"
+  find "$UP" -mindepth 1 | sort | head -25
+  show_markers
+fi
+
+# ===========================================================================
+# STEP A — design §6.1(a): rm -rf whiteout storm + individual-file whiteouts.
+# NOTE: cost is ~1 full-content fetch per cold lower file (see A-BIN), so this
+# is slow on a cold cache by design — that IS the measurement.
+# ===========================================================================
+hr "STEP A [design 6.1(a)]: rm -rf whiteout storm (through MERGED only)"
+echo "-- (A1) rm -rf a whole nested subtree --"
 VICTIM_DIR="$(find "$MTEST" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -v wide | head -1)"
 echo "victim dir: ${VICTIM_DIR:-<none>}"
 if [ -n "${VICTIM_DIR:-}" ]; then
@@ -112,54 +233,40 @@ if [ -n "${VICTIM_DIR:-}" ]; then
   time rm -rf "$VICTIM_DIR"
   ok "removed $VICTIM_DIR via merged view"
 fi
-echo "-- (a2) delete a handful of INDIVIDUAL files from the wide dir (per-file whiteouts) --"
+echo "-- (A2) delete individual files from the wide dir (per-file whiteouts) --"
 mapfile -t FILES < <(find "$MTEST/wide" -maxdepth 1 -type f 2>/dev/null | head -6)
 for f in "${FILES[@]}"; do rm -f "$f"; done
 echo "deleted ${#FILES[@]} individual files from wide/"
-echo "-- (a3) inspect upperdir markers: char-dev whiteout vs .wh.* file? --"
-echo "find $UP -type c (char-device whiteouts):"
-find "$UP" -type c -exec ls -la {} \; 2>/dev/null | head
-echo "find $UP -name '.wh.*' (.wh. file whiteouts):"
-find "$UP" -name '.wh.*' 2>/dev/null | head -20
-echo "find $UP -name '.wh..wh..opq' (opaque-dir sentinels):"
-find "$UP" -name '.wh..wh..opq' 2>/dev/null | head
-echo "-- opaque xattrs on upper dirs (python os.listxattr; getfattr not in image) --"
-python3 - "$UP" <<'PY'
-import os, sys
-up = sys.argv[1]; found = False
-for root, dirs, files in os.walk(up):
-    try: attrs = os.listxattr(root)
-    except OSError: attrs = []
-    for a in attrs:
-        if "opaque" in a:
-            try: v = os.getxattr(root, a)
-            except OSError: v = b"?"
-            print(f"  {root}  {a}={v!r}"); found = True
-if not found: print("  (no opaque xattrs on any upper dir)")
-PY
+echo "-- (A3) marker inspection --"
+show_markers
 
-# ---------------------------------------------------------------------------
-hr "(d) external WebDAV edit while overlay is mounted -> merged fresh/stale?"
+# ===========================================================================
+# STEP D — design §6.1(c): external WebDAV edit while the overlay is mounted.
+# Spike answer: files already read through the mount stay STALE (rclone VFS
+# file cache; survives poll-interval and rc vfs/refresh); un-read files are
+# fresh. The refresh op must invalidate the FILE cache, not just metadata.
+# ===========================================================================
+hr "STEP D [design 6.1(c)]: external WebDAV edit -> merged fresh/stale?"
 PROBE="$(find "$MTEST/wide" -maxdepth 1 -type f -name '*.txt' 2>/dev/null | sort | tail -1)"
 if [ -n "${PROBE:-}" ]; then
   EXT_REL="${PROBE#"$MERGED"/}"; EXT_REL="${EXT_REL#"$SUBDIR"/}"
-  echo "probe file (merged): $PROBE"
-  echo "  tree-rel path: $EXT_REL"
-  echo "  merged content BEFORE external edit: $(cat "$PROBE" 2>/dev/null | head -c 80)"
+  echo "probe (merged): $PROBE  tree-rel: $EXT_REL"
+  echo "  merged BEFORE: $(head -c 80 "$PROBE" 2>/dev/null)"
   if [ -n "${EXT_EDIT_CMD:-}" ]; then
-    echo "  running EXT_EDIT_CMD to mutate '$EXT_REL' via backend directly..."
     EXT_REL="$EXT_REL" bash -c "$EXT_EDIT_CMD" || echo "  (ext edit cmd failed)"
     sleep 2
-    echo "  raw    content AFTER external edit: $(cat "$TEST/$EXT_REL" 2>/dev/null | head -c 80)"
-    echo "  merged content AFTER external edit: $(cat "$PROBE" 2>/dev/null | head -c 80)"
+    echo "  raw    AFTER: $(head -c 80 "$TEST/$EXT_REL" 2>/dev/null)"
+    echo "  merged AFTER: $(head -c 80 "$PROBE" 2>/dev/null)"
     echo "  (merged==raw => fresh; merged==old => stale, needs refresh op)"
   else
-    echo "  EXT_EDIT_CMD not set — driver performs the WebDAV edit + re-read out of band."
+    echo "  EXT_EDIT_CMD unset — drive the WebDAV edit + re-read out of band."
   fi
 fi
 
-# ---------------------------------------------------------------------------
-hr "(e) build-like write workload: merged overlay vs plain local disk"
+# ===========================================================================
+# STEP E — design §6.1(e): build-like write workload, merged vs local disk.
+# ===========================================================================
+hr "STEP E [design 6.1(e)]: build-like write workload"
 WL_LOCAL="${HOME}/.overlay_wl_local"
 WL_MERGED="$MTEST/.overlay_wl_build"
 run_build_workload() {
@@ -182,8 +289,16 @@ echo "-- merged workload files that landed in upper: --"
 find "$UP" -path '*overlay_wl_build*' -type f 2>/dev/null | wc -l
 rm -rf "$WL_LOCAL"
 
-# ---------------------------------------------------------------------------
-hr "(f) enumerate_diff over the upperdir (Task 2 enumerator fidelity)"
+# ===========================================================================
+# STEP F — enumeration fidelity for §6.1(a): enumerate_diff over the upper.
+# COUNT ARITHMETIC: this upper accumulates steps B..E of THIS run only:
+#   deleted = 1 (A1 whole-dir whiteout) + 6 (A2 files) + rename markers
+#             (old-name whiteout + opaque new dir [+ any phantom `.wh..opq`
+#             char node fuse-overlayfs adds inside opaque dirs])
+#   present = copied-up big file + rename children + workload files.
+# Run a step against a FRESH upper when a headline count must close exactly.
+# ===========================================================================
+hr "STEP F [fidelity of 6.1(a)]: enumerate_diff over the upperdir"
 cd /
 python3 - "$UP" "$SRC_ROOT" <<'PY'
 import sys
