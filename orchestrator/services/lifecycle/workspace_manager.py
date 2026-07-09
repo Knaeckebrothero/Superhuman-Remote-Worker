@@ -36,7 +36,7 @@ _LABEL_SELECTOR = "srw.io/component=agent-workspace"
 # "the lookup succeeded and found no row". The distinction matters: a missing
 # row means the job/thread was deleted and the pod is an orphan we may reap
 # (age-gated), while a failed lookup means we know nothing and must not act.
-# See docs/issues/deleted_job_orphans_workspace_pod.md.
+# See docs/done/deleted_job_orphans_workspace_pod.md.
 _FETCH_FAILED = object()
 
 # 'reviewing' is the verification-enabled twin of 'pending_review'
@@ -316,7 +316,7 @@ class WorkspaceInstanceManager:
         pod-created-but-row-not-yet-persisted provisioning window, which is
         seconds long — the grace default is minutes. A pod whose row state is
         merely *unknown* (lookup failed) is never reapable.
-        See docs/issues/deleted_job_orphans_workspace_pod.md.
+        See docs/done/deleted_job_orphans_workspace_pod.md.
 
         Guard: a workspace shared by a live child job (a critic SSHed into the
         parent's pod) is never reapable, regardless of the parent's own status —
