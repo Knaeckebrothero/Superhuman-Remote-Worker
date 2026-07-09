@@ -12,7 +12,10 @@ def _mkchardev_or_skip(p: Path):
         os.mknod(p, 0o600 | 0o020000, os.makedev(0, 0))  # S_IFCHR, 0:0
     except PermissionError:
         import pytest
-        pytest.skip("no CAP_MKNOD in test env; char-whiteout case needs privileged runner")
+        pytest.skip(
+            "mknod c 0,0 denied by backing FS/kernel "
+            "(needs Linux >=5.8 and a non-overlayfs-backed tmpdir)"
+        )
 
 
 def test_added_and_modified_reported_as_present(tmp_path):
