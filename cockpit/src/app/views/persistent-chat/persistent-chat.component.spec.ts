@@ -2,9 +2,11 @@ import {beforeEach, describe, expect, it} from 'vitest';
 
 import {
     canComposeDuringSession,
+    canSendMessage,
     clearDraft,
     draftKey,
     extractClipboardFiles,
+    isMicMode,
     isStartupBannerVisible,
     loadDraft,
     pickCodeServerUrlToOpen,
@@ -13,6 +15,7 @@ import {
     readingWidthToCss,
     saveDraft,
     shouldFoldToolRun,
+    shouldSendOnEnter,
     textSizeToCss,
 } from './persistent-chat.component';
 import {AssistantTurn} from '../../core/models/turn.model';
@@ -76,6 +79,70 @@ describe('canComposeDuringSession', () => {
         // markSessionReady() only flushes the pending queue once, so we must
         // NOT let a message be queued during a reconnect — it would never send.
         expect(canComposeDuringSession(false, false)).toBe(false);
+    });
+});
+
+describe('canSendMessage', () => {
+    // Regression guard: this used to be a computed() over the plain inputText
+    // field, so typing never invalidated it and the send button stayed
+    // disabled on an idle session (Enter still worked). Now a pure function
+    // the component re-evaluates per change-detection pass.
+    it('enables send once there is non-whitespace text', () => {
+        expect(canSendMessage(true, 'hello', 0)).toBe(true);
+    });
+
+    it('stays disabled for empty or whitespace-only text without attachments', () => {
+        expect(canSendMessage(true, '', 0)).toBe(false);
+        expect(canSendMessage(true, '   \n', 0)).toBe(false);
+    });
+
+    it('enables send for attachments alone (voice note, photo)', () => {
+        expect(canSendMessage(true, '', 2)).toBe(true);
+    });
+
+    it('never sends while composing is blocked, regardless of content', () => {
+        expect(canSendMessage(false, 'hello', 1)).toBe(false);
+    });
+});
+
+describe('isMicMode', () => {
+    it('offers the mic on an empty idle composer with audio input', () => {
+        expect(isMicMode(true, false, '', 0)).toBe(true);
+    });
+
+    it('flips to send on the first real keystroke', () => {
+        expect(isMicMode(true, false, 'h', 0)).toBe(false);
+    });
+
+    it('treats whitespace-only text as still empty (nothing sendable)', () => {
+        expect(isMicMode(true, false, '  \n', 0)).toBe(true);
+    });
+
+    it('flips to send when an attachment is queued without text', () => {
+        expect(isMicMode(true, false, '', 1)).toBe(false);
+    });
+
+    it('yields to the stop/spinner states while a turn is in flight', () => {
+        expect(isMicMode(true, true, '', 0)).toBe(false);
+    });
+
+    it('never offers the mic without an audio input device', () => {
+        expect(isMicMode(false, false, '', 0)).toBe(false);
+    });
+});
+
+describe('shouldSendOnEnter', () => {
+    it('sends on plain Enter with a physical keyboard', () => {
+        expect(shouldSendOnEnter(false, false)).toBe(true);
+    });
+
+    it('inserts a newline on Shift+Enter with a physical keyboard', () => {
+        expect(shouldSendOnEnter(true, false)).toBe(false);
+    });
+
+    it('inserts a newline on Enter on touch devices (send button sends)', () => {
+        expect(shouldSendOnEnter(false, true)).toBe(false);
+        expect(shouldSendOnEnter(true, true)).toBe(false);
     });
 });
 

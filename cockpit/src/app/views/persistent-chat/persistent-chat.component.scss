@@ -1624,11 +1624,6 @@
         background: var(--surface-0);
       }
 
-      /* Mic button styled the same as other ctrl buttons */
-      .ctrl.mic .ctrl-icon {
-        font-size: 16px;
-      }
-
       /* Image preview dialog body */
       .image-preview-img {
         display: block;
@@ -2344,26 +2339,23 @@
     .usage-ctx-pct { color: var(--danger, #cc4647); }
   }
 
-  // Phone: collapse to one compact line — output tokens + the context gauge.
-  // The full breakdown was clipping off the left edge of the viewport.
+  // Phone: even the reduced OUTPUT+CTX line pressed against the viewport
+  // edges. Drop the token counters entirely and let the context gauge — the
+  // one actionable number — stretch across the freed width.
   @media (max-width: 768px) {
-    justify-content: space-between;
-    gap: v.$space-sm;
-    min-width: 0;
-
     .usage-tokens {
-      min-width: 0;
-      overflow: hidden;
-      white-space: nowrap;
-    }
-
-    .usage-chip--input,
-    .usage-chip--reasoning {
       display: none;
     }
 
     .usage-ctx {
-      flex-shrink: 0;
+      flex: 1;
+      border-left: 0;
+      padding-left: 0;
+    }
+
+    .usage-gauge {
+      flex: 1;
+      width: auto;
     }
   }
 }
