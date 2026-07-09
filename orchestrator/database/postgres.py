@@ -1230,6 +1230,80 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    # ---- protected cloud mode: per-mount RO reader grants (design §8.1.4) ----
+
+    async def create_ro_mount(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        backend: str,
+        reader_id: str,
+        grant_handle: str,
+        credentials: str | None,
+        webdav_url: str,
+        auth_kind: str,
+    ) -> str:
+        """Upsert the per-mount RO grant row (one live grant per thread).
+
+        Encrypts ``credentials`` at rest. A re-provision on the same thread
+        replaces the prior grant row in place (ON CONFLICT).
+        """
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                """
+                INSERT INTO cloud_ro_mounts
+                    (thread_id, user_id, backend, reader_id, grant_handle,
+                     credentials, webdav_url, auth_kind, status)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active')
+                ON CONFLICT (thread_id) DO UPDATE SET
+                    user_id=$2, backend=$3, reader_id=$4, grant_handle=$5,
+                    credentials=$6, webdav_url=$7, auth_kind=$8,
+                    status='active', created_at=now(), revoked_at=NULL
+                RETURNING id::text
+                """,
+                thread_id, user_id, backend, reader_id, grant_handle,
+                _encrypt_optional(credentials), webdav_url, auth_kind,
+            )
+
+    async def get_ro_mount_by_thread(self, thread_id: str) -> dict | None:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM cloud_ro_mounts WHERE thread_id=$1", thread_id
+            )
+        return self._ro_mount_row(row) if row else None
+
+    async def list_active_ro_mounts(self) -> list[dict]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM cloud_ro_mounts WHERE status='active'"
+            )
+        return [self._ro_mount_row(r) for r in rows]
+
+    async def list_ro_mounts_for_user(self, user_id: str) -> list[dict]:
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM cloud_ro_mounts WHERE user_id=$1", user_id
+            )
+        return [self._ro_mount_row(r) for r in rows]
+
+    async def mark_ro_mount_revoked(self, row_id: str) -> bool:
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE cloud_ro_mounts SET status='revoked', revoked_at=now() "
+                "WHERE id=$1 AND status='active'",
+                row_id,
+            )
+        return result == "UPDATE 1"
+
+    @staticmethod
+    def _ro_mount_row(row) -> dict:
+        d = dict(row)
+        d["credentials"] = _decrypt_stored(
+            d.get("credentials"), field="cloud_ro_mounts.credentials"
+        )
+        return d
+
     async def update_job_exported_folder(
         self,
         job_id: str,
