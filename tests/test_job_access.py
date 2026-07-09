@@ -907,7 +907,7 @@ class TestJobMutationGates:
         snapshots while the row still exists — once the row is gone the
         lifecycle reconciler can no longer reap the pod (no-bound-row is
         treated as in-flight provisioning). See
-        docs/issues/deleted_job_orphans_workspace_pod.md."""
+        docs/done/deleted_job_orphans_workspace_pod.md."""
         from main import delete_job
 
         calls: list[str] = []

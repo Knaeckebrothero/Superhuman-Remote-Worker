@@ -554,7 +554,7 @@ class TestMissingRowOrphan:
     orphan: reapable once past the grace age, clean (nothing to snapshot),
     terminal (PVC/Service reclaimed). A *failed* lookup must never be
     mistaken for a missing row. See
-    docs/issues/deleted_job_orphans_workspace_pod.md."""
+    docs/done/deleted_job_orphans_workspace_pod.md."""
 
     @staticmethod
     def _orphan_pod(job_id: str = "jgone", age_hours: float = 2.0):
