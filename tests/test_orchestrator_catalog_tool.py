@@ -14,6 +14,7 @@ if str(project_root) not in sys.path:
 
 from src.tools.context import ToolContext  # noqa: E402
 from src.tools.orchestrator import create_orchestrator_tools  # noqa: E402
+from src.tools.registry import get_tools_by_category  # noqa: E402
 
 
 def _tool_by_name(tools, name):
@@ -21,6 +22,21 @@ def _tool_by_name(tools, name):
         if t.name == name:
             return t
     raise AssertionError(f"tool {name!r} not in {[t.name for t in tools]}")
+
+
+def test_catalog_tools_have_separate_category():
+    catalog = set(get_tools_by_category("agent_catalog"))
+    fleet = set(get_tools_by_category("orchestrator"))
+
+    expected = {
+        "list_experts",
+        "get_expert",
+        "list_skills",
+        "search_skills",
+        "get_skill",
+    }
+    assert expected <= catalog
+    assert expected.isdisjoint(fleet)
 
 
 class _CapturingClient:

@@ -595,8 +595,8 @@ class TestSetupTools:
         for excluded in _EXCLUDED_TOOLS:
             assert excluded not in loaded_names
 
-    def test_orchestrator_tools_always_included(self):
-        """Session context and orchestrator delegation tools are always appended."""
+    def test_orchestrator_and_catalog_tools_always_included(self):
+        """Fleet Management and Experts & Skills tools are always appended."""
         cfg = _make_config()
         session = _make_session(config=cfg)
         session.workspace_manager = MagicMock()
@@ -616,6 +616,8 @@ class TestSetupTools:
             "list_project_jobs",
             "list_project_repositories",
             "get_default_project_repository",
+        ]
+        catalog_tools = [
             "list_experts",
             "get_expert",
             "list_skills",
@@ -645,6 +647,8 @@ class TestSetupTools:
 
         loaded_names = mock_load.call_args[0][0]
         for name in orch_tools:
+            assert name in loaded_names
+        for name in catalog_tools:
             assert name in loaded_names
         assert "checkout_project_repository" not in loaded_names
 
@@ -716,8 +720,46 @@ class TestSetupTools:
         assert "task_add" in loaded_names
         assert "create_worker_job" not in loaded_names
         assert "list_project_repositories" not in loaded_names
-        assert "list_skills" not in loaded_names
+        assert "list_skills" in loaded_names
         assert "request_workspace_upgrade" not in loaded_names
+
+    def test_agent_catalog_can_be_disabled(self):
+        """Experts & Skills opt-out removes expert/skill catalog tools."""
+        cfg = _make_config(extra={"_agent_catalog_disabled": True})
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend.supports_shell = False
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=[
+                    "web_search",
+                    "create_worker_job",
+                    "list_skills",
+                    "request_workspace_upgrade",
+                ],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext"),
+        ):
+            session._setup_tools(None)
+
+        loaded_names = mock_load.call_args[0][0]
+        assert "web_search" in loaded_names
+        assert "create_worker_job" in loaded_names
+        assert "request_workspace_upgrade" in loaded_names
+        assert "list_skills" not in loaded_names
 
     def test_no_duplicate_orchestrator_tools(self):
         """Orchestrator tools not duplicated if already in config."""

@@ -16,10 +16,10 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "orchestrator.catalog",
         "function": "list_experts",
         "description": (
-            "List bundled and visible user/global experts. Read-only Fleet "
-            "Management catalog inspection."
+            "List bundled and visible user/global experts. Read-only expert "
+            "catalog inspection."
         ),
-        "category": "orchestrator",
+        "category": "agent_catalog",
         "short_description": "List visible experts.",
         "phases": ["strategic", "tactical"],
     },
@@ -30,7 +30,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Get a compact summary of an expert's merged configuration, "
             "instructions preview, enabled tool categories, and effective models."
         ),
-        "category": "orchestrator",
+        "category": "agent_catalog",
         "short_description": "Inspect an expert.",
         "phases": ["strategic", "tactical"],
     },
@@ -38,7 +38,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "orchestrator.catalog",
         "function": "list_skills",
         "description": "List bundled and visible user/global skills.",
-        "category": "orchestrator",
+        "category": "agent_catalog",
         "short_description": "List visible skills.",
         "phases": ["strategic", "tactical"],
     },
@@ -49,7 +49,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Search visible skills by id, name, display name, description, "
             "source, and tags."
         ),
-        "category": "orchestrator",
+        "category": "agent_catalog",
         "short_description": "Search visible skills.",
         "phases": ["strategic", "tactical"],
     },
@@ -60,7 +60,7 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Get a compact summary of a skill, including metadata, file index, "
             "and SKILL.md preview. Does not dump the full file tree by default."
         ),
-        "category": "orchestrator",
+        "category": "agent_catalog",
         "short_description": "Inspect a skill.",
         "phases": ["strategic", "tactical"],
     },

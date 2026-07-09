@@ -341,6 +341,14 @@
           },
           "description": "Fleet Management tools: inspect and steer SRW jobs, projects, repositories, and related orchestrator state. Primarily for persistent agents (src/tools/orchestrator/)",
           "examples": [["create_worker_job", "list_worker_jobs", "get_worker_job", "approve_worker_job", "resume_worker_job"]]
+        },
+        "agent_catalog": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Agent catalog tools: read-only expert and skill catalog inspection. Primarily for persistent agents (src/tools/orchestrator/catalog.py)",
+          "examples": [["list_experts", "get_expert", "list_skills", "search_skills", "get_skill"]]
         }
       }
     },
@@ -579,7 +587,7 @@
           "type": "boolean",
           "default": true,
           "description": "Restrict working directory to workspace root"
-        },
+        }
       },
       "additionalProperties": false
     },
