@@ -1,5 +1,21 @@
 # Protected Cloud Mode — Phase 0 (Spike) Implementation Plan
 
+> **✅ COMPLETE — 2026-07-09. Verdict: GO.** Executed via subagent-driven-development (fresh implementer + task review per task, whole-branch review at the end). All 7 tasks done; results written into `docs/design/cloud_access_unification.md` §11. **Commits `7bd12f3c..891ca0cf` on `develop` (15 commits: 7 task + fix rounds; unpushed).**
+>
+> **Per-task outcome:**
+> - **Task 1** (fuse-overlayfs in both images) — done; container image build-verified (v1.13 in-image). VM tier verified by inspection + `bash -n` only (no VM built). Step 5 (static-binary fallback) **not needed** — apt gate passed.
+> - **Task 2** (whiteout enumerator) — done, 10 tests. One review fix round (empty-remainder `.wh.` → `ValueError`; real xattr test). Later hardened again from Task-4 live data (skip phantom `.wh..opq`) and by the final review (opaque-added-dir docstring + `Raises`).
+> - **Task 3** (fail-closed RO probe) — done, 19 tests. Two review fix rounds (transport-error fail-closed + version floors + real CVE side channels; then strict derived `ok` gate + backend allowlist). Final review added a mandatory positive read control + 403/405-only rejection. **Adjudication:** the plan's Step-3 reference code contradicted its own Global Constraints (spec §3.3 verbatim); constraints governed.
+> - **Task 4** (FUSE-on-FUSE matrix) — done via **Path B** (manual pod; Path A provisioning was time-boxed out). One fix round (binary/rename cells, cold-isolated readdir, count reconciliation). Surfaced two design corrections (§3.2 "metadata-only" falsified; §3.1 mechanism = backing-FS not caps) and a live enumerator bug (now fixed).
+> - **Task 5** (etag walk bench) — done via the real orchestrator project path, one fix round (committed the Depth:infinity probe + reconciled counts). Found a pre-existing product bug (`_propfind.py` returns every subdir twice — **unfixed**, flagged for Phase 1).
+> - **Task 6** (snapshot/refresh) — done (findings only, no commits), one fix round (re-ran the stale-reads cell with proper backend-edit divergence).
+> - **Task 7** (write §11 + go/no-go) — done; §11 added, §6 items flipped (item 4 stays ⏳ OPEN), status line updated.
+> - **Final whole-branch review** — `Ready: Yes` after one fix commit (`891ca0cf`: probe positive read control, enumerator docstring, version-gate sed anchor).
+>
+> **Environment note:** all hands-on cells ran on local k3d against **local Nextcloud 31 (sqlite)** — not the provisioned mount path, not OpenCloud (in-chart OC was config-broken locally), not the VM tier. See §11.7 for the full caveat list.
+>
+> _Original plan preserved below; checkboxes reflect what ran (Task 1 Step 5 marked skipped)._
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Retire the feasibility unknowns in `docs/design/cloud_access_unification.md` §6 with a hands-on spike, and land the two pure-logic artifacts (whiteout enumerator, fail-closed RO probe) that Phase 1 will consume, producing a go/no-go report that seeds the Phase 1 plan.
@@ -51,7 +67,7 @@
 - Consumes: nothing.
 - Produces: a `fuse-overlayfs` binary (≥1.13) present on `PATH` in both the container workspace image and the VM base image. No Python surface.
 
-- [ ] **Step 1: Add the package to the container image apt block**
+- [x] **Step 1: Add the package to the container image apt block**
 
 In `docker/Dockerfile.workspace`, in the `eatmydata apt-get install -y` list, add `fuse-overlayfs` immediately after the `fuse3` line (:73):
 
@@ -60,7 +76,7 @@ In `docker/Dockerfile.workspace`, in the `eatmydata apt-get install -y` list, ad
     fuse-overlayfs \
 ```
 
-- [ ] **Step 2: Add a version assertion after the rclone verification**
+- [x] **Step 2: Add a version assertion after the rclone verification**
 
 In `docker/Dockerfile.workspace`, immediately after the `&& rclone version` line (:138), extend that `RUN` (or add a new one) so the build fails loudly if the distro ships a too-old fuse-overlayfs:
 
@@ -71,7 +87,7 @@ RUN fuse-overlayfs --version \
         || { echo "fuse-overlayfs $v < 1.13 (big-dir/readdir fixes needed)"; exit 1; }
 ```
 
-- [ ] **Step 3: Mirror both changes into the VM base provisioner**
+- [x] **Step 3: Mirror both changes into the VM base provisioner**
 
 In `docker/agent-vm-base/scripts/provision-stage1.sh`, add `fuse-overlayfs \` after the `fuse3 \` line (:124), and after the rclone `_section` block (ends ~:178) add:
 
@@ -82,16 +98,16 @@ dpkg --compare-versions "$v" ge 1.13 \
     || { echo "fuse-overlayfs $v < 1.13"; exit 1; }
 ```
 
-- [ ] **Step 4: Build the container image and verify the binary + version gate**
+- [x] **Step 4: Build the container image and verify the binary + version gate**
 
 Run: `podman build -f docker/Dockerfile.workspace -t srw-workspace:spike . && podman run --rm srw-workspace:spike fuse-overlayfs --version`
 Expected: build succeeds; prints `fuse-overlayfs: version 1.x` with x≥13. (Ubuntu 24.04 ships 1.13 — if apt yields <1.13, the RUN gate fails the build and Step 5 switches to the upstream static binary.)
 
-- [ ] **Step 5 (only if Step 4's version gate fails): pin the upstream static binary instead**
+- [~] **Step 5 (only if Step 4's version gate fails): pin the upstream static binary instead**
 
 Replace the apt entry with a checksum-verified download mirroring the rclone pattern already in the file (release asset `fuse-overlayfs-x86_64` from `github.com/containers/fuse-overlayfs/releases`), install to `/usr/bin/fuse-overlayfs`, `chmod +x`, re-run the version assertion. Apply to both files.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add docker/Dockerfile.workspace docker/agent-vm-base/scripts/provision-stage1.sh
@@ -114,7 +130,7 @@ git commit -m "spike(cloud-overlay): install fuse-overlayfs in workspace + VM im
   - `is_whiteout(path: str) -> bool`, `is_opaque_dir(path: str) -> bool` helpers.
 - Phase 1 relies on these exact names/types (spec §3.4 `UpperdirDiffSource`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/cloud_overlay/test_whiteout.py
@@ -173,12 +189,12 @@ def test_metadata_xattr_files_never_leak_as_paths(tmp_path):
     assert all(not e.path.startswith(".wh") for e in got)
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/cloud_overlay/test_whiteout.py -v`
 Expected: FAIL — `ModuleNotFoundError: src.services.cloud_overlay.whiteout`.
 
-- [ ] **Step 3: Write the enumerator**
+- [x] **Step 3: Write the enumerator**
 
 ```python
 # src/services/cloud_overlay/whiteout.py
@@ -272,12 +288,12 @@ def enumerate_diff(upperdir: str) -> list[DiffEntry]:
     return sorted(out, key=lambda e: e.path)
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/cloud_overlay/test_whiteout.py -v`
 Expected: PASS (the char-device test SKIPs if the runner lacks CAP_MKNOD — that path is re-checked live in Task 4).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/services/cloud_overlay tests/cloud_overlay
@@ -300,7 +316,7 @@ git commit -m "feat(cloud-overlay): engine-agnostic whiteout->diff enumerator"
   - Module constant `MUTATING_VERBS` and `REJECTED_STATUSES = {401, 403, 405}`.
 - Phase 1 calls `probe_read_only` at mount-provision time and refuses protected mode unless `ok`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/cloud/test_ro_probe.py
@@ -346,12 +362,12 @@ async def test_side_channel_verbs_are_probed():
     assert any("restore" in (v[1] or "").lower() for v in MUTATING_VERBS)
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `python -m pytest tests/cloud/test_ro_probe.py -v`
 Expected: FAIL — `ModuleNotFoundError: orchestrator.services.cloud.ro_probe`.
 
-- [ ] **Step 3: Write the probe**
+- [x] **Step 3: Write the probe**
 
 ```python
 # orchestrator/services/cloud/ro_probe.py
@@ -406,12 +422,12 @@ async def probe_read_only(client, base_url: str, path: str) -> RoProbeResult:
     return RoProbeResult(ok=not failures, failures=failures)
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/cloud/test_ro_probe.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/cloud/ro_probe.py tests/cloud/test_ro_probe.py
@@ -429,7 +445,7 @@ git commit -m "feat(cloud): fail-closed read-only mount-identity probe"
 - Consumes: a live workspace pod (built from Task 1's image) with an active rclone cloud mount, the Task 2 enumerator.
 - Produces: a findings block (pasted into the Task 7 report) answering: does fuse-overlayfs mount cleanly over the rclone lower? do both whiteout forms appear and does `enumerate_diff` read them faithfully? copy-up timing? readdir latency?
 
-- [ ] **Step 1: Write the harness script**
+- [x] **Step 1: Write the harness script**
 
 ```bash
 #!/usr/bin/env bash
@@ -464,21 +480,21 @@ from src.services.cloud_overlay.whiteout import enumerate_diff; \
 print(json.dumps([e.__dict__ for e in enumerate_diff('$UP')], indent=1))"
 ```
 
-- [ ] **Step 2: Copy the built image into k3d and start a workspace with a mount**
+- [x] **Step 2: Copy the built image into k3d and start a workspace with a mount**
 
 Run: `k3d image import srw-workspace:spike -c srw` then launch a protected-eligible session per `docs/memories`/`local_k3d_testing_via_orchestrator_api.md` so an rclone mount exists at `/cloud/<name>`.
 Expected: `mcp__orchestrator__get_workspace_overview` (or in-pod `mount | grep fuse`) shows the rclone FUSE mount active.
 
-- [ ] **Step 3: Run the matrix in-pod and capture output**
+- [x] **Step 3: Run the matrix in-pod and capture output**
 
 Run: `kubectl exec <workspace-pod> -- bash /path/to/overlay_matrix.sh /cloud/<name> 2>&1 | tee /tmp/claude-*/scratchpad/overlay_matrix.out`
 Expected (the go/no-go signal): fuse-overlayfs mounts without error; `rm -rf` leaves char(0,0) nodes or `.wh.` files in `$UP`; `enumerate_diff` prints the deletions + `present` entries; copy-up and readdir times are recorded (numbers, not pass/fail).
 
-- [ ] **Step 4: Record findings (no code) into the scratchpad for Task 7**
+- [x] **Step 4: Record findings (no code) into the scratchpad for Task 7**
 
 Write the four answers + raw timings to `scratchpad/spike-findings-overlay.md`. If the mount fails or whiteouts don't enumerate, that is the **no-go** trigger → note it and proceed to Task 7 (the fallback path in spec §8 becomes primary).
 
-- [ ] **Step 5: Commit the harness**
+- [x] **Step 5: Commit the harness**
 
 ```bash
 git add scripts/spike/overlay_matrix.sh
@@ -496,7 +512,7 @@ git commit -m "spike(cloud-overlay): fuse-overlayfs-over-rclone matrix harness"
 - Consumes: an initialized `MainCloudBackend` (via the orchestrator's `main_cloud_router`) and a `ProjectFolderHandle`.
 - Produces: wall-clock + request-count for a full-tree `list_project_folder` PROPFIND at representative sizes — the number that sizes the §8.1.3 decision (full-tree vs touched-paths baseline).
 
-- [ ] **Step 1: Write the benchmark script**
+- [x] **Step 1: Write the benchmark script**
 
 ```python
 # scripts/spike/etag_walk_bench.py — run in-pod against the dev backend.
@@ -522,16 +538,16 @@ async def main(backend_id: str, handle_db: str) -> None:
 asyncio.run(main(sys.argv[1], sys.argv[2]))
 ```
 
-- [ ] **Step 2: Run against a small and a large dev folder**
+- [x] **Step 2: Run against a small and a large dev folder**
 
 Run: `kubectl exec deploy/orchestrator -- python3 /app/scripts/spike/etag_walk_bench.py <backend_id> <handle>` for a ~50-file project folder and the largest dev folder available.
 Expected: two `files=… walk=…s` lines. Record both.
 
-- [ ] **Step 3: Record the finding for Task 7**
+- [x] **Step 3: Record the finding for Task 7**
 
 Append to `scratchpad/spike-findings-overlay.md`: the files/s rate and the extrapolated walk time at 10k / 100k files. Flag whether full-tree-at-mount stays acceptable (§8.1.3 lean holds) or touched-paths scoping is needed sooner.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/spike/etag_walk_bench.py
@@ -549,23 +565,23 @@ git commit -m "spike(cloud-overlay): etag-baseline walk cost benchmark"
 - Consumes: the Task 4 pod (overlay mounted at `~/.overlay/merged`, upperdir at `~/.overlay/upper`).
 - Produces: verified answers to spike items §6.2 (refresh/heal with open FDs) and §6.3 (snapshot without traversing the merged mount).
 
-- [ ] **Step 1: Prove the tar does NOT traverse the merged mount**
+- [x] **Step 1: Prove the tar does NOT traverse the merged mount**
 
 Run in-pod: place the upperdir at `/home/agent-host/.overlay/upper` (inside snapshot scope :362) and the *merged mountpoint* outside it; then run the snapshot tar command from `snapshot_service.py:388-391` and inspect the member list.
 Run: `kubectl exec <pod> -- bash -c 'tar -cf - --exclude=/var/cache/* /home/agent-host/ 2>/dev/null | tar -tf - | grep -c ".overlay/upper"'`
 Expected: upperdir members present, zero members under the merged mountpoint / `/cloud`. If the merged mount is inside `/home/agent-host`, record that placement must move (finding).
 
-- [ ] **Step 2: Test the refresh op against an open FD**
+- [x] **Step 2: Test the refresh op against an open FD**
 
 Run in-pod: open a long-lived reader on a merged-view file (`tail -f`), then execute the refresh sequence (`fusermount3 -u merged` → flush rclone dir cache via its rc `vfs/forget` → remount overlay) and observe whether unmount is blocked (`EBUSY`) and how the held FD behaves.
 Expected: record whether refresh needs the agent to drop FDs first, a lazy unmount (`fusermount3 -uz`), or a quiesce signal. This is the §6.2 answer.
 
-- [ ] **Step 3: Verify upperdir survives an overlay remount**
+- [x] **Step 3: Verify upperdir survives an overlay remount**
 
 Run in-pod: after Step 2's remount, confirm the staged files + whiteouts in `~/.overlay/upper` are byte-identical (checksum before/after).
 Expected: upperdir unchanged (the design's core assumption — spec §3.4). Record confirm/deny.
 
-- [ ] **Step 4: Record findings for Task 7**
+- [x] **Step 4: Record findings for Task 7**
 
 Append refresh-op sequence + snapshot-placement rule to `scratchpad/spike-findings-overlay.md`. No commit (no repo files changed).
 
@@ -580,26 +596,26 @@ Append refresh-op sequence + snapshot-placement rule to `scratchpad/spike-findin
 - Consumes: `scratchpad/spike-findings-overlay.md` (Tasks 4–6) + the committed artifacts (Tasks 2–3).
 - Produces: a go/no-go verdict and the measured inputs Phase 1's plan needs (chosen engine confirmed, copy-up + walk costs, refresh-op sequence, snapshot placement rule).
 
-- [ ] **Step 1: Write §11 into the design doc**
+- [x] **Step 1: Write §11 into the design doc**
 
 Add a `## 11. Phase 0 spike results — <date>` section with subsections mirroring §6 items 1–5, each stating **RESOLVED/measured** + the evidence (raw timings, whiteout forms observed, refresh sequence, snapshot placement). End with a one-line **GO** (proceed to Phase 1 plan) or **NO-GO** (fallback per §8 becomes primary) verdict.
 
-- [ ] **Step 2: Flip the resolved §6 items and the status line**
+- [x] **Step 2: Flip the resolved §6 items and the status line**
 
 In §6, prefix each now-answered item with `✅`. Update the top `**Status:**` line to note the spike is complete and cite §11.
 
-- [ ] **Step 3: Update the architecture memory**
+- [x] **Step 3: Update the architecture memory**
 
 Update the auto-memory `cloud_storage_architecture_map.md` §research line with the spike verdict + the one or two numbers that matter (copy-up cost, walk rate) so the next session inherits them.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/design/cloud_access_unification.md
 git commit -m "docs(design): Phase 0 spike results + go/no-go for protected cloud mode"
 ```
 
-- [ ] **Step 5: Archive or delete the throwaway harness**
+- [x] **Step 5: Archive or delete the throwaway harness**
 
 If GO: leave `scripts/spike/` for Phase 1 reference. If NO-GO: `git rm -r scripts/spike` in a follow-up commit and note the fallback pivot in §11.
 
