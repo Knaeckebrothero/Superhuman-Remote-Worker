@@ -1451,6 +1451,7 @@ class ToolsConfig:
     communication: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
+    agent_catalog: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2200,6 +2201,7 @@ def load_agent_config(
         webdav=tools_data.get("webdav", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
+        agent_catalog=tools_data.get("agent_catalog", []),
     )
 
     connections_data = data.get("connections", {})
@@ -2406,6 +2408,7 @@ def load_agent_config_from_dict(
         webdav=tools_data.get("webdav", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
+        agent_catalog=tools_data.get("agent_catalog", []),
     )
 
     connections_data = data.get("connections", {})
@@ -4091,24 +4094,36 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
     Returns:
         List of all configured tool names
     """
-    names = (
-        config.tools.workspace
-        + config.tools.core
-        + config.tools.research
-        + config.tools.browser_direct
-        + config.tools.citation
-        + config.tools.graph
-        + config.tools.sql
-        + config.tools.mongodb
-        + config.tools.git
-        + config.tools.shell
-        + config.tools.evaluation
-        + config.tools.knowledge
-        + config.tools.webdav
-        + config.tools.communication
-        + config.tools.delegation
-        + config.tools.orchestrator
-    )
+
+    def _category_names(category: str) -> list[str]:
+        value = getattr(config.tools, category, [])
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return []
+
+    names: list[str] = []
+    for category in (
+        "workspace",
+        "core",
+        "research",
+        "browser_direct",
+        "citation",
+        "graph",
+        "sql",
+        "mongodb",
+        "git",
+        "shell",
+        "evaluation",
+        "knowledge",
+        "webdav",
+        "communication",
+        "delegation",
+        "orchestrator",
+        "agent_catalog",
+    ):
+        names.extend(_category_names(category))
 
     # Shell mode aliasing for backward compatibility
     shell_config = config.extra.get("shell", {})

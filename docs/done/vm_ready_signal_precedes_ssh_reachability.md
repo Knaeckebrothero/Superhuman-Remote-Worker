@@ -12,6 +12,15 @@ tags:
 
 # Investigation — VM `ready` signal precedes SSH reachability → loop jobs hard-fail on jobs-repo clone
 
+> **⛔ 2026-07-09 CORRECTION — Part 1 is superseded.** This doc's §B2 claim that the
+> orchestrator reaches `100.64.x` "via a stable, shared node/subnet route" is **false**
+> (verified live: the orchestrator container has no route to the tailnet at all, and no
+> tailnet member exists that could provide one). Consequently the Part-1
+> orchestrator-vantage SSH probe has a **0% pass rate** and wedged 100% of VM jobs from
+> its first deploy (`sha-69a4da6`, 2026-07-08 19:04Z). Part 2 (agent-vantage budget)
+> stands. Replacement design:
+> [`../issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md`](../issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
+
 **Status: DONE (2026-07-08).** Root cause confirmed in code + on the main cluster; two-part
 fix designed, implemented, reviewed sound, and unit-verified (369 affected tests green, ruff
 clean). Uncommitted on `develop` at time of writing — ships via the normal develop pipeline.

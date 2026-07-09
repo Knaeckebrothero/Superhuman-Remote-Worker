@@ -109,6 +109,8 @@ tools:
     - kb_export
   # Orchestrator tools auto-injected by PersistentSession._setup_tools()
   orchestrator: [ ]
+  # Expert/skill catalog tools auto-injected by PersistentSession._setup_tools()
+  agent_catalog: [ ]
   # Phase-specific tools not used in persistent mode
   core: [ ]
   # Datasource-injected (empty by default)

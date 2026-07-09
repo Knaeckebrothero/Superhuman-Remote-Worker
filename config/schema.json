@@ -383,6 +383,22 @@
               "resume_worker_job"
             ]
           ]
+        },
+        "agent_catalog": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Agent catalog tools: read-only expert and skill catalog inspection. Primarily for persistent agents (src/tools/orchestrator/catalog.py)",
+          "examples": [
+            [
+              "list_experts",
+              "get_expert",
+              "list_skills",
+              "search_skills",
+              "get_skill"
+            ]
+          ]
         }
       }
     },

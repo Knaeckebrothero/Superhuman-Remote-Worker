@@ -1145,20 +1145,28 @@ def _session_backend_is_lite(config: Optional[Dict[str, Any]]) -> bool:
 
 
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
+_AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 
 
-def _apply_fleet_management_marker(
+def _apply_session_tool_group_markers(
     merged_config: Dict[str, Any],
     config_override: Optional[Dict[str, Any]],
 ) -> None:
-    """Preserve explicit Fleet Management off/on across dataclass re-parsing."""
+    """Preserve explicit session tool group off/on across dataclass re-parsing."""
     tools = (config_override or {}).get("tools")
-    if not isinstance(tools, dict) or "orchestrator" not in tools:
+    if not isinstance(tools, dict):
         return
-    if tools.get("orchestrator") == []:
-        merged_config[_FLEET_MANAGEMENT_DISABLED_KEY] = True
-    else:
-        merged_config.pop(_FLEET_MANAGEMENT_DISABLED_KEY, None)
+    group_markers = {
+        "orchestrator": _FLEET_MANAGEMENT_DISABLED_KEY,
+        "agent_catalog": _AGENT_CATALOG_DISABLED_KEY,
+    }
+    for group, marker in group_markers.items():
+        if group not in tools:
+            continue
+        if tools.get(group) == []:
+            merged_config[marker] = True
+        else:
+            merged_config.pop(marker, None)
 
 
 async def _attach_session(
@@ -1397,7 +1405,7 @@ async def _attach_session(
 
         base_dict = dataclasses.asdict(effective_config)
         merged = deep_merge(base_dict, config_override)
-        _apply_fleet_management_marker(merged, config_override)
+        _apply_session_tool_group_markers(merged, config_override)
 
         # If the override changes the model, re-apply settings_matrix for the
         # new model family so temperature/top_p/limits get correct defaults.
@@ -4357,7 +4365,7 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
 
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, effective_override)
-        _apply_fleet_management_marker(merged, effective_override)
+        _apply_session_tool_group_markers(merged, effective_override)
 
         # Re-apply settings_matrix when LLM config changes so model-family
         # defaults (temperature, top_p, limits) are resolved correctly.

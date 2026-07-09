@@ -38,6 +38,7 @@ from .graph import create_graph_tools, get_graph_metadata
 from .knowledge import create_knowledge_tools, get_knowledge_metadata
 from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
+from .orchestrator.catalog import create_catalog_tools
 from .research import (
     create_browser_direct_tools,
     create_research_tools,
@@ -565,6 +566,18 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded orchestrator tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load orchestrator tools: {e}")
+
+    # Agent catalog tools (experts + skills)
+    if "agent_catalog" in tools_by_category:
+        try:
+            catalog_tools = create_catalog_tools(context)
+            requested = set(tools_by_category["agent_catalog"])
+            for tool in catalog_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded agent_catalog tool: {tool.name}")
+        except Exception as e:
+            logger.warning(f"Could not load agent catalog tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools
