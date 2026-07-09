@@ -2951,6 +2951,25 @@ def _get_vm_context(job: dict) -> dict:
     return ctx.get("vm", {})
 
 
+async def _fail_vm_parked_job(job_id: str, vm_error: str) -> None:
+    """Fail a job whose VM provisioning parked terminally.
+
+    A parked VM context alone leaves the job in 'created' with nothing
+    scheduled to ever change its state — an invisible wedge that stalls any
+    loop whose current_job never turns terminal. Failing the job makes the
+    park visible (cockpit/API) and lets loop failure handling advance. See
+    docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md.
+    """
+    await postgres_db.update_job_status(
+        job_id,
+        status="failed",
+        error_message=(
+            f"VM provisioning failed: {vm_error}. "
+            "To retry, clear context.vm and re-queue the job."
+        ),
+    )
+
+
 def _job_needs_sandbox(job: dict) -> bool:
     """Check if a job needs a sandbox workspace container.
 
@@ -3919,27 +3938,31 @@ async def _try_dispatch_pending_jobs() -> None:
                         timeout_s=timeout_s,
                     )
                     if vm_decision == VM_PARK_EXHAUSTED:
-                        # Retries used up — park visibly. 'failed' is terminal for
-                        # the dispatcher (VM_PARKED) and skipped by the reconciler
-                        # (_PARKED_VM_STATUSES), so the park holds.
+                        # Retries used up — park the VM context AND fail the job.
+                        # 'failed' is terminal for the dispatcher (VM_PARKED) and
+                        # skipped by the reconciler (_PARKED_VM_STATUSES), so the
+                        # park holds. The job itself must go terminal too: leaving
+                        # it 'created' with nothing scheduled to change its state
+                        # is an invisible wedge (a loop's current_job never turns
+                        # terminal → the loop stalls forever). See docs/issues/
+                        # vm_ssh_readiness_probe_unroutable_from_orchestrator.md.
+                        park_error = (
+                            f"provisioning exhausted after "
+                            f"{provision_attempts} attempts "
+                            f"(never reached 'ready')"
+                        )
                         logger.warning(
                             "Dispatcher: job %s VM provisioning exhausted "
-                            "(%d/%d attempts) — parking; clear context.vm to retry",
+                            "(%d/%d attempts) — failing job",
                             job_id,
                             provision_attempts,
                             max_provision_attempts,
                         )
                         await postgres_db.merge_vm_context(
                             job_id,
-                            {
-                                "status": "failed",
-                                "error": (
-                                    f"provisioning exhausted after "
-                                    f"{provision_attempts} attempts "
-                                    f"(never reached 'ready')"
-                                ),
-                            },
+                            {"status": "failed", "error": park_error},
                         )
+                        await _fail_vm_parked_job(job_id, park_error)
                         continue
                     if vm_decision == VM_PROVISION:
                         # VM needed but absent — never provisioned, torn down while
@@ -4002,13 +4025,18 @@ async def _try_dispatch_pending_jobs() -> None:
                         continue  # Skip this job — wait for VM to register
                     if vm_decision == VM_PARKED:
                         # Provisioning failed terminally — do NOT hot-retry every
-                        # tick (shared VM cluster); park visibly.
+                        # tick (shared VM cluster). The job is still non-terminal
+                        # (it's in the dispatchable list), which means something
+                        # left it parked-but-alive: an older build's park, or a
+                        # controller-callback race with PARK_EXHAUSTED. Heal it
+                        # to 'failed' so it stops wedging its loop.
+                        vm_error = vm_ctx.get("error") or "VM provisioning failed"
                         logger.warning(
-                            "Dispatcher: job %s parked — VM provisioning failed "
-                            "(%s); clear context.vm to retry",
+                            "Dispatcher: job %s VM parked (%s) — failing job",
                             job_id,
-                            vm_ctx.get("error") or "no error recorded",
+                            vm_error,
                         )
+                        await _fail_vm_parked_job(job_id, vm_error)
                         continue
                     if vm_decision == VM_RECYCLE:
                         # Stuck short of 'ready' past the budget — tear it down so

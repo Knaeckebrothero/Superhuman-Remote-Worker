@@ -1290,7 +1290,7 @@
       "communication": "Kommunikation",
       "delegation": "Arbeit delegieren",
       "orchestrator": "Flottenverwaltung",
-      "agent_catalog": "Experten und Skills einsehen",
+      "agent_catalog": "Experten und Skills verwalten",
       "evaluation": "Auswertung"
     },
     "toolContext": {
@@ -1992,7 +1992,7 @@
       },
       "agent_catalog": {
         "label": "Experten & Skills",
-        "description": "Kann verfügbare Experten und Skills einsehen"
+        "description": "Kann Experten und Skills verwalten"
       },
       "knowledge": {
         "label": "Wissen",

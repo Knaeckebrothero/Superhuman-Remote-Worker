@@ -28,7 +28,7 @@ export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
   { key: 'orchestrator', label: 'Fleet Management', icon: 'hub', description: 'Ability to inspect and steer SRW jobs, projects, repositories, and session workspace upgrades' },
-  { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to inspect available experts and skills' },
+  { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to manage experts and skills' },
   { key: 'knowledge', label: 'Knowledge', icon: 'psychology', description: 'Ability to read and write to the project knowledge base' },
   { key: 'git', label: 'Git', icon: 'commit', description: 'Ability to inspect workspace version history' },
 ];

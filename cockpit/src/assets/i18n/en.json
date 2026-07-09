@@ -1290,7 +1290,7 @@
       "communication": "Communication",
       "delegation": "Delegating work",
       "orchestrator": "Fleet management",
-      "agent_catalog": "Inspecting experts and skills",
+      "agent_catalog": "Managing experts and skills",
       "evaluation": "Evaluation"
     },
     "toolContext": {
@@ -1992,7 +1992,7 @@
       },
       "agent_catalog": {
         "label": "Experts & Skills",
-        "description": "Ability to inspect available experts and skills"
+        "description": "Ability to manage experts and skills"
       },
       "knowledge": {
         "label": "Knowledge",

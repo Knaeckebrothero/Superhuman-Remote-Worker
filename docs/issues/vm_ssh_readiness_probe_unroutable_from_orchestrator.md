@@ -12,7 +12,15 @@ tags:
 
 # Investigation — VM SSH-readiness gate probes from a vantage with no tailnet route → 100% of VM jobs wedge in `created`
 
-**Status: OPEN — root cause confirmed live (2026-07-09), fix chosen (this doc).**
+**Status: IMPLEMENTED (2026-07-09, uncommitted on `develop`) — root cause confirmed
+live, fix chosen and built per this doc.** F1 (evidence swap in `nats_bridge`, TCP probe
+deleted), F2 (daemon `ssh_ready` self-report + re-register-on-flip), F3
+(`_fail_vm_parked_job` on both PARK_EXHAUSTED and the VM_PARKED healing branch), F4
+(tailnet-skip guards: `_seed_vm_ide_config`, `capture_vm_snapshot`,
+`stream_extract_snapshot`; shared `is_tailnet_addr`/`orchestrator_can_reach` in
+`ssh_helpers`, env escape hatch `ORCHESTRATOR_HAS_TAILNET_ROUTE=true`). 552 tests green
+across affected + adjacent suites, ruff clean. Remaining: deploy → live smoke
+(§Acceptance criteria) → unwedge `e0f06bc3` (self-heals via F3 on first dispatcher tick).
 This is a **regression introduced by the Part-1 gate** of
 [`../done/vm_ready_signal_precedes_ssh_reachability.md`](../done/vm_ready_signal_precedes_ssh_reachability.md)
 (commit `96c33654`, first deployed to the main cluster as `sha-69a4da6` at

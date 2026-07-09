@@ -932,14 +932,15 @@ research, citation, git, and local task tracking.
 
 ### Experts & Skills Tool Group
 
-Expert and skill catalog inspection is exposed as a separate session tool group
-named **Experts & Skills**. The backing config key is `tools.agent_catalog`.
+Expert and skill management is exposed as a separate session tool group named
+**Experts & Skills**. The backing config key is `tools.agent_catalog`.
 
 Experts & Skills defaults on for existing sessions and configs. A session
 explicitly disables it by setting `tools.agent_catalog: []`; in that mode the
 persistent agent must not receive `list_experts`, `get_expert`, `list_skills`,
-`search_skills`, or `get_skill`. This keeps read-only agent catalog visibility
-independent from Fleet Management's job/project/repository controls.
+`search_skills`, `get_skill`, or future expert/skill authoring tools. This keeps
+expert/skill management independent from Fleet Management's
+job/project/repository controls.
 
 ### Session Always-On Direct Tools
 
