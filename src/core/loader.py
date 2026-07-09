@@ -1452,6 +1452,7 @@ class ToolsConfig:
     delegation: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
     agent_catalog: List[str] = field(default_factory=list)
+    workflows: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2202,6 +2203,7 @@ def load_agent_config(
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
         agent_catalog=tools_data.get("agent_catalog", []),
+        workflows=tools_data.get("workflows", []),
     )
 
     connections_data = data.get("connections", {})
@@ -2409,6 +2411,7 @@ def load_agent_config_from_dict(
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
         agent_catalog=tools_data.get("agent_catalog", []),
+        workflows=tools_data.get("workflows", []),
     )
 
     connections_data = data.get("connections", {})
@@ -4122,6 +4125,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         "delegation",
         "orchestrator",
         "agent_catalog",
+        "workflows",
     ):
         names.extend(_category_names(category))
 

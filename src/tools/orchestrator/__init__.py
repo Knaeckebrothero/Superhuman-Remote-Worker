@@ -22,12 +22,14 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
     from .jobs import create_orchestrator_tools as _create_jobs
     from .projects import create_project_tools
     from .repositories import create_repository_tools
+    from .workflows import create_workflow_tools
 
     return [
         *_create_jobs(context),
         *create_project_tools(context),
         *create_repository_tools(context),
         *create_catalog_tools(context),
+        *create_workflow_tools(context),
     ]
 
 
@@ -37,10 +39,12 @@ def get_orchestrator_metadata() -> Dict[str, Dict[str, Any]]:
     from .jobs import ORCHESTRATOR_TOOLS_METADATA
     from .projects import PROJECT_TOOLS_METADATA
     from .repositories import REPOSITORY_TOOLS_METADATA
+    from .workflows import WORKFLOW_TOOLS_METADATA
 
     return {
         **ORCHESTRATOR_TOOLS_METADATA,
         **PROJECT_TOOLS_METADATA,
         **REPOSITORY_TOOLS_METADATA,
         **CATALOG_TOOLS_METADATA,
+        **WORKFLOW_TOOLS_METADATA,
     }

@@ -134,9 +134,9 @@ class TestSessionWorkspaceBackendOverride:
 
     def test_session_tool_group_overrides_pass_through(self):
         tools = orch_main._validated_session_tool_overrides(
-            {"tools": {"orchestrator": [], "agent_catalog": []}}
+            {"tools": {"orchestrator": [], "agent_catalog": [], "workflows": []}}
         )
-        assert tools == {"orchestrator": [], "agent_catalog": []}
+        assert tools == {"orchestrator": [], "agent_catalog": [], "workflows": []}
 
     def test_absent_fleet_management_tools_override_returns_none(self):
         assert orch_main._validated_session_fleet_tools_override(None) is None
@@ -163,6 +163,14 @@ class TestSessionWorkspaceBackendOverride:
         assert exc.value.status_code == 400
         assert "agent_catalog" in exc.value.detail
 
+    def test_invalid_workflows_tools_override_rejected(self):
+        with pytest.raises(orch_main.HTTPException) as exc:
+            orch_main._validated_session_tool_overrides(
+                {"tools": {"workflows": "disabled"}}
+            )
+        assert exc.value.status_code == 400
+        assert "workflows" in exc.value.detail
+
     def test_fleet_management_disabled_detection(self):
         assert orch_main._fleet_management_explicitly_disabled(
             {"tools": {"orchestrator": []}}
@@ -181,13 +189,21 @@ class TestSessionWorkspaceBackendOverride:
         )
         assert not orch_main._agent_catalog_explicitly_disabled({})
 
+    def test_workflows_disabled_detection(self):
+        assert orch_main._workflows_explicitly_disabled({"tools": {"workflows": []}})
+        assert not orch_main._workflows_explicitly_disabled(
+            {"tools": {"workflows": ["list_automations"]}}
+        )
+        assert not orch_main._workflows_explicitly_disabled({})
+
     def test_session_tool_group_disabled_markers(self):
         markers = orch_main._session_tool_group_disabled_markers(
-            {"tools": {"orchestrator": [], "agent_catalog": []}}
+            {"tools": {"orchestrator": [], "agent_catalog": [], "workflows": []}}
         )
         assert markers == {
             "_fleet_management_disabled": True,
             "_agent_catalog_disabled": True,
+            "_workflows_disabled": True,
         }
 
 

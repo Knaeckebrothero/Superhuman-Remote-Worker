@@ -39,6 +39,7 @@ from .knowledge import create_knowledge_tools, get_knowledge_metadata
 from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
 from .orchestrator.catalog import create_catalog_tools
+from .orchestrator.workflows import create_workflow_tools
 from .research import (
     create_browser_direct_tools,
     create_research_tools,
@@ -578,6 +579,18 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded agent_catalog tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load agent catalog tools: {e}")
+
+    # Workflow tools (automations + project loops)
+    if "workflows" in tools_by_category:
+        try:
+            workflow_tools = create_workflow_tools(context)
+            requested = set(tools_by_category["workflows"])
+            for tool in workflow_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded workflows tool: {tool.name}")
+        except Exception as e:
+            logger.warning(f"Could not load workflow tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools

@@ -47,10 +47,12 @@ baseline for choosing the right bundles.
 
 ## Headline Findings
 
-- Persistent sessions currently get only **8 application-control tools** by
-  default, all focused on worker-job delegation and control.
+- Persistent sessions now auto-inject three SRW application groups by default:
+  **Fleet Management**, **Experts & Skills**, and **Automations & Loops**.
+  Destructive or authoring-heavy tools inside those categories still require
+  explicit listing/grant.
 - Persistent sessions also get **3 lightweight task tools** by default.
-- The agent registry contains **118 agent-runtime tools** across workspace,
+- The agent registry contains **127 agent-runtime tools** across workspace,
   shell, research, citation, datasource, knowledge, git, todo, delegation, and
   evaluation categories.
 - The MCP server currently exposes **103 MCP tools**. It mixes product actions,
@@ -62,9 +64,10 @@ baseline for choosing the right bundles.
   schemas and a large set of operator/API inspection tools. Those are not live
   today and should not be recreated as a separate builder toolset.
 - Major app capabilities that are missing from session defaults include
-  expert/skill authoring grants, automations, project loops, rich job
-  inspection, diff accept/reject, project/datasource management, notifications,
-  and session lifecycle introspection.
+  expert/skill authoring grants, automation lifecycle management, project loop
+  lifecycle controls, rich job inspection, diff accept/reject,
+  project/datasource management, notifications, and session lifecycle
+  introspection.
 - Major MCP gaps include automations, project repositories, experts/skills CRUD,
   project loops, uploads, notification management, job diff accept/reject, and
   several session/workspace lifecycle operations.
@@ -74,19 +77,14 @@ baseline for choosing the right bundles.
 ### Session-Default Application Tools
 
 Persistent sessions auto-inject these from
-`src/api/persistent_session.py::_load_tools_for_backend`, even when the YAML
-`orchestrator` group is empty.
+`src/api/persistent_session.py::_load_tools_for_backend`, even when the matching
+YAML tool groups are empty.
 
-| Tool | Current purpose | Notes |
+| Group | Default tools | Notes |
 | --- | --- | --- |
-| `create_worker_job` | Create a worker job from the session | Sends `thread_id` when available so the orchestrator can infer owner/project context. |
-| `list_worker_jobs` | List visible jobs, optionally by status | Current output truncates IDs; tracked as a bug in the session job-management issue. |
-| `get_worker_job` | Read worker job details | Thin summary only. |
-| `get_job_workspace_file` | Read a file from a worker job workspace | Calls a workspace file endpoint; read-only. |
-| `approve_worker_job` | Approve a pending-review job | Completion semantics are orchestrator-owned. |
-| `resume_worker_job` | Resume a paused/frozen job, optionally with feedback | Uses job resume endpoint. |
-| `cancel_worker_job` | Cancel a running or paused job | Mutating/destructive and should stay grant/confirmation aware. |
-| `pause_worker_job` | Request a running job to pause | Stops at next safe point. |
+| Fleet Management (`tools.orchestrator`) | `get_session_context`, `create_worker_job`, `list_worker_jobs`, `get_worker_job`, `get_job_workspace_file`, `approve_worker_job`, `resume_worker_job`, `cancel_worker_job`, `pause_worker_job`, `get_current_project`, `list_project_jobs`, `list_project_repositories`, `get_default_project_repository` | `checkout_project_repository` is also injected for shell-capable sandbox/VM sessions. `request_workspace_upgrade` is injected for lite sessions without shell. |
+| Experts & Skills (`tools.agent_catalog`) | `list_experts`, `get_expert`, `list_skills`, `search_skills`, `get_skill` | Bundle authoring tools are registered but not auto-injected. |
+| Automations & Loops (`tools.workflows`) | `list_automations`, `get_automation`, `list_automation_runs`, `propose_automation`, `get_project_loop`, `list_project_loop_jobs`, `explain_project_loop` | Automation bundle authoring tools are registered but not auto-injected. Project loop lifecycle controls stay out of the session tool surface. |
 
 ### Session-Default Task Tools
 
@@ -122,8 +120,8 @@ workspace tiers:
 - `knowledge`: `kb_write`, `kb_update`, `kb_read`, `kb_list`, `kb_search`,
   `kb_related`, `kb_contradictions`, `kb_provenance`, `kb_unanswered`,
   `kb_export`
-- Empty by default: `orchestrator`, `agent_catalog`, `core`, `graph`, `sql`,
-  `mongodb`, `evaluation`, `delegation`, `communication`
+- Empty by default: `orchestrator`, `agent_catalog`, `workflows`, `core`,
+  `graph`, `sql`, `mongodb`, `evaluation`, `delegation`, `communication`
 
 `request_workspace_upgrade` is also injected for lite tiers that do not support
 shell execution.
@@ -145,6 +143,7 @@ not necessarily application actions.
 | `session_task` | `task_add`, `task_complete`, `task_list` |
 | `orchestrator` | `get_session_context`, `create_worker_job`, `list_worker_jobs`, `get_worker_job`, `get_job_workspace_file`, `approve_worker_job`, `resume_worker_job`, `cancel_worker_job`, `pause_worker_job`, `get_current_project`, `list_project_jobs`, `list_project_repositories`, `get_default_project_repository`, `checkout_project_repository` |
 | `agent_catalog` | `list_experts`, `get_expert`, `get_expert_bundle`, `set_expert_bundle`, `list_skills`, `search_skills`, `get_skill`, `get_skill_bundle`, `set_skill_bundle` |
+| `workflows` | `list_automations`, `get_automation`, `list_automation_runs`, `propose_automation`, `get_automation_bundle`, `set_automation_bundle`, `get_project_loop`, `list_project_loop_jobs`, `explain_project_loop` |
 | `research` | `web_search`, `extract_webpage`, `crawl_website`, `map_website`, `search_papers`, `download_paper`, `get_paper_info`, `research_topic` |
 | `browser_direct` | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select`, `browser_scroll`, `browser_screenshot`, `browser_back`, `browser_close` |
 | `citation` | `cite_document`, `cite_web`, `list_sources`, `get_citation`, `list_citations`, `edit_citation`, `annotate_source`, `get_annotations`, `tag_source`, `search_library`, `generate_bibliography` |
@@ -606,13 +605,19 @@ Current app capabilities:
 
 Current tools:
 
-- No session automation tools.
+- Sessions have read/propose automation tools under the **Automations & Loops**
+  tool group: `list_automations`, `get_automation`, `list_automation_runs`,
+  and `propose_automation`.
+- Sessions also have explicit-grant automation bundle authoring tools:
+  `get_automation_bundle` and `set_automation_bundle`. These are registered
+  under `tools.workflows` but are not auto-injected into existing sessions.
 - No MCP automation tools.
 
 Candidate shared actions:
 
 - `automations.list`, `automations.get`, `automations.list_runs`
 - `automations.propose`
+- `automations.get_bundle`, `automations.set_bundle`
 - `automations.create_disabled`
 - `automations.create_active`
 - `automations.update`
@@ -622,10 +627,15 @@ Candidate shared actions:
 
 Recommended default:
 
-- Sessions should get list/get/propose and disabled create when the user has the
-  right project role.
-- Active recurring automation creation should require an explicit grant and
-  likely a confirmation step.
+- Sessions should get list/get/runs/propose for visible automations.
+- Creating or updating an automation should use JSON bundle get/set tools with
+  `dry_run` defaulting true, optional `expected_hash`, and an explicit authoring
+  grant.
+- New automations created through session tools default to disabled unless
+  `allow_enabled=true` is explicitly supplied by a granted caller. Delete stays
+  out of the first session automation bundle.
+- Active recurring automation creation should require an explicit grant and a
+  confirmation step.
 - MCP product should get the same actions behind token/project scope.
 
 ### Project Loops
@@ -637,7 +647,9 @@ Current app capabilities:
 
 Current tools:
 
-- No session project-loop tools.
+- Sessions have read-only project-loop tools under the **Automations & Loops**
+  tool group: `get_project_loop`, `list_project_loop_jobs`, and
+  `explain_project_loop`.
 - No MCP project-loop tools.
 
 Candidate shared actions for sessions/MCP:
@@ -906,7 +918,8 @@ Recommended default:
 | `skills.core` | List/get/search skill content | Session, MCP product |
 | `skills.authoring` | Create/update/files/duplicate/import/export/reload/validate | Grant-gated session/canvas, MCP product |
 | `drafts.core` | Job/expert/skill draft artifact editing and promote-to-job | Session/canvas |
-| `automations.core` | List/get/runs/propose/create-disabled/update/pause/resume/run-now | Grant-gated session, MCP product |
+| `automations.core` | List/get/runs/propose | Session, MCP product |
+| `automations.authoring` | Get/set JSON bundle with disabled-by-default create/update | Grant-gated session/canvas, MCP product |
 | `project_loops.core` | Get/list-jobs/explain | Session read-only, MCP product read-only |
 | `knowledge.core` | Project knowledge summary/list/get/search/create/update/export/reindex | Session, MCP product |
 | `approvals.core` | Pending actions, job approve/resume/feedback, diff accept/reject | Session, MCP product |
@@ -934,10 +947,10 @@ tool group named **Fleet Management**. The backing config key remains
 Fleet Management defaults on for existing sessions and configs. A session
 explicitly disables it by setting `tools.orchestrator: []`; in that mode the
 persistent agent must not receive SRW app-control tools such as job/project
-management, repository checkout through SRW, loop inspection, or
-`request_workspace_upgrade`. This supports sessions for untrusted LLM providers
-that should only receive ordinary work tools like shell, files, browser,
-research, citation, git, and local task tracking.
+management, repository checkout through SRW, or `request_workspace_upgrade`.
+This supports sessions for untrusted LLM providers that should only receive
+ordinary work tools like shell, files, browser, research, citation, git, and
+local task tracking.
 
 ### Experts & Skills Tool Group
 
@@ -953,6 +966,25 @@ Only the read-only catalog tools are auto-injected. The bundle authoring tools
 must be explicitly listed or granted by a future manage-mode UI, so existing
 sessions do not silently gain write access. This keeps expert/skill management
 independent from Fleet Management's job/project/repository controls.
+
+### Automations & Loops Tool Group
+
+Automation and project-loop workflow tools are exposed as a separate session
+tool group named **Automations & Loops**. The backing config key is
+`tools.workflows`.
+
+Automations & Loops defaults on for existing sessions and configs. A session
+explicitly disables it by setting `tools.workflows: []`; in that mode the
+persistent agent must not receive `list_automations`, `get_automation`,
+`list_automation_runs`, `propose_automation`, `get_project_loop`,
+`list_project_loop_jobs`, `explain_project_loop`, `get_automation_bundle`,
+`set_automation_bundle`, or future automation/loop tools.
+
+Only read/propose tools are auto-injected: automation list/get/runs/propose and
+project-loop get/list-jobs/explain. Automation bundle authoring tools must be
+explicitly listed or granted by a future manage-mode UI. Project loop
+start/pause/resume/stop remain out of the session tool surface because they can
+spawn or extend expensive autonomous work.
 
 ### Session Always-On Direct Tools
 
@@ -1049,6 +1081,8 @@ confirmation where appropriate:
 - `skills.delete_file`
 - `skills.bind_to_expert`
 - `skills.bind_to_project`
+- `automations.get_bundle`
+- `automations.set_bundle`
 - `automations.create_disabled`
 - `automations.create_active`
 - `automations.update`
@@ -1071,12 +1105,15 @@ Implement in this order:
    `repositories.get_default` is implemented as `get_default_project_repository`.
 6. `repositories.checkout_project_repository` - implemented as
    `checkout_project_repository`.
-7. `project_loops.get` - deferred.
-8. `project_loops.list_jobs` - deferred.
-9. `project_loops.explain_state` - deferred.
+7. `project_loops.get` - implemented as `get_project_loop`.
+8. `project_loops.list_jobs` - implemented as `list_project_loop_jobs`.
+9. `project_loops.explain_state` - implemented as `explain_project_loop`.
 10. `experts.list`, `experts.get`, `skills.list`, `skills.search`, and
     `skills.get` - implemented as `list_experts`, `get_expert`, `list_skills`,
     `search_skills`, and `get_skill`.
+11. `automations.list`, `automations.get`, `automations.list_runs`, and
+    `automations.propose` - implemented as `list_automations`, `get_automation`,
+    `list_automation_runs`, and `propose_automation`.
 
 MCP product:
 

@@ -1291,6 +1291,7 @@
       "delegation": "Delegating work",
       "orchestrator": "Fleet management",
       "agent_catalog": "Managing experts and skills",
+      "workflows": "Managing automations and loops",
       "evaluation": "Evaluation"
     },
     "toolContext": {
@@ -1993,6 +1994,10 @@
       "agent_catalog": {
         "label": "Experts & Skills",
         "description": "Ability to manage experts and skills"
+      },
+      "workflows": {
+        "label": "Automations & Loops",
+        "description": "Ability to inspect automations and project loops, and draft disabled automations"
       },
       "knowledge": {
         "label": "Knowledge",
