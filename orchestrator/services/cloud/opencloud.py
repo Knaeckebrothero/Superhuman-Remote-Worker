@@ -21,6 +21,7 @@ design, and §13.2 for the underlying research references.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -30,7 +31,14 @@ from urllib.parse import quote
 import httpx
 
 from ._propfind import parse_propfind_entries
-from .base import CloudMountSubject, HealthStatus, RcloneMountSpec, UserHome
+from .base import (
+    CanaryFixture,
+    CloudMountSubject,
+    HealthStatus,
+    RcloneMountSpec,
+    RoReaderGrant,
+    UserHome,
+)
 from .config import OpenCloudSettings
 from .etag_baseline import PropfindError, capture_etag_baseline
 from .errors import CloudBackendError, CloudBackendErrorKind
@@ -1656,6 +1664,143 @@ class OpenCloudBackend:
             },
         )
         resp.raise_for_status()
+
+    # ------------------------------------------------ protected cloud mode: RO reader
+    #
+    # NOTE (design §9.2, §11.4): the reader here is a LibreGraph user. For real
+    # login-based mount auth it must be backed by a dedicated Keycloak user, and
+    # creating that on prod-private's SHARED Keycloak is an open question (§9.2).
+    # The Viewer-role RO guarantee is code-read-only/unverified-live (§11.7); the
+    # live status-code validation is the §11.4 manual gate before protected mode
+    # may engage on OpenCloud. This slice implements the interface + the correct
+    # Space Viewer invite; it does not itself provision the KC user.
+
+    async def _find_ro_reader(self, user_key: str) -> Optional[str]:
+        name = f"srw-reader-{user_key}"
+        resp = await self._graph_get("/graph/v1.0/users")
+        for user in resp.json().get("value", []):
+            if user.get("displayName") == name:
+                return str(user["id"])
+        return None
+
+    async def ensure_ro_reader(self, *, user_key: str) -> str:
+        """Idempotently ensure the ``srw-reader-<user_key>`` LibreGraph user with
+        no standing Space access. Returns its LibreGraph id."""
+        self._ensure_ready()
+        existing = await self._find_ro_reader(user_key)
+        if existing:
+            return existing
+        name = f"srw-reader-{user_key}"
+        body = {
+            "accountEnabled": True,
+            "displayName": name,
+            "mail": f"{name}@srw.local",
+            "identities": [
+                {"issuer": self._keycloak_issuer, "issuerAssignedId": name}
+            ],
+        }
+        try:
+            resp = await self._graph_post("/graph/v1.0/users", json=body)
+            if resp.status_code == 409 or (
+                resp.status_code == 400 and "nameAlreadyExists" in resp.text
+            ):
+                found = await self._find_ro_reader(user_key)
+                if found:
+                    return found
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        return str(resp.json()["id"])
+
+    async def mint_ro_grant(
+        self, handle: ProjectFolderHandle, *, user_key: str, grant_key: str
+    ) -> RoReaderGrant:
+        """Invite the reader user to the Space with the **Viewer** role
+        (read-only), capturing the permission id for later revoke."""
+        self._ensure_ready()
+        drive_id = handle.native_id
+        reader_id = await self._find_ro_reader(user_key)
+        if not reader_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"RO reader for {user_key!r} not provisioned",
+                backend=self.backend_id,
+            )
+        role_id = await self._role_id(
+            _SPACE_VIEWER_ROLE_NAME, _SPACE_VIEWER_ROLE_WEIGHT
+        )
+        safe_drive = quote(drive_id, safe="")
+        try:
+            resp = await self._graph_post(
+                f"/graph/v1beta1/drives/{safe_drive}/root/invite",
+                json={
+                    "recipients": [
+                        {"@libre.graph.recipient.type": "user", "objectId": reader_id}
+                    ],
+                    "roles": [role_id],
+                },
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        value = resp.json().get("value") or []
+        if not value or "id" not in value[0]:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                "Space invite returned no permission id",
+                backend=self.backend_id,
+                raw=resp.json(),
+            )
+        permission_id = str(value[0]["id"])
+        webdav_url = f"{self._base_url}/dav/spaces/{drive_id}/"
+        grant_handle = json.dumps(
+            {
+                "permission_id": permission_id,
+                "drive_id": str(drive_id),
+                "reader_id": reader_id,
+                "user_key": user_key,
+            }
+        )
+        return RoReaderGrant(
+            reader_id=reader_id,
+            grant_handle=grant_handle,
+            webdav_url=webdav_url,
+            credentials=None,  # OC reader authenticates with a short-TTL bearer
+            auth_kind="keycloak_user_impersonation",
+        )
+
+    async def revoke_ro_grant(self, grant_handle: str, *, user_key: str) -> None:
+        """Delete the Space Viewer permission minted by ``mint_ro_grant``.
+        Idempotent — a 404 (already gone) is not an error."""
+        self._ensure_ready()
+        data = json.loads(grant_handle)
+        safe_drive = quote(data["drive_id"], safe="")
+        permission_id = data["permission_id"]
+        try:
+            resp = await self._graph_delete(
+                f"/graph/v1beta1/drives/{safe_drive}/root/permissions/{permission_id}"
+            )
+            if resp.status_code not in (200, 204, 404):
+                resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
+    async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
+        """Write a real canary file with the write identity so the RO probe's
+        CVE side channels can target a real path (design §11.4)."""
+        path = ".srw-ro-canary/probe.txt"
+        await self.put_project_folder_file_bytes(handle, path=path, content=b"canary")
+        return CanaryFixture(path=path, version_ref=None, trash_ref=None)
+
+    async def remove_canary_fixture(
+        self, handle: ProjectFolderHandle, fixture: CanaryFixture
+    ) -> None:
+        try:
+            await self.delete_project_folder_file(
+                handle, path=fixture.path, if_exists=True
+            )
+        except CloudBackendError:
+            pass
 
     # ---------------------------------------------------------------- Agent home
 
