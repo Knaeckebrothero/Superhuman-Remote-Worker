@@ -35,7 +35,9 @@ _PROPFIND_CONTENTTYPE_RE = re.compile(
 )
 
 
-def parse_propfind_entries(xml: str, *, href_prefix: str) -> list[ProjectFolderEntry]:
+def parse_propfind_entries(
+    xml: str, *, href_prefix: str, self_path: str = ""
+) -> list[ProjectFolderEntry]:
     """Pull file + directory entries out of a PROPFIND multistatus body.
 
     ``href_prefix`` is the URL path prefix to strip so returned paths are
@@ -43,8 +45,11 @@ def parse_propfind_entries(xml: str, *, href_prefix: str) -> list[ProjectFolderE
     and the ``<d:href>`` values are URL-decoded before comparison — servers
     may return a literal character in the href even when the request URL had
     it percent-encoded (e.g. OpenCloud's literal ``$``, Nextcloud's spaces),
-    which would otherwise break a naive ``startswith`` check. Entries
-    pointing at the root itself (empty path after stripping) are dropped.
+    which would otherwise break a naive ``startswith`` check. Entries pointing
+    at the walk target itself — the root (empty path after stripping) or the
+    subdirectory named by ``self_path`` — are dropped, so a Depth:1 walk does
+    not re-emit a directory it already surfaced as a child of its parent
+    (the double-subdir bug, design §11.5).
     """
     decoded_prefix = unquote(href_prefix)
     entries: list[ProjectFolderEntry] = []
@@ -57,8 +62,10 @@ def parse_propfind_entries(xml: str, *, href_prefix: str) -> list[ProjectFolderE
         if not href.startswith(decoded_prefix):
             continue
         rel_path = href[len(decoded_prefix) :].rstrip("/")
-        if not rel_path:
-            # The folder root itself shows up first; skip it.
+        if rel_path == self_path.strip("/"):
+            # The walk target's own self-entry (the root, or the subdir this
+            # Depth:1 PROPFIND is expanding). Its parent walk already emitted
+            # it; re-emitting here is the double-subdir bug (design §11.5).
             continue
         is_dir = bool(_PROPFIND_COLLECTION_RE.search(block))
         size_match = _PROPFIND_CONTENTLENGTH_RE.search(block)
