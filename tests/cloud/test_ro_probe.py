@@ -42,10 +42,30 @@ class _FakeClient:
 
 @pytest.mark.asyncio
 async def test_all_verbs_rejected_is_ok():
-    res = await probe_read_only(_FakeClient({}), "https://cloud/dav", "folder/")
+    # Full coverage: dav_root/username supplied so the side channels are
+    # attempted too, and everything (primary verbs + side channels) comes
+    # back rejected -> the engage gate opens.
+    res = await probe_read_only(
+        _FakeClient({}),
+        "https://cloud/dav",
+        "folder/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+    )
     assert isinstance(res, RoProbeResult)
     assert res.ok is True
     assert res.failures == []
+    assert res.inconclusive == []
+    assert res.skipped == []
+
+
+def test_ok_requires_all_three_lists_empty():
+    # ok is the strict engage gate: ANY entry in failures, skipped, or
+    # inconclusive refuses — not just failures.
+    assert RoProbeResult().ok is True
+    assert RoProbeResult(failures=["x"]).ok is False
+    assert RoProbeResult(skipped=["x"]).ok is False
+    assert RoProbeResult(inconclusive=["x"]).ok is False
 
 
 @pytest.mark.asyncio
@@ -197,6 +217,18 @@ async def test_opencloud_has_no_version_floor_and_is_ok():
     assert res.failures == []
 
 
+@pytest.mark.asyncio
+async def test_unknown_backend_fails_closed():
+    # Allowlist, not "anything that isn't nextcloud passes": a typo'd or
+    # wrong-case backend value must refuse, not silently skip the floors.
+    client = _FakeCapabilitiesClient(_nc_capabilities(30, 0, 0))
+    res = await check_version_floors(
+        client, "https://cloud/remote.php/dav", backend="Nextcloud"
+    )
+    assert res.ok is False
+    assert any("unknown backend" in f and "fail-closed" in f for f in res.failures)
+
+
 # ---------------------------------------------------------------------------
 # Finding 3 — side channels: skipped / inconclusive / real failure
 # ---------------------------------------------------------------------------
@@ -204,16 +236,24 @@ async def test_opencloud_has_no_version_floor_and_is_ok():
 
 @pytest.mark.asyncio
 async def test_side_channels_skipped_and_recorded_when_username_absent():
+    # No dav_root/username -> side channels never attempted -> the gate
+    # REFUSES (spec: side channels "all must 403/405 or protected mode
+    # refuses to engage"). The refusal is curable — supply dav_root and
+    # username — which is why it lands in `skipped`, not `failures`.
     res = await probe_read_only(_FakeClient({}), "https://cloud/dav", "f/")
-    assert res.ok is True
+    assert res.ok is False
     assert len(res.skipped) == 4
+    assert res.failures == []
     assert res.inconclusive == []
 
 
 @pytest.mark.asyncio
-async def test_side_channel_404_is_inconclusive_not_ok_flip():
+async def test_side_channel_404_is_inconclusive_and_refuses():
     # Synthetic ids are expected to 404 against a real server since they
-    # don't exist; that must not be conflated with "verified rejected".
+    # don't exist; that proves the request round-tripped, NOT that the
+    # authz layer rejected a real restore — so the gate refuses, with the
+    # entries in `inconclusive` (curable: probe real fixture ids) rather
+    # than `failures` (a write path demonstrably open).
     # dav_root deliberately contains "/remote.php/" so the fake client can
     # tell side-channel requests (which go through it) apart from the
     # primary-verb requests (which target base_url + path and must still
@@ -232,7 +272,7 @@ async def test_side_channel_404_is_inconclusive_not_ok_flip():
         dav_root="https://cloud/remote.php/dav",
         username="alice",
     )
-    assert res.ok is True
+    assert res.ok is False
     assert res.failures == []
     assert len(res.inconclusive) == 4
     assert res.skipped == []
