@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -31,9 +32,13 @@ def test_catalog_tools_have_separate_category():
     expected = {
         "list_experts",
         "get_expert",
+        "get_expert_bundle",
+        "set_expert_bundle",
         "list_skills",
         "search_skills",
         "get_skill",
+        "get_skill_bundle",
+        "set_skill_bundle",
     }
     assert expected <= catalog
     assert expected.isdisjoint(fleet)
@@ -42,6 +47,8 @@ def test_catalog_tools_have_separate_category():
 class _CapturingClient:
     def __init__(self, responses=None):
         self.gets: list[tuple[str, dict]] = []
+        self.posts: list[tuple[str, dict]] = []
+        self.puts: list[tuple[str, dict]] = []
         self.responses = responses or {}
 
     async def __aenter__(self):
@@ -52,6 +59,17 @@ class _CapturingClient:
 
     async def get(self, url, params=None, **kwargs):
         self.gets.append((url, params or {}))
+        return self._response(url)
+
+    async def post(self, url, json=None, files=None, **kwargs):
+        self.posts.append((url, {"json": json, "files": files}))
+        return self._response(url)
+
+    async def put(self, url, json=None, **kwargs):
+        self.puts.append((url, json or {}))
+        return self._response(url)
+
+    def _response(self, url):
         resp = MagicMock()
         resp.raise_for_status = MagicMock()
         resp.json = MagicMock(return_value=self.responses.get(url, {}))
@@ -208,3 +226,111 @@ async def test_get_skill_shows_file_index_and_skill_preview(monkeypatch):
     assert "SKILL.md preview:" in result
     assert "Use hotel ERP workflows." in result
     assert "Selected file contents:" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_expert_bundle_returns_portable_json(monkeypatch):
+    expert_id = "developer"
+    url = f"http://localhost:8085/api/experts/{expert_id}/export"
+    cap = _CapturingClient(
+        {
+            url: {
+                "name": "developer",
+                "display_name": "Developer",
+                "expert_type": "worker",
+                "description": "Builds software",
+                "icon": "code",
+                "color": "#6B7280",
+                "tags": ["code"],
+                "config": {"tools": {"shell": ["run_command"]}},
+                "prompts": {"instructions": "Build carefully."},
+            }
+        }
+    )
+    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    get_expert_bundle = _tool_by_name(tools, "get_expert_bundle")
+
+    result = await get_expert_bundle.ainvoke({"expert_id": expert_id})
+    payload = json.loads(result)
+
+    assert cap.gets == [(url, {})]
+    assert payload["kind"] == "expert_bundle"
+    assert payload["bundle_hash"]
+    assert payload["bundle"]["name"] == "developer"
+    assert payload["bundle"]["config"] == {"tools": {"shell": ["run_command"]}}
+
+
+@pytest.mark.asyncio
+async def test_set_expert_bundle_update_sends_only_editable_fields(monkeypatch):
+    expert_id = "11111111-1111-1111-1111-111111111111"
+    url = f"http://localhost:8085/api/experts/{expert_id}"
+    cap = _CapturingClient({url: {"id": expert_id}})
+    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    set_expert_bundle = _tool_by_name(tools, "set_expert_bundle")
+
+    result = await set_expert_bundle.ainvoke(
+        {
+            "mode": "update",
+            "target_id": expert_id,
+            "dry_run": False,
+            "bundle": {
+                "bundle": {
+                    "name": "cannot-change",
+                    "display_name": "Updated",
+                    "expert_type": "worker",
+                    "description": "New description",
+                    "config": {"tools": {"research": ["web_search"]}},
+                    "prompts": {"instructions": "New instructions."},
+                }
+            },
+        }
+    )
+
+    assert "Expert update succeeded." in result
+    assert len(cap.puts) == 1
+    assert cap.puts[0][0] == url
+    body = cap.puts[0][1]
+    assert body["display_name"] == "Updated"
+    assert body["description"] == "New description"
+    assert body["config"] == {"tools": {"research": ["web_search"]}}
+    assert body["prompts"] == {"instructions": "New instructions."}
+    assert "name" not in body
+    assert "expert_type" not in body
+    assert not cap.posts
+
+
+@pytest.mark.asyncio
+async def test_set_skill_bundle_dry_run_validates_file_tree(monkeypatch):
+    cap = _CapturingClient()
+    monkeypatch.setattr("src.tools.orchestrator.catalog._get_client", lambda **kw: cap)
+
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    set_skill_bundle = _tool_by_name(tools, "set_skill_bundle")
+
+    result = await set_skill_bundle.ainvoke(
+        {
+            "mode": "create",
+            "bundle": {
+                "display_name": "Hotel Ops",
+                "files": {
+                    "SKILL.md": (
+                        "---\n"
+                        "name: hotel-ops\n"
+                        "description: Use for hotel ERP workflows.\n"
+                        "---\n"
+                        "Follow hotel operations practices.\n"
+                    )
+                },
+            },
+        }
+    )
+
+    assert "Dry run OK: would create skill." in result
+    assert "Name: hotel-ops" in result
+    assert "Bundle hash:" in result
+    assert not cap.posts
+    assert not cap.puts

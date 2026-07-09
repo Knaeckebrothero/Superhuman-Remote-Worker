@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import hashlib
+import json
+import re
+from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import quote
 
 import httpx
@@ -64,7 +67,85 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "Inspect a skill.",
         "phases": ["strategic", "tactical"],
     },
+    "get_expert_bundle": {
+        "module": "orchestrator.catalog",
+        "function": "get_expert_bundle",
+        "description": (
+            "Get a portable JSON expert bundle for editing or forking. "
+            "Authoring support; not injected by default."
+        ),
+        "category": "agent_catalog",
+        "short_description": "Get editable expert JSON.",
+        "phases": ["strategic", "tactical"],
+    },
+    "set_expert_bundle": {
+        "module": "orchestrator.catalog",
+        "function": "set_expert_bundle",
+        "description": (
+            "Create, update, or fork an expert from a portable JSON bundle. "
+            "dry_run defaults true; set dry_run=false to write. Authoring "
+            "support; not injected by default."
+        ),
+        "category": "agent_catalog",
+        "short_description": "Create or update an expert from JSON.",
+        "phases": ["strategic", "tactical"],
+    },
+    "get_skill_bundle": {
+        "module": "orchestrator.catalog",
+        "function": "get_skill_bundle",
+        "description": (
+            "Get a portable JSON skill bundle with the full file tree for "
+            "editing or forking. Authoring support; not injected by default."
+        ),
+        "category": "agent_catalog",
+        "short_description": "Get editable skill JSON.",
+        "phases": ["strategic", "tactical"],
+    },
+    "set_skill_bundle": {
+        "module": "orchestrator.catalog",
+        "function": "set_skill_bundle",
+        "description": (
+            "Create, update, or fork a skill from a portable JSON bundle. "
+            "dry_run defaults true; set dry_run=false to write. Authoring "
+            "support; not injected by default."
+        ),
+        "category": "agent_catalog",
+        "short_description": "Create or update a skill from JSON.",
+        "phases": ["strategic", "tactical"],
+    },
 }
+
+_EXPERT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_ALLOWED_EXPERT_PROMPT_KEYS = {
+    "persona",
+    "instructions",
+    "strategic",
+    "tactical",
+    "summarization",
+}
+
+_EXPERT_CREATE_FIELDS = {
+    "name",
+    "display_name",
+    "expert_type",
+    "description",
+    "icon",
+    "color",
+    "tags",
+    "config",
+    "prompts",
+}
+_EXPERT_UPDATE_FIELDS = {
+    "display_name",
+    "description",
+    "icon",
+    "color",
+    "tags",
+    "config",
+    "prompts",
+}
+_SKILL_WRITE_FIELDS = {"files", "display_name", "icon", "color", "tags"}
 
 
 def _safe_limit(limit: int, *, default: int, maximum: int) -> int:
@@ -73,6 +154,290 @@ def _safe_limit(limit: int, *, default: int, maximum: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(value, maximum))
+
+
+def _canonical_json(data: Any) -> str:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _bundle_hash(bundle: Dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(bundle).encode("utf-8")).hexdigest()
+
+
+def _pretty_json(data: Any) -> str:
+    return json.dumps(data, indent=2, sort_keys=False, ensure_ascii=True)
+
+
+def _http_error(e: httpx.HTTPStatusError) -> str:
+    detail = ""
+    try:
+        detail = e.response.text
+    except Exception:
+        detail = ""
+    if detail:
+        return f"HTTP {e.response.status_code}: {_truncate(detail, limit=500)}"
+    return f"HTTP {e.response.status_code}"
+
+
+def _write_workspace_json(
+    context: ToolContext,
+    destination_path: Optional[str],
+    payload: Dict[str, Any],
+) -> Optional[str]:
+    if not destination_path:
+        return None
+    if not context.workspace_manager:
+        raise ValueError("destination_path requires a workspace-backed session.")
+    context.workspace_manager.write_file(destination_path, _pretty_json(payload) + "\n")
+    return destination_path
+
+
+def _read_bundle_payload(
+    context: ToolContext,
+    *,
+    bundle: Optional[Dict[str, Any]],
+    bundle_path: Optional[str],
+) -> Dict[str, Any]:
+    if bundle is not None and bundle_path:
+        raise ValueError("Provide either bundle or bundle_path, not both.")
+    if bundle_path:
+        if not context.workspace_manager:
+            raise ValueError("bundle_path requires a workspace-backed session.")
+        text = context.workspace_manager.read_file(bundle_path)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{bundle_path} is not valid JSON: {e}") from e
+        if not isinstance(parsed, dict):
+            raise ValueError("Bundle JSON must be an object.")
+        return parsed
+    if bundle is None:
+        raise ValueError("bundle or bundle_path is required.")
+    if not isinstance(bundle, dict):
+        raise ValueError("bundle must be a JSON object.")
+    return bundle
+
+
+def _unwrap_bundle(payload: Dict[str, Any]) -> Dict[str, Any]:
+    nested = payload.get("bundle")
+    if isinstance(nested, dict):
+        return nested
+    return payload
+
+
+def _normalize_expert_bundle(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw = _unwrap_bundle(payload)
+    return {key: raw[key] for key in _EXPERT_CREATE_FIELDS if key in raw}
+
+
+def _normalize_skill_bundle(detail: Dict[str, Any]) -> Dict[str, Any]:
+    raw = _unwrap_bundle(detail)
+    files = raw.get("files") if isinstance(raw.get("files"), dict) else {}
+    parsed_name = raw.get("name")
+    parsed_description = raw.get("description") or ""
+    skill_md = files.get("SKILL.md")
+    if isinstance(skill_md, str):
+        try:
+            from src.core.skill_format import (
+                SkillFormatError,
+                parse_skill_md,
+                skill_identity,
+            )
+
+            frontmatter, _body = parse_skill_md(skill_md)
+            parsed_name, parsed_description = skill_identity(frontmatter)
+        except (SkillFormatError, TypeError, ValueError):
+            pass
+    return {
+        "name": parsed_name,
+        "display_name": raw.get("display_name") or parsed_name,
+        "description": parsed_description,
+        "icon": raw.get("icon", "extension"),
+        "color": raw.get("color", "#6B7280"),
+        "tags": raw.get("tags") or [],
+        "files": files,
+    }
+
+
+def _validate_expert_bundle(
+    bundle: Dict[str, Any],
+    *,
+    require_create_fields: bool,
+) -> List[str]:
+    from src.core.expert_resolution import hard_deny_scan
+
+    errors: List[str] = []
+    if require_create_fields:
+        for field in ("name", "display_name", "expert_type"):
+            if not bundle.get(field):
+                errors.append(f"{field} is required.")
+    if bundle.get("name") and not _EXPERT_NAME_RE.match(str(bundle["name"])):
+        errors.append("name must match ^[a-z][a-z0-9_-]*$.")
+    if bundle.get("expert_type") and bundle["expert_type"] not in ("worker", "session"):
+        errors.append("expert_type must be worker or session.")
+    if (
+        bundle.get("display_name") is not None
+        and not str(bundle["display_name"]).strip()
+    ):
+        errors.append("display_name cannot be empty.")
+    if bundle.get("color") and not _COLOR_RE.match(str(bundle["color"])):
+        errors.append("color must be a hex color like #6B7280.")
+    tags = bundle.get("tags", [])
+    if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+        errors.append("tags must be a list of strings.")
+    config = bundle.get("config", {})
+    if config is not None and not isinstance(config, dict):
+        errors.append("config must be an object.")
+    elif isinstance(config, dict):
+        offending = hard_deny_scan(config)
+        if offending:
+            errors.append(
+                "config may not set credential sections: "
+                + ", ".join(sorted(offending))
+            )
+    prompts = bundle.get("prompts", {})
+    if prompts is not None and not isinstance(prompts, dict):
+        errors.append("prompts must be an object.")
+    elif isinstance(prompts, dict):
+        unknown = set(prompts) - _ALLOWED_EXPERT_PROMPT_KEYS
+        if unknown:
+            errors.append(f"prompts contains unknown keys: {sorted(unknown)}.")
+    return errors
+
+
+def _validate_skill_bundle(bundle: Dict[str, Any]) -> List[str]:
+    from src.core.expert_resolution import hard_deny_scan
+    from src.core.skill_format import (
+        SkillFormatError,
+        parse_skill_md,
+        skill_identity,
+        validate_skill_files,
+    )
+
+    errors: List[str] = []
+    files = bundle.get("files")
+    if not isinstance(files, dict) or not all(
+        isinstance(path, str) and isinstance(content, str)
+        for path, content in (files or {}).items()
+    ):
+        errors.append("files must be an object mapping paths to text content.")
+        return errors
+    try:
+        validate_skill_files(files)
+        frontmatter, _body = parse_skill_md(files["SKILL.md"])
+        skill_identity(frontmatter)
+    except SkillFormatError as e:
+        errors.append(str(e))
+    else:
+        offending = hard_deny_scan(frontmatter)
+        if offending:
+            errors.append(
+                "SKILL.md frontmatter may not set credential sections: "
+                + ", ".join(sorted(offending))
+            )
+    if bundle.get("color") and not _COLOR_RE.match(str(bundle["color"])):
+        errors.append("color must be a hex color like #6B7280.")
+    tags = bundle.get("tags", [])
+    if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+        errors.append("tags must be a list of strings.")
+    return errors
+
+
+async def _fetch_expert_bundle(
+    client: httpx.AsyncClient,
+    base_url: str,
+    expert_id: str,
+) -> Dict[str, Any]:
+    resp = await client.get(
+        f"{base_url}/api/experts/{quote(str(expert_id), safe='')}/export"
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise ValueError("Expert export did not return a JSON object.")
+    return _normalize_expert_bundle(data)
+
+
+async def _fetch_skill_bundle(
+    client: httpx.AsyncClient,
+    base_url: str,
+    skill_id: str,
+) -> Dict[str, Any]:
+    resp = await client.get(f"{base_url}/api/skills/{quote(str(skill_id), safe='')}")
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise ValueError("Skill detail did not return a JSON object.")
+    return _normalize_skill_bundle(data)
+
+
+def _expert_create_body(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    body = {key: bundle[key] for key in _EXPERT_CREATE_FIELDS if key in bundle}
+    body.setdefault("description", None)
+    body.setdefault("icon", "smart_toy")
+    body.setdefault("color", "#6B7280")
+    body.setdefault("tags", [])
+    body.setdefault("config", {})
+    body.setdefault("prompts", {})
+    return body
+
+
+def _expert_update_body(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: bundle[key] for key in _EXPERT_UPDATE_FIELDS if key in bundle}
+
+
+def _skill_write_body(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    body = {key: bundle[key] for key in _SKILL_WRITE_FIELDS if key in bundle}
+    body.setdefault("icon", "extension")
+    body.setdefault("color", "#6B7280")
+    body.setdefault("tags", [])
+    return body
+
+
+def _dry_run_summary(
+    *,
+    kind: str,
+    mode: str,
+    target_id: Optional[str],
+    bundle: Dict[str, Any],
+) -> str:
+    name = bundle.get("name") or "(unchanged)"
+    display_name = bundle.get("display_name") or name
+    lines = [
+        f"Dry run OK: would {mode} {kind}.",
+        f"Name: {name}",
+        f"Display name: {display_name}",
+    ]
+    if target_id:
+        lines.append(f"Target ID: {target_id}")
+    lines.append(f"Bundle hash: {_bundle_hash(bundle)}")
+    lines.append("No changes written. Call again with dry_run=false to write.")
+    return "\n".join(lines)
+
+
+async def _check_expected_hash(
+    *,
+    client: httpx.AsyncClient,
+    base_url: str,
+    kind: Literal["expert", "skill"],
+    target_id: Optional[str],
+    expected_hash: Optional[str],
+) -> Optional[str]:
+    if not expected_hash:
+        return None
+    if not target_id:
+        return "expected_hash requires target_id so the current bundle can be checked."
+    if kind == "expert":
+        current = await _fetch_expert_bundle(client, base_url, target_id)
+    else:
+        current = await _fetch_skill_bundle(client, base_url, target_id)
+    current_hash = _bundle_hash(current)
+    if current_hash != expected_hash:
+        return (
+            f"Refusing to write: current {kind} bundle hash is {current_hash}, "
+            f"not expected_hash {expected_hash}."
+        )
+    return None
 
 
 def _tags_text(item: Dict[str, Any]) -> str:
@@ -417,10 +782,278 @@ def create_catalog_tools(context: ToolContext) -> List[Any]:
             except httpx.RequestError as e:
                 return f"Failed to connect to orchestrator: {e}"
 
+    @tool
+    async def get_expert_bundle(
+        expert_id: str,
+        destination_path: Optional[str] = None,
+    ) -> str:
+        """Get a portable JSON expert bundle for editing.
+
+        Args:
+            expert_id: Expert UUID or bundled expert id/name.
+            destination_path: Optional workspace path to write the bundle JSON.
+                When omitted, returns the JSON directly.
+        """
+        if not expert_id:
+            return "expert_id is required."
+        async with _get_client(user_id=context.user_id) as client:
+            try:
+                bundle = await _fetch_expert_bundle(client, base_url, expert_id)
+                payload = {
+                    "kind": "expert_bundle",
+                    "id": str(expert_id),
+                    "bundle_hash": _bundle_hash(bundle),
+                    "bundle": bundle,
+                }
+                written = _write_workspace_json(context, destination_path, payload)
+                if written:
+                    return (
+                        f"Wrote expert bundle for '{expert_id}' to {written}.\n"
+                        f"Bundle hash: {payload['bundle_hash']}"
+                    )
+                return _pretty_json(payload)
+            except ValueError as e:
+                return str(e)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    return f"Expert '{expert_id}' not found or not visible."
+                return f"Failed to get expert bundle: {_http_error(e)}"
+            except httpx.RequestError as e:
+                return f"Failed to connect to orchestrator: {e}"
+
+    @tool
+    async def set_expert_bundle(
+        mode: Literal["create", "update", "fork"],
+        bundle: Optional[Dict[str, Any]] = None,
+        bundle_path: Optional[str] = None,
+        target_id: Optional[str] = None,
+        expected_hash: Optional[str] = None,
+        dry_run: bool = True,
+    ) -> str:
+        """Create, update, or fork an expert from a portable JSON bundle.
+
+        Args:
+            mode: create for a new exact name, update for an owned DB expert, or
+                fork for import-style create with name-collision suffixing.
+            bundle: Expert bundle JSON object, or the full object returned by
+                get_expert_bundle.
+            bundle_path: Optional workspace path containing the bundle JSON.
+            target_id: Required for update. Optional with expected_hash for fork.
+            expected_hash: Optional hash from get_expert_bundle; checked before
+                writing when target_id is supplied.
+            dry_run: Defaults true. Set false to write.
+        """
+        try:
+            payload = _read_bundle_payload(
+                context, bundle=bundle, bundle_path=bundle_path
+            )
+            expert_bundle = _normalize_expert_bundle(payload)
+        except ValueError as e:
+            return str(e)
+
+        if mode not in ("create", "update", "fork"):
+            return "mode must be create, update, or fork."
+        if mode == "update" and not target_id:
+            return "target_id is required for update."
+
+        errors = _validate_expert_bundle(
+            expert_bundle, require_create_fields=mode in ("create", "fork")
+        )
+        if errors:
+            return "Expert bundle is invalid:\n- " + "\n- ".join(errors)
+
+        async with _get_client(user_id=context.user_id) as client:
+            try:
+                mismatch = await _check_expected_hash(
+                    client=client,
+                    base_url=base_url,
+                    kind="expert",
+                    target_id=target_id,
+                    expected_hash=expected_hash,
+                )
+                if mismatch:
+                    return mismatch
+                if dry_run:
+                    return _dry_run_summary(
+                        kind="expert",
+                        mode=mode,
+                        target_id=target_id,
+                        bundle=expert_bundle,
+                    )
+
+                if mode == "update":
+                    resp = await client.put(
+                        f"{base_url}/api/experts/{quote(str(target_id), safe='')}",
+                        json=_expert_update_body(expert_bundle),
+                    )
+                elif mode == "fork":
+                    resp = await client.post(
+                        f"{base_url}/api/experts/import",
+                        json=_expert_create_body(expert_bundle),
+                    )
+                else:
+                    resp = await client.post(
+                        f"{base_url}/api/experts",
+                        json=_expert_create_body(expert_bundle),
+                    )
+                resp.raise_for_status()
+                result = resp.json()
+                result_id = result.get("id") if isinstance(result, dict) else None
+                lines = [f"Expert {mode} succeeded."]
+                if result_id:
+                    lines.append(f"Expert ID: {result_id}")
+                lines.append(f"Bundle hash: {_bundle_hash(expert_bundle)}")
+                return "\n".join(lines)
+            except httpx.HTTPStatusError as e:
+                return f"Failed to {mode} expert: {_http_error(e)}"
+            except httpx.RequestError as e:
+                return f"Failed to connect to orchestrator: {e}"
+            except ValueError as e:
+                return str(e)
+
+    @tool
+    async def get_skill_bundle(
+        skill_id: str,
+        destination_path: Optional[str] = None,
+    ) -> str:
+        """Get a portable JSON skill bundle with the full file tree.
+
+        Args:
+            skill_id: Skill UUID or bundled skill id/name.
+            destination_path: Optional workspace path to write the bundle JSON.
+                When omitted, returns the JSON directly.
+        """
+        if not skill_id:
+            return "skill_id is required."
+        async with _get_client(user_id=context.user_id) as client:
+            try:
+                bundle = await _fetch_skill_bundle(client, base_url, skill_id)
+                payload = {
+                    "kind": "skill_bundle",
+                    "id": str(skill_id),
+                    "bundle_hash": _bundle_hash(bundle),
+                    "bundle": bundle,
+                }
+                written = _write_workspace_json(context, destination_path, payload)
+                if written:
+                    return (
+                        f"Wrote skill bundle for '{skill_id}' to {written}.\n"
+                        f"Bundle hash: {payload['bundle_hash']}"
+                    )
+                return _pretty_json(payload)
+            except ValueError as e:
+                return str(e)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    return f"Skill '{skill_id}' not found or not visible."
+                return f"Failed to get skill bundle: {_http_error(e)}"
+            except httpx.RequestError as e:
+                return f"Failed to connect to orchestrator: {e}"
+
+    @tool
+    async def set_skill_bundle(
+        mode: Literal["create", "update", "fork"],
+        bundle: Optional[Dict[str, Any]] = None,
+        bundle_path: Optional[str] = None,
+        target_id: Optional[str] = None,
+        expected_hash: Optional[str] = None,
+        dry_run: bool = True,
+    ) -> str:
+        """Create, update, or fork a skill from a portable JSON bundle.
+
+        Args:
+            mode: create for a new exact name, update for an owned DB skill, or
+                fork for import-style create with name-collision suffixing.
+            bundle: Skill bundle JSON object, or the full object returned by
+                get_skill_bundle.
+            bundle_path: Optional workspace path containing the bundle JSON.
+            target_id: Required for update. Optional with expected_hash for fork.
+            expected_hash: Optional hash from get_skill_bundle; checked before
+                writing when target_id is supplied.
+            dry_run: Defaults true. Set false to write.
+        """
+        try:
+            payload = _read_bundle_payload(
+                context, bundle=bundle, bundle_path=bundle_path
+            )
+            skill_bundle = _normalize_skill_bundle(payload)
+        except ValueError as e:
+            return str(e)
+
+        if mode not in ("create", "update", "fork"):
+            return "mode must be create, update, or fork."
+        if mode == "update" and not target_id:
+            return "target_id is required for update."
+
+        errors = _validate_skill_bundle(skill_bundle)
+        if errors:
+            return "Skill bundle is invalid:\n- " + "\n- ".join(errors)
+
+        async with _get_client(user_id=context.user_id) as client:
+            try:
+                mismatch = await _check_expected_hash(
+                    client=client,
+                    base_url=base_url,
+                    kind="skill",
+                    target_id=target_id,
+                    expected_hash=expected_hash,
+                )
+                if mismatch:
+                    return mismatch
+                if dry_run:
+                    return _dry_run_summary(
+                        kind="skill",
+                        mode=mode,
+                        target_id=target_id,
+                        bundle=skill_bundle,
+                    )
+
+                body = _skill_write_body(skill_bundle)
+                if mode == "update":
+                    resp = await client.put(
+                        f"{base_url}/api/skills/{quote(str(target_id), safe='')}",
+                        json=body,
+                    )
+                elif mode == "fork":
+                    from src.core.skill_format import pack_skill_zip
+
+                    name = str(skill_bundle.get("name") or "skill")
+                    zip_bytes = pack_skill_zip(name, skill_bundle["files"])
+                    resp = await client.post(
+                        f"{base_url}/api/skills/import",
+                        files={
+                            "file": (
+                                f"{name}.zip",
+                                zip_bytes,
+                                "application/zip",
+                            )
+                        },
+                    )
+                else:
+                    resp = await client.post(f"{base_url}/api/skills", json=body)
+                resp.raise_for_status()
+                result = resp.json()
+                result_id = result.get("id") if isinstance(result, dict) else None
+                lines = [f"Skill {mode} succeeded."]
+                if result_id:
+                    lines.append(f"Skill ID: {result_id}")
+                lines.append(f"Bundle hash: {_bundle_hash(skill_bundle)}")
+                return "\n".join(lines)
+            except httpx.HTTPStatusError as e:
+                return f"Failed to {mode} skill: {_http_error(e)}"
+            except httpx.RequestError as e:
+                return f"Failed to connect to orchestrator: {e}"
+            except ValueError as e:
+                return str(e)
+
     return [
         list_experts,
         get_expert,
         list_skills,
         search_skills,
         get_skill,
+        get_expert_bundle,
+        set_expert_bundle,
+        get_skill_bundle,
+        set_skill_bundle,
     ]
