@@ -38,6 +38,7 @@ import httpx
 from ._propfind import parse_propfind_entries
 from .base import CloudMountSubject, HealthStatus, RcloneMountSpec, UserHome
 from .config import NextcloudSettings
+from .etag_baseline import PropfindError, capture_etag_baseline
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
     GroupId,
@@ -716,6 +717,56 @@ class NextcloudBackend:
             )
         return parse_propfind_entries(
             resp.text, href_prefix=href_prefix, self_path=self_path
+        )
+
+    async def _propfind_at_depth(
+        self, url_path: str, href_prefix: str, *, depth: str, self_path: str = ""
+    ) -> list[ProjectFolderEntry]:
+        """PROPFIND at an explicit Depth. ``depth="infinity"`` powers the
+        one-shot etag baseline; a non-207 (e.g. sabre's 400/403 on infinity)
+        or a transport error raises ``PropfindError`` so the caller falls back
+        to a Depth:1 BFS (design §11.5)."""
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                url_path,
+                headers={"Depth": depth},
+                auth=(self._agent_user, self._agent_password),
+            )
+        except httpx.HTTPError as e:
+            raise PropfindError(str(e)) from e
+        if resp.status_code != 207:
+            raise PropfindError(
+                f"PROPFIND Depth:{depth} returned {resp.status_code} for {url_path}"
+            )
+        return parse_propfind_entries(
+            resp.text, href_prefix=href_prefix, self_path=self_path
+        )
+
+    async def capture_etag_baseline(
+        self, handle: ProjectFolderHandle
+    ) -> dict[str, str]:
+        """Mount-time ``{path: etag}`` baseline for the conflict gate — one
+        ``Depth: infinity`` PROPFIND when the server allows it, else a bounded
+        Depth:1 BFS (design §3.4, §11.5)."""
+        self._ensure_ready()
+        base_path = self._groupfolder_dav_base(handle)
+        href_prefix = f"{base_path}/"
+
+        async def list_tree() -> list[ProjectFolderEntry]:
+            return await self._propfind_at_depth(
+                base_path, href_prefix, depth="infinity"
+            )
+
+        async def list_children(sub: str) -> list[ProjectFolderEntry]:
+            safe_sub = quote(sub, safe="/")
+            url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
+            return await self._propfind_at_depth(
+                url_path, href_prefix, depth="1", self_path=sub
+            )
+
+        return await capture_etag_baseline(
+            root_subpath="", list_children=list_children, list_tree=list_tree
         )
 
     @instrument_backend_op("get_project_folder_file_bytes")

@@ -226,6 +226,14 @@ class MainCloudBackend(Protocol):
         """
         ...
 
+    async def capture_etag_baseline(
+        self, handle: ProjectFolderHandle
+    ) -> dict[str, str]:
+        """Return ``{path: etag}`` for every file under the project folder, for
+        the protected-mode conflict baseline (design §3.4). Infinity-first with
+        a Depth:1 BFS fallback (§11.5)."""
+        ...
+
     async def get_project_folder_file_bytes(
         self,
         handle: ProjectFolderHandle,

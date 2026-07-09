@@ -80,6 +80,10 @@ class FakeNextcloud:
         self.etags: dict[str, str] = {}
         self.requests: list[httpx.Request] = []
         self._etag_seq = 0
+        # When True, a ``Depth: infinity`` PROPFIND is answered 400 (mimics
+        # sabre/dav with infinity disabled) so the etag baseline falls back to
+        # the Depth:1 BFS. Default False: the fake honors infinity.
+        self.reject_infinity = False
 
     # ---- seeding helper
     def add_file(self, relpath: str, content: bytes) -> None:
@@ -102,7 +106,7 @@ class FakeNextcloud:
             return httpx.Response(404, content=b"outside group folder")
         method = request.method
         if method == "PROPFIND":
-            return self._propfind(rel)
+            return self._propfind(rel, request.headers.get("Depth", "1"))
         if method == "GET":
             return self._get(rel)
         if method == "PUT":
@@ -120,12 +124,18 @@ class FakeNextcloud:
         return path[len(self.decoded_base) :].strip("/")
 
     # ---- WebDAV verbs
-    def _propfind(self, rel: str) -> httpx.Response:
+    def _propfind(self, rel: str, depth: str = "1") -> httpx.Response:
         if rel and rel not in self.dirs:
             return httpx.Response(404, content=self._dav_error())
-        # Depth: 1 → the collection itself + its immediate children.
+        if depth == "infinity":
+            if self.reject_infinity:
+                return httpx.Response(400, content=self._dav_error())
+            members = self._descendants(rel)
+        else:
+            members = self._children(rel)
+        # The collection itself + the selected members (children or all descendants).
         blocks = [self._block(rel, is_dir=True)]
-        for child, is_dir in sorted(self._children(rel).items()):
+        for child, is_dir in sorted(members.items()):
             blocks.append(self._block(child, is_dir=is_dir))
         body = (
             '<?xml version="1.0"?>'
@@ -180,6 +190,19 @@ class FakeNextcloud:
         return httpx.Response(404, content=self._dav_error())
 
     # ---- helpers
+    def _descendants(self, current: str) -> dict[str, bool]:
+        """Every file + dir at any depth under ``current`` → {relpath: is_dir}
+        (for a ``Depth: infinity`` PROPFIND)."""
+        prefix = (current + "/") if current else ""
+        members: dict[str, bool] = {}
+        for f in self.files:
+            if f.startswith(prefix) and f != current:
+                members[f] = False
+        for d in self.dirs:
+            if d.startswith(prefix) and d != current:
+                members[d] = True
+        return members
+
     def _children(self, current: str) -> dict[str, bool]:
         """Immediate children of ``current`` → {relpath: is_dir}."""
         prefix = (current + "/") if current else ""
@@ -325,6 +348,42 @@ class TestListProjectFolder:
         _install_fake(be, fake)
         entries = await be.list_project_folder(_handle())
         assert [e for e in entries if not e.is_dir] == []
+
+
+class TestCaptureEtagBaseline:
+    @pytest.mark.asyncio
+    async def test_prefers_infinity_single_request(self):
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.add_file("a.md", b"a")
+        fake.add_file("docs/b.md", b"b")
+        _install_fake(be, fake)
+
+        base = await be.capture_etag_baseline(_handle())
+
+        assert set(base) == {"a.md", "docs/b.md"}  # files only, no dirs
+        assert all(v for v in base.values())  # etags populated
+        # Exactly one PROPFIND — the infinity short-circuit, not a per-dir BFS.
+        propfinds = [r for r in fake.requests if r.method == "PROPFIND"]
+        assert len(propfinds) == 1
+        assert propfinds[0].headers.get("Depth") == "infinity"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_bfs_when_infinity_rejected(self):
+        be = NextcloudBackend(_nc_test_settings())
+        fake = FakeNextcloud()
+        fake.reject_infinity = True  # sabre with infinity disabled → 400
+        fake.add_file("a.md", b"a")
+        fake.add_file("docs/b.md", b"b")
+        _install_fake(be, fake)
+
+        base = await be.capture_etag_baseline(_handle())
+
+        assert set(base) == {"a.md", "docs/b.md"}  # same result via BFS
+        methods = [r for r in fake.requests if r.method == "PROPFIND"]
+        # One rejected infinity attempt + at least the root + docs Depth:1 walks.
+        assert any(r.headers.get("Depth") == "infinity" for r in methods)
+        assert any(r.headers.get("Depth") == "1" for r in methods)
 
     @pytest.mark.asyncio
     async def test_missing_mountpoint_raises_invalid_request(self):
