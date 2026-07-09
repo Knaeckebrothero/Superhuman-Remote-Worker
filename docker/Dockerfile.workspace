@@ -71,6 +71,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     unzip \
     zstd \
     fuse3 \
+    fuse-overlayfs \
     # NOTE: sudo intentionally excluded — agent-host must not escalate to root
     ca-certificates \
     gnupg \
@@ -136,6 +137,15 @@ RUN curl -fsSL "https://downloads.rclone.org/v${SRW_RCLONE_VERSION}/rclone-v${SR
     && dpkg -i /tmp/rclone.deb \
     && rm /tmp/rclone.deb \
     && rclone version
+
+# fuse-overlayfs version gate — the overlay-over-rclone spike (see
+# docs/superpowers/plans/2026-07-09-protected-cloud-mode-phase0-spike.md)
+# needs the big-dir/readdir fixes that landed in 1.13. Fail the build loudly
+# rather than silently shipping a too-old binary.
+RUN fuse-overlayfs --version \
+    && v="$(fuse-overlayfs --version | sed -n 's/.*version \([0-9.]*\).*/\1/p')" \
+    && dpkg --compare-versions "$v" ge 1.13 \
+        || { echo "fuse-overlayfs $v < 1.13 (big-dir/readdir fixes needed)"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 2. Node.js 22 + global packages

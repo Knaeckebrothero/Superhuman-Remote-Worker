@@ -122,6 +122,7 @@ sudo eatmydata apt-get install -y \
     ripgrep \
     fd-find \
     fuse3 \
+    fuse-overlayfs \
     poppler-utils \
     pandoc \
     python3 \
@@ -176,6 +177,15 @@ echo "${SRW_RCLONE_SHA256}  /tmp/rclone.deb" | sha256sum -c -
 sudo dpkg -i /tmp/rclone.deb
 rm /tmp/rclone.deb
 rclone version
+
+# fuse-overlayfs version gate — the overlay-over-rclone spike (see
+# docs/superpowers/plans/2026-07-09-protected-cloud-mode-phase0-spike.md)
+# needs the big-dir/readdir fixes that landed in 1.13. Fail the build loudly
+# rather than silently shipping a too-old binary.
+fuse-overlayfs --version
+v="$(fuse-overlayfs --version | sed -n 's/.*version \([0-9.]*\).*/\1/p')"
+dpkg --compare-versions "$v" ge 1.13 \
+    || { echo "fuse-overlayfs $v < 1.13"; exit 1; }
 
 # -----------------------------------------------------------------------------
 # 4. Tailscale (mesh VPN — joins Headscale tailnet at VM boot via cloud-init)
