@@ -32,6 +32,7 @@ import httpx
 from ._propfind import parse_propfind_entries
 from .base import CloudMountSubject, HealthStatus, RcloneMountSpec, UserHome
 from .config import OpenCloudSettings
+from .etag_baseline import PropfindError, capture_etag_baseline
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
     GroupId,
@@ -842,6 +843,64 @@ class OpenCloudBackend:
             )
         return parse_propfind_entries(
             resp.text, href_prefix=href_prefix, self_path=self_path
+        )
+
+    async def _propfind_at_depth(
+        self, url_path: str, href_prefix: str, *, depth: str, self_path: str = ""
+    ) -> list[ProjectFolderEntry]:
+        """PROPFIND at an explicit Depth. OpenCloud (oCIS) rejects
+        ``Depth: infinity`` with 400, which raises ``PropfindError`` so the
+        etag baseline falls straight through to a Depth:1 BFS (design §11.5)."""
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                url_path,
+                headers={"Authorization": f"Bearer {token}", "Depth": depth},
+            )
+        except httpx.HTTPError as e:
+            raise PropfindError(str(e)) from e
+        if resp.status_code != 207:
+            raise PropfindError(
+                f"PROPFIND Depth:{depth} returned {resp.status_code} for {url_path}"
+            )
+        return parse_propfind_entries(
+            resp.text, href_prefix=href_prefix, self_path=self_path
+        )
+
+    async def capture_etag_baseline(
+        self, handle: ProjectFolderHandle
+    ) -> dict[str, str]:
+        """Mount-time ``{path: etag}`` baseline for the conflict gate. OpenCloud
+        rejects ``Depth: infinity``, so this always walks Depth:1 BFS via the
+        shared helper's fallback path (design §3.4, §11.5)."""
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "capture_etag_baseline: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        base_path = f"/dav/spaces/{safe_drive}"
+        href_prefix = f"{base_path}/"
+
+        async def list_tree() -> list[ProjectFolderEntry]:
+            return await self._propfind_at_depth(
+                base_path, href_prefix, depth="infinity"
+            )
+
+        async def list_children(sub: str) -> list[ProjectFolderEntry]:
+            safe_sub = quote(sub, safe="/")
+            url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
+            return await self._propfind_at_depth(
+                url_path, href_prefix, depth="1", self_path=sub
+            )
+
+        return await capture_etag_baseline(
+            root_subpath="", list_children=list_children, list_tree=list_tree
         )
 
     @instrument_backend_op("get_project_folder_file_bytes")
