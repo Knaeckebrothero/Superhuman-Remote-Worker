@@ -730,6 +730,11 @@ class PersistentSession:
                 "list_project_jobs",
                 "list_project_repositories",
                 "get_default_project_repository",
+                "list_experts",
+                "get_expert",
+                "list_skills",
+                "search_skills",
+                "get_skill",
             ]
             for name in _ORCHESTRATOR_TOOLS:
                 if name not in tool_names:

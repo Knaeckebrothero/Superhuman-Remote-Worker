@@ -1044,11 +1044,12 @@ Implement in this order:
    `repositories.get_default` is implemented as `get_default_project_repository`.
 6. `repositories.checkout_project_repository` - implemented as
    `checkout_project_repository`.
-7. `project_loops.get`
-8. `project_loops.list_jobs`
-9. `project_loops.explain_state`
+7. `project_loops.get` - deferred.
+8. `project_loops.list_jobs` - deferred.
+9. `project_loops.explain_state` - deferred.
 10. `experts.list`, `experts.get`, `skills.list`, `skills.search`, and
-    `skills.get`
+    `skills.get` - implemented as `list_experts`, `get_expert`, `list_skills`,
+    `search_skills`, and `get_skill`.
 
 MCP product:
 
