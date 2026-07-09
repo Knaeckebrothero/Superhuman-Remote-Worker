@@ -1,6 +1,7 @@
 ---
 tags:
   - issue
+  - fix-spec
   - jobs
   - workspace-lifecycle
   - sudo-gate
@@ -12,18 +13,26 @@ tags:
 # A job paused for VM-upgrade approval gets its workspace reaped before the operator can approve
 
 **Status:** investigated 2026-07-08 from a live incident on the main cluster
-(`superhuman-remote-worker`). Root cause **confirmed in code**. Not yet fixed.
+(`superhuman-remote-worker`); **research-refined 2026-07-09** (4 codebase lanes + 2
+verified web-prior-art lanes) — now an implementation-ready fix spec. Root causes
+confirmed in code. Not yet implemented.
 **Severity:** high — the job is unrecoverable and the loss is silent. Any job that
-hits the sudo/VM-upgrade gate and isn't approved within the reaper's idle window
-(minutes) dies, even though the approval request itself is valid for **24 h**. For
-VM-backed / non-suspendable workspaces the agent's work is destroyed (only
-phase-boundary git commits survive).
+hits the sudo/VM-upgrade gate and isn't decided within the reaper's window (next
+tick, ~60 s) dies on decision/resume, even though the approval request itself is
+valid for **24 h**. For VM-tier and emptyDir workspaces the agent's live state is
+destroyed (only phase-boundary git commits survive). A second, independent defect
+found during research: **approving via the generic endpoints (incl. MCP) wedges the
+job forever** even when the workspace is still alive.
 **Component:**
-- `orchestrator/services/lifecycle/workspace_manager.py` (`_IDLE_JOB_STATUSES`,
-  `is_idle`, `is_reapable`)
-- `orchestrator/services/lifecycle/reconciler.py` (idle → snapshot/drain tick)
+- `orchestrator/services/lifecycle/workspace_manager.py`, `vm_manager.py`,
+  `reconciler.py` (reap predicates, no grace for `paused`)
 - `orchestrator/services/completion.py` (`vm_upgrade_required` → `paused`)
-- `orchestrator/services/sudo_gate.py` (`insert_vm_upgrade_request`, 24 h TTL)
+- `orchestrator/services/sudo_gate.py` + `orchestrator/main.py` approve/deny
+  endpoints (decision paths)
+- `orchestrator/services/snapshot_service.py`, `workspace_suspension.py`
+  (capture/restore substrate)
+- `src/core/capability_grants.py` + grant PEPs in `main.py` (auto-deny / admin)
+- `cockpit/src/app/views/jobs/job-list.component.ts` + jobs-list SQL (UX)
 **Observed on:** main cluster, job `b5b0c0d0-e7b4-403b-a143-dd8d9f98ae51`
 ("project management software", `default` config, `gemma-4-moe`), sudo request
 `98d88547`, workspace `workspace-b5b0c0d0-e7b` / VM `agent-vm-b5b0c0d0-e7b`.
@@ -35,23 +44,22 @@ phase-boundary git commits survive).
 The sudo gate freezes a job as `vm_upgrade_required` and pauses it so a human can
 decide whether to upgrade it to a VM. That approval request is deliberately given a
 **24 h TTL** — "operator decides in their own time" (`sudo_gate.py:588`). But the
-lifecycle reaper classifies **`paused` as an idle, drainable/reapable state**
-(`workspace_manager.py:53`), and nothing in the reaper checks for an open sudo/VM
-approval. So the reconciler drains the paused workspace on a normal idle tick —
-minutes to ~an hour later — **long before the 24 h approval window closes**.
+lifecycle reaper classifies **`paused` as an idle, reapable state**
+(`workspace_manager.py:53`) with **no grace window** — a paused job is reapable on
+the very next reconciler tick — and nothing links the reap decision to the open
+approval. The workspace is destroyed minutes into a 24 h decision window.
 
-By the time anyone approves (or hits Resume), the workspace is gone. Resume tries to
-reconnect to the recorded workspace endpoint, gets `Name or service not known`,
-exhausts `WORKSPACE_RECOVERY_MAX_ATTEMPTS`, and flips the job to `failed`
-(`workspace_unavailable`). The sudo request is still `PENDING` — it was never
-honoured, because there was nothing left to upgrade.
+By the time anyone decides (or hits Resume), the workspace is gone. Resume
+reconnects to the recorded endpoint, gets NXDOMAIN, exhausts
+`WORKSPACE_RECOVERY_MAX_ATTEMPTS`, and fails the job as `workspace_unavailable`.
 
-Two independent aggravating defects showed up in the same incident:
-1. the requesting user **lacked VM-backend permission**, so even a timely approval
-   would have been rejected by the capability check — and nothing surfaced that;
-2. Cockpit offered **Resume** (not Approve/Deny) as the action for a sudo-gated
-   pause, and Resume against a reaped workspace is what finally consumed the job
-   into `failed`.
+**The correct model is reap-and-restore, not hold-alive** (decided 2026-07-09, and
+confirmed as the industry-consensus shape — no surveyed system holds compute for a
+pending approval): durably capture workspace state at the pause, keep the container
+warm only for a short idle grace, reap it, and make the approve/deny decision
+re-provision + restore + continue. What makes today's behaviour a bug is not that
+it reaps — it's that the reap is **destructive** and the decision path has **no
+restore step** (and, for deny and all generic approve paths, no job action at all).
 
 ## Timeline (observed, job `b5b0c0d0`)
 
@@ -64,192 +72,369 @@ Two independent aggravating defects showed up in the same incident:
 | ~09:56 → ~15:47 | **Zero job activity for ~6 h.** Workspace reaped during this window; `context.vm.status` → `deleted`, DNS for `workspace-b5b0c0d0-e7b…svc.cluster.local` no longer resolves. |
 | ~15:47:42 | Operator hits **Resume**. Orchestrator tries to reconnect → `Failed to connect to workspace … [gone]: [Errno -2] Name or service not known`; recovery exhausted after 3 attempts → job `failed` (`freeze_type: workspace_unavailable`, `recovery_attempts: 4`). |
 
-The sudo request `98d88547` remained `PENDING` throughout — it never registered an
-approval, and its 24 h TTL had not yet expired, so the system's own view still said
-"awaiting operator decision" for a workspace that had been dead for ~5 h.
+The sudo request `98d88547` remained `PENDING` throughout. An approval email *was*
+received and (reportedly) acted on by an operator — but no approval ever registered
+on the request row, consistent with the operator landing on the job's Resume button
+rather than the inbox Approve controls, or an approve click failing silently
+against the dead workspace.
 
 ## Root cause (confirmed in code)
 
-**A TTL mismatch between the approval window and the reaper's idle window, with no
-guard linking them.**
+**A TTL mismatch between the approval window and the reaper's window, with no
+durable capture underneath.**
 
 ### 1. The pause is legitimately long-lived
-`completion.py:577` maps the gate freeze to a paused job:
-```python
-if freeze_type == "vm_upgrade_required":
-    return ("paused", None)
-```
-`sudo_gate.insert_vm_upgrade_request` (`sudo_gate.py:577`) records the decision with
-a **24 h** TTL, by design:
-```
-… "these have no reply subject and use a long TTL (24h — operator decides in their own time)."
-INSERT INTO sudo_approval_requests (… request_type, ttl_seconds, expires_at)
-VALUES (…, 'vm_upgrade', 86400, NOW() + INTERVAL '86400 seconds')
-```
+`completion.py:577` maps the gate freeze to a paused job. Deliberately, `vm_upgrade_required`
+is **NOT** in `AUTO_REDISPATCH_FREEZE_TYPES` (`completion.py:268-275`), so `/complete`
+leaves `freeze_data` on the row — which parks the job invisible to the auto-dispatcher
+(`get_dispatchable_jobs` requires `freeze_data IS NULL`) until a human decides.
+`sudo_gate.insert_vm_upgrade_request` (`sudo_gate.py:577-636`) records the decision
+with a **24 h** TTL, by design.
 
-### 2. The reaper treats that same pause as disposable
+### 2. The reaper treats that same pause as immediately disposable
 `workspace_manager.py:53`:
 ```python
 _IDLE_JOB_STATUSES = frozenset(
     {"paused", "pending_review", "reviewing", "waiting_for_reply"}
 )
-…
-_REAPABLE_JOB_STATUSES = _IDLE_JOB_STATUSES | _TERMINAL_JOB_STATUSES
 ```
-`is_idle()` / `is_reapable()` return `True` whenever `job_status ∈` those sets. The
-reconciler tick (`reconciler.py:185-210`) then runs `snapshot()` → `drain()` (a
-pod delete) on the idle instance. The **only** guards are:
-- `has_live_shared_child` — a critic SSHed into this pod (irrelevant here), and
-- `bound_row_missing` — the deleted-job orphan age gate (irrelevant here).
+`is_idle()`/`is_reapable()` return `True` for `paused` **with no grace window** —
+`is_idle` explicitly documents that it does *not* gate on `last_activity` ("react as
+soon as the bound work is in a quiescent state, regardless of how long",
+`workspace_manager.py:232-250`), and `Instance.metadata` built in `list_instances`
+carries no `paused_at`/`last_activity` at all. The only reap guards are
+`has_live_shared_child` and `bound_row_missing` — **nothing checks for an open
+sudo/VM approval.** Same in `vm_manager.py:196` for VMs.
 
-**There is no check for an open, unexpired sudo/VM-upgrade request** bound to the
-job. A job paused *specifically so a human can decide within 24 h* is drained on the
-same schedule as any quiescent paused job — i.e. as soon as the idle/drain window
-elapses (minutes to ~1 h, well under 24 h).
+### 3. The reap is destructive for exactly the workspace classes that matter
+The reconciler's snapshot-before-delete lives in `_reap` (`reconciler.py:254`,
+snapshot at `:271-275`), delegating to `SnapshotService.capture_vm_snapshot`
+(SSH-tar → S3/MinIO, `snapshot_service.py:300`). Per workspace class:
+- **PVC-backed pods** — already safe for *same-tier* pause-reap: `delete()` retains
+  the PVC for non-terminal jobs (`workspace_manager.py:551`) and `give_up()`
+  recreates the pod against it (`:437`). But the **upgrade-to-VM path abandons the
+  PVC** (fresh VM, different backend) — cross-tier approve is lossy even here.
+- **emptyDir pods** — snapshot works while the pod is reachable, but nothing forces
+  it at pause time; if capture is skipped/exhausted, `give_up()` force-deletes with
+  no recreate (`:413-439`) and S3 was the only copy.
+- **VMs** — capture is a **structural no-op**: the orchestrator is not a tailnet
+  member, so `orchestrator_can_reach()` (`ssh_helpers.py:49`, `_TAILNET_NET
+  100.64.0.0/10:33`) rejects the VM's ssh_host and `capture_vm_snapshot` returns
+  `capture_skipped` (`snapshot_service.py:331-354`). `give_up()` is an explicit
+  force-delete with *"no volume-reattach (delete is destructive)"*
+  (`vm_manager.py:315-322`). A paused VM job is reapable + dirty + unreachable →
+  bounded attempts → destroyed. **This is what killed `b5b0c0d0`.**
+- **Graph checkpoint** — default `CHECKPOINTER_BACKEND=sqlite` (`db_url.py:54`)
+  stores the LangGraph checkpoint **inside the workspace**
+  (`workspace/checkpoints/job_<id>.db`, `agent.py:1077,3375-3384`) — so losing the
+  workspace loses the reasoning state too. The cross-pod `AsyncPostgresSaver`
+  backend exists (`agent.py:1073`) but is not yet the chart default.
 
-### 3. The drain is fatal for this workspace class
-The reap is designed to be state-safe for suspend-capable, PVC-backed workspaces
-(`snapshot()` before `drain()`, PVC retained because `paused` is non-terminal → later
-reattach + checkpoint resume). But this job's workspace was VM-tier / non-reattachable
-(there is no persistent VM rootdisk yet — see
-[`../features/vm_persistent_rootdisk.md`](../features/vm_persistent_rootdisk.md)),
-so the drain destroyed the live filesystem. Only the
-phase-boundary git commits in `job-b5b0c0d0` survived. Even where a snapshot *does*
-survive, it does not rescue this flow: the operator's approval wants to **upgrade the
-original live workspace in place**, and that workspace no longer exists.
+### 4. The decision paths can't recover — and two of three wedge the job outright
+There are **three** approve surfaces (found 2026-07-09):
+- `POST /api/sudo/requests/{id}/approve` (generic; **also what the MCP
+  `approve_sudo_request` tool calls**, `mcp/server.py:2596-2618`) →
+  `sudo_gate.approve_request()` **only flips the row**; the NULL `nats_reply_subject`
+  makes the reply a no-op (`sudo_gate.py:682-688`). `freeze_data` stays set → job
+  invisible to the dispatcher → **wedged forever, silently.** Same for `/deny`.
+- `POST /api/sudo/requests/{id}/approve-upgrade` (`main.py:8129-8148`) → the only
+  path that acts: `upgrade_job_to_vm()` (`main.py:8691-8817`) does the correct
+  Continue-as-New skeleton — clears `freeze_data`, `assigned_agent_id=NULL`,
+  `status='paused'`, `context.vm.requested=true`, `_trigger_dispatch()` — but
+  performs **no restore** of any snapshot into the fresh VM; it silently relies on
+  a checkpoint that the reap may have destroyed.
+- `POST /api/sudo/requests/{id}/resume-without-vm` (`main.py:8151-8170`) →
+  `approve_job()`, which sets `status='processing'` **without unassigning or
+  re-provisioning** — it assumes the original workspace is still live (exactly what
+  the reap destroys) and injects **no denied tool result**.
 
-### 4. Resume can't recover, and reports the wrong thing
-On Resume the recovery arm reconnects to the recorded endpoint, fails NXDOMAIN,
-retries to the cap, and fails the job as `workspace_unavailable` — a generic
-"workspace vanished mid-run" message that gives the operator no hint that **their own
-still-open approval request is the thing that got stranded**. See the sibling
-resilience spec [`agent_fast_freeze_on_dead_workspace.md`](agent_fast_freeze_on_dead_workspace.md)
-(the freeze *type* is
-correct; the problem is that the workspace should never have been reaped while an
-approval was pending).
+**A real deny path does not exist in any form.**
 
-## Secondary defects surfaced by the same incident
+## Additional defects surfaced by the research
 
-- **An approval the requester can't satisfy is still raised to a human.** The job's
-  creator was an **admin** but had no VM-backend grant — the grant system was added
-  after he became admin and he didn't know he had to self-assign VM in Grants.
-  Approving the VM upgrade would have been rejected by the capability check anyway, yet
-  the approval email ("Approve a VM upgrade or reject") gave no signal that the request
-  was unsatisfiable. → fixed by **directions 4 (auto-deny)** and **5 (admins bypass
-  grants)**.
-- **Resume is the wrong affordance for a sudo-gated pause, and the job list hides the
-  wait.** Cockpit (and the email deep-link) surfaced **Resume**, not Approve/Deny —
-  and the STATUS column showed no sign an approval was pending (the screenshotted row
-  reads `Created` with a green Resume button). Resume does not approve the request;
-  against a live workspace it just re-enters the gate, and against a reaped one it
-  destructively consumes the job into `failed`. → fixed by **direction 6**.
-- **`PENDING`-forever display.** Because the request TTL is 24 h, `list_sudo_requests`
-  keeps showing `PENDING` even after the workspace it depends on is gone — the operator
-  cannot tell from the request that approving it is now hopeless. → addressed by
-  **directions 1 (durable capture)** + **3 (restore-and-decide / expire loudly)** — the
-  request stays valid because the workspace becomes restorable, not because it's held.
+- **D2 — generic approve/deny (and MCP) silently wedge the job** (see §4 above).
+  This is a live bug independent of the reaper: even with the workspace alive, an
+  operator approving from the MCP tools or any generic client parks the job forever.
+- **D3 — `upgrade_job_to_vm` is itself ungated** (`main.py:8691` checks only
+  `require_job_access`); VM-grant enforcement is deferred to the dispatcher
+  pre-flight (`_check_vm_permission`, `main.py:3892/3906`), which fails ungrantable
+  jobs with a generic 403 instead of a graceful outcome.
+- **D4 — admin premise of the incident corrected.** The job creator (`kai`,
+  `082c4027…`) has `users.is_admin = TRUE` (verified in the main-cluster DB
+  2026-07-09), and **admin already bypasses every grant check**: the PDP takes
+  `is_admin` (`capability_grants.py:134`), and the PEPs short-circuit
+  (`main.py:3095, 3133, 3196-3197, 3245, 3261, 3926`) — commits `25283b38`
+  (2026-04-23) and `a7ad2be0` (2026-06-18), both predating the incident. So the VM
+  check should never have blocked him, and the post-incident "give him the VM grant"
+  was very likely unnecessary. What misled everyone: the **Grants UI shows an admin
+  with zero grant rows**, which reads as "no VM permission" — an admin-looks-
+  unentitled UX gap, not a missing bypass. (Caveat: the *deployed* main-cluster
+  build wasn't diffed against these commits — verify before closing fix #5's
+  option A as already-done.) One real footgun remains:
+  `postgres_db.user_can_use_vm` (`postgres.py:9203-9224`) is **admin-agnostic**;
+  it's safe today only because every caller is `_check_vm_permission`, which checks
+  `is_admin` first — any new direct caller (e.g. fix #4's auto-deny) would
+  misclassify an admin.
+- **D5 — the job list hides the wait.** STATUS shows a bare `Paused`/`Created` chip
+  and a green **Resume** button (`job-list.component.ts:305` desktop, `:223` mobile
+  kebab) for a job that is actually blocked on an approval; the list has zero sudo
+  awareness (`JobSummary` has no approval field). The **email path is already
+  correct** — it deep-links to `/inbox?sudo=<requestId>` (`email.py:269-275`) where
+  Approve/Deny/Upgrade controls exist (`inbox-page.component.ts:327-357`,
+  query-param select at `:1567-1580`).
+- **D6 — `PENDING`-forever display.** The 24 h TTL keeps `list_sudo_requests`
+  showing `PENDING` long after the workspace it depends on is gone.
 
-## Fix directions
+## Implementation plan (research-refined 2026-07-09)
 
-The correct model is **reap-and-restore, not hold-alive.** Holding an idle workspace
-warm for the full 24 h approval window wastes resources; the workspace should be
-disposable. What makes today's behaviour a *bug* is not that it reaps — it's that the
-reap is **destructive** and the decision path can't recover from it. Make the reap
-non-destructive and the decision trigger a restore, then reap freely.
+The model: **reap-and-restore.** The workspace-relative tar archive in S3/MinIO is
+the durable contract; the runtime (pod or VM) is disposable; the approve/deny
+decision — not Resume — triggers re-provision + restore + continue. This is the
+Gitpod-Classic production pattern (tar → S3 → restore into a fresh container) and
+the Airflow-deferrable shape (free the compute, persist a resume point, re-queue on
+signal). CSI VolumeSnapshots are a dead end on our stack (k3s local-path-provisioner
+has no snapshot support), and VMM-level snapshots (savevm/Firecracker-style) solve
+process resume we don't need — LangGraph checkpoint already externalizes it.
 
-Primary (fixes the class):
+### Fix 1 — durable capture at the gate pause (the precondition)
 
-1. **Durably capture workspace state at the moment of the gate pause — the precondition
-   everything else rests on.** Before the job goes `paused` for `vm_upgrade_required`,
-   force a snapshot/commit of the workspace to durable storage and confirm the graph
-   checkpoint is persisted (cross-pod Postgres saver). Today this does *not* reliably
-   happen: emptyDir pod workspaces have no retained volume and rootdisk-less VM
-   workspaces have no persistent disk, so `drain()` deletes the only copy — which is
-   exactly why `b5b0c0d0` returned `workspace_unavailable`. Without durable capture,
-   "restart the container and tell the agent the outcome" has nothing to restart from.
-   Persistent VM rootdisk ([`../features/vm_persistent_rootdisk.md`](../features/vm_persistent_rootdisk.md),
-   proposed) is on this critical path for VM-tier jobs.
-2. **Reap on a short warm grace, not the 24 h window; decouple the request TTL from the
-   workspace lifetime.** Keep the workspace warm only for the standard
-   persistent-session idle-sweep period, so a fast approver gets an instant, lossless
-   resume off the live container; after that, snapshot-and-reap. The
-   `sudo_approval_requests` row keeps its 24 h TTL independently — the operator still has
-   24 h to decide, they just pay a restore on resume instead of getting a warm
-   container. (Note `is_idle` currently does *not* gate on `last_activity` for `paused`,
-   so a paused job is drained on the very next tick; this adds that grace.) Requires #1
-   so the post-grace reap is non-destructive.
-3. **Restore-and-decide on approve/deny; fail loudly only on true expiry.** When the
-   operator acts — even hours later, workspace long reaped — re-dispatch the job:
-   - **approve** → provision the VM (tier upgrade), restore the snapshot/commit into it,
-     re-run the gated command, continue;
-   - **deny** → re-provision the original tier, restore, and hand the agent a *denied*
-     tool result so it adapts and continues without the privilege.
+*Exists:* `SnapshotService.capture_vm_snapshot` (SSH-tar → S3, includes
+`/home/agent-host/` + `/usr/local/`, excludes `repos/`+`node_modules/`, 10 GB cap,
+`snapshot_service.py:300-416`); `workspace_suspension` suspend/restore
+(`workspace_suspension.py:110/252/436`); phase snapshots (`src/core/phase_snapshot.py`).
 
-   This is the same Continue-as-New re-dispatch the `version_upgrade` freeze already uses
-   (`completion.py` → `paused` → auto-assign dispatcher re-runs a fresh agent on the
-   preserved context). Only if the 24 h TTL lapses with no decision does the job fail —
-   with an explicit `vm_upgrade_expired` reason ("approval window closed; re-run"), never
-   the generic `workspace_unavailable`.
+*Add:*
+1. **Force a snapshot at the `vm_upgrade_required` freeze**, before the job becomes
+   reapable. Hook points: the agent-side freeze consumer (`src/graph.py:4286-4305`,
+   alongside the existing `job_frozen.json` write + git commit — the agent can tar
+   from *inside*, sidestepping orchestrator reachability) and/or the `/complete`
+   vm_upgrade branch (`main.py:11009`) for pod workspaces the orchestrator can reach.
+2. **Flip `CHECKPOINTER_BACKEND` to `postgres` in the chart** (the saver exists,
+   `agent.py:1073`; cross-pod checkpointer is live-verified) so reasoning state
+   never lives only inside the workspace. Treat "checkpoint persisted" as part of
+   the freeze contract.
+3. **VM capture:** until the persistent-rootdisk feature lands
+   ([`../features/vm_persistent_rootdisk.md`](../features/vm_persistent_rootdisk.md)
+   — the proper substrate; disk survives VM deletion, reattached by name), either
+   snapshot from inside the guest (agent-side tar-to-S3 at freeze, as in (1)) or
+   accept `ORCHESTRATOR_HAS_TAILNET_ROUTE`. Do **not** build on
+   `orchestrator_can_reach` for VM tier — it is `False` by construction
+   (`ssh_helpers.py:49`).
+4. **Archive is the cross-tier contract:** workspace-root-relative tar, one
+   canonical uid across workspace image and VM golden image, extract with
+   `--numeric-owner` by the provisioner (init-container for pods; cloud-init /
+   VM-controller first-boot pull-from-MinIO for VMs) *before* the agent attaches.
+   Container→VM restore then falls out for free. Avoid virtiofs as a restore
+   transport (uid-mapping traps). No fsfreeze needed — the workload is stopped;
+   `sync` in-guest before a VM tar.
+5. Everything between freeze and snapshot must be **idempotent** — on restore the
+   graph re-enters at the checkpoint and the gated tool call is replayed
+   (LangGraph re-executes pre-interrupt code; this is our exact failure shape if
+   restore replays a partial turn).
 
-*(This supersedes the earlier "don't reap while a request is open / hold the workspace
-for 24 h" framing — reaping is fine and desirable; the workspace just has to be
-restorable and the decision has to trigger the restore.)*
+### Fix 2 — warm grace, then reap; TTL decoupled from workspace lifetime
 
-Secondary — capability model + UX (decided 2026-07-09):
+*Exists:* the suspension sweep already implements snapshot-then-free after
+**`WORKSPACE_IDLE_TIMEOUT` (default 30 min)** for `paused`/`pending_review`/
+`waiting_for_reply` jobs (`workspace_suspension.py:781,102-104,828-843`); the
+orphan age-gate shows the predicate pattern (`_orphan_grace_s`,
+`workspace_manager.py:378`).
 
-4. **Auto-deny an approval the requester can never satisfy — don't ask a human.** At
-   gate time, resolve the requesting user's capabilities. If they do **not** hold the
-   capability the agent is asking for (e.g. no VM grant), there is no decision for the
-   operator to make: **auto-deny immediately** and let the job continue *without* the
-   privilege — the agent receives a denied tool result and adapts (or freezes on its
-   own terms) — rather than pausing indefinitely on an unanswerable request. Only raise
-   an approval to a human when the user *could* actually grant it. (This also removes
-   the "workspace reaped under a request that could never be honoured" case entirely for
-   ungrantable users.)
-5. **Admins bypass grants (or are seeded with max-level grants).** The root trigger
-   here was that the requester was an **admin** but still had no VM grant — the grant
-   system was introduced *after* he became admin, and he didn't know he had to open
-   Grants and self-assign VM. An admin should never be blocked by a capability they can
-   grant themselves. Treat `admin` as holding **all** capabilities (short-circuit the
-   grant check), or seed admins with max-level grants by default and **backfill existing
-   admins on migration** so no admin is silently missing a grant added later.
-6. **Make the job list tell the truth, and gate Resume behind the approval.** A job
-   blocked on a sudo/VM-upgrade request must show that in the **STATUS column** (e.g.
-   `Waiting · approval`) instead of a bare `Paused`/`Created` (see screenshot — the row
-   shows `Created` + a green **Resume** button with no hint an approval is pending). For
-   such a job, **replace the Resume action with an "Approve request" button that
-   deep-links to the pending request in the notification center**, so the operator
-   *cannot* Resume without first approving or denying it. Resume must be unreachable for
-   an approval-blocked job; the approval email's deep-link should also land on that
-   Approve control, not the job's Resume button.
+*Add:* a grace gate for `paused` in **both** managers' `is_idle`/`is_reapable`
+(`workspace_manager.py:232/252`, `vm_manager.py:196`): plumb a
+`paused_at`/`last_activity` timestamp into `Instance.metadata` in `list_instances`
+(currently absent) and treat `paused` as reapable only after the grace window
+(reuse/align with `WORKSPACE_IDLE_TIMEOUT`; 30–60 min matches the
+Codespaces/Gitpod/Coder consensus). Fast approver → instant lossless resume on the
+warm workspace; slow approver → pays a restore. The `sudo_approval_requests` 24 h
+TTL is untouched and fully decoupled. Retain the S3 archive for as long as the job
+is paused, plus ~30 days past terminal (extend when uncommitted git changes exist —
+Gitpod's 14-vs-28-day distinction).
+
+### Fix 3 — restore-and-decide; a real deny path; unwedge the generic endpoints
+
+*Exists:* the approve skeleton `upgrade_job_to_vm` (`main.py:8691-8817`) +
+dispatcher Continue-as-New contract (`get_dispatchable_jobs` `postgres.py:3099-3161`,
+CAS claim `:2950-2979`, `pause_job` `:973-1002`) + fresh-agent resume
+(`restore_todo_state`, `graph.py:3532-3586`). The tier-upgrade design doc names this
+the template (`docs/features/workspace_tier_upgrade.md` §2.1; its W3 worker-VM arm
+is explicitly deferred — this fix is effectively W3).
+
+*Add:*
+1. **Approve:** extend `upgrade_job_to_vm` (or the fresh-agent resume path,
+   `_resume_job_on_agent` `main.py:2155`) to **restore the archive + checkpoint into
+   the newly provisioned VM** before the graph re-enters; the gated command then
+   re-runs under `sudo_action="allow"`. Keep approval and resume as **two steps**
+   (approval never auto-guarantees the run — re-provisioning can fail and must
+   surface, not silently wedge; GitLab's model). Bound the upgraded VM's elevated
+   lifetime rather than leaving open-ended escalation (AWS-TEAM lesson).
+2. **Deny (new):** like `upgrade_job_to_vm` but without `vm.requested`: clear
+   `freeze_data`, unassign, re-provision the **original tier**, restore, and
+   **inject a denied tool result** into the checkpointed history so the gated
+   `run_command` returns *who denied it, why, and what to do instead* (e.g. "sudo
+   denied by operator — continue without elevated privileges; do not re-attempt
+   sudo"). Reason-less denials demonstrably cause agent retry loops. Make the
+   denial **sticky** for the job so a re-request of the same escalation auto-denies
+   without re-freezing.
+3. **Unwedge the generic surface (D2):** `approve_request`/`deny_request` must
+   branch on `request_type='vm_upgrade'` (uniquely identified by
+   `nats_reply_subject IS NULL`) and dispatch to (1)/(2) — so the generic REST
+   endpoints (`main.py:8092-8126`) and the MCP tools (`server.py:2596-2643`) drive
+   the job instead of only flipping the row.
+4. **Decision hygiene:** decisions idempotent and bound to the immutable request id
+   (first-decider-wins, second decision = visible no-op — PIM; never "the currently
+   pending item" — GitLab's stacking race); a TTL-expired request **rejects** late
+   decisions (Step-Functions stale-token model).
+5. **Expiry:** when the 24 h TTL lapses undecided, fail the job loudly with an
+   explicit **`vm_upgrade_expired`** reason ("approval window closed; re-run") —
+   never route it through the generic `workspace_unavailable` recovery-exhausted
+   arm (`main.py:10588-10605`).
+
+### Fix 4 — auto-deny an approval the requester can never satisfy
+
+*Insertion point:* `main.py:11009` (the `ft == "vm_upgrade_required"` branch of the
+`/complete` handler), **before** `insert_vm_upgrade_request` — the job row,
+`postgres_db.get_user`, `user_can_use_vm`, `resolve_grants_for` + `evaluate` are
+all in scope there. `SudoGateService` itself holds only a DB pool; the check does
+not belong inside it.
+
+```python
+owner = await postgres_db.get_user(str(job["user_id"])) if job.get("user_id") else None
+can_satisfy = owner and (owner.get("is_admin") or await postgres_db.user_can_use_vm(owner))
+if not can_satisfy:
+    # No decision a human can make → don't raise an unanswerable approval.
+    # Route directly to the fix-3 deny arm (original tier + denied tool result).
+else:
+    sudo_request_id = await sudo_gate.insert_vm_upgrade_request(...)
+```
+
+This is standard JIT-access practice, not an optimization (Teleport rejects
+unsatisfiable requests at creation by construction; GCP PAM only lets entitled
+principals request). **Still write the auto-denied request row** (status
+`auto_denied` — the enum already exists in `list_sudo_requests`) for audit parity.
+Ensure the deny arm prevents the job from ever reaching dispatch with
+`context.vm.requested=true` for an ungrantable user — otherwise the dispatcher's
+`_check_vm_permission` (`main.py:3906`) fails it with a generic 403 (D3).
+
+### Fix 5 — admin semantics: harden + make the data/UI tell the truth
+
+Option A (short-circuit) is **already implemented** at every choke point (see D4).
+Remaining work:
+1. **Harden `postgres_db.user_can_use_vm`** (`postgres.py:9203`) with an
+   `is_admin` guard — the one admin-agnostic primitive, and a direct dependency of
+   fix #4's predicate.
+2. **Option B for robustness (recommended):** seed admin grants at user creation
+   (`upsert_user_from_oidc`, `postgres.py:6991/7079` — currently seeds **no** grant
+   rows for anyone) + a one-time backfill migration
+   (`0049_backfill_admin_grants.sql`, following 0030's idempotent
+   `INSERT … SELECT … ON CONFLICT DO NOTHING` precedent, lines 51-66, filtered
+   `WHERE is_admin = TRUE`: `vm_workspace=true`, optionally `shell_tools`,
+   `delegation`, `autonomy_ceiling='full'`, `permission_mode='autonomous'`). This
+   fixes the *data* so no future callsite needs to special-case admin — enforcement
+   is currently spread across ≥6 PEP sites and only the PDP + `user_can_use_vm` are
+   central.
+3. **UI truth (the actual incident confusion):** the Grants page / `/api/users/me/
+   capabilities` should render admins as "Admin — unrestricted" instead of an empty
+   grant list that reads as "no permission". Mirror PIM/PAM: bypass = auto-approve
+   *with a record*, never a silent absence.
+
+### Fix 6 — job list tells the truth; Resume gated behind the decision
+
+*Exists:* inbox deep-link + controls + email link (see D5) — no routing or email
+work needed.
+
+*Add (smallest honest version):*
+1. **SQL:** in both jobs-list builders (`postgres.py` `get_jobs` :691-704,
+   `get_visible_jobs` :767-780 — both already compute booleans via LEFT JOIN) add
+   `EXISTS(SELECT 1 FROM sudo_approval_requests s WHERE s.job_id=j.id AND
+   s.status='pending' AND s.expires_at>NOW()) AS pending_approval` plus the request
+   id via `LEFT JOIN LATERAL … LIMIT 1` so the button can deep-link without a
+   second fetch.
+2. **Model:** add both fields to `JobSummary`
+   (`cockpit/src/app/core/models/audit.model.ts:104-127`).
+3. **Chip:** in the status cell (`job-list.component.ts:181-200`, tone map
+   `jobStatusTone` :1108-1128) render `Waiting · approval` with a warning tone when
+   `pending_approval` (today `paused`→neutral, `created`→info — the bland chip from
+   the incident screenshot).
+4. **Button:** guard the Resume `@if` (:305 desktop) and the mobile kebab item
+   (:223) with `&& !row.job.pending_approval`; add an **"Approve request"**
+   button/menu-item when `pending_approval`, navigating
+   `router.navigate(['/inbox'], { queryParams: { sudo: pending_approval_request_id } })`
+   (pattern: `goToReview()` :1276). Resume becomes unreachable for an
+   approval-blocked job. GitHub-Actions precedent: an explicit "Waiting" state in
+   run lists.
+5. i18n strings (`jobs.status.waiting_approval`, `jobs.action.approveRequest`).
+
+*Fuller version:* subscribe the list to the sudo SSE `request_decided` event
+(`sudo.service.ts:180`) so the chip clears instantly; carry `request_type` +
+`expires_at` for a countdown; a "Waiting · approval" filter chip; reword the email
+button "Reply in Cockpit" → "Approve in Cockpit".
+
+### Suggested sequencing
+
+1. **Fix 6 + D2-unwedge (fix 3.3) + fix 4 + fix 5.1** — small, independent, stop
+   the silent wedges and the misleading UX immediately; no reaper/snapshot risk.
+2. **Fix 1 (capture at pause) + fix 2 (grace)** — makes the reap non-destructive;
+   pods first (infrastructure exists), VMs ride on persistent-rootdisk or
+   agent-side capture.
+3. **Fix 3.1/3.2 (restore-on-approve, deny path) + 3.4/3.5 (hygiene, expiry)** —
+   completes restore-and-decide.
+4. **Fix 5.2/5.3** — data seeding + UI truth, anytime.
+
+## Prior art (verified 2026-07-09, primary sources)
+
+- **No surveyed system holds compute for a pending approval** — Teleport/PIM/PAM/
+  AWS-TEAM decouple access from workload; Temporal/Step Functions/Airflow release
+  compute and resume on signal; GitHub's 30-day warm "Waiting" runs are the
+  cautionary tale.
+- **Auto-deny unsatisfiable requests at creation** is how Teleport
+  (`allow.request.roles`) and GCP PAM (entitlement principals) work by construction.
+- **Admin bypass = auto-approve with a record** (PIM/PAM), never a silent no-record
+  path.
+- **Denial must carry reason + alternative and be sticky** — OpenAI Agents SDK
+  `reject({message})` / `alwaysReject`; bare denials produce documented retry loops.
+- **Decision hygiene:** first-decider-wins + notify (PIM); decisions bound to
+  immutable request ids (GitLab approval-stacking race); expired gates reject late
+  decisions (Step Functions token regeneration).
+- **Tar-to-object-storage is the production pattern for workspace pause** (Gitpod
+  Classic); CSI snapshots unavailable on k3s local-path; VMM memory snapshots
+  (savevm ~9× write amplification; Firecracker path/host-bound, disks excluded) are
+  the wrong tool when process state is externally checkpointed.
+- **Idle-grace consensus ~30 min** (Codespaces 30 min default; Gitpod 30 min;
+  Coder activity-bumped), three-stage lifecycle (running → stopped-restorable →
+  deleted after weeks), retention extended for uncommitted changes.
 
 ## Recovery for this incident
 
-Not resumable — the workspace is gone and the failure is a destroyed VM workspace, not
-a permission denial, so granting VM permission (already done) does not un-fail it. The
-Phase-8 work **is** preserved in Gitea repo `job-b5b0c0d0` (20 commits through
-`04b82c19`), and the research subjob output is in OpenCloud
-(`sessions/job-f8326e32a3ea`). Re-run as a **fresh VM-backed job**, optionally seeded
-from the `job-b5b0c0d0` repo so the prior phases aren't redone. Clean up the orphaned
-`PENDING` request `98d88547` (deny or let it expire).
+Not resumable — the workspace is gone and the failure is a destroyed VM workspace.
+(The VM grant added afterwards was likely unnecessary — the creator is an admin and
+bypasses the check; see D4.) The Phase-8 work **is** preserved in Gitea repo
+`job-b5b0c0d0` (20 commits through `04b82c19`), and the research subjob output is in
+OpenCloud (`sessions/job-f8326e32a3ea`). Re-run as a **fresh VM-backed job**,
+optionally seeded from the `job-b5b0c0d0` repo. Clean up the orphaned `PENDING`
+request `98d88547` (deny or let it expire).
 
-**Operational caveat (2026-07-08):** VM jobs on the main cluster are currently wedged
-independently by the orchestrator-vantage SSH-readiness gate (`96c33654`, live via
-`sha-69a4da6`) — the orchestrator has no tailnet route so the probe can never pass. A
-"re-run on VM" recovery will not actually dispatch until that is resolved. Track
-separately (VM SSH-readiness saga).
+**Operational caveat (2026-07-08):** VM jobs on the main cluster are currently
+wedged independently by the orchestrator-vantage SSH-readiness gate (`96c33654`,
+live via `sha-69a4da6`) — the orchestrator has no tailnet route so the probe can
+never pass. A "re-run on VM" recovery will not dispatch until that is resolved.
+Track separately (VM SSH-readiness saga). Note this is the *same* missing tailnet
+route that makes VM snapshots a no-op (fix 1.3) — one route/rootdisk decision
+serves both.
 
 ## Related
 
-- [`deleted_job_orphans_workspace_pod.md`](deleted_job_orphans_workspace_pod.md) — the
-  *inverse* failure (deleted-row pods that never get reaped); shares the
+- [`deleted_job_orphans_workspace_pod.md`](deleted_job_orphans_workspace_pod.md) —
+  the *inverse* failure (deleted-row pods never reaped); shares the
   `is_idle`/`is_reapable` predicates edited here.
 - [`agent_fast_freeze_on_dead_workspace.md`](agent_fast_freeze_on_dead_workspace.md) —
-  make workspace loss survivable/quick-to-freeze; the recovery consumer this incident
-  lands in.
+  make workspace loss survivable/quick-to-freeze; the recovery consumer this
+  incident lands in.
 - [`loop_job_workspace_lost_wedged_in_recovery.md`](loop_job_workspace_lost_wedged_in_recovery.md)
   — the recovery arm that fails after `WORKSPACE_RECOVERY_MAX_ATTEMPTS`.
 - [`reviewing_parent_pod_reaped_under_critic.md`](reviewing_parent_pod_reaped_under_critic.md)
-  — origin of the `has_live_shared_child` reap guard; a new "pending-approval" guard
-  should follow the same pattern.
-- `docs/features/workspace_tier_upgrade.md` — the VM-upgrade design this gate implements.
+  — origin of the `has_live_shared_child` reap guard.
+- `docs/features/workspace_tier_upgrade.md` — the VM-upgrade design; its deferred
+  **W3** (operator-gated worker `*→vm` re-dispatch) is effectively fix 3 here.
+- [`../features/vm_persistent_rootdisk.md`](../features/vm_persistent_rootdisk.md) —
+  the durable substrate for VM-tier capture (fix 1.3).

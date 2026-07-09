@@ -1146,6 +1146,7 @@ def _session_backend_is_lite(config: Optional[Dict[str, Any]]) -> bool:
 
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
+_WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
 
 
 def _apply_session_tool_group_markers(
@@ -1159,6 +1160,7 @@ def _apply_session_tool_group_markers(
     group_markers = {
         "orchestrator": _FLEET_MANAGEMENT_DISABLED_KEY,
         "agent_catalog": _AGENT_CATALOG_DISABLED_KEY,
+        "workflows": _WORKFLOWS_DISABLED_KEY,
     }
     for group, marker in group_markers.items():
         if group not in tools:

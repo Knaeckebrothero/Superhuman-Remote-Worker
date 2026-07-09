@@ -177,6 +177,9 @@ tools:
   # Agent catalog tools - expert/skill management
   # Empty by default; persistent agents auto-load these via PersistentSession
   agent_catalog: [ ]
+  # Workflow tools - automations and project loop inspection
+  # Empty by default; persistent agents auto-load safe defaults via PersistentSession
+  workflows: [ ]
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log

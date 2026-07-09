@@ -111,6 +111,8 @@ tools:
   orchestrator: [ ]
   # Expert/skill catalog tools auto-injected by PersistentSession._setup_tools()
   agent_catalog: [ ]
+  # Automation and project-loop workflow tools auto-injected by PersistentSession._setup_tools()
+  workflows: [ ]
   # Phase-specific tools not used in persistent mode
   core: [ ]
   # Datasource-injected (empty by default)

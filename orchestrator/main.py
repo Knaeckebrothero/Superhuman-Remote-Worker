@@ -2685,10 +2685,13 @@ def _validated_session_workspace_override(
     return ws
 
 
-_SESSION_CREATE_TOOL_OVERRIDE_KEYS = frozenset({"orchestrator", "agent_catalog"})
+_SESSION_CREATE_TOOL_OVERRIDE_KEYS = frozenset(
+    {"orchestrator", "agent_catalog", "workflows"}
+)
 _SESSION_TOOL_DISABLED_MARKERS = {
     "orchestrator": "_fleet_management_disabled",
     "agent_catalog": "_agent_catalog_disabled",
+    "workflows": "_workflows_disabled",
 }
 
 
@@ -2736,6 +2739,13 @@ def _agent_catalog_explicitly_disabled(
 ) -> bool:
     tools = (config_override or {}).get("tools")
     return isinstance(tools, dict) and tools.get("agent_catalog") == []
+
+
+def _workflows_explicitly_disabled(
+    config_override: dict[str, Any] | None,
+) -> bool:
+    tools = (config_override or {}).get("tools")
+    return isinstance(tools, dict) and tools.get("workflows") == []
 
 
 def _session_tool_group_disabled_markers(
