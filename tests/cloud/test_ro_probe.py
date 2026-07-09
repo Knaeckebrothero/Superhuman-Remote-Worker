@@ -26,6 +26,11 @@ class _FakeResp:
 class _FakeClient:
     """Returns a per-verb status from a dict; defaults to 403 (rejected).
 
+    ``PROPFIND`` (the Finding 1 positive read control) defaults to 207
+    instead — a fake RO identity that is live and can read the target,
+    which is what every pre-existing happy-path test intends. Override
+    ``statuses["PROPFIND"]`` explicitly to exercise a failing read control.
+
     ``raises`` maps a verb to an exception instance raised instead of
     returning a response — used to simulate transport failures (timeouts,
     connection errors) for the fail-closed transport-error path.
@@ -37,7 +42,8 @@ class _FakeClient:
     async def request(self, method, url, **kw):
         if method in self._raises:
             raise self._raises[method]
-        return _FakeResp(self._s.get(method, 403))
+        default = 207 if method == "PROPFIND" else 403
+        return _FakeResp(self._s.get(method, default))
 
 
 @pytest.mark.asyncio
@@ -107,6 +113,78 @@ def test_mutating_verbs_no_longer_contain_fake_post_side_channels():
 # ---------------------------------------------------------------------------
 # Finding 1 — transport exceptions must fail closed
 # ---------------------------------------------------------------------------
+
+
+class _BlanketStatusClient:
+    """Every request — the read control included — gets the same status.
+
+    Models a wrong/expired RO credential: the server 401s indiscriminately,
+    on the read-control PROPFIND *and* on every mutating verb. This is
+    exactly the shape of the whole-branch-review Finding 1 bug: with the
+    old ``REJECTED_STATUSES = {401, 403, 405}``, every mutation-401 counted
+    as "verified rejected" -> ``ok=True`` having authenticated nothing.
+    """
+
+    def __init__(self, status):
+        self._status = status
+
+    async def request(self, method, url, **kw):
+        return _FakeResp(self._status)
+
+
+@pytest.mark.asyncio
+async def test_blanket_401_is_not_ok_finding_1_positive_read_control():
+    # THE BUG (whole-branch review, Finding 1): a client that 401s on
+    # everything — including the read-control PROPFIND — must NOT report
+    # ok=True. Before the fix this assertion is FALSE (old code had no
+    # positive read control, and 401 was in REJECTED_STATUSES, so a
+    # blanket-401 server sailed through as "read-only verified").
+    # RED (pre-fix): res.ok is True, so `assert res.ok is False` fails.
+    # GREEN (post-fix): the read control fails (PROPFIND -> 401, not 2xx),
+    # recorded in `failures`, and `ok` is False.
+    client = _BlanketStatusClient(401)
+    res = await probe_read_only(
+        client,
+        "https://cloud/dav",
+        "folder/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+    )
+    assert res.ok is False
+    assert any(
+        "read control failed" in f and "PROPFIND" in f for f in res.failures
+    )
+
+
+@pytest.mark.asyncio
+async def test_positive_read_control_passes_and_mutations_rejected_is_ok():
+    # Positive control passes (PROPFIND Depth:0 -> 207) and every mutation
+    # is genuinely rejected (403 default) -> ok is True. This is the
+    # legitimate RO-identity shape the probe exists to certify.
+    res = await probe_read_only(
+        _FakeClient({}),
+        "https://cloud/dav",
+        "folder/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+    )
+    assert res.ok is True
+    assert res.failures == []
+
+
+@pytest.mark.asyncio
+async def test_read_control_passes_but_401_mutation_fails_closed():
+    # Finding 1 also drops 401 from REJECTED_STATUSES: once the credential
+    # is proven live (read control passes), a genuine RO identity should
+    # only ever see 403/405 on a mutation. A 401 here is anomalous (the
+    # credential that just read fine is being told "unauthenticated" on a
+    # write attempt) and must fail closed, not be read as "rejected".
+    res = await probe_read_only(
+        _FakeClient({"PUT": 401}), "https://cloud/dav", "f/"
+    )
+    assert res.ok is False
+    put_failure = next(f for f in res.failures if f.startswith("PUT"))
+    assert "401" in put_failure
 
 
 @pytest.mark.asyncio
@@ -261,6 +339,11 @@ async def test_side_channel_404_is_inconclusive_and_refuses():
     # findings).
     class _404ForSideChannelsClient:
         async def request(self, method, url, **kw):
+            if method == "PROPFIND":
+                # Positive read control passes — this test is about
+                # side-channel 404s being inconclusive, not about the
+                # read control itself.
+                return _FakeResp(207)
             if "/remote.php/" in url:
                 return _FakeResp(404)
             return _FakeResp(403)
@@ -284,6 +367,10 @@ async def test_side_channel_201_flips_ok_false():
     # only the deliberate versions-restore 201 is under test.
     class _OneSucceedsClient:
         async def request(self, method, url, **kw):
+            if method == "PROPFIND":
+                # Positive read control passes — this test is about the
+                # one deliberately-open mutation, not the read control.
+                return _FakeResp(207)
             if method == "MOVE" and "/versions/" in url:
                 return _FakeResp(201)
             if "/remote.php/" in url:
