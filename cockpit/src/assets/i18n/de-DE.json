@@ -294,7 +294,8 @@
       "completed": "Abgeschlossen",
       "paused": "Pausiert",
       "failed": "Fehlgeschlagen",
-      "cancelled": "Abgebrochen"
+      "cancelled": "Abgebrochen",
+      "waiting_approval": "Wartet · Freigabe"
     },
     "action": {
       "view": "Ansehen",
@@ -312,7 +313,8 @@
       "promote": "Heraufstufen",
       "createProject": "Projekt erstellen",
       "exportToCloud": "Cloud-Ordner öffnen",
-      "exported": "Exportiert"
+      "exported": "Exportiert",
+      "approveRequest": "Anfrage freigeben"
     },
     "tooltip": {
       "collapse": "Unteraufträge einklappen",
@@ -338,7 +340,8 @@
       "snapshotStats": "S3-Snapshot-Speicher",
       "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
       "delegationWaiting": "Warte auf Abschluss der Delegations-Unteraufträge",
-      "delegationChild": "Delegations-Unterauftrag (Erstellungsreihenfolge {{order}})"
+      "delegationChild": "Delegations-Unterauftrag (Erstellungsreihenfolge {{order}})",
+      "approveRequest": "Dieser Auftrag wartet auf eine Sudo-/VM-Upgrade-Entscheidung — Anfrage im Posteingang öffnen"
     },
     "delegationChildren": "{{count}} Unteraufträge",
     "promote": {

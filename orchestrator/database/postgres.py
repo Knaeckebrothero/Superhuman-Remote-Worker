@@ -695,9 +695,18 @@ class PostgresDB:
                        j.repo_name, j.branch_name, j.merge_status,
                        j.diff_status, j.exported_at, j.created_at,
                        j.context->'snapshot'->>'status' AS snapshot_status,
-                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
+                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
+                       (pa.id IS NOT NULL) AS pending_approval,
+                       pa.id AS pending_approval_request_id
                 FROM jobs j
                 LEFT JOIN projects p ON p.id = j.project_id
+                LEFT JOIN LATERAL (
+                    SELECT s.id FROM sudo_approval_requests s
+                    WHERE s.job_id = j.id AND s.status = 'pending'
+                      AND s.expires_at > NOW()
+                    ORDER BY s.requested_at DESC
+                    LIMIT 1
+                ) pa ON TRUE
                 {where_clause}
                 ORDER BY j.created_at DESC
                 LIMIT ${param_count}
@@ -771,9 +780,18 @@ class PostgresDB:
                        j.repo_name, j.branch_name, j.merge_status,
                        j.diff_status, j.exported_at, j.created_at,
                        j.context->'snapshot'->>'status' AS snapshot_status,
-                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
+                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
+                       (pa.id IS NOT NULL) AS pending_approval,
+                       pa.id AS pending_approval_request_id
                 FROM jobs j
                 LEFT JOIN projects p ON p.id = j.project_id
+                LEFT JOIN LATERAL (
+                    SELECT s.id FROM sudo_approval_requests s
+                    WHERE s.job_id = j.id AND s.status = 'pending'
+                      AND s.expires_at > NOW()
+                    ORDER BY s.requested_at DESC
+                    LIMIT 1
+                ) pa ON TRUE
                 {where_clause}
                 ORDER BY j.created_at DESC
                 LIMIT ${param_count}
@@ -9202,7 +9220,14 @@ class PostgresDB:
 
     async def user_can_use_vm(self, user: dict) -> bool:
         """Effective vm_workspace grant; fall back to the legacy can_use_vm column
-        during rollout / on grant-read failure (per-capability fail-mode)."""
+        during rollout / on grant-read failure (per-capability fail-mode).
+
+        Admins short-circuit to True — grants restrict non-admins only (the PDP
+        takes ``is_admin`` the same way). Without this, a direct caller that
+        doesn't pre-check ``is_admin`` (unlike ``_check_vm_permission``) would
+        misclassify an admin with zero grant rows as un-entitled."""
+        if user.get("is_admin"):
+            return True
         try:
             scoped = await self.list_grants_for_scopes(
                 user_id=str(user["id"]), project_ids=[]
@@ -9222,6 +9247,44 @@ class PostgresDB:
         except Exception:
             logger.exception("vm grant read failed; fall back to can_use_vm column")
         return bool(user.get("can_use_vm"))
+
+    # Max-level user-scope grants for admins. Admins bypass the PDP at every
+    # PEP, so these rows change no enforcement outcome — they make the DATA
+    # tell the truth (Grants UI, and any future admin-agnostic caller) instead
+    # of an empty grant list that reads as "no permission". Kept in lockstep
+    # with migration 0049_backfill_admin_grants.sql. NOTE: on admin DEMOTION
+    # these become live grants for the ex-admin — review them then.
+    _ADMIN_GRANT_SEED: tuple[tuple[str, str], ...] = (
+        ("vm_workspace", "true"),
+        ("shell_tools", "true"),
+        ("delegation", "true"),
+        ("autonomy_ceiling", '"full"'),
+        ("permission_mode", '"autonomous"'),
+    )
+
+    async def seed_admin_grants(self, user_id: str) -> None:
+        """Idempotently seed max-level user-scope grants for an admin user.
+
+        Called on first admin login and on promotion to admin (auth.py);
+        existing admins are backfilled by migration 0049. Best-effort — a
+        failure never blocks authentication.
+        """
+        try:
+            async with self.acquire() as conn:
+                for key, value_json in self._ADMIN_GRANT_SEED:
+                    await conn.execute(
+                        """
+                        INSERT INTO capability_grants
+                            (scope_kind, scope_id, key, value_json, granted_by)
+                        VALUES ('user', $1, $2, $3::jsonb, NULL)
+                        ON CONFLICT (scope_kind, scope_id, key) DO NOTHING
+                        """,
+                        UUID(str(user_id)),
+                        key,
+                        value_json,
+                    )
+        except Exception:
+            logger.exception("Failed to seed admin grants for %s", user_id)
 
     # =========================================================================
     # Key/value store for deploy-time configuration that operators can edit

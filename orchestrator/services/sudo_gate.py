@@ -580,6 +580,8 @@ class SudoGateService:
         command: str,
         reason: str = "",
         config_name: str = "",
+        status: str = "pending",
+        decision_reason: str = "",
     ) -> Optional[str]:
         """Insert a vm_upgrade request into sudo_approval_requests.
 
@@ -587,36 +589,64 @@ class SudoGateService:
         Unlike NATS sudo requests, these have no reply subject and use
         a long TTL (24h — operator decides in their own time).
 
+        ``status`` other than ``pending`` (e.g. ``auto_denied`` when the job
+        owner can never satisfy the request) records an already-decided row
+        for audit parity — decided by ``system``, no ``new_request`` SSE
+        (there is nothing for an operator to act on).
+
         Returns the request ID, or None on failure.
         """
         if not self._db:
             return None
         try:
+            metadata = json.dumps(
+                {
+                    "freeze_type": "vm_upgrade_required",
+                    "reason": reason,
+                }
+            )
             async with self._db.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO sudo_approval_requests
-                        (job_id, vm_name, command, arguments, working_directory,
-                         requesting_user, target_user, nats_reply_subject, metadata,
-                         request_type, ttl_seconds, expires_at)
-                    VALUES ($1, $2, $3, '{}', '', 'agent', 'root', NULL, $4,
-                            'vm_upgrade', 86400,
-                            NOW() + INTERVAL '86400 seconds')
-                    RETURNING id
-                    """,
-                    job_id,
-                    config_name or "container",
-                    command,
-                    json.dumps(
-                        {
-                            "freeze_type": "vm_upgrade_required",
-                            "reason": reason,
-                        }
-                    ),
-                )
+                if status == "pending":
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO sudo_approval_requests
+                            (job_id, vm_name, command, arguments, working_directory,
+                             requesting_user, target_user, nats_reply_subject, metadata,
+                             request_type, ttl_seconds, expires_at)
+                        VALUES ($1, $2, $3, '{}', '', 'agent', 'root', NULL, $4,
+                                'vm_upgrade', 86400,
+                                NOW() + INTERVAL '86400 seconds')
+                        RETURNING id
+                        """,
+                        job_id,
+                        config_name or "container",
+                        command,
+                        metadata,
+                    )
+                else:
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO sudo_approval_requests
+                            (job_id, vm_name, command, arguments, working_directory,
+                             requesting_user, target_user, nats_reply_subject, metadata,
+                             request_type, ttl_seconds, expires_at,
+                             status, decided_at, decided_by, decision_reason)
+                        VALUES ($1, $2, $3, '{}', '', 'agent', 'root', NULL, $4,
+                                'vm_upgrade', 86400,
+                                NOW() + INTERVAL '86400 seconds',
+                                $5::sudo_request_status, NOW(), 'system', $6)
+                        RETURNING id
+                        """,
+                        job_id,
+                        config_name or "container",
+                        command,
+                        metadata,
+                        status,
+                        decision_reason,
+                    )
             request_id = str(row["id"]) if row else None
 
-            if request_id:
+            if request_id and status == "pending":
                 event = {
                     "id": request_id,
                     "job_id": job_id,

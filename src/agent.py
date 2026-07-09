@@ -1351,6 +1351,7 @@ class UniversalAgent:
                 # sandbox keeps the sudo gate ("freeze") so its sudo→VM
                 # escalation path still fires; only a vm target would set "allow".
                 sudo_action=shell_config.get("sudo_action", "freeze"),
+                sudo_block_message=shell_config.get("sudo_block_message"),
             )
             await asyncio.to_thread(new_backend.connect)
         except Exception as e:
@@ -1856,6 +1857,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         "retry_timeouts_as_booting", False
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
+                    sudo_block_message=shell_config.get("sudo_block_message"),
                 )
                 workspace_backend.connect()
                 logger.info(
@@ -2582,6 +2584,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     else None,
                     backend=ws_backend,
                     sudo_action=sudo_action,
+                    sudo_block_message=shell_config.get("sudo_block_message"),
                 )
                 context.shell_manager = shell_manager
                 self._shell_manager = shell_manager

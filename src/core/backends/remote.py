@@ -139,6 +139,7 @@ class RemoteBackend(WorkspaceBackend):
         max_retries: int = 5,
         retry_timeouts_as_booting: bool = False,
         sudo_action: str = "freeze",
+        sudo_block_message: Optional[str] = None,
     ):
         if paramiko is None:
             raise ImportError(
@@ -161,6 +162,10 @@ class RemoteBackend(WorkspaceBackend):
         self._retry_timeouts_as_booting = retry_timeouts_as_booting
         self._has_connected_once = False
         self._sudo_action = sudo_action
+        # Optional custom message for sudo_action="block" — carries the
+        # operator's denial reason after a denied vm_upgrade request, so the
+        # agent gets a reasoned rejection instead of the generic block text.
+        self._sudo_block_message = sudo_block_message
 
         if blocked_commands is None:
             self._blocked_commands = DEFAULT_BLOCKED_COMMANDS
@@ -839,7 +844,7 @@ class RemoteBackend(WorkspaceBackend):
             elif self._sudo_action == "freeze":
                 return SUDO_FREEZE_SENTINEL
             else:  # "block"
-                return (
+                return self._sudo_block_message or (
                     "Command blocked: 'sudo' is not available in this workspace. "
                     "System package installation requires a VM runtime."
                 )

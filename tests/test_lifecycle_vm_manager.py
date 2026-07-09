@@ -8,6 +8,7 @@ to know which backend is active.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -416,10 +417,33 @@ class TestIsHealthy:
 
 class TestIsIdle:
     @pytest.mark.asyncio
-    async def test_paused_job_is_idle(self):
+    async def test_paused_job_is_idle_after_grace(self):
+        # 'paused' is idle only once the warm grace has passed — a fresh pause
+        # is often a human-wait (sudo/VM approval), and VM reaps are
+        # destructive. See vm_upgrade_pause_workspace_reaped_before_approval.md.
         mgr, *_ = _make_manager()
-        inst = Instance(kind="vm", id="x", metadata={"job_status": "paused"})
+        inst = Instance(
+            kind="vm",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc) - timedelta(hours=2),
+            },
+        )
         assert await mgr.is_idle(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_freshly_paused_job_is_not_idle(self):
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc),
+            },
+        )
+        assert await mgr.is_idle(inst) is False
 
     @pytest.mark.asyncio
     async def test_reviewing_without_live_child_is_idle(self):
@@ -578,12 +602,36 @@ class TestIsReapable:
         assert await mgr.is_reapable(inst) is True
 
     @pytest.mark.asyncio
-    async def test_paused_job_is_reapable(self):
+    async def test_paused_job_is_reapable_after_grace(self):
         # A paused job with no dispatchable hint (e.g. still frozen / assigned)
-        # is genuinely parked → its VM is reclaimable (idle-suspension).
+        # is genuinely parked → its VM is reclaimable (idle-suspension) once
+        # the warm grace has passed.
         mgr, *_ = _make_manager()
-        inst = Instance(kind="vm", id="x", metadata={"job_status": "paused"})
+        inst = Instance(
+            kind="vm",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc) - timedelta(hours=2),
+            },
+        )
         assert await mgr.is_reapable(inst) is True
+
+    @pytest.mark.asyncio
+    async def test_freshly_paused_job_is_not_reapable(self):
+        # The incident: a job froze on a vm_upgrade approval (24h TTL) and the
+        # reaper destroyed its VM on the next tick. Within the grace the VM
+        # must survive.
+        mgr, *_ = _make_manager()
+        inst = Instance(
+            kind="vm",
+            id="x",
+            metadata={
+                "job_status": "paused",
+                "job_updated_at": datetime.now(timezone.utc),
+            },
+        )
+        assert await mgr.is_reapable(inst) is False
 
     @pytest.mark.asyncio
     async def test_dispatchable_paused_job_not_reapable(self):
@@ -610,12 +658,17 @@ class TestIsReapable:
 
     @pytest.mark.asyncio
     async def test_non_dispatchable_paused_job_still_reapable(self):
-        # Explicit false (assigned or frozen) → idle-suspension still applies.
+        # Explicit false (assigned or frozen) → idle-suspension still applies
+        # (after the warm grace).
         mgr, *_ = _make_manager()
         inst = Instance(
             kind="vm",
             id="x",
-            metadata={"job_status": "paused", "job_dispatchable": False},
+            metadata={
+                "job_status": "paused",
+                "job_dispatchable": False,
+                "job_updated_at": datetime.now(timezone.utc) - timedelta(hours=2),
+            },
         )
         assert await mgr.is_reapable(inst) is True
 
@@ -894,6 +947,8 @@ class TestChurnRegression:
         job = {
             "id": "j-idle",
             "status": "paused",
+            # Paused long past the warm grace → genuinely parked.
+            "updated_at": datetime.now(timezone.utc) - timedelta(hours=2),
             "unassigned": True,
             "freeze_free": False,
             "context": {
