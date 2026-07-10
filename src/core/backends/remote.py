@@ -63,6 +63,12 @@ _GONE_ERRNOS = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN}
 _EXEC_MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 _EXEC_POLL_SECONDS = 0.05
 
+# Transport-level keepalive + SFTP channel timeout: without these, a
+# blackholed connection (network partition, silently-dead VM) hangs SFTP
+# reads/writes forever while holding _sftp_lock, wedging ALL file ops.
+_TRANSPORT_KEEPALIVE_SECONDS = 15
+_SFTP_OP_TIMEOUT_SECONDS = 60.0
+
 
 def _classify_connect_error(e: Exception) -> str:
     """Bucket an SSH connect failure to size the retry budget.
@@ -312,6 +318,12 @@ class RemoteBackend(WorkspaceBackend):
                 backoff = min(backoff * 2, 15.0)
 
         self._sftp = self._ssh.open_sftp()
+        transport = self._ssh.get_transport()
+        if transport is not None:
+            transport.set_keepalive(_TRANSPORT_KEEPALIVE_SECONDS)
+        sftp_chan = self._sftp.get_channel()
+        if sftp_chan is not None:
+            sftp_chan.settimeout(_SFTP_OP_TIMEOUT_SECONDS)
         self._has_connected_once = True
         logger.info(f"Connected to workspace {self._host}:{self._port}")
 
@@ -547,6 +559,10 @@ class RemoteBackend(WorkspaceBackend):
                     data = f.read()
             except FileNotFoundError:
                 raise FileNotFoundError(f"File not found: {path}")
+            except socket.timeout as e:
+                raise RemoteCommandTimeoutError(
+                    f"Workspace I/O timed out reading {path}"
+                ) from e
             except IOError as e:
                 raise FileNotFoundError(f"Cannot read {path}: {e}") from e
 
