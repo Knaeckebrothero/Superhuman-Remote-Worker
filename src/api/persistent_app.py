@@ -672,6 +672,14 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
     """Collect metrics for heartbeat."""
     metrics: Dict[str, Any] = {}
     try:
+        tool_context = _session.tool_context if _session is not None else None
+        if tool_context is not None:
+            graph_progress = tool_context.get_graph_progress()
+            metrics["graph_progress"] = graph_progress
+    except Exception:
+        pass
+
+    try:
         import psutil
 
         proc = psutil.Process()

@@ -228,6 +228,17 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
     """Get agent metrics for heartbeat reporting."""
     metrics: Dict[str, Any] = {}
     try:
+        graph_progress = (
+            _agent._tool_context.get_graph_progress()
+            if _agent is not None and _agent._tool_context is not None
+            else None
+        )
+        if graph_progress is not None:
+            metrics["graph_progress"] = graph_progress
+    except Exception:
+        pass
+
+    try:
         import psutil
 
         process = psutil.Process()
