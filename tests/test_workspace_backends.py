@@ -1788,3 +1788,25 @@ class TestBackendInterfaceCompliance:
         ]
         for method in shell_methods:
             assert hasattr(backend, method), f"RemoteBackend missing {method}"
+
+
+class TestConnectionHardening:
+    """Tests for transport keepalive + SFTP channel timeout hardening."""
+
+    def test_connect_sets_keepalive_and_sftp_timeout(self, remote_backend):
+        """A blackholed connection must eventually error, not wait forever:
+        transport keepalive + a socket timeout on the shared SFTP channel
+        (which serializes ALL file ops behind _sftp_lock)."""
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_ssh.get_transport.return_value.set_keepalive.assert_called_with(15)
+        mock_sftp.get_channel.return_value.settimeout.assert_called_with(60.0)
+
+    def test_read_file_timeout_is_not_file_not_found(self, remote_backend):
+        """socket.timeout is an OSError; without special-casing it,
+        read_file reports a hung workspace as 'file not found'."""
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_sftp.open.side_effect = socket.timeout("timed out")
+        with pytest.raises(RemoteCommandTimeoutError, match="timed out reading"):
+            backend.read_file("some/file.md")
