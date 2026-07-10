@@ -329,7 +329,12 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error deleting: {str(e)}"
 
     @tool
-    def search_files(query: str, path: str = "", case_sensitive: bool = False) -> str:
+    def search_files(
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
+    ) -> str:
         """Search for text content in workspace files.
 
         Searches through all text files and returns matching lines
@@ -339,6 +344,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             query: Text or pattern to search for
             path: Directory to search in (empty for entire workspace)
             case_sensitive: Whether to match case exactly
+            exclude_dirs: Optional list of directory names to skip with grep
+                --exclude-dir
 
         Returns:
             Search results with file paths, line numbers, and matching lines
@@ -353,7 +360,10 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 return format_workspace_cloud_search_guard_message(path)
 
             results = workspace.search_files(
-                query, path=path, case_sensitive=case_sensitive
+                query,
+                path=path,
+                case_sensitive=case_sensitive,
+                exclude_dirs=exclude_dirs,
             )
 
             if not results:

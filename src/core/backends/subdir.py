@@ -116,9 +116,15 @@ class SubdirBackend:
         return [self._strip(e) for e in entries]
 
     def search_files(
-        self, query: str, path: str = "", case_sensitive: bool = False
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
     ) -> List[dict]:
-        results = self._parent.search_files(query, self._p(path), case_sensitive)
+        results = self._parent.search_files(
+            query, self._p(path), case_sensitive, exclude_dirs=exclude_dirs
+        )
         out = []
         for r in results:
             r = dict(r)

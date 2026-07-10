@@ -8,8 +8,10 @@ reflection/freeze, hard caps, and tool-not-found enrichment.
 See docs/features/stuck_agent_recovery.md for the full design.
 """
 
+import asyncio
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -26,6 +28,7 @@ if str(src_path) not in sys.path:
 
 from src.graph import create_audited_tool_node  # noqa: E402
 from src.core.loader import LimitsConfig  # noqa: E402
+from src.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
 
 
 # =============================================================================
@@ -803,6 +806,142 @@ class TestCategoryFailureTracking:
                 assert not any("restricted" in (m.content or "") for m in tool_msgs)
                 # But the error from the tool itself should be there
                 assert any("not configured" in (m.content or "") for m in tool_msgs)
+
+
+class TestToolNodeTimeoutEscalation:
+    """Tests for audited tool-node timeout behavior and reconnect/failure handoff."""
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_reconnects_and_returns_error_once(self):
+        """A first timeout disconnects and reconnects, then returns timeout errors."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "search_files"
+
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("search_files", "ok", "call_t")]}
+
+        backend = MagicMock()
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            start = time.perf_counter()
+            result = await audited(
+                make_state(
+                    [make_tool_call("search_files", {"query": "needle"}, "call_t")]
+                )
+            )
+            elapsed = time.perf_counter() - start
+
+        msgs = [m for m in result.get("messages", []) if isinstance(m, ToolMessage)]
+        assert len(msgs) == 1
+        assert "timed out" in (msgs[0].content or "").lower()
+        assert elapsed >= 1.0
+        assert elapsed < 2.0
+        backend.disconnect.assert_called_once()
+        backend.connect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_repeated_raises_workspace_unavailable(self):
+        """A second timeout without recovery raises WorkspaceUnavailableError."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "search_files"
+
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("search_files", "ok", "call_t")]}
+
+        backend = MagicMock()
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            await audited(
+                make_state(
+                    [make_tool_call("search_files", {"query": "needle"}, "call_t")]
+                )
+            )
+
+            with pytest.raises(WorkspaceUnavailableError):
+                await audited(
+                    make_state(
+                        [make_tool_call("search_files", {"query": "needle"}, "call_t2")]
+                    )
+                )
+
+        assert backend.disconnect.call_count == 1
+        assert backend.connect.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_reconnect_failure_raises_workspace_unavailable(
+        self,
+    ):
+        """If reconnect fails, timeout escalates immediately to WorkspaceUnavailableError."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "search_files"
+
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("search_files", "ok", "call_t")]}
+
+        backend = MagicMock()
+        backend.connect.side_effect = RuntimeError("can't connect")
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            with pytest.raises(WorkspaceUnavailableError):
+                await audited(
+                    make_state(
+                        [make_tool_call("search_files", {"query": "needle"}, "call_t")]
+                    )
+                )
+
+        backend.disconnect.assert_called_once()
+        backend.connect.assert_called_once()
 
 
 # =============================================================================

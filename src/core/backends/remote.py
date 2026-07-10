@@ -68,6 +68,10 @@ _EXEC_POLL_SECONDS = 0.05
 # reads/writes forever while holding _sftp_lock, wedging ALL file ops.
 _TRANSPORT_KEEPALIVE_SECONDS = 15
 _SFTP_OP_TIMEOUT_SECONDS = 60.0
+_TCP_KEEPALIVE_IDLE_SECONDS = 10
+_TCP_KEEPALIVE_COUNT = 3
+_TCP_KEEPALIVE_INTERVAL_SECONDS = 5
+_TCP_USER_TIMEOUT_MILLIS = 10_000
 
 # Explicit deadlines for heavy/recursive remote ops. Now that _exec's
 # deadline actually binds (drain-loop fix), these need generous budgets or
@@ -327,6 +331,66 @@ class RemoteBackend(WorkspaceBackend):
         transport = self._ssh.get_transport()
         if transport is not None:
             transport.set_keepalive(_TRANSPORT_KEEPALIVE_SECONDS)
+            try:
+                sock = transport.get_socket()
+            except Exception:
+                sock = None
+            if sock is not None:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                except Exception:
+                    # Keepalive may be unsupported on custom transport stacks.
+                    logger.debug(
+                        "SO_KEEPALIVE unavailable for transport socket", exc_info=True
+                    )
+                if hasattr(socket, "TCP_KEEPIDLE"):
+                    try:
+                        sock.setsockopt(
+                            socket.IPPROTO_TCP,
+                            socket.TCP_KEEPIDLE,
+                            _TCP_KEEPALIVE_IDLE_SECONDS,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "TCP_KEEPIDLE unavailable for transport socket",
+                            exc_info=True,
+                        )
+                if hasattr(socket, "TCP_KEEPINTVL"):
+                    try:
+                        sock.setsockopt(
+                            socket.IPPROTO_TCP,
+                            socket.TCP_KEEPINTVL,
+                            _TCP_KEEPALIVE_INTERVAL_SECONDS,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "TCP_KEEPINTVL unavailable for transport socket",
+                            exc_info=True,
+                        )
+                if hasattr(socket, "TCP_KEEPCNT"):
+                    try:
+                        sock.setsockopt(
+                            socket.IPPROTO_TCP,
+                            socket.TCP_KEEPCNT,
+                            _TCP_KEEPALIVE_COUNT,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "TCP_KEEPCNT unavailable for transport socket",
+                            exc_info=True,
+                        )
+                if hasattr(socket, "TCP_USER_TIMEOUT"):
+                    try:
+                        sock.setsockopt(
+                            socket.IPPROTO_TCP,
+                            socket.TCP_USER_TIMEOUT,
+                            _TCP_USER_TIMEOUT_MILLIS,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "TCP_USER_TIMEOUT unavailable for transport socket",
+                            exc_info=True,
+                        )
         sftp_chan = self._sftp.get_channel()
         if sftp_chan is not None:
             sftp_chan.settimeout(_SFTP_OP_TIMEOUT_SECONDS)
@@ -704,7 +768,11 @@ class RemoteBackend(WorkspaceBackend):
         return sorted(results)
 
     def search_files(
-        self, query: str, path: str = "", case_sensitive: bool = False
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
     ) -> list[dict]:
         """Search via server-side grep for efficiency."""
         self._ensure_connected()
@@ -723,9 +791,18 @@ class RemoteBackend(WorkspaceBackend):
             f"--exclude='*.{ext}'"
             for ext in ["pdf", "docx", "png", "jpg", "gif", "zip", "db"]
         )
+        exclude_dir_flags = ""
+        if exclude_dirs:
+            # Use safe shell-quoting for single quotes inside directory names:
+            # Keep this format aligned with query escaping.
+            exclude_dir_flags = " ".join(
+                "--exclude-dir='{}'".format(d.replace("'", "'\\''"))
+                for d in exclude_dirs
+            )
 
         cmd = (
-            f"grep {flags} {excludes} -- '{safe_query}' {remote_path} 2>/dev/null "
+            f"grep {flags} {excludes} {exclude_dir_flags} -- '{safe_query}' {remote_path} "
+            "2>/dev/null "
             f"| head -n {SEARCH_RESULT_HARD_CAP} || true"
         )
         output = self._exec(cmd, timeout=60)

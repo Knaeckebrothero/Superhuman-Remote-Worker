@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import re
+import asyncio
 import time
 from typing import Any, Callable, Dict, List, Literal, Optional
 from urllib.parse import urlsplit
@@ -3863,6 +3864,9 @@ def create_audited_tool_node(
     _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 15
     _HARD_CAP = config.limits.max_tool_calls_per_phase  # default 100
 
+    _TOOL_TIMEOUT_RETRIES = [0]  # tracks consecutive batch timeouts
+    _TOOL_BATCH_TIMEOUT_SECONDS = 900  # absolute cap for any audited tool batch
+
     # Tools that indicate forward progress (reset stuck counter)
     PROGRESS_TOOLS = {
         "todo_complete",
@@ -3889,6 +3893,54 @@ def create_audited_tool_node(
             for name, meta in TOOL_REGISTRY.items()
             if meta.get("category") == category
         ]
+
+    def _get_tool_category_timeout(tool_name: str) -> int:
+        configured = dict(config.limits.tool_category_timeouts or {})
+        category = _get_tool_category(tool_name) or "default"
+        fallback = int(configured.get("default", 120))
+        raw = configured.get(category, fallback)
+        value = raw if isinstance(raw, (int, float)) else fallback
+        timeout = int(value)
+        if timeout <= 0:
+            timeout = max(1, int(fallback))
+        return timeout
+
+    def _get_batch_tool_timeout(tool_calls: List[dict]) -> int:
+        if not tool_calls:
+            return max(
+                1,
+                int((config.limits.tool_category_timeouts or {}).get("default", 120)),
+            )
+        timeout = max(_get_tool_category_timeout(tc["name"]) for tc in tool_calls)
+        return min(_TOOL_BATCH_TIMEOUT_SECONDS, max(1, timeout))
+
+    def _build_timeout_error_result(
+        tool_calls: List[dict], timeout_seconds: int
+    ) -> Dict[str, Any]:
+        timeout_msgs: list[ToolMessage] = []
+        for tc in tool_calls:
+            call_id = tc["call_id"]
+            name = tc["name"]
+            timeout_msgs.append(
+                ToolMessage(
+                    content=(
+                        f"Error: tool execution timed out after {timeout_seconds}s for "
+                        f"tool '{name}'."
+                    ),
+                    tool_call_id=call_id,
+                    name=name,
+                )
+            )
+        return {"messages": timeout_msgs}
+
+    def _reconnect_workspace() -> None:
+        if not tool_context or not tool_context.workspace_manager:
+            raise WorkspaceUnavailableError(
+                "Tool execution timed out and no workspace manager is available"
+            )
+        backend = tool_context.workspace_manager.backend
+        backend.disconnect()
+        backend.connect()
 
     # Build phase-allowed tool sets for defense-in-depth validation.
     # Primary enforcement is LLM schema binding; this catches hallucinated calls.
@@ -3969,6 +4021,7 @@ def create_audited_tool_node(
             _phase_tool_call_count[0] = 0
             _warned_signatures.clear()
             _category_failures.clear()
+            _TOOL_TIMEOUT_RETRIES[0] = 0
 
         # Hard cap check
         _phase_tool_call_count[0] += len(tool_calls_info)
@@ -4096,8 +4149,51 @@ def create_audited_tool_node(
 
         # Execute all tools (loop detection is advisory, never blocks execution)
         start_time = time.time()
-        result = await tool_node.ainvoke(state)
+        batch_timeout = _get_batch_tool_timeout(tool_calls_info)
+        executed_tool_batch = len(tool_calls_info) > 0
+        try:
+            result = await asyncio.wait_for(
+                tool_node.ainvoke(state), timeout=batch_timeout
+            )
+            _TOOL_TIMEOUT_RETRIES[0] = 0
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[{job_id}] Tool batch timed out after {batch_timeout}s "
+                f"across {len(tool_calls_info)} calls"
+            )
+            if _TOOL_TIMEOUT_RETRIES[0] >= 1:
+                _TOOL_TIMEOUT_RETRIES[0] = 0
+                raise WorkspaceUnavailableError(
+                    "Tool batch repeatedly timed out — workspace may be wedged"
+                )
+
+            _TOOL_TIMEOUT_RETRIES[0] += 1
+            try:
+                _reconnect_workspace()
+            except Exception as e:
+                logger.error(
+                    f"[{job_id}] Tool-batch reconnect failed after timeout: {e}"
+                )
+                raise WorkspaceUnavailableError(
+                    f"Tool batch timeout recovery failed: {e}"
+                )
+
+            result = _build_timeout_error_result(tool_calls_info, batch_timeout)
         execution_time_ms = int((time.time() - start_time) * 1000)
+
+        # Heartbeat visibility marker:
+        # each completed tool batch increments a monotonic counter so the
+        # orchestrator can detect long-running "still heartbeating, no progress"
+        # stalls.
+        if executed_tool_batch and tool_context is not None:
+            increment_progress = getattr(tool_context, "next_graph_progress", None)
+            if callable(increment_progress):
+                try:
+                    increment_progress()
+                except Exception:
+                    logger.debug(
+                        "Failed to increment graph progress marker", exc_info=True
+                    )
 
         # Append loop warnings to tool results for flagged calls
         if _loop_warned_call_ids and "messages" in result:
