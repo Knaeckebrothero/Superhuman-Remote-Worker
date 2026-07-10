@@ -126,6 +126,27 @@ class TestGlmFamily:
         assert config.limits.message_count_min_tokens == 400000  # 1000000 * 0.40
 
 
+class TestGpt56Family:
+    def test_gpt56_registered_in_matrix(self):
+        matrix = _load_settings_matrix()
+        assert "gpt-5.6" in matrix
+        assert matrix["gpt-5.6"]["temperature"] == 1.0
+        assert matrix["gpt-5.6"]["multimodal"] is True
+        assert matrix["gpt-5.6"]["parallel_tool_calls"] is False
+        assert matrix["gpt-5.6"]["model_max_context_tokens"] == 1000000
+        # Single context value per family — leaves derive at load, no `limits` here.
+        assert "limits" not in matrix["gpt-5.6"]
+
+    def test_gpt56_settings_applied(self):
+        data = {"llm": {"model": "gpt-5.6-sol"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["llm"]["temperature"] == 1.0
+        assert data["llm"]["model_max_context_tokens"] == 1000000
+        assert data["limits"]["model_max_context_tokens"] == 1000000
+        assert data["limits"]["context_threshold_tokens"] == 800000  # 1000000 * 0.80
+        assert data["limits"]["message_count_min_tokens"] == 400000  # 1000000 * 0.40
+
+
 # =============================================================================
 # _load_settings_matrix
 # =============================================================================
@@ -858,6 +879,7 @@ class TestRealMatrixFamilies:
             ("o3-mini", 200000),  # o-series true max
             ("deepseek-v4-pro", 1000000),  # V4 Pro: 1M true max
             ("deepseek-v4-flash", 1000000),  # shares the deepseek family
+            ("gpt-5.6-sol", 1000000),  # GPT-5.6 (Luna/Terra/Sol): 1M ctx
             ("gemini-2.0-flash", 1000000),
             ("gpt-oss-120b", 131072),
             ("some-unknown-model", 128000),  # default entry

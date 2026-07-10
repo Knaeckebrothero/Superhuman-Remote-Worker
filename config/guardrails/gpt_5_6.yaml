@@ -1,0 +1,10 @@
+# GPT-5.6 (Luna/Terra/Sol) guardrails
+#
+# GPT-5.6 shares the GPT-5 wire format. This file is intentionally empty so
+# `gpt-5.6` resolves through `default.yaml` exactly like `gpt_5.yaml`. Kept
+# as a separate file so 5.6-specific drift can be added later without
+# touching the matrix.
+
+tool_examples: {}
+
+nudges: {}
