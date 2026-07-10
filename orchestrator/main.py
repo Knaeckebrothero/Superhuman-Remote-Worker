@@ -25397,7 +25397,8 @@ def _fire_background_repair(key: str, coro: Coroutine[Any, Any, Any]) -> bool:
     is closed so it never warns "never awaited").
     """
     now = time.monotonic()
-    if now - _bg_repair_last.get(key, 0.0) < _BG_REPAIR_COOLDOWN_S:
+    last = _bg_repair_last.get(key)
+    if last is not None and now - last < _BG_REPAIR_COOLDOWN_S:
         coro.close()
         return False
     _bg_repair_last[key] = now
