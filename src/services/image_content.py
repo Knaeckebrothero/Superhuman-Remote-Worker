@@ -33,6 +33,8 @@ from typing import Optional, Sequence
 
 from langchain_core.messages import HumanMessage
 
+from src.services.image_downscale import DEFAULT_BYTE_THRESHOLD, downscale_image_b64
+
 # ---------------------------------------------------------------------------
 # Tag formats — single source of truth shared with src/tools/workspace/files.py
 # ---------------------------------------------------------------------------
@@ -84,13 +86,27 @@ def to_data_url(image_bytes: bytes, mime_type: str) -> str:
     return to_data_url_from_b64(base64.b64encode(image_bytes).decode(), mime_type)
 
 
-def make_image_content_block_from_b64(b64: str, mime_type: str) -> dict:
+def make_image_content_block_from_b64(
+    b64: str,
+    mime_type: str,
+    *,
+    max_edge: int | None = None,
+    byte_threshold: int = DEFAULT_BYTE_THRESHOLD,
+) -> dict:
     """Build an OpenAI-compatible image content block from base64 input.
 
     The `image_url` shape is what LangChain's per-provider message
     translators understand; OpenAI/Anthropic/Google variants are emitted
     automatically by their respective `langchain_*` integrations.
+
+    When ``max_edge`` is set (the resolved image-quality tier's longest-edge
+    cap), the image is downscaled/re-encoded here — the single point every
+    image funnels through — so the emitted block, and therefore the token
+    estimate that later reads its dimensions, both reflect what is actually
+    sent. ``max_edge=None`` leaves the image untouched (back-compat).
     """
+    if max_edge:
+        b64, mime_type = downscale_image_b64(b64, mime_type, max_edge, byte_threshold)
     return {
         "type": "image_url",
         "image_url": {"url": to_data_url_from_b64(b64, mime_type)},
@@ -105,16 +121,29 @@ def make_image_content_block(image_bytes: bytes, mime_type: str) -> dict:
 
 
 def make_multimodal_user_message(
-    text: str, images: Sequence[ExtractedImage]
+    text: str,
+    images: Sequence[ExtractedImage],
+    *,
+    max_edge: int | None = None,
+    byte_threshold: int = DEFAULT_BYTE_THRESHOLD,
 ) -> HumanMessage:
     """Build a HumanMessage whose content list interleaves text + images.
 
     The first part is always the text prefix; subsequent parts are one
-    image content block per `ExtractedImage`, in input order.
+    image content block per `ExtractedImage`, in input order. ``max_edge``
+    (the resolved image-quality tier cap) is applied per image; ``None``
+    leaves images untouched.
     """
     parts: list[dict] = [{"type": "text", "text": text}]
     for img in images:
-        parts.append(make_image_content_block_from_b64(img.base64_data, img.mime_type))
+        parts.append(
+            make_image_content_block_from_b64(
+                img.base64_data,
+                img.mime_type,
+                max_edge=max_edge,
+                byte_threshold=byte_threshold,
+            )
+        )
     return HumanMessage(content=parts)
 
 

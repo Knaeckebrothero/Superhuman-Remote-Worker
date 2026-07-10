@@ -3441,6 +3441,7 @@ def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
                     "turn": turn,
                     "input_tokens": metrics.get("input_tokens"),
                     "output_tokens": metrics.get("output_tokens"),
+                    "cached_tokens": metrics.get("cached_tokens"),
                 },
             )
         except Exception as e:

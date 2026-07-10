@@ -1492,6 +1492,7 @@ async def _execute_turn(
         usage_md = getattr(response, "usage_metadata", None) or {}
         if response is not None and (token_usage or usage_md):
             usage_details = usage_md.get("output_token_details") or {}
+            input_details = usage_md.get("input_token_details") or {}
             turn_metrics = {
                 "input_tokens": token_usage.get("input_tokens")
                 or token_usage.get("prompt_tokens")
@@ -1501,6 +1502,14 @@ async def _execute_turn(
                 or usage_md.get("output_tokens"),
                 "reasoning_tokens": token_usage.get("reasoning_tokens")
                 or usage_details.get("reasoning"),
+                # Cached prompt tokens. LangChain normalizes both Chat Completions
+                # and the Responses API (codex/gpt-5.x) to input_token_details.
+                # cache_read; the raw token_usage path is a fallback for providers
+                # that surface prompt_tokens_details but no usage_metadata.
+                "cached_tokens": input_details.get("cache_read")
+                or (token_usage.get("prompt_tokens_details") or {}).get(
+                    "cached_tokens"
+                ),
                 "latency_ms": llm_latency_ms,
                 "model": meta.get("model_name"),
             }

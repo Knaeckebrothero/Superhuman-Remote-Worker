@@ -48,8 +48,10 @@ def _row(
     m_output=None,
     m_reasoning=None,
     m_cached=None,
+    m_cached_norm=None,
     md_input=None,
     md_output=None,
+    md_cached=None,
 ):
     """Build one ``llm_requests`` result row (as the SELECT's ``->>`` text cols)."""
     return {
@@ -65,8 +67,10 @@ def _row(
         "m_output": m_output,
         "m_reasoning": m_reasoning,
         "m_cached": m_cached,
+        "m_cached_norm": m_cached_norm,
         "md_input": md_input,
         "md_output": md_output,
+        "md_cached": md_cached,
     }
 
 
@@ -234,6 +238,60 @@ class TestMaterialize:
         assert [(e.unit, e.quantity) for e in ledger.events] == [
             ("cached-prompt-token", 100)
         ]
+
+    @pytest.mark.asyncio
+    async def test_cached_from_normalized_usage_metadata_responses_api(self):
+        # Codex / gpt-5.x on the Responses API: response_metadata carries no
+        # token_usage, so prompt+cached come from LangChain's normalized
+        # metrics.usage_metadata (m_input + m_cached_norm), never m_cached.
+        audit = FakePool(
+            AuditConn(
+                [
+                    _row(
+                        11,
+                        model="gpt-5.5",
+                        m_input="1000",
+                        m_output="40",
+                        m_cached_norm="600",
+                    )
+                ]
+            )
+        )
+        app = FakePool(AppConn(jobs={JOB: (USER, PROJ)}))
+        ledger = FakeLedger()
+        res = await materialize_llm_usage_from_audit(
+            audit, app, ledger, min_age_s=0, now=NOW
+        )
+        assert res["materialized"] == 3
+        by_unit = {e.unit: e.quantity for e in ledger.events}
+        assert by_unit["prompt-token"] == 400
+        assert by_unit["cached-prompt-token"] == 600
+        assert by_unit["completion-token"] == 40
+
+    @pytest.mark.asyncio
+    async def test_cached_from_session_metadata(self):
+        # Persistent session turn: tokens live in metadata (md_*), including the
+        # newly-threaded md_cached.
+        row = _row(
+            12,
+            job_id=THREAD,
+            agent_type="persistent",
+            model="gpt-5.5",
+            md_input="500",
+            md_output="30",
+            md_cached="350",
+        )
+        audit = FakePool(AuditConn([row]))
+        app = FakePool(AppConn(threads={THREAD: (USER, PROJ)}))
+        ledger = FakeLedger()
+        res = await materialize_llm_usage_from_audit(
+            audit, app, ledger, min_age_s=0, now=NOW
+        )
+        assert res["materialized"] == 3
+        by_unit = {e.unit: e.quantity for e in ledger.events}
+        assert by_unit["prompt-token"] == 150
+        assert by_unit["cached-prompt-token"] == 350
+        assert by_unit["completion-token"] == 30
 
     @pytest.mark.asyncio
     async def test_reasoning_tokens_in_details_not_a_third_row(self):

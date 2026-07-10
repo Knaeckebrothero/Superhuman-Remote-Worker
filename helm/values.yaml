@@ -1165,6 +1165,16 @@ llm:
   # Pin replacement defaults via Admin → Models → Defaults.
   keyCooldownSeconds: "3600"
 
+  # Codex raw-response diagnostic. When "1"/"true", the codex lane dumps each
+  # non-streaming /v1/responses request+response pair (incl. the raw usage
+  # block) to codexRawDumpDir on the pod running the LLM call — used to confirm
+  # whether the CLIProxyAPI proxy forwards input_tokens_details.cached_tokens.
+  # Default off (verbose + disk); flip in values-local.yaml for k3d testing,
+  # then start a FRESH session so a new agent pod inherits the ConfigMap value.
+  # See docs/issues/codex_cached_tokens_not_metered.md.
+  debugCodexRawResponse: "0"
+  codexRawDumpDir: "/app/logs/codex-raw"
+
   # ---------------------------------------------------------------------------
   # One-shot seed for system-scoped provider keys and LLM endpoints. Applied
   # by a post-install / post-upgrade Job. Insert-only: existing rows in
