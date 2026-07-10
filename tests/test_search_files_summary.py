@@ -1,0 +1,63 @@
+"""Render tests for the search_files tool's result summary line.
+
+Regression coverage for the "server-side capped" branch introduced alongside
+SEARCH_RESULT_HARD_CAP (src/core/workspace_backend.py): when a backend's
+search_files() returns a result set that hit the hard cap, the display must
+say so honestly instead of reporting a plain count that understates how many
+matches actually exist.
+"""
+
+from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
+from src.tools.context import ToolContext
+from src.tools.workspace.filesystem import create_filesystem_tools
+
+
+class _StubWorkspace:
+    """A WorkspaceManager stand-in whose search_files() returns a fixed
+    number of matches, regardless of query."""
+
+    is_initialized = True
+
+    def __init__(self, result_count: int) -> None:
+        self._result_count = result_count
+
+    def search_files(self, query: str, path: str = "", case_sensitive: bool = False):
+        return [
+            {"path": "file.txt", "line_number": i + 1, "line": f"match {i}"}
+            for i in range(self._result_count)
+        ]
+
+
+def _context(workspace: _StubWorkspace) -> ToolContext:
+    return ToolContext(
+        workspace_manager=workspace,
+        config={"max_search_results": 50},
+    )
+
+
+def _search_files_tool(workspace: _StubWorkspace):
+    tools = create_filesystem_tools(_context(workspace))
+    return next(t for t in tools if t.name == "search_files")
+
+
+def test_summary_shows_server_side_capped_at_hard_cap():
+    """Exactly SEARCH_RESULT_HARD_CAP results (the backend's grep pipeline
+    was capped) must render the honest "N+ (capped)" summary, not a bare
+    count equal to the cap."""
+    workspace = _StubWorkspace(SEARCH_RESULT_HARD_CAP)
+    result = _search_files_tool(workspace).invoke({"query": "role"})
+
+    assert (
+        f"[Showing 50 of {SEARCH_RESULT_HARD_CAP}+ matches (server-side capped)]"
+        in result
+    )
+
+
+def test_summary_shows_plain_count_below_hard_cap():
+    """A result set above the display cap but below the hard cap keeps the
+    plain "Showing X of Y matches" summary (no false "capped" claim)."""
+    workspace = _StubWorkspace(SEARCH_RESULT_HARD_CAP - 1)
+    result = _search_files_tool(workspace).invoke({"query": "role"})
+
+    assert f"[Showing 50 of {SEARCH_RESULT_HARD_CAP - 1} matches]" in result
+    assert "capped" not in result

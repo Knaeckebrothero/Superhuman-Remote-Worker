@@ -11,7 +11,7 @@ import logging
 from typing import Any, Dict, List
 
 from langchain_core.tools import tool
-from src.core.workspace_backend import WorkspaceUnavailableError
+from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP, WorkspaceUnavailableError
 
 from ..context import ToolContext
 from ...services.cloud_mount.guardrails import (
@@ -382,7 +382,13 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                     line_text = line_text[:100] + "..."
                 lines.append(f"    L{line_num}: {line_text}")
 
-            if total > max_search_results:
+            if total >= SEARCH_RESULT_HARD_CAP:
+                lines.append("")
+                lines.append(
+                    f"[Showing {max_search_results} of {SEARCH_RESULT_HARD_CAP}+ "
+                    f"matches (server-side capped)]"
+                )
+            elif total > max_search_results:
                 lines.append("")
                 lines.append(f"[Showing {max_search_results} of {total} matches]")
 
