@@ -1262,8 +1262,14 @@ class PostgresDB:
                     status='active', created_at=now(), revoked_at=NULL
                 RETURNING id::text
                 """,
-                thread_id, user_id, backend, reader_id, grant_handle,
-                _encrypt_optional(credentials), webdav_url, auth_kind,
+                thread_id,
+                user_id,
+                backend,
+                reader_id,
+                grant_handle,
+                _encrypt_optional(credentials),
+                webdav_url,
+                auth_kind,
             )
 
     async def get_ro_mount_by_thread(self, thread_id: str) -> dict | None:

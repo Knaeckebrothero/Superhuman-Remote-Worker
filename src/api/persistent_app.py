@@ -5254,10 +5254,30 @@ def _title_is_placeholder(current: Optional[str]) -> bool:
 # treated as low-signal. Such prompts fall through to _auto_title_after_first_turn.
 _LOW_SIGNAL_PROMPTS = frozenset(
     {
-        "hi", "hey", "hello", "yo", "sup", "ok", "okay", "thanks", "thank you",
-        "help", "please help", "can you help", "can you help me", "go on",
-        "go ahead", "keep going", "carry on", "continue", "resume",
-        "are you there", "whats up", "what's up", "test", "testing",
+        "hi",
+        "hey",
+        "hello",
+        "yo",
+        "sup",
+        "ok",
+        "okay",
+        "thanks",
+        "thank you",
+        "help",
+        "please help",
+        "can you help",
+        "can you help me",
+        "go on",
+        "go ahead",
+        "keep going",
+        "carry on",
+        "continue",
+        "resume",
+        "are you there",
+        "whats up",
+        "what's up",
+        "test",
+        "testing",
     }
 )
 
