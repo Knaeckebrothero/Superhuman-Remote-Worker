@@ -1,6 +1,15 @@
 # Subjobs inherit a by-value snapshot of the parent's workspace_container — a scholar spawned mid-provisioning captures `status:"created"` (no SSH host) and hard-fails at workspace init
 
-**Status:** OPEN — root cause confirmed on live dev 2026-07-10, fix designed, not implemented.
+**Status:** FIX IMPLEMENTED + k3d-verified 2026-07-10, UNCOMMITTED. Root cause
+confirmed on live dev 2026-07-10. Implementation: `orchestrator/main.py`
+(`_resolve_subjob_inherited_workspace` + dispatcher wiring in
+`_try_dispatch_pending_jobs` + a dispatch backstop in `_dispatch_job_to_agent`),
+tests in `tests/test_subjob_inherited_workspace.py` (18, against the real
+resolver). Live k3d verification: in-pod probe of the deployed resolver against
+the real DB (overlay/fail/no-op) emitting the real `resolved live at dispatch`
+log, plus the real dispatcher loop failing a dead-workspace subjob with a
+diagnosable message (no agent provisioning). See "Implementation notes" at the
+end.
 **Motivating incident:** scholar subjob `4de67cda-13e8-47f6-b076-05b87c03bfe7`
 (kickoff for parent `4b4b7127-99a8-4e72-be3c-cedf767f5f09`, "Alternative
 Software zu MS Projekt"), dev cluster `main` / namespace
@@ -235,6 +244,50 @@ Live (k3d, then homelab):
 3. VM-backed variant: same, host resolved from the parent VM.
 4. Negative: kill/deny the parent's workspace and confirm the subjob is held
    then fails with a diagnosable reason, and the parent still unblocks.
+
+## Implementation notes (2026-07-10)
+
+Shipped in the working tree (uncommitted), all in `orchestrator/main.py`:
+
+1. **`_resolve_subjob_inherited_workspace(job)`** (near `_get_container_context`)
+   — async. No-op unless the job has a `parent_job_id` and its own context
+   carries an inherited `workspace_container`/`vm` that is not yet `ready`.
+   Reads the parent's live row (`postgres_db.get_job`) and, if the parent's
+   workspace is `ready`, overlays it onto the **in-memory** `job["context"]`
+   (never persisted). Returns `("proceed"|"wait"|"fail", msg)`. `fail` covers a
+   missing/terminal parent or a dead (`failed`/`deleted`) parent workspace, and
+   a bounded wait timeout (`WORKSPACE_INHERIT_MAX_WAIT_S`, default 600s, keyed on
+   the subjob's `created_at`).
+2. **Dispatcher wiring** — first thing in the `_try_dispatch_pending_jobs`
+   per-job loop: `wait`→`continue` (retry next tick), `fail`→
+   `update_job_status(failed)`+`continue`, `proceed`→fall through. Once
+   overlaid, `_job_needs_sandbox`/`_job_needs_vm` + the existing injectors see a
+   ready context and inject `workspace.remote` unchanged.
+3. **Backstop** in `_dispatch_job_to_agent` (after the worktree-path block): a
+   non-lite backend with no `workspace.remote` after all injection is refused
+   (`status=failed`, diagnosable message) instead of POSTing a guaranteed
+   0-token hard-fail. Verified not to false-fire on normal jobs: `ensure_workspace`
+   returns `READY` only when the in-memory context is already `ready`, so a
+   normal sandbox job always reaches dispatch with `remote` injected.
+
+Tests: `tests/test_subjob_inherited_workspace.py` — 18, exercising the real
+resolver (mocking only `postgres_db.get_job`) across proceed/overlay, wait,
+wait-timeout→fail, parent-failed/terminal/missing, VM variant, JSON-string
+context, plus a backstop-predicate mirror. Full run: 215 dispatch/workspace
+regression tests green.
+
+Live k3d verification (image `sha-194cdf2`, `main.py` hot-synced via `kubectl cp`
++ uvicorn `--reload`):
+- In-pod probe of the **deployed** resolver against the **real DB**: a stale
+  `{status:created}` snapshot + a seeded parent whose workspace is `ready`
+  overlaid the parent's live host and emitted the production log line
+  `Dispatcher: subjob … inheriting parent … workspace container (host=…) —
+  resolved live at dispatch`; missing-parent→fail; non-subjob→no-op (no DB hit).
+- The **real dispatcher loop** failed a seeded dead-workspace subjob with the
+  diagnosable message and provisioned **no** agent — confirming the wiring
+  invokes the resolver and acts on its verdict.
+- (The k3d code was an ephemeral hot-patch — it reverts on pod restart; the
+  working tree is the source of truth. Ship via commit → CI/CD.)
 
 ## Related
 
