@@ -29,6 +29,9 @@ import logging
 import math
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from openai import BadRequestError
+from pydantic import ValidationError
+
 from src.core.chunk_planner import (
     DEFAULT_AUX_WINDOW,
     SCHEMA_OVERHEAD_TOKENS,
@@ -38,6 +41,7 @@ from src.core.chunk_planner import (
     SummarizationFailed,
     count_text_tokens,
 )
+from src.core.context import IdentityAnchor
 
 logger = logging.getLogger(__name__)
 
@@ -83,15 +87,18 @@ def format_structured_summary(result: Any) -> str:
     identity_anchor = getattr(result, "identity_anchor", None)
     if identity_anchor:
         if isinstance(identity_anchor, dict):
+            identity_anchor = IdentityAnchor(**identity_anchor)
+
+        if isinstance(identity_anchor, IdentityAnchor):
             anchor_parts = []
-            if identity_anchor.get("agent_role"):
-                anchor_parts.append(f"Role: {identity_anchor['agent_role']}")
-            if identity_anchor.get("current_task"):
-                anchor_parts.append(f"Task: {identity_anchor['current_task']}")
-            if identity_anchor.get("active_constraints"):
-                constraints = identity_anchor["active_constraints"]
-                if isinstance(constraints, list):
-                    anchor_parts.append("Constraints: " + "; ".join(constraints))
+            if identity_anchor.agent_role:
+                anchor_parts.append(f"Role: {identity_anchor.agent_role}")
+            if identity_anchor.current_task:
+                anchor_parts.append(f"Task: {identity_anchor.current_task}")
+            if identity_anchor.active_constraints:
+                anchor_parts.append(
+                    "Constraints: " + "; ".join(identity_anchor.active_constraints)
+                )
             if anchor_parts:
                 parts.append("**Identity Anchor:**\n" + "\n".join(anchor_parts))
         elif isinstance(identity_anchor, str) and identity_anchor.strip():
@@ -117,6 +124,14 @@ def is_overflow_error(exc: BaseException) -> bool:
         if name in ("ContextOverflowError", "AuxInputTooLarge"):
             return True
         if getattr(current, "status_code", None) == 413:
+            return True
+        if (
+            isinstance(current, BadRequestError)
+            and str(getattr(current, "code", "") or "").lower()
+            == "invalid_json_schema"
+        ):
+            return True
+        if isinstance(current, ValidationError):
             return True
         text = str(current)
         if "context_overflow" in text or "exceeds limit of" in text:

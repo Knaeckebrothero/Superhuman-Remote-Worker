@@ -29,7 +29,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.core.image_tokens import (
     content_to_summary_text,
@@ -61,6 +61,16 @@ def extract_summary_text(messages: List[BaseMessage]) -> Optional[str]:
         ):
             return content.split(prefix, 1)[1].strip()
     return None
+
+
+class IdentityAnchor(BaseModel):
+    """Identity persistence payload for deterministic compaction stitching."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_role: str = ""
+    current_task: str = ""
+    active_constraints: List[str] = Field(default_factory=list)
 
 
 class ConversationSummary(BaseModel):
@@ -98,7 +108,7 @@ class ConversationSummary(BaseModel):
     pinned_instructions: str | List[str] = Field(
         default="", description="Rules from instructions/config that must persist"
     )
-    identity_anchor: dict | str | List[str] = Field(
+    identity_anchor: IdentityAnchor | str | List[str] = Field(
         default="",
         description="Agent role, current task, and active constraints for identity persistence",
     )
@@ -117,7 +127,8 @@ class ConversationSummary(BaseModel):
             return data
         for key, value in data.items():
             if key == "identity_anchor" and isinstance(value, dict):
-                continue  # dicts handled downstream
+                data[key] = IdentityAnchor(**value)
+                continue
             if isinstance(value, list):
                 data[key] = "\n".join(
                     f"- {item}" if isinstance(item, str) else f"- {item}"

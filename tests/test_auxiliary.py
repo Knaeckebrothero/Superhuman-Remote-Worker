@@ -402,7 +402,9 @@ class TestAuxiliaryLLMChain:
             == "The users table uses soft deletes via deleted_at."
         )
         mock_llm.with_structured_output.assert_called_once_with(
-            ExtractedMemories, include_raw=True
+            ExtractedMemories,
+            method="json_schema",
+            include_raw=True,
         )
 
     @pytest.mark.asyncio

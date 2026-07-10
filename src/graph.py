@@ -73,6 +73,7 @@ from .core.context import (
 )
 from .core.loader import (
     AgentConfig,
+    resolve_model_settings,
     load_summarization_prompt,
     load_auxiliary_prompt,
     get_phase_system_prompt,
@@ -4450,11 +4451,18 @@ def build_phase_alternation_graph(
         from src.services.auxiliary import AuxiliaryLLM
 
         raw_llm = summarization_llm or strategic_llm_with_tools
+        aux_settings = resolve_model_settings(
+            aux_model, config._deployment_dir
+        )
+        aux_structured_output_method = aux_settings.get(
+            "structured_output_method", "json_schema"
+        )
         # Fallback summarizer is the main/summarization LLM → its window is
         # the main working window.
         auxiliary_llm = AuxiliaryLLM(
             llm=raw_llm,
             max_context_tokens=config.limits.model_max_context_tokens,
+            structured_output_method=aux_structured_output_method,
         )
 
     # Extract RecallStore for memory injection and free sources
