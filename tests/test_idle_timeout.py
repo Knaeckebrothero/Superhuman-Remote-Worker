@@ -646,9 +646,9 @@ class TestStaleDetectorSweep:
         assert names.index("mark_stuck_working_agents_ready") < names.index(
             "mark_stalled_working_agents_by_graph_progress"
         )
-        assert names.index("mark_stalled_working_agents_by_graph_progress") < names.index(
-            "mark_stuck_session_agents_ready"
-        )
+        assert names.index(
+            "mark_stalled_working_agents_by_graph_progress"
+        ) < names.index("mark_stuck_session_agents_ready")
         assert names.index("mark_stuck_session_agents_ready") < names.index(
             "recover_orphaned_jobs"
         )
@@ -765,8 +765,7 @@ async def mark_stalled_working_agents_by_graph_progress(db, stall_minutes=10):
               AND metadata ? 'graph_progress_seen_at'
               AND (metadata->>'graph_progress_seen_at')::timestamptz
                     < NOW() - ($1 || ' minutes')::INTERVAL
-            """
-            ,
+            """,
             stall_minutes,
         )
     if result.startswith("UPDATE "):
@@ -786,7 +785,8 @@ class TestMarkStalledWorkingAgentsByGraphProgress:
         db.acquire.return_value = ctx
 
         assert (
-            await mark_stalled_working_agents_by_graph_progress(db, stall_minutes=10) == 4
+            await mark_stalled_working_agents_by_graph_progress(db, stall_minutes=10)
+            == 4
         )
 
     @pytest.mark.asyncio
@@ -806,6 +806,8 @@ class TestMarkStalledWorkingAgentsByGraphProgress:
         assert "current_job_id IS NOT NULL" in sql
         assert "metadata ? 'graph_progress_seen_at'" in sql
         assert "NOW() - ($1 || ' minutes')::INTERVAL" in sql
+
+
 # =============================================================================
 # mark_stuck_session_agents_ready (replicated SQL logic)
 # =============================================================================

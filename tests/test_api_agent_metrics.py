@@ -71,4 +71,3 @@ class TestDualAppMetrics:
             assert result["cpu_percent"] == 3.5
         finally:
             dual_app._agent = original_agent
-

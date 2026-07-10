@@ -2687,9 +2687,9 @@ class PostgresDB:
                 if graph_progress is not None:
                     previous_progress = prev_metadata.get("graph_progress")
                     if graph_progress != previous_progress:
-                        metrics_payload["graph_progress_seen_at"] = (
-                            datetime.now(timezone.utc).isoformat()
-                        )
+                        metrics_payload["graph_progress_seen_at"] = datetime.now(
+                            timezone.utc
+                        ).isoformat()
                 set_clauses.append(
                     f"metadata = metadata || {_p(json.dumps(metrics_payload))}::jsonb"
                 )
@@ -3824,8 +3824,7 @@ class PostgresDB:
                   AND metadata ? 'graph_progress_seen_at'
                   AND (metadata->>'graph_progress_seen_at')::timestamptz
                         < NOW() - ($1 || ' minutes')::INTERVAL
-                """
-                ,
+                """,
                 stall_minutes,
             )
 
