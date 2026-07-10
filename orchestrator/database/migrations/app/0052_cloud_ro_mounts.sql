@@ -1,4 +1,4 @@
--- migration:     0050_cloud_ro_mounts.sql
+-- migration:     0052_cloud_ro_mounts.sql
 -- description:   Per-mount read-only reader grants for protected cloud mode.
 --                One row per protected session mount: the srw-reader-<user>
 --                account, the serialized grant handle to revoke (NC group->
@@ -34,8 +34,14 @@ COMMENT ON TABLE cloud_ro_mounts IS
     'is gone. Credentials are encrypted at rest (postgres._encrypt_optional).';
 
 -- One live grant per thread; a re-provision upserts in place.
-CREATE UNIQUE INDEX cloud_ro_mounts_thread_idx ON cloud_ro_mounts (thread_id);
+-- These indexes are built on a brand-new, empty table inside this transactional
+-- migration: CONCURRENTLY cannot run in a transaction and buys nothing on zero
+-- rows (docs/db_migration.md: "Add table/index -> direct CREATE IF NOT EXISTS").
+-- squawk-ignore require-concurrent-index-creation
+CREATE UNIQUE INDEX IF NOT EXISTS cloud_ro_mounts_thread_idx ON cloud_ro_mounts (thread_id);
 -- Reconciler sweep scans active rows.
-CREATE INDEX cloud_ro_mounts_status_idx ON cloud_ro_mounts (status);
+-- squawk-ignore require-concurrent-index-creation
+CREATE INDEX IF NOT EXISTS cloud_ro_mounts_status_idx ON cloud_ro_mounts (status);
 -- User-deletion GC.
-CREATE INDEX cloud_ro_mounts_user_idx ON cloud_ro_mounts (user_id);
+-- squawk-ignore require-concurrent-index-creation
+CREATE INDEX IF NOT EXISTS cloud_ro_mounts_user_idx ON cloud_ro_mounts (user_id);
