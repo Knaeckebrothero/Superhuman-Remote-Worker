@@ -25,6 +25,20 @@ the same day (3 codebase-mapping + 3 web-research agents). Intentionally deferre
 B3 catalog per-model `reasoning_level` override (precedence layer 3 — inert until an
 operator sets it); token-budget control for Claude/Gemini (Phase 2).
 
+**Addendum (2026-07-10) — per-family clamp DONE; `gpt-5.6` family added.** The design
+bullet "replace the global `_clamp_reasoning_level` with per-family clamp against
+`options`" was still open at ship time (the OpenAI/codex factories kept the hardcoded
+`_OPENAI_REASONING_LEVELS={low,medium,high}` set). Implemented `9e78fb80`: the clamp now
+walks `_EFFORT_LADDER = (none, minimal, low, medium, high, xhigh, max)` against
+`_supported_efforts(cap)` (the family's matrix `options`, conservative OpenAI-set
+fallback) — downward first (never exceeds the request), upward only when nothing below
+is supported; unknown values → `high`. Trigger: GPT-5.6 GA (2026-07-09) shipped `xhigh`
++ `max` efforts, which the old set silently downgraded on the codex path. A dedicated
+`gpt-5.6` family (`bcc0361c`) carries `options: [low, medium, high, xhigh, max]` —
+the §"family inventory" below predates it. `ultra` is `reasoning.mode`, not an effort;
+deliberately unsupported. Plan:
+`docs/superpowers/plans/2026-07-10-gpt-5-6-reasoning-levels-and-family.md`.
+
 ### What shipped
 
 - **Slice A — backend delivery.** Per-family `reasoning` block in
