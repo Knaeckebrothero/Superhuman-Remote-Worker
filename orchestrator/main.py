@@ -622,8 +622,10 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                     f"Released {stuck_working} agent(s) stuck in 'working' with no job"
                 )
                 _trigger_dispatch()
-            stalled_working = await postgres_db.mark_stalled_working_agents_by_graph_progress(
-                stall_minutes=10
+            stalled_working = (
+                await postgres_db.mark_stalled_working_agents_by_graph_progress(
+                    stall_minutes=10
+                )
             )
             if stalled_working > 0:
                 logger.info(
