@@ -162,6 +162,39 @@ class TestExecDrainLoop:
         assert len(out) < 6 * 1024 * 1024
 
 
+class _InfiniteChannel(_WindowedChannel):
+    """recv_ready() is always True and never exits — an infinite/fast-enough
+    producer. The deadline check in the old code only ran once BOTH inner
+    drain loops went empty, so a channel like this evaded the timeout
+    forever. Used to prove the deadline now binds the inner loops too."""
+
+    def __init__(self):
+        super().__init__(never_exits=True)
+
+    def recv_ready(self):
+        return True
+
+    def recv(self, n):
+        return b"x" * n
+
+
+class TestExecDrainLoopDeadline:
+    """The wall-clock deadline must bound the inner recv/recv_stderr drain
+    loops, not just the outer 'both buffers empty' check."""
+
+    def test_infinite_producer_still_hits_deadline(self, remote_backend):
+        """A channel whose recv_ready() never goes false must still raise
+        RemoteCommandTimeoutError instead of looping forever."""
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        chan = _InfiniteChannel()
+        _wire_exec_channel(mock_ssh, chan)
+        with patch("time.sleep"):
+            with pytest.raises(RemoteCommandTimeoutError):
+                backend._exec("yes", timeout=0)
+        assert chan.closed
+
+
 # =============================================================================
 # RemoteBackend Tests
 # =============================================================================
@@ -682,6 +715,18 @@ class TestRemoteBackendWriteFile:
         backend.write_file("text.txt", "Hello")
         file_obj.write.assert_called_once_with(b"Hello")
 
+    def test_write_file_timeout_raises(self, remote_backend):
+        """A stalled sftp.open() during a write must surface as
+        RemoteCommandTimeoutError, not an opaque/uncaught socket.timeout."""
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+
+        mock_sftp.stat.return_value = _make_sftp_attr(is_dir=True)
+        mock_sftp.open.side_effect = socket.timeout("timed out")
+
+        with pytest.raises(RemoteCommandTimeoutError, match="timed out writing"):
+            backend.write_file("output.txt", "Hello!")
+
 
 class TestRemoteBackendHomeFile:
     """Tests for RemoteBackend.write_home_file() and resolve_home_path()."""
@@ -899,6 +944,42 @@ class TestRemoteBackendListDir:
 
         result = backend.list_dir("")
         assert result == []
+
+
+class TestSftpTimeoutNotSwallowed:
+    """socket.timeout is an IOError subclass. Now that the SFTP channel
+    carries a 60s timeout (TestConnectionHardening), a stalled channel
+    reaches these ``except IOError`` sites and must NOT be reported as
+    "path doesn't exist" / "empty directory" / "already exists" — it must
+    surface as RemoteCommandTimeoutError, same as read_file already does.
+    """
+
+    def test_remote_stat_timeout_raises_via_exists(self, remote_backend):
+        """A stalled stat() must not read as 'file doesn't exist'."""
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_sftp.stat.side_effect = socket.timeout("timed out")
+        with pytest.raises(RemoteCommandTimeoutError, match="timed out"):
+            backend.exists("file.txt")
+
+    def test_list_dir_listdir_attr_timeout_raises(self, remote_backend):
+        """A stalled listdir_attr() must not read as 'empty directory'."""
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_sftp.stat.return_value = _make_sftp_attr(is_dir=True)
+        mock_sftp.listdir_attr.side_effect = socket.timeout("timed out")
+        with pytest.raises(RemoteCommandTimeoutError, match="timed out"):
+            backend.list_dir("")
+
+    def test_ensure_remote_dir_mkdir_timeout_raises(self, remote_backend):
+        """A stalled mkdir() inside _ensure_remote_dir must not be
+        swallowed as 'race condition or already exists'."""
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_sftp.stat.side_effect = FileNotFoundError()  # no existing ancestor
+        mock_sftp.mkdir.side_effect = socket.timeout("timed out")
+        with pytest.raises(RemoteCommandTimeoutError, match="timed out"):
+            backend.mkdir("new_dir")
 
 
 class TestRemoteBackendSearchFiles:
