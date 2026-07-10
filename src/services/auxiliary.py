@@ -31,10 +31,12 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 if TYPE_CHECKING:
     from src.core.archiver import LLMArchiver
+
+from src.llm.structured_recovery import recover_structured
 
 logger = logging.getLogger(__name__)
 
@@ -965,6 +967,9 @@ class AuxiliaryLLM:
     def __init__(
         self,
         llm: BaseChatModel,
+        *,
+        structured_output_method: str = "json_schema",
+        fallback_structured_output_method: Optional[str] = None,
         max_iterations: int = 15,
         timeout: float = 120.0,
         archiver: Optional["LLMArchiver"] = None,
@@ -974,6 +979,10 @@ class AuxiliaryLLM:
         fallback_llm: Optional[BaseChatModel] = None,
     ):
         self.llm = llm
+        self.structured_output_method = structured_output_method or "json_schema"
+        self.fallback_structured_output_method = (
+            fallback_structured_output_method or self.structured_output_method
+        )
         #: Drop-in fallback for a dead/unreachable *dedicated* aux model —
         #: normally the main session/worker model, which is always present and
         #: working (it serves the turns). When the aux model fails a call, the
@@ -981,10 +990,12 @@ class AuxiliaryLLM:
         #: the next compaction. None when the aux model already IS the main model
         #: (no separate fallback to fall back to). See
         #: docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
-        self.fallback_llm = fallback_llm if fallback_llm is not llm else None
-        self._fallback_model_name = (
-            _get_model_name(self.fallback_llm) if self.fallback_llm else None
+        primary_name = _get_model_name(llm)
+        fallback_name = _get_model_name(fallback_llm) if fallback_llm is not None else None
+        self.fallback_llm = (
+            fallback_llm if fallback_name and fallback_name != primary_name else None
         )
+        self._fallback_model_name = fallback_name if self.fallback_llm else None
         self.max_iterations = max_iterations
         self.timeout = timeout
         self.max_context_tokens = max_context_tokens
@@ -1012,6 +1023,9 @@ class AuxiliaryLLM:
         *,
         task_name: str,
         timeout: Optional[float] = None,
+        structured_schema: Optional[Type[BaseModel]] = None,
+        method: Optional[str] = None,
+        fallback_method: Optional[str] = None,
     ):
         """Invoke ``build_runnable(llm).ainvoke(invoke_arg)`` on the dedicated aux
         model; on failure, retry once on the main-model fallback.
@@ -1032,20 +1046,68 @@ class AuxiliaryLLM:
             than limping with half a context.
         """
         _timeout = timeout if timeout is not None else self.timeout
+        method = method or self.structured_output_method
+        fallback_method = (
+            fallback_method or self.fallback_structured_output_method
+        )
         try:
             result = await asyncio.wait_for(
-                build_runnable(self.llm).ainvoke(invoke_arg), timeout=_timeout
+                build_runnable(self.llm, method).ainvoke(invoke_arg),
+                timeout=_timeout,
             )
             self.health.mark_aux_reachable()
-            return result
+            if structured_schema is not None:
+                try:
+                    return self._recover_structured_output(
+                        result, structured_schema, task_name
+                    )
+                except Exception:
+                    parsed = await self._recover_via_raw_invoke(
+                        self.llm,
+                        invoke_arg,
+                        structured_schema,
+                        timeout=_timeout,
+                    )
+                    if parsed is not None:
+                        self.health.mark_aux_reachable()
+                        return parsed
+            else:
+                return result
+            # parsed shape/validation failed and raw recovery did not recover
+            raise ValueError(
+                f"Structured-output validation failed for {task_name} "
+                "after raw fallback recovery"
+            )
+        except ValidationError as primary_exc:
+            parsed = await self._recover_via_raw_invoke(
+                self.llm,
+                invoke_arg,
+                structured_schema,
+                timeout=_timeout,
+            )
+            if parsed is not None:
+                self.health.mark_aux_reachable()
+                return parsed
+            if self.fallback_llm is None:
+                raise primary_exc
+            # fall through to fallback path if available
         except Exception as primary_exc:
+            parsed = None
+            if structured_schema is not None and self.fallback_llm is None:
+                parsed = await self._recover_via_raw_invoke(
+                    self.llm,
+                    invoke_arg,
+                    structured_schema,
+                    timeout=_timeout,
+                )
+            if parsed is not None:
+                self.health.mark_aux_reachable()
+                return parsed
             if self.fallback_llm is None:
                 raise
             logger.error(
-                "AUXILIARY FALLING BACK TO MAIN MODEL: aux model '%s' failed on "
-                "task '%s' (%s: %s) — retrying on main model '%s'. The dedicated "
-                "auxiliary model is unreachable; background + compaction tasks "
-                "run on the main model (slower/pricier) until it recovers.",
+                "AUXILIARY OUTPUT PARSE/transport failure on aux model '%s' for "
+                "task '%s' (%s: %s) — retrying on main model '%s'.",
                 self.health.model,
                 task_name,
                 type(primary_exc).__name__,
@@ -1053,10 +1115,30 @@ class AuxiliaryLLM:
                 self._fallback_model_name,
             )
             self.health.mark_aux_unreachable(task_name, primary_exc)
-            return await asyncio.wait_for(
-                build_runnable(self.fallback_llm).ainvoke(invoke_arg),
+            fallback_raw = await asyncio.wait_for(
+                build_runnable(self.fallback_llm, fallback_method).ainvoke(invoke_arg),
                 timeout=_timeout,
             )
+            if structured_schema is not None:
+                try:
+                    return self._recover_structured_output(
+                        fallback_raw, structured_schema, task_name
+                    )
+                except Exception:
+                    logger.debug(
+                        "Structured-output fallback parse failed on raw response; "
+                        "trying raw invoke recovery on fallback model."
+                    )
+                    fallback_raw = await self._recover_via_raw_invoke(
+                        self.fallback_llm,
+                        invoke_arg,
+                        structured_schema,
+                        timeout=_timeout,
+                    )
+                    if fallback_raw is not None:
+                        return fallback_raw
+                    raise
+            return fallback_raw
 
     async def ainvoke(
         self,
@@ -1073,8 +1155,63 @@ class AuxiliaryLLM:
         the same fallback + loud-degrade behaviour as chain/agent.
         """
         return await self._ainvoke_fallback(
-            lambda llm: llm, messages, task_name=task_name, timeout=timeout
+            lambda llm, method: llm,
+            messages,
+            task_name=task_name,
+            timeout=timeout,
         )
+
+    def _recover_structured_output(
+        self, result: Any, schema: Type[BaseModel], task_name: str
+    ) -> dict:
+        if not isinstance(result, dict):
+            raise TypeError(f"Unexpected structured-output result for {task_name}: {type(result)}")
+        parsed = result.get("parsed")
+        if parsed is None:
+            raw_text = None
+            raw_result = result.get("raw")
+            if hasattr(raw_result, "content"):
+                raw_text = raw_result.content
+            recovery = recover_structured(raw_text, schema)
+            if recovery is None:
+                parsing_error = result.get("parsing_error")
+                raise ValueError(
+                    f"Structured-output validation failed for {task_name}: {parsing_error}"
+                )
+            return {"raw": raw_result, "parsed": recovery, "parsing_error": None}
+        return {"raw": result.get("raw"), "parsed": parsed}
+
+    def _build_with_structured_output(
+        self, llm: BaseChatModel, schema: Type[BaseModel], method: Optional[str]
+    ):
+        return llm.with_structured_output(
+            schema,
+            method=method or self.structured_output_method,
+            include_raw=True,
+        )
+
+    async def _recover_via_raw_invoke(
+        self,
+        llm: BaseChatModel,
+        invoke_arg,
+        schema: Optional[Type[BaseModel]],
+        *,
+        timeout: float,
+    ) -> Optional[dict]:
+        if schema is None:
+            return None
+        try:
+            raw_result = await asyncio.wait_for(llm.ainvoke(invoke_arg), timeout=timeout)
+        except Exception as recovery_exc:
+            logger.debug("Raw fallback parse recovery failed: %s", recovery_exc)
+            return None
+        raw_text = (
+            raw_result.content if hasattr(raw_result, "content") else str(raw_result)
+        )
+        parsed = recover_structured(raw_text, schema)
+        if parsed is None:
+            return None
+        return {"raw": raw_result, "parsed": parsed, "parsing_error": None}
 
     async def chain(self, task: AuxTask, timeout: Optional[float] = None) -> BaseModel:
         """Single LLM call: system prompt + context -> structured output.
@@ -1120,10 +1257,12 @@ class AuxiliaryLLM:
         start = time.monotonic()
         raw_result = await self._invoke_aux(
             self._ainvoke_fallback(
-                lambda llm: llm.with_structured_output(
-                    task.output_schema, include_raw=True
+                lambda llm, method: self._build_with_structured_output(
+                    llm, task.output_schema, method
                 ),
                 messages,
+                structured_schema=task.output_schema,
+                method=self.structured_output_method,
                 task_name=task.__class__.__name__,
                 timeout=timeout if timeout is not None else self.timeout,
             ),
@@ -1177,10 +1316,11 @@ class AuxiliaryLLM:
         for iteration in range(self.max_iterations):
             response = await self._invoke_aux(
                 self._ainvoke_fallback(
-                    lambda llm: llm.bind_tools(tools),
-                    messages,
-                    task_name=task.__class__.__name__,
-                    timeout=self.timeout,
+                lambda llm, method: llm.bind_tools(tools),
+                messages,
+                method=self.structured_output_method,
+                task_name=task.__class__.__name__,
+                timeout=self.timeout,
                 ),
                 task=task,
                 messages=messages,
@@ -1234,10 +1374,12 @@ class AuxiliaryLLM:
 
         raw_result = await self._invoke_aux(
             self._ainvoke_fallback(
-                lambda llm: llm.with_structured_output(
-                    task.output_schema, include_raw=True
+                lambda llm, method: self._build_with_structured_output(
+                    llm, task.output_schema, method
                 ),
                 messages,
+                structured_schema=task.output_schema,
+                method=self.structured_output_method,
                 task_name=task.__class__.__name__,
                 timeout=self.timeout,
             ),

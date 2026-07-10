@@ -16,6 +16,8 @@ fallback or the fallback also fails.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage
+from pydantic import ValidationError
 
 from src.core.loader import (
     AuxiliaryConfig,
@@ -23,7 +25,7 @@ from src.core.loader import (
     _parse_auxiliary_config,
     create_llm,
 )
-from src.services.auxiliary import AuxiliaryLLM
+from src.services.auxiliary import AuxiliaryLLM, CurationResult, CurateKnowledgeTask
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +205,76 @@ class TestAuxiliaryMainModelFallback:
         aux = _mock_llm("aux-model")
         wrapper = AuxiliaryLLM(llm=aux, fallback_llm=aux)
         assert wrapper.fallback_llm is None
+
+    @pytest.mark.asyncio
+    async def test_chain_recovers_from_parsed_none_parsing_error(self):
+        # Simulates structured-output returning parsed=None + parsing_error while
+        # still including a raw response that can be parsed as JSON.
+        raw_text = (
+            '{"notes_created": 2, "notes_updated": 1, "summary": "Recovered from raw"}'
+        )
+        structured_raw = AIMessage(content=raw_text)
+        structured_response = {
+            "raw": structured_raw,
+            "parsed": None,
+            "parsing_error": {"type": "SchemaMismatch"},
+        }
+
+        llm = MagicMock()
+        structured_mock = AsyncMock()
+        structured_mock.ainvoke = AsyncMock(return_value=structured_response)
+        llm.with_structured_output = MagicMock(return_value=structured_mock)
+        llm.ainvoke = AsyncMock(return_value=structured_raw)
+
+        aux = AuxiliaryLLM(llm=llm)
+        task = CurateKnowledgeTask(
+            phase_data="phase",
+            workspace_md="workspace",
+            plan_md="plan",
+            existing_notes=[],
+            kb_tools=[],
+            prompt="curate",
+        )
+
+        result = await aux.chain(task)
+
+        assert result == CurationResult(
+            notes_created=2, notes_updated=1, summary="Recovered from raw"
+        )
+
+    @pytest.mark.asyncio
+    async def test_chain_recovers_from_validation_error_surface(self):
+        # The raw structured-without-model-validation path should still recover from
+        # the parse error in a second raw invoke pass.
+        try:
+            CurationResult.model_validate({})
+        except ValidationError as parse_error:
+            parse_error_value = parse_error
+        else:
+            raise AssertionError("Expected validation error")
+
+        llm = MagicMock()
+        structured_mock = AsyncMock()
+        structured_mock.ainvoke = AsyncMock(side_effect=parse_error_value)
+        llm.with_structured_output = MagicMock(return_value=structured_mock)
+        llm.ainvoke = AsyncMock(
+            return_value=AIMessage(
+                content='{ "notes_created": 3, "notes_updated": 0, "summary": "Recovered" }'
+            )
+        )
+
+        aux = AuxiliaryLLM(llm=llm)
+        task = CurateKnowledgeTask(
+            phase_data="phase",
+            workspace_md="workspace",
+            plan_md="plan",
+            existing_notes=[],
+            kb_tools=[],
+            prompt="curate",
+        )
+
+        result = await aux.chain(task)
+
+        assert result == CurationResult(
+            notes_created=3, notes_updated=0, summary="Recovered"
+        )

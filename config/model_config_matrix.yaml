@@ -79,6 +79,7 @@ minimax:
   guardrails:
     file: minimax.yaml
   settings:
+    structured_output_method: json_schema
     temperature: 1.0  # M2.7 is a reasoning model; use default
     top_p: 0.95
     multimodal: false
@@ -115,6 +116,7 @@ minimax-m3:
   guardrails:
     file: minimax_m3.yaml
   settings:
+    structured_output_method: function_calling
     temperature: 1.0   # MiniMax recommends temp 1.0 for M-series reasoning models
     top_p: 0.95        # MiniMax recommended top_p
     # top_k: intentionally omitted. MiniMax recommends top_k=40, but the OpenAI
@@ -341,6 +343,7 @@ gpt-5.6:
   guardrails:
     file: gpt_5_6.yaml
   settings:
+    structured_output_method: json_schema
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5.6 supports image inputs
     # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
@@ -473,6 +476,7 @@ gemma:
   guardrails:
     file: gemma.yaml
   settings:
+    structured_output_method: json_schema
     # Google official for Gemma 4 instruct is temp=1.0, top_p=0.95, top_k=64.
     # We run temp=0.3 because the workload is heavy tool-calling / structured
     # output and community evidence shows high entropy increases malformed

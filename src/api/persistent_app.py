@@ -1459,17 +1459,28 @@ async def _attach_session(
             extra_body=model_settings.get("extra_body"),
             max_retries=1,
         )
+        aux_structured_output_method = model_settings.get(
+            "structured_output_method", "json_schema"
+        )
+        fallback_model = effective_config.llm.model
+        fallback_settings = resolve_model_settings(
+            fallback_model, effective_config._deployment_dir
+        )
         aux_inner = create_llm(aux_llm_config, effective_config.limits)
         auxiliary_llm = AuxiliaryLLM(
             llm=aux_inner,
             max_iterations=aux_cfg.max_iterations,
             timeout=aux_cfg.timeout,
             max_context_tokens=model_settings.get("model_max_context_tokens"),
+            structured_output_method=aux_structured_output_method,
             # Drop-in fallback to the main session model when the dedicated aux
             # model is unreachable — keeps compaction/memory/titles alive instead
             # of crashing the session. See
             # docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
             fallback_llm=llm,
+            fallback_structured_output_method=fallback_settings.get(
+                "structured_output_method", "json_schema"
+            ),
         )
         logger.info(
             "Auxiliary override applied: model=%s, base_url=%s",
@@ -4443,15 +4454,26 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 extra_body=model_settings.get("extra_body"),
                 max_retries=1,
             )
+            aux_structured_output_method = model_settings.get(
+                "structured_output_method", "json_schema"
+            )
+            fallback_model = new_config.llm.model
+            fallback_settings = resolve_model_settings(
+                fallback_model, new_config._deployment_dir
+            )
             aux_inner = create_llm(aux_llm_config, new_config.limits)
             _session.auxiliary_llm = AuxiliaryLLM(
                 llm=aux_inner,
                 max_iterations=aux_cfg.max_iterations,
                 timeout=aux_cfg.timeout,
                 max_context_tokens=model_settings.get("model_max_context_tokens"),
+                structured_output_method=aux_structured_output_method,
                 # Fall back to the (possibly just-rebuilt) main session model when
                 # the dedicated aux model is unreachable.
                 fallback_llm=_session._llm,
+                fallback_structured_output_method=fallback_settings.get(
+                    "structured_output_method", "json_schema"
+                ),
             )
             logger.info(
                 "Auxiliary hot-swapped: model=%s, base_url=%s",
