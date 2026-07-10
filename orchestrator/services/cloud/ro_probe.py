@@ -65,6 +65,7 @@ Phase 1 must call BOTH ``check_version_floors`` and ``probe_read_only``
 and require ``ok`` from each — passing one gate does not imply the
 other.
 """
+
 from __future__ import annotations
 
 import re
@@ -181,8 +182,7 @@ def side_channel_probes(
                 "url": f"{root}/trashbin/{username}/trash/{_SYNTHETIC_TRASH_ITEM}",
                 "headers": {
                     "Destination": (
-                        f"{root}/trashbin/{username}/restore/"
-                        f"{_SYNTHETIC_TRASH_ITEM}"
+                        f"{root}/trashbin/{username}/restore/{_SYNTHETIC_TRASH_ITEM}"
                     )
                 },
             },
@@ -354,9 +354,7 @@ async def probe_read_only(
             # against a credential the read control just proved live is
             # anomalous, and must fail closed rather than land in
             # `inconclusive` or go unclassified.
-            failures.append(
-                f"{label} -> {status} (expected 403/405; write path open)"
-            )
+            failures.append(f"{label} -> {status} (expected 403/405; write path open)")
     else:
         # dav_root/username weren't supplied — the side channels were
         # never attempted, so the gate refuses until they are (see
@@ -447,9 +445,7 @@ def _capabilities_origin(base_url: str) -> str:
     return stripped[:idx]
 
 
-async def check_version_floors(
-    client, base_url: str, *, backend: str
-) -> RoProbeResult:
+async def check_version_floors(client, base_url: str, *, backend: str) -> RoProbeResult:
     """Runtime-check the version floors that fixed the RO-bypass CVEs.
 
     docs/design/cloud_access_unification.md §3.3 (verbatim): "Version
@@ -484,9 +480,7 @@ async def check_version_floors(
     if backend != "nextcloud":
         # Allowlist: an unrecognized backend value must refuse, not
         # silently skip the floors (fail-open would defeat the gate).
-        return RoProbeResult(
-            failures=[f"unknown backend {backend!r} (fail-closed)"]
-        )
+        return RoProbeResult(failures=[f"unknown backend {backend!r} (fail-closed)"])
 
     url = f"{_capabilities_origin(base_url)}/ocs/v2.php/cloud/capabilities?format=json"
 

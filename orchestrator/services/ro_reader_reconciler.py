@@ -7,6 +7,7 @@ existing periodic reconcilers (lifecycle/reconciler, project_loop_sweeper). The
 leader-gated periodic wrapper lives in ``orchestrator/main.py`` so it can close
 over the ``postgres_db`` / ``main_cloud_router`` module globals.
 """
+
 from __future__ import annotations
 
 import json

@@ -70,7 +70,8 @@ class FakeOc:
         path = url.path
         if url.host == "kc.example.com":
             return httpx.Response(
-                200, json={"access_token": "t", "expires_in": 300, "token_type": "Bearer"}
+                200,
+                json={"access_token": "t", "expires_in": 300, "token_type": "Bearer"},
             )
         if "/dav/spaces/" in str(url):
             if method == "MKCOL":
@@ -83,7 +84,10 @@ class FakeOc:
                 return httpx.Response(204)
             return httpx.Response(500)
 
-        if method == "GET" and path == "/graph/v1beta1/roleManagement/permissions/roleDefinitions":
+        if (
+            method == "GET"
+            and path == "/graph/v1beta1/roleManagement/permissions/roleDefinitions"
+        ):
             return httpx.Response(200, json=list(self.role_catalog))
         if method == "GET" and path == "/graph/v1.0/users":
             return httpx.Response(200, json={"value": list(self.users.values())})
@@ -93,8 +97,15 @@ class FakeOc:
             # 400s ("no value given for required property ...", live dev-cluster
             # validation 2026-07-10). Mirror that so the fake is faithful.
             if not body.get("onPremisesSamAccountName"):
-                return httpx.Response(400, json={"error": {"code": "invalidRequest",
-                    "message": "no value given for required property onPremisesSamAccountName"}})
+                return httpx.Response(
+                    400,
+                    json={
+                        "error": {
+                            "code": "invalidRequest",
+                            "message": "no value given for required property onPremisesSamAccountName",
+                        }
+                    },
+                )
             uid = self._new("user-")
             self.users[uid] = {"id": uid, "displayName": body["displayName"]}
             return httpx.Response(201, json=self.users[uid])
@@ -125,7 +136,10 @@ def _oc_backend_with_fake():
     backend._initialized = True
     # Pre-seed the role cache with the correct tuple keys so _role_id hits the
     # early-return path (the refresh path has a latent bug, opencloud.py:1610).
-    backend._role_cache = {("Can edit", 90): "editor-role", ("Can view", 40): "viewer-role"}
+    backend._role_cache = {
+        ("Can edit", 90): "editor-role",
+        ("Can view", 40): "viewer-role",
+    }
     return backend, fake
 
 

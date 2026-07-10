@@ -16,16 +16,28 @@ from orchestrator.services.ro_reader_reconciler import reconcile_orphaned_ro_mou
 @pytest.mark.asyncio
 async def test_reconciler_revokes_grants_for_dead_threads():
     db = AsyncMock()
-    db.list_active_ro_mounts = AsyncMock(return_value=[
-        {"id": "r1", "thread_id": "alive", "backend": "nextcloud",
-         "grant_handle": '{"group_id":"g1","reader_id":"srw-reader-a"}',
-         "user_id": "u1"},
-        {"id": "r2", "thread_id": "dead", "backend": "nextcloud",
-         "grant_handle": '{"group_id":"g2","reader_id":"srw-reader-b"}',
-         "user_id": "u2"},
-    ])
+    db.list_active_ro_mounts = AsyncMock(
+        return_value=[
+            {
+                "id": "r1",
+                "thread_id": "alive",
+                "backend": "nextcloud",
+                "grant_handle": '{"group_id":"g1","reader_id":"srw-reader-a"}',
+                "user_id": "u1",
+            },
+            {
+                "id": "r2",
+                "thread_id": "dead",
+                "backend": "nextcloud",
+                "grant_handle": '{"group_id":"g2","reader_id":"srw-reader-b"}',
+                "user_id": "u2",
+            },
+        ]
+    )
     db.get_thread = AsyncMock(
-        side_effect=lambda tid: {"id": tid, "status": "active"} if tid == "alive" else None
+        side_effect=lambda tid: {"id": tid, "status": "active"}
+        if tid == "alive"
+        else None
     )
     db.mark_ro_mount_revoked = AsyncMock(return_value=True)
     backend = AsyncMock()
@@ -42,10 +54,17 @@ async def test_reconciler_revokes_grants_for_dead_threads():
 @pytest.mark.asyncio
 async def test_reconciler_revokes_grants_for_ended_threads():
     db = AsyncMock()
-    db.list_active_ro_mounts = AsyncMock(return_value=[
-        {"id": "r3", "thread_id": "ended", "backend": "nextcloud",
-         "grant_handle": '{"group_id":"g","reader_id":"srw-reader-x"}', "user_id": "u"},
-    ])
+    db.list_active_ro_mounts = AsyncMock(
+        return_value=[
+            {
+                "id": "r3",
+                "thread_id": "ended",
+                "backend": "nextcloud",
+                "grant_handle": '{"group_id":"g","reader_id":"srw-reader-x"}',
+                "user_id": "u",
+            },
+        ]
+    )
     db.get_thread = AsyncMock(return_value={"id": "ended", "status": "ended"})
     db.mark_ro_mount_revoked = AsyncMock(return_value=True)
     backend = AsyncMock()
@@ -58,10 +77,17 @@ async def test_reconciler_revokes_grants_for_ended_threads():
 @pytest.mark.asyncio
 async def test_reconciler_leaves_live_grants_alone():
     db = AsyncMock()
-    db.list_active_ro_mounts = AsyncMock(return_value=[
-        {"id": "r1", "thread_id": "alive", "backend": "nextcloud",
-         "grant_handle": '{"group_id":"g","reader_id":"srw-reader-a"}', "user_id": "u"},
-    ])
+    db.list_active_ro_mounts = AsyncMock(
+        return_value=[
+            {
+                "id": "r1",
+                "thread_id": "alive",
+                "backend": "nextcloud",
+                "grant_handle": '{"group_id":"g","reader_id":"srw-reader-a"}',
+                "user_id": "u",
+            },
+        ]
+    )
     db.get_thread = AsyncMock(return_value={"id": "alive", "status": "active"})
     db.mark_ro_mount_revoked = AsyncMock()
     backend = AsyncMock()
@@ -76,12 +102,24 @@ async def test_reconciler_leaves_live_grants_alone():
 @pytest.mark.asyncio
 async def test_reconciler_continues_after_a_revoke_failure():
     db = AsyncMock()
-    db.list_active_ro_mounts = AsyncMock(return_value=[
-        {"id": "r1", "thread_id": "dead1", "backend": "nextcloud",
-         "grant_handle": '{"group_id":"g1","reader_id":"srw-reader-a"}', "user_id": "u"},
-        {"id": "r2", "thread_id": "dead2", "backend": "nextcloud",
-         "grant_handle": '{"group_id":"g2","reader_id":"srw-reader-b"}', "user_id": "u"},
-    ])
+    db.list_active_ro_mounts = AsyncMock(
+        return_value=[
+            {
+                "id": "r1",
+                "thread_id": "dead1",
+                "backend": "nextcloud",
+                "grant_handle": '{"group_id":"g1","reader_id":"srw-reader-a"}',
+                "user_id": "u",
+            },
+            {
+                "id": "r2",
+                "thread_id": "dead2",
+                "backend": "nextcloud",
+                "grant_handle": '{"group_id":"g2","reader_id":"srw-reader-b"}',
+                "user_id": "u",
+            },
+        ]
+    )
     db.get_thread = AsyncMock(return_value=None)  # both orphaned
     db.mark_ro_mount_revoked = AsyncMock(return_value=True)
     backend = AsyncMock()

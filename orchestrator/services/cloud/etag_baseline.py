@@ -10,6 +10,7 @@ when the backend rejects infinity (OpenCloud 400s it — opencloud.py:763).
 Pure orchestration: the caller injects the two PROPFIND primitives so this
 module stays backend- and auth-agnostic and unit-testable without httpx.
 """
+
 from __future__ import annotations
 
 import asyncio

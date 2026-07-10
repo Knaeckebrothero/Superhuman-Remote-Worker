@@ -48,6 +48,7 @@ Raises:
         ``.wh..wh.x``); the guard fails loudly rather than letting engine
         bookkeeping masquerade as a user-visible change.
 """
+
 from __future__ import annotations
 
 import os
@@ -83,9 +84,7 @@ def is_whiteout(name: str) -> bool:
     valid whiteout; neither is the opaque sentinel.
     """
     return (
-        name.startswith(_WH_PREFIX)
-        and name != _OPAQUE_SENTINEL
-        and name != _WH_PREFIX
+        name.startswith(_WH_PREFIX) and name != _OPAQUE_SENTINEL and name != _WH_PREFIX
     )
 
 
@@ -138,11 +137,9 @@ def enumerate_diff(upperdir: str) -> list[DiffEntry]:
                     # Prefix first, then validate the remainder: a bare
                     # `.wh.` must fail loudly, not alias to the parent dir
                     # or slip through as a "present" file.
-                    remainder = name[len(_WH_PREFIX):]
+                    remainder = name[len(_WH_PREFIX) :]
                     if not remainder:
-                        raise ValueError(
-                            f"malformed whiteout marker: {entry.path!r}"
-                        )
+                        raise ValueError(f"malformed whiteout marker: {entry.path!r}")
                     real = os.path.join(dirpath, remainder)
                     out.append(DiffEntry(rel(real), "deleted"))
                     continue

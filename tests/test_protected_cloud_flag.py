@@ -8,8 +8,14 @@ import pytest
 @pytest.mark.parametrize(
     "value,expected",
     [
-        ("true", True), ("TRUE", True), (" 1 ", True), ("yes", True),
-        ("false", False), ("0", False), ("", False), ("off", False),
+        ("true", True),
+        ("TRUE", True),
+        (" 1 ", True),
+        ("yes", True),
+        ("false", False),
+        ("0", False),
+        ("", False),
+        ("off", False),
     ],
 )
 def test_protected_cloud_mode_flag_parsing(monkeypatch, value, expected):

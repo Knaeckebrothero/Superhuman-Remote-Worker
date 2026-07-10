@@ -35,6 +35,7 @@ class _FakeClient:
     returning a response — used to simulate transport failures (timeouts,
     connection errors) for the fail-closed transport-error path.
     """
+
     def __init__(self, statuses, raises=None):
         self._s = statuses
         self._raises = raises or {}
@@ -151,9 +152,7 @@ async def test_blanket_401_is_not_ok_finding_1_positive_read_control():
         username="alice",
     )
     assert res.ok is False
-    assert any(
-        "read control failed" in f and "PROPFIND" in f for f in res.failures
-    )
+    assert any("read control failed" in f and "PROPFIND" in f for f in res.failures)
 
 
 @pytest.mark.asyncio
@@ -179,9 +178,7 @@ async def test_read_control_passes_but_401_mutation_fails_closed():
     # only ever see 403/405 on a mutation. A 401 here is anomalous (the
     # credential that just read fine is being told "unauthenticated" on a
     # write attempt) and must fail closed, not be read as "rejected".
-    res = await probe_read_only(
-        _FakeClient({"PUT": 401}), "https://cloud/dav", "f/"
-    )
+    res = await probe_read_only(_FakeClient({"PUT": 401}), "https://cloud/dav", "f/")
     assert res.ok is False
     put_failure = next(f for f in res.failures if f.startswith("PUT"))
     assert "401" in put_failure
@@ -191,9 +188,7 @@ async def test_read_control_passes_but_401_mutation_fails_closed():
 async def test_transport_error_fails_closed_and_keeps_probing():
     # PUT raises (simulated connection error); DELETE is unexpectedly
     # accepted (201) to prove probing continued past the exception.
-    client = _FakeClient(
-        {"DELETE": 201}, raises={"PUT": ConnectionError("boom")}
-    )
+    client = _FakeClient({"DELETE": 201}, raises={"PUT": ConnectionError("boom")})
     res = await probe_read_only(client, "https://cloud/dav", "f/")
     assert res.ok is False
     put_failure = next(f for f in res.failures if f.startswith("PUT"))
@@ -266,9 +261,7 @@ async def test_nc_below_server_floor_is_not_ok():
 
 @pytest.mark.asyncio
 async def test_nc_at_floor_exactly_with_groupfolders_is_ok():
-    client = _FakeCapabilitiesClient(
-        _nc_capabilities(28, 0, 3, groupfolders="20.1.2")
-    )
+    client = _FakeCapabilitiesClient(_nc_capabilities(28, 0, 3, groupfolders="20.1.2"))
     res = await check_version_floors(
         client, "https://cloud/remote.php/dav", backend="nextcloud"
     )
@@ -288,9 +281,7 @@ async def test_unparseable_capabilities_json_is_not_ok():
 @pytest.mark.asyncio
 async def test_opencloud_has_no_version_floor_and_is_ok():
     client = _FakeCapabilitiesClient(None)
-    res = await check_version_floors(
-        client, "https://cloud/dav", backend="opencloud"
-    )
+    res = await check_version_floors(client, "https://cloud/dav", backend="opencloud")
     assert res.ok is True
     assert res.failures == []
 
@@ -409,7 +400,9 @@ class _TextResp:
 async def test_groupfolders_appversion_at_floor_is_ok():
     # Real NC exposes capabilities.groupfolders = {"appVersion": "20.1.2", ...}.
     client = _FakeCapabilitiesClient(
-        _nc_capabilities(31, 0, 14, groupfolders={"appVersion": "20.1.2", "hasGroupFolders": False})
+        _nc_capabilities(
+            31, 0, 14, groupfolders={"appVersion": "20.1.2", "hasGroupFolders": False}
+        )
     )
     res = await check_version_floors(
         client, "https://cloud/remote.php/dav", backend="nextcloud"
@@ -446,9 +439,9 @@ class _ProppatchClient:
             body = (
                 '<?xml version="1.0"?>'
                 '<d:multistatus xmlns:d="DAV:"><d:response>'
-                '<d:href>/f</d:href><d:propstat><d:prop><d:displayname/></d:prop>'
-                f'<d:status>HTTP/1.1 {self._inner} X</d:status>'
-                '</d:propstat></d:response></d:multistatus>'
+                "<d:href>/f</d:href><d:propstat><d:prop><d:displayname/></d:prop>"
+                f"<d:status>HTTP/1.1 {self._inner} X</d:status>"
+                "</d:propstat></d:response></d:multistatus>"
             )
             return _TextResp(207, body)
         return _TextResp(403)

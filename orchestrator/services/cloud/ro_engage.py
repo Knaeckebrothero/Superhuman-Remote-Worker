@@ -12,6 +12,7 @@ Phase 0 with unit coverage but no wiring. The canary side channels still target
 synthetic ids until the §11.4 live-validation step supplies real version/trash
 ids, so a real run today lands ``inconclusive`` and — correctly — REFUSES.
 """
+
 from __future__ import annotations
 
 import logging
@@ -57,8 +58,7 @@ async def engage_ro_mount(
         )
         if not floors.ok:
             raise RoEngageRefused(
-                f"version floor check failed: "
-                f"{floors.failures or floors.inconclusive}"
+                f"version floor check failed: {floors.failures or floors.inconclusive}"
             )
 
         # probe_read_only(client, base_url, path, *, dav_root=None, username=None)

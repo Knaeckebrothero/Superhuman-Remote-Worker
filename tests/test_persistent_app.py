@@ -1343,9 +1343,7 @@ class TestEarlyTitleFromPrompt:
         with (
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch(
-                "src.api.persistent_app._generate_title", AsyncMock()
-            ) as gen,
+            patch("src.api.persistent_app._generate_title", AsyncMock()) as gen,
             patch("src.api.persistent_app._broadcast") as bcast,
         ):
             await _early_title_from_prompt("hi")
@@ -1363,9 +1361,7 @@ class TestEarlyTitleFromPrompt:
         with (
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch(
-                "src.api.persistent_app._generate_title", AsyncMock()
-            ) as gen,
+            patch("src.api.persistent_app._generate_title", AsyncMock()) as gen,
             patch("src.api.persistent_app._broadcast") as bcast,
         ):
             await _early_title_from_prompt("a perfectly good titleable prompt")
