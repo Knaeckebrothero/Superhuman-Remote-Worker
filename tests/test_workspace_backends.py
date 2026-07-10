@@ -20,7 +20,10 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
+from src.core.workspace_backend import (  # noqa: E402
+    RemoteCommandTimeoutError,
+    WorkspaceUnavailableError,
+)
 
 
 # =============================================================================
@@ -46,6 +49,117 @@ def _make_sftp_entry(
     entry = _make_sftp_attr(is_dir=is_dir, size=size)
     entry.filename = filename
     return entry
+
+
+class _WindowedChannel:
+    """Mock paramiko Channel with window-full deadlock semantics.
+
+    Exit status only becomes ready once ALL pending output has been
+    recv()'d — exactly like a remote command blocked on pipe_write until
+    the reader drains the channel. recv_exit_status() raises if called
+    while output is undrained, which is the deadlock the fix removes
+    (on real paramiko it blocks forever instead of raising).
+    """
+
+    def __init__(
+        self, stdout_data=b"", stderr_data=b"", exit_code=0, never_exits=False
+    ):
+        self._out = stdout_data
+        self._err = stderr_data
+        self._exit_code = exit_code
+        self._never_exits = never_exits
+        self.closed = False
+
+    def recv_ready(self):
+        return bool(self._out)
+
+    def recv(self, n):
+        chunk, self._out = self._out[:n], self._out[n:]
+        return chunk
+
+    def recv_stderr_ready(self):
+        return bool(self._err)
+
+    def recv_stderr(self, n):
+        chunk, self._err = self._err[:n], self._err[n:]
+        return chunk
+
+    def exit_status_ready(self):
+        if self._never_exits:
+            return False
+        return not self._out and not self._err
+
+    def recv_exit_status(self):
+        if self._out or self._err:
+            raise AssertionError(
+                "recv_exit_status() called with output undrained — "
+                "window-full deadlock (hangs forever on real paramiko)"
+            )
+        return self._exit_code
+
+    def close(self):
+        self.closed = True
+
+
+def _wire_exec_channel(mock_ssh, channel):
+    """Point mock_ssh.exec_command at a (stdin, stdout, stderr) triple
+    whose stdout.channel is the given mock channel."""
+    stdout = MagicMock()
+    stdout.channel = channel
+    mock_ssh.exec_command.return_value = (MagicMock(), stdout, MagicMock())
+
+
+class TestExecDrainLoop:
+    """_exec must drain the channel and bound every wait.
+
+    Regression tests for docs/issues/remote_backend_indefinite_wait_deadlock.md
+    (job 2dbe6854: grep output 2,319,835 B > 2 MiB window wedged a job 8 h).
+    """
+
+    def test_large_output_does_not_deadlock(self, remote_backend):
+        """Output bigger than the 2 MiB channel window must be returned,
+        not deadlock. Fails on pre-fix code (recv_exit_status first)."""
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        big = b"x" * (3 * 1024 * 1024)  # > 2 MiB window
+        _wire_exec_channel(mock_ssh, _WindowedChannel(stdout_data=big))
+        out = backend._exec("grep -rni role /ws")
+        assert len(out) == 3 * 1024 * 1024
+
+    def test_stderr_is_drained(self, remote_backend):
+        """stderr shares the channel window; undrained stderr must not
+        stall the loop even on a non-zero exit."""
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        chan = _WindowedChannel(
+            stdout_data=b"ok", stderr_data=b"e" * 100_000, exit_code=1
+        )
+        _wire_exec_channel(mock_ssh, chan)
+        assert backend._exec("cmd") == "ok"
+
+    def test_timeout_raises_and_closes_channel(self, remote_backend):
+        """A command that never exits must raise RemoteCommandTimeoutError
+        (NOT WorkspaceUnavailableError) and close the channel."""
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        chan = _WindowedChannel(never_exits=True)
+        _wire_exec_channel(mock_ssh, chan)
+        with patch("time.sleep"):
+            with pytest.raises(RemoteCommandTimeoutError):
+                backend._exec("sleep 999", timeout=0)
+        assert chan.closed
+        assert not issubclass(RemoteCommandTimeoutError, WorkspaceUnavailableError)
+
+    def test_output_truncated_at_cap(self, remote_backend):
+        """Output beyond 5 MiB is dropped (marker appended), but the
+        channel is still drained so the command can finish."""
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        big = b"y" * (6 * 1024 * 1024)
+        _wire_exec_channel(mock_ssh, _WindowedChannel(stdout_data=big))
+        out = backend._exec("cat huge")
+        assert out.endswith("[output truncated at 5 MiB]")
+        assert len(out) < 6 * 1024 * 1024
 
 
 # =============================================================================
@@ -327,12 +441,7 @@ class TestRemoteBackendDisconnect:
         backend._tabs["default"] = MagicMock()
 
         # Mock exec_command for the tmux kill
-        stdout_mock = MagicMock()
-        stdout_mock.read.return_value = b""
-        stdout_mock.channel.recv_exit_status.return_value = 0
-        stderr_mock = MagicMock()
-        stderr_mock.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout_mock, stderr_mock)
+        _wire_exec_channel(mock_ssh, _WindowedChannel())
 
         backend.disconnect()
         assert backend._shell_initialized is False
@@ -797,12 +906,10 @@ class TestRemoteBackendSearchFiles:
 
     def _setup_exec(self, mock_ssh, output: str, exit_code: int = 0):
         """Set up mock exec_command to return given output."""
-        stdout = MagicMock()
-        stdout.read.return_value = output.encode("utf-8")
-        stdout.channel.recv_exit_status.return_value = exit_code
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(
+            mock_ssh,
+            _WindowedChannel(stdout_data=output.encode("utf-8"), exit_code=exit_code),
+        )
 
     def test_search_parses_grep_output(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -957,12 +1064,7 @@ class TestRemoteBackendDeleteDirectory:
         mock_sftp.stat.return_value = _make_sftp_attr(is_dir=True)
 
         # Mock exec for rm -rf
-        stdout = MagicMock()
-        stdout.read.return_value = b""
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(mock_ssh, _WindowedChannel())
 
         result = backend.delete_directory("tree")
         assert result is True
@@ -997,12 +1099,7 @@ class TestRemoteBackendMove:
     """Tests for RemoteBackend.move()."""
 
     def _setup_exec(self, mock_ssh):
-        stdout = MagicMock()
-        stdout.read.return_value = b""
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(mock_ssh, _WindowedChannel())
 
     def test_move_calls_mv(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -1030,12 +1127,7 @@ class TestRemoteBackendCopy:
     """Tests for RemoteBackend.copy()."""
 
     def _setup_exec(self, mock_ssh):
-        stdout = MagicMock()
-        stdout.read.return_value = b""
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(mock_ssh, _WindowedChannel())
 
     def test_copy_calls_cp(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -1089,12 +1181,10 @@ class TestRemoteBackendStat:
 
         mock_sftp.stat.return_value = _make_sftp_attr(is_dir=True)
 
-        stdout = MagicMock()
-        stdout.read.return_value = b"4096\t/home/agent-host/workspace/dir\n"
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(
+            mock_ssh,
+            _WindowedChannel(stdout_data=b"4096\t/home/agent-host/workspace/dir\n"),
+        )
 
         size = backend.stat("dir")
         assert size == 4096
@@ -1105,12 +1195,9 @@ class TestRemoteBackendStat:
 
         mock_sftp.stat.return_value = _make_sftp_attr(is_dir=True)
 
-        stdout = MagicMock()
-        stdout.read.return_value = b"malformed output\n"
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(
+            mock_ssh, _WindowedChannel(stdout_data=b"malformed output\n")
+        )
 
         assert backend.stat("dir") == 0
 
@@ -1122,12 +1209,7 @@ class TestRemoteBackendExec:
         backend, mock_ssh, mock_sftp = remote_backend
         backend.connect()
 
-        stdout = MagicMock()
-        stdout.read.return_value = b"output data\n"
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(mock_ssh, _WindowedChannel(stdout_data=b"output data\n"))
 
         result = backend._exec("echo hello")
         assert result == "output data\n"
@@ -1137,12 +1219,12 @@ class TestRemoteBackendExec:
         backend, mock_ssh, mock_sftp = remote_backend
         backend.connect()
 
-        stdout = MagicMock()
-        stdout.read.return_value = b"some output\n"
-        stdout.channel.recv_exit_status.return_value = 1
-        stderr = MagicMock()
-        stderr.read.return_value = b"error msg"
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(
+            mock_ssh,
+            _WindowedChannel(
+                stdout_data=b"some output\n", stderr_data=b"error msg", exit_code=1
+            ),
+        )
 
         result = backend._exec("grep notfound .")
         assert result == "some output\n"
@@ -1292,12 +1374,10 @@ class TestRemoteBackendShellOperations:
     """Tests for RemoteBackend shell tab management."""
 
     def _setup_exec_mock(self, mock_ssh, output: str = "", exit_code: int = 0):
-        stdout = MagicMock()
-        stdout.read.return_value = output.encode("utf-8")
-        stdout.channel.recv_exit_status.return_value = exit_code
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(
+            mock_ssh,
+            _WindowedChannel(stdout_data=output.encode("utf-8"), exit_code=exit_code),
+        )
 
     def test_shell_list_tabs_after_init(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -1363,12 +1443,7 @@ class TestRemoteBackendShellOperations:
         mock_ssh.get_transport.return_value = transport
         mock_ssh.open_sftp.return_value = mock_sftp
 
-        stdout = MagicMock()
-        stdout.read.return_value = b""
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(mock_ssh, _WindowedChannel())
 
         with patch("paramiko.SSHClient", return_value=mock_ssh):
             backend = RemoteBackend(
@@ -1431,16 +1506,15 @@ class TestRemoteBackendShellOperations:
         backend, mock_ssh, mock_sftp = remote_backend
         backend.connect()
 
-        # Setup exec for init + is_alive check
-        stdout = MagicMock()
-        stdout.read.return_value = b"yes\n"
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        # Setup exec for init (empty — _init_shell discards its own output)
+        _wire_exec_channel(mock_ssh, _WindowedChannel())
 
         with patch("time.sleep"):
             backend._init_shell()
+
+        # Re-wire with the is_alive check's actual output: the channel above
+        # is a single-shot drain, already consumed by _init_shell's _exec calls.
+        _wire_exec_channel(mock_ssh, _WindowedChannel(stdout_data=b"yes\n"))
 
         assert backend.shell_is_alive() is True
 
@@ -1452,12 +1526,7 @@ class TestRemoteBackendShellOperations:
         backend, mock_ssh, mock_sftp = remote_backend
         backend.connect()
 
-        stdout = MagicMock()
-        stdout.read.return_value = b""
-        stdout.channel.recv_exit_status.return_value = 0
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(mock_ssh, _WindowedChannel())
 
         with patch("time.sleep"):
             backend._init_shell()
@@ -1475,12 +1544,10 @@ class TestRemoteBackendShellSend:
     """Tests for RemoteBackend.shell_send()."""
 
     def _setup_exec_mock(self, mock_ssh, output: str = "", exit_code: int = 0):
-        stdout = MagicMock()
-        stdout.read.return_value = output.encode("utf-8")
-        stdout.channel.recv_exit_status.return_value = exit_code
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(
+            mock_ssh,
+            _WindowedChannel(stdout_data=output.encode("utf-8"), exit_code=exit_code),
+        )
 
     def test_send_to_existing_tab(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -1531,12 +1598,10 @@ class TestRemoteBackendShellRead:
     """Tests for RemoteBackend.shell_read() and shell_read_with_offset()."""
 
     def _setup_exec_mock(self, mock_ssh, output: str = "", exit_code: int = 0):
-        stdout = MagicMock()
-        stdout.read.return_value = output.encode("utf-8")
-        stdout.channel.recv_exit_status.return_value = exit_code
-        stderr = MagicMock()
-        stderr.read.return_value = b""
-        mock_ssh.exec_command.return_value = (MagicMock(), stdout, stderr)
+        _wire_exec_channel(
+            mock_ssh,
+            _WindowedChannel(stdout_data=output.encode("utf-8"), exit_code=exit_code),
+        )
 
     def test_shell_read_tail_mode(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend

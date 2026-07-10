@@ -41,7 +41,11 @@ from ...tools.shell.shell_manager import (
     compute_no_change_state,
     prompt_is_ready,
 )
-from ..workspace_backend import WorkspaceBackend, WorkspaceUnavailableError
+from ..workspace_backend import (
+    RemoteCommandTimeoutError,
+    WorkspaceBackend,
+    WorkspaceUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,11 @@ logger = logging.getLogger(__name__)
 # Connect-failure buckets → how many attempts each is worth.
 _AMBIGUOUS_RETRY_CAP = 2
 _GONE_ERRNOS = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN}
+
+# _exec output cap: past this, output is dropped (marker appended) but the
+# channel keeps draining so the remote command can finish. Guards agent RAM.
+_EXEC_MAX_OUTPUT_BYTES = 5 * 1024 * 1024
+_EXEC_POLL_SECONDS = 0.05
 
 
 def _classify_connect_error(e: Exception) -> str:
@@ -378,15 +387,56 @@ class RemoteBackend(WorkspaceBackend):
     def _exec(self, command: str, timeout: int = 30) -> str:
         """Execute a command via SSH and return stdout.
 
-        Raises WorkspaceUnavailableError on connection failure.
+        Drains stdout AND stderr while waiting for the exit status, so output
+        larger than the SSH channel window cannot deadlock the command
+        (docs/issues/remote_backend_indefinite_wait_deadlock.md), and enforces
+        ``timeout`` as a wall-clock deadline on the whole command.
+
+        Raises WorkspaceUnavailableError on connection failure and
+        RemoteCommandTimeoutError when the deadline expires.
         """
         self._ensure_connected()
         try:
             _, stdout, stderr = self._ssh.exec_command(command, timeout=timeout)
-            exit_code = stdout.channel.recv_exit_status()
-            output = stdout.read().decode("utf-8", errors="replace")
+            chan = stdout.channel
+            out_chunks: list[bytes] = []
+            err_chunks: list[bytes] = []
+            out_size = 0
+            err_size = 0
+            truncated = False
+            deadline = time.monotonic() + timeout
+            while True:
+                while chan.recv_ready():
+                    chunk = chan.recv(65536)
+                    if out_size < _EXEC_MAX_OUTPUT_BYTES:
+                        out_chunks.append(chunk)
+                    else:
+                        truncated = True
+                    out_size += len(chunk)
+                while chan.recv_stderr_ready():
+                    chunk = chan.recv_stderr(65536)
+                    if err_size < _EXEC_MAX_OUTPUT_BYTES:
+                        err_chunks.append(chunk)
+                    err_size += len(chunk)
+                if (
+                    chan.exit_status_ready()
+                    and not chan.recv_ready()
+                    and not chan.recv_stderr_ready()
+                ):
+                    break
+                if time.monotonic() > deadline:
+                    chan.close()  # frees the remote side before we bail
+                    raise RemoteCommandTimeoutError(
+                        f"Remote command timed out after {timeout}s on "
+                        f"{self._host}: {command[:80]}"
+                    )
+                time.sleep(_EXEC_POLL_SECONDS)
+            exit_code = chan.recv_exit_status()  # ready — returns immediately
+            output = b"".join(out_chunks).decode("utf-8", errors="replace")
+            if truncated:
+                output += "\n[output truncated at 5 MiB]"
             if exit_code != 0:
-                err = stderr.read().decode("utf-8", errors="replace")
+                err = b"".join(err_chunks).decode("utf-8", errors="replace")
                 # Some commands (grep with no match, tmux has-session) use non-zero
                 # exit codes for normal conditions — callers check output.
                 logger.debug(
