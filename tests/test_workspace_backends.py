@@ -203,7 +203,15 @@ class TestExecDrainLoopDeadline:
 # We mock at the paramiko SSHClient/SFTPClient level rather than patching
 # the module import.
 
-from src.core.backends.remote import RemoteBackend, _RemoteTab  # noqa: E402
+from src.core.backends.remote import (  # noqa: E402
+    RemoteBackend,
+    _RemoteTab,
+    _TCP_KEEPALIVE_COUNT,
+    _TCP_KEEPALIVE_IDLE_SECONDS,
+    _TCP_KEEPALIVE_INTERVAL_SECONDS,
+    _TCP_USER_TIMEOUT_MILLIS,
+    _TRANSPORT_KEEPALIVE_SECONDS,
+)
 
 
 @pytest.fixture
@@ -1902,6 +1910,35 @@ class TestConnectionHardening:
         backend.connect()
         mock_ssh.get_transport.return_value.set_keepalive.assert_called_with(15)
         mock_sftp.get_channel.return_value.settimeout.assert_called_with(60.0)
+
+    def test_connect_sets_transport_socket_options(self, remote_backend):
+        """Connect applies kernel socket options for long-halt recovery."""
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+
+        transport = mock_ssh.get_transport.return_value
+        transport.set_keepalive.assert_called_with(_TRANSPORT_KEEPALIVE_SECONDS)
+        sock = transport.get_socket.return_value
+
+        sock.setsockopt.assert_any_call(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt.assert_any_call(
+                socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _TCP_KEEPALIVE_IDLE_SECONDS
+            )
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt.assert_any_call(
+                socket.IPPROTO_TCP,
+                socket.TCP_KEEPINTVL,
+                _TCP_KEEPALIVE_INTERVAL_SECONDS,
+            )
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt.assert_any_call(
+                socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _TCP_KEEPALIVE_COUNT
+            )
+        if hasattr(socket, "TCP_USER_TIMEOUT"):
+            sock.setsockopt.assert_any_call(
+                socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, _TCP_USER_TIMEOUT_MILLIS
+            )
 
     def test_read_file_timeout_is_not_file_not_found(self, remote_backend):
         """socket.timeout is an OSError; without special-casing it,
