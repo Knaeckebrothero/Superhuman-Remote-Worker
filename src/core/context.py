@@ -402,6 +402,7 @@ class ContextConfig:
     keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
     max_tool_result_length: int = 5000
+    keep_window_max_tool_result_chars: int = 16000
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
@@ -1722,24 +1723,103 @@ class ContextManager:
         # removal_markers loop so the originals' IDs are evicted from state.
         conversation = sanitized_conversation
 
+        def _tool_result_is_already_truncated(msg: ToolMessage) -> bool:
+            content = msg.content if isinstance(msg.content, str) else ""
+            if not content:
+                return False
+            lower = content.lower()
+            return lower.startswith(
+                "[tool result elided by compaction"
+            ) or lower.startswith("[tool result truncated by compaction")
+
+        def _cap_keep_window_tool_results(
+            tool_messages: List[BaseMessage],
+        ) -> Tuple[List[BaseMessage], int, int]:
+            """Head-truncate oversized tail tool messages.
+
+            Returns:
+                capped_messages, before_tokens, after_tokens
+            """
+            before_tokens = self.get_token_count(
+                [m for m in tool_messages if not isinstance(m, RemoveMessage)]
+            )
+            capped_messages: List[BaseMessage] = []
+            for msg in tool_messages:
+                if not isinstance(msg, ToolMessage):
+                    capped_messages.append(msg)
+                    continue
+
+                content = msg.content if isinstance(msg.content, str) else ""
+                if len(content) <= self.config.keep_window_max_tool_result_chars:
+                    capped_messages.append(msg)
+                    continue
+                if _tool_result_is_already_truncated(msg):
+                    capped_messages.append(msg)
+                    continue
+
+                omitted_chars = (
+                    len(content) - self.config.keep_window_max_tool_result_chars
+                )
+                omitted_tokens = max(1, omitted_chars // 4)
+                capped_messages.append(
+                    ToolMessage(
+                        content=(
+                            f"{content[: self.config.keep_window_max_tool_result_chars]}\n\n"
+                            f"[tool result truncated by compaction: kept "
+                            f"{self.config.keep_window_max_tool_result_chars:,} of "
+                            f"{len(content):,} chars (~{omitted_tokens:,} tokens). "
+                            "Full content was saved to the workspace / is re-fetchable — "
+                            "re-run the tool or read the saved file if the rest is needed.]"
+                        ),
+                        tool_call_id=msg.tool_call_id,
+                        name=getattr(msg, "name", None),
+                    )
+                )
+
+            after_tokens = self.get_token_count(
+                [m for m in capped_messages if not isinstance(m, RemoveMessage)]
+            )
+            return capped_messages, before_tokens, after_tokens
+
         # Helper: when normal compaction can't proceed (too few messages,
         # summary larger than original, etc.) but we *did* substitute
         # oversized messages, return the substitution as a standalone
         # result so the backstop still wins. Without this, the runaway
         # AIMessage would survive the early returns and re-poison the
         # next turn.
-        def _substitution_only_result() -> List[BaseMessage]:
+        def _substitution_only_result(
+            fresh_messages: Optional[List[BaseMessage]] = None,
+        ) -> List[BaseMessage]:
             markers = [
                 RemoveMessage(id=m.id)
                 for m in original_conversation
                 if hasattr(m, "id") and m.id
             ]
-            return markers + system_msgs + sanitized_conversation
+            replacement = fresh_messages or sanitized_conversation
+            return markers + system_msgs + replacement
 
         if len(conversation) <= effective_keep_recent:
             if oversized_count > 0:
-                return _substitution_only_result()
-            return messages
+                capped_conversation, _, _ = _cap_keep_window_tool_results(conversation)
+                return _substitution_only_result(
+                    fresh_messages=capped_conversation
+                    if capped_conversation != conversation
+                    else None
+                )
+
+            capped_conversation, before_tokens, after_tokens = (
+                _cap_keep_window_tool_results(conversation)
+            )
+            if after_tokens >= before_tokens:
+                return messages
+
+            self.compaction_runs += 1
+            markers = [
+                RemoveMessage(id=m.id)
+                for m in original_conversation
+                if hasattr(m, "id") and m.id
+            ]
+            return markers + system_msgs + capped_conversation
 
         # Find safe slice point that doesn't orphan ToolMessages
         target_start = len(conversation) - effective_keep_recent
@@ -1748,6 +1828,10 @@ class ContextManager:
         # Messages to summarize (older ones) and recent messages to keep
         messages_to_summarize = conversation[:safe_start]
         recent_messages = conversation[safe_start:]
+        capped_recent_messages, recent_before_tokens, recent_after_tokens = (
+            _cap_keep_window_tool_results(recent_messages)
+        )
+        keep_window_token_savings = max(0, recent_before_tokens - recent_after_tokens)
 
         # Rolling-summary continuation: prior summaries seed the fold (the
         # engine prepends them as "Prior Summary:" to the first pass) instead
@@ -1761,7 +1845,7 @@ class ContextManager:
 
         # Generate summary
         summary = await self.summarize_conversation(
-            messages_to_summarize,
+            conversation,
             auxiliary,
             summarization_prompt,
             max_summary_length,
@@ -1789,7 +1873,10 @@ class ContextManager:
 
         # Guard: if summary is larger than what we're replacing, skip compaction
         summary_tokens = self.get_token_count([SystemMessage(content=summary)])
-        original_tokens = self.get_token_count(old_summaries + messages_to_summarize)
+        original_tokens = (
+            self.get_token_count(old_summaries + messages_to_summarize)
+            + keep_window_token_savings
+        )
         if summary_tokens > original_tokens:
             logger.error(
                 f"Summary ({summary_tokens} tokens) larger than original ({original_tokens} tokens) — skipping compaction"
@@ -1845,7 +1932,7 @@ class ContextManager:
         # Create fresh copies of recent messages without IDs so they get appended
         # after the summary instead of staying in their original positions
         fresh_recent = []
-        for msg in recent_messages:
+        for msg in capped_recent_messages:
             if isinstance(msg, AIMessage):
                 fresh_recent.append(
                     AIMessage(
@@ -1859,6 +1946,7 @@ class ContextManager:
                     ToolMessage(
                         content=msg.content,
                         tool_call_id=msg.tool_call_id,
+                        name=getattr(msg, "name", None),
                     )
                 )
             elif isinstance(msg, HumanMessage):
