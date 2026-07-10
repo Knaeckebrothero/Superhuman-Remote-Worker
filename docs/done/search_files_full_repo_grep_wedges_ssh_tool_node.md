@@ -13,12 +13,18 @@ tags:
 
 # Parallel full-repo `search_files` greps can wedge the SSH tool node for hours, invisibly — the async heartbeat keeps firing so orchestrator orphan-detection never fires
 
-**Status:** DIAGNOSED 2026-07-10 from a live incident; fix plan agreed, none
-built yet. Root cause is a workspace SSH stall inside a **sync** tool call that
-the app-level `_exec` deadline did not catch; the exact below-`_exec` block
-point is not 100% pinned from code alone (see "Open questions"). Fix design
-(2026-07-10): safety is enforced by timeout layers (L1/L2) + observability (L3),
-**not** by restricting search scope — see "Fix plan" below.
+**Status:** RESOLVED 2026-07-10 — all four layers (L0–L3) implemented,
+lint-clean (`ruff` on all touched source), and unit/integration-tested (271
+targeted tests green). Source committed in `de393722` (L0 `exclude_dirs`) and
+`78493022` (L1 socket timeouts + L2 tool-batch timeout + L3 graph-progress
+heartbeat). **Remaining:** test files are staged but uncommitted, and the *live*
+k3d acceptance checks (force a real wedge, confirm timeout→reconnect→re-dispatch
+and the stall-detector pause) are not yet run — see "Loose ends". Root cause was
+a workspace SSH stall inside a **sync** tool call that the app-level `_exec`
+deadline did not catch; the exact below-`_exec` block point was never reproduced
+(see "Open questions") — L1 hardens it defensively. Safety is enforced by the
+timeout layers (L1/L2) + observability (L3), **not** by restricting search scope.
+As-built mapping below; original design in "Fix plan".
 
 **Motivating incident:** job `2dbe6854-8b4f-4c63-9315-f761076cd7e1` — "Design a
 UI for the Hotel ERP System", dev cluster `main`, image `sha-194cdf2`.
@@ -121,6 +127,59 @@ phase_number: 4` — but the live run was **phase 3 tactical**, per the audit
 trail. Treat `get_frozen_job`'s `version_upgrade` as synthesized/unreliable
 (cf. `vm_ssh_readiness_probe_unroutable_from_orchestrator.md`) and trust the
 `get_audit_trail` timestamps + DB `freeze_data`.
+
+## Implementation (as built) — RESOLVED 2026-07-10
+
+Commits: `de393722` (L0), `78493022` (L1 + L2 + L3). `ruff` clean on all touched
+source; 271 targeted tests green across `test_search_files_summary`,
+`test_workspace_backends`, `test_stuck_detection`, `test_stale_agent_detector`,
+`test_api_agent_metrics`, `test_orchestrator_client`, `test_internal_auth`.
+
+- **L0 — DONE.** `exclude_dirs: list[str] | None = None` threaded through tool
+  wrapper (`filesystem.py:336`), `WorkspaceManager` facade (`workspace.py:728`,
+  forwarded at `:745`), abstract base (`workspace_backend.py:195`), `remote.py:775`
+  (builds shell-escaped `--exclude-dir` args at `:795-800`), `subdir.py:123`
+  (forwards to parent), `virtual.py:290`, `scratch.py:138`, and all three test
+  stubs. Default `None` = search everything, unchanged. Covered by
+  `test_search_files_forwards_exclude_dirs_to_workspace`,
+  `test_search_with_exclude_dirs_includes_flags`,
+  `test_search_escapes_single_quotes_in_exclude_dirs`.
+- **L1 — DONE (defensive; unreproduced).** `connect()` sets `SO_KEEPALIVE`,
+  `TCP_KEEPIDLE`/`INTVL`/`CNT`, and `TCP_USER_TIMEOUT=10s`
+  (`_TCP_USER_TIMEOUT_MILLIS`) on the transport socket (`remote.py:331-391`). A
+  black-holed TCP now aborts in ~10s instead of hanging indefinitely.
+- **L2 — DONE.** `_get_batch_tool_timeout` (max per-category cap from
+  `config.limits.tool_category_timeouts`, clamped to `_TOOL_BATCH_TIMEOUT_SECONDS`
+  outer ceiling; `graph.py:3908`) wraps `tool_node.ainvoke` in `asyncio.wait_for`
+  (`graph.py:4152-4181`). On timeout → `_reconnect_workspace` (`disconnect()` +
+  `connect()`) + tool-error `ToolMessage`; **second consecutive** timeout or
+  reconnect failure → `WorkspaceUnavailableError` → `agent.py:1058` freeze
+  `workspace_unavailable` → orchestrator pause + re-dispatch. Retry counter resets
+  on any successful batch.
+- **L3 — DONE.** `ToolContext.next_graph_progress` / `get_graph_progress`
+  (`context.py:231-242`) incremented per completed batch (`graph.py:4188`);
+  surfaced as heartbeat metric `graph_progress` (`app.py`, `dual_app.py`,
+  `persistent_app.py`); stamped `graph_progress_seen_at` on change
+  (`postgres.py:2686`); consumed by `mark_stalled_working_agents_by_graph_progress`
+  (`postgres.py:3798`) via `stale_agent_detector` (`main.py:625`). Closes the
+  "heartbeating but wedged" blind spot that made this incident invisible for 8h.
+
+### Loose ends
+
+- **Tests uncommitted.** `tests/test_workspace_backends.py`,
+  `test_stuck_detection.py`, `test_internal_auth.py`, `test_orchestrator_client.py`
+  (modified) and `test_api_agent_metrics.py`, `test_stale_agent_detector.py` (new)
+  are unstaged; source is committed. Commit them before/with the next push.
+- **Live k3d acceptance not yet run.** Only unit/integration tests were executed.
+  The "Live" acceptance bullets below (force a real hang → confirm
+  timeout→reconnect→re-dispatch for L2, and the graph-progress stall pause for L3)
+  remain to be exercised on the cluster.
+- **L2 reconnect runs on the event loop.** `_reconnect_workspace` calls blocking
+  `disconnect()`/`connect()` directly in the async handler — now bounded by L1's
+  `TCP_USER_TIMEOUT` (~10s) but could be offloaded to a thread for full
+  event-loop safety. Minor.
+- **L1 efficacy vs. the original incident is unverified** (never reproduced). If
+  it recurs, the L2/L3 backstops will catch it in minutes rather than hours.
 
 ## Fix plan (layered — safety lives in the timeout layers, NOT in exclusion)
 

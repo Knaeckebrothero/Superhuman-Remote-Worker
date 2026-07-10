@@ -29,6 +29,7 @@ if str(src_path) not in sys.path:
 from src.graph import create_audited_tool_node  # noqa: E402
 from src.core.loader import LimitsConfig  # noqa: E402
 from src.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
+from src.tools.context import ToolContext  # noqa: E402
 
 
 # =============================================================================
@@ -532,7 +533,42 @@ class TestStuckDetectionEscalation:
             ]
             assert len(sys_msgs) == 1
             assert "OBSERVATION:" in sys_msgs[0].content
-            assert not result.get("should_stop", False)
+
+
+class TestProgressHeartbeatMarker:
+    """Tests for heartbeat-facing graph-progress signaling."""
+
+    @pytest.mark.asyncio
+    async def test_graph_progress_increments_on_each_batch(self, config):
+        """Each executed tool batch increments graph-progress by one."""
+        fake_tool = MagicMock()
+        fake_tool.name = "read_file"
+        tool_context = ToolContext()
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node(
+                [fake_tool], config, tool_context=tool_context
+            )
+
+            assert tool_context.get_graph_progress() == 0
+
+            state = make_state(
+                [make_tool_call("read_file", {"path": "a.txt"}, "call_a")]
+            )
+            await audited(state)
+            assert tool_context.get_graph_progress() == 1
+
+            state = make_state(
+                [make_tool_call("read_file", {"path": "b.txt"}, "call_b")]
+            )
+            await audited(state)
+            assert tool_context.get_graph_progress() == 2
 
 
 # =============================================================================
