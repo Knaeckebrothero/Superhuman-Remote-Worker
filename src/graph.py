@@ -4451,9 +4451,7 @@ def build_phase_alternation_graph(
         from src.services.auxiliary import AuxiliaryLLM
 
         raw_llm = summarization_llm or strategic_llm_with_tools
-        aux_settings = resolve_model_settings(
-            aux_model, config._deployment_dir
-        )
+        aux_settings = resolve_model_settings(aux_model, config._deployment_dir)
         aux_structured_output_method = aux_settings.get(
             "structured_output_method", "json_schema"
         )
