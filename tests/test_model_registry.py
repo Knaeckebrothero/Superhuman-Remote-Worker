@@ -139,6 +139,88 @@ class TestEndpointMetaProviderResolution:
         assert _catalog_row_to_meta(row).provider == "openai"
 
 
+class TestCodexContextWindowCap:
+    """Models routed onto the ``codex`` factory get their working window clamped
+    to the Codex surface cap (the ChatGPT-OAuth backend caps context ~400K and
+    rejects larger inputs with ``context_too_large``). Keyed on the resolved
+    *provider*, not the family — so the same model over the real API keeps its
+    full window. See docs/issues/codex_proxy_context_window_cap.md.
+    """
+
+    def _codex_endpoint_row(self, context_window):
+        return {
+            "model_id": "gpt-5.6-sol",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "family": "gpt-5.6",
+            "context_window": context_window,
+        }
+
+    def test_null_window_becomes_cap(self):
+        # The live-wedge case: NULL row would otherwise inherit the family's ~1M.
+        meta = _endpoint_row_to_meta(self._codex_endpoint_row(None), origin="system")
+        assert meta.provider == "codex"
+        assert meta.context_window == 400_000
+
+    def test_oversized_window_clamped_to_cap(self):
+        meta = _endpoint_row_to_meta(
+            self._codex_endpoint_row(1_050_000), origin="system"
+        )
+        assert meta.context_window == 400_000
+
+    def test_smaller_window_respected(self):
+        # A deliberately-smaller admin window wins (cost control) — cap is a
+        # ceiling, not a fixed value.
+        meta = _endpoint_row_to_meta(self._codex_endpoint_row(200_000), origin="system")
+        assert meta.context_window == 200_000
+
+    def test_non_codex_window_untouched(self):
+        row = {
+            "model_id": "gemma-4-moe",
+            "base_url": "http://srw-vllm:8000/v1",
+            "label": "homelab",
+            "endpoint_id": "e2",
+            "context_window": 1_050_000,
+        }
+        meta = _endpoint_row_to_meta(row, origin="system")
+        assert meta.provider == "openai"
+        assert meta.context_window == 1_050_000
+
+    def test_catalog_endpoint_codex_row_capped(self):
+        row = {
+            "provider_kind": "endpoint",
+            "provider_ref": "e1",
+            "model_id": "gpt-5.6-sol",
+            "endpoint_id": "e1",
+            "endpoint_label": "codex-proxy",
+            "endpoint_base_url": "http://srw-codex-proxy:8317/v1",
+            "family": "gpt-5.6",
+            "context_window": None,
+        }
+        assert _catalog_row_to_meta(row).context_window == 400_000
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("CODEX_CONTEXT_WINDOW_CAP", "256000")
+        meta = _endpoint_row_to_meta(self._codex_endpoint_row(None), origin="system")
+        assert meta.context_window == 256_000
+
+    def test_env_zero_disables_clamp(self, monkeypatch):
+        # Kill-switch for the day OpenAI ships 1M-for-Codex: fall back to the
+        # model's own window (None here → inherit family default downstream).
+        monkeypatch.setenv("CODEX_CONTEXT_WINDOW_CAP", "0")
+        meta = _endpoint_row_to_meta(
+            self._codex_endpoint_row(1_050_000), origin="system"
+        )
+        assert meta.context_window == 1_050_000
+
+    def test_malformed_env_falls_back_to_default(self, monkeypatch):
+        # A typo must not silently un-cap and re-wedge sessions.
+        monkeypatch.setenv("CODEX_CONTEXT_WINDOW_CAP", "banana")
+        meta = _endpoint_row_to_meta(self._codex_endpoint_row(None), origin="system")
+        assert meta.context_window == 400_000
+
+
 class TestFamilyOf:
     """family_of() — sync prefix-pattern fallback for callers without a row."""
 

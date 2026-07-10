@@ -87,6 +87,13 @@ data:
   # Protected cloud mode: RO-reader provisioning + capture overlay. Read by the
   # orchestrator's RO engage gate + reader reconciler. Default-off (prod-safe).
   PROTECTED_CLOUD_MODE_ENABLED: {{ .Values.agent.protectedCloudModeEnabled | default "false" | quote }}
+  # Effective context ceiling for models routed via the system codex proxy
+  # (CLIProxyAPI / ChatGPT-OAuth backend), which caps context far below the
+  # models' true API windows and rejects larger inputs with `context_too_large`.
+  # Read by src/core/model_registry.py (_cap_context_window) at dispatch. Set 0 to
+  # disable the day OpenAI ships 1M-for-Codex. New sessions only (agents read env
+  # at pod start). See docs/issues/codex_proxy_context_window_cap.md.
+  CODEX_CONTEXT_WINDOW_CAP: {{ .Values.agent.codexContextWindowCap | default 400000 | quote }}
 
   # OIDC / SSO — works with internal Keycloak or external OIDC provider
   KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}

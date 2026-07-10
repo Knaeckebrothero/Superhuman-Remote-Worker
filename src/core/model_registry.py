@@ -27,6 +27,7 @@ failure mode is structurally impossible.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -119,6 +120,52 @@ def _endpoint_factory_provider(
     if base_url and CODEX_PROXY_ENDPOINT_LABEL in base_url.lower():
         return "codex"
     return "openai"
+
+
+# OpenAI's Codex product surface caps context far below the models' true API
+# windows — a deliberate throughput/cost limit, not a capability. gpt-5.x report
+# ~1M on the raw API, but the Codex/ChatGPT-OAuth backend the system codex proxy
+# speaks rejects larger inputs with ``context_too_large``. Measured live against
+# srw-codex-proxy 2026-07-10: 356,590 input -> 200, 380,364 input -> 400. We
+# declare this as the working window so context compaction (threshold = 80% of
+# it) keeps input under the wall instead of dead-ending every turn on an
+# empty/400. Applies to any model resolved onto the ``codex`` factory, regardless
+# of family or catalog window. Override via ``CODEX_CONTEXT_WINDOW_CAP`` (set 0 to
+# disable the day OpenAI ships 1M-for-Codex — see openai/codex#19464).
+CODEX_CONTEXT_WINDOW_CAP_DEFAULT = 400_000
+
+
+def _codex_context_cap() -> int:
+    """Effective context ceiling for codex-proxy-routed models (env-overridable).
+
+    Read from ``CODEX_CONTEXT_WINDOW_CAP``; ``<= 0`` disables the clamp (fall back
+    to the model's own window). A malformed value falls back to the default rather
+    than 0, so a typo can't silently un-cap and re-wedge sessions.
+    """
+    try:
+        return int(
+            os.getenv("CODEX_CONTEXT_WINDOW_CAP", str(CODEX_CONTEXT_WINDOW_CAP_DEFAULT))
+        )
+    except (TypeError, ValueError):
+        return CODEX_CONTEXT_WINDOW_CAP_DEFAULT
+
+
+def _cap_context_window(provider: str, context_window: Optional[int]) -> Optional[int]:
+    """Clamp a codex-routed model's working window to the Codex surface cap.
+
+    Non-codex providers pass through untouched (they inherit their family/catalog
+    window as before). For ``codex``: a NULL/too-large window becomes the cap; a
+    deliberately-smaller admin ``context_window`` is respected (``min``). Keying on
+    the resolved *provider* (transport), not the family, means gpt-5.x over the
+    real API keeps its full window while the same model over the codex proxy is
+    capped.
+    """
+    if provider != "codex":
+        return context_window
+    cap = _codex_context_cap()
+    if cap <= 0:
+        return context_window
+    return min(context_window, cap) if context_window else cap
 
 
 # Dependency injection: the orchestrator registers DB-backed lookups at
@@ -280,14 +327,15 @@ def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
     travels inline on the endpoint row — the dispatcher fetches it via
     get_user_llm_endpoint(endpoint_id), not through resolve_api_keys_for_job.
     """
+    provider = _endpoint_factory_provider(row.get("base_url"), row.get("label"))
     return ModelMeta(
         model_id=row["model_id"],
-        provider=_endpoint_factory_provider(row.get("base_url"), row.get("label")),
+        provider=provider,
         family=row.get("family") or "default",
         display_name=row.get("display_name") or row["model_id"],
         base_url=row["base_url"],
         api_key_ref=None,
-        context_window=row.get("context_window"),
+        context_window=_cap_context_window(provider, row.get("context_window")),
         max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin=origin,
@@ -317,30 +365,32 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
     provider_ref = row["provider_ref"]
     capability = row.get("capability") or "chat"
     if provider_kind == "endpoint":
+        provider = _endpoint_factory_provider(
+            row.get("endpoint_base_url"), row.get("endpoint_label")
+        )
         return ModelMeta(
             model_id=row["model_id"],
-            provider=_endpoint_factory_provider(
-                row.get("endpoint_base_url"), row.get("endpoint_label")
-            ),
+            provider=provider,
             family=row.get("family") or "default",
             display_name=row.get("display_label") or row["model_id"],
             base_url=row.get("endpoint_base_url"),
             api_key_ref=None,
-            context_window=row.get("context_window"),
+            context_window=_cap_context_window(provider, row.get("context_window")),
             max_output_tokens=_params_max_output_tokens(row),
             reasoning_level=row.get("reasoning_level"),
             origin="catalog",
             endpoint_id=str(row["endpoint_id"]) if row.get("endpoint_id") else None,
             capability=capability,
         )
+    provider = _factory_provider(provider_ref)
     return ModelMeta(
         model_id=row["model_id"],
-        provider=_factory_provider(provider_ref),
+        provider=provider,
         family=row.get("family") or "default",
         display_name=row.get("display_label") or row["model_id"],
         base_url=None,
         api_key_ref=provider_ref,
-        context_window=row.get("context_window"),
+        context_window=_cap_context_window(provider, row.get("context_window")),
         max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin="catalog",
