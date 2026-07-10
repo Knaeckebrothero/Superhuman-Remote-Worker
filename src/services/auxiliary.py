@@ -991,7 +991,9 @@ class AuxiliaryLLM:
         #: (no separate fallback to fall back to). See
         #: docs/issues/openrouter_auxiliary_misrouted_to_openai.md.
         primary_name = _get_model_name(llm)
-        fallback_name = _get_model_name(fallback_llm) if fallback_llm is not None else None
+        fallback_name = (
+            _get_model_name(fallback_llm) if fallback_llm is not None else None
+        )
         self.fallback_llm = (
             fallback_llm if fallback_name and fallback_name != primary_name else None
         )
@@ -1047,9 +1049,7 @@ class AuxiliaryLLM:
         """
         _timeout = timeout if timeout is not None else self.timeout
         method = method or self.structured_output_method
-        fallback_method = (
-            fallback_method or self.fallback_structured_output_method
-        )
+        fallback_method = fallback_method or self.fallback_structured_output_method
         try:
             result = await asyncio.wait_for(
                 build_runnable(self.llm, method).ainvoke(invoke_arg),
@@ -1165,7 +1165,9 @@ class AuxiliaryLLM:
         self, result: Any, schema: Type[BaseModel], task_name: str
     ) -> dict:
         if not isinstance(result, dict):
-            raise TypeError(f"Unexpected structured-output result for {task_name}: {type(result)}")
+            raise TypeError(
+                f"Unexpected structured-output result for {task_name}: {type(result)}"
+            )
         parsed = result.get("parsed")
         if parsed is None:
             raw_text = None
@@ -1201,7 +1203,9 @@ class AuxiliaryLLM:
         if schema is None:
             return None
         try:
-            raw_result = await asyncio.wait_for(llm.ainvoke(invoke_arg), timeout=timeout)
+            raw_result = await asyncio.wait_for(
+                llm.ainvoke(invoke_arg), timeout=timeout
+            )
         except Exception as recovery_exc:
             logger.debug("Raw fallback parse recovery failed: %s", recovery_exc)
             return None
@@ -1316,11 +1320,11 @@ class AuxiliaryLLM:
         for iteration in range(self.max_iterations):
             response = await self._invoke_aux(
                 self._ainvoke_fallback(
-                lambda llm, method: llm.bind_tools(tools),
-                messages,
-                method=self.structured_output_method,
-                task_name=task.__class__.__name__,
-                timeout=self.timeout,
+                    lambda llm, method: llm.bind_tools(tools),
+                    messages,
+                    method=self.structured_output_method,
+                    task_name=task.__class__.__name__,
+                    timeout=self.timeout,
                 ),
                 task=task,
                 messages=messages,

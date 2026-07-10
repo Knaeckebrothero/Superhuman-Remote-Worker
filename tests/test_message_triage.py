@@ -100,13 +100,13 @@ class TestResolveFromDB:
 class TestStructuredRecovery:
     def test_recover_structured_json_fences(self):
         payload = message_triage._recover_structured_json(
-            "```json\n{\"action\":\"interrupt\",\"reason\":\"urgent\"}\n```"
+            '```json\n{"action":"interrupt","reason":"urgent"}\n```'
         )
         assert payload == {"action": "interrupt", "reason": "urgent"}
 
     def test_recover_structured_json_with_think_prefix(self):
         payload = message_triage._recover_structured_json(
-            "<think>internal</think>{\"action\":\"queue\",\"reason\":\"ok\"}"
+            '<think>internal</think>{"action":"queue","reason":"ok"}'
         )
         assert payload == {"action": "queue", "reason": "ok"}
 
