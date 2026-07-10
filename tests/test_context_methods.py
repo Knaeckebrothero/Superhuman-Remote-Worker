@@ -640,6 +640,13 @@ class TestTrimMessages:
         assert mgr.state.total_messages_trimmed > 0
 
 
+class TestContextConfigDefaults:
+    """ContextConfig defaults include keep-window tool result truncation."""
+
+    def test_keep_window_max_tool_result_chars_default(self):
+        assert ContextConfig().keep_window_max_tool_result_chars == 16000
+
+
 # =============================================================================
 # update_limits — in-place threshold rebind on model hot-swap
 # =============================================================================

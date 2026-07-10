@@ -10,7 +10,13 @@ Design: docs/features/context_summarization_rework.md.
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from src.core.context import ContextManager, ContextConfig, ConversationSummary
 from src.core.summarizer import (
@@ -1229,6 +1235,139 @@ class TestKeepWindowElision:
         ]
         assert len(elided) == 2
         assert {m.tool_call_id for m in elided} == {"t1", "t2"}
+
+    @pytest.mark.asyncio
+    async def test_run_counter_increments_for_tail_tool_truncation_no_summary(
+        self, context_manager, mock_llm
+    ):
+        """When the conversation stays under keep_recent, keep-window truncation
+        is still an actual compaction event and must bump compaction_runs."""
+        context_manager.config.keep_window_max_tool_result_chars = 32
+
+        messages = [
+            HumanMessage(content="query", id="h1"),
+            ToolMessage(
+                content="x" * 20000,
+                tool_call_id="t1",
+                name="read_file",
+                id="t1",
+            ),
+            AIMessage(content="ack", id="a1"),
+        ]
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        assert context_manager.compaction_runs == 1
+        assert not any(
+            isinstance(m, SystemMessage)
+            and "[Summary of prior work]" in (m.content or "")
+            for m in result
+        )
+        assert any(
+            isinstance(m, ToolMessage)
+            and "[tool result truncated by compaction" in (m.content or "")
+            for m in result
+            if not isinstance(m, RemoveMessage)
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_truncated_tail_is_skipped(self, context_manager, mock_llm):
+        """Already-truncated tool results are recognized and left untouched."""
+        context_manager.config.keep_window_max_tool_result_chars = 20
+        messages = [
+            HumanMessage(content="short", id="h1"),
+            ToolMessage(
+                content="[tool result truncated by compaction: kept 10 of 20 chars (~3 tokens).]",
+                tool_call_id="t1",
+                name="read_file",
+                id="t1",
+            ),
+            AIMessage(content="done", id="a1"),
+        ]
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        assert context_manager.compaction_runs == 0
+        assert result == messages
+
+    @pytest.mark.asyncio
+    async def test_fresh_tool_message_preserves_name(self, context_manager, mock_llm):
+        """ToolMessage rebuild in the keep-window slice preserves `name`."""
+        context_manager.config.keep_window_max_tool_result_chars = 40
+        context_manager.summarize_conversation = AsyncMock(
+            return_value="manual summary"
+        )
+
+        messages = [
+            HumanMessage(content="seed", id="h0"),
+            AIMessage(content="response", id="a0"),
+            HumanMessage(content="next", id="h1"),
+            AIMessage(content="response", id="a1"),
+            HumanMessage(content="probe", id="h2"),
+            HumanMessage(content="status", id="h3"),
+            AIMessage(
+                content="",
+                id="a2",
+                tool_calls=[{"id": "t1", "name": "read_pdf", "args": {}}],
+            ),
+            ToolMessage(
+                content="x" * 120,
+                tool_call_id="t1",
+                name="read_pdf",
+                id="t1",
+            ),
+        ]
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        assert context_manager.compaction_runs == 1
+        tool_msgs = [
+            m
+            for m in result
+            if isinstance(m, ToolMessage) and not isinstance(m, RemoveMessage)
+        ]
+        assert any(
+            m.tool_call_id == "t1" and m.name == "read_pdf" for m in tool_msgs
+        ), "re-built keep-window tool results must preserve `name`"
+
+    @pytest.mark.asyncio
+    async def test_summarize_receives_full_conversation(
+        self, context_manager, mock_llm
+    ):
+        """Manual cap lives inside summarize_and_compact; the summarizer sees
+        the whole conversation, not only the pre-summarized slice."""
+        observed = []
+
+        async def _fake_summarize(messages, *args, **kwargs):
+            observed.extend(messages)
+            return "manual summary"
+
+        context_manager.summarize_conversation = AsyncMock(side_effect=_fake_summarize)
+
+        messages = [
+            HumanMessage(content=f"hi {i}", id=f"h{i}")
+            if i % 2 == 0
+            else AIMessage(
+                content=f"reply {i}",
+                id=f"a{i}",
+            )
+            for i in range(6)
+        ]
+        result = await context_manager.summarize_and_compact(messages, mock_llm)
+
+        assert [m.content for m in observed] == [m.content for m in messages]
+        assert any(
+            isinstance(m, SystemMessage)
+            and "[Summary of prior work]" in (m.content or "")
+            for m in result
+        )
 
 
 # =============================================================================

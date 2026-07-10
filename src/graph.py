@@ -4387,6 +4387,7 @@ def build_phase_alternation_graph(
         message_count_min_tokens=config.limits.message_count_min_tokens,
         keep_recent_messages=config.context_management.keep_recent_messages,
         keep_recent_tool_results=config.context_management.keep_recent_tool_results,
+        keep_window_max_tool_result_chars=config.context_management.keep_window_max_tool_result_chars,
         # Safety layer constant (summarization budgets are computed at call
         # time from the aux model's window — src/core/summarizer.py)
         model_max_context_tokens=config.limits.model_max_context_tokens,
