@@ -21,6 +21,19 @@ class WorkspaceUnavailableError(Exception):
     pass
 
 
+class RemoteCommandTimeoutError(Exception):
+    """A remote operation exceeded its wall-clock deadline.
+
+    Deliberately NOT a WorkspaceUnavailableError: a slow command is not a
+    dead workspace and must not trip the fast-freeze path — it surfaces to
+    the model as an ordinary tool error instead. If the workspace is truly
+    gone, the next operation's connect path classifies that and freezes.
+    See docs/issues/remote_backend_indefinite_wait_deadlock.md.
+    """
+
+    pass
+
+
 class WorkspaceBackend(ABC):
     """Abstraction over workspace file storage and shell execution.
 
