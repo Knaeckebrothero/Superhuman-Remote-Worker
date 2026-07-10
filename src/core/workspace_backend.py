@@ -34,6 +34,12 @@ class RemoteCommandTimeoutError(Exception):
     pass
 
 
+# Server-side cap on search_files matches. The display layer shows at most
+# max_search_results (default 50); this bounds what backends ship over the
+# wire. filesystem.py renders "N+ (capped)" when a result set hits this.
+SEARCH_RESULT_HARD_CAP = 2000
+
+
 class WorkspaceBackend(ABC):
     """Abstraction over workspace file storage and shell execution.
 
