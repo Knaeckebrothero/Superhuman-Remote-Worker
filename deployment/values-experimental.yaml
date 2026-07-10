@@ -63,15 +63,15 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-c6de6a9
+    tag: sha-01bf2c9
   agent:
-    tag: sha-c6de6a9
+    tag: sha-01bf2c9
   cockpit:
-    tag: sha-c6de6a9
+    tag: sha-01bf2c9
   mcp:
     tag: sha-f1f32eb
   workspace:
-    tag: sha-c6de6a9
+    tag: sha-01bf2c9
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
 # (docs/operations/orchestrator_m1_go_live.md)
