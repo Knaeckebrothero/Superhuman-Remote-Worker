@@ -382,7 +382,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                     line_text = line_text[:100] + "..."
                 lines.append(f"    L{line_num}: {line_text}")
 
-            if total >= SEARCH_RESULT_HARD_CAP:
+            if total == SEARCH_RESULT_HARD_CAP:
                 lines.append("")
                 lines.append(
                     f"[Showing {max_search_results} of {SEARCH_RESULT_HARD_CAP}+ "
