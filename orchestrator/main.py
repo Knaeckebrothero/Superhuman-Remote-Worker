@@ -2065,6 +2065,31 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     f"Dispatch: using worktree path {worktree_path} for job {job_id}"
                 )
 
+        # Backstop: never dispatch a workspace-backed job with no SSH remote.
+        # A sandbox/vm backend without a `remote` block hard-fails the agent at
+        # init_workspace (0 tokens, no log) — the failure mode from
+        # docs/issues/subjob_inherits_stale_workspace_container_snapshot.md. The
+        # auto-assign dispatcher now resolves inherited workspaces up front, but
+        # this guards every other dispatch path (manual assign, future callers):
+        # fail fast with a diagnosable message instead of a cryptic agent crash.
+        # `remote` is only ever injected into config_override (VM/container
+        # blocks above); lite tiers (virtual/none) set an explicit backend and
+        # legitimately have no remote, so they're exempt.
+        _ws_final = (config_override or {}).get("workspace", {})
+        _backend_final = _ws_final.get("backend")
+        if _backend_final not in LITE_BACKENDS and not _ws_final.get("remote"):
+            msg = (
+                "Workspace backend requires SSH credentials but none were "
+                f"resolved at dispatch (backend={_backend_final or 'sandbox (default)'}). "
+                "For a subjob this usually means the parent's workspace container/VM "
+                "was not ready; it should be held until ready rather than dispatched."
+            )
+            logger.error("Dispatch: job %s refused — %s", job_id, msg)
+            await postgres_db.update_job_status(
+                job_id=job_id, status="failed", error_message=msg
+            )
+            return False
+
         # Orchestrator-resolved config (supersedes agent-side Decision 6): when
         # experts are enabled, resolve the full config here with the same loader
         # the agent uses, freeze the secret-free copy into jobs.resolved_config,
@@ -3149,6 +3174,156 @@ def _get_container_context(job: dict) -> dict:
     return ctx.get("workspace_container", {})
 
 
+# Bounded wait for a subjob to inherit its parent's provisioned workspace.
+# Parent container/VM readiness is an async event that lands AFTER the subjob is
+# spawned (a scholar is created ~3s after its parent, mid-provisioning), so we
+# re-resolve from the parent's live row every dispatch tick rather than trust
+# the subjob's creation-time snapshot. This bounds how long we wait before
+# giving up with a diagnosable failure instead of stranding the job.
+_INHERIT_WORKSPACE_MAX_WAIT_S = int(
+    os.environ.get("WORKSPACE_INHERIT_MAX_WAIT_S", "600")
+)
+
+
+async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | None]:
+    """Refresh a subjob's inherited workspace from its parent's LIVE context.
+
+    Subjobs that share a parent's workspace (scholar research,
+    verification/critic) copy the parent's ``context.workspace_container`` /
+    ``vm`` **by value** at spawn time (``_spawn_scholar_subjob`` /
+    ``_trigger_verification_on_complete``). A scholar is spawned ~3s after its
+    parent is created — before the parent's pod is ready — so that snapshot
+    carries ``status='created'`` with no SSH host and never self-updates,
+    stranding the subjob at ``init_workspace`` with ``no workspace.remote``
+    (docs/issues/subjob_inherits_stale_workspace_container_snapshot.md).
+
+    We re-read the parent's current workspace here and overlay it onto the
+    in-memory ``job['context']`` (never persisted — persisting would re-freeze a
+    snapshot that goes stale again on pod reattach). The subjob rides the
+    parent's pod via its ``worktree_path``; it must never provision its own.
+
+    Returns one of:
+      ``("proceed", None)`` — not an inheriting subjob, or the parent workspace
+        is ready and now overlaid; let normal dispatch continue.
+      ``("wait", None)`` — inheriting, parent workspace still provisioning;
+        caller should skip this tick and retry.
+      ``("fail", message)`` — inheriting, but the parent workspace is gone/failed
+        or the wait budget is exhausted; caller should fail the job.
+    """
+    parent_id = job.get("parent_job_id")
+    if not parent_id:
+        return ("proceed", None)
+
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            return ("proceed", None)
+
+    own_container = ctx.get("workspace_container") or {}
+    own_vm = ctx.get("vm") or {}
+    # Only subjobs that inherited a shared workspace carry these keys. Lite /
+    # own-provisioned subjobs don't — leave them to the normal path.
+    if not own_container and not own_vm:
+        return ("proceed", None)
+    # Snapshot already usable (e.g. a critic spawned long after the parent pod
+    # went ready) — no refresh needed.
+    if own_container.get("status") == "ready" or own_vm.get("status") == "ready":
+        return ("proceed", None)
+
+    try:
+        parent = await postgres_db.get_job(str(parent_id))
+    except Exception as e:
+        logger.warning(
+            "Dispatcher: subjob %s — failed to read parent %s for workspace "
+            "resolution: %s (waiting)",
+            job.get("id"),
+            parent_id,
+            e,
+        )
+        return ("wait", None)
+
+    if not parent:
+        return (
+            "fail",
+            f"Parent job {parent_id} no longer exists; cannot inherit its workspace.",
+        )
+
+    parent_ctx = parent.get("context") or {}
+    if isinstance(parent_ctx, str):
+        try:
+            parent_ctx = json.loads(parent_ctx)
+        except (json.JSONDecodeError, ValueError):
+            parent_ctx = {}
+    parent_container = parent_ctx.get("workspace_container") or {}
+    parent_vm = parent_ctx.get("vm") or {}
+
+    # Parent's workspace is ready → overlay the live context and dispatch. All
+    # downstream machinery (_job_needs_sandbox/_job_needs_vm, the dispatch-time
+    # injectors) then keys off the ready context and injects workspace.remote.
+    if own_container and parent_container.get("status") == "ready":
+        ctx["workspace_container"] = parent_container
+        job["context"] = ctx
+        logger.info(
+            "Dispatcher: subjob %s inheriting parent %s workspace container "
+            "(host=%s) — resolved live at dispatch",
+            job.get("id"),
+            parent_id,
+            parent_container.get("host") or parent_container.get("pod_ip"),
+        )
+        return ("proceed", None)
+    if own_vm and parent_vm.get("status") == "ready":
+        ctx["vm"] = parent_vm
+        job["context"] = ctx
+        logger.info(
+            "Dispatcher: subjob %s inheriting parent %s VM (host=%s) — resolved "
+            "live at dispatch",
+            job.get("id"),
+            parent_id,
+            parent_vm.get("ssh_host"),
+        )
+        return ("proceed", None)
+
+    # Parent workspace is dead (reaped/failed) or the parent itself reached a
+    # terminal state — no point waiting on a workspace that will never be ready.
+    dead_states = ("failed", "deleted")
+    parent_status = parent.get("status")
+    if (
+        parent_container.get("status") in dead_states
+        or parent_vm.get("status") in dead_states
+        or parent_status in ("failed", "cancelled", "completed")
+    ):
+        return (
+            "fail",
+            (
+                f"Parent job {parent_id} workspace is unavailable (parent "
+                f"status={parent_status}, container="
+                f"{parent_container.get('status')}, vm={parent_vm.get('status')}); "
+                "subjob cannot inherit it."
+            ),
+        )
+
+    # Still provisioning — bounded wait keyed on the subjob's age.
+    created_at = job.get("created_at")
+    age_s = 0.0
+    if isinstance(created_at, datetime):
+        ref = (
+            created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        )
+        age_s = (datetime.now(timezone.utc) - ref).total_seconds()
+    if age_s > _INHERIT_WORKSPACE_MAX_WAIT_S:
+        return (
+            "fail",
+            (
+                f"Timed out after {int(age_s)}s waiting for parent job "
+                f"{parent_id} workspace to become ready (container="
+                f"{parent_container.get('status')}, vm={parent_vm.get('status')})."
+            ),
+        )
+    return ("wait", None)
+
+
 def _apply_sticky_sudo_denial(job: dict, config_override: dict | None) -> dict | None:
     """Flip the agent's sudo gate to a reasoned block when the job carries a
     sudo/VM-upgrade denial (``context.sudo_denial``, written by
@@ -4054,6 +4229,36 @@ async def _try_dispatch_pending_jobs() -> None:
             dispatchable_jobs = []
             for job in pending_jobs:
                 job_id = str(job["id"])
+
+                # Subjobs (scholar / critic) share their parent's workspace but
+                # copy its context by value at spawn time — stale when the parent
+                # pod wasn't ready yet. Re-resolve from the parent's live row so
+                # the subjob rides the parent pod instead of stranding at
+                # init_workspace with no SSH host. See docs/issues/
+                # subjob_inherits_stale_workspace_container_snapshot.md.
+                inherit_action, inherit_msg = await _resolve_subjob_inherited_workspace(
+                    job
+                )
+                if inherit_action == "wait":
+                    logger.debug(
+                        "Dispatcher: subjob %s waiting for parent %s workspace "
+                        "to become ready",
+                        job_id,
+                        job.get("parent_job_id"),
+                    )
+                    continue
+                if inherit_action == "fail":
+                    logger.error(
+                        "Dispatcher: subjob %s cannot inherit parent workspace "
+                        "— failing: %s",
+                        job_id,
+                        inherit_msg,
+                    )
+                    await postgres_db.update_job_status(
+                        job_id, status="failed", error_message=inherit_msg
+                    )
+                    continue
+
                 if _job_needs_vm(job):
                     # Admin-gated permission check (kill-switch + per-user grant).
                     # Re-verified here in case a grant was revoked or the
