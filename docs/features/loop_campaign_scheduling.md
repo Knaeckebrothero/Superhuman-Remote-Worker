@@ -1,17 +1,32 @@
 # Loop campaign scheduling — the Critic as planner
 
-**Status**: P0 (dark machinery) BUILT 2026-07-09, uncommitted — migration
-0050, plan intake endpoint, planner advance path, router opt-in, 46 new unit
-tests (116 loop tests green total, rotation suites unmodified). See
-"As-built notes (P0)" for deviations from the sketch below — the biggest:
-**no `pending_stages` column and no sweeper changes**; recovery rides
-member-job context stamps + a `plan_job_id` idempotency guard instead.
+**Status**: P0 (dark machinery) + P1 (agent surface + notifications) BUILT
+2026-07-09, uncommitted — migration 0050, plan intake endpoint, planner
+advance path, router opt-in, `loop_plan` tool with checkpoint-only injection,
+planner/member kickoff blocks, both notification kinds; 68 unit tests in
+`tests/test_loop_campaign_scheduling.py` (rotation suites unmodified). See "As-built notes" below for deviations —
+the biggest: **no `pending_stages` column and no sweeper changes** (recovery
+rides member-job context stamps + a `plan_job_id` idempotency guard), and
+`loop_user_question` detection happens at advance time (kb_write is an
+agent-side dual-write; there is no orchestrator KB-write path to hook).
 Design agreed 2026-07-09 — all open questions resolved with the owner same
 day (see "Resolved questions" at the bottom). Written from the Better Resavio
 loop audit (project `68137e29`, main cluster). Companion to
 `docs/features/loop_parallel_stages.md` (shipped) and the not-yet-written
 seasons/annealing prompt work (see "Interaction with seasons" below).
-P1 (agent surface + notifications), P2 (cockpit), P3 (live flip) not started.
+**k3d smoke GREEN 2026-07-09** (gemma planner loop `942ef046`, 2-stage
+template, 6 jobs, ~5h wall clock): checkpoint tool injection + PLANNER
+DUTIES kickoff verified on real jobs; plan intake accepted/rejected
+correctly (incl. disposition-required, oversize, missing-note, unknown-job);
+plan application → stamped members → stage succession (once via the
+sweeper's backstop path); review flip; DISPOSITION DUTY kickoff on the next
+checkpoint; ship disposition → history entry + new campaign; both
+notification kinds fired in one advance and the bell row persisted
+(`loop-942ef0`). Two real bugs found and fixed by the smoke (notes 6+7
+below). Cleaned up: loop stopped, jobs/project deleted, pods reaped.
+**P2 (cockpit) BUILT + k3d-verified 2026-07-10**, uncommitted — campaign
+card + history + scheduling opt-in + live SSE handling; see "P2 as-built
+notes". Remaining: P3 (live flip).
 
 ## Motivation
 
@@ -423,6 +438,57 @@ machinery (same convention as loop_parallel_stages.md's as-built section):
    critic slot — a campaign-member critic carries the execution slot's index
    and is rejected without any role-string inspection.
 
+### P1 as-built notes (same day)
+
+1. **Injection lever = additive tool category.** `ToolsConfig` gained a
+   `loop` category (never listed in bundled configs); `create_loop_job` sets
+   `config_override.tools.loop = ["loop_plan"]` for checkpoint critics. The
+   deep-merge adds the key without touching the expert's other tool lists.
+   Checkpoint detection simplified to *planner + role critic + not a campaign
+   member* — the planner grammar already guarantees critic-stage uniqueness,
+   so no seq_index arithmetic is needed at spawn.
+2. **`loop_plan` is available in BOTH phases**, not strategic-only as
+   sketched: the live iter-23 Better Resavio critic wrote its verdict in a
+   *tactical* phase, so a strategic-only tool would never be reachable at
+   decision time. The server-side gates are the real protection.
+3. **`loop_user_question` detection moved to advance time.** `kb_write` is an
+   agent-side dual-write straight to the stores — the sketched "orchestrator
+   KB-write path" doesn't exist. Instead, after each loop job's merge/retro,
+   the advance scans `knowledge_index` for `user-question`-tagged notes by
+   that job (capped 5, best-effort) and notifies per note.
+4. **Bell persistence = `message_log` outbound rows** (the existing
+   notification store; the list view joins the job for description/config) +
+   `notification_feed.broadcast` SSE kinds. Zero cockpit changes needed for
+   P1 — the bell renders the rows generically; live SSE handling of the new
+   kinds is P2's chip work.
+5. **Kickoff blocks ride `extra_context`**: `build_loop_kickoff` got an
+   optional `extra_context` param (a stamped `loop_campaign_id` marks a
+   member); `_spawn_campaign_member` passes its campaign into the spawn's
+   loop dict, and the rotation passes a pending `campaign_update` the same
+   way — required for two-stage templates where the checkpoint critic spawns
+   in the same rotation that flips its campaign to `review`.
+6. **Smoke-found fix — notification persistence hit `message_log.thread_id
+   varchar(12) NOT NULL`.** The first live disposition + user-question events
+   fired at exactly the right moment with the right content, but the bell
+   row insert passed `thread_id=None` and failed the constraint (the
+   best-effort guard kept the advance unharmed; the SSE half succeeded).
+   Loop events now thread as `loop-<6 hex>` (11 chars, grouped per loop).
+   Two nuances recorded for later: a stored plan currently applies even if
+   the critic job itself ends `failed` (defensible — the plan was validated
+   at filing — but undecided), and the finale proved both event kinds fire
+   in one advance (user-question scan + disposition) as designed.
+7. **Smoke-found fix — loop jobs never land `pending_review`.** The first
+   live campaign member (gemma) finished without declaring `job_complete`
+   (no freeze_data at all); `determine_job_status`'s generic fallback put it
+   on the human-review gate, wedging the loop (the advance fires only on
+   terminal statuses — same invisible-wedge class as the narrowly-exempted
+   Mode-A diff gate). Fix in `services/completion.py`: for loop jobs
+   (`job_loop_id` present) both `pending_review` returns map to `completed`
+   — retros + the next critic judge quality, F29/empty-merge flags lost
+   work, and legitimate pause freezes (version_upgrade, llm_unavailable, …)
+   are untouched. This closes the wedge class for rotation loops too, not
+   just campaigns.
+
 Files: `orchestrator/database/migrations/app/0050_loop_campaign_scheduling.sql`
 (+ `schema_current.sql` regen), `orchestrator/database/postgres.py` (decode,
 create, allowlist, campaign JSONB encoding), `orchestrator/services/
@@ -430,9 +496,44 @@ project_loops.py` (caps + `planner_slots` + `validate_loop_plan` +
 `create_loop_job` extra_context), `orchestrator/main.py`
 (`_advance_planner_campaign`, `_spawn_campaign_member`, rotate wiring,
 `file_loop_plan` endpoint), `orchestrator/routers/project_loops.py` (start
-opt-in), `tests/test_loop_campaign_scheduling.py` (46 tests),
+opt-in), `tests/test_loop_campaign_scheduling.py` (68 tests incl. the P1 +
+smoke-fix additions),
 `docs/security/endpoint_inventory.txt` (+1: the loop-plan endpoint,
 classified `internal:require_internal` by the auth-inventory script).
+
+### P2 as-built notes (cockpit, 2026-07-10)
+
+Zero backend changes — the loop GET already returns the whole row dict, so
+the four campaign columns reached the cockpit for free. Four pieces:
+
+1. **Campaign card** in the live loop panel (`project-loop.component.ts`):
+   initiative title, status badge (active/review/aborted), per-stage role
+   chips with done/current/pending states, a progress line, `extended ×N`
+   marker, member-failure warning, and the pre-registered acceptance list
+   (the campaign's contract — showing it is the point). "Current" derives
+   from `max(stages_done, cursor − 1)` so a stale cursor (torn advance,
+   healed later) can never point at an already-finished stage.
+2. **Campaign history block** ("Campaigns (N)", newest first, outcome badges
+   ship/extend/kill + notes) — rendered for terminal loops too: the run's
+   investment record outlives it.
+3. **Scheduling opt-in on the start form**: a Rotation/Planner select plus
+   `plannerIneligibility()`, a client-side mirror of the `planner_slots`
+   grammar (exactly one single-role critic; the cyclically-next stage
+   single-role) that renders the problem inline and blocks `start()` —
+   saving the doomed round-trip; the server remains the authority.
+4. **Live SSE handling** (`notification.service.ts`): `loop_user_question` +
+   `loop_campaign_disposition` frames bump the unread count, prepend a bell
+   entry whose `thread_id` mirrors the server row's `loop-<6 hex>` key (so a
+   REST refresh dedupes against the live entry), and toast the subject.
+
+Tests follow the file's pure-function convention (no TestBed): 20 new specs
+across `plannerIneligibility` / `campaignStageState` / `campaignProgressLabel`
++ 3 SSE-kind specs; cockpit suite 876 green. k3d-verified 2026-07-10 against
+a seeded planner loop row (status `paused` so the torn-advance sweeper —
+running-only — ignores the synthetic row, `current_job_id` NULL for the jobs
+FK): card, chip states, history, terminal-state history persistence, the
+scheduling select, and the inline planner guard all confirmed in the browser;
+seeded project deleted after.
 
 ## Resolved questions (owner + assistant, 2026-07-09)
 

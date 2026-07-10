@@ -36,6 +36,7 @@ from .evaluation import create_evaluation_tools, get_evaluation_metadata
 from .git import create_git_tools, get_git_metadata
 from .graph import create_graph_tools, get_graph_metadata
 from .knowledge import create_knowledge_tools, get_knowledge_metadata
+from .loop import create_loop_tools, get_loop_metadata
 from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
 from .orchestrator.catalog import create_catalog_tools
@@ -79,6 +80,9 @@ TOOL_REGISTRY.update(get_evaluation_metadata())
 TOOL_REGISTRY.update(get_knowledge_metadata())
 TOOL_REGISTRY.update(get_communication_metadata())
 TOOL_REGISTRY.update(get_orchestrator_metadata())
+# Loop campaign tools — never in bundled configs; injected per-job via
+# config_override.tools.loop for planner-loop checkpoint critics only.
+TOOL_REGISTRY.update(get_loop_metadata())
 
 # Register session task tools (lightweight todos for persistent sessions)
 TOOL_REGISTRY.update(get_session_task_metadata())
@@ -543,6 +547,19 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded communication tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load communication tools: {e}")
+
+    # Loop campaign tools (checkpoint-critic plan filing — injected per-job by
+    # the orchestrator, never present in bundled expert configs)
+    if "loop" in tools_by_category:
+        try:
+            loop_tools = create_loop_tools(context)
+            requested = set(tools_by_category["loop"])
+            for tool in loop_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded loop tool: {tool.name}")
+        except Exception as e:
+            logger.warning(f"Could not load loop tools: {e}")
 
     # Delegation tools (subagent spawning)
     if "delegation" in tools_by_category:

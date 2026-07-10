@@ -561,11 +561,26 @@ def determine_job_status(
         or fd.get("status") == "job_completed"
     )
 
+    # Unattended project-loop jobs must never land on the human-review gate:
+    # the loop's advance hook fires only on TERMINAL statuses, so a
+    # pending_review loop job wedges the whole loop forever (the same
+    # invisible-wedge class as the Mode-A diff gate, which is exempted
+    # narrowly in the /complete handler). Quality judgment for loop work
+    # belongs to the retro + the next critic, and lost work is already
+    # flagged by the empty-merge (F29) check — so a loop job that stops
+    # without declaring completion maps to `completed` (weak, but honest in
+    # its retro), never `pending_review`. Found live: a campaign member that
+    # finished without freeze_data wedged the P1 smoke loop.
+    # docs/features/loop_campaign_scheduling.md.
+    from services.project_loops import job_loop_id
+
+    is_loop_job = bool(job_loop_id(job))
+
     # Job completion (any autonomy level)
     if is_completion:
         if is_verification_enabled(job):
             return ("reviewing", None)
-        elif goal_achieved:
+        elif goal_achieved or is_loop_job:
             return ("completed", None)
         else:
             # Non-full autonomy, no verification — keep pending_review
@@ -643,6 +658,19 @@ def determine_job_status(
                 + ". Check the model endpoint/provider (Admin → Models).",
             )
         return ("paused", None)
+    if is_loop_job:
+        # Non-completion stop with no recognized freeze on an unattended loop
+        # job (agent stopped without declaring job_complete — weak-model
+        # finishes do this). `completed` keeps the loop advancing; the retro
+        # records the actual (possibly poor) state and the empty-merge check
+        # flags lost work. See the loop-wedge rationale above.
+        logger.warning(
+            "Loop job %s stopped without a completion declaration "
+            "(freeze_type=%r) — mapping to 'completed' so the loop advances",
+            job.get("id"),
+            freeze_type,
+        )
+        return ("completed", None)
     return ("pending_review", None)
 
 

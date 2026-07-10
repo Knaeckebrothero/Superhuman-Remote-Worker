@@ -10472,6 +10472,109 @@ async def _spawn_loop_stage(
 _WB_UNSET: Any = object()
 
 
+async def _notify_loop_event(
+    loop: dict[str, Any],
+    *,
+    job_id: str,
+    event_type: str,
+    subject: str,
+    message: str,
+) -> None:
+    """Surface a loop event to the loop's owner — notification bell + SSE.
+
+    Persists an outbound ``message_log`` row (the bell's backing store; the
+    list view joins the job for description/config) and broadcasts the SSE
+    event kind for connected clients. No email, no push — resolved Q3 of
+    docs/features/loop_campaign_scheduling.md. Best-effort on both channels:
+    a notification must never break an advance.
+    """
+    owner_id = loop.get("owner_id")
+    if not owner_id:
+        return
+    try:
+        await postgres_db.log_message(
+            job_id=str(job_id),
+            # message_log.thread_id is varchar(12) NOT NULL (email-threading
+            # key). Loop events aren't email threads; group them per loop —
+            # "loop-" + 6 hex chars = 11 chars.
+            thread_id=f"loop-{str(loop.get('id', ''))[:6]}",
+            direction="outbound",
+            subject=subject,
+            message=message,
+            status="sent",
+            user_id=str(owner_id),
+            mode="async",
+        )
+    except Exception:
+        logger.warning(
+            "loop notify: message_log write failed (non-fatal)", exc_info=True
+        )
+    try:
+        from services.notification_feed import notification_feed
+
+        notification_feed.broadcast(
+            user_id=str(owner_id),
+            event_type=event_type,
+            data={
+                "loop_id": str(loop.get("id")),
+                "project_id": (
+                    str(loop.get("project_id")) if loop.get("project_id") else None
+                ),
+                "job_id": str(job_id),
+                "subject": subject,
+                "message": message,
+            },
+        )
+    except Exception:
+        logger.warning("loop notify: SSE broadcast failed (non-fatal)", exc_info=True)
+
+
+async def _notify_loop_user_questions(
+    loop: dict[str, Any], job: dict[str, Any]
+) -> None:
+    """Surface ``user-question``-tagged KB notes a completed loop job filed.
+
+    The loop's constitution tells agents that human-gated concerns (legal
+    review, budgets, third-party access) become `user-question` notes instead
+    of fictional blockers — this is the delivery half: one bell notification
+    per note (capped) so the operator sees the question without KB
+    archaeology. Best-effort; a missing/down vector store is silent
+    (KB failures are non-fatal by convention).
+    """
+    project_id = loop.get("project_id")
+    if not project_id or vector_db is None:
+        return
+    try:
+        async with vector_db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT note_id, title FROM knowledge_index "
+                "WHERE job_id = $1::uuid AND project_id = $2::uuid "
+                "AND 'user-question' = ANY(tags) "
+                "ORDER BY indexed_at DESC LIMIT 5",
+                str(job["id"]),
+                str(project_id),
+            )
+    except Exception:
+        logger.debug(
+            "loop notify: user-question scan unavailable (non-fatal)",
+            exc_info=True,
+        )
+        return
+    for r in rows:
+        await _notify_loop_event(
+            loop,
+            job_id=str(job["id"]),
+            event_type="loop_user_question",
+            subject=f"Loop question: {str(r['title'])[:120]}",
+            message=(
+                f"A loop agent filed a question for you (KB note "
+                f"'{r['note_id']}'). It proceeded on its best assumption — "
+                "answer via the KB or the loop's steering fields when "
+                "convenient."
+            ),
+        )
+
+
 async def _writeback_loop_stage(
     loop_id: str,
     *,
@@ -10679,6 +10782,9 @@ async def _spawn_campaign_member(
 
     loop_for_spawn = dict(loop)
     loop_for_spawn["remaining_iterations"] = next_remaining
+    # The member's kickoff (campaign context block) must describe the campaign
+    # being spawned for — not the loop row's possibly-stale pre-advance state.
+    loop_for_spawn["campaign"] = campaign
     try:
         jobs, new_total = await _spawn_loop_stage(
             loop_for_spawn,
@@ -10801,6 +10907,18 @@ async def _advance_planner_campaign(
                 f"{member_failures} consecutive member failures — returning to "
                 "the critic checkpoint"
             )
+            await _notify_loop_event(
+                loop,
+                job_id=str(completed_job["id"]),
+                event_type="loop_campaign_disposition",
+                subject=f"Loop campaign aborted: {label}",
+                message=(
+                    f"Campaign '{label}' aborted after {member_failures} "
+                    f"consecutive stage failures ({stages_done} of "
+                    f"{len(stages)} stages done). The loop is returning to "
+                    "the critic checkpoint for a disposition."
+                ),
+            )
             return False, {
                 **campaign,
                 "status": "aborted",
@@ -10909,10 +11027,29 @@ async def _advance_planner_campaign(
             }
         )
         history = history[-LOOP_CAMPAIGN_HISTORY_LIMIT:]
+        disposed_label = (
+            campaign.get("title") or campaign.get("initiative_note_id") or "?"
+        )
         actions.append(
-            f"project loop {loop_id[:8]}: campaign "
-            f"'{campaign.get('title') or campaign.get('initiative_note_id')}' "
+            f"project loop {loop_id[:8]}: campaign '{disposed_label}' "
             f"disposed ({outcome})"
+        )
+        await _notify_loop_event(
+            loop,
+            job_id=str(completed_job["id"]),
+            event_type="loop_campaign_disposition",
+            subject=f"Loop campaign {outcome}: {disposed_label}",
+            message=(
+                f"The critic disposed campaign '{disposed_label}' as "
+                f"{outcome.upper()} ({campaign.get('stages_done', '?')} of "
+                f"{len(campaign.get('stages') or [])} stages done"
+                f"{', extending it' if outcome == 'extend' else ''})."
+                + (
+                    f" Notes: {disposition.get('notes')}"
+                    if disposition.get("notes")
+                    else ""
+                )
+            ),
         )
 
     new_campaign = {
@@ -11027,9 +11164,14 @@ async def _rotate_loop_to_next_stage(
                 "project loop %s: KB TTL decrement failed (non-fatal)", loop_id
             )
 
-    # Reflect the decremented budget in the kickoff the next stage sees.
+    # Reflect the decremented budget in the kickoff the next stage sees — and
+    # any campaign mutation from the planner step (a review/abort flip must be
+    # visible to the very next spawn: with a two-stage template the checkpoint
+    # critic spawns in the SAME rotation that flips its campaign to review).
     loop_for_spawn = dict(loop)
     loop_for_spawn["remaining_iterations"] = next_remaining
+    if campaign_update is not _WB_UNSET:
+        loop_for_spawn["campaign"] = campaign_update
 
     try:
         jobs, new_total = await _spawn_loop_stage(
@@ -11148,6 +11290,9 @@ async def _advance_project_loop(
         failed=failed,
         last_error=last_error,
     )
+    # Any loop role may have filed `user-question` KB notes — surface them to
+    # the owner's notification bell (best-effort, never blocks the advance).
+    await _notify_loop_user_questions(loop, job)
 
     remaining = loop.get("remaining_iterations")
     next_remaining = (remaining - 1) if remaining is not None else None
@@ -11226,6 +11371,9 @@ async def _advance_loop_parallel_member(
         failed=failed,
         last_error=member_error,
     )
+    # Surface this member's `user-question` KB notes (mirrors the single-role
+    # path; every member passes here regardless of who wins the barrier).
+    await _notify_loop_user_questions(loop, job)
 
     # Barrier: only the last member to go terminal claims the rotate.
     if not await postgres_db.claim_project_loop_stage_barrier(loop_id, str(job["id"])):

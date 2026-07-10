@@ -1453,6 +1453,10 @@ class ToolsConfig:
     orchestrator: List[str] = field(default_factory=list)
     agent_catalog: List[str] = field(default_factory=list)
     workflows: List[str] = field(default_factory=list)
+    # Loop campaign tools (loop_plan). Never listed in bundled configs — the
+    # orchestrator injects `tools.loop` via config_override only for a planner
+    # loop's checkpoint critic (docs/features/loop_campaign_scheduling.md).
+    loop: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -4126,6 +4130,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         "orchestrator",
         "agent_catalog",
         "workflows",
+        "loop",
     ):
         names.extend(_category_names(category))
 

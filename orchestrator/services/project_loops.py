@@ -503,7 +503,101 @@ def _format_budget(remaining: int | None, run_until: Any) -> str:
     return ("Budget: " + " / ".join(bits) + ".") if bits else "Budget: bounded."
 
 
-def build_loop_kickoff(loop: dict[str, Any], *, role: str, iteration: int) -> str:
+def _planner_critic_block(loop: dict[str, Any], budget_line: str) -> str:
+    """Planner duties appended to a checkpoint critic's kickoff.
+
+    docs/features/loop_campaign_scheduling.md (P1). Covers: the loop_plan verb
+    + budget arithmetic, the disposition duty when a campaign awaits review,
+    why campaigns exist (multi-job investments beat horizon-1 selection), and
+    the no-fictional-stakeholders rule the Better Resavio audit earned.
+    """
+    caps = resolve_campaign_caps(loop)
+    campaign = loop.get("campaign") or {}
+    lines = [
+        "PLANNER DUTIES (this loop runs campaign scheduling):",
+        "- You are the loop's PLANNER as well as its judge. After selecting "
+        "the next initiative, you MAY file a campaign plan with the "
+        f"`loop_plan` tool: 1..{caps['max_stages']} execution stages (each "
+        "stage = one job = one iteration of budget) toward ONE initiative — "
+        "an EXISTING KB note, so kb_write your verdict note BEFORE filing — "
+        "plus the acceptance evidence the closing critic will check. If you "
+        "file no plan, the loop falls back to a single follow-up job.",
+        f"- Budget arithmetic: {budget_line} A k-stage campaign costs k "
+        "iterations — spend accordingly.",
+        "- A multi-job campaign is how high-value work that cannot be proven "
+        "in one job (a UI, an integration, a migration) beats yet another "
+        "small provable increment: early stages may be honest scaffolding; "
+        "the campaign is judged at its END against the acceptance evidence, "
+        "not per-job.",
+        "- Constraints must be REAL: the only human stakeholder is the "
+        "operator. If something seems to need a human (legal review, budget, "
+        "third-party access), file a KB note tagged `user-question` and "
+        "proceed on the best assumption — NEVER park or defer work on a "
+        "trigger no real person will ever pull.",
+    ]
+    if campaign.get("status") in ("review", "aborted"):
+        acceptance = campaign.get("acceptance") or []
+        checks = (
+            "\n".join(f"    {c}" for c in acceptance)
+            if acceptance
+            else "    (none pre-registered — judge against the KB verdict "
+            "that selected it)"
+        )
+        lines.insert(
+            1,
+            f"- DISPOSITION DUTY FIRST: campaign "
+            f"'{campaign.get('title') or campaign.get('initiative_note_id')}' "
+            f"({campaign.get('stages_done', '?')} of "
+            f"{len(campaign.get('stages') or [])} stages, status "
+            f"{campaign.get('status')}) awaits your verdict. Run its "
+            f"pre-registered acceptance checks:\n{checks}\n  Then dispose via "
+            "loop_plan's disposition fields: ship (evidence passes), extend "
+            "(alive but unfinished — your stages continue the SAME "
+            "initiative), or kill (dead end — record why in the KB). A plan "
+            "without a disposition will be rejected while this campaign is "
+            "pending.",
+        )
+    return "\n".join(lines)
+
+
+def _campaign_member_block(campaign: dict[str, Any], stage_index: int) -> str:
+    """Campaign context appended to a campaign member's kickoff.
+
+    The verification-repricing contract: mid-campaign scaffolding is licensed,
+    dishonest retros are not — the campaign is judged at its end against the
+    pre-registered evidence, so truthfulness (not per-job provability) is what
+    keeps the loop's shared reality intact.
+    """
+    stages = campaign.get("stages") or []
+    acceptance = campaign.get("acceptance") or []
+    checks = (
+        "\n".join(f"    {c}" for c in acceptance)
+        if acceptance
+        else "    (none pre-registered)"
+    )
+    return (
+        f"CAMPAIGN CONTEXT: you are stage {stage_index + 1} of {len(stages)} "
+        f"of campaign '{campaign.get('title') or campaign.get('initiative_note_id')}' "
+        f"(initiative KB note: {campaign.get('initiative_note_id')}).\n"
+        "- Prior stages' actual state: check retros/ (newest first) and the "
+        "repo — build on what landed, don't restart.\n"
+        "- The campaign is judged at its END against this pre-registered "
+        f"acceptance evidence:\n{checks}\n"
+        "- You do NOT have to reach a fully provable state THIS job — "
+        "mid-campaign scaffolding is fine — but your retro MUST be honest "
+        "about actual state: never claim working what isn't. The closing "
+        "critic runs the checks above; honesty is the contract that keeps "
+        "the loop sane."
+    )
+
+
+def build_loop_kickoff(
+    loop: dict[str, Any],
+    *,
+    role: str,
+    iteration: int,
+    extra_context: dict[str, Any] | None = None,
+) -> str:
     """Assemble the loop-aware kickoff *message* for one job.
 
     Delivered via ``context["kickoff_message"]`` (the "Opening Message" channel),
@@ -516,6 +610,12 @@ def build_loop_kickoff(loop: dict[str, Any], *, role: str, iteration: int) -> st
     "done" to external acceptance criteria, makes the agent restate the goal,
     states the remaining budget (termination awareness), and tells it to read
     the tried/rejected record before proposing (repetition guard).
+
+    Planner-scheduled loops add a block: the checkpoint critic gets its
+    planner duties (loop_plan / disposition / budget arithmetic), a campaign
+    member gets its campaign context (stage N of M + the honesty contract).
+    ``extra_context`` is the spawn-time context stamp dict — a present
+    ``loop_campaign_id`` marks a campaign member.
     """
     goal = (loop.get("goal") or "").strip() or (
         "(no explicit goal set — make useful, self-directed progress and record "
@@ -551,6 +651,21 @@ def build_loop_kickoff(loop: dict[str, Any], *, role: str, iteration: int) -> st
         "next agent should do. If you closed or abandoned an approach, record it "
         "as tried/rejected so nobody repeats it.",
     ]
+
+    # Planner-scheduled loops (docs/features/loop_campaign_scheduling.md):
+    # campaign context for members, planner duties for the checkpoint critic.
+    if (loop.get("scheduling") or "rotation") == "planner":
+        stamps = extra_context or {}
+        if stamps.get("loop_campaign_id") is not None:
+            campaign = loop.get("campaign") or {}
+            try:
+                stage_index = int(stamps.get("loop_campaign_index") or 0)
+            except (TypeError, ValueError):
+                stage_index = 0
+            parts.append(_campaign_member_block(campaign, stage_index))
+        elif role == "critic":
+            parts.append(_planner_critic_block(loop, budget_line))
+
     if user_prompt:
         parts.append(f"ADDITIONAL STEERING FROM THE USER:\n{user_prompt}")
     return "\n\n".join(parts)
@@ -645,8 +760,24 @@ async def create_loop_job(
     # and the full loop protocol as the kickoff message, carried through the
     # "Opening Message" channel (context["kickoff_message"]). Both land together
     # in the agent's task_brief.md; only the description shows as the job title.
+    # Planner loops: the checkpoint critic gets the campaign-filing tool via
+    # an additive category override (tools.loop doesn't exist in any bundled
+    # config, so the deep-merge adds it without touching the expert's other
+    # tool lists). Campaign members — even critic-flavored sub-critics — and
+    # rotation loops never get it; the intake endpoint re-gates server-side
+    # (defense in depth, mirroring phase-restricted tools).
+    is_campaign_member = bool((extra_context or {}).get("loop_campaign_id"))
+    if (
+        (loop.get("scheduling") or "rotation") == "planner"
+        and role == "critic"
+        and not is_campaign_member
+    ):
+        config_override["tools"] = {"loop": ["loop_plan"]}
+
     description = build_loop_description(loop, role=role, iteration=iteration)
-    kickoff = build_loop_kickoff(loop, role=role, iteration=iteration)
+    kickoff = build_loop_kickoff(
+        loop, role=role, iteration=iteration, extra_context=extra_context
+    )
     context = {
         "loop_id": loop_id,
         "loop_role": role,

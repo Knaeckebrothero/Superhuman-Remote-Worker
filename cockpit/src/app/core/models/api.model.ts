@@ -828,6 +828,49 @@ export type ProjectLoopStatus =
   | 'failed';
 
 /**
+ * A multi-job campaign a planner loop's checkpoint critic filed via
+ * `loop_plan`. Lives in `project_loops.campaign` (JSONB); shape is what
+ * `_advance_planner_campaign` writes (orchestrator/main.py).
+ * See docs/features/loop_campaign_scheduling.md.
+ */
+export interface LoopCampaign {
+  /** Deterministic: the plan-filing critic job's id. */
+  id: string;
+  plan_job_id: string;
+  /** KB note carrying the initiative the campaign invests in. */
+  initiative_note_id: string;
+  title: string;
+  /** Ordered execution stages; each spawns one job of that role. */
+  stages: {role: string}[];
+  /** Pre-registered acceptance checks the closing critic judges against. */
+  acceptance: string[];
+  /** Next stage index to spawn (the running stage is cursor - 1). */
+  cursor: number;
+  /** Stages that finished (success or failure). */
+  stages_done: number;
+  /** Consecutive failed members; hitting the cap aborts the campaign. */
+  member_failures: number;
+  extensions_used: number;
+  /** active → running stages; review/aborted → awaiting the critic's verdict. */
+  status: 'active' | 'review' | 'aborted';
+}
+
+/** A disposed campaign, archived on `project_loops.campaign_history` (newest last). */
+export interface LoopCampaignHistoryEntry {
+  id: string | null;
+  initiative_note_id: string | null;
+  title: string | null;
+  stages_total: number;
+  stages_done: number | null;
+  extensions_used: number | null;
+  status_at_close: string | null;
+  /** The critic's verdict: ship (done), extend (new campaign, same initiative), kill. */
+  outcome: 'ship' | 'extend' | 'kill';
+  notes: string | null;
+  disposed_by: string;
+}
+
+/**
  * A project self-improvement loop — the control row that runs jobs one at a
  * time, rotating role_sequence (e.g. scholar→critic→developer) until a
  * budget (max_iterations / run_until / consecutive-failure cap) stops it.
@@ -866,6 +909,18 @@ export interface ProjectLoop {
   consecutive_failures: number;
   last_error: string | null;
   stop_reason: string | null;
+  /**
+   * Execution-slot scheduling: 'rotation' (default — one job per turn) or
+   * 'planner' (the checkpoint critic may expand the execution slot into a
+   * multi-stage campaign). Start-time only. loop_campaign_scheduling.md.
+   */
+  scheduling?: 'rotation' | 'planner';
+  /** The live campaign on a planner loop (null between campaigns). */
+  campaign?: LoopCampaign | null;
+  /** Disposed campaigns, newest last (bounded server-side). */
+  campaign_history?: LoopCampaignHistoryEntry[];
+  /** Per-loop guardrail overrides ({max_stages, max_extensions, abort_failures}). */
+  campaign_caps?: Record<string, number> | null;
   created_at: string;
   updated_at: string;
 }
@@ -883,6 +938,12 @@ export interface ProjectLoopStartRequest {
   user_prompt?: string | null;
   goal_override?: string | null;
   max_consecutive_failures?: number;
+  /**
+   * 'planner' lets the checkpoint critic file multi-job campaigns; requires
+   * exactly one single-role critic step followed by a single-role step
+   * (validated server-side; mirrored in plannerIneligibility client-side).
+   */
+  scheduling?: 'rotation' | 'planner';
 }
 
 /**

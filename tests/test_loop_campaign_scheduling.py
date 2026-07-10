@@ -810,11 +810,12 @@ async def test_campaign_spawn_failure_marks_loop_failed():
 
 
 class _FakeAcquire:
-    """Minimal async-context-manager pool: acquire() → conn with fetchrow."""
+    """Minimal async-context-manager pool: acquire() → conn with fetchrow/fetch."""
 
-    def __init__(self, fetchrow: AsyncMock):
+    def __init__(self, fetchrow: AsyncMock, fetch: AsyncMock | None = None):
         self._conn = MagicMock()
         self._conn.fetchrow = fetchrow
+        self._conn.fetch = fetch or AsyncMock(return_value=[])
 
     def acquire(self):
         conn = self._conn
@@ -997,3 +998,425 @@ async def test_start_rejects_campaign_caps_on_rotation():
             await start_project_loop(MagicMock(), str(uuid.uuid4()), body)
     assert e.value.status_code == 400
     assert "campaign_caps" in e.value.detail
+
+
+# =============================================================================
+# 5. P1 — checkpoint-only tool injection, kickoff blocks, notifications, tool
+# =============================================================================
+
+
+def _spawn_db() -> AsyncMock:
+    db = AsyncMock()
+    db.create_job = AsyncMock(return_value={"id": "job-1"})
+    db.list_experts_visible = AsyncMock(return_value=[])
+    db.list_project_datasources = AsyncMock(return_value=[])
+    return db
+
+
+def _bare_loop(**over) -> dict:
+    base = {
+        "id": LOOP_ID,
+        "project_id": None,
+        "owner_id": None,
+        "goal": "Build a thing",
+        "scheduling": "planner",
+        "role_sequence": [["scholar", "product-qa"], "critic", "developer"],
+        "remaining_iterations": 20,
+        "campaign": None,
+        "campaign_caps": None,
+    }
+    base.update(over)
+    return base
+
+
+class TestLoopPlanToolInjection:
+    @pytest.mark.asyncio
+    async def test_checkpoint_critic_gets_loop_plan(self):
+        db = _spawn_db()
+        await create_loop_job(
+            db, _bare_loop(), role="critic", iteration=10, seq_index=1
+        )
+        co = db.create_job.call_args.kwargs["config_override"]
+        assert co["tools"] == {"loop": ["loop_plan"]}
+
+    @pytest.mark.asyncio
+    async def test_rotation_critic_gets_nothing(self):
+        db = _spawn_db()
+        await create_loop_job(
+            db,
+            _bare_loop(scheduling="rotation"),
+            role="critic",
+            iteration=10,
+            seq_index=1,
+        )
+        assert "tools" not in db.create_job.call_args.kwargs["config_override"]
+
+    @pytest.mark.asyncio
+    async def test_campaign_member_sub_critic_gets_nothing(self):
+        db = _spawn_db()
+        await create_loop_job(
+            db,
+            _bare_loop(campaign=_campaign()),
+            role="critic",
+            iteration=11,
+            seq_index=2,
+            extra_context={"loop_campaign_id": CRITIC_JOB_ID, "loop_campaign_index": 1},
+        )
+        assert "tools" not in db.create_job.call_args.kwargs["config_override"]
+
+    @pytest.mark.asyncio
+    async def test_planner_developer_gets_nothing(self):
+        db = _spawn_db()
+        await create_loop_job(
+            db, _bare_loop(), role="developer", iteration=11, seq_index=2
+        )
+        assert "tools" not in db.create_job.call_args.kwargs["config_override"]
+
+
+class TestPlannerKickoffBlocks:
+    def test_checkpoint_critic_gets_planner_duties(self):
+        from services.project_loops import build_loop_kickoff
+
+        text = build_loop_kickoff(_bare_loop(), role="critic", iteration=10)
+        assert "PLANNER DUTIES" in text
+        assert "loop_plan" in text
+        assert "user-question" in text  # the anti-fiction rule
+        assert "DISPOSITION DUTY" not in text  # no campaign pending
+
+    def test_pending_campaign_adds_disposition_duty_with_acceptance(self):
+        from services.project_loops import build_loop_kickoff
+
+        loop = _bare_loop(campaign=_campaign(status="review", stages_done=3))
+        text = build_loop_kickoff(loop, role="critic", iteration=13)
+        assert "DISPOSITION DUTY FIRST" in text
+        assert "pytest -x" in text  # pre-registered acceptance surfaced
+        assert "ship" in text and "extend" in text and "kill" in text
+
+    def test_campaign_member_gets_campaign_context(self):
+        from services.project_loops import build_loop_kickoff
+
+        loop = _bare_loop(campaign=_campaign())
+        text = build_loop_kickoff(
+            loop,
+            role="developer",
+            iteration=11,
+            extra_context={
+                "loop_campaign_id": CRITIC_JOB_ID,
+                "loop_campaign_index": 1,
+            },
+        )
+        assert "CAMPAIGN CONTEXT: you are stage 2 of 3" in text
+        assert "honest" in text  # the verification-repricing contract
+        assert "PLANNER DUTIES" not in text
+
+    def test_rotation_loop_kickoffs_unchanged(self):
+        from services.project_loops import build_loop_kickoff
+
+        text = build_loop_kickoff(
+            _bare_loop(scheduling="rotation"), role="critic", iteration=10
+        )
+        assert "PLANNER DUTIES" not in text
+        assert "CAMPAIGN CONTEXT" not in text
+
+    def test_planner_non_member_developer_gets_no_block(self):
+        from services.project_loops import build_loop_kickoff
+
+        text = build_loop_kickoff(_bare_loop(), role="developer", iteration=11)
+        assert "CAMPAIGN CONTEXT" not in text
+        assert "PLANNER DUTIES" not in text
+
+
+class TestLoopNotifications:
+    @pytest.mark.asyncio
+    async def test_notify_persists_and_broadcasts(self):
+        from main import _notify_loop_event
+
+        db = AsyncMock()
+        feed = MagicMock()
+        loop = _loop(owner_id="cccccccc-0000-0000-0000-000000000001")
+        with patch("main.postgres_db", db):
+            with patch("services.notification_feed.notification_feed", feed):
+                await _notify_loop_event(
+                    loop,
+                    job_id=CRITIC_JOB_ID,
+                    event_type="loop_campaign_disposition",
+                    subject="Loop campaign ship: F5",
+                    message="done",
+                )
+        db.log_message.assert_awaited_once()
+        kw = db.log_message.call_args.kwargs
+        assert kw["direction"] == "outbound"
+        assert kw["user_id"] == "cccccccc-0000-0000-0000-000000000001"
+        # message_log.thread_id is varchar(12) NOT NULL — found live when the
+        # first disposition event failed the constraint with thread_id=None.
+        assert kw["thread_id"] and len(kw["thread_id"]) <= 12
+        feed.broadcast.assert_called_once()
+        assert (
+            feed.broadcast.call_args.kwargs["event_type"] == "loop_campaign_disposition"
+        )
+
+    @pytest.mark.asyncio
+    async def test_notify_skips_ownerless_loops(self):
+        from main import _notify_loop_event
+
+        db = AsyncMock()
+        with patch("main.postgres_db", db):
+            await _notify_loop_event(
+                _loop(owner_id=None),
+                job_id=CRITIC_JOB_ID,
+                event_type="x",
+                subject="s",
+                message="m",
+            )
+        db.log_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_user_question_scan_emits_per_note(self):
+        from main import _notify_loop_user_questions
+
+        rows = [
+            {"note_id": "q-1", "title": "Need lawyer budget?"},
+            {"note_id": "q-2", "title": "Which domain name?"},
+        ]
+        vector = _FakeAcquire(AsyncMock(), fetch=AsyncMock(return_value=rows))
+        notify = AsyncMock()
+        loop = _loop(project_id=str(uuid.uuid4()))
+        job = {"id": CRITIC_JOB_ID}
+        with patch("main.vector_db", vector):
+            with patch("main._notify_loop_event", notify):
+                await _notify_loop_user_questions(loop, job)
+        assert notify.await_count == 2
+        first = notify.call_args_list[0].kwargs
+        assert first["event_type"] == "loop_user_question"
+        assert "Need lawyer budget?" in first["subject"]
+
+    @pytest.mark.asyncio
+    async def test_user_question_scan_silent_without_project_or_store(self):
+        from main import _notify_loop_user_questions
+
+        notify = AsyncMock()
+        with patch("main.vector_db", None):
+            with patch("main._notify_loop_event", notify):
+                await _notify_loop_user_questions(
+                    _loop(project_id=None), {"id": CRITIC_JOB_ID}
+                )
+        notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_abort_emits_disposition_event(self):
+        from main import _rotate_loop_to_next_stage
+
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        notify = AsyncMock()
+        camp = _campaign(member_failures=1)
+        member = _member_job(camp["id"], 1, status="failed")
+        with _patched_main(db, spawn):
+            with patch("main._notify_loop_event", notify):
+                await _rotate_loop_to_next_stage(
+                    _loop(campaign=camp, seq_index=2, current_job_id=member["id"]),
+                    seq_index_completed=2,
+                    base_total=12,
+                    next_remaining=17,
+                    consecutive=2,
+                    last_error="job failed",
+                    actions=[],
+                    completed_job=member,
+                    completed_ctx=member["context"],
+                    completed_failed=True,
+                )
+        notify.assert_awaited_once()
+        kw = notify.call_args.kwargs
+        assert kw["event_type"] == "loop_campaign_disposition"
+        assert "aborted" in kw["subject"]
+
+    @pytest.mark.asyncio
+    async def test_disposition_emits_event_with_outcome(self):
+        from main import _rotate_loop_to_next_stage
+
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        notify = AsyncMock()
+        prior = "aaaaaaaa-0000-0000-0000-00000000dead"
+        reviewed = _campaign(status="review", id=prior, plan_job_id=prior)
+        plan = _plan(disposition={"outcome": "ship", "notes": "evidence green"})
+        with _patched_main(db, spawn):
+            with patch("main._notify_loop_event", notify):
+                await _rotate_loop_to_next_stage(
+                    _loop(campaign=reviewed),
+                    seq_index_completed=1,
+                    base_total=13,
+                    next_remaining=16,
+                    consecutive=0,
+                    last_error=None,
+                    actions=[],
+                    completed_job=_critic_job(plan),
+                    completed_ctx=_critic_job(plan)["context"],
+                    completed_failed=False,
+                )
+        notify.assert_awaited_once()
+        kw = notify.call_args.kwargs
+        assert "ship" in kw["subject"]
+        assert "evidence green" in kw["message"]
+
+
+class TestLoopPlanTool:
+    class _FakeResp:
+        def __init__(self, status_code: int, payload: Any):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = str(payload)
+
+        def json(self):
+            return self._payload
+
+    @staticmethod
+    def _client_returning(resp, calls: list):
+        class _Client:
+            def __init__(self, *a, **kw):
+                self._kw = kw
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, json=None):
+                calls.append(
+                    {"url": url, "json": json, "headers": self._kw.get("headers")}
+                )
+                return resp
+
+        return _Client
+
+    @pytest.mark.asyncio
+    async def test_accepted_plan_round_trip(self, monkeypatch):
+        from src.tools.context import ToolContext
+        from src.tools.loop.plan import create_loop_plan_tools
+
+        monkeypatch.setenv("ORCHESTRATOR_URL", "http://orch:8085")
+        monkeypatch.setenv("MCP_INTERNAL_KEY", "sekrit")
+        calls: list = []
+        resp = self._FakeResp(
+            200,
+            {
+                "status": "accepted",
+                "plan": {
+                    "initiative": {"kb_note_id": "qa-finding-f5"},
+                    "stages": [{"role": "developer"}, {"role": "developer"}],
+                    "disposition": {"outcome": "ship"},
+                },
+            },
+        )
+        with patch(
+            "src.tools.loop.plan.httpx.AsyncClient",
+            self._client_returning(resp, calls),
+        ):
+            tool_fn = create_loop_plan_tools(ToolContext(_job_id="j-123"))[0]
+            out = await tool_fn.ainvoke(
+                {
+                    "initiative_note_id": "qa-finding-f5",
+                    "stages": ["developer", "developer"],
+                    "disposition_outcome": "ship",
+                }
+            )
+        assert "Plan ACCEPTED: 2-stage campaign" in out
+        assert "disposed: ship" in out
+        call = calls[0]
+        assert call["url"] == "http://orch:8085/api/jobs/j-123/loop-plan"
+        assert call["headers"]["X-Internal-Key"] == "sekrit"
+        assert call["json"]["plan"]["stages"] == [
+            {"role": "developer"},
+            {"role": "developer"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rejection_surfaces_validator_detail(self):
+        from src.tools.context import ToolContext
+        from src.tools.loop.plan import create_loop_plan_tools
+
+        calls: list = []
+        resp = self._FakeResp(400, {"detail": "plan costs 9 iterations but..."})
+        with patch(
+            "src.tools.loop.plan.httpx.AsyncClient",
+            self._client_returning(resp, calls),
+        ):
+            tool_fn = create_loop_plan_tools(ToolContext(_job_id="j-123"))[0]
+            out = await tool_fn.ainvoke(
+                {"initiative_note_id": "n", "stages": ["developer"]}
+            )
+        assert "Plan REJECTED" in out
+        assert "plan costs 9 iterations" in out
+        assert "nothing was stored" in out.lower()
+
+    @pytest.mark.asyncio
+    async def test_registry_and_loader_wiring(self):
+        from src.core.loader import AgentConfig
+        from src.core.loader import get_all_tool_names
+        from src.tools.registry import TOOL_REGISTRY
+
+        assert "loop_plan" in TOOL_REGISTRY
+        assert TOOL_REGISTRY["loop_plan"]["category"] == "loop"
+
+        cfg = AgentConfig(agent_id="test", display_name="Test")
+        cfg.tools.loop = ["loop_plan"]
+        assert "loop_plan" in get_all_tool_names(cfg)
+
+
+class TestLoopJobsNeverPendingReview:
+    """A pending_review loop job wedges its loop forever (the advance fires
+    only on terminal statuses) — found live when a campaign member finished
+    without declaring job_complete. Loop jobs must map to completed instead;
+    non-loop jobs keep the human-review gate. Legitimate pause freezes
+    (version_upgrade etc.) must survive the exemption."""
+
+    @staticmethod
+    def _job(loop: bool, **over) -> dict:
+        base = {
+            "id": str(uuid.uuid4()),
+            "context": {"loop_id": LOOP_ID} if loop else {},
+            "config_override": {"verification": {"enabled": False}},
+            "freeze_data": None,
+        }
+        base.update(over)
+        return base
+
+    def test_loop_job_without_declaration_completes(self):
+        from services.completion import determine_job_status
+
+        status, err = determine_job_status(
+            self._job(loop=True), {"should_stop": True, "goal_achieved": False}
+        )
+        assert (status, err) == ("completed", None)
+
+    def test_loop_completion_without_goal_achieved_completes(self):
+        from services.completion import determine_job_status
+
+        job = self._job(loop=True, freeze_data={"freeze_type": "job_complete"})
+        status, err = determine_job_status(
+            job, {"should_stop": True, "goal_achieved": False}
+        )
+        assert (status, err) == ("completed", None)
+
+    def test_non_loop_job_keeps_review_gate(self):
+        from services.completion import determine_job_status
+
+        status, _ = determine_job_status(
+            self._job(loop=False), {"should_stop": True, "goal_achieved": False}
+        )
+        assert status == "pending_review"
+        job = self._job(loop=False, freeze_data={"freeze_type": "job_complete"})
+        status, _ = determine_job_status(
+            job, {"should_stop": True, "goal_achieved": False}
+        )
+        assert status == "pending_review"
+
+    def test_loop_pause_freezes_still_pause(self):
+        from services.completion import determine_job_status
+
+        job = self._job(loop=True, freeze_data={"freeze_type": "version_upgrade"})
+        status, _ = determine_job_status(
+            job, {"should_stop": True, "goal_achieved": False}
+        )
+        assert status == "paused"
