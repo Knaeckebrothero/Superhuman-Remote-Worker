@@ -2192,6 +2192,13 @@ async def _accept_user_input(content: str) -> str:
             # it for any turn that starts.
             logger.warning(f"Accept-time user message persist failed: {e}")
     await _loop_user_queue.put({"content": content, "id": msg.id})
+    # Title the thread from the opening prompt(s) so the cockpit header fills in
+    # on submit rather than only after the (possibly long) first turn ends.
+    # Fire-and-forget — must not block input acceptance. _early_title_from_prompt
+    # self-guards on a placeholder title and a low-signal prompt; the after-turn
+    # pass in _loop_on_turn_complete remains the fallback.
+    if _session is not None and _session.turn_count <= 2:
+        asyncio.create_task(_early_title_from_prompt(content))
     return msg.id
 
 
@@ -5228,34 +5235,116 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         return None
 
 
-async def _auto_title_after_first_turn() -> None:
-    """Generate and push a title after the first assistant turn (fire-and-forget).
+def _title_is_placeholder(current: Optional[str]) -> bool:
+    """True while the thread still carries a default placeholder title.
 
-    Loop-driven (fired from _loop_on_turn_complete), broadcasts to every
-    subscriber so each attached client sees the new title.
+    Shared guard for both titling passes (early-from-prompt and after-turn) so
+    each is a no-op once the other has written a real title — and so a manual
+    rename is never clobbered.
+    """
+    return (
+        not current
+        or current.startswith("Local Session")
+        or current == "Untitled Session"
+    )
+
+
+# Opening lines too terse/generic to mint a useful title from. Matched after
+# lowercasing and stripping trailing punctuation; anything <10 chars is also
+# treated as low-signal. Such prompts fall through to _auto_title_after_first_turn.
+_LOW_SIGNAL_PROMPTS = frozenset(
+    {
+        "hi", "hey", "hello", "yo", "sup", "ok", "okay", "thanks", "thank you",
+        "help", "please help", "can you help", "can you help me", "go on",
+        "go ahead", "keep going", "carry on", "continue", "resume",
+        "are you there", "whats up", "what's up", "test", "testing",
+    }
+)
+
+
+def _is_low_signal_prompt(content: str) -> bool:
+    """A prompt too terse/generic to title from — greeting, ack, or 'continue'.
+
+    These are left to the after-turn fallback, which titles from the agent's
+    response once there's real content, rather than minting a useless
+    "Hello" / "Continue" title from the opening line.
+    """
+    text = (content or "").strip().lower()
+    if len(text) < 10:
+        return True
+    return text.rstrip("?!. ") in _LOW_SIGNAL_PROMPTS
+
+
+async def _write_title_if_placeholder(title: str, *, origin: str) -> bool:
+    """Write ``title`` only while the thread is still untitled, then broadcast.
+
+    The placeholder re-check under the same guard makes the early-prompt and
+    after-turn passes idempotent against each other and against a manual rename.
+    Returns True iff the title was written.
+    """
+    if not title or not _session or not _session.postgres_conn or not _thread_id:
+        return False
+    thread = await _session.postgres_conn.get_thread(_thread_id)
+    if not _title_is_placeholder(thread.get("title", "") if thread else ""):
+        return False
+    async with _session.postgres_conn.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET title = $2 WHERE id = $1",
+            _thread_id,
+            title,
+        )
+    _broadcast("title.updated", {"title": title})
+    logger.info("%s-titled thread %s: %s", origin, _thread_id, title)
+    return True
+
+
+async def _early_title_from_prompt(content: str) -> None:
+    """Title the thread from the user's opening prompt, before the (possibly
+    long) first turn runs — so the cockpit header fills in on submit instead of
+    only after the agent's answer lands.
+
+    Primary titling path. Fire-and-forget from _accept_user_input; must never
+    block input acceptance. Low-signal prompts are skipped and left to
+    _auto_title_after_first_turn, which titles them from real content later.
     """
     try:
         if not _session or not _session.postgres_conn or not _thread_id:
             return
-        # Check current title is still a default placeholder
-        thread = await _session.postgres_conn.get_thread(_thread_id)
-        current = thread.get("title", "") if thread else ""
-        if (
-            current
-            and not current.startswith("Local Session")
-            and current != "Untitled Session"
-        ):
-            return  # already has a real title
-        title = await _generate_title(_session.messages, _session.auxiliary_llm)
-        if not title:
+        if _is_low_signal_prompt(content):
             return
-        async with _session.postgres_conn.acquire() as conn:
-            await conn.execute(
-                "UPDATE threads SET title = $2 WHERE id = $1",
-                _thread_id,
-                title,
-            )
-        _broadcast("title.updated", {"title": title})
-        logger.info(f"Auto-titled thread {_thread_id}: {title}")
+        # Cheap early-out before spending an aux-LLM call on an already-titled
+        # thread (e.g. a resumed session).
+        thread = await _session.postgres_conn.get_thread(_thread_id)
+        if not _title_is_placeholder(thread.get("title", "") if thread else ""):
+            return
+        # after-turn normally wires the aux archiver; we run before the first
+        # turn completes, so wire it here (idempotent) for the same aux fallback.
+        _wire_session_aux_archiver()
+        from langchain_core.messages import HumanMessage as HM
+
+        title = await _generate_title([HM(content=content)], _session.auxiliary_llm)
+        if title:
+            await _write_title_if_placeholder(title, origin="Early")
+    except Exception as e:
+        logger.warning(f"Early title generation failed (non-fatal): {e}")
+
+
+async def _auto_title_after_first_turn() -> None:
+    """Fallback title pass, fired from _loop_on_turn_complete on the first few
+    turns. Primary titling now happens at prompt-accept time
+    (_early_title_from_prompt); this covers what that skipped — a low-signal
+    opening prompt, or an early pass that failed/returned empty — and titles
+    from the full message sample. The shared placeholder guard makes it a no-op
+    once a real title already exists.
+    """
+    try:
+        if not _session or not _session.postgres_conn or not _thread_id:
+            return
+        thread = await _session.postgres_conn.get_thread(_thread_id)
+        if not _title_is_placeholder(thread.get("title", "") if thread else ""):
+            return  # already has a real title (e.g. from the early pass)
+        title = await _generate_title(_session.messages, _session.auxiliary_llm)
+        if title:
+            await _write_title_if_placeholder(title, origin="Auto")
     except Exception as e:
         logger.warning(f"Auto-title generation failed (non-fatal): {e}")

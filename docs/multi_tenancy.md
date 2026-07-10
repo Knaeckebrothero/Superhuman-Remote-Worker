@@ -1,6 +1,6 @@
 # Multi-User Isolation, SaaS Readiness, and Multi-Tenancy
 
-**Status:** M1.A (API data isolation) is shipped end-to-end as of 2026-05-18 — Track A, P4 follow-up, P4b/Track B, and the admin "view as user" toggle (PRs 1–3) are all live with **0 unscoped endpoints** (was 55). What's left for **M1 (SaaS readiness)** is operational hygiene (~1 day), cloud storage per-user OAuth (~1–2 weeks, the actual hosted-product blocker), abuse-prevention primitives (rate limiting / pod quotas / workspace egress), and user account lifecycle (self-deletion + data export). **M2 (Organizations / multi-tenancy)** is deferred until M1 is solid and there's real demand.
+**Status:** M1.A (API data isolation) is shipped end-to-end as of 2026-05-18 — Track A, P4 follow-up, P4b/Track B, and the admin "view as user" toggle (PRs 1–3) are all live with **0 unscoped endpoints** (was 55). What's left for **M1 (SaaS readiness)** is operational hygiene (~1 day), cloud storage per-user OAuth (~1–2 weeks, the actual hosted-product blocker), abuse-prevention primitives (rate limiting / pod quotas / workspace egress), and user account lifecycle (self-deletion + data export). **M2 (Organizations / multi-tenancy)** is deferred until M1 is solid and there's real demand. *(This status line dates from 2026-05-18 — see the truth-up quotes under [Where we are now](#where-we-are-now-2026-05-18): egress, admission, the 403 audit log, and the cloud mount path have since shipped, and usage metering landed 2026-06; the current gap list is per-user rate limiting, compute pod quotas, the WebDAV-datasource residual, account lifecycle, and billing proper.)*
 
 **German context:** "Mandantenfähigkeit" = **M2**. M1 ("multi-user isolation") is the prerequisite.
 **Related:** [`docs/features/auth_bff_and_api_tokens.md`](features/auth_bff_and_api_tokens.md) (auth foundation), [`docs/features/admin_view_as_user.md`](features/admin_view_as_user.md) (admin UX, shipped 2026-05-18).
@@ -35,6 +35,25 @@ The historical Phase-1 audit and per-bundle implementation log are preserved und
 > the shared service account (`main.py:17863`), and BYO Nextcloud stays
 > env-var-credentialed by design.
 
+> **Truth-up 2026-07-10** (code-verified; full detail in
+> [`saas_roadmap.md`](saas_roadmap.md) §truth-up 2026-07-10). **#6 stands
+> open** — still no per-user API middleware (CSRF/CORS/CorrelationId only).
+> The June LiteLLM-gateway throttle (RPM + daily quota stop, knobs inert) was
+> disabled 2026-07-01 and is slated for removal
+> ([remove_litellm_proxy_and_gateway_concept.md](issues/remove_litellm_proxy_and_gateway_concept.md)),
+> so the REST middleware is again the whole rate-limiting story. **#7 is now
+> partial** — `helm/templates/workspace-resourcequota.yaml` (2026-06-30) caps
+> workspace PVC storage + count per storage class; CPU/RAM quotas,
+> `LimitRange`, and a concurrent-jobs-per-user dispatch cap remain. **#9
+> re-verified absent.** The #1 residual's mint site moved to `main.py:25259`
+> (now a single site, the admin create-user flow). On the billing gate, the
+> **metering half landed**: `usage_events` ledger (LLM tokens + workspace
+> compute) with real `cost_usd` via the audit→`usage_events` pipeline +
+> OpenRouter pricing sync, plus the Cockpit usage dashboard (2026-06-26);
+> wallet schema + debit gate remain
+> ([usage_monitoring_and_rate_limiting.md](done/usage_monitoring_and_rate_limiting.md),
+> [usage_dashboard.md](features/usage_dashboard.md)).
+
 **API auth surface: fully closed.** Every HTTP endpoint (232 total) and every WebSocket endpoint (2 total) has an explicit gate. The endpoint inventory at `docs/security/endpoint_inventory.txt` reports **0 unscoped** (down from 55 at the C2 baseline). The snapshot test (`tests/test_endpoint_inventory.py`) enforces this going forward — no new endpoint can ship without a gate.
 
 **Coverage map:**
@@ -64,8 +83,8 @@ The historical Phase-1 audit and per-bundle implementation log are preserved und
 | 3 | **MongoDB has no retention/TTL** on `llm_requests` + `agent_audit`. Stale prompts/responses hoarded indefinitely. | Low | M1.B #3 | MongoDB indices |
 | 4 | **Keycloak self-registration broken** — `VERIFY_EMAIL` fires with no SMTP, and `default-roles-srw` doesn't carry the `user` role. Strangers can't sign up; also blocks live E2E cross-user verification. | **High** (onboarding broken) | M1.B #1 | Keycloak realm config |
 | 5 | ~~**No audit log of cross-user 403 attempts.**~~ **Closed 2026-06-11** — every `access.py` 403 (+ `_require_admin` + IDE proxy denials) now writes a `security_events` row + WARNING line. See [security_event_log.md](features/security_event_log.md). | ~~Medium~~ | M1.B #4 | `security/access.py` (`log_security_event`), migration 0025 |
-| 6 | **No per-user API rate limiting.** UUID enumeration / endpoint hammering / LLM-cost runaway are unprevented. | Medium (high for SaaS) | M1.D #1 | new — FastAPI middleware |
-| 7 | **No per-agent K8s `ResourceQuota` / `LimitRange`.** One user can OOM the cluster or saturate CPU. | Medium (high for SaaS) | M1.D #2 | new — Helm chart |
+| 6 | **No per-user API rate limiting.** UUID enumeration / endpoint hammering / LLM-cost runaway are unprevented. *(2026-07-10: still open — the June LLM-gateway throttle was disabled 2026-07-01 + slated for removal; REST middleware never started.)* | Medium (high for SaaS) | M1.D #1 | new — FastAPI middleware |
+| 7 | **No per-agent K8s `ResourceQuota` / `LimitRange`.** One user can OOM the cluster or saturate CPU. *(Partial 2026-06-30: workspace PVC storage/count quota shipped — `workspace-resourcequota.yaml`; compute quotas + `LimitRange` + per-user job cap remain.)* | Medium (high for SaaS) | M1.D #2 | new — Helm chart |
 | 8 | **Unrestricted workspace egress.** Agent pods can crypto-mine / port-scan / spam from your AWS IPs. | Medium (high for SaaS) | M1.D #3 | new — NetworkPolicy |
 | 9 | **No user self-deletion + data export.** GDPR-shaped, plus support workflows. | Low (table-stakes for SaaS) | M1.E | new — REST endpoints + cascade |
 | 10 | **View-as PR 4** — audit-log enrichment (`view_as_user` + `real_is_admin` on per-request audit row); remaining matrix walk. | Low | M1.B #5 | [view-as PR 4](features/admin_view_as_user.md#pr-4--validation--audit-d-open) |
@@ -133,7 +152,8 @@ Five operational items, each independently shippable. Together they're a single 
 > personal WebDAV *datasource* is still minted with shared service-account
 > credentials (`main.py:17863`, `:12384`) and BYO Nextcloud keeps explicit
 > env-var credentials by design (v1 decision). The warning below now applies
-> only to that datasource path.
+> only to that datasource path. *(2026-07-10: residual unchanged; the mint
+> site is now a single one, the admin create-user flow at `main.py:25259`.)*
 
 **The actual hosted-product blocker.** `src/services/cloud_sync/` authenticates to OpenCloud (and BYO Nextcloud) as a single shared admin service account; every user's files live under that one identity, namespaced by path. A path-scoping bug → user A reads user B's files. This is the only remaining place in the system where a single bug in our code = cross-user file exposure.
 
@@ -166,6 +186,15 @@ Each needs a short design doc before implementation — these are new territory,
 > [workspace_network_isolation.md](features/workspace_network_isolation.md)).
 > #1 and #2 remain open, designs still to write.
 
+> **Update 2026-07-10:** **#2 is now partial** — the workspace PVC
+> storage/count `ResourceQuota` shipped 2026-06-30 as the capacity guard of
+> the workspace-PVC work (`helm/templates/workspace-resourcequota.yaml`,
+> fail-closed on quota hit); CPU/RAM quotas, `LimitRange`, and the
+> concurrent-jobs-per-user dispatch cap remain. **#1 is unchanged** (no
+> middleware) — and the June LiteLLM-gateway throttle is *not* a substitute:
+> it shipped with inert knobs and was disabled 2026-07-01 (slated for
+> removal, [remove_litellm_proxy_and_gateway_concept.md](issues/remove_litellm_proxy_and_gateway_concept.md)).
+
 ### M1.E — User account lifecycle (design pending, ~3–5d total)
 
 Two flows SaaS needs that a single-org self-host doesn't.
@@ -188,9 +217,9 @@ Pre-launch checklist. **Every line must be ✅ before opening signups beyond inv
 - [x] **M1.A** — every API endpoint gated; inventory test enforces; admin view-as toggle live
 - [ ] **M1.B** — ~~self-reg/admission~~ ✅ 2026-06-10; ~~403 audit log~~ ✅ 2026-06-11 (security-event log, incl. `view_as` enrichment); **remaining: view-as PR 4 remainder** (general audit enrichment + matrix walk; Chromium per-job + MongoDB TTL closed/deferred 2026-05-28)
 - [ ] **M1.C** — ~~mount path~~ ✅ per-user via token-exchange impersonation 2026-06-10; **remaining: WebDAV datasource path off the shared service account**
-- [ ] **M1.D** — ~~egress~~ ✅ shipped; **remaining: pod quotas + pre-billing rate limit** (designs written *and* implementations shipped)
+- [ ] **M1.D** — ~~egress~~ ✅ shipped; ~~workspace storage quota~~ ✅ 2026-06-30 (PVC capacity guard); **remaining: compute pod quotas (CPU/RAM + `LimitRange` + per-user job cap) + pre-billing API rate limit** (designs written *and* implementations shipped)
 - [ ] **M1.E** — user self-deletion + data export
-- [ ] **Billing + usage metering** — wallet schema, per-user attribution audit, debit gate, Cockpit usage page ([design doc](features/saas_billing_and_metering.md), implementation comes after design + before public signup)
+- [ ] **Billing + usage metering** — ~~per-user attribution~~ ✅ + ~~Cockpit usage page~~ ✅ (audit→`usage_events` pipeline with real `cost_usd` + fused usage dashboard, 2026-06); **remaining: wallet schema + debit gate** ([design doc](features/saas_billing_and_metering.md) still stub; implementation before public signup)
 
 When all five tick, **M1 is done** and you can open signups to strangers without burning either user data or your AWS bill.
 
