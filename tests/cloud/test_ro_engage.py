@@ -92,14 +92,18 @@ async def test_engage_persists_and_returns_grant_when_probe_ok():
     db.create_ro_mount = AsyncMock(return_value="row-1")
 
     grant = await engage_ro_mount(
-        backend=backend, handle=_handle(), user_key="abc",
-        thread_id="t1", user_id="u1", postgres_db=db,
+        backend=backend,
+        handle=_handle(),
+        user_key="abc",
+        thread_id="t1",
+        user_id="u1",
+        postgres_db=db,
         http_client_factory=lambda creds: probe_client,
     )
 
     assert grant.reader_id == "srw-reader-abc"
     db.create_ro_mount.assert_awaited_once()
-    assert backend.revoked == []          # not revoked on success
+    assert backend.revoked == []  # not revoked on success
     assert backend.canary_removed is True  # canary always cleaned up
 
 
@@ -111,8 +115,12 @@ async def test_engage_refuses_and_revokes_when_a_write_succeeds():
 
     with pytest.raises(RoEngageRefused):
         await engage_ro_mount(
-            backend=backend, handle=_handle(), user_key="abc",
-            thread_id="t1", user_id="u1", postgres_db=db,
+            backend=backend,
+            handle=_handle(),
+            user_key="abc",
+            thread_id="t1",
+            user_id="u1",
+            postgres_db=db,
             http_client_factory=lambda creds: probe_client,
         )
 
@@ -131,8 +139,12 @@ async def test_engage_refuses_when_read_control_fails():
 
     with pytest.raises(RoEngageRefused):
         await engage_ro_mount(
-            backend=backend, handle=_handle(), user_key="abc",
-            thread_id="t1", user_id="u1", postgres_db=db,
+            backend=backend,
+            handle=_handle(),
+            user_key="abc",
+            thread_id="t1",
+            user_id="u1",
+            postgres_db=db,
             http_client_factory=lambda creds: probe_client,
         )
     db.create_ro_mount.assert_not_awaited()
@@ -142,13 +154,19 @@ async def test_engage_refuses_when_read_control_fails():
 @pytest.mark.asyncio
 async def test_engage_refuses_when_version_below_floor():
     backend = _FakeRoBackend()
-    probe_client = _reader_client(all_rejected=True, read_control=207, nc_version="27.0.0")
+    probe_client = _reader_client(
+        all_rejected=True, read_control=207, nc_version="27.0.0"
+    )
     db = AsyncMock()
 
     with pytest.raises(RoEngageRefused):
         await engage_ro_mount(
-            backend=backend, handle=_handle(), user_key="abc",
-            thread_id="t1", user_id="u1", postgres_db=db,
+            backend=backend,
+            handle=_handle(),
+            user_key="abc",
+            thread_id="t1",
+            user_id="u1",
+            postgres_db=db,
             http_client_factory=lambda creds: probe_client,
         )
     db.create_ro_mount.assert_not_awaited()

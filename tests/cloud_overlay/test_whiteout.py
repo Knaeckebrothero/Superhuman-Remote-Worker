@@ -12,6 +12,7 @@ def _mkchardev_or_skip(p: Path):
         os.mknod(p, 0o600 | 0o020000, os.makedev(0, 0))  # S_IFCHR, 0:0
     except PermissionError:
         import pytest
+
         pytest.skip(
             "mknod c 0,0 denied by backing FS/kernel "
             "(needs Linux >=5.8 and a non-overlayfs-backed tmpdir)"
@@ -42,10 +43,10 @@ def test_char_device_is_deletion(tmp_path):
 def test_opaque_dir_sentinel_marks_dir_replaced(tmp_path):
     d = tmp_path / "docs"
     d.mkdir()
-    (d / ".wh..wh..opq").write_text("")       # opaque sentinel
+    (d / ".wh..wh..opq").write_text("")  # opaque sentinel
     (d / "kept.txt").write_text("x")
     got = enumerate_diff(str(tmp_path))
-    assert DiffEntry("docs", "deleted") in got        # lower dir wiped
+    assert DiffEntry("docs", "deleted") in got  # lower dir wiped
     assert DiffEntry("docs/kept.txt", "present") in got
     assert all(e.path != "docs/.wh..wh..opq" for e in got)  # sentinel hidden
 
@@ -79,7 +80,7 @@ def test_bare_whiteout_marker_nested_raises(tmp_path):
 
 def test_is_whiteout_rejects_bare_and_sentinel_names():
     assert is_whiteout(".wh.gone.txt")
-    assert not is_whiteout(".wh.")          # marker with no target is not valid
+    assert not is_whiteout(".wh.")  # marker with no target is not valid
     assert not is_whiteout(".wh..wh..opq")  # opaque sentinel, not a whiteout
     assert not is_whiteout("regular.txt")
 

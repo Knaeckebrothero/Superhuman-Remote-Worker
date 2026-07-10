@@ -58,15 +58,22 @@ async def test_create_ro_mount_encrypts_credentials():
 @pytest.mark.asyncio
 async def test_get_ro_mount_decrypts_credentials():
     conn = _mock_conn()
-    conn.fetchrow = AsyncMock(return_value={
-        "id": "row-uuid",
-        "thread_id": "t", "user_id": "u", "backend": "nextcloud",
-        "reader_id": "srw-reader-abc",
-        "grant_handle": "{}",
-        "credentials": _encrypt_optional("s3cr3t-app-pw"),
-        "webdav_url": "https://nc/...", "auth_kind": "basic",
-        "status": "active", "created_at": None, "revoked_at": None,
-    })
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "id": "row-uuid",
+            "thread_id": "t",
+            "user_id": "u",
+            "backend": "nextcloud",
+            "reader_id": "srw-reader-abc",
+            "grant_handle": "{}",
+            "credentials": _encrypt_optional("s3cr3t-app-pw"),
+            "webdav_url": "https://nc/...",
+            "auth_kind": "basic",
+            "status": "active",
+            "created_at": None,
+            "revoked_at": None,
+        }
+    )
     db = _make_db_with_conn(conn)
     row = await db.get_ro_mount_by_thread("t")
     assert row["credentials"] == "s3cr3t-app-pw"
@@ -83,22 +90,38 @@ async def test_get_ro_mount_missing_returns_none():
 @pytest.mark.asyncio
 async def test_list_active_ro_mounts_decrypts_each():
     conn = _mock_conn()
-    conn.fetch = AsyncMock(return_value=[
-        {
-            "id": "r1", "thread_id": "t1", "user_id": "u1", "backend": "nextcloud",
-            "reader_id": "srw-reader-a", "grant_handle": "{}",
-            "credentials": _encrypt_optional("pw-a"),
-            "webdav_url": "x", "auth_kind": "basic",
-            "status": "active", "created_at": None, "revoked_at": None,
-        },
-        {
-            "id": "r2", "thread_id": "t2", "user_id": "u2", "backend": "opencloud",
-            "reader_id": "srw-reader-b", "grant_handle": "{}",
-            "credentials": None,  # OC bearer — no stored credential
-            "webdav_url": "y", "auth_kind": "keycloak_user_impersonation",
-            "status": "active", "created_at": None, "revoked_at": None,
-        },
-    ])
+    conn.fetch = AsyncMock(
+        return_value=[
+            {
+                "id": "r1",
+                "thread_id": "t1",
+                "user_id": "u1",
+                "backend": "nextcloud",
+                "reader_id": "srw-reader-a",
+                "grant_handle": "{}",
+                "credentials": _encrypt_optional("pw-a"),
+                "webdav_url": "x",
+                "auth_kind": "basic",
+                "status": "active",
+                "created_at": None,
+                "revoked_at": None,
+            },
+            {
+                "id": "r2",
+                "thread_id": "t2",
+                "user_id": "u2",
+                "backend": "opencloud",
+                "reader_id": "srw-reader-b",
+                "grant_handle": "{}",
+                "credentials": None,  # OC bearer — no stored credential
+                "webdav_url": "y",
+                "auth_kind": "keycloak_user_impersonation",
+                "status": "active",
+                "created_at": None,
+                "revoked_at": None,
+            },
+        ]
+    )
     db = _make_db_with_conn(conn)
     rows = await db.list_active_ro_mounts()
     assert [r["credentials"] for r in rows] == ["pw-a", None]

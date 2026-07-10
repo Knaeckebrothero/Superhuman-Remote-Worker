@@ -121,7 +121,5 @@ def test_self_path_default_keeps_backward_compatible_root_drop():
     # No self_path → only the root (empty stripped path) is dropped; the
     # subdir self-entry survives (this is the pre-fix behavior the walker
     # must now suppress by passing self_path).
-    paths = {
-        e.path for e in parse_propfind_entries(SUBDIR_BODY, href_prefix=PREFIX)
-    }
+    paths = {e.path for e in parse_propfind_entries(SUBDIR_BODY, href_prefix=PREFIX)}
     assert paths == {"Documents", "Documents/report.md"}

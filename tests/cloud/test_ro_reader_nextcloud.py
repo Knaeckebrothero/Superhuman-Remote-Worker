@@ -80,7 +80,10 @@ class FakeNcOcs:
             uid = self._form(request).get("userid", "")
             if uid in self.users:
                 return self._ocs(102)  # already exists
-            self.users[uid] = {"groups": [], "password": self._form(request).get("password")}
+            self.users[uid] = {
+                "groups": [],
+                "password": self._form(request).get("password"),
+            }
             return self._ocs(100)
 
         m = re.fullmatch(r"/ocs/v2\.php/cloud/users/([^/]+)", path)
@@ -88,7 +91,9 @@ class FakeNcOcs:
             uid = m.group(1)
             form = self._form(request)
             if form.get("key") == "password":
-                self.users.setdefault(uid, {"groups": []})["password"] = form.get("value")
+                self.users.setdefault(uid, {"groups": []})["password"] = form.get(
+                    "value"
+                )
             return self._ocs(100)
 
         m = re.fullmatch(r"/ocs/v2\.php/cloud/users/([^/]+)/groups", path)
@@ -113,7 +118,8 @@ class FakeNcOcs:
         if m and method == "DELETE":
             self.groups.discard(m.group(1))
             self.folder_group_perms and [
-                perms.pop(m.group(1), None) for perms in self.folder_group_perms.values()
+                perms.pop(m.group(1), None)
+                for perms in self.folder_group_perms.values()
             ]
             return self._ocs(100)
 
@@ -138,7 +144,7 @@ class FakeNcOcs:
         # --- WebDAV groupfolders (canary) ---
         dav_prefix = f"/remote.php/dav/groupfolders/{AGENT_USER}/{MOUNTPOINT}"
         if path.startswith(dav_prefix):
-            rel = path[len(dav_prefix):].strip("/")
+            rel = path[len(dav_prefix) :].strip("/")
             if method == "PUT":
                 # MKCOL parents are also PUT-preceded by MKCOL; accept both.
                 self.files[rel] = bytes(request.content)

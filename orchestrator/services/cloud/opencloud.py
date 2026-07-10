@@ -1702,9 +1702,7 @@ class OpenCloudBackend:
             # 2026-07-10). It doubles as the reader's login username.
             "onPremisesSamAccountName": name,
             "mail": f"{name}@srw.local",
-            "identities": [
-                {"issuer": self._keycloak_issuer, "issuerAssignedId": name}
-            ],
+            "identities": [{"issuer": self._keycloak_issuer, "issuerAssignedId": name}],
         }
         try:
             resp = await self._graph_post("/graph/v1.0/users", json=body)
