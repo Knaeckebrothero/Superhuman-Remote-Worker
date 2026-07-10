@@ -70,6 +70,17 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 # codec on the read pool. The fallback order per dimension is applied in Python
 # (:func:`_first_int`): worker's metrics.token_usage first, then session's
 # metadata.*_tokens. metrics is NOT NULL DEFAULT '{}'; metadata may be NULL.
+#
+# Cached prompt tokens have three homes, tried in order (:func:`_first_int`):
+#   1. m_cached      — metrics.token_usage.prompt_tokens_details.cached_tokens
+#                      (worker, Chat Completions: minimax/gemma/etc.)
+#   2. m_cached_norm — metrics.usage_metadata.input_token_details.cache_read
+#                      (worker, LangChain-normalized — the ONLY home for the
+#                      Responses API / codex/gpt-5.x, whose response_metadata
+#                      carries no token_usage)
+#   3. md_cached     — metadata.cached_tokens (session/persistent turns)
+# Codex cached tokens showed 0 in the By-Model view because only (1) was read.
+#
 # Ordered by (timestamp, id): timestamp is the monotonic cursor, id the stable
 # tiebreak within a timestamp.
 _SELECT_SQL = """
@@ -81,8 +92,11 @@ SELECT id, job_id, agent_type, call_type, model, timestamp,
        metrics->'token_usage'->>'reasoning_tokens'  AS m_reasoning,
        metrics->'token_usage'->'prompt_tokens_details'->>'cached_tokens'
                                                    AS m_cached,
+       metrics->'usage_metadata'->'input_token_details'->>'cache_read'
+                                                   AS m_cached_norm,
        metadata->>'input_tokens'                    AS md_input,
-       metadata->>'output_tokens'                   AS md_output
+       metadata->>'output_tokens'                   AS md_output,
+       metadata->>'cached_tokens'                   AS md_cached
 FROM llm_requests
 WHERE timestamp > $1
 ORDER BY timestamp, id
@@ -207,7 +221,9 @@ async def materialize_llm_usage_from_audit(
         completion = _first_int(r["m_completion"], r["m_output"], r["md_output"])
         if not prompt and not completion:
             continue  # health check / audio / errored call — nothing to meter
-        cached = min(_first_int(r["m_cached"]), prompt)
+        cached = min(
+            _first_int(r["m_cached"], r["m_cached_norm"], r["md_cached"]), prompt
+        )
         uncached_prompt = prompt - cached
         is_session = (r["agent_type"] or "") == _SESSION_AGENT_TYPE
         user_id, project_id = owners.get(r["job_id"], (None, None))

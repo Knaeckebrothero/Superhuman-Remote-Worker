@@ -142,9 +142,11 @@ data:
   # qwen3-embedding-8b model that backs memory/KB — so there is no separate
   # CITATION_EMBEDDING_* stack. See docs/done/citation_engine_integration.md.)
 
-  # Codex raw-response diagnostic capture
-  DEBUG_CODEX_RAW_RESPONSE: {{ "0" | quote }}
-  CODEX_RAW_DUMP_DIR: {{ "/app/logs/codex-raw" | quote }}
+  # Codex raw-response diagnostic capture. Agent pods inherit this via envFrom,
+  # so flipping llm.debugCodexRawResponse in values(-local).yaml enables the
+  # /v1/responses usage-block dump on the next freshly-provisioned agent pod.
+  DEBUG_CODEX_RAW_RESPONSE: {{ .Values.llm.debugCodexRawResponse | default "0" | quote }}
+  CODEX_RAW_DUMP_DIR: {{ .Values.llm.codexRawDumpDir | default "/app/logs/codex-raw" | quote }}
 
   # Orchestrator settings
   AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}

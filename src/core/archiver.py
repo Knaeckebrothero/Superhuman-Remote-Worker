@@ -329,10 +329,17 @@ class LLMArchiver:
                 "tool_calls": len(response.tool_calls)
                 if hasattr(response, "tool_calls") and response.tool_calls
                 else 0,
-                # Token usage from response metadata (incl. reasoning_tokens)
+                # Token usage from response metadata (incl. reasoning_tokens).
+                # Chat Completions shape (prompt_tokens, prompt_tokens_details).
                 "token_usage": getattr(response, "response_metadata", {}).get(
                     "token_usage", {}
                 ),
+                # LangChain's normalized usage — the ONLY home for token counts on
+                # the Responses API (codex/gpt-5.x via the CLIProxyAPI proxy), whose
+                # response_metadata carries no token_usage. Cached prompt tokens land
+                # under input_token_details.cache_read here for BOTH APIs, so this is
+                # the provider-agnostic source the metering SQL reads.
+                "usage_metadata": getattr(response, "usage_metadata", None) or {},
             }
 
             tool_count = metrics["tool_calls"]
