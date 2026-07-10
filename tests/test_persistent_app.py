@@ -17,8 +17,10 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.api.persistent_app import (
+    _early_title_from_prompt,
     _extract_thinking,
     _generate_title,
+    _is_low_signal_prompt,
     _get_agent_metrics,
     _handle_archive,
     _handle_compact,
@@ -1255,6 +1257,139 @@ class TestGenerateTitle:
         )
 
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# 3.6 _is_low_signal_prompt() / _early_title_from_prompt()
+# ---------------------------------------------------------------------------
+
+
+class TestIsLowSignalPrompt:
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "hi",
+            "Hey",
+            "  hello  ",
+            "ok",
+            "thanks",
+            "continue",
+            "Keep going",
+            "can you help me?",
+            "what's up",
+            "test",
+            "",
+            "fix ci",  # under the 10-char floor
+        ],
+    )
+    def test_low_signal(self, prompt):
+        assert _is_low_signal_prompt(prompt) is True
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "why can't external clients reach my service?",
+            "Deploy the orchestrator to prod",
+            "Refactor the title generation to fire on submit",
+            "continue the migration where we left off",  # 'continue' + real content
+        ],
+    )
+    def test_titleable(self, prompt):
+        assert _is_low_signal_prompt(prompt) is False
+
+
+class TestEarlyTitleFromPrompt:
+    def _mock_session(self, title="Untitled Session"):
+        mock_session = MagicMock()
+        mock_session.auxiliary_llm = MagicMock()
+        mock_conn = AsyncMock()
+        mock_conn.get_thread = AsyncMock(return_value={"title": title})
+        mock_conn_ctx = AsyncMock()
+        # acquire() must be a *sync* call returning an async CM, not an AsyncMock
+        # (which would return a coroutine and break `async with`).
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=mock_conn_ctx)
+        acquire_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_conn.acquire = MagicMock(return_value=acquire_cm)
+        mock_session.postgres_conn = mock_conn
+        return mock_session, mock_conn, mock_conn_ctx
+
+    @pytest.mark.asyncio
+    async def test_titles_untitled_thread_from_prompt(self):
+        """Writes a title + broadcasts from the opening prompt alone."""
+        mock_session, mock_conn, mock_conn_ctx = self._mock_session()
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("src.api.persistent_app._wire_session_aux_archiver"),
+            patch(
+                "src.api.persistent_app._generate_title",
+                AsyncMock(return_value="Reach external service"),
+            ) as gen,
+            patch("src.api.persistent_app._broadcast") as bcast,
+        ):
+            await _early_title_from_prompt("why can't external clients reach my svc?")
+
+        # Titled from the prompt only — a single HumanMessage, no assistant turn.
+        assert len(gen.call_args[0][0]) == 1
+        mock_conn_ctx.execute.assert_awaited_once()
+        assert bcast.call_args[0][0] == "title.updated"
+        assert bcast.call_args[0][1]["title"] == "Reach external service"
+
+    @pytest.mark.asyncio
+    async def test_skips_low_signal_prompt(self):
+        """A greeting is left to the after-turn fallback — no LLM call, no write."""
+        mock_session, mock_conn, mock_conn_ctx = self._mock_session()
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._generate_title", AsyncMock()
+            ) as gen,
+            patch("src.api.persistent_app._broadcast") as bcast,
+        ):
+            await _early_title_from_prompt("hi")
+
+        gen.assert_not_called()
+        mock_conn_ctx.execute.assert_not_called()
+        bcast.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_already_titled(self):
+        """A resumed session with a real title is not re-titled or re-generated."""
+        mock_session, mock_conn, mock_conn_ctx = self._mock_session(
+            title="Existing real title"
+        )
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._generate_title", AsyncMock()
+            ) as gen,
+            patch("src.api.persistent_app._broadcast") as bcast,
+        ):
+            await _early_title_from_prompt("a perfectly good titleable prompt")
+
+        gen.assert_not_called()
+        mock_conn_ctx.execute.assert_not_called()
+        bcast.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generation_failure_non_fatal(self):
+        """A failed aux call must not raise out of the fire-and-forget task."""
+        mock_session, _, mock_conn_ctx = self._mock_session()
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("src.api.persistent_app._wire_session_aux_archiver"),
+            patch(
+                "src.api.persistent_app._generate_title",
+                AsyncMock(side_effect=RuntimeError("aux down")),
+            ),
+        ):
+            await _early_title_from_prompt("a perfectly good titleable prompt")
+
+        mock_conn_ctx.execute.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
