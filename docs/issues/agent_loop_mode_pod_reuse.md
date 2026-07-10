@@ -169,3 +169,58 @@ metering work don't get conflated.
 - [[lifecycle_session_agents_without_thread_never_drain]] — the dual-mode
   warm-pool reattach machinery path B must not regress.
 - [[observability_and_quotas]] — the metering work this surfaced from (unaffected).
+
+---
+
+# 2026-07-10 — the risk is no longer hypothetical: two live incidents, both consequences of long-lived reused agents
+
+The 06-20 filing framed reuse as a *latent* question. The 07-04 loop incident
+(`docs/issues/version_upgrade_drain_livelock.md`) produced two **live** failures
+that both trace back to agents being long-lived, mutable, and pooled:
+
+1. **Session steal (observed on dev, 07-04).** The self-improvement loop's
+   developer job (`302e73af`, iter 6) was churning pause→re-dispatch (the drain
+   livelock). Each cycle its dual agent flicked back to `ready` — and the session
+   dispatcher grabbed it for an **unrelated user chat thread**
+   (`_send_session_attach` set `thread_id`; `current_job_id` went NULL) while the
+   job's `assigned_agent_id` still pointed at it. The job sat `processing`, bound
+   to an agent now serving someone else's chat. It self-resolved on a later
+   re-dispatch, but the race is structural:
+   - `_find_idle_persistent_agent` (session side) requires `thread_id IS NULL`
+     but **not** `current_job_id IS NULL`.
+   - `get_available_agents` (job side, `postgres.py:3255`) requires the cooldown
+     but **not** `thread_id IS NULL` — the same gap, mirrored.
+2. **The drain livelock itself is reuse-induced complexity.** The entire
+   stale-image drain machinery (reconciler drift detection → `should_drain`
+   intent → heartbeat delivery → phase-boundary `version_upgrade` freeze →
+   pause → re-dispatch, plus the checkpoint-resume bug fixed in `65f550b8`)
+   exists **only because** worker pods outlive the image they were built from.
+   One-shot pods pick up the new image on their next provision — for workers,
+   the whole class disappears by construction.
+
+**Cheap hardening regardless of the A/B decision** — make the two pool queries
+mutually exclusive (one-line predicates each):
+`_find_idle_persistent_agent` += `AND current_job_id IS NULL`;
+`get_available_agents` += `AND thread_id IS NULL`. This closes the
+assignment race without touching the reuse question.
+
+**Updated recommendation.** The 06-20 recommendation was (A) for everything.
+With the item-1 audit passed but two reuse-induced incidents on the board, the
+calculus shifts to a **split**:
+
+- **Workers/jobs → (B), one-shot** ("stateless agents"): pod handles exactly one
+  job, then exits; freshness comes from `ensure_warm_pool` pre-provisioning
+  *fresh* pods (pre-provisioning ≠ reuse). Agent version becomes a pure
+  **deployment property** — new image ⇒ new pods on next provision; no worker
+  drain/Continue-as-New machinery, no stale-image reaping for workers, no pool
+  races, isolation by construction (items 2–5 of the audit become moot for
+  workers). Costs: pod-churn + cold-start beyond the warm buffer.
+- **Sessions → stay persistent/dual** with the existing drain+suspend machinery:
+  interactive threads are inherently long-lived, and warm reattach
+  (`_find_idle_persistent_agent`) legitimately needs a live idle pod.
+
+Open items for the (B) slice: dual-mode's job arm drops `--loop` (K8s only);
+verify job pause/resume re-dispatch provisions a fresh pod (it already does when
+none is idle — the resume path exercised on 07-04 rode fresh pods each cycle);
+sizing `MIN_AGENTS`/`AGENT_BUFFER` for burst; Compose/bare-metal keeps `--loop`
+until [[deprecate_docker_compose_stack]] lands.
