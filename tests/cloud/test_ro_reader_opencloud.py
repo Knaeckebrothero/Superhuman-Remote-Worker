@@ -89,6 +89,12 @@ class FakeOc:
             return httpx.Response(200, json={"value": list(self.users.values())})
         if method == "POST" and path == "/graph/v1.0/users":
             body = json.loads(request.content)
+            # Real oCIS REQUIRES onPremisesSamAccountName — a create without it
+            # 400s ("no value given for required property ...", live dev-cluster
+            # validation 2026-07-10). Mirror that so the fake is faithful.
+            if not body.get("onPremisesSamAccountName"):
+                return httpx.Response(400, json={"error": {"code": "invalidRequest",
+                    "message": "no value given for required property onPremisesSamAccountName"}})
             uid = self._new("user-")
             self.users[uid] = {"id": uid, "displayName": body["displayName"]}
             return httpx.Response(201, json=self.users[uid])

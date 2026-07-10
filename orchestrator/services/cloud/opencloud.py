@@ -1696,6 +1696,11 @@ class OpenCloudBackend:
         body = {
             "accountEnabled": True,
             "displayName": name,
+            # oCIS LibreGraph REQUIRES onPremisesSamAccountName on create —
+            # omitting it returns 400 "no value given for required property
+            # onPremisesSamAccountName" (live dev-cluster oCIS validation,
+            # 2026-07-10). It doubles as the reader's login username.
+            "onPremisesSamAccountName": name,
             "mail": f"{name}@srw.local",
             "identities": [
                 {"issuer": self._keycloak_issuer, "issuerAssignedId": name}
