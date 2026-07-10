@@ -424,6 +424,37 @@ class TestFamilyOptionsDriveClamp:
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 
 
+class TestGpt56Reasoning:
+    """gpt-5.6 family: xhigh/max are declared in the matrix and survive the
+    codex (Responses API) path un-clamped."""
+
+    def test_capability_lists_xhigh_and_max(self):
+        cap = reasoning_capability("gpt-5.6-sol")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "high"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_max_reaches_codex_responses_api(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="gpt-5.6-sol", reasoning_level="max")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["reasoning"] == {"effort": "max", "summary": "auto"}
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_reaches_codex_responses_api(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-5.6-terra", reasoning_level="xhigh")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+
+
 class TestOpenAIReasoningClamping:
     """Integration tests verifying clamping reaches ReasoningChatOpenAI for OpenAI."""
 

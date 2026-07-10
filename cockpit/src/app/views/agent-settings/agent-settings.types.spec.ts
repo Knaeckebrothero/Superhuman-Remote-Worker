@@ -15,6 +15,20 @@ describe('detectModelFamily — GLM', () => {
   });
 });
 
+describe('detectModelFamily — GPT-5.6', () => {
+  it('maps GPT-5.6 tiers to the gpt-5.6 family, ahead of gpt-5', () => {
+    expect(detectModelFamily('gpt-5.6-sol')).toBe('gpt-5.6');
+    expect(detectModelFamily('gpt-5.6-terra')).toBe('gpt-5.6');
+    expect(detectModelFamily('openai/gpt-5.6-luna')).toBe('gpt-5.6');
+    expect(detectModelFamily('codex/gpt-5.6-sol')).toBe('gpt-5.6');
+  });
+
+  it('keeps neighbors unaffected', () => {
+    expect(detectModelFamily('gpt-5.5')).toBe('gpt-5');
+    expect(detectModelFamily('gpt-5.6-codex')).toBe('codex');
+  });
+});
+
 describe('detectModelFamily — Mistral', () => {
   it('maps Mistral 3 family + specialists across transports', () => {
     expect(detectModelFamily('mistral-large-latest')).toBe('mistral');

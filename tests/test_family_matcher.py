@@ -27,6 +27,12 @@ from orchestrator.services.family_matcher import detect_family
         ("gpt-5", "gpt-5"),
         ("gpt-5.2", "gpt-5"),
         ("gpt-5-mini", "gpt-5"),
+        # GPT-5.6 tiers (Luna/Terra/Sol) — dedicated family, must beat gpt-5;
+        # codex variants keep the codex family (rule order).
+        ("gpt-5.6-sol", "gpt-5.6"),
+        ("gpt-5.6-terra", "gpt-5.6"),
+        ("openrouter/openai/gpt-5.6-luna", "gpt-5.6"),
+        ("gpt-5.6-codex", "codex"),
         ("o3", "o-series"),
         ("o3-mini", "o-series"),
         ("o4", "o-series"),

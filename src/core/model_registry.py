@@ -203,6 +203,8 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "codex-spark"
     if "codex" in name and name.startswith("gpt-5"):
         return "codex"
+    if name.startswith("gpt-5.6"):
+        return "gpt-5.6"
     if name.startswith("gpt-5"):
         return "gpt-5"
     if name.startswith("gpt-4o"):
