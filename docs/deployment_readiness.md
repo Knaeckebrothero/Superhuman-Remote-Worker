@@ -1,8 +1,10 @@
 # Deployment Readiness for the Open-Source Release
 
 **Status:** Active — checklist tracking
-**Last updated:** 2026-06-15
+**Last updated:** 2026-07-10
 **Owner:** deployment / release
+
+**Progress:** Phase 1 (chart-correctness gates in CI) is **complete and live on `develop`** — render matrix + `kubeconform` + `values.schema.json`, wired as dedicated `chart-test` / `chart-schema-negative` jobs that also gate the chart-publish steps. Re-verified green 2026-07-10. Next up: Phase 2 (install test on throwaway infra). Phases 3–6 remain open.
 
 ## Goal
 
@@ -59,9 +61,9 @@ internal-ops to fence off.
 
 | Area | Today | Target |
 |---|---|---|
-| Chart lint in CI | `helm lint` ×2 (`test-values.yaml`, `customer-external-values.yaml`) | + render matrix, kubeconform, values schema |
+| Chart correctness in CI | render matrix (4 scenarios) + `kubeconform` + `helm lint` in a dedicated `chart-test` job, gated on `helm/` changes; chart-publish gated on it | **✅ done (Phase 1)** |
 | Install test in CI | none | throwaway k3d job: install + wait + health, incl. upgrade-from-published |
-| `values.schema.json` | absent | present; bad values fail at `helm install`, not pod-crash |
+| `values.schema.json` | present — bad values fail at `helm template`/install; `chart-schema-negative` job asserts it | **✅ done (Phase 1)** |
 | `helm test` hooks | none | health-probe hooks (CI gate **and** user `helm test srw`) |
 | Single-node install doc | none (README has eval + k3d-dev only) | dedicated mini-PC k3s guide |
 | Docker Compose | 3 root files + `DockerProvisioner` + `agent.py --loop`, docs say "supported" | removed (per existing plan) |
@@ -72,30 +74,35 @@ internal-ops to fence off.
 
 ## Phase 1 — Chart correctness gates in CI
 
+**Status: ✅ COMPLETE — live on `develop`, re-verified 2026-07-10.** Implementation + execution record: `docs/superpowers/plans/2026-06-15-phase1-chart-correctness-gates.md`. All four scenarios render + `kubeconform`-validate clean (0 invalid / 0 skipped) and the negative test bites — confirmed again today against the current chart (which has since dropped MongoDB; the scenario files were kept in sync). **Bonus:** the matrix immediately caught a real latent bug — `customer-external-values.yaml` set `postgres.externalUrl` where the chart requires `externalHost`/`externalPort`/`externalDb`; it passed `helm lint` but failed a real `helm template`. Fixed.
+
 **Goal:** Catch template, schema, and values-wiring regressions on every PR that
 touches `helm/`, before anything reaches a cluster. Cheap, fast, no cluster.
 
-- [ ] **Render matrix.** `helm template` across the meaningful permutations:
-  the three secrets modes (ESO / pre-existing Secret / chart-created), internal
-  vs. external for each database, hostname overrides, `vmController` on/off,
-  `mcp`/`neo4j`/`opencloud` toggles. Build out `helm/ci/*-values.yaml` as the
-  matrix inputs (extends the two files already there).
-- [ ] **`kubeconform`** over the rendered output, pinned to the K8s versions we
-  claim to support (chart says 1.28+). Validates against real API schemas; needs
-  CRD schemas for KubeVirt/ESO/cert-manager where those resources render.
-- [ ] **`values.schema.json`** for the chart. Required keys (`global.domain`,
-  `license.acceptTerms`, a coherent secrets mode) fail at install time with a
-  clear message instead of a downstream crash-loop. Doubles as install-time UX.
-- [ ] Wire all three into the existing `lint` job in `develop.yml` / `main.yml`,
-  gated on `helm/` changes via the existing `changes` job.
-- [ ] *(Stretch)* targeted `helm-unittest` only if a specific template keeps
-  regressing — not adopted wholesale.
+- [x] **Render matrix.** `helm template` across four scenario files covering the
+  meaningful permutations — `test` (ESO secrets + internal DBs), `customer-external`
+  (pre-existing Secret + external DBs), `eval` (chart-created secrets + minimal
+  single-node footprint), `vm` (`vmController` on). In `helm/ci/*-values.yaml`.
+- [x] **`kubeconform`** over each rendered scenario, pinned to K8s 1.28, with the
+  datreeio CRD catalog resolving `ExternalSecret` / `Certificate` / `Middleware`
+  (0 skipped — real CRD validation, not just skips).
+- [x] **`values.schema.json`** — permissive type/enum schema; bad input fails at
+  `helm template` / install. The `chart-schema-negative` job asserts it actually
+  rejects a deliberately-invalid file.
+- [x] Wired into CI **as two dedicated jobs (`chart-test`, `chart-schema-negative`),
+  not folded into `lint`** (a render matrix needs a job-level `strategy.matrix`, and
+  gating needs `needs: changes`; `helm lint` moved out of `lint` into the matrix).
+  develop: chart-gated, lint soft / render+kubeconform hard. main: always-run, all
+  hard. Both chart-publish jobs (`deploy-experimental`, `release-chart`) are gated on
+  `chart-test` so a red gate blocks publication.
+- [x] *(Stretch)* `helm-unittest` — **not adopted** (nothing is regressing enough to
+  warrant it), as planned.
 
-**Acceptance criteria:**
+**Acceptance criteria** — _all met:_
 
-- A PR that breaks any matrix permutation's render or schema fails CI.
-- `helm install` with a missing required value fails fast citing the value.
-- No new always-on cluster cost; jobs run only when `helm/` changed.
+- [x] A PR that breaks any matrix permutation's render or schema fails CI. (render + `kubeconform` are hard gates; `values.schema.json` catches type/enum errors)
+- [x] `helm install` with a missing required value fails fast citing the value. (schema + the chart's existing `required`/`fail` guards)
+- [x] No new always-on cluster cost; jobs run only when `helm/` changed. (no cluster — render/validate on the runner; chart-gated on develop, always-run on main per the full-power contract)
 
 ---
 
