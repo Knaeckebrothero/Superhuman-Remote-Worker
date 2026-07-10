@@ -1114,13 +1114,19 @@ codexProxy:
   enabled: false
   image: docker.io/eceasy/cli-proxy-api:latest
   storageSize: "1Gi"
+  # The proxy buffers the full request/response body in memory (Go), so a
+  # single multimodal turn (e.g. several multi-MB images base64-inflated to
+  # ~30MB each, plus the response) can spike well past a tight limit. The old
+  # 256Mi limit was OOMKilled mid-turn by an image-heavy session, which the
+  # agent saw as `APIConnectionError: Connection error.` and the turn died.
+  # Give it generous headroom (limit is a ceiling, not a reservation).
   resources:
     requests:
-      memory: "64Mi"
-      cpu: "50m"
-    limits:
       memory: "256Mi"
-      cpu: "200m"
+      cpu: "100m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
 
 # =============================================================================
 # Reloader (watches ConfigMap/Secret changes and triggers rolling restarts)
