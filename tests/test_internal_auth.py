@@ -184,6 +184,67 @@ class TestPureInternalEndpoints:
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
+    async def test_agent_heartbeat_merges_graph_progress_into_metrics(self, fake_request):
+        from main import AgentHeartbeat, agent_heartbeat
+
+        hb = AgentHeartbeat(
+            status="working",
+            current_job_id="11111111-1111-1111-1111-111111111111",
+            metrics={"memory_mb": 128},
+            graph_progress=9,
+        )
+        fake_db = MagicMock()
+        fake_db.heartbeat = AsyncMock(
+            return_value={"previous_status": "working", "effective_status": "working"}
+        )
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+        ):
+            result = await agent_heartbeat(fake_request, "agent-1", hb)
+
+        fake_db.heartbeat.assert_awaited_once_with(
+            agent_id="agent-1",
+            status="working",
+            current_job_id="11111111-1111-1111-1111-111111111111",
+            metrics={"memory_mb": 128, "graph_progress": 9},
+            aux_degraded=None,
+        )
+        assert result == {"status": "ok", "intents": {}}
+
+    @pytest.mark.asyncio
+    async def test_agent_heartbeat_graph_progress_overrides_metric_field(self, fake_request):
+        from main import AgentHeartbeat, agent_heartbeat
+
+        hb = AgentHeartbeat(
+            status="working",
+            current_job_id="11111111-1111-1111-1111-111111111111",
+            metrics={"graph_progress": 1, "memory_mb": 256},
+            graph_progress=2,
+        )
+        fake_db = MagicMock()
+        fake_db.heartbeat = AsyncMock(
+            return_value={"previous_status": "working", "effective_status": "working"}
+        )
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+        ):
+            await agent_heartbeat(fake_request, "agent-1", hb)
+
+        fake_db.heartbeat.assert_awaited_once_with(
+            agent_id="agent-1",
+            status="working",
+            current_job_id="11111111-1111-1111-1111-111111111111",
+            metrics={"memory_mb": 256, "graph_progress": 2},
+            aux_degraded=None,
+        )
+
+    @pytest.mark.asyncio
     async def test_complete_job_without_key_401(self, fake_request, job_a):
         from main import JobCompleteRequest, complete_job
 

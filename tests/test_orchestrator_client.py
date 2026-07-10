@@ -209,6 +209,31 @@ class TestOrchestratorClient:
             mock_client.post.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_heartbeat_payload_includes_graph_progress_metric(self, client):
+        """Graph-progress heartbeat metrics should be forwarded untouched."""
+        client.agent_id = "agent-123"
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json = MagicMock(return_value={"status": "ok", "intents": {}})
+
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(return_value=mock_response)
+
+            result = await client.heartbeat(
+                status="working",
+                job_id="job-7",
+                metrics={"graph_progress": 9, "memory_mb": 512},
+            )
+
+            assert result == {"status": "ok", "intents": {}}
+            mock_client.post.assert_called_once()
+            payload = mock_client.post.call_args.kwargs["json"]
+            assert payload["status"] == "working"
+            assert payload["current_job_id"] == "job-7"
+            assert payload["metrics"]["graph_progress"] == 9
+
+    @pytest.mark.asyncio
     async def test_heartbeat_returns_intents(self, client):
         """When orchestrator surfaces drain intent, the agent receives it."""
         client.agent_id = "agent-123"
