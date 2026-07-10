@@ -1420,3 +1420,60 @@ class TestLoopJobsNeverPendingReview:
             job, {"should_stop": True, "goal_achieved": False}
         )
         assert status == "paused"
+
+
+class TestAgentLoaderBindsLoopCategory:
+    """Agent-side half of the tool-injection contract.
+
+    The P3 live flip on 2026-07-10 found the gap the classes above can't see:
+    the orchestrator injected ``tools: {loop: [loop_plan]}`` correctly (per
+    TestLoopPlanToolInjection), but the agent's ToolsConfig constructor calls
+    silently dropped the ``loop`` key (and ``communication``, breaking
+    ``send_message`` for every worker) — so the checkpoint critic held its
+    PLANNER DUTIES kickoff while owning no loop_plan tool, and every campaign
+    silently degraded to single-job rotation. These tests load a dispatched
+    config dict the way agent.py does and assert the categories survive all
+    the way into get_all_tool_names.
+    """
+
+    def _load(self, tools: dict):
+        from src.core.loader import load_agent_config_from_dict
+
+        return load_agent_config_from_dict(
+            {"agent_id": "t", "display_name": "T", "tools": tools}
+        )
+
+    def test_loop_category_survives_from_dict(self):
+        config = self._load({"loop": ["loop_plan"]})
+        assert config.tools.loop == ["loop_plan"]
+
+    def test_loop_plan_reaches_the_bound_tool_names(self):
+        from src.core.loader import get_all_tool_names
+
+        config = self._load({"loop": ["loop_plan"], "core": ["todo_complete"]})
+        names = get_all_tool_names(config)
+        assert "loop_plan" in names
+        assert "todo_complete" in names
+
+    def test_communication_category_survives_from_dict(self):
+        from src.core.loader import get_all_tool_names
+
+        config = self._load({"communication": ["send_message"]})
+        assert config.tools.communication == ["send_message"]
+        assert "send_message" in get_all_tool_names(config)
+
+    def test_every_tools_config_field_round_trips(self):
+        """Parity guard: adding a ToolsConfig field without wiring the
+        constructor kwarg is exactly the bug class this file exists for."""
+        import dataclasses
+
+        from src.core.loader import ToolsConfig
+
+        field_names = [f.name for f in dataclasses.fields(ToolsConfig)]
+        sentinel = {name: [f"x_{name}"] for name in field_names}
+        config = self._load(sentinel)
+        for name in field_names:
+            assert getattr(config.tools, name) == [f"x_{name}"], (
+                f"tools.{name} was dropped by the loader — add the kwarg to "
+                "both ToolsConfig(...) construction sites in src/core/loader.py"
+            )

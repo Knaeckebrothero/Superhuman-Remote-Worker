@@ -2205,10 +2205,12 @@ def load_agent_config(
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
         webdav=tools_data.get("webdav", []),
+        communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
         agent_catalog=tools_data.get("agent_catalog", []),
         workflows=tools_data.get("workflows", []),
+        loop=tools_data.get("loop", []),
     )
 
     connections_data = data.get("connections", {})
@@ -2416,10 +2418,12 @@ def load_agent_config_from_dict(
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
         webdav=tools_data.get("webdav", []),
+        communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
         agent_catalog=tools_data.get("agent_catalog", []),
         workflows=tools_data.get("workflows", []),
+        loop=tools_data.get("loop", []),
     )
 
     connections_data = data.get("connections", {})

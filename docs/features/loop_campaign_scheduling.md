@@ -26,7 +26,14 @@ notification kinds fired in one advance and the bell row persisted
 below). Cleaned up: loop stopped, jobs/project deleted, pods reaped.
 **P2 (cockpit) BUILT + k3d-verified 2026-07-10**, uncommitted — campaign
 card + history + scheduling opt-in + live SSE handling; see "P2 as-built
-notes". Remaining: P3 (live flip).
+notes". **P0–P2 pushed to develop + deployed 2026-07-10.** **P3 first live
+flip (Better Resavio, planner loop `8e832884`) found a release blocker**: the
+agent-side loader silently dropped the injected `tools.loop` category, so
+checkpoint critics carried PLANNER DUTIES but never owned the `loop_plan`
+tool — every cycle degraded to single-job rotation. Root cause + fix (+ the
+collateral `communication`/`send_message` discovery) in "P3 first-flip
+findings" below. Fix BUILT + tested 2026-07-10, uncommitted. Remaining:
+push the fix, then re-observe a full campaign cycle live.
 
 ## Motivation
 
@@ -534,6 +541,59 @@ running-only — ignores the synthetic row, `current_job_id` NULL for the jobs
 FK): card, chip states, history, terminal-state history persistence, the
 scheduling select, and the inline planner guard all confirmed in the browser;
 seeded project deleted after.
+
+### P3 first-flip findings (Better Resavio, 2026-07-10)
+
+The owner pushed P0–P2, started a fresh planner loop on Better Resavio
+(loop `8e832884`, scholar → critic → developer, MiniMax-M3, VM workspace),
+and let it run overnight. Symptom: **six jobs, two critic checkpoints, zero
+campaigns** — every cycle fell back to the single default developer stage
+(`campaign` NULL, `campaign_history` []), i.e. planner scheduling behaved
+exactly like rotation.
+
+**Forensics** (srw-auditdb `llm_requests` is the ground truth for what a
+model could actually call): both critic jobs had the correct
+`config_override` (`tools: {loop: [loop_plan]}`) in the jobs row and the
+PLANNER DUTIES kickoff in `context->kickoff_message` — but **zero** of their
+LLM requests contained the `loop_plan` tool schema (probe: the schema-only
+string `initiative_note_id`; the 84 hits for the bare string `loop_plan` in
+iter-2's requests were the *kickoff text*, a probe trap worth remembering).
+The critic was being told "you MAY file a campaign plan with the `loop_plan`
+tool" while owning no such tool.
+
+**Root cause**: `src/core/loader.py` — the P1 commit added the `loop` field
+to the `ToolsConfig` dataclass and the registry wiring
+(`create_loop_tools`), but the two `ToolsConfig(...)` construction sites
+(`load_agent_config` + `load_agent_config_from_dict`) enumerate category
+kwargs explicitly and were never given `loop=tools_data.get("loop", [])` —
+the merged override survived YAML/dict parsing and was dropped at dataclass
+construction, defaulting to `[]` forever.
+
+**Collateral discovery**: `communication` was missing from the same two
+constructor calls, meaning `defaults.yaml`'s `communication: [send_message]`
+never bound for ANY worker agent (verified live: 0/249 requests of a fresh
+scholar job carried the `send_message` schema). Same bug class, pre-existing.
+The fix restores it — worker agents can now actually `send_message`, which
+is defaults-intended behavior but a live behavior change to be aware of.
+
+**Fix** (uncommitted): both constructor sites now pass `communication` and
+`loop`; regression tests in `tests/test_loop_campaign_scheduling.py`
+(`TestAgentLoaderBindsLoopCategory`, red without the fix / green with it),
+including a dataclass-fields parity test so the next `ToolsConfig` field
+addition cannot silently repeat this. Suite: 72 campaign tests green, full
+pytest green except a pre-existing live-DB-dependent local failure.
+
+**Why the P1 k3d smoke missed it**: "tool injection verified" checked the
+`config_override` *row content*, and plan intake was exercised by POSTing
+the endpoint directly — nobody asserted the schema reached the model. The
+new regression tests close the agent half; for live verification the
+`llm_requests` schema probe above is the check to repeat.
+
+**Unrelated one-off observed**: the iter-5 critic (`7b83d65f`) initialized
+with `task_brief_length: 0` and `task_brief.md` missing from its (reused VM)
+workspace — its kickoff never materialized at all. Single occurrence, during
+the 19:17Z deploy-rollout window; the other five jobs' briefs were intact.
+Watch for recurrence; not chased.
 
 ## Resolved questions (owner + assistant, 2026-07-09)
 
