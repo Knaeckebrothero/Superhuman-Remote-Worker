@@ -1116,7 +1116,9 @@ dozzle:
 
 codexProxy:
   enabled: false
-  image: docker.io/eceasy/cli-proxy-api:latest
+  # Pin a concrete upstream version — CLIProxyAPI ships multiple builds/day and
+  # `latest` makes pod restarts silently change behavior. Overlays may override.
+  image: docker.io/eceasy/cli-proxy-api:v7.2.61
   storageSize: "1Gi"
   # The proxy buffers the full request/response body in memory (Go), so a
   # single multimodal turn (e.g. several multi-MB images base64-inflated to

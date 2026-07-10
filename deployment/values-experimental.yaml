@@ -136,7 +136,13 @@ codexProxy:
   # `<|tool_call>…<tool_call|>` into chat/completions `content` (structured
   # tool_calls stayed correct). Verify after rollout: (1) codex auth still
   # survives >13 calls (no 401 storm), (2) leak gone. Revert this line if 401s return.
-  image: docker.io/eceasy/cli-proxy-api:v7.2.27
+  # Bumped 2026-07-10 (v7.2.27 → v7.2.61): GPT-5.6 (Sol/Terra/Luna) model
+  # registry landed v7.2.55 (GA day), Sol config revised v7.2.59, ultra effort
+  # exposure v7.2.60 — v7.2.27 predates all of it, so gpt-5.6-* rows can't
+  # resolve through the proxy. Verify after rollout: (1) codex auth survives
+  # >13 calls (no 401 storm), (2) no raw `<|tool_call>` leak in chat content,
+  # (3) a gpt-5.6-sol completion succeeds. Revert this line if 401s return.
+  image: docker.io/eceasy/cli-proxy-api:v7.2.61
 # -----------------------------------------------------------------------------
 # Cloud storage — OpenCloud bundled (chart default)
 # -----------------------------------------------------------------------------
