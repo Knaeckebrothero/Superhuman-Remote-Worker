@@ -20,8 +20,16 @@ class _StubWorkspace:
 
     def __init__(self, result_count: int) -> None:
         self._result_count = result_count
+        self.search_calls: list[tuple[str, str, bool, list[str] | None]] = []
 
-    def search_files(self, query: str, path: str = "", case_sensitive: bool = False):
+    def search_files(
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
+    ):
+        self.search_calls.append((query, path, case_sensitive, exclude_dirs))
         return [
             {"path": "file.txt", "line_number": i + 1, "line": f"match {i}"}
             for i in range(self._result_count)
@@ -73,3 +81,13 @@ def test_summary_shows_plain_count_above_hard_cap():
 
     assert f"[Showing 50 of {above_cap} matches]" in result
     assert "capped" not in result
+
+
+def test_search_files_forwards_exclude_dirs_to_workspace():
+    """The search_files tool passes exclude_dirs through WorkspaceManager."""
+    workspace = _StubWorkspace(1)
+    _search_files_tool(workspace).invoke(
+        {"query": "role", "path": "src", "exclude_dirs": ["node_modules", ".git"]}
+    )
+
+    assert workspace.search_calls == [("role", "src", False, ["node_modules", ".git"])]

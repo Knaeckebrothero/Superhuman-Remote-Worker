@@ -1500,6 +1500,9 @@ class LimitsConfig:
     # through limits like image_tokens. None -> renderer default (150). Read by
     # the tool layer (_get_visual_content), not ContextManager.
     pdf_render_dpi: Optional[int] = None
+    # Per-tool-category wall-clock ceilings for audited tool batches in seconds.
+    # Empty maps keep fallback values in graph.py.
+    tool_category_timeouts: Dict[str, int] = field(default_factory=dict)
     response_validation: ResponseValidationConfig = field(
         default_factory=ResponseValidationConfig
     )
@@ -2219,6 +2222,14 @@ def load_agent_config(
     )
 
     limits_data = data.get("limits", {})
+    raw_tool_category_timeouts = limits_data.get("tool_category_timeouts", {})
+    tool_category_timeouts: dict[str, int] = {}
+    if isinstance(raw_tool_category_timeouts, dict):
+        tool_category_timeouts = {
+            str(k): int(v)
+            for k, v in raw_tool_category_timeouts.items()
+            if isinstance(v, (int, float)) and int(v) > 0
+        }
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
@@ -2231,6 +2242,7 @@ def load_agent_config(
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
+        tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
     )
@@ -2432,6 +2444,14 @@ def load_agent_config_from_dict(
     )
 
     limits_data = data.get("limits", {})
+    raw_tool_category_timeouts = limits_data.get("tool_category_timeouts", {})
+    tool_category_timeouts = {}
+    if isinstance(raw_tool_category_timeouts, dict):
+        tool_category_timeouts = {
+            str(k): int(v)
+            for k, v in raw_tool_category_timeouts.items()
+            if isinstance(v, (int, float)) and int(v) > 0
+        }
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
@@ -2444,6 +2464,7 @@ def load_agent_config_from_dict(
         response_validation=_parse_response_validation(
             limits_data.get("response_validation", {})
         ),
+        tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
     )

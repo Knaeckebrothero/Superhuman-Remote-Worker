@@ -230,6 +230,25 @@ limits:
     max_line_repetitions: 10    # same line repeated in output
   progress_stall_threshold: 30     # tool calls without progress before nudge reminder
   max_tool_calls_per_phase: 200    # max tool calls per phase before rewind (tactical) or freeze (strategic)
+  # Per-category audited tool-batch timeout (seconds). The batch timeout is the
+  # max of categories in the batch, then clipped by graph-level hard ceilings.
+  tool_category_timeouts:
+    default: 120
+    workspace: 120
+    core: 120
+    research: 120
+    citation: 120
+    graph: 120
+    shell: 900
+    webdav: 120
+    git: 120
+    knowledge: 120
+    communication: 120
+    delegation: 120
+    orchestrator: 120
+    workflows: 120
+    loop: 120
+    agent_catalog: 120
 
 context_management:
   compact_on_archive: true

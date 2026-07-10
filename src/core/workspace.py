@@ -721,7 +721,11 @@ class WorkspaceManager:
         return self._backend.list_dir(relative_path, pattern)
 
     def search_files(
-        self, query: str, path: str = "", case_sensitive: bool = False
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
     ) -> List[dict]:
         """Search for text in workspace files.
 
@@ -729,11 +733,17 @@ class WorkspaceManager:
             query: Text to search for
             path: Directory to search in (default: entire workspace)
             case_sensitive: Whether search is case-sensitive
+            exclude_dirs: Optional list of directory names to skip with grep
 
         Returns:
             List of dicts with 'path', 'line_number', and 'line' for each match
         """
-        return self._backend.search_files(query, path, case_sensitive)
+        return self._backend.search_files(
+            query,
+            path,
+            case_sensitive,
+            exclude_dirs=exclude_dirs,
+        )
 
     def get_size(self, relative_path: str = "") -> int:
         """Get size of a file or directory in bytes.
