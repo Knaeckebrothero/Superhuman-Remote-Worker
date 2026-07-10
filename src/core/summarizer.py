@@ -127,8 +127,7 @@ def is_overflow_error(exc: BaseException) -> bool:
             return True
         if (
             isinstance(current, BadRequestError)
-            and str(getattr(current, "code", "") or "").lower()
-            == "invalid_json_schema"
+            and str(getattr(current, "code", "") or "").lower() == "invalid_json_schema"
         ):
             return True
         if isinstance(current, ValidationError):

@@ -112,4 +112,3 @@ def test_aux_output_schemas_are_strict_json_compatible(schema: Type[BaseModel]):
 
     assert isinstance(result, dict)
     assert result.get("type") in {"object", None}
-
