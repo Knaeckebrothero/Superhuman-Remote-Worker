@@ -61,3 +61,14 @@ def test_summary_shows_plain_count_below_hard_cap():
 
     assert f"[Showing 50 of {SEARCH_RESULT_HARD_CAP - 1} matches]" in result
     assert "capped" not in result
+
+
+def test_summary_shows_plain_count_above_hard_cap():
+    """A result set above the hard cap (from an uncapping backend) must show
+    the plain accurate count, not a false "capped" message. The cap applies
+    only to RemoteBackend; Scratch/Virtual/Subdir backends may return more."""
+    workspace = _StubWorkspace(2500)
+    result = _search_files_tool(workspace).invoke({"query": "role"})
+
+    assert "[Showing 50 of 2500 matches]" in result
+    assert "capped" not in result
