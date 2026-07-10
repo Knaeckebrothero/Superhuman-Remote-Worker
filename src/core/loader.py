@@ -2658,25 +2658,52 @@ def _should_use_reasoning_summary(model: str) -> bool:
     return any(model_lower.startswith(p) for p in reasoning_prefixes)
 
 
-# Reasoning levels supported by each provider API
+# Reasoning levels assumed for the OpenAI wire when a family declares no usable
+# `options` list (conservative fallback; the matrix `reasoning.options` is the
+# source of truth — see docs/done/family_centered_reasoning.md).
 _OPENAI_REASONING_LEVELS = {"low", "medium", "high"}
+
+# Known effort levels, weakest → strongest. Clamping walks this ladder downward
+# from an unsupported request (never silently exceeding the asked-for effort),
+# then upward only when nothing below is supported (e.g. `minimal` on a
+# low/medium/high family).
+_EFFORT_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _supported_efforts(cap: Dict[str, Any]) -> set[str]:
+    """Effort values a family accepts, from its matrix ``reasoning.options``.
+
+    Falls back to the conservative OpenAI set when the capability block carries
+    no usable options list (fall-through ``default`` entries, malformed blocks).
+    """
+    options = cap.get("options") if isinstance(cap, dict) else None
+    if isinstance(options, (list, tuple)) and options:
+        return {str(o).lower() for o in options}
+    return set(_OPENAI_REASONING_LEVELS)
 
 
 def _clamp_reasoning_level(level: str, supported: set[str]) -> str:
     """Clamp a reasoning level to the nearest supported value.
 
-    Maps unsupported levels to the closest supported equivalent:
-    - 'minimal' -> 'low'
-    - 'xhigh' -> 'high'
+    Walks ``_EFFORT_LADDER`` downward from the requested level, then upward
+    when nothing below is supported. Unknown values off the ladder fall back
+    to ``high``.
     """
+    level = str(level).lower()
     if level in supported:
         return level
-    mapping = {"minimal": "low", "xhigh": "high"}
-    clamped = mapping.get(level, level)
-    if clamped not in supported:
-        return "high"  # safe fallback
-    logger.debug(f"Clamped reasoning level '{level}' -> '{clamped}' for provider")
-    return clamped
+    if level in _EFFORT_LADDER:
+        idx = _EFFORT_LADDER.index(level)
+        for candidate in reversed(_EFFORT_LADDER[:idx]):
+            if candidate in supported:
+                logger.debug(f"Clamped reasoning level '{level}' -> '{candidate}'")
+                return candidate
+        for candidate in _EFFORT_LADDER[idx + 1 :]:
+            if candidate in supported:
+                logger.debug(f"Clamped reasoning level '{level}' -> '{candidate}'")
+                return candidate
+    logger.debug(f"Unknown reasoning level '{level}' -> 'high' (safe fallback)")
+    return "high"
 
 
 def _set_nested(d: dict, dotted: str, value: Any) -> None:
@@ -3055,7 +3082,9 @@ def _create_openai_llm(
         and _rplan.get("delivery") == "native"
         and _rplan.get("value")
     ):
-        level = _clamp_reasoning_level(_rplan["value"], _OPENAI_REASONING_LEVELS)
+        level = _clamp_reasoning_level(
+            _rplan["value"], _supported_efforts(_rplan["cap"])
+        )
         model_kwargs["reasoning_effort"] = level
         reasoning_mode = f"chat_completions(effort={level})"
     elif _rplan["method"] == "binary_toggle" and _rplan.get("value"):
@@ -3635,7 +3664,9 @@ def _create_codex_llm(
     reasoning_mode = "none"
     _rplan = resolve_reasoning_plan(config)
     if _rplan["method"] == "effort_enum" and _rplan.get("value"):
-        level = _clamp_reasoning_level(_rplan["value"], _OPENAI_REASONING_LEVELS)
+        level = _clamp_reasoning_level(
+            _rplan["value"], _supported_efforts(_rplan["cap"])
+        )
         if _should_use_reasoning_summary(model):
             llm_kwargs["reasoning"] = {
                 "effort": level,

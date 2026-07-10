@@ -8,6 +8,7 @@ import pytest
 from src.core.loader import (
     _should_use_reasoning_summary,
     _clamp_reasoning_level,
+    _supported_efforts,
     _OPENAI_REASONING_LEVELS,
     _create_openai_llm,
     _create_openrouter_llm,
@@ -358,6 +359,69 @@ class TestReasoningLevelClamping:
     def test_unknown_level_falls_back_to_high(self):
         """Unknown levels should fall back to high."""
         assert _clamp_reasoning_level("turbo", _OPENAI_REASONING_LEVELS) == "high"
+
+    def test_max_clamped_to_high_when_unsupported(self):
+        """max walks the ladder down past xhigh to high on a low/medium/high family."""
+        assert _clamp_reasoning_level("max", {"low", "medium", "high"}) == "high"
+
+    def test_max_clamps_down_to_xhigh_first(self):
+        """The nearest supported level below wins — never skip past one."""
+        assert (
+            _clamp_reasoning_level("max", {"low", "medium", "high", "xhigh"}) == "xhigh"
+        )
+
+    def test_xhigh_and_max_pass_when_supported(self):
+        gpt56 = {"low", "medium", "high", "xhigh", "max"}
+        assert _clamp_reasoning_level("xhigh", gpt56) == "xhigh"
+        assert _clamp_reasoning_level("max", gpt56) == "max"
+
+    def test_level_is_case_insensitive(self):
+        assert (
+            _clamp_reasoning_level("XHigh", {"low", "medium", "high", "xhigh"})
+            == "xhigh"
+        )
+
+
+class TestSupportedEfforts:
+    """_supported_efforts derives the clamp set from the family capability."""
+
+    def test_reads_family_options(self):
+        cap = {"options": ["low", "medium", "high", "xhigh", "max"]}
+        assert _supported_efforts(cap) == {"low", "medium", "high", "xhigh", "max"}
+
+    def test_falls_back_to_openai_set(self):
+        assert _supported_efforts({}) == _OPENAI_REASONING_LEVELS
+        assert _supported_efforts({"options": []}) == _OPENAI_REASONING_LEVELS
+
+    def test_normalizes_case(self):
+        assert _supported_efforts({"options": ["Low", "HIGH"]}) == {"low", "high"}
+
+
+class TestFamilyOptionsDriveClamp:
+    """The matrix `reasoning.options` — not a hardcoded transport set — decide
+    what effort reaches the wire (docs/done/family_centered_reasoning.md)."""
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_deepseek_xhigh_survives_openai_factory(self, mock_chat):
+        """deepseek declares xhigh in its options → no clamp on the OpenAI wire."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="deepseek-v4", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "xhigh"
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_gpt5_xhigh_still_clamped(self, mock_chat):
+        """gpt-5 family still lists only low/medium/high → xhigh clamps to high."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="gpt-5.2-pro", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 
 
 class TestOpenAIReasoningClamping:
