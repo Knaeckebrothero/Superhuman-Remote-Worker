@@ -2,14 +2,17 @@ import {describe, it, expect} from 'vitest';
 
 import {
   buildRoleSequence,
+  campaignProgressLabel,
+  campaignStageState,
   formatRoleSequence,
   formatStage,
   hasInFlightJob,
   isAnalysisRole,
   isLoopWindingDown,
+  plannerIneligibility,
   workerExpertsOnly,
 } from './project-loop.component';
-import type {Job, ProjectLoop} from '../../core/models/api.model';
+import type {Job, LoopCampaign, ProjectLoop} from '../../core/models/api.model';
 
 /**
  * Pure-function tests for the loop wind-down logic (the project convention is to
@@ -158,5 +161,126 @@ describe('formatStage / formatRoleSequence', () => {
     expect(
       formatRoleSequence([['scholar', 'product-qa'], 'critic', 'developer']),
     ).toBe('scholar ∥ product-qa → critic → developer');
+  });
+});
+
+describe('plannerIneligibility (client mirror of planner_slots)', () => {
+  it('accepts the build preset (scholar → critic → developer)', () => {
+    expect(plannerIneligibility(['scholar', 'critic', 'developer'])).toBeNull();
+  });
+
+  it('accepts a fan-out analysis stage before the critic', () => {
+    expect(
+      plannerIneligibility([['scholar', 'product-qa'], 'critic', 'developer']),
+    ).toBeNull();
+  });
+
+  it('accepts the critic as the LAST step (execution slot wraps cyclically)', () => {
+    expect(plannerIneligibility(['developer', 'critic'])).toBeNull();
+  });
+
+  it('rejects a critic inside a fan-out step', () => {
+    expect(
+      plannerIneligibility([['scholar', 'critic'], 'developer']),
+    ).toMatch(/own step/);
+  });
+
+  it('rejects zero critic steps', () => {
+    expect(plannerIneligibility(['scholar', 'developer'])).toMatch(/found 0/);
+  });
+
+  it('rejects two critic steps', () => {
+    expect(
+      plannerIneligibility(['critic', 'developer', 'critic']),
+    ).toMatch(/found 2/);
+  });
+
+  it('rejects a critic-only rotation (no execution slot)', () => {
+    expect(plannerIneligibility(['critic'])).toMatch(/at least one other step/);
+  });
+
+  it('rejects a fan-out execution slot after the critic', () => {
+    expect(
+      plannerIneligibility(['critic', ['scholar', 'product-qa']]),
+    ).toMatch(/single role/);
+  });
+});
+
+const campaign = (over: Partial<LoopCampaign>): LoopCampaign =>
+  ({
+    id: 'c-1',
+    plan_job_id: 'c-1',
+    initiative_note_id: 'note-1',
+    title: 'Ship the dice roller',
+    stages: [{role: 'developer'}, {role: 'developer'}, {role: 'product-qa'}],
+    acceptance: [],
+    cursor: 0,
+    stages_done: 0,
+    member_failures: 0,
+    extensions_used: 0,
+    status: 'active',
+    ...over,
+  }) as LoopCampaign;
+
+describe('campaignStageState', () => {
+  it('marks the freshly-spawned first stage current, rest pending', () => {
+    const c = campaign({cursor: 1, stages_done: 0});
+    expect(campaignStageState(c, 0)).toBe('current');
+    expect(campaignStageState(c, 1)).toBe('pending');
+    expect(campaignStageState(c, 2)).toBe('pending');
+  });
+
+  it('marks finished stages done and the running one current', () => {
+    const c = campaign({cursor: 2, stages_done: 1});
+    expect(campaignStageState(c, 0)).toBe('done');
+    expect(campaignStageState(c, 1)).toBe('current');
+    expect(campaignStageState(c, 2)).toBe('pending');
+  });
+
+  it('a stale cursor (torn advance) never marks a done stage current', () => {
+    // cursor lagged behind stages_done — the healed write-back fixes the row,
+    // but the UI must not point "current" at an already-finished stage.
+    const c = campaign({cursor: 1, stages_done: 2});
+    expect(campaignStageState(c, 0)).toBe('done');
+    expect(campaignStageState(c, 1)).toBe('done');
+    expect(campaignStageState(c, 2)).toBe('current');
+  });
+
+  it('review status has no current stage — everything is done', () => {
+    const c = campaign({status: 'review', cursor: 3, stages_done: 3});
+    expect(campaignStageState(c, 0)).toBe('done');
+    expect(campaignStageState(c, 2)).toBe('done');
+  });
+
+  it('aborted status leaves unrun stages pending, none current', () => {
+    const c = campaign({status: 'aborted', cursor: 2, stages_done: 2});
+    expect(campaignStageState(c, 1)).toBe('done');
+    expect(campaignStageState(c, 2)).toBe('pending');
+  });
+});
+
+describe('campaignProgressLabel', () => {
+  it('active: names the running stage', () => {
+    expect(campaignProgressLabel(campaign({cursor: 2, stages_done: 1}))).toBe(
+      'stage 2 of 3',
+    );
+  });
+
+  it('active with a stale cursor still reports a sane stage number', () => {
+    expect(campaignProgressLabel(campaign({cursor: 0, stages_done: 1}))).toBe(
+      'stage 2 of 3',
+    );
+  });
+
+  it('review: reports completion and the pending verdict', () => {
+    expect(
+      campaignProgressLabel(campaign({status: 'review', cursor: 3, stages_done: 3})),
+    ).toBe("all 3 stage(s) done — awaiting the critic's verdict");
+  });
+
+  it('aborted: reports how far it got', () => {
+    expect(
+      campaignProgressLabel(campaign({status: 'aborted', cursor: 2, stages_done: 2})),
+    ).toBe('aborted after 2 of 3 stage(s)');
   });
 });
