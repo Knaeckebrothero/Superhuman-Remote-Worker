@@ -1202,6 +1202,38 @@ class TestRemoteBackendStat:
         assert backend.stat("dir") == 0
 
 
+class TestHeavyOpTimeouts:
+    """Timeouts now actually bind (Task 1), so heavy ops need explicit
+    generous deadlines or big trees would newly fail at the 30s default."""
+
+    @pytest.mark.parametrize(
+        "call,expected_timeout",
+        [
+            (lambda b: b.delete_directory("big"), 300),
+            (lambda b: b.copy("a", "b"), 300),
+            (lambda b: b.move("a", "b"), 120),
+            (lambda b: b.stat("big"), 120),
+        ],
+    )
+    def test_heavy_ops_pass_generous_timeouts(
+        self, remote_backend, call, expected_timeout
+    ):
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+
+        # Mock stat to return directory for "big" paths, files for others
+        def mock_stat(path):
+            if "big" in path:
+                return _make_sftp_attr(is_dir=True)
+            else:
+                return _make_sftp_attr(is_dir=False)
+
+        mock_sftp.stat.side_effect = mock_stat
+        with patch.object(backend, "_exec", return_value="0\t/ws") as ex:
+            call(backend)
+        assert ex.call_args.kwargs.get("timeout") == expected_timeout
+
+
 class TestRemoteBackendExec:
     """Tests for RemoteBackend._exec()."""
 

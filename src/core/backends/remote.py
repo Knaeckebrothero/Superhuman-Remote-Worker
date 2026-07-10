@@ -739,7 +739,7 @@ class RemoteBackend(WorkspaceBackend):
 
         # Use rm -rf for recursive delete
         safe_path = remote_path.replace("'", "'\\''")
-        self._exec(f"rm -rf '{safe_path}'")
+        self._exec(f"rm -rf '{safe_path}'", timeout=300)
         logger.debug(f"Deleted remote directory: {path}")
         return True
 
@@ -757,7 +757,7 @@ class RemoteBackend(WorkspaceBackend):
 
         safe_src = src_path.replace("'", "'\\''")
         safe_dst = dst_path.replace("'", "'\\''")
-        self._exec(f"mv '{safe_src}' '{safe_dst}'")
+        self._exec(f"mv '{safe_src}' '{safe_dst}'", timeout=120)
         logger.debug(f"Moved remote: {src} -> {dst}")
 
     def copy(self, src: str, dst: str) -> None:
@@ -775,7 +775,7 @@ class RemoteBackend(WorkspaceBackend):
 
         safe_src = src_path.replace("'", "'\\''")
         safe_dst = dst_path.replace("'", "'\\''")
-        self._exec(f"cp -a '{safe_src}' '{safe_dst}'")
+        self._exec(f"cp -a '{safe_src}' '{safe_dst}'", timeout=300)
         logger.debug(f"Copied remote: {src} -> {dst}")
 
     def stat(self, path: str) -> int:
@@ -790,7 +790,9 @@ class RemoteBackend(WorkspaceBackend):
 
         # Directory: use du -sb for total size
         safe_path = remote_path.replace("'", "'\\''")
-        output = self._exec(f"du -sb '{safe_path}' 2>/dev/null || echo '0'")
+        output = self._exec(
+            f"du -sb '{safe_path}' 2>/dev/null || echo '0'", timeout=120
+        )
         try:
             return int(output.split()[0])
         except (ValueError, IndexError):
