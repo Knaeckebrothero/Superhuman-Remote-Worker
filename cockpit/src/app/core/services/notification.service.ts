@@ -228,6 +228,35 @@ export class NotificationService {
                 name: data.automation_name || '',
             }),
         );
+    } else if (
+        data.type === 'loop_user_question' ||
+        data.type === 'loop_campaign_disposition'
+    ) {
+        // Project-loop events (loop_campaign_scheduling.md P1/P2): a loop
+        // agent filed a question for the operator, or the critic disposed a
+        // campaign. The orchestrator already persisted the bell row
+        // (_notify_loop_event); mirror it live so an open cockpit sees the
+        // event without a refresh. subject/message are server-built English
+        // sentences — shown verbatim, like every other bell entry.
+        this.unreadCount.update((c) => c + 1);
+        this.notifications.update((ns) => [
+            {
+                id: crypto.randomUUID(),
+                job_id: data.job_id || null,
+                // Mirror the server row's thread key ("loop-" + 6 hex chars)
+                // so live and REST-loaded entries dedupe identically.
+                thread_id: data.loop_id ? `loop-${String(data.loop_id).slice(0, 6)}` : null,
+                subject: data.subject || 'Loop update',
+                message: data.message || '',
+                job_description: null,
+                config_name: null,
+                status: 'sent',
+                read_at: null,
+                created_at: new Date().toISOString(),
+            },
+            ...ns,
+        ]);
+        this.toast.info(data.subject || 'Loop update');
     }
   }
 

@@ -95,4 +95,54 @@ describe('NotificationService.handleSseEvent', () => {
     expect(toast.warning).not.toHaveBeenCalled();
     expect(service.adminUserRegistered()).toBeNull();
   });
+
+  it('loop_user_question → bell entry with the server thread key + info toast', () => {
+    const {service, toast} = createService();
+
+    service.handleSseEvent({
+      type: 'loop_user_question',
+      loop_id: '942ef046-1234-5678-9abc-def012345678',
+      project_id: 'p-1',
+      job_id: 'j-1',
+      subject: 'Loop question: Should the dice roller support D20 notation?',
+      message: 'A loop agent filed a question for you.',
+    });
+
+    expect(service.unreadCount()).toBe(1);
+    expect(service.notifications()).toHaveLength(1);
+    const n = service.notifications()[0];
+    // Mirrors the persisted message_log row's thread key ("loop-" + 6 hex)
+    // so a REST refresh dedupes against the live-prepended entry.
+    expect(n.thread_id).toBe('loop-942ef0');
+    expect(n.job_id).toBe('j-1');
+    expect(n.subject).toContain('D20');
+    expect(toast.info).toHaveBeenCalledWith(
+      'Loop question: Should the dice roller support D20 notation?',
+    );
+  });
+
+  it('loop_campaign_disposition → bell entry + toast', () => {
+    const {service, toast} = createService();
+
+    service.handleSseEvent({
+      type: 'loop_campaign_disposition',
+      loop_id: '942ef046-1234-5678-9abc-def012345678',
+      job_id: 'j-2',
+      subject: 'Loop campaign ship: Dice roller',
+      message: "The critic disposed campaign 'Dice roller' as SHIP.",
+    });
+
+    expect(service.unreadCount()).toBe(1);
+    expect(service.notifications()[0].message).toContain('SHIP');
+    expect(toast.info).toHaveBeenCalledOnce();
+  });
+
+  it('loop event without loop_id still lands, with a null thread', () => {
+    const {service} = createService();
+
+    service.handleSseEvent({type: 'loop_user_question', subject: 'Q'});
+
+    expect(service.notifications()[0].thread_id).toBeNull();
+    expect(service.notifications()[0].job_id).toBeNull();
+  });
 });
