@@ -42,6 +42,7 @@ from ...tools.shell.shell_manager import (
     prompt_is_ready,
 )
 from ..workspace_backend import (
+    SEARCH_RESULT_HARD_CAP,
     RemoteCommandTimeoutError,
     WorkspaceBackend,
     WorkspaceUnavailableError,
@@ -662,7 +663,10 @@ class RemoteBackend(WorkspaceBackend):
             for ext in ["pdf", "docx", "png", "jpg", "gif", "zip", "db"]
         )
 
-        cmd = f"grep {flags} {excludes} -- '{safe_query}' {remote_path} 2>/dev/null || true"
+        cmd = (
+            f"grep {flags} {excludes} -- '{safe_query}' {remote_path} 2>/dev/null "
+            f"| head -n {SEARCH_RESULT_HARD_CAP} || true"
+        )
         output = self._exec(cmd, timeout=60)
 
         results = []

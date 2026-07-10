@@ -990,6 +990,20 @@ class TestRemoteBackendSearchFiles:
         assert results == []
 
 
+class TestSearchFilesCap:
+    """search_files must bound grep output server-side: the display cap
+    is 50 matches, yet uncapped grep shipped 2.2 MB in the incident."""
+
+    def test_grep_command_is_head_capped(self, remote_backend):
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        with patch.object(backend, "_exec", return_value="") as ex:
+            backend.search_files("role")
+        cmd = ex.call_args.args[0]
+        assert "| head -n 2000" in cmd
+        assert cmd.rstrip().endswith("|| true")
+
+
 class TestRemoteBackendMkdir:
     """Tests for RemoteBackend.mkdir()."""
 
