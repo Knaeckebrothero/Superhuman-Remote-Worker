@@ -249,9 +249,7 @@ class TestHeartbeatGraphProgress:
         metadata_payloads = [
             json.loads(p)
             for p in params
-            if isinstance(p, str)
-            and p.startswith("{")
-            and "graph_progress" in p
+            if isinstance(p, str) and p.startswith("{") and "graph_progress" in p
         ]
         assert metadata_payloads, "metadata payload missing"
         latest = metadata_payloads[-1]
@@ -278,9 +276,7 @@ class TestHeartbeatGraphProgress:
         metadata_payloads = [
             json.loads(p)
             for p in params
-            if isinstance(p, str)
-            and p.startswith("{")
-            and "graph_progress" in p
+            if isinstance(p, str) and p.startswith("{") and "graph_progress" in p
         ]
         assert metadata_payloads, "metadata payload missing"
         latest = metadata_payloads[-1]

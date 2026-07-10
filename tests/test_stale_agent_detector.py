@@ -17,7 +17,9 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
         event.set()
         return 0
 
-    db.mark_stale_agents_offline = AsyncMock(side_effect=lambda *args, **kwargs: _stop(shutdown_event))
+    db.mark_stale_agents_offline = AsyncMock(
+        side_effect=lambda *args, **kwargs: _stop(shutdown_event)
+    )
     db.mark_stuck_working_agents_ready = AsyncMock(return_value=0)
     db.mark_stalled_working_agents_by_graph_progress = AsyncMock(
         return_value=stall_return
@@ -54,9 +56,9 @@ async def test_stale_detector_uses_graph_progress_stall_window():
     assert method_calls.index("mark_stuck_working_agents_ready") < method_calls.index(
         "mark_stalled_working_agents_by_graph_progress"
     )
-    assert method_calls.index("mark_stalled_working_agents_by_graph_progress") < method_calls.index(
-        "mark_stuck_session_agents_ready"
-    )
+    assert method_calls.index(
+        "mark_stalled_working_agents_by_graph_progress"
+    ) < method_calls.index("mark_stuck_session_agents_ready")
     assert method_calls.index("mark_stuck_session_agents_ready") < method_calls.index(
         "reap_orphaned_session_agents"
     )

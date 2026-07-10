@@ -184,7 +184,9 @@ class TestPureInternalEndpoints:
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_agent_heartbeat_merges_graph_progress_into_metrics(self, fake_request):
+    async def test_agent_heartbeat_merges_graph_progress_into_metrics(
+        self, fake_request
+    ):
         from main import AgentHeartbeat, agent_heartbeat
 
         hb = AgentHeartbeat(
@@ -215,7 +217,9 @@ class TestPureInternalEndpoints:
         assert result == {"status": "ok", "intents": {}}
 
     @pytest.mark.asyncio
-    async def test_agent_heartbeat_graph_progress_overrides_metric_field(self, fake_request):
+    async def test_agent_heartbeat_graph_progress_overrides_metric_field(
+        self, fake_request
+    ):
         from main import AgentHeartbeat, agent_heartbeat
 
         hb = AgentHeartbeat(
