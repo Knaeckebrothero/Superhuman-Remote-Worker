@@ -283,7 +283,11 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         return sorted(out)
 
     def search_files(
-        self, query: str, path: str = "", case_sensitive: bool = False
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
     ) -> list[dict]:
         # Bounded content search (hydration guard): binary extensions skipped,
         # per-file byte cap. Name/path search is implicit via list_dir.

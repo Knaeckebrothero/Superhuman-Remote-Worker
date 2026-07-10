@@ -188,7 +188,11 @@ class WorkspaceBackend(ABC):
 
     @abstractmethod
     def search_files(
-        self, query: str, path: str = "", case_sensitive: bool = False
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
     ) -> list[dict]:
         """Search for text in workspace files.
 
@@ -196,6 +200,7 @@ class WorkspaceBackend(ABC):
             query: Text to search for.
             path: Directory to search in (default: entire workspace).
             case_sensitive: Whether search is case-sensitive.
+            exclude_dirs: Optional list of directory names to skip with grep.
 
         Returns:
             List of dicts with 'path', 'line_number', and 'line'.

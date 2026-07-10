@@ -1060,6 +1060,17 @@ class TestRemoteBackendSearchFiles:
         assert len(results) == 1
         assert results[0]["path"] == "good.txt"
 
+    def test_search_with_exclude_dirs_includes_flags(self, remote_backend):
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        self._setup_exec(mock_ssh, "")
+        exclude_dirs = ["node_modules", ".git"]
+
+        backend.search_files("needle", exclude_dirs=exclude_dirs)
+        cmd = mock_ssh.exec_command.call_args[0][0]
+        assert "--exclude-dir='node_modules'" in cmd
+        assert "--exclude-dir='.git'" in cmd
+
     def test_search_handles_invalid_line_number(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
         backend.connect()
@@ -1069,6 +1080,15 @@ class TestRemoteBackendSearchFiles:
 
         results = backend.search_files("query")
         assert results == []
+
+    def test_search_escapes_single_quotes_in_exclude_dirs(self, remote_backend):
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        self._setup_exec(mock_ssh, "")
+        backend.search_files("needle", exclude_dirs=["foo'bar"])
+
+        cmd = mock_ssh.exec_command.call_args[0][0]
+        assert "--exclude-dir='foo'\\''bar'" in cmd
 
 
 class TestSearchFilesCap:

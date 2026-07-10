@@ -531,6 +531,22 @@
           "minimum": 20,
           "default": 200,
           "description": "Max tool calls per phase before rewind (tactical) or freeze (strategic)"
+        },
+        "tool_category_timeouts": {
+          "type": "object",
+          "description": "Per-tool-category audited batch timeout ceilings (seconds). Empty values use graph defaults.",
+          "properties": {
+            "default": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 120,
+              "description": "Fallback timeout for categories not explicitly listed"
+            }
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
         }
       }
     },

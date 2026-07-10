@@ -131,7 +131,11 @@ class ScratchBackend(WorkspaceBackend):
         return sorted(results)
 
     def search_files(
-        self, query: str, path: str = "", case_sensitive: bool = False
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
     ) -> list[dict]:
         search_path = self._resolve(path)
         results = []

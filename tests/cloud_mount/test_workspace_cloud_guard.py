@@ -10,13 +10,17 @@ from src.tools.workspace.filesystem import create_filesystem_tools
 class FakeWorkspace:
     def __init__(self) -> None:
         self.is_initialized = True
-        self.search_calls: list[tuple[str, str, bool]] = []
+        self.search_calls: list[tuple[str, str, bool, list[str] | None]] = []
         self.exists_calls: list[str] = []
 
     def search_files(
-        self, query: str, path: str = "", case_sensitive: bool = False
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: list[str] | None = None,
     ) -> list[dict]:
-        self.search_calls.append((query, path, case_sensitive))
+        self.search_calls.append((query, path, case_sensitive, exclude_dirs))
         return [{"path": "notes/todo.md", "line_number": 1, "line": "invoice"}]
 
     def exists(self, path: str) -> bool:
@@ -67,7 +71,7 @@ def test_search_files_allows_non_cloud_workspace_path():
     result = search_files.invoke({"query": "invoice", "path": "notes"})
 
     assert "Search results for 'invoice'" in result
-    assert workspace.search_calls == [("invoice", "notes", False)]
+    assert workspace.search_calls == [("invoice", "notes", False, None)]
 
 
 def test_read_file_blocks_cloud_path_when_cache_limit_reached():
