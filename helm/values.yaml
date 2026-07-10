@@ -187,6 +187,12 @@ agent:
   # Default OFF (prod-safe); the dev/experimental values file turns it on.
   # See docs/design/cloud_access_unification.md §8 Phase 1.
   protectedCloudModeEnabled: "false"
+  # -- Effective context ceiling (tokens) for models routed via the system codex
+  # proxy, whose ChatGPT-OAuth backend caps context ~400K regardless of the
+  # model's true API window. Compaction fires at 80% of this. Set 0 to disable
+  # (e.g. once OpenAI ships 1M-for-Codex). See
+  # docs/issues/codex_proxy_context_window_cap.md.
+  codexContextWindowCap: 400000
   resources:
     requests:
       memory: "512Mi"
