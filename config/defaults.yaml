@@ -235,6 +235,7 @@ context_management:
   compact_on_archive: true
   keep_recent_tool_results: 150
   keep_recent_messages: 10
+  keep_window_max_tool_result_chars: 16000
   summarization_template: summarization_prompt.txt
   reasoning_level: high  # Only injected when reasoning_method is "prompt" (gpt-oss)
   max_summary_length: 20000

@@ -112,6 +112,22 @@ class TestInteractiveConfigParsing:
         assert isinstance(config.interactive, InteractiveConfig)
 
 
+class TestContextManagementParsing:
+    """Context management parse tests for keep-window truncation config."""
+
+    def test_keep_window_cap_defaults(self):
+        cfg = load_agent_config_from_dict(_minimal_config_data())
+        assert cfg.context_management.keep_window_max_tool_result_chars == 16000
+
+    def test_keep_window_cap_override(self):
+        cfg = load_agent_config_from_dict(
+            _minimal_config_data(
+                context_management={"keep_window_max_tool_result_chars": 12345}
+            )
+        )
+        assert cfg.context_management.keep_window_max_tool_result_chars == 12345
+
+
 # =============================================================================
 # 8.3: Prompt resolution for interactive mode
 # =============================================================================
