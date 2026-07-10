@@ -96,16 +96,33 @@ def _clear_stop() -> None:
 
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
+    metrics: Dict[str, Any] = {}
+    try:
+        graph_progress = (
+            _agent._tool_context.get_graph_progress()
+            if _agent is not None and _agent._tool_context is not None
+            else None
+        )
+        if graph_progress is not None:
+            metrics["graph_progress"] = graph_progress
+    except Exception:
+        pass
+
     try:
         import psutil
 
         proc = psutil.Process()
-        return {
-            "memory_mb": round(proc.memory_info().rss / 1_048_576, 1),
-            "cpu_percent": proc.cpu_percent(interval=0),
-        }
+        metrics.update(
+            {
+                "memory_mb": round(proc.memory_info().rss / 1_048_576, 1),
+                "cpu_percent": proc.cpu_percent(interval=0),
+            }
+        )
     except Exception:
+        if metrics:
+            return metrics
         return None
+    return metrics
 
 
 def _get_heartbeat_status() -> str:

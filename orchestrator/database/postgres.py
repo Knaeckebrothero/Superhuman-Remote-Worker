@@ -2609,13 +2609,23 @@ class PostgresDB:
             # (orchestrator-set drain/upgrade hints that the agent reads
             # from the heartbeat response and reacts to).
             prev = await conn.fetchrow(
-                "SELECT status, intents FROM agents WHERE id = $1",
+                "SELECT status, intents, metadata FROM agents WHERE id = $1",
                 uuid_val,
             )
             if not prev:
                 return None
 
             prev_status = prev["status"]
+            prev_metadata_raw = prev["metadata"] if "metadata" in prev else None
+            if isinstance(prev_metadata_raw, str):
+                try:
+                    prev_metadata = json.loads(prev_metadata_raw)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    prev_metadata = {}
+            elif isinstance(prev_metadata_raw, dict):
+                prev_metadata = prev_metadata_raw
+            else:
+                prev_metadata = {}
             intents_raw = prev["intents"] if "intents" in prev else None
             if isinstance(intents_raw, str):
                 try:
@@ -2672,8 +2682,16 @@ class PostgresDB:
                 "last_heartbeat = CURRENT_TIMESTAMP",
             ]
             if metrics:
+                metrics_payload: Dict[str, Any] = dict(metrics)
+                graph_progress = metrics_payload.get("graph_progress")
+                if graph_progress is not None:
+                    previous_progress = prev_metadata.get("graph_progress")
+                    if graph_progress != previous_progress:
+                        metrics_payload["graph_progress_seen_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                 set_clauses.append(
-                    f"metadata = metadata || {_p(json.dumps(metrics))}::jsonb"
+                    f"metadata = metadata || {_p(json.dumps(metrics_payload))}::jsonb"
                 )
             if set_completed:
                 set_clauses.append("last_completed_at = CURRENT_TIMESTAMP")
@@ -3773,6 +3791,44 @@ class PostgresDB:
                   AND current_job_id IS NULL
                 """
             )
+        if result.startswith("UPDATE "):
+            return int(result.split()[1])
+        return 0
+
+    async def mark_stalled_working_agents_by_graph_progress(
+        self, stall_minutes: int = 10
+    ) -> int:
+        """Pause agents that keep heartbeating without graph-progress updates.
+
+        This catches a specific wedge mode: the process still reports heartbeats
+        and stays in ``working`` state, but its tool/graph progress marker has
+        not changed for a sustained interval.
+
+        Args:
+            stall_minutes: Time without a progress-marker timestamp bump before
+                the agent is released to ``ready``.
+
+        Returns:
+            Number of agents flipped to ``ready``.
+        """
+        if stall_minutes <= 0:
+            return 0
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE agents
+                SET status = 'ready'
+                WHERE status = 'working'
+                  AND current_job_id IS NOT NULL
+                  AND metadata ? 'graph_progress_seen_at'
+                  AND (metadata->>'graph_progress_seen_at')::timestamptz
+                        < NOW() - ($1 || ' minutes')::INTERVAL
+                """
+                ,
+                stall_minutes,
+            )
+
         if result.startswith("UPDATE "):
             return int(result.split()[1])
         return 0
