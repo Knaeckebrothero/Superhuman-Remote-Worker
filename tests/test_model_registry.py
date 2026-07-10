@@ -162,6 +162,19 @@ class TestFamilyOf:
     def test_codex_spark_beats_codex(self):
         assert family_of("gpt-5.3-codex-spark") == "codex-spark"
 
+    def test_gpt_5_6_tiers(self):
+        assert family_of("gpt-5.6-sol") == "gpt-5.6"
+        assert family_of("gpt-5.6-terra") == "gpt-5.6"
+        assert family_of("openai/gpt-5.6-luna") == "gpt-5.6"
+        assert family_of("codex/gpt-5.6-sol") == "gpt-5.6"
+
+    def test_gpt_5_6_codex_stays_codex(self):
+        # Codex checks keep precedence: a future 5.6 codex variant is `codex`.
+        assert family_of("gpt-5.6-codex") == "codex"
+
+    def test_gpt_5_5_stays_gpt_5(self):
+        assert family_of("gpt-5.5") == "gpt-5"
+
     def test_minimax_m2_stays_minimax(self):
         # M2.x must NOT be captured by the new minimax-m3 branch.
         assert family_of("minimax-m2.7") == "minimax"

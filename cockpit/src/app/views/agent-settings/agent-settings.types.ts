@@ -107,6 +107,7 @@ export function detectModelFamily(model: string): string {
   if (name.startsWith('claude-haiku')) return 'claude-haiku';
   if (name.includes('codex-spark')) return 'codex-spark';
   if (name.includes('codex') && name.startsWith('gpt-5')) return 'codex';
+  if (name.startsWith('gpt-5.6')) return 'gpt-5.6';
   if (name.startsWith('gpt-5')) return 'gpt-5';
   if (name.startsWith('gpt-4o')) return 'gpt-4o';
   if (name.startsWith('o1') || name.startsWith('o3') || name.startsWith('o4')) return 'o-series';

@@ -49,6 +49,8 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
     # the `gpt-5` prefix and the `codex` substring.
     (re.compile(r"codex-spark", re.IGNORECASE), "codex-spark"),
     (re.compile(r"codex", re.IGNORECASE), "codex"),
+    # GPT-5.6 tiers (Luna/Terra/Sol) — must beat the generic gpt-5 rule below.
+    (re.compile(r"gpt-5\.6", re.IGNORECASE), "gpt-5.6"),
     # OpenAI gpt-5 family + o-series reasoning models
     (re.compile(r"gpt-5", re.IGNORECASE), "gpt-5"),
     (re.compile(r"^o[1-9](-|$)", re.IGNORECASE), "o-series"),

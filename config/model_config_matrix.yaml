@@ -319,6 +319,38 @@ gpt-5:
     # ~1:1 (no published multiplier). A 1700x2200 page ~= 3726 tok.
     image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
 
+gpt-5.6:
+  # GPT-5.6 (GA 2026-07-09): Luna / Terra / Sol tiers, 1M ctx / 128K max output.
+  # Dedicated family because effort options are a family-level property and
+  # 5.6 adds xhigh + max, which older gpt-5.x rows must not offer. `ultra` is
+  # NOT an effort — it's `reasoning.mode` (standard/pro/ultra), deliberately
+  # unsupported here (different API param, ~4x token burn).
+  reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
+  prompts:
+    # Aliases the gpt-5 prompt set (same wire format) — exactly how `codex`
+    # does it. Fork into _gpt_5_6 files only when 5.6-specific drift shows up.
+    systemprompt: systemprompt_gpt_5.txt
+    systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+    persona: persona_gpt_5.txt
+    strategic: strategic_gpt_5.txt
+    tactical: tactical_gpt_5.txt
+    summarization: summarization_prompt_gpt_5.txt
+    memory_extraction: memory_extraction_prompt_gpt_5.txt
+    memory_assembler: memory_assembler_prompt_gpt_5.txt
+    curation: curation_prompt_gpt_5.txt
+  guardrails:
+    file: gpt_5_6.yaml
+  settings:
+    temperature: 1.0  # Reasoning model: only default 1.0 is supported
+    multimodal: true  # GPT-5.6 supports image inputs
+    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
+    # (Same Responses-API streaming constraint as gpt-5 — codex proxy path.)
+    parallel_tool_calls: false
+    model_max_context_tokens: 1000000  # Luna/Terra/Sol: 1M ctx, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # Same 32px-patch vision scheme as the gpt-5 family.
+    image_tokens: { mode: openai_patches, patch_px: 32, budget: 10000, flat: 3000 }
+
 codex:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   prompts:
