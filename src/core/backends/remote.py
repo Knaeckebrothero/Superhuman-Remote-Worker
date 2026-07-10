@@ -69,6 +69,12 @@ _EXEC_POLL_SECONDS = 0.05
 _TRANSPORT_KEEPALIVE_SECONDS = 15
 _SFTP_OP_TIMEOUT_SECONDS = 60.0
 
+# Explicit deadlines for heavy/recursive remote ops. Now that _exec's
+# deadline actually binds (drain-loop fix), these need generous budgets or
+# large trees would newly fail at the 30s default.
+_HEAVY_OP_TIMEOUT_SECONDS = 300  # rm -rf, cp -a: recursive tree operations
+_MEDIUM_OP_TIMEOUT_SECONDS = 120  # mv, du -sb: single-pass but can be slow
+
 
 def _classify_connect_error(e: Exception) -> str:
     """Bucket an SSH connect failure to size the retry budget.
@@ -410,7 +416,7 @@ class RemoteBackend(WorkspaceBackend):
         """
         self._ensure_connected()
         try:
-            _, stdout, stderr = self._ssh.exec_command(command, timeout=timeout)
+            _, stdout, _ = self._ssh.exec_command(command, timeout=timeout)
             chan = stdout.channel
             out_chunks: list[bytes] = []
             err_chunks: list[bytes] = []
@@ -419,14 +425,19 @@ class RemoteBackend(WorkspaceBackend):
             truncated = False
             deadline = time.monotonic() + timeout
             while True:
-                while chan.recv_ready():
+                # Bound the inner drains by the deadline too: a producer
+                # that keeps recv_ready() True (output arriving faster than
+                # we can be pre-empted) would otherwise evade the timeout
+                # forever, since the deadline check below only ran once
+                # BOTH buffers went momentarily empty.
+                while chan.recv_ready() and time.monotonic() <= deadline:
                     chunk = chan.recv(65536)
                     if out_size < _EXEC_MAX_OUTPUT_BYTES:
                         out_chunks.append(chunk)
                     else:
                         truncated = True
                     out_size += len(chunk)
-                while chan.recv_stderr_ready():
+                while chan.recv_stderr_ready() and time.monotonic() <= deadline:
                     chunk = chan.recv_stderr(65536)
                     if err_size < _EXEC_MAX_OUTPUT_BYTES:
                         err_chunks.append(chunk)
@@ -516,13 +527,24 @@ class RemoteBackend(WorkspaceBackend):
         return full
 
     def _remote_stat(self, remote_path: str) -> Optional[paramiko.SFTPAttributes]:
-        """Get SFTP stat, returning None if path doesn't exist."""
+        """Get SFTP stat, returning None if path doesn't exist.
+
+        socket.timeout is an IOError subclass, so it must be special-cased
+        BEFORE the generic IOError handler — otherwise a stalled channel
+        (see _SFTP_OP_TIMEOUT_SECONDS) reads as "path doesn't exist",
+        which corrupts exists/is_file/is_dir/move/copy/stat/delete_directory
+        semantics all built on top of this method.
+        """
         self._ensure_connected()
         with self._sftp_lock:
             try:
                 return self._sftp.stat(remote_path)
             except FileNotFoundError:
                 return None
+            except socket.timeout as e:
+                raise RemoteCommandTimeoutError(
+                    f"Workspace I/O timed out stat {remote_path}"
+                ) from e
             except IOError:
                 return None
 
@@ -542,6 +564,10 @@ class RemoteBackend(WorkspaceBackend):
             for d in reversed(parts_to_create):
                 try:
                     self._sftp.mkdir(d)
+                except socket.timeout as e:
+                    raise RemoteCommandTimeoutError(
+                        f"Workspace I/O timed out mkdir {d}"
+                    ) from e
                 except IOError:
                     # Race condition or already exists
                     pass
@@ -578,8 +604,13 @@ class RemoteBackend(WorkspaceBackend):
 
         data = content if isinstance(content, bytes) else content.encode("utf-8")
         with self._sftp_lock:
-            with self._sftp.open(remote_path, "wb") as f:
-                f.write(data)
+            try:
+                with self._sftp.open(remote_path, "wb") as f:
+                    f.write(data)
+            except socket.timeout as e:
+                raise RemoteCommandTimeoutError(
+                    f"Workspace I/O timed out writing {path}"
+                ) from e
         logger.debug(f"Wrote remote file: {path}")
 
     def write_home_file(self, relative_path: str, content: str | bytes) -> None:
@@ -590,8 +621,13 @@ class RemoteBackend(WorkspaceBackend):
 
         data = content if isinstance(content, bytes) else content.encode("utf-8")
         with self._sftp_lock:
-            with self._sftp.open(remote_path, "wb") as f:
-                f.write(data)
+            try:
+                with self._sftp.open(remote_path, "wb") as f:
+                    f.write(data)
+            except socket.timeout as e:
+                raise RemoteCommandTimeoutError(
+                    f"Workspace I/O timed out writing {relative_path}"
+                ) from e
         logger.debug(f"Wrote remote home file: {relative_path}")
 
     def resolve_home_path(self, relative_path: str) -> str:
@@ -604,8 +640,13 @@ class RemoteBackend(WorkspaceBackend):
         self._ensure_remote_dir(parent)
 
         with self._sftp_lock:
-            with self._sftp.open(remote_path, "ab") as f:
-                f.write(content.encode("utf-8"))
+            try:
+                with self._sftp.open(remote_path, "ab") as f:
+                    f.write(content.encode("utf-8"))
+            except socket.timeout as e:
+                raise RemoteCommandTimeoutError(
+                    f"Workspace I/O timed out writing {path}"
+                ) from e
 
     def exists(self, path: str) -> bool:
         return self._remote_stat(self._resolve(path)) is not None
@@ -635,6 +676,10 @@ class RemoteBackend(WorkspaceBackend):
         with self._sftp_lock:
             try:
                 entries = self._sftp.listdir_attr(remote_path)
+            except socket.timeout as e:
+                raise RemoteCommandTimeoutError(
+                    f"Workspace I/O timed out listing {remote_path}"
+                ) from e
             except IOError:
                 return []
 
@@ -759,7 +804,7 @@ class RemoteBackend(WorkspaceBackend):
 
         # Use rm -rf for recursive delete
         safe_path = remote_path.replace("'", "'\\''")
-        self._exec(f"rm -rf '{safe_path}'", timeout=300)
+        self._exec(f"rm -rf '{safe_path}'", timeout=_HEAVY_OP_TIMEOUT_SECONDS)
         logger.debug(f"Deleted remote directory: {path}")
         return True
 
@@ -777,7 +822,7 @@ class RemoteBackend(WorkspaceBackend):
 
         safe_src = src_path.replace("'", "'\\''")
         safe_dst = dst_path.replace("'", "'\\''")
-        self._exec(f"mv '{safe_src}' '{safe_dst}'", timeout=120)
+        self._exec(f"mv '{safe_src}' '{safe_dst}'", timeout=_MEDIUM_OP_TIMEOUT_SECONDS)
         logger.debug(f"Moved remote: {src} -> {dst}")
 
     def copy(self, src: str, dst: str) -> None:
@@ -795,7 +840,9 @@ class RemoteBackend(WorkspaceBackend):
 
         safe_src = src_path.replace("'", "'\\''")
         safe_dst = dst_path.replace("'", "'\\''")
-        self._exec(f"cp -a '{safe_src}' '{safe_dst}'", timeout=300)
+        self._exec(
+            f"cp -a '{safe_src}' '{safe_dst}'", timeout=_HEAVY_OP_TIMEOUT_SECONDS
+        )
         logger.debug(f"Copied remote: {src} -> {dst}")
 
     def stat(self, path: str) -> int:
@@ -811,7 +858,8 @@ class RemoteBackend(WorkspaceBackend):
         # Directory: use du -sb for total size
         safe_path = remote_path.replace("'", "'\\''")
         output = self._exec(
-            f"du -sb '{safe_path}' 2>/dev/null || echo '0'", timeout=120
+            f"du -sb '{safe_path}' 2>/dev/null || echo '0'",
+            timeout=_MEDIUM_OP_TIMEOUT_SECONDS,
         )
         try:
             return int(output.split()[0])
