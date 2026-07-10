@@ -622,6 +622,16 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                     f"Released {stuck_working} agent(s) stuck in 'working' with no job"
                 )
                 _trigger_dispatch()
+            stalled_working = await postgres_db.mark_stalled_working_agents_by_graph_progress(
+                stall_minutes=10
+            )
+            if stalled_working > 0:
+                logger.info(
+                    "Released %d working agent(s) with no graph-progress "
+                    "for the stall interval",
+                    stalled_working,
+                )
+                _trigger_dispatch()
             stuck_session = await postgres_db.mark_stuck_session_agents_ready()
             if stuck_session > 0:
                 logger.info(
@@ -4952,6 +4962,10 @@ class AgentHeartbeat(BaseModel):
     metrics: dict[str, Any] | None = Field(
         None,
         description="Optional metrics (memory_mb, cpu_percent, tokens_processed)",
+    )
+    graph_progress: int | None = Field(
+        None,
+        description="Monotonic graph-progress marker from worker heartbeat path",
     )
 
 
@@ -17305,18 +17319,22 @@ async def agent_heartbeat(
     """
     await require_internal(request)
     try:
+        metrics = dict(heartbeat.metrics or {})
+        if heartbeat.graph_progress is not None:
+            metrics["graph_progress"] = heartbeat.graph_progress
+
         # Surface auxiliary-model health (aux Phase 2): the agent folds a
         # compact AuxHealth summary into metrics.aux; persist its degraded flag
         # on the agent row so the admin view can badge it. Absent on older
         # agent builds / before the aux LLM is wired → None, which leaves the
         # persisted flag untouched.
-        aux = (heartbeat.metrics or {}).get("aux")
+        aux = metrics.get("aux")
         aux_degraded = bool(aux.get("degraded")) if isinstance(aux, dict) else None
         result = await postgres_db.heartbeat(
             agent_id=agent_id,
             status=heartbeat.status,
             current_job_id=heartbeat.current_job_id,
-            metrics=heartbeat.metrics,
+            metrics=metrics if metrics else None,
             aux_degraded=aux_degraded,
         )
         if result is None:

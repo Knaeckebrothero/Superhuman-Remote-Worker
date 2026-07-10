@@ -8,6 +8,7 @@ actually delete pods rather than flicker a status field nothing reads.
 """
 
 from contextlib import asynccontextmanager
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -224,6 +225,67 @@ class TestHeartbeatAuxDegraded:
         assert "metadata = metadata ||" in sql
         assert "last_completed_at = CURRENT_TIMESTAMP" in sql
         assert "aux_degraded = " in sql
+
+
+class TestHeartbeatGraphProgress:
+    """Graph-progress markers in heartbeat metadata are tracked with a timestamp."""
+
+    @pytest.mark.asyncio
+    async def test_graph_progress_changes_writes_seen_at_timestamp(self):
+        db, conn = _make_db_with_mocked_acquire(
+            prev_status="ready",
+            intents={},
+        )
+        conn.fetchrow.return_value["metadata"] = {"graph_progress": 1}
+
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            metrics={"graph_progress": 2},
+        )
+
+        sql, *params = conn.execute.call_args[0]
+        # Graph-progress timestamp is encoded in the payload, not SQL text.
+        metadata_payloads = [
+            json.loads(p)
+            for p in params
+            if isinstance(p, str)
+            and p.startswith("{")
+            and "graph_progress" in p
+        ]
+        assert metadata_payloads, "metadata payload missing"
+        latest = metadata_payloads[-1]
+        assert latest["graph_progress"] == 2
+        assert "graph_progress_seen_at" in latest
+
+    @pytest.mark.asyncio
+    async def test_graph_progress_unchanged_skips_seen_at_timestamp(self):
+        db, conn = _make_db_with_mocked_acquire(
+            prev_status="ready",
+            intents={},
+        )
+        conn.fetchrow.return_value["metadata"] = {"graph_progress": 3}
+
+        await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+            metrics={"graph_progress": 3},
+        )
+
+        sql, *params = conn.execute.call_args[0]
+        # The SQL text stays stable; only the payload differs when progress is
+        # unchanged.
+        metadata_payloads = [
+            json.loads(p)
+            for p in params
+            if isinstance(p, str)
+            and p.startswith("{")
+            and "graph_progress" in p
+        ]
+        assert metadata_payloads, "metadata payload missing"
+        latest = metadata_payloads[-1]
+        assert latest["graph_progress"] == 3
+        assert "graph_progress_seen_at" not in latest
 
 
 class TestHeartbeatReturnsIntents:

@@ -117,6 +117,7 @@ class ToolContext:
     _project_ids: List[str] = field(
         default_factory=list
     )  # Multi-project UUIDs for persistent sessions
+    _graph_progress: int = 0
     _pending_memories: List[Dict[str, Any]] = field(
         default_factory=list
     )  # Sync-safe memory queue
@@ -226,6 +227,19 @@ class ToolContext:
             Datasource connection object, or None if not available
         """
         return self.datasources.get(ds_type)
+
+    def next_graph_progress(self) -> int:
+        """Advance and return the graph-progress marker.
+
+        This marker is emitted in heartbeat metrics and used by the orchestrator
+        to detect a worker that is heartbeating but not advancing graph work.
+        """
+        self._graph_progress += 1
+        return self._graph_progress
+
+    def get_graph_progress(self) -> int:
+        """Return the current graph-progress marker."""
+        return self._graph_progress
 
     def has_git(self) -> bool:
         """Check if git manager is available and active.
