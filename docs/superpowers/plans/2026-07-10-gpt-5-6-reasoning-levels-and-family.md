@@ -29,7 +29,7 @@
 - Consumes: `resolve_reasoning_plan(config)` → `{"method", "value", "delivery", "cap"}` (unchanged; `cap` is the family's matrix `reasoning` block incl. `options`).
 - Produces: `_supported_efforts(cap: Dict[str, Any]) -> set[str]` and `_clamp_reasoning_level(level: str, supported: set[str]) -> str` (same signature, ladder semantics), module constant `_EFFORT_LADDER: tuple[str, ...]`. Task 2's tests rely on these exact names.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `tests/test_loader_routing.py`, extend the import block at the top of the file:
 
@@ -119,12 +119,12 @@ class TestFamilyOptionsDriveClamp:
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_loader_routing.py -x -q`
 Expected: FAIL at collection with `ImportError: cannot import name '_supported_efforts'`.
 
-- [ ] **Step 3: Implement the ladder clamp**
+- [x] **Step 3: Implement the ladder clamp**
 
 In `src/core/loader.py`, replace the block from `# Reasoning levels supported by each provider API` through the end of the current `_clamp_reasoning_level` (currently `:2661-2680`) with:
 
@@ -189,12 +189,12 @@ In `_create_codex_llm` (~`:3638`):
         level = _clamp_reasoning_level(_rplan["value"], _supported_efforts(_rplan["cap"]))
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_loader_routing.py -q`
 Expected: PASS, including all pre-existing clamp tests (`xhigh`→`high` on gpt-5.2-pro, `minimal`→`low` on o3-mini, codex `codex/gpt-5.4-pro` `xhigh`→`high`, OpenRouter pass-through — all unchanged behavior for existing families).
 
-- [ ] **Step 5: Lint + commit**
+- [x] **Step 5: Lint + commit**
 
 ```bash
 ruff check src/core/loader.py tests/test_loader_routing.py && ruff format src/core/loader.py tests/test_loader_routing.py
@@ -225,7 +225,7 @@ and tts.py's options-driven clamp are unchanged."
 - Consumes: `_supported_efforts` / ladder clamp from Task 1 (the codex-path integration test asserts `max` survives).
 - Produces: family key string `"gpt-5.6"` — must be byte-identical across matrix key, `family_of()`, `detect_family()`, `detectModelFamily()`, and the `FAMILIES` array (stored verbatim in `config_overrides.family`, matched against `family_of(model)` at dispatch — migration 0021).
 
-- [ ] **Step 1: Write the failing Python tests**
+- [x] **Step 1: Write the failing Python tests**
 
 `tests/test_model_registry.py` — add inside `class TestFamilyOf` (after `test_codex_spark_beats_codex`):
 
@@ -319,12 +319,12 @@ class TestGpt56Reasoning:
         assert call_kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_model_registry.py tests/test_family_matcher.py tests/test_settings_matrix.py tests/test_loader_routing.py -q`
 Expected: FAIL — `family_of("gpt-5.6-sol")` returns `"gpt-5"`, matrix has no `gpt-5.6` key.
 
-- [ ] **Step 3: Implement matrix block + guardrails + the two Python detection sites**
+- [x] **Step 3: Implement matrix block + guardrails + the two Python detection sites**
 
 `config/model_config_matrix.yaml` — insert between the end of the `gpt-5:` block and `codex:` (i.e. right before line `codex:`):
 
@@ -398,12 +398,12 @@ nudges: {}
     (re.compile(r"gpt-5", re.IGNORECASE), "gpt-5"),
 ```
 
-- [ ] **Step 4: Run Python tests to verify they pass**
+- [x] **Step 4: Run Python tests to verify they pass**
 
 Run: `python -m pytest tests/test_model_registry.py tests/test_family_matcher.py tests/test_settings_matrix.py tests/test_loader_routing.py -q`
 Expected: PASS.
 
-- [ ] **Step 5: Cockpit — detection branch, FAMILIES entry, spec**
+- [x] **Step 5: Cockpit — detection branch, FAMILIES entry, spec**
 
 `cockpit/src/app/views/agent-settings/agent-settings.types.ts` — in `detectModelFamily`, insert between the codex line and the gpt-5 line:
 
@@ -437,12 +437,12 @@ describe('detectModelFamily — GPT-5.6', () => {
 });
 ```
 
-- [ ] **Step 6: Run cockpit tests**
+- [x] **Step 6: Run cockpit tests**
 
 Run: `cd cockpit && npx vitest run`
 Expected: PASS (all suites; the new GPT-5.6 describe block green).
 
-- [ ] **Step 7: Lint + commit**
+- [x] **Step 7: Lint + commit**
 
 ```bash
 ruff check src/core/model_registry.py orchestrator/services/family_matcher.py tests/ && ruff format src/core/model_registry.py orchestrator/services/family_matcher.py tests/test_model_registry.py tests/test_family_matcher.py tests/test_settings_matrix.py tests/test_loader_routing.py
@@ -470,7 +470,7 @@ new options up from /api/models with no frontend change."
 - Consumes: nothing from Tasks 1-2 (independent; deployable alone).
 - Produces: proxy image `docker.io/eceasy/cli-proxy-api:v7.2.61` everywhere. CLIProxyAPI ≥v7.2.55 carries the GPT-5.6 (Sol/Terra/Luna) model registry; v7.2.59 revised the Sol config; v7.2.60 exposed the ultra effort to Codex clients. The currently-pinned v7.2.27 predates ALL GPT-5.6 support.
 
-- [ ] **Step 1: Pin the chart default**
+- [x] **Step 1: Pin the chart default**
 
 `helm/values.yaml` — replace:
 
@@ -486,7 +486,7 @@ with:
   image: docker.io/eceasy/cli-proxy-api:v7.2.61
 ```
 
-- [ ] **Step 2: Bump the deployment overlays**
+- [x] **Step 2: Bump the deployment overlays**
 
 `deployment/values-experimental.yaml` — replace the `image:` line and extend the comment block (keep the existing history lines, append):
 
@@ -514,12 +514,12 @@ with:
   image: docker.io/eceasy/cli-proxy-api:v7.2.61
 ```
 
-- [ ] **Step 3: Render check**
+- [x] **Step 3: Render check**
 
 Run: `helm template srw helm --set codexProxy.enabled=true 2>/dev/null | grep "cli-proxy-api"`
 Expected: one line, `image: docker.io/eceasy/cli-proxy-api:v7.2.61`. (If the chart needs required values to render, fall back to: `grep -rn "cli-proxy-api" helm/ deployment/` and confirm no `:latest` or `:v7.2.27` remains.)
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add helm/values.yaml deployment/values-experimental.yaml deployment/values-local.yaml deployment/values-local.example.yaml
