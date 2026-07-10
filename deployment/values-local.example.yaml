@@ -239,7 +239,7 @@ databases:
 # -----------------------------------------------------------------------------
 codexProxy:
   enabled: true
-  image: docker.io/eceasy/cli-proxy-api:v7.2.27
+  image: docker.io/eceasy/cli-proxy-api:v7.2.61
 
 # -----------------------------------------------------------------------------
 # Workspace PVC — single-node k3d uses local-path, which is RWO-only.
