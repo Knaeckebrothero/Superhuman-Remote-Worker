@@ -661,15 +661,15 @@ import {ViewportService} from '../../core/services/viewport.service';
                       <span class="ds-desc">{{ ds.description }}</span>
                     }
                     @if (viewport.isMobile()) {
-                      <app-badge class="ds-scope-inline" [tone]="ds.job_id ? 'neutral' : 'accent'" size="xs">
-                        {{ (ds.job_id ? 'datasources.table.scopeJob' : 'datasources.table.scopeGlobal') | transloco }}
+                      <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
+                        {{ scopeLabelKey(ds) | transloco }}
                       </app-badge>
                     }
                   </td>
                   <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
                   <td class="col-scope">
-                    <app-badge [tone]="ds.job_id ? 'neutral' : 'accent'" size="xs">
-                      {{ (ds.job_id ? 'datasources.table.scopeJob' : 'datasources.table.scopeGlobal') | transloco }}
+                    <app-badge [tone]="scopeTone(ds)" size="xs">
+                      {{ scopeLabelKey(ds) | transloco }}
                     </app-badge>
                   </td>
                   <td class="actions-cell">
@@ -1627,6 +1627,29 @@ export class DatasourceListComponent implements OnInit {
 
   onGitAuthMethodChange(value: string | null): void {
     this.gitAuthMethod = value === 'ssh' ? 'ssh' : 'token';
+  }
+
+  /**
+   * Visibility badge for a datasource. Three real states:
+   *  - is_global → shared with all users, agents run against its stored
+   *    credentials ("Global"); only admins/system-seeding can create these
+   *  - job_id    → scoped to a single job ("Job")
+   *  - otherwise → owner-only, attachable via the picker ("Private")
+   *
+   * NOTE: this badge previously keyed off `job_id` alone, so an ordinary
+   * private datasource (is_global=false, job_id=null) rendered "Global" —
+   * a display-only mislabel, not an actual visibility bug.
+   */
+  scopeLabelKey(ds: Datasource): string {
+    if (ds.is_global) return 'datasources.table.scopeGlobal';
+    if (ds.job_id) return 'datasources.table.scopeJob';
+    return 'datasources.table.scopePrivate';
+  }
+
+  scopeTone(ds: Datasource): BadgeTone {
+    if (ds.is_global) return 'accent';
+    if (ds.job_id) return 'neutral';
+    return 'info';
   }
 
   dsTypeTone(type: DatasourceType | string): BadgeTone {

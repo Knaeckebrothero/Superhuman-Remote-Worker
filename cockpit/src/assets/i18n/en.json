@@ -1485,6 +1485,7 @@
       "colActions": "Actions",
       "scopeJob": "Job",
       "scopeGlobal": "Global",
+      "scopePrivate": "Private",
       "testTooltip": "Test connection",
       "editTooltip": "Edit",
       "deleteTooltip": "Delete",
