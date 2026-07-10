@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha-9eb6f7b"
+  version: "0.0.0-dev.sha-f1f32eb"
   takeOwnership: true
   values:
     license:
@@ -47,7 +47,7 @@ helm:
     # in-place via yq.
     image:
       vmController:
-        tag: "sha-9eb6f7b"
+        tag: "sha-f1f32eb"
     vmController:
       defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-e375179"
       # Golden-image boot acceleration: import the VM base image ONCE into a
