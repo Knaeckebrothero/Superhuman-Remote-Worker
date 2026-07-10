@@ -492,11 +492,20 @@ class UniversalAgent:
         # fallback summarizer IS the main/summarization LLM there). See
         # docs/features/context_summarization_rework.md (S1).
         main_window = getattr(limits, "model_max_context_tokens", None)
+        summarization_config = llm_config.get_phase_config("summarization")
+        summarization_settings = resolve_model_settings(
+            summarization_config.model, self.config._deployment_dir
+        )
+        summarization_structured_output_method = summarization_settings.get(
+            "structured_output_method", "json_schema"
+        )
 
         if not aux_config.enabled:
             # Wrap summarization LLM as fallback even when auxiliary is disabled
             self._auxiliary_llm = AuxiliaryLLM(
-                llm=self._summarization_llm, max_context_tokens=main_window
+                llm=self._summarization_llm,
+                max_context_tokens=main_window,
+                structured_output_method=summarization_structured_output_method,
             )
             logger.info("AuxiliaryLLM disabled, using summarization LLM as fallback")
             return
@@ -526,11 +535,15 @@ class UniversalAgent:
             # summarization LLM (main working model). Keeps compaction + memory
             # alive instead of crashing the job when the aux endpoint fails.
             aux_fallback = self._summarization_llm
+            aux_fallback_method = summarization_structured_output_method
             logger.info(
                 f"Created auxiliary LLM: {aux_config.model}"
                 f" (settings matrix: top_p={aux_llm_config.top_p},"
                 f" top_k={aux_llm_config.top_k},"
                 f" max_ctx={aux_llm_config.model_max_context_tokens})"
+            )
+            aux_structured_output_method = model_settings.get(
+                "structured_output_method", "json_schema"
             )
         else:
             # Reuse summarization LLM (which is already the best fallback chain)
@@ -538,6 +551,8 @@ class UniversalAgent:
             aux_window = main_window
             # aux already IS the main model — nothing to fall back to.
             aux_fallback = None
+            aux_fallback_method = None
+            aux_structured_output_method = summarization_structured_output_method
             logger.info("AuxiliaryLLM: reusing summarization LLM")
 
         self._auxiliary_llm = AuxiliaryLLM(
@@ -546,6 +561,8 @@ class UniversalAgent:
             timeout=aux_config.timeout,
             max_context_tokens=aux_window,
             fallback_llm=aux_fallback,
+            structured_output_method=aux_structured_output_method,
+            fallback_structured_output_method=aux_fallback_method,
         )
 
     def _initialize_citation_verifier(self, limits) -> None:
@@ -594,6 +611,9 @@ class UniversalAgent:
                 verify_llm = create_llm(verify_cfg, limits=limits)
                 self._citation_verify_aux = AuxiliaryLLM(
                     llm=verify_llm,
+                    structured_output_method=model_settings.get(
+                        "structured_output_method", "json_schema"
+                    ),
                     timeout=aux_cfg.timeout,
                     max_context_tokens=verify_cfg.model_max_context_tokens,
                 )
