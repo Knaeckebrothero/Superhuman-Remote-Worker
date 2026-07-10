@@ -658,7 +658,7 @@ Per-mount RO grant records: the reconciler (A8) needs a durable list of active g
 Create `orchestrator/database/migrations/app/0050_cloud_ro_mounts.sql`:
 
 ```sql
--- migration:     0050_cloud_ro_mounts.sql
+-- migration:     0052_cloud_ro_mounts.sql
 -- description:   Per-mount read-only reader grants for protected cloud mode.
 --                One row per protected session mount: the srw-reader-<user>
 --                account, the serialized grant handle to revoke (NC group→
@@ -704,7 +704,7 @@ CREATE INDEX cloud_ro_mounts_user_idx ON cloud_ro_mounts (user_id);
 - [ ] **Step 2: Apply the migration locally and regenerate the snapshot**
 
 Run: `python -m orchestrator.database.migrate --database app` (or the project's documented migrate entrypoint — check `orchestrator/database/migrate.py` for the exact CLI).
-Expected: applies `0050_cloud_ro_mounts.sql` with no error.
+Expected: applies `0052_cloud_ro_mounts.sql` with no error.
 Run: `scripts/schema-snapshot.sh app`
 Expected: `orchestrator/database/schema_current.sql` now contains `CREATE TABLE public.cloud_ro_mounts`.
 
