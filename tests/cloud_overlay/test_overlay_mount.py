@@ -238,6 +238,18 @@ def test_over_quota_false_when_quota_bytes_absent():
     assert mgr.quota_guard_message() is None
 
 
+def test_over_quota_true_at_exact_quota_boundary():
+    """used == quota_bytes must block AT the cap, not only strictly above it."""
+    backend = FakeRemoteBackend()
+    quota = 8 * 1024**3  # matches _cfg()'s quota_bytes
+    backend.outputs_by_script["overlay_usage.sh"] = (
+        f"{quota}\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    )
+    mgr = _manager(backend)
+    assert mgr.over_quota() is True
+    assert mgr.quota_guard_message() is not None
+
+
 def test_over_quota_false_when_quota_bytes_zero():
     backend = FakeRemoteBackend()
     backend.outputs_by_script["overlay_usage.sh"] = "999999999999\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
