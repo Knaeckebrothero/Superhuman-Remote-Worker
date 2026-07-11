@@ -518,7 +518,9 @@ CREATE TABLE public.jobs (
     exported_folder_handle text,
     exported_at timestamp with time zone,
     expert_id uuid,
+    runner_kind text DEFAULT 'user'::text NOT NULL,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
+    CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT valid_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'processing'::character varying, 'completed'::character varying, 'failed'::character varying, 'cancelled'::character varying, 'pending_review'::character varying, 'paused'::character varying, 'reviewing'::character varying, 'waiting'::character varying, 'waiting_for_reply'::character varying])::text[])))
 );
 
@@ -552,6 +554,13 @@ COMMENT ON COLUMN public.jobs.exported_at IS 'Timestamp the Mode B shared-folder
 
 
 --
+-- Name: COLUMN jobs.runner_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.runner_kind IS 'Dispatch runner class. user = owner grants; lifecycle = system subjob with owner capabilities and full autonomy ceiling; service = reserved for ownerless system jobs.';
+
+
+--
 -- Name: job_summary; Type: VIEW; Schema: public; Owner: -
 --
 
@@ -571,7 +580,9 @@ CREATE VIEW public.job_summary AS
     j.created_at,
     j.completed_at,
     j.total_tokens_used,
-    j.total_requests
+    j.total_requests,
+    j.error_message,
+    j.runner_kind
    FROM public.jobs j;
 
 

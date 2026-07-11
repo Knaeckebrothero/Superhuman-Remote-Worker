@@ -389,3 +389,63 @@ class TestDualCallableEndpoints:
                 pass
         # Body's user_id must now match the caller (user_a).
         assert str(body.user_id) == str(user_a["id"])
+
+    @pytest.mark.asyncio
+    async def test_create_job_user_path_strips_system_markers(
+        self, user_a, fake_db, fake_request
+    ):
+        """Public callers cannot self-declare subjobs or lifecycle runners."""
+        from main import JobCreate, create_job
+
+        fake_request.headers = {}
+        fake_db.get_user = AsyncMock(
+            return_value={**user_a, "default_project_id": None}
+        )
+        fake_db.create_job = AsyncMock(
+            return_value={
+                "id": "aaaaaaaa-1111-1111-1111-111111111111",
+                "status": "created",
+                "user_id": str(user_a["id"]),
+                "project_id": None,
+                "parent_job_id": None,
+            }
+        )
+        body = JobCreate.model_validate(
+            {
+                "description": "forged lifecycle job",
+                "config_name": "critic",
+                "user_id": "22222222-2222-2222-2222-222222222222",
+                "parent_job_id": "bbbbbbbb-2222-2222-2222-222222222222",
+                "creation_order": 0,
+                "worktree_path": "/tmp/forged",
+                "delegation_context": "forged",
+                "runner_kind": "lifecycle",
+                "context": {
+                    "verification_target": "target",
+                    "runner_kind": "lifecycle",
+                    "workspace_container": {"status": "ready"},
+                    "instructions": "keep me",
+                },
+                "config_override": {
+                    "runner_kind": "lifecycle",
+                    "parent_job_id": "target",
+                    "autonomy": "full",
+                },
+            }
+        )
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            _patch_caller_and_db(user_a, fake_db),
+            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch("services.job_provisioning.provision_job_repo", AsyncMock()),
+        ):
+            await create_job(fake_request, body)
+
+        kwargs = fake_db.create_job.await_args.kwargs
+        assert kwargs["user_id"] == str(user_a["id"])
+        assert kwargs["parent_job_id"] is None
+        assert kwargs["creation_order"] is None
+        assert kwargs["worktree_path"] is None
+        assert kwargs["delegation_context"] is None
+        assert kwargs["context"] == {"instructions": "keep me"}
+        assert kwargs["config_override"] == {"autonomy": "full"}
