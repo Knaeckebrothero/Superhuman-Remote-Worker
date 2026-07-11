@@ -455,7 +455,8 @@ echo "{_OK}"
                 state.target_path,
             )
 
-        self._install_workspace_links(states)
+        if not self.cloud_cfg.get("skip_workspace_links"):
+            self._install_workspace_links(states)
         self._states = states
 
     def _state_for_mount(self, mount: dict[str, Any], index: int) -> RcloneMountState:
