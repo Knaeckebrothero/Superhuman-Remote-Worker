@@ -1009,7 +1009,8 @@ The upperdir shares the ~10Gi emptyDir; breaching an emptyDir `sizeLimit` **evic
 **Files:**
 - Modify: `src/services/cloud_overlay/overlay_mount.py` — `upperdir_usage_bytes()`, `over_quota()`, `quota_guard_message()`
 - Modify: `src/tools/shell/shell_tools.py` — consult the overlay quota in the preflight (like `_cloud_cache_guard_decision`)
-- Test: `tests/cloud_overlay/test_overlay_mount.py` (extend)
+- Modify (scope amendment — B6 review finding): `src/tools/workspace/files.py` — the file tools consume the cache guard via the path-based `_cloud_cache_guard_for_path` (:79-91) used by `read_file`/`write_file`/`edit_file`; add a WRITE-scoped sibling `_cloud_upperdir_guard_for_path(path, context)` calling `quota_guard_message()` and wire it into `write_file` + `edit_file` only (reads don't copy-up into the upper). Without this, file tools fill the upperdir past cap unguarded — the exact pod-eviction scenario §9.9 exists to prevent.
+- Test: `tests/cloud_overlay/test_overlay_mount.py` (extend; include a `used == quota` boundary test), plus wiring tests for the file-tool guard wherever the cache-guard path tests live
 
 **Interfaces:**
 - Consumes: `self.cfg["quota_bytes"]`, `self.upper`, `_run` (require_ok=False), the `_OVERLAY_OK` sentinel.
