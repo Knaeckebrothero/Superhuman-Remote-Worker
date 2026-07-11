@@ -1383,15 +1383,15 @@ class NextcloudBackend:
         await self._delete_group(group_id)
 
     async def seed_canary_fixture(self, handle: ProjectFolderHandle) -> CanaryFixture:
-        """Write a real canary file with the WRITE identity so the RO probe's
-        CVE side channels can target a real path (design §11.4)."""
+        """Write a real canary file with the WRITE identity and discover REAL
+        version/trash ids so the RO probe's CVE side channels target ids the
+        server actually knows (design §11.4). A ref left None keeps that side
+        channel inconclusive → the strict engage gate refuses (fail-closed)."""
         path = ".srw-ro-canary/probe.txt"
-        await self.put_project_folder_file_bytes(handle, path=path, content=b"canary")
-        # version_ref/trash_ref require live NC version/trash APIs to enumerate
-        # real ids; wired + tuned during the §11.4 live-validation step. Until
-        # then they stay None and those side channels remain inconclusive → the
-        # strict engage gate refuses (fail-closed).
-        return CanaryFixture(path=path, version_ref=None, trash_ref=None)
+        fileid = await self._put_canary_and_get_fileid(handle, path)
+        version_ref = await self._enumerate_version_ref(fileid) if fileid else None
+        trash_ref = await self._enumerate_trash_ref()
+        return CanaryFixture(path=path, version_ref=version_ref, trash_ref=trash_ref)
 
     async def remove_canary_fixture(
         self, handle: ProjectFolderHandle, fixture: CanaryFixture
@@ -1402,3 +1402,137 @@ class NextcloudBackend:
             )
         except CloudBackendError:
             pass
+
+    async def _put_canary_and_get_fileid(
+        self, handle: ProjectFolderHandle, path: str
+    ) -> Optional[str]:
+        """PUT the canary (write identity) and return its numeric OC-FileId."""
+        resp = await self._put_project_folder_file_bytes_raw(
+            handle, path=path, content=b"canary"
+        )
+        fid = resp.headers.get("OC-FileId") if resp is not None else None
+        if not fid:
+            return None
+        # OC-FileId is a 20-char padded token on some builds; the versions API
+        # keys on the leading numeric id. Take the leading digits.
+        digits = "".join(ch for ch in fid if ch.isdigit())
+        return digits or None
+
+    async def _put_project_folder_file_bytes_raw(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> Optional[httpx.Response]:
+        """Same MKCOL-parents-then-PUT idiom as ``put_project_folder_file_bytes``,
+        but returns the PUT response so the caller can read response headers
+        (``OC-FileId``) — the public method discards it and returns ``None``.
+        """
+        self._ensure_ready()
+        base_path = self._groupfolder_dav_base(handle)
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "_put_project_folder_file_bytes_raw: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        segments = rel.split("/")
+        parents = segments[:-1]
+        try:
+            for i in range(len(parents)):
+                partial = "/".join(parents[: i + 1])
+                url = f"{base_path}/{quote(partial, safe='/')}"
+                resp = await self._client.request(
+                    "MKCOL",
+                    url,
+                    auth=(self._agent_user, self._agent_password),
+                )
+                # 201 = created, 405 = already exists — both fine.
+                if resp.status_code in (201, 405):
+                    continue
+                resp.raise_for_status()
+
+            put_url = f"{base_path}/{quote(rel, safe='/')}"
+            headers: dict[str, str] = {}
+            if content_type:
+                headers["Content-Type"] = content_type
+            put_resp = await self._client.put(
+                put_url,
+                headers=headers,
+                content=content,
+                auth=(self._agent_user, self._agent_password),
+            )
+            if put_resp.status_code not in (200, 201, 204):
+                put_resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        return put_resp
+
+    async def _enumerate_version_ref(self, fileid: str) -> Optional[str]:
+        """Return ``{fileid}/{versionid}`` for the newest version, or None.
+
+        A brand-new single-write file may have zero versions; that's fine —
+        None keeps the versions side channel inconclusive (fail-closed)."""
+        user = self.webdav_credentials.get("username")
+        if not user:
+            return None
+        url = f"/remote.php/dav/versions/{user}/versions/{fileid}"
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                url,
+                headers={"Depth": "1"},
+                auth=(self._agent_user, self._agent_password),
+            )
+        except httpx.HTTPError:
+            return None
+        if resp.status_code != 207:
+            return None
+        version_id = self._first_child_leaf(resp.text, self_segment=fileid)
+        return f"{fileid}/{version_id}" if version_id else None
+
+    async def _enumerate_trash_ref(self) -> Optional[str]:
+        """Return a real trashed item name from the write identity's trashbin,
+        or None when the trashbin is empty (side channel stays inconclusive)."""
+        user = self.webdav_credentials.get("username")
+        if not user:
+            return None
+        url = f"/remote.php/dav/trashbin/{user}/trash"
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                url,
+                headers={"Depth": "1"},
+                auth=(self._agent_user, self._agent_password),
+            )
+        except httpx.HTTPError:
+            return None
+        if resp.status_code != 207:
+            return None
+        return self._first_child_leaf(resp.text, self_segment="trash")
+
+    @staticmethod
+    def _first_child_leaf(xml: str, *, self_segment: Optional[str]) -> Optional[str]:
+        """Return the trailing path segment of the first <d:href> that is a
+        strict child (not the collection self-href). Used to pull a real
+        version id or trashed-item name out of a Depth:1 PROPFIND body.
+
+        A Depth:1 PROPFIND always re-states the queried collection itself as
+        its own first ``<d:response>`` (WebDAV semantics; see the same
+        self-entry filtering in ``_propfind.parse_propfind_entries``) — so
+        without this filter the "first href" is the collection's own
+        self-href, not a real child, on every live server response.
+        """
+        hrefs = re.findall(r"<d:href>([^<]+)</d:href>", xml, flags=re.IGNORECASE)
+        for href in hrefs:
+            seg = href.rstrip("/").rsplit("/", 1)[-1]
+            if not seg:
+                continue
+            if self_segment is not None and seg == self_segment:
+                continue  # the collection self-href
+            return seg
+        return None
