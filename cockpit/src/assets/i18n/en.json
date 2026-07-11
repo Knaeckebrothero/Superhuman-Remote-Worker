@@ -1922,6 +1922,7 @@
       "scholar": "Scholar (pre-research)",
       "critic": "Critic (verification)",
       "projectMemory": "Project memory",
+      "imageQuality": "Image Quality",
       "autonomyDefaultHint": "Controls when the agent pauses for human review"
     },
     "autonomy": {
@@ -1958,6 +1959,20 @@
       "autonomous": {
         "label": "Autonomous",
         "description": "Agent runs without asking for approval"
+      }
+    },
+    "imageQuality": {
+      "economy": {
+        "label": "Economy",
+        "description": "Lowest resolution (~768px) — cheapest, coarse detail"
+      },
+      "standard": {
+        "label": "Standard",
+        "description": "Balanced (~1568px) — good detail for most tasks"
+      },
+      "high": {
+        "label": "High",
+        "description": "Model-family max — best for OCR, charts, UI screenshots"
       }
     },
     "criticRounds": {

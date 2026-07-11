@@ -1922,6 +1922,7 @@
       "scholar": "Scholar (Vorrecherche)",
       "critic": "Critic (Verifikation)",
       "projectMemory": "Projektgedächtnis",
+      "imageQuality": "Bildqualität",
       "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert"
     },
     "autonomy": {
@@ -1958,6 +1959,20 @@
       "autonomous": {
         "label": "Autonom",
         "description": "Agent führt Aktionen ohne Rückfrage aus"
+      }
+    },
+    "imageQuality": {
+      "economy": {
+        "label": "Sparsam",
+        "description": "Niedrigste Auflösung (~768px) — günstig, grobe Details"
+      },
+      "standard": {
+        "label": "Standard",
+        "description": "Ausgewogen (~1568px) — gute Details für die meisten Aufgaben"
+      },
+      "high": {
+        "label": "Hoch",
+        "description": "Modellfamilien-Maximum — ideal für OCR, Diagramme, UI-Screenshots"
       }
     },
     "criticRounds": {
