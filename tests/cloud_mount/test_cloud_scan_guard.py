@@ -35,6 +35,14 @@ class FakeCloudMountManager:
         return "Cloud mount status:\n- home mounted"
 
 
+class FakeOverlayManager:
+    def __init__(self, quota_message: str | None = None) -> None:
+        self.quota_message = quota_message
+
+    def quota_guard_message(self) -> str | None:
+        return self.quota_message
+
+
 def _context(shell_manager: FakeShellManager, cloud_mount: dict | None = None):
     config = {
         "shell": {"mode": "stateless"},
@@ -138,6 +146,78 @@ def test_run_command_does_not_cache_check_non_cloud_command():
 
     assert "Cloud cache guard" not in result
     assert shell_manager.run_calls == ["git status --short"]
+
+
+def test_run_command_blocks_cloud_write_when_upperdir_over_quota():
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(
+            shell_manager,
+            {
+                "active": True,
+                "scan_guard": "warn",
+                "_overlay_manager": FakeOverlayManager("Cloud staging guard: full"),
+            },
+        )
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "cp report.pdf /workspace/cloud/report.pdf"})
+
+    assert "Cloud staging guard: full" in result
+    assert shell_manager.run_calls == []
+
+
+def test_run_command_does_not_upperdir_check_non_cloud_command():
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(
+            shell_manager,
+            {
+                "active": True,
+                "_overlay_manager": FakeOverlayManager("Cloud staging guard: full"),
+            },
+        )
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "git status --short"})
+
+    assert "Cloud staging guard" not in result
+    assert shell_manager.run_calls == ["git status --short"]
+
+
+def test_run_command_upperdir_guard_exception_fails_open():
+    class RaisingOverlayManager:
+        def quota_guard_message(self) -> str | None:
+            raise RuntimeError("probe unreachable")
+
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(
+            shell_manager,
+            {"active": True, "_overlay_manager": RaisingOverlayManager()},
+        )
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "cp report.pdf /workspace/cloud/report.pdf"})
+
+    assert "Cloud staging guard" not in result
+    assert shell_manager.run_calls == ["cp report.pdf /workspace/cloud/report.pdf"]
+
+
+def test_run_command_no_overlay_manager_skips_upperdir_guard():
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(shell_manager, {"active": True, "scan_guard": "warn"})
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "cp report.pdf /workspace/cloud/report.pdf"})
+
+    assert "Cloud staging guard" not in result
+    assert shell_manager.run_calls == ["cp report.pdf /workspace/cloud/report.pdf"]
 
 
 def test_detects_rm_rf_over_cloud_mount():
