@@ -5,6 +5,7 @@ import {
     CredentialFileEntry,
     Datasource,
     DatasourceCreateRequest,
+    DatasourceIndexStatus,
     DatasourceTestResult,
     DatasourceType,
     DatasourceUpdateRequest,
@@ -22,6 +23,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
+import {UserService} from '../../core/services/user.service';
 /**
  * Datasource management panel with full CRUD, type filtering, and connection testing.
  */
@@ -135,7 +137,10 @@ import {ViewportService} from '../../core/services/viewport.service';
                 >
                   <optgroup [label]="'datasources.form.typeGroupCli' | transloco">
                     <option value="generic">{{ 'datasources.form.optGeneric' | transloco }}</option>
+                  </optgroup>
+                  <optgroup [label]="'datasources.form.typeGroupKnowledge' | transloco">
                     <option value="repository">{{ 'datasources.form.optRepository' | transloco }}</option>
+                    <option value="kb">{{ 'datasources.form.optKb' | transloco }}</option>
                   </optgroup>
                   <optgroup [label]="'datasources.form.typeGroupManaged' | transloco">
                     <option value="postgresql">{{ 'datasources.form.optPostgresql' | transloco }}</option>
@@ -155,7 +160,7 @@ import {ViewportService} from '../../core/services/viewport.service';
             <!-- Connection URL (required for non-generic, non-credential-file types) -->
             @if (hasConnectionUrl() && formData.type !== 'generic') {
               <app-form-field
-                [label]="(formData.type === 'repository' ? 'datasources.form.repoUrlLabel' : 'datasources.form.connectionUrlLabel') | transloco"
+                [label]="(isGitBackedType() ? 'datasources.form.repoUrlLabel' : 'datasources.form.connectionUrlLabel') | transloco"
                 [required]="true"
               >
                 <app-input
@@ -260,8 +265,8 @@ import {ViewportService} from '../../core/services/viewport.service';
               </app-form-field>
             }
 
-            <!-- Repository: default branch -->
-            @if (formData.type === 'repository') {
+            <!-- Git-backed datasource: default branch -->
+            @if (isGitBackedType()) {
               <app-form-field [label]="'datasources.form.defaultBranchLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
                 <app-input
                   size="sm"
@@ -273,8 +278,26 @@ import {ViewportService} from '../../core/services/viewport.service';
               </app-form-field>
             }
 
-            <!-- Repository: auth method -->
-            @if (formData.type === 'repository') {
+            <!-- OKF Knowledge Base: repository-relative note root -->
+            @if (formData.type === 'kb') {
+              <app-form-field
+                [label]="'datasources.form.okfRootLabel' | transloco"
+                [hint]="'datasources.form.okfRootHint' | transloco"
+                [optional]="'datasources.form.optional' | transloco"
+              >
+                <app-input
+                  size="sm"
+                  class="mono"
+                  [value]="formData.root_path"
+                  (valueChange)="formData.root_path = $event"
+                  [placeholder]="'datasources.form.okfRootPlaceholder' | transloco"
+                  [disabled]="isSaving()"
+                />
+              </app-form-field>
+            }
+
+            <!-- Git-backed datasource: auth method -->
+            @if (isGitBackedType()) {
               <app-form-field [label]="'datasources.form.authMethodLabel' | transloco" [required]="true">
                 <app-select
                   size="sm"
@@ -350,8 +373,13 @@ import {ViewportService} from '../../core/services/viewport.service';
                   }
                 </div>
               }
+              @if (editingId()) {
+                <div class="credential-retain-hint">
+                  {{ 'datasources.form.credentialsRetainHint' | transloco }}
+                </div>
+              }
               <div class="form-hint">
-                {{ 'datasources.form.repoHint' | transloco }}
+                {{ (formData.type === 'kb' ? 'datasources.form.kbHint' : 'datasources.form.repoHint') | transloco }}
               </div>
             }
 
@@ -660,6 +688,30 @@ import {ViewportService} from '../../core/services/viewport.service';
                     @if (ds.description) {
                       <span class="ds-desc">{{ ds.description }}</span>
                     }
+                    @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
+                      <div class="index-status-row">
+                        <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
+                          {{ indexStatusLabel(indexStatus) }}
+                        </app-badge>
+                        @if (indexStatus.last_success_at) {
+                          <span
+                            class="index-status-detail"
+                            [title]="indexStatus.last_success_at"
+                          >
+                            {{ 'datasources.table.lastSuccess' | transloco }}:
+                            {{ formatIndexDate(indexStatus.last_success_at) }}
+                          </span>
+                        }
+                        @if (indexStatus.last_error) {
+                          <span
+                            class="index-status-error"
+                            [title]="redactIndexError(indexStatus.last_error)"
+                          >
+                            {{ redactIndexError(indexStatus.last_error) }}
+                          </span>
+                        }
+                      </div>
+                    }
                     @if (viewport.isMobile()) {
                       <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
                         {{ scopeLabelKey(ds) | transloco }}
@@ -673,7 +725,7 @@ import {ViewportService} from '../../core/services/viewport.service';
                     </app-badge>
                   </td>
                   <td class="actions-cell">
-                    @if (viewport.isMobile()) {
+                    @if (canManage(ds) && viewport.isMobile()) {
                       <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
                            cell is just the kebab and the table fits without h-scroll
                            (mirrors the Jobs list). -->
@@ -681,7 +733,7 @@ import {ViewportService} from '../../core/services/viewport.service';
                         variant="ghost"
                         size="sm"
                         [ariaLabel]="'datasources.table.moreActions' | transloco"
-                        [loading]="testingIds().has(ds.id)"
+                        [loading]="testingIds().has(ds.id) || reindexingIds().has(ds.id)"
                         [appMenuTrigger]="rowMenu"
                         menuPlacement="bottom-end"
                       >
@@ -691,6 +743,16 @@ import {ViewportService} from '../../core/services/viewport.service';
                         <app-menu-item (activated)="testDatasource(ds.id)">
                           {{ 'datasources.table.testTooltip' | transloco }}
                         </app-menu-item>
+                        @if (ds.type === 'kb') {
+                          <app-menu-item (activated)="reindexDatasource(ds)">
+                            {{ 'datasources.table.reindexTooltip' | transloco }}
+                          </app-menu-item>
+                        }
+                        @if (ds.type === 'kb') {
+                          <app-menu-item (activated)="reindexDatasource(ds, true)">
+                            {{ 'datasources.table.fullReindexTooltip' | transloco }}
+                          </app-menu-item>
+                        }
                         <app-menu-item (activated)="openEditForm(ds)">
                           {{ 'datasources.table.editTooltip' | transloco }}
                         </app-menu-item>
@@ -698,7 +760,7 @@ import {ViewportService} from '../../core/services/viewport.service';
                           {{ 'datasources.table.deleteTooltip' | transloco }}
                         </app-menu-item>
                       </app-menu>
-                    } @else {
+                    } @else if (canManage(ds)) {
                       <app-icon-button
                         variant="ghost"
                         size="sm"
@@ -709,6 +771,28 @@ import {ViewportService} from '../../core/services/viewport.service';
                       >
                         <app-icon size="sm">cable</app-icon>
                       </app-icon-button>
+                      @if (ds.type === 'kb') {
+                        <app-icon-button
+                          variant="ghost"
+                          size="sm"
+                          [ariaLabel]="'datasources.table.reindexTooltip' | transloco"
+                          [tooltip]="'datasources.table.reindexTooltip' | transloco"
+                          [loading]="reindexingIds().has(ds.id)"
+                          (clicked)="reindexDatasource(ds)"
+                        >
+                          <app-icon size="sm">sync</app-icon>
+                        </app-icon-button>
+                        <app-icon-button
+                          variant="ghost"
+                          size="sm"
+                          [ariaLabel]="'datasources.table.fullReindexTooltip' | transloco"
+                          [tooltip]="'datasources.table.fullReindexTooltip' | transloco"
+                          [disabled]="reindexingIds().has(ds.id)"
+                          (clicked)="reindexDatasource(ds, true)"
+                        >
+                          <app-icon size="sm">restart_alt</app-icon>
+                        </app-icon-button>
+                      }
                       <app-icon-button
                         variant="ghost"
                         size="sm"
@@ -729,7 +813,7 @@ import {ViewportService} from '../../core/services/viewport.service';
                       </app-icon-button>
                     }
 
-                    @if (testResults()[ds.id]; as result) {
+                    @if (canManage(ds) && testResults()[ds.id]; as result) {
                       <span
                         class="inline-test"
                         [class.test-ok]="result.status === 'ok'"
@@ -944,6 +1028,12 @@ import {ViewportService} from '../../core/services/viewport.service';
         font-size: 11px;
         color: var(--text-secondary, var(--text-secondary));
         line-height: 1.5;
+      }
+
+      .credential-retain-hint {
+        margin-top: 4px;
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
       }
 
       /* Env var editor */
@@ -1204,6 +1294,31 @@ import {ViewportService} from '../../core/services/viewport.service';
         max-width: 200px;
       }
 
+      .index-status-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 5px;
+        max-width: 360px;
+      }
+
+      .index-status-detail,
+      .index-status-error {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 10px;
+      }
+
+      .index-status-detail {
+        color: var(--text-muted, #6c7086);
+      }
+
+      .index-status-error {
+        color: var(--danger);
+      }
+
       /* URL cell */
       .url-cell {
         font-family: 'JetBrains Mono', monospace;
@@ -1317,6 +1432,7 @@ import {ViewportService} from '../../core/services/viewport.service';
 export class DatasourceListComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly transloco = inject(TranslocoService);
+  private readonly userService = inject(UserService);
   protected readonly viewport = inject(ViewportService);
 
   // State signals
@@ -1327,6 +1443,8 @@ export class DatasourceListComponent implements OnInit {
   readonly editingId = signal<string | null>(null);
   readonly testResults = signal<Record<string, DatasourceTestResult>>({});
   readonly testingIds = signal<Set<string>>(new Set());
+  readonly indexStatuses = signal<Record<string, DatasourceIndexStatus>>({});
+  readonly reindexingIds = signal<Set<string>>(new Set());
   readonly isTesting = signal(false);
   readonly isSaving = signal(false);
   readonly formTestResult = signal<DatasourceTestResult | null>(null);
@@ -1346,6 +1464,7 @@ export class DatasourceListComponent implements OnInit {
     { labelKey: 'datasources.filter.all', value: 'all' },
     { labelKey: 'datasources.filter.generic', value: 'generic' },
     { labelKey: 'datasources.filter.repository', value: 'repository' },
+    { labelKey: 'datasources.filter.kb', value: 'kb' },
     { labelKey: 'datasources.filter.postgresql', value: 'postgresql' },
     { labelKey: 'datasources.filter.neo4j', value: 'neo4j' },
     { labelKey: 'datasources.filter.mongodb', value: 'mongodb' },
@@ -1368,6 +1487,10 @@ export class DatasourceListComponent implements OnInit {
     return !this.isCredentialFileType();
   }
 
+  isGitBackedType(type: DatasourceType | string = this.formData.type): boolean {
+    return type === 'repository' || type === 'kb';
+  }
+
   // Computed filtered list
   readonly filteredDatasources = computed(() => {
     const filter = this.typeFilter();
@@ -1381,6 +1504,7 @@ export class DatasourceListComponent implements OnInit {
     const placeholders: Record<string, string> = {
       generic: 'e.g. postgresql://host:5432/db or https://api.example.com',
       repository: 'https://github.com/org/repo.git',
+      kb: 'https://github.com/org/knowledge-base.git',
       postgresql: 'postgres://user:pass@host:5432/dbname',
       neo4j: 'bolt://host:7687',
       mongodb: 'mongodb://user:pass@host:27017/dbname',
@@ -1432,6 +1556,7 @@ export class DatasourceListComponent implements OnInit {
     description: string;
     cli_hint: string;
     default_branch: string;
+    root_path: string;
   } = {
     name: '',
     type: 'generic',
@@ -1439,6 +1564,7 @@ export class DatasourceListComponent implements OnInit {
     description: '',
     cli_hint: '',
     default_branch: '',
+    root_path: '',
   };
 
   formCredentials: { username: string; password: string } = {
@@ -1461,6 +1587,10 @@ export class DatasourceListComponent implements OnInit {
     this.isLoading.set(true);
     this.api.getDatasources().subscribe((datasources) => {
       this.datasources.set(datasources);
+      this.indexStatuses.set({});
+      for (const ds of datasources) {
+        if (ds.type === 'kb') this.loadIndexStatus(ds.id);
+      }
       this.isLoading.set(false);
     });
   }
@@ -1484,6 +1614,7 @@ export class DatasourceListComponent implements OnInit {
       description: ds.description || '',
       cli_hint: ds.cli_hint || '',
       default_branch: ds.default_branch || '',
+      root_path: ds.config?.root_path || '',
     };
     // F3 (docs/multi_tenancy.md): credentials never come back from the
     // API. The user re-enters them only if they want to change the stored
@@ -1492,7 +1623,7 @@ export class DatasourceListComponent implements OnInit {
     // Repository auth: pick the right tab based on cli_hint so the user
     // sees the same auth method they'd previously configured, but the
     // SSH key field stays blank for the same "leave blank to keep" reason.
-    if (ds.type === 'repository') {
+    if (this.isGitBackedType(ds.type)) {
       this.gitAuthMethod = ds.cli_hint?.includes('ssh') ? 'ssh' : 'token';
       this.gitSshKey = '';
     } else {
@@ -1659,6 +1790,8 @@ export class DatasourceListComponent implements OnInit {
       case 'repository':
       case 'postgresql':
         return 'info';
+      case 'kb':
+        return 'accent';
       case 'neo4j':
         return 'success';
       case 'webdav':
@@ -1698,6 +1831,9 @@ export class DatasourceListComponent implements OnInit {
         credentials: creds,
         cli_hint: this.formData.cli_hint || undefined,
         default_branch: this.formData.default_branch || undefined,
+        config: this.formData.type === 'kb'
+          ? {root_path: this.formData.root_path.trim()}
+          : undefined,
       };
 
       this.api.updateDatasource(editId, update).subscribe({
@@ -1725,6 +1861,9 @@ export class DatasourceListComponent implements OnInit {
         credentials: creds,
         cli_hint: this.formData.cli_hint || undefined,
         default_branch: this.formData.default_branch || undefined,
+        config: this.formData.type === 'kb'
+          ? {root_path: this.formData.root_path.trim()}
+          : undefined,
       };
 
       this.api.createDatasource(create).subscribe({
@@ -1771,6 +1910,10 @@ export class DatasourceListComponent implements OnInit {
         connection_url: this.formData.connection_url || undefined,
         description: this.formData.description || undefined,
         credentials: this.buildCredentials(),
+        default_branch: this.formData.default_branch || undefined,
+        config: this.formData.type === 'kb'
+          ? {root_path: this.formData.root_path.trim()}
+          : undefined,
       };
 
       this.api.createDatasource(create).subscribe({
@@ -1832,6 +1975,45 @@ export class DatasourceListComponent implements OnInit {
     });
   }
 
+  reindexDatasource(ds: Datasource, full = false): void {
+    if (
+      ds.type !== 'kb' ||
+      !this.canManage(ds) ||
+      this.reindexingIds().has(ds.id)
+    ) {
+      return;
+    }
+    if (
+      full &&
+      !confirm(this.transloco.translate('datasources.table.fullReindexConfirm'))
+    ) {
+      return;
+    }
+
+    this.reindexingIds.update((ids) => new Set(ids).add(ds.id));
+    this.clearMessages();
+    this.api.reindexDatasource(ds.id, full).subscribe((result) => {
+      this.reindexingIds.update((ids) => {
+        const next = new Set(ids);
+        next.delete(ds.id);
+        return next;
+      });
+      if (result) {
+        this.successMessage.set(
+          this.transloco.translate('datasources.messages.reindexed', {
+            name: ds.name,
+            status: result.status,
+          }),
+        );
+        this.loadIndexStatus(ds.id);
+      } else {
+        this.errorMessage.set(
+          this.transloco.translate('datasources.messages.reindexFailed'),
+        );
+      }
+    });
+  }
+
   deleteDatasource(ds: Datasource): void {
     this.clearMessages();
     this.api.deleteDatasource(ds.id).subscribe({
@@ -1855,6 +2037,7 @@ export class DatasourceListComponent implements OnInit {
     const icons: Record<string, string> = {
       generic: 'settings_input_component',
       repository: 'code',
+      kb: 'menu_book',
       postgresql: 'database',
       neo4j: 'hub',
       mongodb: 'eco',
@@ -1872,6 +2055,57 @@ export class DatasourceListComponent implements OnInit {
     } catch {
       return url;
     }
+  }
+
+  canManage(ds: Datasource): boolean {
+    const user = this.userService.currentUser();
+    return !!user && (user.is_admin === true || ds.created_by === user.id);
+  }
+
+  indexStatusTone(status: DatasourceIndexStatus['status']): BadgeTone {
+    switch (status) {
+      case 'ready':
+        return 'success';
+      case 'indexing':
+        return 'info';
+      case 'partial':
+        return 'warning';
+      case 'failed':
+        return 'danger';
+      default:
+        return 'neutral';
+    }
+  }
+
+  indexStatusLabel(status: DatasourceIndexStatus): string {
+    if (status.status === 'ready') {
+      const sha = (status.indexed_commit || status.source_head || '').slice(0, 8);
+      return this.transloco.translate('datasources.table.indexReady', {
+        sha: sha || '—',
+      });
+    }
+    return this.transloco.translate(
+      `datasources.table.index${status.status[0].toUpperCase()}${status.status.slice(1)}`,
+    );
+  }
+
+  formatIndexDate(value: string): string {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  }
+
+  redactIndexError(value: string): string {
+    return value
+      .replace(/(https?:\/\/)[^/@\s]+@/gi, '$1***@')
+      .replace(/\b(token|password|secret)=([^\s&]+)/gi, '$1=***')
+      .slice(0, 240);
+  }
+
+  private loadIndexStatus(id: string): void {
+    this.api.getDatasourceIndexStatus(id).subscribe((status) => {
+      if (!status) return;
+      this.indexStatuses.update((statuses) => ({...statuses, [id]: status}));
+    });
   }
 
   // Env var editor methods
@@ -1899,13 +2133,19 @@ export class DatasourceListComponent implements OnInit {
       if (Object.keys(envVarsObj).length === 0) return undefined;
       return { env_vars: envVarsObj };
     }
-    if (this.formData.type === 'repository') {
+    if (this.isGitBackedType()) {
       if (this.gitAuthMethod === 'ssh') {
-        if (!this.gitSshKey) return isEditing ? undefined : { read_only: true };
+        if (!this.gitSshKey) {
+          return isEditing || this.formData.type === 'kb'
+            ? undefined
+            : {read_only: true};
+        }
         return { auth_method: 'ssh', ssh_key: this.gitSshKey };
       } else {
         if (!this.formCredentials.password) {
-          return isEditing ? undefined : { read_only: true };
+          return isEditing || this.formData.type === 'kb'
+            ? undefined
+            : {read_only: true};
         }
         return { auth_method: 'token', token: this.formCredentials.password };
       }
@@ -1953,6 +2193,7 @@ export class DatasourceListComponent implements OnInit {
       description: '',
       cli_hint: '',
       default_branch: '',
+      root_path: '',
     };
     this.formCredentials = { username: '', password: '' };
     this.gitAuthMethod = 'token';

@@ -332,10 +332,14 @@ class TestDualCallableEndpoints:
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_create_job_internal_bypasses_user_auth(self, fake_request, fake_db):
-        """Agent delegation path: valid key skips approved-user + force-id
-        check. Body's user_id should be respected (the agent supplies it
-        from the parent job's context)."""
+    async def test_create_job_internal_rejects_unbound_body_user(
+        self, fake_request, fake_db
+    ):
+        """An internal key authenticates transport, not a claimed body user.
+
+        Agent jobs must bind identity through a thread/parent (or an
+        authenticated MCP-forwarded user); a bare body user_id is rejected.
+        """
         from main import JobCreate, create_job
 
         fake_request.headers = {"X-Internal-Key": "secret"}
@@ -352,17 +356,152 @@ class TestDualCallableEndpoints:
                 AsyncMock(side_effect=AssertionError("user auth ran")),
             ),
             patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            pytest.raises(HTTPException) as exc,
         ):
-            # Handler may still fail past the gate (project lookup, etc.) —
-            # the only assertion is the user-auth dud didn't fire.
-            try:
-                await create_job(fake_request, body)
-            except AssertionError:
-                raise
-            except Exception:
-                pass
-        # body.user_id is NOT force-overwritten on the internal path.
-        assert body.user_id == "11111111-1111-1111-1111-111111111111"
+            await create_job(fake_request, body)
+
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Internal job origin scope is unavailable"
+        fake_db.create_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_job_rejects_originless_internal_request(
+        self, fake_request, fake_db
+    ):
+        """The shared internal key is present in agent pods and therefore can
+        never grant an originless HTTP "system job" bypass."""
+        from main import JobCreate, create_job
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        body = JobCreate(description="originless internal attempt")
+
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await create_job(fake_request, body)
+
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Internal job origin scope is unavailable"
+        fake_db.create_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_job_internal_thread_rejects_cross_project_native_scope(
+        self,
+        user_a,
+        project_a,
+        project_b,
+        thread_a,
+        fake_request,
+        fake_db,
+    ):
+        """A session agent cannot point a child at another project's native KB
+        or repositories by submitting a different project_id."""
+        from main import JobCreate, create_job
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        scoped_thread = {**thread_a, "project_id": project_a["id"]}
+        fake_db.get_thread = AsyncMock(return_value=scoped_thread)
+        fake_db.get_user = AsyncMock(return_value=user_a)
+        body = JobCreate(
+            description="cross-project attempt",
+            thread_id=str(thread_a["id"]),
+            project_id=str(project_b["id"]),
+        )
+
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+            patch(
+                "main._thread_project_ids",
+                AsyncMock(return_value=[str(project_a["id"])]),
+            ),
+            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await create_job(fake_request, body)
+
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Internal job origin scope is unavailable"
+        fake_db.create_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_job_internal_thread_rejects_private_datasource_uuid(
+        self,
+        user_a,
+        project_a,
+        datasource_b,
+        thread_a,
+        fake_request,
+        fake_db,
+    ):
+        """A valid thread principal still cannot attach another user's private
+        datasource (including an external OKF KB) by guessing its UUID."""
+        from main import JobCreate, create_job
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        scoped_thread = {**thread_a, "project_id": project_a["id"]}
+        fake_db.get_thread = AsyncMock(return_value=scoped_thread)
+        fake_db.get_user = AsyncMock(return_value=user_a)
+        body = JobCreate(
+            description="private datasource attempt",
+            thread_id=str(thread_a["id"]),
+            datasource_ids=[str(datasource_b["id"])],
+        )
+
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+            patch(
+                "main._thread_project_ids",
+                AsyncMock(return_value=[str(project_a["id"])]),
+            ),
+            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await create_job(fake_request, body)
+
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "One or more selected datasources are unavailable"
+        assert str(datasource_b["id"]) not in exc.value.detail
+        fake_db.create_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_job_reauthorizes_inherited_parent_datasources(
+        self,
+        user_a,
+        job_a,
+        datasource_b,
+        fake_request,
+        fake_db,
+    ):
+        """A child cannot retain a datasource after the parent's owner's
+        current access was revoked; inheritance is selection, not authority."""
+        from main import JobCreate, create_job
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        fake_db.get_user = AsyncMock(return_value=user_a)
+        fake_db.list_job_datasource_ids = AsyncMock(
+            return_value=[str(datasource_b["id"])]
+        )
+        body = JobCreate(
+            description="inherit revoked datasource",
+            parent_job_id=str(job_a["id"]),
+        )
+
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await create_job(fake_request, body)
+
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "One or more selected datasources are unavailable"
+        fake_db.create_job.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_job_user_path_forces_user_id(
@@ -389,6 +528,33 @@ class TestDualCallableEndpoints:
                 pass
         # Body's user_id must now match the caller (user_a).
         assert str(body.user_id) == str(user_a["id"])
+
+    @pytest.mark.asyncio
+    async def test_create_job_revalidates_stale_public_default_project(
+        self, user_a, project_a, fake_db, fake_request
+    ):
+        """A stale users.default_project_id cannot restore native KB/project
+        scope after the user loses editor access."""
+        from main import JobCreate, create_job
+
+        fake_request.headers = {}
+        fake_db.get_user = AsyncMock(
+            return_value={**user_a, "default_project_id": project_a["id"]}
+        )
+        fake_db.get_user_role_in_project = AsyncMock(return_value="viewer")
+        body = JobCreate(description="stale default project")
+
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            _patch_caller_and_db(user_a, fake_db),
+            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await create_job(fake_request, body)
+
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "Project role 'editor' or higher required"
+        fake_db.create_job.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_job_user_path_strips_system_markers(

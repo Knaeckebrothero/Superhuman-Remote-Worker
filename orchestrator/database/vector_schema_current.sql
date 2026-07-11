@@ -592,7 +592,13 @@ CREATE TABLE public.kb_index_watermark (
     branch text,
     indexed_commit character varying(64),
     pipeline_version text,
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    source_head character varying(64),
+    status text DEFAULT 'ready'::text NOT NULL,
+    last_attempt_at timestamp with time zone,
+    last_success_at timestamp with time zone,
+    last_error text,
+    CONSTRAINT kb_index_watermark_status_valid CHECK ((status = ANY (ARRAY['pending'::text, 'indexing'::text, 'ready'::text, 'partial'::text, 'failed'::text])))
 );
 
 

@@ -1013,6 +1013,18 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AUTO_ASSIGN_ENABLED
+            {{- with .Values.orchestrator.kbGitAllowedHosts }}
+            - name: KB_GIT_ALLOWED_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.orchestrator.kbGitSshKnownHosts }}
+            - name: KB_GIT_SSH_KNOWN_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
+            - name: KB_EXTERNAL_REINDEX_CONCURRENCY
+              value: {{ .Values.orchestrator.kbExternalReindexConcurrency | quote }}
+            - name: KB_REINDEX_SWEEP_SECONDS
+              value: {{ .Values.orchestrator.kbReindexSweepSeconds | quote }}
             # Agent pool sizing (AgentProvisioner)
             - name: MAX_AGENTS
               valueFrom:

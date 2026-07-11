@@ -859,6 +859,10 @@ async def _execute_turn(
     knowledge_block = ""
     citation_feedback_block = ""
 
+    from .core.knowledge_injection import selected_knowledge_bindings
+
+    kb_bindings = selected_knowledge_bindings(tool_context)
+
     # Memory/knowledge retrieval with timeout — must never block the LLM call
     _RETRIEVAL_TIMEOUT = 5  # seconds
 
@@ -892,6 +896,16 @@ async def _execute_turn(
             )
         )
         manager_injection = _payload.messages()
+        if kb_bindings:
+            # Multi-KB retrieval below owns the knowledge budget. Preserve the
+            # manager's memory messages while fencing its legacy note-level KB
+            # retriever to prevent duplicate native injection.
+            manager_injection = [
+                message
+                for block in _payload.blocks
+                if block.kind != "knowledge"
+                for message in block.messages
+            ]
         for _block in _payload.blocks:
             if _block.kind == "memory" and _block.items:
                 logger.debug(
@@ -945,7 +959,46 @@ async def _execute_turn(
             )
 
     effective_pids = project_ids or ([project_id] if project_id else [])
-    if memory_service is None and knowledge_store and effective_pids:
+    if knowledge_store and kb_bindings:
+        try:
+            kb_context = ""
+            for msg in reversed(messages):
+                if isinstance(msg, HumanMessage):
+                    kb_context = (
+                        msg.content
+                        if isinstance(msg.content, str)
+                        else str(msg.content)
+                    )
+                    break
+
+            from .core.knowledge_injection import retrieve_bound_knowledge
+            from .services.knowledge_store import KnowledgeStore as _KS
+
+            selection = await retrieve_bound_knowledge(
+                knowledge_store,
+                kb_bindings,
+                kb_context,
+                timeout=_RETRIEVAL_TIMEOUT,
+            )
+            if selection.notes:
+                knowledge_block = _KS.assemble_knowledge_block(
+                    selection.notes,
+                    model=getattr(config.llm, "model", None),
+                    bindings=selection.bindings,
+                    external_watermarks=selection.external_watermarks,
+                )
+                logger.debug(
+                    "Knowledge injection: %s notes retrieved by binding=%s",
+                    len(selection.notes),
+                    selection.counts_by_binding,
+                )
+        except Exception as e:
+            logger.warning(
+                "Knowledge retrieval failed (non-fatal): %s: %s",
+                type(e).__name__,
+                e,
+            )
+    elif memory_service is None and knowledge_store and effective_pids:
         try:
             kb_context = ""
             for msg in reversed(messages):

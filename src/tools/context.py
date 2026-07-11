@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # Avoid circular imports with TYPE_CHECKING
 if TYPE_CHECKING:
     from ..database.postgres_db import PostgresDB
+    from ..services.knowledge.bindings import KnowledgeBinding
 
 
 @dataclass
@@ -113,6 +114,9 @@ class ToolContext:
         None  # KnowledgeGraphDB (system Neo4j for knowledge base)
     )
     knowledge_store: Optional[Any] = None  # KnowledgeStore (pgvector search index)
+    knowledge_bindings: List["KnowledgeBinding"] = field(
+        default_factory=list
+    )  # Native + selected external OKF KB scopes
     _project_id: Optional[str] = None  # Project UUID for knowledge scoping
     _project_ids: List[str] = field(
         default_factory=list
@@ -291,6 +295,29 @@ class ToolContext:
         """Set project IDs (also updates primary project_id)."""
         self._project_ids = value or []
         self._project_id = value[0] if value else None
+
+    @property
+    def kb_ids(self) -> List[str]:
+        """Authorized KB ids, falling back to legacy project scoping."""
+        if self.knowledge_bindings:
+            return [str(binding.kb_id) for binding in self.knowledge_bindings]
+        return list(self.project_ids)
+
+    def knowledge_binding(self, selector: str) -> Optional["KnowledgeBinding"]:
+        """Resolve a KB alias or UUID inside the authorized binding set."""
+        needle = str(selector or "").strip().lower()
+        for binding in self.knowledge_bindings:
+            if binding.alias.lower() == needle or str(binding.kb_id).lower() == needle:
+                return binding
+        return None
+
+    @property
+    def writable_knowledge_binding(self) -> Optional["KnowledgeBinding"]:
+        """The native write target; external Slice 4 bindings are read-only."""
+        for binding in self.knowledge_bindings:
+            if binding.writable:
+                return binding
+        return None
 
     @property
     def db(self) -> Optional["PostgresDB"]:

@@ -221,6 +221,9 @@ class PersistentSession:
 
     # Datasource connections keyed by type (for ToolContext)
     datasources: Dict[str, Any] = field(default_factory=dict)
+    # Authorized native + selected external OKF KB scopes. External entries
+    # carry ids/display metadata only; repository credentials stay orchestrator-side.
+    knowledge_bindings: List[Any] = field(default_factory=list)
     # Parent clients for cleanup (e.g. MongoClient)
     _datasource_clients: Dict[str, Any] = field(default_factory=dict)
 
@@ -587,7 +590,7 @@ class PersistentSession:
                 logger.warning(f"Failed to deploy instruction file {entry.file}: {e}")
 
     def _setup_knowledge(self, vector_conn: Optional[Any]) -> None:
-        """Initialize knowledge base connections (Neo4j + pgvector).
+        """Initialize the pgvector store and optional Neo4j Graph tier.
 
         Must be called BEFORE _setup_tools() so that the ToolContext
         has knowledge_graph and knowledge_store set, allowing knowledge
@@ -595,29 +598,28 @@ class PersistentSession:
 
         Mirrors the worker agent pattern in agent.py._setup_job_tools().
         """
-        if not self.project_ids:
-            return  # No project context — knowledge base not applicable
+        if not self.knowledge_bindings and not self.project_ids:
+            return  # No native or selected external knowledge scope
 
+        self._kb_degraded = False
         try:
-            from src.services.knowledge_graph import KnowledgeGraphDB
-            from src.services.knowledge_store import KnowledgeStore
-            from src.services.embedding_service import get_embedding_service
+            if vector_conn is None:
+                raise RuntimeError("Vector database connection is unavailable")
 
-            kg = KnowledgeGraphDB()
-            if kg.connect():
-                embedding_service = get_embedding_service()
-                ks = KnowledgeStore(
-                    db=vector_conn,
-                    embedding_service=embedding_service,
-                )
-                self._knowledge_graph = kg
-                self.knowledge_store = ks
-                logger.info(
-                    f"Knowledge base initialized for project(s) {self.project_ids}"
-                )
-            else:
-                logger.warning("Failed to connect to Neo4j — knowledge tools disabled")
+            from src.services.embedding_service import get_kb_embedding_service
+            from src.services.knowledge_store import KnowledgeStore
+
+            embedding_service = get_kb_embedding_service()
+            self.knowledge_store = KnowledgeStore(
+                db=vector_conn,
+                embedding_service=embedding_service,
+            )
+            logger.info(
+                "Knowledge store initialized for %d KB binding(s)",
+                len(self.knowledge_bindings) or len(self.project_ids),
+            )
         except Exception as e:
+            self._kb_degraded = True
             from src.core.archiver import audit_unavailable as _audit_unavailable
 
             _audit_unavailable(
@@ -628,13 +630,35 @@ class PersistentSession:
                 error=e,
                 node_name="session_setup",
                 extra={
-                    "embedding_provider": os.environ.get("EMBEDDING_PROVIDER", "local"),
+                    "embedding_provider": os.environ.get(
+                        "KB_EMBEDDING_PROVIDER",
+                        os.environ.get("EMBEDDING_PROVIDER", "local"),
+                    ),
                 },
             )
             logger.warning(
-                f"Failed to initialize knowledge base (non-fatal): {e} "
-                f"[embedding_provider={os.environ.get('EMBEDDING_PROVIDER', 'local')}]"
+                f"Failed to initialize knowledge store (non-fatal): {e} "
+                f"[embedding_provider={os.environ.get('KB_EMBEDDING_PROVIDER', os.environ.get('EMBEDDING_PROVIDER', 'local'))}]"
             )
+
+        if not self.project_ids:
+            return
+
+        try:
+            from src.services.knowledge_graph import KnowledgeGraphDB
+
+            kg = KnowledgeGraphDB()
+            if kg.connect():
+                self._knowledge_graph = kg
+                logger.info(
+                    f"Knowledge Graph tier initialized for project(s) "
+                    f"{self.project_ids}"
+                )
+            else:
+                logger.warning("Failed to connect to Neo4j — Graph tier disabled")
+        except Exception as e:
+            # Neo4j is optional: do not mark vector search/read as degraded.
+            logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
 
     def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
         """Load tools from config, excluding phase-specific ones."""
@@ -684,6 +708,7 @@ class PersistentSession:
             session_task_manager=self.session_task_manager,
             knowledge_graph=self._knowledge_graph,
             knowledge_store=self.knowledge_store,
+            knowledge_bindings=list(self.knowledge_bindings),
         )
         if self.project_ids:
             self.tool_context.project_ids = self.project_ids
@@ -1125,10 +1150,10 @@ class PersistentSession:
         # Skip if already initialized by _setup_knowledge() (for tool loading)
         if self.knowledge_store is None:
             try:
-                from src.services.embedding_service import get_embedding_service
+                from src.services.embedding_service import get_kb_embedding_service
                 from src.services.knowledge_store import KnowledgeStore
 
-                embedding_service = get_embedding_service()
+                embedding_service = get_kb_embedding_service()
                 self.knowledge_store = KnowledgeStore(
                     db=vector_conn,
                     embedding_service=embedding_service,
@@ -1146,13 +1171,14 @@ class PersistentSession:
                     node_name="session_setup",
                     extra={
                         "embedding_provider": os.environ.get(
-                            "EMBEDDING_PROVIDER", "local"
+                            "KB_EMBEDDING_PROVIDER",
+                            os.environ.get("EMBEDDING_PROVIDER", "local"),
                         ),
                     },
                 )
                 logger.warning(
                     f"Failed to initialize KnowledgeStore (non-fatal): {e} "
-                    f"[embedding_provider={os.environ.get('EMBEDDING_PROVIDER', 'local')}]"
+                    f"[embedding_provider={os.environ.get('KB_EMBEDDING_PROVIDER', os.environ.get('EMBEDDING_PROVIDER', 'local'))}]"
                 )
                 self._kb_degraded = True
 
@@ -1178,9 +1204,9 @@ class PersistentSession:
                 f"EMBEDDING_MODEL={os.environ.get('EMBEDDING_MODEL', 'unset')}). "
                 "Check the embedding model/endpoint (Admin → Models)."
             )
-        if _memory_required and self.project_ids and self._kb_degraded:
+        if _memory_required and self.knowledge_bindings and self._kb_degraded:
             raise MemoryUnavailableError(
-                "memory is required for this session but the project KnowledgeStore "
+                "memory is required for this session but the KnowledgeStore "
                 "failed to initialize — the embedding endpoint is unavailable "
                 f"(EMBEDDING_BASE_URL={os.environ.get('EMBEDDING_BASE_URL', 'unset')})."
             )

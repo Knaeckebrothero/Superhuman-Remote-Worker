@@ -11,6 +11,8 @@ import {
     DailyStatistics,
     Datasource,
     DatasourceCreateRequest,
+    DatasourceIndexStatus,
+    DatasourceReindexResult,
     DatasourceTestResult,
     DatasourceUpdateRequest,
     SSHKeyGenerateResponse,
@@ -715,6 +717,38 @@ export class ApiService {
     );
   }
 
+  /** Get credential-free operational index state for an OKF Knowledge Base. */
+  getDatasourceIndexStatus(id: string): Observable<DatasourceIndexStatus | null> {
+    return this.http
+      .get<DatasourceIndexStatus>(`${this.baseUrl}/datasources/${id}/index-status`)
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch datasource index status ${id}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /** Trigger an incremental (or explicitly confirmed full) KB reindex. */
+  reindexDatasource(
+    id: string,
+    full = false,
+  ): Observable<DatasourceReindexResult | null> {
+    const params = new HttpParams().set('full', String(full));
+    return this.http
+      .post<DatasourceReindexResult>(
+        `${this.baseUrl}/datasources/${id}/reindex`,
+        {},
+        {params},
+      )
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to reindex datasource ${id}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
   /**
    * Generate a fresh ed25519 SSH keypair for a repository datasource. The
    * caller drops the private key into the form's SSH key textarea and shows
@@ -762,8 +796,12 @@ export class ApiService {
   /**
    * Link a datasource to a project.
    */
-  linkProjectDatasource(projectId: string, datasourceId: string): Observable<{ status: string } | null> {
-    return this.http.post<{ status: string }>(`${this.baseUrl}/projects/${projectId}/datasources/${datasourceId}`, {}).pipe(
+  linkProjectDatasource(
+    projectId: string,
+    datasourceId: string,
+    body: {read_only?: boolean} = {},
+  ): Observable<{ status: string } | null> {
+    return this.http.post<{ status: string }>(`${this.baseUrl}/projects/${projectId}/datasources/${datasourceId}`, body).pipe(
       catchError((error) => {
         console.error(`Failed to link datasource:`, error);
         return of(null);

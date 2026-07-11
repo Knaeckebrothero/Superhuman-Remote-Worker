@@ -1503,6 +1503,84 @@ class TestSetupMemory:
                 )
 
 
+class TestSetupKnowledge:
+    def test_external_only_scope_initializes_store_without_graph(self):
+        session = _make_session()
+        session.project_ids = []
+        session.knowledge_bindings = [MagicMock()]
+        knowledge_store = MagicMock(name="knowledge_store")
+
+        with (
+            patch("src.services.embedding_service.get_kb_embedding_service"),
+            patch(
+                "src.services.knowledge_store.KnowledgeStore",
+                return_value=knowledge_store,
+            ),
+            patch("src.services.knowledge_graph.KnowledgeGraphDB") as graph_cls,
+        ):
+            session._setup_knowledge(MagicMock(name="vector_conn"))
+
+        assert session.knowledge_store is knowledge_store
+        graph_cls.assert_not_called()
+
+    def test_vector_store_is_available_when_graph_connection_fails(self):
+        """Neo4j failure must not hide the pgvector-backed knowledge tools."""
+        session = _make_session()
+        session.project_ids = [str(uuid.uuid4())]
+        vector_conn = MagicMock(name="vector_conn")
+        embedding_service = MagicMock(name="embedding_service")
+        knowledge_store = MagicMock(name="knowledge_store")
+        knowledge_graph = MagicMock(name="knowledge_graph")
+        knowledge_graph.connect.return_value = False
+
+        with (
+            patch(
+                "src.services.embedding_service.get_kb_embedding_service",
+                return_value=embedding_service,
+            ),
+            patch(
+                "src.services.knowledge_store.KnowledgeStore",
+                return_value=knowledge_store,
+            ) as store_cls,
+            patch(
+                "src.services.knowledge_graph.KnowledgeGraphDB",
+                return_value=knowledge_graph,
+            ),
+        ):
+            session._setup_knowledge(vector_conn)
+
+        store_cls.assert_called_once_with(
+            db=vector_conn,
+            embedding_service=embedding_service,
+        )
+        assert session.knowledge_store is knowledge_store
+        assert session._knowledge_graph is None
+        assert session._kb_degraded is False
+
+    def test_embedding_failure_marks_store_degraded(self):
+        session = _make_session()
+        session.project_ids = [str(uuid.uuid4())]
+        knowledge_graph = MagicMock()
+        knowledge_graph.connect.return_value = False
+
+        with (
+            patch(
+                "src.services.embedding_service.get_kb_embedding_service",
+                side_effect=RuntimeError("embedding unavailable"),
+            ),
+            patch("src.core.archiver.audit_unavailable") as audit_unavailable,
+            patch(
+                "src.services.knowledge_graph.KnowledgeGraphDB",
+                return_value=knowledge_graph,
+            ),
+        ):
+            session._setup_knowledge(MagicMock(name="vector_conn"))
+
+        assert session.knowledge_store is None
+        assert session._kb_degraded is True
+        audit_unavailable.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # 2.10 swap_backend()
 # ---------------------------------------------------------------------------

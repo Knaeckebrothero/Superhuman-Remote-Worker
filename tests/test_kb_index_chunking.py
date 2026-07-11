@@ -17,7 +17,9 @@ Covers:
 """
 
 import uuid
-from unittest.mock import AsyncMock
+from contextlib import asynccontextmanager
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -25,6 +27,12 @@ from src.services.knowledge_store import (
     KbWatermark,
     KnowledgeChunk,
     KnowledgeStore,
+)
+
+
+STATUS_MIGRATION = (
+    Path(__file__).parents[1]
+    / "orchestrator/database/migrations/vector/0011_kb_watermark_status.sql"
 )
 
 
@@ -42,6 +50,21 @@ def _make_store():
 
 
 class TestKbWatermarkFromRow:
+    def test_status_migration_adds_operational_fields_and_constraint(self):
+        sql = STATUS_MIGRATION.read_text()
+        for field in (
+            "source_head",
+            "status",
+            "last_attempt_at",
+            "last_success_at",
+            "last_error",
+        ):
+            assert field in sql
+        assert "pending" in sql
+        assert "indexing" in sql
+        assert "partial" in sql
+        assert "failed" in sql
+
     def test_maps_all_fields(self):
         kb = uuid.uuid4()
         wm = KbWatermark.from_row(
@@ -102,6 +125,64 @@ class TestGetWatermark:
         assert await store.get_watermark(uuid.uuid4()) is None
 
 
+class TestReindexAdvisoryLock:
+    @pytest.mark.asyncio
+    async def test_nonblocking_claim_is_released_on_exit(self):
+        conn = AsyncMock()
+        conn.fetchval.side_effect = [True, True]
+        db = MagicMock()
+
+        @asynccontextmanager
+        async def acquire():
+            yield conn
+
+        db.acquire = acquire
+        store = KnowledgeStore(db=db, embedding_service=AsyncMock())
+        kb_id = uuid.uuid4()
+
+        async with store.try_reindex_lock(kb_id) as claimed:
+            assert claimed is True
+
+        assert "pg_try_advisory_lock" in conn.fetchval.await_args_list[0].args[0]
+        assert "pg_advisory_unlock" in conn.fetchval.await_args_list[1].args[0]
+        assert (
+            conn.fetchval.await_args_list[0].args[1]
+            == (conn.fetchval.await_args_list[1].args[1])
+        )
+
+    @pytest.mark.asyncio
+    async def test_blocking_delete_claim_uses_the_same_key_and_releases(self):
+        conn = AsyncMock()
+        transaction = AsyncMock()
+        transaction.__aenter__.return_value = transaction
+        transaction.__aexit__.return_value = False
+        conn.transaction = MagicMock(return_value=transaction)
+        db = MagicMock()
+        acquire_count = 0
+
+        @asynccontextmanager
+        async def acquire():
+            nonlocal acquire_count
+            acquire_count += 1
+            assert acquire_count == 1, "nested pool acquisition would deadlock"
+            yield conn
+
+        db.acquire = acquire
+        store = KnowledgeStore(db=db, embedding_service=None)
+        kb_id = uuid.uuid4()
+
+        async with store.reindex_lock(kb_id) as lock_conn:
+            await store.delete_kb_index(kb_id, conn=lock_conn)
+
+        acquire_call, release_call = conn.fetchval.await_args_list
+        assert acquire_count == 1
+        assert "pg_advisory_lock" in acquire_call.args[0]
+        assert "pg_try_advisory_lock" not in acquire_call.args[0]
+        assert "pg_advisory_unlock" in release_call.args[0]
+        assert acquire_call.args[1] == release_call.args[1]
+        assert conn.execute.await_count == 2
+
+
 # =============================================================================
 # upsert_watermark
 # =============================================================================
@@ -141,6 +222,54 @@ class TestUpsertWatermark:
         )
         query = mock_db.execute.call_args[0][0]
         assert "NOW()" in query
+
+    @pytest.mark.asyncio
+    async def test_status_update_does_not_advance_indexed_commit(self):
+        store, mock_db, _ = _make_store()
+        kb = uuid.uuid4()
+
+        await store.set_watermark_status(
+            kb,
+            "partial",
+            source_head="f" * 40,
+            last_error="one note failed",
+            repo_name=f"datasource:{kb}",
+            branch="main",
+        )
+
+        query, *params = mock_db.execute.await_args.args
+        assert "source_head" in query
+        assert "status" in query
+        assert "indexed_commit" not in query
+        assert "partial" in params
+        assert "one note failed" in params
+
+
+class TestDeleteKbIndex:
+    @pytest.mark.asyncio
+    async def test_deletes_only_one_kb_notes_and_watermark(self):
+        conn = AsyncMock()
+        transaction = AsyncMock()
+        transaction.__aenter__.return_value = transaction
+        transaction.__aexit__.return_value = False
+        conn.transaction = MagicMock(return_value=transaction)
+        db = MagicMock()
+
+        @asynccontextmanager
+        async def acquire():
+            yield conn
+
+        db.acquire = acquire
+        store = KnowledgeStore(db=db, embedding_service=None)
+        kb = uuid.uuid4()
+
+        await store.delete_kb_index(kb)
+
+        first, second = conn.execute.await_args_list
+        assert "knowledge_index WHERE kb_id = $1" in first.args[0]
+        assert "kb_index_watermark WHERE kb_id = $1" in second.args[0]
+        assert first.args[1] == kb
+        assert second.args[1] == kb
 
 
 # =============================================================================
@@ -385,7 +514,7 @@ class TestReplaceNoteChunks:
 
 
 # =============================================================================
-# adopt_legacy_row — claim a pre-slice-3 row by (kb_id, note_id), set its path
+# adopt_legacy_row — claim a legacy row or move a stable id after a Git rename
 # =============================================================================
 
 
@@ -403,14 +532,60 @@ class TestAdoptLegacyRow:
         assert result == row_id
         query, *params = mock_db.fetchval.call_args[0]
         assert "UPDATE knowledge_index" in query
-        assert "path IS NULL" in query  # never steals an already-migrated row
+        assert "path IS DISTINCT FROM $3" in query
+        assert "note.path IS NULL OR note.path = ANY($4::text[])" in query
         assert "project_id = $1" in query
         assert "note_id = $2" in query
-        assert "RETURNING id" in query
+        assert "RETURNING note.id" in query
+        assert "destination.path = $3" in query  # never steals another row
         # sets BOTH kb_id and path on the claimed row
         set_clause = query.split("SET")[1].split("WHERE")[0]
         assert "kb_id" in set_clause and "path" in set_clause
-        assert params == [kb, "chose-jwt", "knowledge/chose-jwt.md"]
+        assert params == [kb, "chose-jwt", "knowledge/chose-jwt.md", []]
+
+    @pytest.mark.asyncio
+    async def test_moves_existing_same_id_row_to_renamed_path(self):
+        """A stable frontmatter id is the identity across a Git path rename."""
+        store, mock_db, _ = _make_store()
+        row_id = uuid.uuid4()
+        mock_db.fetchval.return_value = row_id
+        kb = uuid.uuid4()
+
+        result = await store.adopt_legacy_row(
+            kb,
+            "stable-id",
+            "knowledge/new-name.md",
+            movable_paths=["knowledge/old-name.md"],
+        )
+
+        assert result == row_id
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "note.path IS DISTINCT FROM $3" in query
+        assert "note.path IS NULL OR note.path = ANY($4::text[])" in query
+        assert "NOT EXISTS" in query
+        assert params == [
+            kb,
+            "stable-id",
+            "knowledge/new-name.md",
+            ["knowledge/old-name.md"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_id_cannot_move_a_still_canonical_path(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = None
+        kb = uuid.uuid4()
+
+        await store.adopt_legacy_row(
+            kb,
+            "duplicate-id",
+            "knowledge/second.md",
+            movable_paths=[],
+        )
+
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "note.path IS NULL OR note.path = ANY($4::text[])" in query
+        assert params[-1] == []
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_legacy_row(self):

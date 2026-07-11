@@ -39,6 +39,7 @@ Usage:
 import hashlib
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -75,6 +76,7 @@ class KnowledgeRecord:
     id: Optional[uuid.UUID] = None
     note_id: str = ""
     project_id: Optional[uuid.UUID] = None
+    kb_id: Optional[uuid.UUID] = None
     title: str = ""
     note_type: str = ""
     status: str = "active"
@@ -97,6 +99,7 @@ class KnowledgeRecord:
             id=row.get("id"),
             note_id=row.get("note_id", ""),
             project_id=row.get("project_id"),
+            kb_id=row.get("kb_id") or row.get("project_id"),
             title=row.get("title", ""),
             note_type=row.get("note_type", ""),
             status=row.get("status", "active"),
@@ -129,6 +132,11 @@ class KbWatermark:
     branch: Optional[str] = None
     indexed_commit: Optional[str] = None
     pipeline_version: Optional[str] = None
+    source_head: Optional[str] = None
+    status: str = "ready"
+    last_attempt_at: Optional[datetime] = None
+    last_success_at: Optional[datetime] = None
+    last_error: Optional[str] = None
     updated_at: Optional[datetime] = None
 
     @classmethod
@@ -140,6 +148,11 @@ class KbWatermark:
             branch=row.get("branch"),
             indexed_commit=row.get("indexed_commit"),
             pipeline_version=row.get("pipeline_version"),
+            source_head=row.get("source_head"),
+            status=row.get("status") or "ready",
+            last_attempt_at=row.get("last_attempt_at"),
+            last_success_at=row.get("last_success_at"),
+            last_error=row.get("last_error"),
             updated_at=row.get("updated_at"),
         )
 
@@ -433,6 +446,56 @@ class KnowledgeStore:
         )
         return KbWatermark.from_row(dict(row)) if row else None
 
+    @asynccontextmanager
+    async def try_reindex_lock(self, kb_id: uuid.UUID):
+        """Claim a cross-replica session lock for one KB reindex run.
+
+        The orchestrator already serializes runs inside one process. This lock
+        closes the remaining HA race where an operator request reaches a
+        different replica while the leader sweeper is rebuilding the same KB.
+        It is deliberately a non-blocking claim: callers can report
+        ``already-indexing`` instead of tying up a request or sweep worker.
+        """
+        lock_key = self._reindex_lock_key(kb_id)
+        async with self.db.acquire() as conn:
+            claimed = bool(
+                await conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_key)
+            )
+            try:
+                yield claimed
+            finally:
+                if claimed:
+                    await conn.fetchval("SELECT pg_advisory_unlock($1)", lock_key)
+
+    @asynccontextmanager
+    async def reindex_lock(self, kb_id: uuid.UUID):
+        """Wait for exclusive ownership of one KB's disposable index.
+
+        Reindex requests use :meth:`try_reindex_lock` so an API request or
+        sweep never queues behind another replica. Destructive lifecycle work
+        is different: datasource deletion must wait for an in-flight rebuild
+        to finish before removing the final vector rows. Both contexts derive
+        the same session advisory-lock key, so they coordinate across
+        orchestrator replicas as well as within one process.
+        """
+        lock_key = self._reindex_lock_key(kb_id)
+        async with self.db.acquire() as conn:
+            await conn.fetchval("SELECT pg_advisory_lock($1)", lock_key)
+            try:
+                # Destructive callers must reuse this connection for their
+                # vector transaction. Acquiring a second pool connection while
+                # holding the session lock deadlocks when the pool size is one.
+                yield conn
+            finally:
+                await conn.fetchval("SELECT pg_advisory_unlock($1)", lock_key)
+
+    @staticmethod
+    def _reindex_lock_key(kb_id: uuid.UUID) -> int:
+        """Stable signed bigint key shared by reindex and deletion claims."""
+        return int.from_bytes(
+            hashlib.sha256(kb_id.bytes).digest()[:8], "big", signed=True
+        )
+
     async def upsert_watermark(
         self,
         kb_id: uuid.UUID,
@@ -440,6 +503,10 @@ class KnowledgeStore:
         branch: Optional[str],
         indexed_commit: Optional[str],
         pipeline_version: Optional[str],
+        *,
+        source_head: Optional[str] = None,
+        status: str = "ready",
+        last_error: Optional[str] = None,
     ) -> None:
         """Record (or advance) the as-of commit for a KB's index.
 
@@ -451,13 +518,24 @@ class KnowledgeStore:
         await self.db.execute(
             """
             INSERT INTO kb_index_watermark
-                (kb_id, repo_name, branch, indexed_commit, pipeline_version, updated_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
+                (kb_id, repo_name, branch, indexed_commit, pipeline_version,
+                 source_head, status, last_attempt_at, last_success_at,
+                 last_error, updated_at)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, $4), $7, NOW(),
+                    CASE WHEN $7 = 'ready' THEN NOW() ELSE NULL END, $8, NOW())
             ON CONFLICT (kb_id) DO UPDATE
                SET repo_name = $2,
                    branch = $3,
                    indexed_commit = $4,
                    pipeline_version = $5,
+                   source_head = COALESCE($6, $4),
+                   status = $7,
+                   last_attempt_at = NOW(),
+                   last_success_at = CASE
+                       WHEN $7 = 'ready' THEN NOW()
+                       ELSE kb_index_watermark.last_success_at
+                   END,
+                   last_error = $8,
                    updated_at = NOW()
             """,
             kb_id,
@@ -465,7 +543,72 @@ class KnowledgeStore:
             branch,
             indexed_commit,
             pipeline_version,
+            source_head,
+            status,
+            last_error,
         )
+
+    async def set_watermark_status(
+        self,
+        kb_id: uuid.UUID,
+        status: str,
+        *,
+        source_head: Optional[str] = None,
+        last_error: Optional[str] = None,
+        repo_name: Optional[str] = None,
+        branch: Optional[str] = None,
+        conn: Any = None,
+    ) -> None:
+        """Record an index attempt without advancing ``indexed_commit``."""
+        executor = conn if conn is not None else self.db
+        await executor.execute(
+            """
+            INSERT INTO kb_index_watermark
+                (kb_id, repo_name, branch, source_head, status,
+                 last_attempt_at, last_error, updated_at)
+            VALUES ($1, $2, $3, $4, $5, NOW(), $6, NOW())
+            ON CONFLICT (kb_id) DO UPDATE
+               SET repo_name = COALESCE($2, kb_index_watermark.repo_name),
+                   branch = COALESCE($3, kb_index_watermark.branch),
+                   source_head = COALESCE($4, kb_index_watermark.source_head),
+                   status = $5,
+                   last_attempt_at = NOW(),
+                   last_error = $6,
+                   updated_at = NOW()
+            """,
+            kb_id,
+            repo_name,
+            branch,
+            source_head,
+            status,
+            last_error,
+        )
+
+    async def delete_kb_index(self, kb_id: uuid.UUID, *, conn: Any = None) -> None:
+        """Delete one disposable KB index; chunk/link rows cascade.
+
+        ``conn`` is supplied by :meth:`reindex_lock` for coordinated datasource
+        deletion so the session advisory lock and cleanup transaction share one
+        pool connection. Standalone callers retain the normal acquire path.
+        """
+
+        async def delete_with_connection(active_conn: Any) -> None:
+            async with active_conn.transaction():
+                await active_conn.execute(
+                    "DELETE FROM knowledge_index WHERE kb_id = $1",
+                    kb_id,
+                )
+                await active_conn.execute(
+                    "DELETE FROM kb_index_watermark WHERE kb_id = $1",
+                    kb_id,
+                )
+
+        if conn is not None:
+            await delete_with_connection(conn)
+            return
+
+        async with self.db.acquire() as acquired_conn:
+            await delete_with_connection(acquired_conn)
 
     async def get_indexed_blob_shas(self, kb_id: uuid.UUID) -> Dict[str, str]:
         """``{path: blob_sha}`` for every indexed note in a KB.
@@ -484,9 +627,14 @@ class KnowledgeStore:
         return {r["path"]: r["blob_sha"] for r in rows}
 
     async def adopt_legacy_row(
-        self, kb_id: uuid.UUID, note_id: str, path: str
+        self,
+        kb_id: uuid.UUID,
+        note_id: str,
+        path: str,
+        *,
+        movable_paths: Optional[List[str]] = None,
     ) -> Optional[uuid.UUID]:
-        """Claim a pre-slice-3 row for the files-canonical index.
+        """Claim a pre-slice-3 row or move a stable note id to its new path.
 
         Legacy rows (written by the DB-first ``upsert_note`` path) carry
         ``(project_id, note_id)`` but no ``path``. A reindex INSERT for the same
@@ -495,19 +643,40 @@ class KnowledgeStore:
         unique constraint. So the reindexer first adopts: set ``kb_id`` + ``path``
         on the pathless row (project-scoped KB: ``project_id`` doubles as the kb
         id), after which :meth:`upsert_kb_note` hits the ``(kb_id, path)`` arbiter
-        normally. ``path IS NULL`` guards against stealing an already-migrated
-        row. Returns the adopted row id, or ``None`` when there is no legacy row.
+        normally.
+
+        The same identity-first update also handles a Git rename whose OKF
+        frontmatter keeps the same ``id`` when the old path is in this run's
+        deletion set: move that existing row before the path-keyed upsert,
+        otherwise the old row still owns the unique ``(project_id, note_id)``
+        key and the first rename pass fails. Requiring an explicitly movable old
+        path prevents a second file with a duplicate frontmatter id from
+        stealing the still-canonical row. The destination guard likewise leaves
+        path replacement/collision handling to the normal path-keyed upsert.
+        Returns the adopted/moved row id, or ``None`` when no row was eligible.
         """
+        movable_paths = movable_paths or []
         return await self.db.fetchval(
             """
-            UPDATE knowledge_index
+            UPDATE knowledge_index AS note
             SET kb_id = $1, path = $3
-            WHERE project_id = $1 AND note_id = $2 AND path IS NULL
-            RETURNING id
+            WHERE note.project_id = $1
+              AND note.note_id = $2
+              AND note.path IS DISTINCT FROM $3
+              AND (note.path IS NULL OR note.path = ANY($4::text[]))
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM knowledge_index AS destination
+                  WHERE destination.kb_id = $1
+                    AND destination.path = $3
+                    AND destination.id <> note.id
+              )
+            RETURNING note.id
             """,
             kb_id,
             note_id,
             path,
+            movable_paths,
         )
 
     async def upsert_kb_note(
@@ -1347,12 +1516,15 @@ class KnowledgeStore:
     # =========================================================================
 
     @staticmethod
-    def format_note(note: KnowledgeRecord, index: int) -> str:
+    def format_note(
+        note: KnowledgeRecord, index: int, source_alias: Optional[str] = None
+    ) -> str:
         """Format a single note for context injection.
 
         Args:
             note: KnowledgeRecord to format
             index: Display index (1-based)
+            source_alias: Optional qualified KB alias for multi-KB injection
 
         Returns:
             Formatted note string
@@ -1373,6 +1545,13 @@ class KnowledgeStore:
         if len(content) > 500:
             content = content[:497] + "..."
 
+        if source_alias:
+            handle = f"{source_alias}:{note.note_id}"
+            title = note.title or note.note_id
+            return (
+                f"[{index}] [{source_alias}] {handle} — {title} "
+                f"({meta}){links}\n{content}"
+            )
         return f"[{index}] ({meta}){links}\n{content}"
 
     @classmethod
@@ -1380,6 +1559,8 @@ class KnowledgeStore:
         cls,
         notes: List[KnowledgeRecord],
         model: Optional[str] = None,
+        bindings: Optional[List[Any]] = None,
+        external_watermarks: Optional[Dict[str, Optional[str]]] = None,
     ) -> str:
         """Assemble formatted knowledge block for context injection.
 
@@ -1387,6 +1568,8 @@ class KnowledgeStore:
             notes: List of KnowledgeRecord objects
             model: Model id used to resolve family-specific block headers
                 / footer. Falls through to the default family if None.
+            bindings: Optional authorized KB bindings used to source-label notes.
+            external_watermarks: External alias → indexed commit used by retrieval.
 
         Returns:
             Formatted knowledge block string
@@ -1396,20 +1579,29 @@ class KnowledgeStore:
 
         from src.services.guardrails import format_nudge
 
+        binding_by_id = {str(binding.kb_id): binding for binding in (bindings or [])}
         lines = [format_nudge("knowledge_block_header", model=model), ""]
         for i, note in enumerate(notes, 1):
-            lines.append(cls.format_note(note, i))
+            kb_id = getattr(note, "kb_id", None) or getattr(note, "project_id", None)
+            binding = binding_by_id.get(str(kb_id))
+            source_alias = binding.alias if binding is not None else None
+            lines.append(cls.format_note(note, i, source_alias=source_alias))
             lines.append("")
 
         tokens_est = sum(len(n.content) // 4 for n in notes)
-        lines.append(
-            format_nudge(
-                "knowledge_block_footer",
-                model=model,
-                count=len(notes),
-                tokens=f"{tokens_est:,}",
-            )
+        footer = format_nudge(
+            "knowledge_block_footer",
+            model=model,
+            count=len(notes),
+            tokens=f"{tokens_est:,}",
         )
+        if external_watermarks:
+            snapshots = ", ".join(
+                f"[{alias}] {(commit or 'unavailable')}"
+                for alias, commit in external_watermarks.items()
+            )
+            footer += f"\nExternal snapshots (as of): {snapshots}"
+        lines.append(footer)
         return "\n".join(lines)
 
 

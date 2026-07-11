@@ -90,6 +90,14 @@ def process_datasources(
                 "clone_repository_datasources().",
                 ds.get("name", "unnamed"),
             )
+        elif ds_type == "kb":
+            # External OKF KBs are centrally indexed. The agent receives only
+            # datasource id/display/config metadata and never opens a connector
+            # or clones the repository.
+            logger.debug(
+                "OKF Knowledge Base %r handled by KnowledgeStore bindings",
+                ds.get("name", "unnamed"),
+            )
         else:
             is_read_only = ds.get("project_read_only", False)
             if not is_read_only and ds_type in ("postgresql", "neo4j", "mongodb"):
@@ -829,6 +837,7 @@ def inject_datasource_index(
 
     # Group by category for readable output
     repos = [ds for ds in ds_configs if ds.get("type") == "repository"]
+    knowledge_bases = [ds for ds in ds_configs if ds.get("type") == "kb"]
     databases = [
         ds for ds in ds_configs if ds.get("type") in ("postgresql", "neo4j", "mongodb")
     ]
@@ -839,6 +848,7 @@ def inject_datasource_index(
         if ds.get("type")
         not in (
             "repository",
+            "kb",
             "postgresql",
             "neo4j",
             "mongodb",
@@ -856,6 +866,18 @@ def inject_datasource_index(
             lines.append(
                 f"- **{ds.get('name')}** — cloned at `./repos/{clone_name}/`, "
                 f"git pre-authenticated"
+            )
+        lines.append("")
+
+    if knowledge_bases:
+        lines.append("### OKF Knowledge Bases")
+        for ds in knowledge_bases:
+            name = ds.get("name", "Unnamed")
+            root = str((ds.get("config") or {}).get("root_path") or "")
+            root_hint = f", root `{root}`" if root else ""
+            lines.append(
+                f"- **{name}** (centrally indexed, read-only{root_hint}) — "
+                "use `kb_search`, `kb_list`, and `kb_read`"
             )
         lines.append("")
 

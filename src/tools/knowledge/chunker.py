@@ -234,15 +234,44 @@ def build_embed_text(
 
 
 def embedding_version(
-    model: str, dimensions: int, chunker_version: str = CHUNKER_VERSION
+    model: str,
+    dimensions: int,
+    chunker_version: str = CHUNKER_VERSION,
+    profile_fingerprint: Optional[str] = None,
 ) -> str:
-    """The pipeline stamp written on every embedded row (``model:dims:chunker``).
+    """The pipeline stamp written on every embedded row.
 
     Retrieval filters ``WHERE embedding_version = current`` so mixed-model or
-    mixed-chunker vectors can't silently drift into the same result set. Any of
-    the three components changing = a new version = a per-KB rebuild.
+    mixed-chunker vectors can't silently drift into the same result set. The
+    optional profile fingerprint distinguishes the same model label served by
+    another provider/catalog endpoint. Any component changing means a per-KB
+    rebuild.
     """
-    return f"{model}:{dimensions}:{chunker_version}"
+    stamp = f"{model}:{dimensions}:{chunker_version}"
+    if profile_fingerprint:
+        stamp = f"{stamp}:{profile_fingerprint}"
+    return stamp
+
+
+def embedding_version_for_service(
+    embedding_service: Any, chunker_version: str = CHUNKER_VERSION
+) -> str:
+    """Build the row/query stamp from one effective embedding service.
+
+    Keeping this resolution in one helper prevents central indexing and agent
+    query filtering from accidentally using different profile identities.
+    Test doubles and older service implementations without a fingerprint retain
+    the legacy three-component stamp.
+    """
+    fingerprint = getattr(embedding_service, "profile_fingerprint", None)
+    if not isinstance(fingerprint, str):
+        fingerprint = None
+    return embedding_version(
+        embedding_service.model,
+        embedding_service.expected_dimensions,
+        chunker_version,
+        fingerprint,
+    )
 
 
 def note_centroid(embeddings: List[List[float]]) -> Optional[List[float]]:
@@ -285,9 +314,7 @@ async def embed_note_chunks(
     call) but still returns the version so the caller can stamp the — now
     chunk-less — note row consistently.
     """
-    version = embedding_version(
-        embedding_service.model, embedding_service.expected_dimensions, chunker_version
-    )
+    version = embedding_version_for_service(embedding_service, chunker_version)
     chunks = chunk_note(body, target_tokens=target_tokens, token_counter=token_counter)
     if not chunks:
         return [], version

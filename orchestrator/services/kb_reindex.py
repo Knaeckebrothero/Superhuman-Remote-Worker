@@ -18,16 +18,18 @@ sweeper, the MCP operator hatch) stay thin.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import posixpath
 import re
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from src.tools.knowledge.chunker import (
     embed_note_chunks,
-    embedding_version,
+    embedding_version_for_service,
     note_centroid,
 )
 
@@ -46,6 +48,11 @@ SWEEP_TICK_SECONDS = int(os.getenv("KB_REINDEX_SWEEP_SECONDS", "900"))
 
 # The vault root within a project's jobs repo (slice 1 dual-write target).
 KNOWLEDGE_PREFIX = "knowledge/"
+
+# Bump when OKF parsing semantics change independently of the chunker. The
+# watermark pipeline stamp also includes the normalized root, while chunk rows
+# retain the embedding-only version used to filter query vectors.
+OKF_PARSER_VERSION = "okf-parser-v1"
 
 # OKF reserved filenames — generated navigation/history, never indexed
 # (mirrors gardener._RESERVED; index.md carries no frontmatter by spec).
@@ -77,7 +84,22 @@ _CONFIDENCE_MAX = 20
 _H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
 
 
-def knowledge_blob_map(tree: List[Dict[str, str]]) -> Dict[str, str]:
+def normalize_root_path(root_path: Optional[str]) -> str:
+    """Normalize an already-validated repository-relative OKF root."""
+    root = str(root_path or "").strip().replace("\\", "/").strip("/")
+    return "/".join(part for part in root.split("/") if part not in ("", "."))
+
+
+def reindex_pipeline_version(embedding_stamp: str, root_path: Optional[str]) -> str:
+    """Watermark stamp for embedding, parser, and root-path semantics."""
+    root = normalize_root_path(root_path)
+    scope = hashlib.sha256(f"{OKF_PARSER_VERSION}\0{root}".encode()).hexdigest()[:12]
+    return f"{embedding_stamp}:{OKF_PARSER_VERSION}:{scope}"
+
+
+def knowledge_blob_map(
+    tree: List[Dict[str, str]], root_path: Optional[str] = "knowledge"
+) -> Dict[str, str]:
     """Filter a recursive ``list_tree`` result to indexable knowledge notes.
 
     Keeps ``knowledge/**/*.md`` blobs, drops the reserved generated files
@@ -85,12 +107,16 @@ def knowledge_blob_map(tree: List[Dict[str, str]]) -> Dict[str, str]:
     ``KnowledgeStore.get_indexed_blob_shas`` returns, so the two sides diff
     directly.
     """
+    root = normalize_root_path(root_path)
+    prefix = f"{root}/" if root else ""
     result: Dict[str, str] = {}
     for entry in tree:
         if entry.get("type") != "blob":
             continue
         path = str(entry.get("path", ""))
-        if not path.startswith(KNOWLEDGE_PREFIX) or not path.endswith(".md"):
+        if prefix and not path.startswith(prefix):
+            continue
+        if not path.endswith(".md"):
             continue
         if posixpath.basename(path) in _RESERVED_BASENAMES:
             continue
@@ -185,15 +211,92 @@ def _kb_lock(kb_id: uuid.UUID) -> asyncio.Lock:
     return _kb_locks.setdefault(kb_id, asyncio.Lock())
 
 
+@asynccontextmanager
+async def kb_index_lock(store: Any, kb_id: uuid.UUID, *, wait: bool = False):
+    """Serialize all mutations of one KB index locally and across replicas.
+
+    Routine reindex requests use the non-blocking advisory claim and report
+    ``already-indexing`` when another replica owns it. Datasource deletion uses
+    ``wait=True`` because it must run *after* any mutation already in flight and
+    keep the claim until both vector cleanup and app-row deletion are complete.
+
+    Narrow mock stores used by legacy unit tests have neither concrete lock
+    method; they still receive the in-process serialization contract.
+    """
+    async with _kb_lock(kb_id):
+        if wait:
+            lock_method = getattr(type(store), "reindex_lock", None)
+            if lock_method is not None:
+                async with store.reindex_lock(kb_id) as conn:
+                    yield conn
+                return
+            yield None
+            return
+
+        claim_method = getattr(type(store), "try_reindex_lock", None)
+        if claim_method is not None:
+            async with store.try_reindex_lock(kb_id) as claimed:
+                yield bool(claimed)
+            return
+        yield True
+
+
+def _empty_summary(
+    status: str,
+    *,
+    errors: int = 0,
+    indexed_commit: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "indexed_commit": indexed_commit,
+        "full": False,
+        "upserted": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "errors": errors,
+    }
+
+
+async def _set_reindex_status(
+    store: Any,
+    kb_id: uuid.UUID,
+    status: str,
+    *,
+    source_label: str,
+    branch: Optional[str],
+    source_head: Optional[str] = None,
+    last_error: Optional[str] = None,
+) -> None:
+    """Best-effort operational state; never compromise index durability."""
+    try:
+        await store.set_watermark_status(
+            kb_id,
+            status,
+            source_head=source_head,
+            last_error=(last_error or "")[:2000] or None,
+            repo_name=source_label[:255],
+            branch=(branch or "")[:255] or None,
+        )
+    except Exception as exc:
+        logger.warning("kb_reindex[%s]: status update skipped: %s", kb_id, exc)
+
+
 async def reindex_kb(
     *,
-    gitea_client: Any,
     store: Any,
     embedding_service: Any,
     kb_id: uuid.UUID,
-    repo_name: str,
-    branch: str = "main",
+    source: Any = None,
+    root_path: Optional[str] = None,
+    source_label: Optional[str] = None,
+    # Legacy native-project arguments. They remain supported so post-merge,
+    # MCP, and existing callers can migrate independently.
+    gitea_client: Any = None,
+    repo_name: Optional[str] = None,
+    branch: Optional[str] = "main",
     force_full: bool = False,
+    is_active: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> Dict[str, Any]:
     """Bring a KB's chunk-granular index up to the repo's HEAD.
 
@@ -220,59 +323,116 @@ async def reindex_kb(
     longer exists are invisible to the diff and left for the offline frontmatter
     audit (§11 migration-hygiene gate).
 
-    Runs are serialized per KB (see :func:`_kb_lock`); distinct KBs proceed
+    Runs are serialized per KB (see :func:`kb_index_lock`); distinct KBs proceed
     concurrently.
 
     Returns a summary dict: ``status`` (``no-head`` / ``up-to-date`` /
-    ``tree-fetch-failed`` / ``completed`` / ``partial``), ``indexed_commit``,
-    ``full``, ``upserted``, ``deleted``, ``skipped``, ``errors``.
+    ``tree-fetch-failed`` / ``completed`` / ``partial`` / ``source-deleted``),
+    ``indexed_commit``, ``full``, ``upserted``, ``deleted``, ``skipped``,
+    ``errors``.
     """
-    async with _kb_lock(kb_id):
+    if source is None:
+        if gitea_client is None or not repo_name:
+            raise ValueError("reindex_kb requires a git source")
+        from .kb_git_source import GiteaKnowledgeGitSource
+
+        source = GiteaKnowledgeGitSource(
+            gitea_client,
+            repo_name,
+            branch=branch or "main",
+            label=source_label or repo_name,
+        )
+        if root_path is None:
+            root_path = "knowledge"
+    elif root_path is None:
+        root_path = ""
+
+    label = str(source_label or source.label or "knowledge-repository")
+    normalized_root = normalize_root_path(root_path)
+
+    async with kb_index_lock(store, kb_id) as claimed:
+        if not claimed:
+            return _empty_summary("already-indexing")
+        # External datasource work lists can become stale while they wait for
+        # an in-flight rebuild or deletion. Re-check application ownership only
+        # after both mutation locks are held, before even writing a status row.
+        if is_active is not None and not await is_active():
+            return _empty_summary("source-deleted")
         return await _reindex_kb_unlocked(
-            gitea_client=gitea_client,
+            source=source,
             store=store,
             embedding_service=embedding_service,
             kb_id=kb_id,
-            repo_name=repo_name,
+            source_label=label,
             branch=branch,
+            root_path=normalized_root,
             force_full=force_full,
         )
 
 
 async def _reindex_kb_unlocked(
     *,
-    gitea_client: Any,
+    source: Any,
     store: Any,
     embedding_service: Any,
     kb_id: uuid.UUID,
-    repo_name: str,
-    branch: str = "main",
+    source_label: str,
+    branch: Optional[str],
+    root_path: str,
     force_full: bool = False,
 ) -> Dict[str, Any]:
     """The reindex cycle body — call through :func:`reindex_kb` (per-KB lock)."""
-    head = await gitea_client.get_branch_head_sha(repo_name, branch)
-    if not head:
-        logger.warning("kb_reindex[%s]: no HEAD for %s@%s", kb_id, repo_name, branch)
-        return {
-            "status": "no-head",
-            "indexed_commit": None,
-            "full": False,
-            "upserted": 0,
-            "deleted": 0,
-            "skipped": 0,
-            "errors": 0,
-        }
-
-    current_version = embedding_version(
-        embedding_service.model, embedding_service.expected_dimensions
-    )
+    # Read the durable as-of marker before contacting the source. Every failure
+    # summary must report the commit the index still covers, never the uncommitted
+    # source HEAD (or a misleading None when a prior usable snapshot exists).
     wm = await store.get_watermark(kb_id)
+    previous_indexed_commit = wm.indexed_commit if wm is not None else None
+    try:
+        head = await source.get_head()
+    except Exception as exc:
+        detail = str(exc)[-2000:] or "Git HEAD read failed"
+        await _set_reindex_status(
+            store,
+            kb_id,
+            "failed",
+            source_label=source_label,
+            branch=branch,
+            last_error=detail,
+        )
+        logger.warning(
+            "kb_reindex[%s]: HEAD read failed for %s: %s", kb_id, source_label, detail
+        )
+        return _empty_summary(
+            "source-failed", errors=1, indexed_commit=previous_indexed_commit
+        )
+    if not head:
+        await _set_reindex_status(
+            store,
+            kb_id,
+            "failed",
+            source_label=source_label,
+            branch=branch,
+            last_error="Repository branch has no resolvable HEAD",
+        )
+        logger.warning("kb_reindex[%s]: no HEAD for %s", kb_id, source_label)
+        return _empty_summary("no-head", indexed_commit=previous_indexed_commit)
+
+    embedding_stamp = embedding_version_for_service(embedding_service)
+    current_version = reindex_pipeline_version(embedding_stamp, root_path)
     if (
         wm is not None
         and wm.indexed_commit == head
         and wm.pipeline_version == current_version
         and not force_full
     ):
+        await _set_reindex_status(
+            store,
+            kb_id,
+            "ready",
+            source_label=source_label,
+            branch=branch,
+            source_head=head,
+        )
         return {
             "status": "up-to-date",
             "indexed_commit": head,
@@ -285,27 +445,102 @@ async def _reindex_kb_unlocked(
 
     full = force_full or wm is None or wm.pipeline_version != current_version
 
-    tree = await gitea_client.list_tree(repo_name, head)
-    if tree is None:
+    await _set_reindex_status(
+        store,
+        kb_id,
+        "indexing",
+        source_label=source_label,
+        branch=branch,
+        source_head=head,
+    )
+    try:
+        async with source.snapshot(head) as snapshot:
+            return await _reindex_snapshot(
+                snapshot=snapshot,
+                store=store,
+                embedding_service=embedding_service,
+                kb_id=kb_id,
+                source_label=source_label,
+                branch=branch,
+                root_path=root_path,
+                head=head,
+                embedding_stamp=embedding_stamp,
+                pipeline_version=current_version,
+                full=full,
+                previous_indexed_commit=previous_indexed_commit,
+            )
+    except Exception as exc:
+        detail = str(exc)[-2000:] or "Git snapshot failed"
+        await _set_reindex_status(
+            store,
+            kb_id,
+            "failed",
+            source_label=source_label,
+            branch=branch,
+            source_head=head,
+            last_error=detail,
+        )
+        logger.warning(
+            "kb_reindex[%s]: snapshot failed for %s: %s",
+            kb_id,
+            source_label,
+            detail,
+        )
+        return _empty_summary(
+            "source-failed", errors=1, indexed_commit=previous_indexed_commit
+        )
+
+
+async def _reindex_snapshot(
+    *,
+    snapshot: Any,
+    store: Any,
+    embedding_service: Any,
+    kb_id: uuid.UUID,
+    source_label: str,
+    branch: Optional[str],
+    root_path: str,
+    head: str,
+    embedding_stamp: str,
+    pipeline_version: str,
+    full: bool,
+    previous_indexed_commit: Optional[str],
+) -> Dict[str, Any]:
+    """Index one immutable source snapshot, which owns all blob reads."""
+
+    try:
+        tree = await snapshot.list_tree()
+    except Exception as exc:
+        detail = str(exc)[-2000:] or "Git tree read failed"
+        await _set_reindex_status(
+            store,
+            kb_id,
+            "failed",
+            source_label=source_label,
+            branch=branch,
+            source_head=head,
+            last_error=detail,
+        )
         logger.warning("kb_reindex[%s]: tree fetch failed at %s", kb_id, head)
         return {
             "status": "tree-fetch-failed",
-            "indexed_commit": None,
+            "indexed_commit": previous_indexed_commit,
             "full": full,
             "upserted": 0,
             "deleted": 0,
             "skipped": 0,
-            "errors": 0,
+            "errors": 1,
         }
 
-    current_map = knowledge_blob_map(tree)
+    current_map = knowledge_blob_map(tree, root_path)
     indexed_map = await store.get_indexed_blob_shas(kb_id)
     upsert_paths, delete_paths = plan_reindex(indexed_map, current_map, full=full)
 
     upserted = skipped = errors = 0
+    invalid_paths: List[str] = []
     for path in upsert_paths:
         try:
-            text = await gitea_client.get_file_content(repo_name, path, ref=head)
+            text = await snapshot.get_file(path)
             if text is None:
                 logger.warning("kb_reindex[%s]: fetch failed for %s", kb_id, path)
                 errors += 1
@@ -314,7 +549,11 @@ async def _reindex_kb_unlocked(
                 fm, body = parse_note_md(text)
             except ValueError as exc:
                 # Malformed frontmatter — lint's problem, not the reindexer's.
+                # Remove any prior indexed version of this path: serving stale
+                # content after the canonical file became invalid would be less
+                # honest than omitting it until a later commit repairs the note.
                 logger.warning("kb_reindex[%s]: skipping %s: %s", kb_id, path, exc)
+                invalid_paths.append(path)
                 skipped += 1
                 continue
             fields = note_fields(path, fm, body)
@@ -327,9 +566,15 @@ async def _reindex_kb_unlocked(
                 tags=fields["tags"],
                 embedding_service=embedding_service,
             )
-            # Claim any pre-slice-3 row for this slug so the (kb_id, path)
-            # upsert can't unique-violate on uq_knowledge_project_note.
-            await store.adopt_legacy_row(kb_id, fields["note_id"], path)
+            # Claim a pre-slice-3 row or move the stable OKF id on a Git rename,
+            # so the path-keyed upsert cannot collide with the old row's
+            # uq_knowledge_project_note identity.
+            await store.adopt_legacy_row(
+                kb_id,
+                fields["note_id"],
+                path,
+                movable_paths=delete_paths,
+            )
             # Upsert UNSTAMPED (blob_sha/embedding_version NULL): the stamp
             # means "chunks durable" and lands only after replace_note_chunks,
             # so a chunk-write failure keeps the note in the next run's diff.
@@ -352,7 +597,7 @@ async def _reindex_kb_unlocked(
                 note_row=note_row,
                 kb_id=kb_id,
                 chunks=chunk_rows,
-                embedding_version=current_version,
+                embedding_version=embedding_stamp,
             )
             # Rewrite the note's outbound link edges (the kg-less kb_related
             # backend). Before the stamp, so a link-write failure keeps the note
@@ -369,7 +614,7 @@ async def _reindex_kb_unlocked(
             # reindexed notes again.
             centroid = note_centroid([c["embedding"] for c in chunk_rows])
             await store.stamp_note_indexed(
-                note_row, current_map[path], current_version, centroid=centroid
+                note_row, current_map[path], embedding_stamp, centroid=centroid
             )
             upserted += 1
         except Exception as exc:
@@ -377,7 +622,7 @@ async def _reindex_kb_unlocked(
             errors += 1
 
     deleted = 0
-    for path in delete_paths:
+    for path in sorted(set(delete_paths + invalid_paths)):
         try:
             if await store.delete_kb_note(kb_id, path):
                 deleted += 1
@@ -402,14 +647,26 @@ async def _reindex_kb_unlocked(
     if errors == 0:
         await store.upsert_watermark(
             kb_id=kb_id,
-            repo_name=repo_name,
+            repo_name=source_label[:255],
             branch=branch,
             indexed_commit=head,
-            pipeline_version=current_version,
+            pipeline_version=pipeline_version,
+            source_head=head,
+            status="ready",
+            last_error=None,
         )
         status = "completed"
     else:
         status = "partial"
+        await _set_reindex_status(
+            store,
+            kb_id,
+            "partial",
+            source_label=source_label,
+            branch=branch,
+            source_head=head,
+            last_error=f"{errors} note operation(s) failed; retry scheduled",
+        )
 
     logger.info(
         "kb_reindex[%s]: %s at %s (full=%s upserted=%d deleted=%d "
@@ -426,7 +683,7 @@ async def _reindex_kb_unlocked(
     )
     return {
         "status": status,
-        "indexed_commit": head,
+        "indexed_commit": head if errors == 0 else previous_indexed_commit,
         "full": full,
         "upserted": upserted,
         "deleted": deleted,
@@ -460,7 +717,7 @@ async def kb_sweep_tick(
     embedding_service: Any,
     reindex_fn: Callable[..., Awaitable[Dict[str, Any]]] = reindex_kb,
 ) -> int:
-    """One sweep: bring every project KB index up to its repo HEAD.
+    """One sweep: refresh native project and external datasource KBs.
 
     The work list is every jobs-role project repo. Per-KB failures are logged
     and skipped — one broken repo must not starve the rest. Returns the number
@@ -490,6 +747,49 @@ async def kb_sweep_tick(
                 worked += 1
         except Exception:
             logger.exception("kb_sweep: reindex failed for project %s", project_id)
+    # External KB datasources are indexed once under datasources.id, regardless
+    # of how many projects/jobs select them. ``list_datasources`` decrypts the
+    # credential field only inside this orchestrator process; the source keeps
+    # those credentials out of argv, logs, status, and agent payloads.
+    try:
+        external_rows = await postgres_db.list_datasources(ds_type="kb", limit=10000)
+    except Exception:
+        logger.exception("kb_sweep: failed to enumerate external KB datasources")
+        external_rows = []
+    if not isinstance(external_rows, (list, tuple)):
+        external_rows = []  # compatibility with narrow/mocked DB facades
+
+    if external_rows:
+        from .kb_datasources import reindex_kb_datasource
+
+    for datasource in external_rows:
+        datasource_id = datasource.get("id")
+        try:
+
+            async def datasource_is_active(
+                datasource_id: Any = datasource_id,
+            ) -> bool:
+                current = await postgres_db.get_datasource(str(datasource_id))
+                return bool(current and current.get("type") == "kb")
+
+            result = await reindex_kb_datasource(
+                datasource,
+                store=store,
+                embedding_service=embedding_service,
+                is_active=datasource_is_active,
+                reindex_fn=reindex_fn,
+            )
+            if result.get("status") not in (
+                "up-to-date",
+                "no-head",
+                "already-indexing",
+                "source-deleted",
+            ):
+                worked += 1
+        except Exception:
+            logger.exception(
+                "kb_sweep: reindex failed for datasource %s", datasource_id
+            )
     return worked
 
 
