@@ -76,6 +76,47 @@ def detect_cloud_scan_risk(command: str) -> CloudScanRisk | None:
     return None
 
 
+def detect_cloud_delete_risk(command: str) -> CloudScanRisk | None:
+    """Flag broad deletes over a cloud mount.
+
+    Over a capture overlay, ``rm -rf`` is O(files) cold backend round-trips and
+    can download full file bodies just to whiteout them (design §11.1). Catch
+    recursive ``rm`` and ``find ... -delete`` pointed at a cloud path; a single
+    ``rm file`` (no -r) is cheap enough to allow.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        if _mentions_cloud_path(command):
+            return CloudScanRisk(
+                "delete command mentions a cloud mount but cannot be parsed safely"
+            )
+        return None
+    if not argv or not _argv_touches_cloud(argv):
+        return None
+    name = _base_command(argv)
+    if name == "rm" and _has_recursive_flag(argv):
+        return CloudScanRisk(
+            "recursive rm over a cloud mount whiteouts each file (O(files) backend round-trips)"
+        )
+    if name == "find" and _contains_any(argv, {"-delete"}):
+        return CloudScanRisk("find -delete over a cloud mount whiteouts matches one by one")
+    return None
+
+
+def format_cloud_delete_guard_message(command: str, risk: CloudScanRisk) -> str:
+    return (
+        "Cloud delete guard: this command was not run because a broad delete "
+        "over cloud storage is expensive under the capture overlay.\n"
+        f"Reason: {risk.reason}.\n"
+        f"Command: {command}\n\n"
+        "In protected mode a delete is STAGED (the cloud is untouched until you "
+        "apply the diff), but whiteouting each file still costs a backend "
+        "round-trip and may download its body first. Narrow the path, delete "
+        "specific files, or confirm with the operator before a bulk delete."
+    )
+
+
 def command_touches_cloud_mount(command: str) -> bool:
     """Return True when an argv-parsable command names a cloud mount path."""
     try:
