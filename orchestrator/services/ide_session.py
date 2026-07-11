@@ -164,6 +164,16 @@ class IdeSessionService:
                 "error": session_ctx.get("error"),
             }
 
+        # Topology gate verdict is terminal: the snapshot may exist, but the
+        # restore can never succeed here — surface the error instead of
+        # re-offering a doomed retry (which would poll to the 5-min cap).
+        if session_status == "unavailable":
+            return {
+                "status": "unavailable",
+                "code_server_url": None,
+                "error": session_ctx.get("error"),
+            }
+
         # 3. Check for available snapshot
         if snapshot_ctx.get("status") == "available":
             return {
@@ -217,7 +227,10 @@ class IdeSessionService:
         if current["status"] == "restoring":
             return current
         if current["status"] == "unavailable":
-            return {"status": "unavailable", "error": "No snapshot or repo available"}
+            return {
+                "status": "unavailable",
+                "error": current.get("error") or "No snapshot or repo available",
+            }
 
         job = await self._get_job(job_id)
         if not job:
@@ -230,7 +243,9 @@ class IdeSessionService:
         # Determine restore method
         if snapshot_ctx.get("status") == "available":
             source = "snapshot"
-            estimated_seconds = 30 if snapshot_type == "pod" else _VM_READY_TIMEOUT_SECONDS
+            estimated_seconds = (
+                30 if snapshot_type == "pod" else _VM_READY_TIMEOUT_SECONDS
+            )
         elif job.get("repo_name"):
             source = "gitea"
             estimated_seconds = 45
@@ -427,7 +442,10 @@ class IdeSessionService:
                     return
 
                 restored = False
-                if self._container_provisioner and self._container_provisioner.is_available:
+                if (
+                    self._container_provisioner
+                    and self._container_provisioner.is_available
+                ):
                     restored = await self._restore_snapshot_container(job_id, job)
 
                 if not restored:
@@ -445,6 +463,13 @@ class IdeSessionService:
                     logger.warning(
                         "Pod snapshot restore failed for job %s; falling back to Gitea clone",
                         job_id,
+                    )
+                    # Clear the failed verdict before the fallback runs, or the
+                    # cockpit's 3s poll sees 'failed' mid-fallback and reports
+                    # an error for a session that may still come up.
+                    await self._set_session_context(
+                        job_id,
+                        {"status": "restoring", "error": None},
                     )
                     await self._restore_gitea_container(job_id, job)
             else:
@@ -585,9 +610,7 @@ class IdeSessionService:
 
         # Route to K8s or local container path
         if self._container_provisioner and self._container_provisioner.is_available:
-            return await self._restore_k8s_ide_container(
-                job_id, job, repo_name, branch
-            )
+            return await self._restore_k8s_ide_container(job_id, job, repo_name, branch)
         else:
             return await self._restore_local_ide_container(job_id, repo_name, branch)
 
@@ -838,9 +861,8 @@ class IdeSessionService:
             },
         )
 
-        if (
-            not self._container_provisioner
-            or not getattr(self._container_provisioner, "is_available", True)
+        if not self._container_provisioner or not getattr(
+            self._container_provisioner, "is_available", True
         ):
             await self._set_session_context(
                 job_id,
