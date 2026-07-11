@@ -270,9 +270,12 @@
     "snapshotsSummary": "{{count}} Snapshots · {{size}}",
     "count": "Zeige {{filtered}} von {{total}} Aufträgen",
     "colJob": "Auftrag",
+    "colProject": "Projekt",
     "colStatus": "Status",
     "colCreated": "Erstellt",
     "colActions": "Aktionen",
+    "projectNone": "Kein Projekt",
+    "projectUnknown": "Unbekanntes Projekt",
     "filter": {
       "all": "Alle",
       "pending_review": "Prüfung",

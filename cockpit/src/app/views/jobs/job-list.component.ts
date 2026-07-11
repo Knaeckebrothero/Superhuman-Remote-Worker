@@ -133,6 +133,7 @@ interface JobRow {
             <thead>
               <tr>
                 <th class="col-prompt">{{ 'jobs.colJob' | transloco }}</th>
+                <th class="col-project">{{ 'jobs.colProject' | transloco }}</th>
                 <th class="col-status">{{ 'jobs.colStatus' | transloco }}</th>
                 <th class="col-created">{{ 'jobs.colCreated' | transloco }}</th>
                 <th class="col-actions">{{ 'jobs.colActions' | transloco }}</th>
@@ -177,6 +178,15 @@ interface JobRow {
                         <span class="config-badge">{{ row.job.config_name }}</span>
                       }
                     </div>
+                  </td>
+                  <td class="project-cell">
+                    <span
+                      class="project-name"
+                      [class.empty]="!row.job.project_id"
+                      [title]="row.job.project_id ? ((row.job.project_name || ('jobs.projectUnknown' | transloco)) + ' · ' + row.job.project_id) : ('jobs.projectNone' | transloco)"
+                    >
+                      {{ row.job.project_name || (row.job.project_id ? ('jobs.projectUnknown' | transloco) : ('jobs.projectNone' | transloco)) }}
+                    </span>
                   </td>
                   <td>
                     <div class="status-cell-inner">
@@ -597,6 +607,7 @@ interface JobRow {
       }
 
       .col-prompt { width: 100%; }
+      .col-project { width: 180px; white-space: nowrap; }
       .col-status { white-space: nowrap; }
       .col-created { white-space: nowrap; }
       .col-actions { white-space: nowrap; }
@@ -759,6 +770,24 @@ interface JobRow {
         text-overflow: ellipsis;
       }
 
+      /* Project Cell */
+      .project-cell {
+        max-width: 180px;
+      }
+
+      .project-name {
+        display: inline-block;
+        max-width: 180px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        vertical-align: middle;
+      }
+
+      .project-name.empty {
+        color: var(--text-muted, #6c7086);
+      }
+
       /* Created Cell */
       .created-cell {
         font-family: 'JetBrains Mono', monospace;
@@ -818,7 +847,15 @@ interface JobRow {
           display: none;
         }
 
+        .col-project {
+          display: none;
+        }
+
         .created-cell {
+          display: none;
+        }
+
+        .project-cell {
           display: none;
         }
 
