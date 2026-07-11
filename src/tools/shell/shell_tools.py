@@ -139,6 +139,22 @@ def _cloud_cache_guard_decision(command: str, context: ToolContext) -> Optional[
         return None
 
 
+def _cloud_upperdir_guard_decision(command: str, context: ToolContext) -> Optional[str]:
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not command_touches_cloud_mount(command):
+        return None
+    overlay = cloud_mount_cfg.get("_overlay_manager")
+    if overlay is None or not hasattr(overlay, "quota_guard_message"):
+        return None
+    try:
+        return overlay.quota_guard_message()
+    except Exception as exc:
+        logger.warning("Cloud upperdir guard check failed: %s", exc)
+        return None
+
+
 def _cloud_mount_manager(context: ToolContext) -> Any | None:
     cloud_mount_cfg = context.get_config("cloud_mount", {})
     if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
@@ -396,6 +412,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             if cache_guard_msg:
                 return cache_guard_msg
 
+            upperdir_guard_msg = _cloud_upperdir_guard_decision(command, context)
+            if upperdir_guard_msg:
+                return upperdir_guard_msg
+
             guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
             if guard_msg and guard_blocks:
                 return guard_msg
@@ -538,6 +558,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 if cache_guard_msg:
                     return f"{tab_header}\n{cache_guard_msg}"
 
+                upperdir_guard_msg = _cloud_upperdir_guard_decision(command, context)
+                if upperdir_guard_msg:
+                    return f"{tab_header}\n{upperdir_guard_msg}"
+
                 guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
                 if guard_msg and guard_blocks:
                     return f"{tab_header}\n{guard_msg}"
@@ -567,6 +591,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 cache_guard_msg = _cloud_cache_guard_decision(command, context)
                 if cache_guard_msg:
                     return f"{tab_header}\n{cache_guard_msg}"
+
+                upperdir_guard_msg = _cloud_upperdir_guard_decision(command, context)
+                if upperdir_guard_msg:
+                    return f"{tab_header}\n{upperdir_guard_msg}"
 
                 guard_msg, guard_blocks = _cloud_scan_guard_decision(command, context)
                 if guard_msg and guard_blocks:
