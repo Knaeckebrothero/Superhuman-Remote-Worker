@@ -830,6 +830,118 @@ class TestAgentGetThreadWorkspace:
         assert result["project_ids"] == ["proj-1", "proj-2"]
 
 
+def resolve_cloud_sync_fork(
+    *,
+    thread: dict,
+    metadata: dict,
+    cloud_mount_cfg,
+    mount_rows: list,
+    driver: str,
+    cloud_up: bool,
+    build_agent_cloud_sync,
+):
+    """5.2 cloud_sync fork — mirrors ``agent_get_thread_workspace``
+    (orchestrator/main.py ~17008-17033), including the B8 F2 review fix: a
+    ``protected_cloud`` thread whose ``cloud_mount_cfg`` resolved to None
+    (flag off, VM tier, or a refused/absent grant) must NOT fall into the
+    live rclone/session-folder ``cloud_sync`` fallback — that would hand a
+    protected thread a live write path. ``driver`` stands in for
+    ``_cloud_workspace_driver()`` so this stays hermetic (no env coupling).
+    """
+    if cloud_mount_cfg:
+        cloud_sync_cfg = None
+    elif metadata.get("protected_cloud"):
+        cloud_sync_cfg = None
+    elif driver == "rclone_mount":
+        cloud_sync_cfg = build_agent_cloud_sync(thread, mount_rows=[])
+    else:
+        cloud_sync_cfg = build_agent_cloud_sync(thread, mount_rows=mount_rows)
+    cloud_sync_degraded = bool(
+        cloud_up
+        and not cloud_mount_cfg
+        and not cloud_sync_cfg
+        and not thread.get("nc_session_folder")
+    )
+    return cloud_sync_cfg, cloud_sync_degraded
+
+
+class TestResolveCloudSyncFork:
+    """B8 review F2: a protected_cloud thread whose cloud_mount_cfg resolved
+    to None must get NO live cloud_sync fallback, and must be flagged
+    degraded so the agent surfaces the same degraded-cloud state it shows
+    for a failed initial pull."""
+
+    def test_protected_thread_with_no_mount_skips_live_fallback_and_is_degraded(self):
+        thread = {"id": "t1"}
+        build_sync = MagicMock()
+        cloud_sync_cfg, degraded = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={"protected_cloud": True},
+            cloud_mount_cfg=None,
+            mount_rows=[{"backend_id": "nextcloud", "cloud_handle": "handle::Proj"}],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is None
+        assert degraded is True
+        build_sync.assert_not_called()
+
+    def test_protected_thread_with_no_mount_skips_rclone_fallback_too(self):
+        """Same guard must hold even when CLOUD_WORKSPACE_DRIVER=rclone_mount,
+        which for an unprotected thread would otherwise take the rclone-driver
+        branch (empty mount_rows session-folder fallback)."""
+        thread = {"id": "t1"}
+        build_sync = MagicMock()
+        cloud_sync_cfg, degraded = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={"protected_cloud": True},
+            cloud_mount_cfg=None,
+            mount_rows=[],
+            driver="rclone_mount",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is None
+        assert degraded is True
+        build_sync.assert_not_called()
+
+    def test_protected_thread_with_resolved_mount_is_not_degraded(self):
+        thread = {"id": "t1"}
+        build_sync = MagicMock()
+        cloud_sync_cfg, degraded = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={"protected_cloud": True},
+            cloud_mount_cfg={"driver": "rclone", "protected": True},
+            mount_rows=[],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is None
+        assert degraded is False
+        build_sync.assert_not_called()
+
+    def test_non_protected_thread_still_gets_live_fallback(self):
+        """Regression guard: the new elif must not swallow the ordinary
+        (non-protected) fallback path."""
+        thread = {"id": "t1"}
+        sentinel = {"kind": "session_folder"}
+        build_sync = MagicMock(return_value=sentinel)
+        cloud_sync_cfg, degraded = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={},
+            cloud_mount_cfg=None,
+            mount_rows=[],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is sentinel
+        assert degraded is False
+        build_sync.assert_called_once_with(thread, mount_rows=[])
+
+
 # =============================================================================
 # 5.3: POST /api/agents/threads/{thread_id}/upgrade-to-vm
 # =============================================================================
