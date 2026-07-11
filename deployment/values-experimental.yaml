@@ -63,13 +63,13 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-20130c3
+    tag: sha-2a71df3
   agent:
     tag: sha-20130c3
   cockpit:
-    tag: sha-01bf2c9
+    tag: sha-2a71df3
   mcp:
-    tag: sha-f1f32eb
+    tag: sha-2a71df3
   workspace:
     tag: sha-01bf2c9
 # -----------------------------------------------------------------------------
