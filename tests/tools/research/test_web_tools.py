@@ -2,12 +2,17 @@
 
 import sys
 from types import ModuleType
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.tools.context import ToolContext
 from src.tools.research.web import (
+    MAX_TOTAL_INLINE_CHARS,
     RESEARCH_TOOLS_METADATA,
+    _crawl_website,
+    _direct_web_search,
+    _extract_webpage,
     _get_tavily_api_key,
     _parse_comma_list,
     _truncate_content,
@@ -28,6 +33,65 @@ def mock_langchain_tavily():
 
 
 # ── Helpers ────────────────────────────────────────────────────────
+
+
+class _TempWorkspaceBackend:
+    """Minimal local workspace backend for ToolContext disk writes."""
+
+    host = None
+
+    def __init__(self, root):
+        self.root = root
+
+    def mkdir(self, relative_path):
+        (self.root / relative_path).mkdir(parents=True, exist_ok=True)
+
+
+class _TempWorkspaceManager:
+    """Minimal WorkspaceManager-shaped object accepted by ToolContext."""
+
+    is_initialized = True
+    job_id = "test-job-web"
+
+    def __init__(self, root):
+        self.root = root
+        self.backend = _TempWorkspaceBackend(root)
+
+    def exists(self, relative_path):
+        return (self.root / relative_path).exists()
+
+    def write_file(self, relative_path, content):
+        path = self.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+
+def _make_disk_context(tmp_path, register_side_effect=None):
+    """Create a ToolContext that registers fake sources and writes real files."""
+    context = ToolContext(workspace_manager=_TempWorkspaceManager(tmp_path))
+
+    if register_side_effect is None:
+        source_ids = {}
+
+        async def default_register_source(url, name=None):
+            source_ids.setdefault(url, len(source_ids) + 1)
+            return source_ids[url], None
+
+        register_side_effect = default_register_source
+
+    context.get_or_register_web_source = AsyncMock(side_effect=register_side_effect)
+    return context
+
+
+def _make_no_workspace_context():
+    """Create a ToolContext whose web source registration works but saving fails."""
+    context = ToolContext()
+
+    async def register_source(url, name=None):
+        return 1, None
+
+    context.get_or_register_web_source = AsyncMock(side_effect=register_source)
+    return context
 
 
 class TestHelpers:
@@ -245,7 +309,7 @@ class TestWebSearch:
         constructor_kwargs = mock_langchain_tavily.TavilySearch.call_args[1]
         assert constructor_kwargs.get("include_raw_content") is True
 
-    def test_raw_content_not_truncated_300(
+    def test_raw_content_archived_not_inlined(
         self, mock_tool_context, mock_langchain_tavily, monkeypatch
     ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
@@ -267,9 +331,11 @@ class TestWebSearch:
         ws = next(t for t in tools if t.name == "web_search")
         result = ws.invoke({"query": "test", "include_raw_content": True})
 
-        assert long_content in result
+        assert long_content not in result
+        assert "Snippet: short" in result
+        assert "Full text saved:" in result
 
-    def test_raw_content_word_limit(
+    def test_raw_content_not_inlined_even_when_huge(
         self, mock_tool_context, mock_langchain_tavily, monkeypatch
     ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
@@ -291,7 +357,8 @@ class TestWebSearch:
         ws = next(t for t in tools if t.name == "web_search")
         result = ws.invoke({"query": "test", "include_raw_content": True})
 
-        assert "truncated from 6000 words" in result
+        assert "truncated from 6000 words" not in result
+        assert "Full text saved:" in result
 
     def test_citation_registration(
         self, mock_tool_context, mock_langchain_tavily, monkeypatch
@@ -327,6 +394,107 @@ class TestWebSearch:
 
         assert "WARNING" in result
         assert "INACCESSIBLE" in result
+
+    def test_raw_search_archives_full_text_without_context_bloat(
+        self, tmp_path, mock_langchain_tavily, monkeypatch
+    ):
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        raw_content = "RAW_FULL_TEXT " + ("x" * 200_000)
+        results = [
+            {
+                "url": f"https://example.com/page-{i}",
+                "title": f"Result {i}",
+                "content": f"Short snippet {i}",
+                "raw_content": f"{raw_content} {i}",
+            }
+            for i in range(10)
+        ]
+        mock_instance = MagicMock()
+        mock_instance.invoke.return_value = {"results": results}
+        mock_langchain_tavily.TavilySearch.return_value = mock_instance
+        context = _make_disk_context(tmp_path)
+
+        output = _direct_web_search(
+            "heavy query",
+            10,
+            context,
+            include_raw_content=True,
+        )
+
+        assert len(output) < 15_000
+        assert "RAW_FULL_TEXT" not in output
+        assert output.count("Full text saved: documents/external/") == 10
+        assert (
+            mock_langchain_tavily.TavilySearch.call_args[1]["include_raw_content"]
+            is True
+        )
+        saved_files = list((tmp_path / "documents" / "external").glob("*.md"))
+        assert len(saved_files) == 10
+        assert all("RAW_FULL_TEXT" in path.read_text() for path in saved_files)
+        for path in saved_files:
+            relative_path = path.relative_to(tmp_path).as_posix()
+            assert relative_path in output
+
+    def test_raw_search_without_workspace_uses_bounded_excerpts(
+        self, mock_langchain_tavily, monkeypatch
+    ):
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        results = [
+            {
+                "url": f"https://example.com/no-workspace-{i}",
+                "title": f"Result {i}",
+                "content": f"Short snippet {i}",
+                "raw_content": f"RAW_{i} " + ("word " * 3000),
+            }
+            for i in range(10)
+        ]
+        mock_instance = MagicMock()
+        mock_instance.invoke.return_value = {"results": results}
+        mock_langchain_tavily.TavilySearch.return_value = mock_instance
+
+        output = _direct_web_search(
+            "heavy query",
+            10,
+            _make_no_workspace_context(),
+            include_raw_content=True,
+        )
+
+        assert "Full text saved:" not in output
+        assert "Content excerpt (not saved):" in output
+        assert "inline aggregate cap reached" in output
+        assert len(output) < MAX_TOTAL_INLINE_CHARS + 8_000
+
+    def test_inaccessible_source_has_warning_without_saved_path_pointer(
+        self, tmp_path, mock_langchain_tavily, monkeypatch
+    ):
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        mock_instance = MagicMock()
+        mock_instance.invoke.return_value = {
+            "results": [
+                {
+                    "url": "https://blocked.example.com",
+                    "title": "Blocked",
+                    "content": "Blocked snippet",
+                    "raw_content": "Blocked full text",
+                }
+            ]
+        }
+        mock_langchain_tavily.TavilySearch.return_value = mock_instance
+
+        async def register_inaccessible(url, name=None):
+            return 42, "HTTP 403"
+
+        output = _direct_web_search(
+            "blocked",
+            1,
+            _make_disk_context(tmp_path, register_inaccessible),
+            include_raw_content=True,
+        )
+
+        assert "WARNING" in output
+        assert "INACCESSIBLE" in output
+        assert "Full text saved:" not in output
+        assert "Content excerpt (not saved):" not in output
 
 
 # ── extract_webpage ────────────────────────────────────────────────
@@ -485,6 +653,32 @@ class TestExtractWebpage:
         result = t.invoke({"urls": ""})
         assert "No URLs provided" in result
 
+    def test_many_huge_urls_use_aggregate_cap_then_saved_pointers(
+        self, tmp_path, mock_langchain_tavily, monkeypatch
+    ):
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        results = [
+            {
+                "url": f"https://example.com/extract-{i}",
+                "raw_content": f"START_{i} " + ("word " * 3000) + f"TAIL_{i}",
+            }
+            for i in range(20)
+        ]
+        self._setup_extract(
+            mock_langchain_tavily,
+            {"results": results, "failed_results": []},
+        )
+
+        output = _extract_webpage(
+            ",".join(result["url"] for result in results),
+            _make_disk_context(tmp_path),
+        )
+
+        assert "TAIL_0" in output
+        assert "TAIL_10" not in output
+        assert output.count("Full text saved: documents/external/") >= 10
+        assert len(list((tmp_path / "documents" / "external").glob("*.md"))) == 20
+
 
 # ── crawl_website ──────────────────────────────────────────────────
 
@@ -618,7 +812,8 @@ class TestCrawlWebsite:
         t = next(t for t in tools if t.name == "crawl_website")
         result = t.invoke({"url": "https://ex.com"})
 
-        assert "truncated from 6000 words" in result
+        assert "truncated from 6000 words" not in result
+        assert "Full text saved:" in result
 
     def test_no_results(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
@@ -629,6 +824,31 @@ class TestCrawlWebsite:
         result = t.invoke({"url": "https://example.com"})
 
         assert "No pages could be crawled" in result
+
+    def test_crawl_returns_snippet_and_saved_pointer_per_page(
+        self, tmp_path, mock_langchain_tavily, monkeypatch
+    ):
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+        self._setup_crawl(
+            mock_langchain_tavily,
+            {
+                "results": [
+                    {
+                        "url": "https://docs.example.com/page",
+                        "raw_content": ("A" * 800) + "TAIL_SHOULD_NOT_INLINE",
+                    }
+                ],
+            },
+        )
+
+        output = _crawl_website(
+            "https://docs.example.com",
+            _make_disk_context(tmp_path),
+        )
+
+        assert "Full text saved: documents/external/" in output
+        assert "TAIL_SHOULD_NOT_INLINE" not in output
+        assert len(list((tmp_path / "documents" / "external").glob("*.md"))) == 1
 
 
 # ── map_website ────────────────────────────────────────────────────
