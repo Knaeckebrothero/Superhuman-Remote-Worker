@@ -841,12 +841,24 @@ def resolve_cloud_sync_fork(
     build_agent_cloud_sync,
 ):
     """5.2 cloud_sync fork — mirrors ``agent_get_thread_workspace``
-    (orchestrator/main.py ~17008-17033), including the B8 F2 review fix: a
-    ``protected_cloud`` thread whose ``cloud_mount_cfg`` resolved to None
-    (flag off, VM tier, or a refused/absent grant) must NOT fall into the
-    live rclone/session-folder ``cloud_sync`` fallback — that would hand a
-    protected thread a live write path. ``driver`` stands in for
-    ``_cloud_workspace_driver()`` so this stays hermetic (no env coupling).
+    (orchestrator/main.py), including:
+
+    - B8 F2: a ``protected_cloud`` thread whose ``cloud_mount_cfg`` resolved
+      to None (flag off, VM tier, or a refused/absent grant) must NOT fall
+      into the live rclone/session-folder ``cloud_sync`` fallback — that
+      would hand a protected thread a live write path.
+    - B10 F-C1: ``cloud_sync_degraded`` drops the ``nc_session_folder`` veto
+      for a protected thread — a protected thread with no resolved mount is
+      ALWAYS degraded, even when a (now-unused) legacy ``nc_session_folder``
+      happens to still be set on the row. Previously a protected thread with
+      a stale ``nc_session_folder`` reported ``cloud_sync_degraded=False``
+      despite having no live cloud access at all.
+    - B10 F-C1: also returns the ``protected_cloud`` response key the
+      endpoint now surfaces, so the agent can gate its own legacy shim on
+      the same signal.
+
+    ``driver`` stands in for ``_cloud_workspace_driver()`` so this stays
+    hermetic (no env coupling).
     """
     if cloud_mount_cfg:
         cloud_sync_cfg = None
@@ -856,13 +868,14 @@ def resolve_cloud_sync_fork(
         cloud_sync_cfg = build_agent_cloud_sync(thread, mount_rows=[])
     else:
         cloud_sync_cfg = build_agent_cloud_sync(thread, mount_rows=mount_rows)
+    protected_cloud = bool(metadata.get("protected_cloud"))
     cloud_sync_degraded = bool(
         cloud_up
         and not cloud_mount_cfg
         and not cloud_sync_cfg
-        and not thread.get("nc_session_folder")
+        and (protected_cloud or not thread.get("nc_session_folder"))
     )
-    return cloud_sync_cfg, cloud_sync_degraded
+    return cloud_sync_cfg, cloud_sync_degraded, protected_cloud
 
 
 class TestResolveCloudSyncFork:
@@ -874,7 +887,7 @@ class TestResolveCloudSyncFork:
     def test_protected_thread_with_no_mount_skips_live_fallback_and_is_degraded(self):
         thread = {"id": "t1"}
         build_sync = MagicMock()
-        cloud_sync_cfg, degraded = resolve_cloud_sync_fork(
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
             thread=thread,
             metadata={"protected_cloud": True},
             cloud_mount_cfg=None,
@@ -885,6 +898,7 @@ class TestResolveCloudSyncFork:
         )
         assert cloud_sync_cfg is None
         assert degraded is True
+        assert protected_cloud is True
         build_sync.assert_not_called()
 
     def test_protected_thread_with_no_mount_skips_rclone_fallback_too(self):
@@ -893,7 +907,7 @@ class TestResolveCloudSyncFork:
         branch (empty mount_rows session-folder fallback)."""
         thread = {"id": "t1"}
         build_sync = MagicMock()
-        cloud_sync_cfg, degraded = resolve_cloud_sync_fork(
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
             thread=thread,
             metadata={"protected_cloud": True},
             cloud_mount_cfg=None,
@@ -904,12 +918,13 @@ class TestResolveCloudSyncFork:
         )
         assert cloud_sync_cfg is None
         assert degraded is True
+        assert protected_cloud is True
         build_sync.assert_not_called()
 
     def test_protected_thread_with_resolved_mount_is_not_degraded(self):
         thread = {"id": "t1"}
         build_sync = MagicMock()
-        cloud_sync_cfg, degraded = resolve_cloud_sync_fork(
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
             thread=thread,
             metadata={"protected_cloud": True},
             cloud_mount_cfg={"driver": "rclone", "protected": True},
@@ -920,6 +935,7 @@ class TestResolveCloudSyncFork:
         )
         assert cloud_sync_cfg is None
         assert degraded is False
+        assert protected_cloud is True
         build_sync.assert_not_called()
 
     def test_non_protected_thread_still_gets_live_fallback(self):
@@ -928,7 +944,7 @@ class TestResolveCloudSyncFork:
         thread = {"id": "t1"}
         sentinel = {"kind": "session_folder"}
         build_sync = MagicMock(return_value=sentinel)
-        cloud_sync_cfg, degraded = resolve_cloud_sync_fork(
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
             thread=thread,
             metadata={},
             cloud_mount_cfg=None,
@@ -939,7 +955,49 @@ class TestResolveCloudSyncFork:
         )
         assert cloud_sync_cfg is sentinel
         assert degraded is False
+        assert protected_cloud is False
         build_sync.assert_called_once_with(thread, mount_rows=[])
+
+    def test_protected_thread_with_nc_session_folder_set_is_still_degraded(self):
+        """B10 F-C1: the exact bug being fixed. A protected thread with no
+        resolved mount, but a still-set legacy ``nc_session_folder`` (e.g. a
+        thread created before the protected-mode refactor, or one whose
+        session-folder provisioning raced ahead of the protected marker),
+        must NOT get to hide behind the nc_session_folder veto — it is
+        degraded (no live cloud access at all) regardless."""
+        thread = {"id": "t1", "nc_session_folder": "Sessions/thread-1"}
+        build_sync = MagicMock()
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={"protected_cloud": True},
+            cloud_mount_cfg=None,
+            mount_rows=[],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert cloud_sync_cfg is None
+        assert degraded is True
+        assert protected_cloud is True
+        build_sync.assert_not_called()
+
+    def test_non_protected_thread_with_nc_session_folder_set_is_not_degraded(self):
+        """Regression guard: the dropped nc_session_folder veto is
+        protected-only — an ordinary thread with a working legacy session
+        folder (and no cloud_sync resolved, hypothetically) is unaffected."""
+        thread = {"id": "t1", "nc_session_folder": "Sessions/thread-1"}
+        build_sync = MagicMock(return_value=None)
+        cloud_sync_cfg, degraded, protected_cloud = resolve_cloud_sync_fork(
+            thread=thread,
+            metadata={},
+            cloud_mount_cfg=None,
+            mount_rows=[],
+            driver="sync",
+            cloud_up=True,
+            build_agent_cloud_sync=build_sync,
+        )
+        assert degraded is False
+        assert protected_cloud is False
 
 
 # =============================================================================

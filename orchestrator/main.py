@@ -17350,7 +17350,10 @@ async def agent_get_thread_workspace(
         _cloud_up
         and not cloud_mount_cfg
         and not cloud_sync_cfg
-        and not thread.get("nc_session_folder")
+        and (
+            metadata.get("protected_cloud")
+            or not thread.get("nc_session_folder")
+        )
     )
     # Re-inject credentials in-flight: the persisted config_override is stripped
     # of secrets (redact_config_override at create/hot-swap). This endpoint is
@@ -17452,6 +17455,10 @@ async def agent_get_thread_workspace(
         "cloud_mount": cloud_mount_cfg,
         # True when cloud is up but no sync target resolved (Issue 13 follow-up).
         "cloud_sync_degraded": cloud_sync_degraded,
+        # Protected Cloud Mode marker (F-C1): tells the agent to fail-close
+        # the legacy nc_session_folder sync shim and any cloud_sync
+        # consumption rather than falling back to a live WebDAV mount.
+        "protected_cloud": bool(metadata.get("protected_cloud")),
     }
 
 
@@ -18716,19 +18723,24 @@ async def create_thread(
         # ``_provision_thread_workspace`` below. Fail-closed: a refusal or
         # provisioning error is recorded on the thread's metadata inside
         # ``_engage_protected_cloud_for_thread`` itself and never raises here;
-        # the session simply boots with no cloud mount.
-        if request_body.protected_cloud and _is_protected_cloud_mode_enabled():
-            seeded_rows = await postgres_db.list_thread_mounts(thread_id)
-
-            async def _engage_protected(tid: str) -> None:
-                await _engage_protected_cloud_for_thread(
-                    tid,
+        # the session simply boots with no cloud mount. Registered via
+        # ``_schedule_protected_engage`` (F-I1) so a concurrent attach that
+        # lands before this task finishes can await it instead of racing it.
+        if request_body.protected_cloud:
+            if _is_protected_cloud_mode_enabled():
+                seeded_rows = await postgres_db.list_thread_mounts(thread_id)
+                _schedule_protected_engage(
+                    thread_id,
                     user_id=str(user["id"]),
                     mount_rows=seeded_rows,
-                    metadata={},
                 )
-
-            asyncio.create_task(_engage_protected(thread_id))
+            else:
+                # F-M2: explain the degradation up front instead of leaving a
+                # protected-marked, mount-less thread silent about why.
+                await _record_protected_error(
+                    thread_id,
+                    "protected cloud mode is disabled on this deployment",
+                )
 
         # Provision workspace container + agent pod FIRST (non-blocking).
         # Start image pull / pod creation immediately so it runs in parallel
@@ -19352,6 +19364,49 @@ async def _build_rclone_session_mount(
     }
 
 
+# F-I1/F-I2: module-level registry of in-flight engage tasks, keyed by
+# thread_id. Holding the reference fixes the asyncio "fire-and-forget task
+# can be GC'd mid-flight" hazard, and lets a concurrent reader
+# (``_build_agent_cloud_mount``'s protected branch, or a future resume)
+# await the SAME task instead of racing it with its own poll loop.
+_protected_engage_tasks: dict[str, "asyncio.Task[None]"] = {}
+
+
+def _schedule_protected_engage(
+    thread_id: str,
+    *,
+    user_id: str,
+    mount_rows: list[dict[str, Any]] | None,
+    metadata: dict[str, Any] | None = None,
+) -> "asyncio.Task[None]":
+    """Fire-and-forget schedule of ``_engage_protected_cloud_for_thread``,
+    registering the task in ``_protected_engage_tasks`` so callers racing the
+    attach path (F-I1) or a re-engage on resume (F-I2) can await it instead
+    of falling straight through to a bare poll. Shared by ``create_thread``
+    and ``resume_thread`` so both engage paths behave identically."""
+
+    async def _run() -> None:
+        await _engage_protected_cloud_for_thread(
+            thread_id,
+            user_id=user_id,
+            mount_rows=mount_rows,
+            metadata=metadata or {},
+        )
+
+    task = asyncio.create_task(_run())
+    _protected_engage_tasks[thread_id] = task
+
+    def _done(finished: "asyncio.Task[None]") -> None:
+        # Only clear the slot if it's still ours — a newer registration for
+        # the same thread_id (e.g. a resume re-engage firing right after a
+        # create engage) must not be clobbered by this stale callback.
+        if _protected_engage_tasks.get(thread_id) is finished:
+            _protected_engage_tasks.pop(thread_id, None)
+
+    task.add_done_callback(_done)
+    return task
+
+
 async def _engage_protected_cloud_for_thread(
     thread_id: str,
     *,
@@ -19519,12 +19574,36 @@ async def _build_agent_cloud_mount(
                 thread.get("id"),
             )
             return None
-        row = await postgres_db.get_ro_mount_by_thread(str(thread.get("id")))
-        return (
-            _build_protected_cloud_mount(row, thread_id=str(thread.get("id")))
-            if row
-            else None
-        )
+        tid = str(thread.get("id"))
+        row = await postgres_db.get_ro_mount_by_thread(tid)
+        if row is None:
+            # F-I1: engage-vs-attach race. Create-time engage is
+            # fire-and-forget, so an early attach (or an idle-pool resume
+            # that lands fast) can beat it here. Prefer awaiting the SAME
+            # in-flight task (bounded) over guessing with a bare poll; only
+            # fall back to polling when no task is registered for this
+            # thread (e.g. a second replica handled create — HA) AND no
+            # terminal error is already recorded (a refusal/error means the
+            # task already ran to completion with nothing to wait for).
+            task = _protected_engage_tasks.get(tid)
+            if task is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=30)
+                except Exception as e:
+                    logger.warning(
+                        "Thread %s: awaiting in-flight protected engage "
+                        "task failed/timed out: %s",
+                        tid,
+                        e,
+                    )
+                row = await postgres_db.get_ro_mount_by_thread(tid)
+            elif not metadata.get("protected_cloud_error"):
+                for _ in range(3):
+                    await asyncio.sleep(3)
+                    row = await postgres_db.get_ro_mount_by_thread(tid)
+                    if row is not None:
+                        break
+        return _build_protected_cloud_mount(row, thread_id=tid) if row else None
 
     # A cross-cluster VM runtime needs the public WebDAV URL (it can't reach the
     # internal service DNS) and defaults to a read-only mount (root tier). A
@@ -19754,6 +19833,22 @@ async def resume_thread(
     await _revalidate_thread_datasource_ids(thread, metadata.get("datasource_ids"))
 
     await postgres_db.resume_thread(thread_id)
+
+    # F-I2: the Slice A reconciler revokes cloud_ro_mounts grants of ended
+    # threads, so an end -> resume cycle would otherwise leave a
+    # protected-marked thread permanently mount-less. Re-engage here
+    # whenever there's no ACTIVE grant on record — via the same registry
+    # ``_schedule_protected_engage`` uses at create, so a concurrent attach
+    # can await this task exactly like it would the create-time one.
+    if metadata.get("protected_cloud") and _is_protected_cloud_mode_enabled():
+        ro_row = await postgres_db.get_ro_mount_by_thread(thread_id)
+        if not ro_row or ro_row.get("status") != "active":
+            resume_mount_rows = await postgres_db.list_thread_mounts(thread_id)
+            _schedule_protected_engage(
+                thread_id,
+                user_id=str(user["id"]),
+                mount_rows=resume_mount_rows,
+            )
 
     # Provision cloud session folder if missing (e.g. session was created
     # before the cloud backend was initialized), or retry the share alone
