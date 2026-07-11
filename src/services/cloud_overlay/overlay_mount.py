@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _OVERLAY_OK = "__SRW_OVERLAY_OK__"
 _OVERLAY_FAILED = "__SRW_OVERLAY_FAILED__"
+_OVERLAY_DEAD = "__SRW_OVERLAY_DEAD__"
 
 
 class OverlayMountError(RuntimeError):
@@ -96,6 +97,27 @@ class OverlayMountManager:
         """
         self._run("overlay_pre_refresh_unmount.sh", self._plain_unmount_script(), timeout=60)
         refresh_lower()
+        self._run("overlay_remount.sh", self._mount_body_only_script(), timeout=120)
+
+    def health_check(self) -> bool:
+        """True when the merged view is readable; False on ENOTCONN (dead lower).
+
+        A readdir over the merged view is the only reliable liveness signal —
+        /proc/mounts and ``mountpoint -q`` both report "mounted" over a dead
+        rclone endpoint (design §11.2)."""
+        out = self._run("overlay_probe.sh", self._probe_script(), timeout=30, require_ok=False)
+        if _OVERLAY_DEAD in out:
+            return False
+        return _OVERLAY_OK in out
+
+    def heal(self, remount_lower: Callable[[], None]) -> None:
+        """Recover a dead rclone lower under a live overlay (design §11.2).
+
+        Lazy-unmount the overlay FIRST (safe here: the dead lower makes every
+        held-FD read fail loudly with ENOTCONN — no silent-staleness window),
+        remount the lower via the callback, then remount the overlay."""
+        self._run("overlay_heal_unmount.sh", self._heal_unmount_script(), timeout=60, require_ok=False)
+        remount_lower()
         self._run("overlay_remount.sh", self._mount_body_only_script(), timeout=120)
 
     # --------------------------------------------------------------- scripts
@@ -192,6 +214,30 @@ mkdir -p {upper} {work} {merged}
 if ! mountpoint -q {lower}; then echo "{_OVERLAY_FAILED} rc=2 (lower not mounted)"; exit 2; fi
 fuse-overlayfs -o {opts} {merged}
 mountpoint -q {merged}
+echo "{_OVERLAY_OK}"
+"""
+
+    def _probe_script(self) -> str:
+        merged = shlex.quote(self.merged)
+        return f"""#!/usr/bin/env bash
+set +e
+# A readdir returning ENOTCONN means the rclone lower died under us.
+ls {merged} >/tmp/.srw-overlay-probe 2>/tmp/.srw-overlay-probe.err
+rc=$?
+if grep -qi 'not connected\\|ENOTCONN\\|Transport endpoint' /tmp/.srw-overlay-probe.err 2>/dev/null; then
+  echo "{_OVERLAY_DEAD} ENOTCONN"
+  exit 0
+fi
+if [ "$rc" -ne 0 ]; then echo "{_OVERLAY_DEAD} rc=$rc"; exit 0; fi
+echo "{_OVERLAY_OK}"
+"""
+
+    def _heal_unmount_script(self) -> str:
+        merged = shlex.quote(self.merged)
+        return f"""#!/usr/bin/env bash
+set +e
+# LAZY unmount is correct on heal (dead lower => held reads ENOTCONN loudly).
+fusermount3 -uz {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null
 echo "{_OVERLAY_OK}"
 """
 

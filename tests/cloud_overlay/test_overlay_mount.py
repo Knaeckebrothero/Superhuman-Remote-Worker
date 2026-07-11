@@ -146,3 +146,24 @@ def test_refresh_unmounts_overlay_refreshes_lower_then_remounts():
         b for p, b in backend.files.items() if p.endswith("overlay_remount.sh")
     )
     assert "fuse-overlayfs -o lowerdir=/cloud/lower" in remount_script
+
+
+def test_health_check_true_on_ok_false_on_enotconn():
+    ok_backend = FakeRemoteBackend()
+    assert _manager(ok_backend).health_check() is True
+
+    dead = FakeRemoteBackend()
+    dead.outputs_by_script["overlay_probe.sh"] = "__SRW_OVERLAY_DEAD__ ENOTCONN\n"
+    assert _manager(dead).health_check() is False
+
+
+def test_heal_lazy_unmounts_overlay_first_then_remounts_lower_then_overlay():
+    backend = FakeRemoteBackend()
+    mgr = _manager(backend)
+    order: list[str] = []
+    mgr.heal(lambda: order.append("lower-remounted"))
+    assert order == ["lower-remounted"]
+    unmount = next(b for p, b in backend.files.items() if p.endswith("overlay_heal_unmount.sh"))
+    assert "fusermount3 -uz /cloud/merged" in unmount  # LAZY is correct on heal
+    remount = next(b for p, b in backend.files.items() if p.endswith("overlay_remount.sh"))
+    assert "fuse-overlayfs -o lowerdir=/cloud/lower" in remount
