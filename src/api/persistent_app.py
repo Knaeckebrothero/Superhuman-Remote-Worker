@@ -1264,6 +1264,11 @@ async def _attach_session(
     cloud_mount_cfg = (
         workspace_override.get("cloud_mount") if workspace_override else None
     )
+    # F-C1: Protected Cloud Mode marker, tracked across BOTH orchestrator
+    # fetch sites in this function (this one and the cloud_sync one further
+    # below) so a protected thread can never resolve a legacy live sync
+    # config regardless of which fetch happens to carry the field first.
+    protected_cloud = bool((workspace_override or {}).get("protected_cloud"))
     if (
         (
             not config_override
@@ -1288,6 +1293,9 @@ async def _attach_session(
                     datasources = ws_info.get("datasources")
                 if not cloud_mount_cfg:
                     cloud_mount_cfg = ws_info.get("cloud_mount")
+                protected_cloud = protected_cloud or bool(
+                    ws_info.get("protected_cloud")
+                )
         except Exception:
             pass
 
@@ -1688,16 +1696,26 @@ async def _attach_session(
         except Exception as e:
             logger.warning(f"Failed to inject datasource index: {e}")
 
-    # Initialize cloud workspace sync if the orchestrator gave us a config
+    # Initialize cloud workspace sync if the orchestrator gave us a config.
+    # F-C1: a protected thread NEVER adopts cloud_sync or nc_session_folder
+    # from either fetch site — protected mode's only sanctioned live-write
+    # surface is the capture overlay (already reflected in
+    # cloud_mount_active above); letting either field through here would
+    # rebuild a live agent-service WebDAV sync in every degraded-protected
+    # scenario (refused engage, flag off, VM tier, overlay-failure teardown).
     cloud_cfg = (
         None
-        if cloud_mount_active
+        if cloud_mount_active or protected_cloud
         else workspace_override.get("cloud_sync")
         if workspace_override
         else None
     )
     nc_folder = (
-        workspace_override.get("nc_session_folder") if workspace_override else None
+        None
+        if protected_cloud
+        else workspace_override.get("nc_session_folder")
+        if workspace_override
+        else None
     )
     cloud_degraded_hint = False
     if (
@@ -1709,13 +1727,20 @@ async def _attach_session(
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
-                cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
-                nc_folder = nc_folder or ws_info.get("nc_session_folder")
+                protected_cloud = protected_cloud or bool(
+                    ws_info.get("protected_cloud")
+                )
+                if not protected_cloud:
+                    cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
+                    nc_folder = nc_folder or ws_info.get("nc_session_folder")
                 cloud_degraded_hint = bool(ws_info.get("cloud_sync_degraded"))
         except Exception:
             pass
-    # Back-compat: translate a bare nc_session_folder into the new schema
-    if not cloud_mount_active and not cloud_cfg and nc_folder:
+    # Back-compat: translate a bare nc_session_folder into the new schema.
+    # F-C1: gated on `not protected_cloud` too (defense-in-depth — nc_folder
+    # is already forced None above for a protected thread, but this keeps
+    # the invariant explicit at the point the shim actually fires).
+    if not cloud_mount_active and not protected_cloud and not cloud_cfg and nc_folder:
         cloud_cfg = _legacy_nc_cloud_cfg(nc_folder)
     if cloud_cfg:
         try:
@@ -4833,6 +4858,9 @@ async def _poll_workspace_ready(
                 "cloud_sync": ws.get("cloud_sync"),
                 "cloud_mount": ws.get("cloud_mount"),
                 "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
+                # F-C1: carried through so _attach_session can fail-close the
+                # legacy nc_session_folder sync shim for protected threads.
+                "protected_cloud": ws.get("protected_cloud"),
             }
 
         # Check container workspace
@@ -4856,6 +4884,8 @@ async def _poll_workspace_ready(
                 "cloud_sync": ws.get("cloud_sync"),
                 "cloud_mount": ws.get("cloud_mount"),
                 "cloud_sync_degraded": ws.get("cloud_sync_degraded"),
+                # F-C1: see comment above (vm branch).
+                "protected_cloud": ws.get("protected_cloud"),
             }
         if status == "failed" and (not vm_status or vm_status == "failed"):
             logger.warning(f"Workspace provisioning failed: {ws}")
