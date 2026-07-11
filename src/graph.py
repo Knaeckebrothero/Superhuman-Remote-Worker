@@ -102,7 +102,11 @@ from .llm.exceptions import ContextOverflowError
 from .llm.response_guards import is_degenerate_response
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .services.guardrails import format_nudge
-from .services.image_content import extract_image_tags, make_multimodal_user_message
+from .services.image_content import (
+    extract_image_tags,
+    make_multimodal_user_message,
+    resolve_image_max_edge,
+)
 from .tools.context import ToolContext
 from .utils.db_url import checkpointer_backend
 
@@ -4222,6 +4226,7 @@ def create_audited_tool_node(
         # the base64 lives transiently in this local `result`.
         if "messages" in result:
             image_followups: list[HumanMessage] = []
+            img_max_edge = resolve_image_max_edge(config)
             for msg in result["messages"]:
                 if not isinstance(msg, ToolMessage) or not msg.content:
                     continue
@@ -4233,6 +4238,7 @@ def create_audited_tool_node(
                     make_multimodal_user_message(
                         text=(f"Image content from tool call {msg.tool_call_id}:"),
                         images=extracted,
+                        max_edge=img_max_edge,
                     )
                 )
             if image_followups:
