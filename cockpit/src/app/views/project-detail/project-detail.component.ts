@@ -147,7 +147,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               </div>
               <div class="stats-row">
                 <div class="stat-card">
-                  <span class="stat-value">{{ jobs().length }}</span>
+                  <span class="stat-value">{{ proj.job_count ?? jobs().length }}</span>
                   <span class="stat-label">{{ 'projectDetail.overview.statsJobs' | transloco }}</span>
                 </div>
                 <div class="stat-card">

@@ -208,3 +208,128 @@ async def test_wait_for_vm_ready_returns_none_on_unroutable_host(service_factory
 
     assert ssh_host is None
     assert ssh_port is None
+
+
+@pytest.mark.asyncio
+async def test_extract_snapshot_uses_home_scoped_command(service_factory):
+    """IDE pod extraction must scope to home/agent-host, not the full tarball."""
+    from orchestrator.services.ide_session import EXTRACT_HOME_REMOTE_CMD
+
+    svc = service_factory
+    svc._snapshot_service.is_available = True
+    svc._snapshot_service.download_snapshot = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "orchestrator.services.ide_session.stream_extract_snapshot",
+            AsyncMock(return_value=(0, b"")),
+        ) as mock_extract,
+        patch(
+            "orchestrator.services.ide_session.resolve_ssh_key_path", return_value="k"
+        ),
+    ):
+        ok = await svc._extract_snapshot_to_k8s_pod("job-0008", "10.0.0.10", 30022)
+
+    assert ok is True
+    assert mock_extract.await_args.kwargs["remote_cmd"] == EXTRACT_HOME_REMOTE_CMD
+
+
+@pytest.mark.asyncio
+async def test_extract_rc_nonzero_with_populated_workspace_continues(service_factory):
+    """tar noise (rc=2) must not fail the restore when the workspace landed."""
+    svc = service_factory
+    svc._snapshot_service.is_available = True
+    svc._snapshot_service.download_snapshot = AsyncMock(return_value=True)
+    svc._workspace_populated = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "orchestrator.services.ide_session.stream_extract_snapshot",
+            AsyncMock(return_value=(2, b"tar: usr/local/bin/x: Cannot open")),
+        ),
+        patch(
+            "orchestrator.services.ide_session.resolve_ssh_key_path", return_value="k"
+        ),
+    ):
+        ok = await svc._extract_snapshot_to_k8s_pod("job-0009", "10.0.0.10", 30022)
+
+    assert ok is True
+    for call in svc._db.merge_ide_session_context.await_args_list:
+        assert call.args[1].get("status") != "failed"
+
+
+@pytest.mark.asyncio
+async def test_extract_rc_nonzero_with_empty_workspace_fails(service_factory):
+    """A genuinely failed extraction (empty workspace) still fails the session."""
+    svc = service_factory
+    svc._snapshot_service.is_available = True
+    svc._snapshot_service.download_snapshot = AsyncMock(return_value=True)
+    svc._workspace_populated = AsyncMock(return_value=False)
+
+    with (
+        patch(
+            "orchestrator.services.ide_session.stream_extract_snapshot",
+            AsyncMock(return_value=(2, b"zstd: corrupt input")),
+        ),
+        patch(
+            "orchestrator.services.ide_session.resolve_ssh_key_path", return_value="k"
+        ),
+    ):
+        ok = await svc._extract_snapshot_to_k8s_pod("job-0010", "10.0.0.10", 30022)
+
+    assert ok is False
+    last_ctx = svc._db.merge_ide_session_context.await_args_list[-1]
+    assert last_ctx.args[1]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_gitea_clone_chain_is_idempotent(service_factory):
+    """Retries against a pre-populated workspace must not die on remote add."""
+    svc = service_factory
+    svc._container_provisioner.create_ide_pod = AsyncMock(return_value="10.0.0.10")
+
+    proc = AsyncMock()
+    proc.returncode = 0
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+
+    with (
+        patch(
+            "orchestrator.services.ide_session.build_agent_ssh_cmd",
+            return_value=["ssh", "cmd"],
+        ) as mock_build_ssh,
+        patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+        patch(
+            "orchestrator.services.ide_session.IdeSessionService._wait_for_code_server",
+            AsyncMock(return_value=True),
+        ),
+    ):
+        ok = await svc._restore_k8s_ide_container(
+            "job-0011",
+            {"branch_name": "main", "repo_name": "demo/repo"},
+            "demo/repo",
+            "main",
+        )
+
+    assert ok is True
+    clone_cmd = mock_build_ssh.call_args_list[0].args[2]
+    assert "git remote set-url origin" in clone_cmd
+
+
+@pytest.mark.asyncio
+async def test_snapshot_restore_runs_git_repair_fetch(service_factory):
+    """Successful extraction is followed by the best-effort git object refetch."""
+    svc = service_factory
+    svc._container_provisioner.create_ide_pod = AsyncMock(return_value="10.0.0.10")
+    svc._extract_snapshot_to_k8s_pod = AsyncMock(return_value=True)
+    svc._repair_git_after_snapshot = AsyncMock()
+    svc._seed_ide_profile_for_user = AsyncMock()
+    svc._wait_for_code_server = AsyncMock(return_value=True)
+
+    ok = await svc._restore_snapshot_container(
+        "job-0012", {"repo_name": "demo/repo", "branch_name": "job/abc"}
+    )
+
+    assert ok is True
+    svc._repair_git_after_snapshot.assert_awaited_once_with(
+        "job-0012", ANY, "10.0.0.10", 30022
+    )

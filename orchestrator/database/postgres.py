@@ -7814,6 +7814,7 @@ class PostgresDB:
                        nextcloud_folder_id, cloud_storage_read_only,
                        main_cloud_backend, main_cloud_folder_handle,
                        network_tier,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.project_id = projects.id) AS job_count,
                        created_at, updated_at
                 FROM projects
                 WHERE id = $1
