@@ -695,6 +695,7 @@ class PostgresDB:
                        j.repo_name, j.branch_name, j.merge_status,
                        j.diff_status, j.exported_at, j.created_at,
                        j.context->'snapshot'->>'status' AS snapshot_status,
+                       p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
                        (pa.id IS NOT NULL) AS pending_approval,
                        pa.id AS pending_approval_request_id
@@ -780,6 +781,7 @@ class PostgresDB:
                        j.repo_name, j.branch_name, j.merge_status,
                        j.diff_status, j.exported_at, j.created_at,
                        j.context->'snapshot'->>'status' AS snapshot_status,
+                       p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
                        (pa.id IS NOT NULL) AS pending_approval,
                        pa.id AS pending_approval_request_id
