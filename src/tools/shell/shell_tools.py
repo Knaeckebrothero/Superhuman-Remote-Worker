@@ -112,7 +112,9 @@ def _cloud_delete_guard_decision(
     if risk is None:
         return None, False
 
-    message = format_cloud_delete_guard_message(command, risk)
+    message = format_cloud_delete_guard_message(
+        command, risk, protected=bool(cloud_mount_cfg.get("protected"))
+    )
     if mode == "warn":
         return (
             f"{message}\n\nThe command will still run because cloud_scan_guard=warn.",
