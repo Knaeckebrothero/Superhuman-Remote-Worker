@@ -22,6 +22,7 @@ from src.tools.knowledge.chunker import (
     chunk_note,
     embed_note_chunks,
     embedding_version,
+    embedding_version_for_service,
     note_centroid,
 )
 
@@ -208,6 +209,14 @@ class TestEmbeddingVersion:
     def test_defaults_to_module_chunker_version(self):
         stamp = embedding_version("qwen3-embedding-8b", 4096)
         assert stamp.endswith(f":{CHUNKER_VERSION}")
+
+    def test_service_profile_fingerprint_is_part_of_row_and_query_stamp(self):
+        svc = _make_embedding_service()
+        svc.profile_fingerprint = "pf-effective-profile"
+
+        assert embedding_version_for_service(svc) == (
+            f"qwen3-embedding-8b:4096:{CHUNKER_VERSION}:pf-effective-profile"
+        )
 
 
 # =============================================================================

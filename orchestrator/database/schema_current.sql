@@ -411,8 +411,16 @@ CREATE TABLE public.datasources (
     job_id uuid,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    project_id uuid
+    project_id uuid,
+    config jsonb DEFAULT '{}'::jsonb NOT NULL
 );
+
+
+--
+-- Name: COLUMN datasources.config; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.config IS 'Non-secret type-specific datasource configuration. Credentials and tokens must not be stored here.';
 
 
 --

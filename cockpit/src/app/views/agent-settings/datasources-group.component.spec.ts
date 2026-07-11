@@ -11,8 +11,9 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
 /**
  * Selection logic for the explicit-only datasource picker: by default all
  * eligible datasources are selected (the picker is the source of truth), the
- * user can opt out, repository sources are excluded under a lite (virtual/none)
- * backend, and a stale selection (after switching project) re-applies defaults.
+ * user can opt out, clone-based repository sources are excluded under a lite
+ * (virtual/none) backend, centrally indexed KB sources remain available, and a
+ * stale selection (after switching project) re-applies defaults.
  */
 function makeDs(id: string, type: string): Datasource {
   return {
@@ -42,8 +43,18 @@ describe('datasources-group selection logic', () => {
   });
 
   it('excludes repository datasources under a lite backend', () => {
-    const ds = [makeDs('repo', 'repository'), makeDs('pg', 'postgresql')];
-    expect(selectedDatasourceIds(ds, null, true)).toEqual(['pg']);
+    const ds = [
+      makeDs('repo', 'repository'),
+      makeDs('kb', 'kb'),
+      makeDs('pg', 'postgresql'),
+    ];
+    expect(selectedDatasourceIds(ds, null, true)).toEqual(['kb', 'pg']);
+  });
+
+  it('includes OKF Knowledge Base datasources on every workspace tier', () => {
+    const ds = [makeDs('kb', 'kb')];
+    expect(selectedDatasourceIds(ds, null, true)).toEqual(['kb']);
+    expect(selectedDatasourceIds(ds, null, false)).toEqual(['kb']);
   });
 
   it('includes repository datasources when the backend is not lite', () => {
@@ -102,9 +113,13 @@ describe('datasources-group select-all state', () => {
   });
 
   it('ignores lite-excluded repository sources (all toggleable selected ⇒ true)', () => {
-    const ds = [makeDs('repo', 'repository'), makeDs('pg', 'postgresql')];
-    // repo is excluded under a lite backend, so "all selected" only considers pg.
-    const selection = {key: datasourceSetKey(ds), ids: new Set(['pg'])};
+    const ds = [
+      makeDs('repo', 'repository'),
+      makeDs('kb', 'kb'),
+      makeDs('pg', 'postgresql'),
+    ];
+    // repo is excluded under a lite backend; KB and pg remain selectable.
+    const selection = {key: datasourceSetKey(ds), ids: new Set(['kb', 'pg'])};
     expect(allDatasourcesSelected(ds, selection, true)).toBe(true);
   });
 

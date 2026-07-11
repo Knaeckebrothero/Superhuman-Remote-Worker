@@ -1,5 +1,6 @@
 """Unit tests for EmbeddingService."""
 
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +15,15 @@ def mock_env(monkeypatch):
     monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
     monkeypatch.delenv("EMBEDDING_PROVIDER", raising=False)
     monkeypatch.delenv("EMBEDDING_DIMENSIONS", raising=False)
+    for key in (
+        "KB_EMBEDDING_PROVIDER",
+        "KB_EMBEDDING_MODEL",
+        "KB_EMBEDDING_BASE_URL",
+        "KB_EMBEDDING_API_KEY",
+        "KB_EMBEDDING_DIMENSIONS",
+        "KB_EMBEDDING_PROFILE_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture
@@ -65,6 +75,34 @@ class TestEmbeddingServiceInit:
         service = EmbeddingService()
         assert service.base_url == "http://localhost:11434/v1"
 
+    def test_profile_fingerprint_is_normalized_and_never_depends_on_key(
+        self, mock_env, mock_openai_client
+    ):
+        from src.services.embedding_service import EmbeddingService
+
+        first = EmbeddingService(
+            provider="openai",
+            base_url="HTTPS://AI.Example:443/v1/?access_token=secret-one",
+            api_key="secret-one",
+            profile_identity="system:endpoint-1",
+        )
+        same_transport = EmbeddingService(
+            provider="OPENAI",
+            base_url="https://ai.example/v1#secret-two",
+            api_key="secret-two",
+            profile_identity="system:endpoint-1",
+        )
+        moved_endpoint = EmbeddingService(
+            provider="openai",
+            base_url="https://other.example/v1",
+            api_key="secret-one",
+            profile_identity="system:endpoint-2",
+        )
+
+        assert first.profile_fingerprint == same_transport.profile_fingerprint
+        assert first.profile_fingerprint != moved_endpoint.profile_fingerprint
+        assert "secret" not in first.profile_fingerprint
+
 
 class TestEmbeddingServiceSingleton:
     """Test get_embedding_service singleton pattern."""
@@ -82,6 +120,128 @@ class TestEmbeddingServiceSingleton:
 
         # Cleanup
         mod._embedding_service = None
+
+
+class TestKnowledgeEmbeddingService:
+    """The centrally indexed OKF corpus uses its own stable profile."""
+
+    def _reset(self, mod):
+        mod._embedding_service = None
+        mod._kb_embedding_service = None
+        mod._kb_embedding_profile = None
+
+    def test_dedicated_profile_is_independent_of_user_memory(
+        self, mock_env, monkeypatch, mock_openai_client
+    ):
+        import src.services.embedding_service as mod
+
+        self._reset(mod)
+        monkeypatch.setenv("EMBEDDING_MODEL", "user-memory-model")
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://user.example/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "user-key")
+        monkeypatch.setenv("KB_EMBEDDING_PROVIDER", "openai")
+        monkeypatch.setenv("KB_EMBEDDING_MODEL", "system-kb-model")
+        monkeypatch.setenv("KB_EMBEDDING_BASE_URL", "https://system.example/v1")
+        monkeypatch.setenv("KB_EMBEDDING_API_KEY", "system-key")
+        monkeypatch.setenv("KB_EMBEDDING_DIMENSIONS", "4096")
+        monkeypatch.setenv("KB_EMBEDDING_PROFILE_ID", "system:endpoint-1")
+
+        memory = mod.get_embedding_service()
+        knowledge = mod.get_kb_embedding_service()
+
+        assert memory.model == "user-memory-model"
+        assert memory.api_key == "user-key"
+        assert knowledge is not memory
+        assert knowledge.model == "system-kb-model"
+        assert knowledge.base_url == "https://system.example/v1"
+        assert knowledge.api_key == "system-key"
+        assert knowledge.expected_dimensions == 4096
+        assert knowledge.profile_identity == "system:endpoint-1"
+        self._reset(mod)
+
+    def test_legacy_deployment_falls_back_to_memory_profile(
+        self, mock_env, mock_openai_client
+    ):
+        import src.services.embedding_service as mod
+
+        self._reset(mod)
+        assert mod.get_kb_embedding_service() is mod.get_embedding_service()
+        self._reset(mod)
+
+    def test_declared_profile_never_borrows_user_key(
+        self, mock_env, monkeypatch, mock_openai_client
+    ):
+        import src.services.embedding_service as mod
+
+        self._reset(mod)
+        monkeypatch.setenv("EMBEDDING_API_KEY", "user-key")
+        monkeypatch.setenv("KB_EMBEDDING_MODEL", "system-kb-model")
+        monkeypatch.delenv("KB_EMBEDDING_API_KEY", raising=False)
+
+        knowledge = mod.get_kb_embedding_service()
+
+        assert knowledge.model == "system-kb-model"
+        assert knowledge.api_key == ""
+        self._reset(mod)
+
+    def test_profile_change_rebuilds_only_kb_singleton(
+        self, mock_env, monkeypatch, mock_openai_client
+    ):
+        import src.services.embedding_service as mod
+
+        self._reset(mod)
+        monkeypatch.setenv("KB_EMBEDDING_MODEL", "kb-v1")
+        monkeypatch.setenv("KB_EMBEDDING_API_KEY", "system-key")
+        first = mod.get_kb_embedding_service()
+        memory = mod.get_embedding_service()
+
+        monkeypatch.setenv("KB_EMBEDDING_MODEL", "kb-v2")
+        second = mod.get_kb_embedding_service()
+
+        assert second is not first
+        assert second.model == "kb-v2"
+        assert mod.get_embedding_service() is memory
+        self._reset(mod)
+
+    def test_authoritative_apply_clears_stale_endpoint_and_profile_removal(
+        self, mock_env, mock_openai_client
+    ):
+        import src.services.embedding_service as mod
+
+        self._reset(mod)
+        mod.apply_kb_embedding_env(
+            {
+                "KB_EMBEDDING_PROVIDER": "openai",
+                "KB_EMBEDDING_MODEL": "endpoint-model",
+                "KB_EMBEDDING_BASE_URL": "https://old.example/v1",
+                "KB_EMBEDDING_API_KEY": "old-system-key",
+                "KB_EMBEDDING_DIMENSIONS": "4096",
+            }
+        )
+        first = mod.get_kb_embedding_service()
+        assert first.base_url == "https://old.example/v1"
+
+        # Provider-backed replacement deliberately has no BASE_URL. The old
+        # endpoint must disappear rather than combine with the new model/key.
+        mod.apply_kb_embedding_env(
+            {
+                "KB_EMBEDDING_PROVIDER": "openrouter",
+                "KB_EMBEDDING_MODEL": "openai/text-embedding-3-large",
+                "KB_EMBEDDING_API_KEY": "new-system-key",
+            }
+        )
+        second = mod.get_kb_embedding_service()
+        assert second is not first
+        assert second.base_url == mod.EmbeddingService.OPENROUTER_API_URL
+        assert second.api_key == "new-system-key"
+        assert "KB_EMBEDDING_BASE_URL" not in os.environ
+
+        # Attaching a thread/job without knowledge scope removes the whole
+        # system profile and restores the legacy general-profile fallback.
+        mod.apply_kb_embedding_env(None)
+        assert all(key not in os.environ for key in mod.KB_EMBEDDING_ENV_KEYS)
+        assert mod.get_kb_embedding_service() is mod.get_embedding_service()
+        self._reset(mod)
 
 
 class TestEmbeddingServiceEmbed:

@@ -22,11 +22,13 @@ from orchestrator.services.kb_reindex import (
     knowledge_blob_map,
     note_fields,
     plan_reindex,
+    reindex_pipeline_version,
     reindex_kb,
     resolve_kb_repo,
 )
 
-CURRENT_VERSION = f"qwen3-embedding-8b:4096:{CHUNKER_VERSION}"
+EMBEDDING_VERSION = f"qwen3-embedding-8b:4096:{CHUNKER_VERSION}"
+CURRENT_VERSION = reindex_pipeline_version(EMBEDDING_VERSION, "knowledge")
 
 
 def _note_md(slug: str, body: str = "the body", note_type: str = "learning") -> str:
@@ -99,6 +101,27 @@ class TestKnowledgeBlobMap:
 
     def test_empty_tree(self):
         assert knowledge_blob_map([]) == {}
+
+    def test_external_root_can_be_nested_or_repository_root(self):
+        tree = [
+            {"path": "vault/a.md", "type": "blob", "sha": "a"},
+            {"path": "vault/deep/b.md", "type": "blob", "sha": "b"},
+            {"path": "elsewhere/c.md", "type": "blob", "sha": "c"},
+        ]
+        assert knowledge_blob_map(tree, "vault") == {
+            "vault/a.md": "a",
+            "vault/deep/b.md": "b",
+        }
+        assert knowledge_blob_map(tree, "") == {
+            "vault/a.md": "a",
+            "vault/deep/b.md": "b",
+            "elsewhere/c.md": "c",
+        }
+
+    def test_root_path_changes_watermark_pipeline_stamp(self):
+        assert reindex_pipeline_version(EMBEDDING_VERSION, "vault") != (
+            reindex_pipeline_version(EMBEDDING_VERSION, "docs")
+        )
 
 
 # =============================================================================
@@ -263,16 +286,22 @@ class TestReindexKbShortCircuits:
 
     @pytest.mark.asyncio
     async def test_tree_fetch_failure_does_not_advance_watermark(self):
-        gitea, store, svc = _make_deps(head="headsha")
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="last-good", pipeline_version=CURRENT_VERSION
+        )
+        gitea, store, svc = _make_deps(head="headsha", watermark=wm)
         gitea.list_tree.return_value = None
         result = await reindex_kb(
             gitea_client=gitea,
             store=store,
             embedding_service=svc,
-            kb_id=uuid.uuid4(),
+            kb_id=kb,
             repo_name="r",
         )
         assert result["status"] == "tree-fetch-failed"
+        assert result["indexed_commit"] == "last-good"
+        assert result["errors"] == 1
         store.upsert_watermark.assert_not_awaited()
 
 
@@ -286,8 +315,10 @@ class TestReindexKbIncremental:
     @pytest.mark.asyncio
     async def test_changed_note_flows_through_pipeline(self):
         kb = uuid.uuid4()
+        endpoint_stamp = f"{EMBEDDING_VERSION}:pf-effective-profile"
+        endpoint_pipeline = reindex_pipeline_version(endpoint_stamp, "knowledge")
         wm = KbWatermark(
-            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+            kb_id=kb, indexed_commit="old", pipeline_version=endpoint_pipeline
         )
         gitea, store, svc = _make_deps(
             head="headsha",
@@ -296,6 +327,7 @@ class TestReindexKbIncremental:
             indexed={"knowledge/changed.md": "OLD", "knowledge/same.md": "same1"},
             contents={"knowledge/changed.md": _note_md("changed", "fresh insight")},
         )
+        svc.profile_fingerprint = "pf-effective-profile"
         result = await reindex_kb(
             gitea_client=gitea,
             store=store,
@@ -311,7 +343,7 @@ class TestReindexKbIncremental:
         )
         # adopt-then-upsert ordering for the legacy-collision guard
         store.adopt_legacy_row.assert_awaited_once_with(
-            kb, "changed", "knowledge/changed.md"
+            kb, "changed", "knowledge/changed.md", movable_paths=[]
         )
         up_kwargs = store.upsert_kb_note.await_args[1]
         assert up_kwargs["kb_id"] == kb
@@ -323,7 +355,7 @@ class TestReindexKbIncremental:
         # chunks persisted with the note row id
         rc_kwargs = store.replace_note_chunks.await_args[1]
         assert rc_kwargs["kb_id"] == kb
-        assert rc_kwargs["embedding_version"] == CURRENT_VERSION
+        assert rc_kwargs["embedding_version"] == endpoint_stamp
         assert len(rc_kwargs["chunks"]) >= 1
         # ... then the stamp, carrying the git blob + pipeline version + the
         # whole-note centroid of the chunk embeddings (PR4d).
@@ -331,13 +363,13 @@ class TestReindexKbIncremental:
         store.stamp_note_indexed.assert_awaited_once_with(
             store.upsert_kb_note.return_value,
             "NEW",
-            CURRENT_VERSION,
+            endpoint_stamp,
             centroid=expected_centroid,
         )
         # watermark advanced to head with the current pipeline version
         wm_kwargs = store.upsert_watermark.await_args[1]
         assert wm_kwargs["indexed_commit"] == "headsha"
-        assert wm_kwargs["pipeline_version"] == CURRENT_VERSION
+        assert wm_kwargs["pipeline_version"] == endpoint_pipeline
 
     @pytest.mark.asyncio
     async def test_stamp_centroid_spans_multiple_chunks(self):
@@ -437,6 +469,121 @@ class TestReindexKbIncremental:
         store.delete_kb_note.assert_awaited_once_with(kb, "knowledge/gone.md")
 
     @pytest.mark.asyncio
+    async def test_same_id_git_rename_moves_before_path_upsert(self):
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        new_path = "knowledge/new-name.md"
+        old_path = "knowledge/old-name.md"
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=[{"path": new_path, "type": "blob", "sha": "same-blob"}],
+            indexed={old_path: "same-blob"},
+            contents={new_path: _note_md("stable-id")},
+        )
+        order = []
+        store.adopt_legacy_row.side_effect = lambda *a, **k: order.append("move")
+        store.upsert_kb_note.side_effect = lambda **k: (
+            order.append("upsert") or uuid.uuid4()
+        )
+        # In production the move means the old path no longer matches a row.
+        store.delete_kb_note.return_value = False
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "completed"
+        assert result["upserted"] == 1
+        assert order[:2] == ["move", "upsert"]
+        store.adopt_legacy_row.assert_awaited_once_with(
+            kb, "stable-id", new_path, movable_paths=[old_path]
+        )
+        store.delete_kb_note.assert_awaited_once_with(kb, old_path)
+
+    @pytest.mark.asyncio
+    async def test_duplicate_id_does_not_steal_still_canonical_note(self):
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=CURRENT_VERSION
+        )
+        canonical = "knowledge/canonical.md"
+        duplicate = "knowledge/duplicate.md"
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=[
+                {"path": canonical, "type": "blob", "sha": "same"},
+                {"path": duplicate, "type": "blob", "sha": "new"},
+            ],
+            indexed={canonical: "same"},
+            contents={duplicate: _note_md("stable-id")},
+        )
+        # The real unique (project_id, note_id) constraint rejects the second
+        # identity. Crucially, adoption was not authorized to move the existing
+        # row because its canonical path remains in the current tree.
+        store.upsert_kb_note.side_effect = RuntimeError("duplicate note id")
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "partial"
+        assert result["errors"] == 1
+        assert result["indexed_commit"] == "old"
+        store.adopt_legacy_row.assert_awaited_once_with(
+            kb, "stable-id", duplicate, movable_paths=[]
+        )
+        store.upsert_watermark.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_history_rewrite_reconciles_directly_from_current_tree(self):
+        """A force-push needs no ancestry walk: current path/blob truth wins."""
+        kb = uuid.uuid4()
+        wm = KbWatermark(
+            kb_id=kb,
+            indexed_commit="commit-from-rewritten-history",
+            pipeline_version=CURRENT_VERSION,
+        )
+        gitea, store, svc = _make_deps(
+            head="new-unrelated-head",
+            watermark=wm,
+            tree=[
+                {"path": "knowledge/kept.md", "type": "blob", "sha": "same"},
+                {"path": "knowledge/new.md", "type": "blob", "sha": "new"},
+            ],
+            indexed={
+                "knowledge/kept.md": "same",
+                "knowledge/removed.md": "gone",
+            },
+            contents={"knowledge/new.md": _note_md("new")},
+        )
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "completed"
+        assert result["full"] is False
+        assert result["indexed_commit"] == "new-unrelated-head"
+        store.upsert_kb_note.assert_awaited_once()
+        store.delete_kb_note.assert_awaited_once_with(kb, "knowledge/removed.md")
+
+    @pytest.mark.asyncio
     async def test_pipeline_version_change_forces_full_rebuild(self):
         kb = uuid.uuid4()
         wm = KbWatermark(
@@ -527,6 +674,28 @@ class TestReindexKbFailureHonesty:
         assert result["skipped"] == 1
         assert result["upserted"] == 1
         store.upsert_watermark.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unparseable_changed_note_drops_stale_indexed_version(self):
+        kb = uuid.uuid4()
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            tree=[{"path": "knowledge/bad.md", "type": "blob", "sha": "new"}],
+            indexed={"knowledge/bad.md": "old"},
+            contents={"knowledge/bad.md": "---\n: bad: [yaml\n---\nbody"},
+        )
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "completed"
+        assert result["skipped"] == 1
+        store.delete_kb_note.assert_awaited_once_with(kb, "knowledge/bad.md")
 
     @pytest.mark.asyncio
     async def test_embed_failure_counts_error_and_blocks_watermark(self):
@@ -765,6 +934,87 @@ class TestKbSweepTick:
         )
         assert n == 1  # the second KB still reindexed
         assert reindex_fn.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_external_datasource_is_swept_once_under_datasource_id(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("KB_GIT_ALLOWED_HOSTS", "example.test")
+        datasource_id = uuid.uuid4()
+        postgres_db = AsyncMock()
+        postgres_db.fetch.return_value = []
+        postgres_db.list_datasources.return_value = [
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "name": "Team Docs",
+                "connection_url": "https://example.test/team-docs.git",
+                "credentials": {"token": "orchestrator-only"},
+                "default_branch": "main",
+                "config": {"root_path": "vault"},
+            }
+        ]
+        reindex_fn = AsyncMock(return_value={"status": "up-to-date"})
+
+        worked = await kb_sweep_tick(
+            postgres_db=postgres_db,
+            store=MagicMock(),
+            gitea_client=MagicMock(),
+            embedding_service=MagicMock(),
+            reindex_fn=reindex_fn,
+        )
+
+        assert worked == 0
+        kwargs = reindex_fn.await_args.kwargs
+        assert kwargs["kb_id"] == datasource_id
+        assert kwargs["root_path"] == "vault"
+        assert kwargs["source_label"] == f"datasource:{datasource_id}"
+        assert kwargs["source"].label == f"datasource:{datasource_id}"
+
+    @pytest.mark.asyncio
+    async def test_external_sweep_shares_the_global_reindex_limit(self, monkeypatch):
+        import orchestrator.services.kb_datasources as datasource_service
+
+        monkeypatch.setenv("KB_GIT_ALLOWED_HOSTS", "example.test")
+        datasource_id = uuid.uuid4()
+        postgres_db = AsyncMock()
+        postgres_db.fetch.return_value = []
+        postgres_db.list_datasources.return_value = [
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "name": "Team Docs",
+                "connection_url": "https://example.test/team-docs.git",
+                "credentials": {},
+                "default_branch": "main",
+                "config": {"root_path": "vault"},
+            }
+        ]
+        reindex_started = asyncio.Event()
+
+        async def fake_reindex(**_kwargs):
+            reindex_started.set()
+            return {"status": "up-to-date"}
+
+        limiter = asyncio.Semaphore(1)
+        await limiter.acquire()  # represent an in-flight create/manual build
+        monkeypatch.setattr(datasource_service, "_external_reindex_semaphore", limiter)
+
+        sweep = asyncio.create_task(
+            kb_sweep_tick(
+                postgres_db=postgres_db,
+                store=MagicMock(),
+                gitea_client=MagicMock(),
+                embedding_service=MagicMock(),
+                reindex_fn=fake_reindex,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not reindex_started.is_set()
+
+        limiter.release()
+        assert await sweep == 0
+        assert reindex_started.is_set()
 
 
 # =============================================================================

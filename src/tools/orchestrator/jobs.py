@@ -10,6 +10,7 @@ The orchestrator URL is read from the ORCHESTRATOR_URL environment variable
 
 import logging
 import os
+from uuid import UUID
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -414,6 +415,18 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         # preferences during dispatch). No-op for worker-mode callers.
         if context.thread_id:
             payload["thread_id"] = context.thread_id
+        # Worker-mode callers must bind child identity/scope to the job they are
+        # currently executing. X-Internal-Key/X-MCP-User-Id authenticate the
+        # transport/user but do not prove that a model-selected project or
+        # datasource belongs to this worker's job. Persistent sessions use the
+        # thread_id above; contexts that legitimately carry both send both and
+        # the orchestrator requires their scopes to agree.
+        parent_job_id = context._job_metadata.get("job_id")
+        try:
+            if parent_job_id:
+                payload["parent_job_id"] = str(UUID(str(parent_job_id)))
+        except (ValueError, TypeError, AttributeError):
+            pass
         if not project_id and context.project_id:
             payload["project_id"] = context.project_id
 

@@ -757,11 +757,113 @@ class TestEmbeddingCredentialReliability:
     async def test_system_default_injected_without_user(self, patched_main_embedding):
         """No user_id → user block skipped; the system-default fallback still
         injects the embedding endpoint + key (the core asymmetry fix)."""
-        result = await main._inject_dispatch_credentials(_job_no_user(), {})
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(), {}, include_kb_profile=True
+        )
         env = result["env_keys"]
         assert env["EMBEDDING_MODEL"] == EMB_MODEL
         assert env["EMBEDDING_BASE_URL"] == EMB_BASE_URL
         assert env["EMBEDDING_API_KEY"] == EMB_API_KEY
+        assert env["KB_EMBEDDING_MODEL"] == EMB_MODEL
+        assert env["KB_EMBEDDING_BASE_URL"] == EMB_BASE_URL
+        assert env["KB_EMBEDDING_API_KEY"] == EMB_API_KEY
+        assert env["KB_EMBEDDING_PROVIDER"] == "openai"
+        assert env["KB_EMBEDDING_DIMENSIONS"] == "4096"
+        assert env["KB_EMBEDDING_PROFILE_ID"] == f"system:{EMB_ENDPOINT_ID}"
+
+    @pytest.mark.asyncio
+    async def test_kb_profile_is_system_owned(self, patched_main_embedding):
+        """A request cannot make KB queries use a user/BYO vector profile."""
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(),
+            {
+                "env_keys": {
+                    "KB_EMBEDDING_MODEL": "attacker-model",
+                    "KB_EMBEDDING_BASE_URL": "https://attacker.invalid/v1",
+                    "KB_EMBEDDING_API_KEY": "attacker-key",
+                    "KB_EMBEDDING_PROVIDER": "openrouter",
+                }
+            },
+            include_kb_profile=True,
+        )
+        env = result["env_keys"]
+        assert env["KB_EMBEDDING_MODEL"] == EMB_MODEL
+        assert env["KB_EMBEDDING_BASE_URL"] == EMB_BASE_URL
+        assert env["KB_EMBEDDING_API_KEY"] == EMB_API_KEY
+        assert env["KB_EMBEDDING_PROVIDER"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_unscoped_job_receives_no_system_kb_secret(
+        self, patched_main_embedding
+    ):
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(),
+            {
+                "env_keys": {
+                    "KB_EMBEDDING_MODEL": "caller-model",
+                    "KB_EMBEDDING_API_KEY": "caller-key",
+                }
+            },
+        )
+
+        assert not any(
+            key.startswith("KB_EMBEDDING_") for key in result.get("env_keys", {})
+        )
+
+    @pytest.mark.asyncio
+    async def test_central_indexer_uses_dispatched_kb_profile(
+        self, patched_main_embedding
+    ):
+        dispatched = await main._inject_dispatch_credentials(
+            _job_no_user(), {}, include_kb_profile=True
+        )
+        service = await main._build_kb_embedding_service()
+        env = dispatched["env_keys"]
+
+        assert service.model == env["KB_EMBEDDING_MODEL"]
+        assert service.base_url == env["KB_EMBEDDING_BASE_URL"]
+        assert service.api_key == env["KB_EMBEDDING_API_KEY"]
+        assert service.provider == env["KB_EMBEDDING_PROVIDER"]
+        assert service.expected_dimensions == int(env["KB_EMBEDDING_DIMENSIONS"])
+        assert service.profile_identity == env["KB_EMBEDDING_PROFILE_ID"]
+
+    @pytest.mark.asyncio
+    async def test_dev_env_fallback_is_dispatched_as_authoritative_kb_profile(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+        monkeypatch.setenv("EMBEDDING_MODEL", "dev-kb-model")
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://dev.example/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "dev-system-key")
+        monkeypatch.setenv("EMBEDDING_DIMENSIONS", "4096")
+        monkeypatch.setattr(
+            main.postgres_db,
+            "resolve_default_for_capability",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "resolve_api_keys_for_job",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_user_settings",
+            AsyncMock(return_value={}),
+        )
+
+        result = await main._inject_dispatch_credentials(
+            _job_no_user(), {}, include_kb_profile=True
+        )
+        service = await main._build_kb_embedding_service()
+        env = result["env_keys"]
+
+        assert env["KB_EMBEDDING_MODEL"] == "dev-kb-model"
+        assert env["KB_EMBEDDING_BASE_URL"] == "https://dev.example/v1"
+        assert env["KB_EMBEDDING_API_KEY"] == "dev-system-key"
+        assert service.model == env["KB_EMBEDDING_MODEL"]
+        assert service.base_url == env["KB_EMBEDDING_BASE_URL"]
+        assert service.api_key == env["KB_EMBEDDING_API_KEY"]
 
     @pytest.mark.asyncio
     async def test_user_without_embedding_pref_still_gets_key(
@@ -803,3 +905,14 @@ class TestEmbeddingCredentialReliability:
         assert "EMBEDDING_API_KEY" not in env
         assert "EMBEDDING_BASE_URL" not in env
         assert any(EMB_ENDPOINT_ID in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_catalog_kb_profile_never_indexes_with_env_fallback(
+        self, patched_main_embedding, monkeypatch
+    ):
+        """A broken selected profile must fail, not index with another model."""
+        patched_main_embedding["api_key"] = None
+        monkeypatch.setenv("EMBEDDING_MODEL", "different-env-model")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "env-key")
+
+        assert await main._build_kb_embedding_service() is None

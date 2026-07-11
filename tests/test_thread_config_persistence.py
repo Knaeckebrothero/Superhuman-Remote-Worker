@@ -18,7 +18,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -133,6 +133,133 @@ class TestInjectThreadCredentials:
             stripped, user_id="u", project_id="p"
         )
         assert restored["llm"]["api_key"] == API_KEY
+
+    @pytest.mark.asyncio
+    async def test_user_memory_profile_does_not_change_system_kb_profile(
+        self, monkeypatch
+    ):
+        kb_model = "system-kb-model"
+
+        async def fake_default(capability):
+            return kb_model if capability == "embedding" else None
+
+        async def fake_resolve(model_id, user_id=None, capability="chat"):
+            if model_id == kb_model:
+                return ModelMeta(
+                    model_id=kb_model,
+                    provider="openai",
+                    family="default",
+                    display_name="System KB",
+                    origin="system",
+                    endpoint_id=ENDPOINT_ID,
+                    capability="embedding",
+                )
+            return None
+
+        monkeypatch.setattr(
+            main.postgres_db,
+            "resolve_default_for_capability",
+            AsyncMock(side_effect=fake_default),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "resolve_api_keys_for_job",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_user_llm_endpoint",
+            AsyncMock(
+                return_value={
+                    "base_url": BASE_URL,
+                    "api_key": API_KEY,
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            main,
+            "_resolve_model",
+            AsyncMock(side_effect=fake_resolve),
+            raising=True,
+        )
+        co = {
+            "env_keys": {
+                "EMBEDDING_PROVIDER": "openrouter",
+                "EMBEDDING_MODEL": "user-memory-model",
+                "EMBEDDING_BASE_URL": "https://user.example/v1",
+                "EMBEDDING_API_KEY": "user-key",
+            }
+        }
+
+        out = await main._inject_thread_dispatch_credentials(
+            co,
+            user_id="u",
+            project_id="p",
+            include_kb_profile=True,
+        )
+
+        env = out["env_keys"]
+        assert env["EMBEDDING_MODEL"] == "user-memory-model"
+        assert env["EMBEDDING_API_KEY"] == "user-key"
+        assert env["KB_EMBEDDING_MODEL"] == kb_model
+        assert env["KB_EMBEDDING_BASE_URL"] == BASE_URL
+        assert env["KB_EMBEDDING_API_KEY"] == API_KEY
+        assert env["KB_EMBEDDING_PROVIDER"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_resolved_session_uses_canonical_mount_projects_for_kb_gate(monkeypatch):
+    """A mount-only project thread still receives KB_* in the preferred blob."""
+    thread_id = "aaaaaaaa-1111-2222-3333-444444444444"
+    mounted_project = "bbbbbbbb-1111-2222-3333-444444444444"
+    monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
+    monkeypatch.setattr(
+        main, "_user_experts_enabled", AsyncMock(return_value=True), raising=True
+    )
+    monkeypatch.setattr(
+        main, "_resolve_default_models", AsyncMock(return_value={}), raising=True
+    )
+    monkeypatch.setattr(
+        main, "_gather_in_scope_skills", AsyncMock(return_value=[]), raising=True
+    )
+    monkeypatch.setattr(
+        main,
+        "_seed_registry_model_overrides",
+        AsyncMock(side_effect=lambda override, **_kwargs: override),
+        raising=True,
+    )
+    project_lookup = AsyncMock(return_value=[mounted_project])
+    monkeypatch.setattr(main, "_thread_project_ids", project_lookup, raising=True)
+    monkeypatch.setattr(
+        main, "_enforce_dispatch_grants", AsyncMock(return_value=None), raising=True
+    )
+    injector = AsyncMock(side_effect=lambda co, **_kwargs: co)
+    monkeypatch.setattr(
+        main, "_inject_thread_dispatch_credentials", injector, raising=True
+    )
+
+    def fake_resolve_config(*, capture, **_kwargs):
+        capture["merged_fragment"] = {}
+        return {"agent": {}}
+
+    monkeypatch.setattr(main, "resolve_config", fake_resolve_config, raising=True)
+
+    async def fake_inject_blob(blob, callback):
+        await callback({})
+        return blob
+
+    monkeypatch.setattr(main, "inject_blob_credentials", fake_inject_blob, raising=True)
+    # The helper imports this function inside the call; patch the source module.
+    monkeypatch.setattr("src.core.skill_resolution.filter_bound_skills", MagicMock())
+
+    result = await main._resolve_session_config(
+        {"id": thread_id, "project_id": None, "config_name": "persistent_defaults"},
+        {},
+    )
+
+    assert result == {"agent": {}}
+    project_lookup.assert_awaited_once_with(thread_id)
+    assert injector.await_args.kwargs["include_kb_profile"] is True
 
 
 CODEX_ENDPOINT_ID = "44444444-4444-4444-4444-444444444444"

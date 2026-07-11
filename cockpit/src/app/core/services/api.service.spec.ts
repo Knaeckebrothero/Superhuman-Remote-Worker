@@ -260,3 +260,69 @@ describe('ApiService audit id normalization (Mongo _id / Postgres id)', () => {
     expect(res!._id).toBe('7');
   });
 });
+
+describe('ApiService OKF Knowledge Base datasource index endpoints', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('GETs credential-free datasource index status', async () => {
+    const pending = firstValueFrom(api.getDatasourceIndexStatus('kb-1'));
+    const req = httpMock.expectOne((r) =>
+      r.url.endsWith('/datasources/kb-1/index-status'),
+    );
+    expect(req.request.method).toBe('GET');
+    req.flush({
+      datasource_id: 'kb-1',
+      status: 'ready',
+      indexed_commit: 'abc123',
+      last_success_at: '2026-07-11T12:00:00Z',
+    });
+    expect((await pending)?.indexed_commit).toBe('abc123');
+  });
+
+  it('POSTs incremental and full datasource reindex requests', async () => {
+    const incremental = firstValueFrom(api.reindexDatasource('kb-1'));
+    const req1 = httpMock.expectOne((r) =>
+      r.url.endsWith('/datasources/kb-1/reindex') && r.params.get('full') === 'false',
+    );
+    expect(req1.request.method).toBe('POST');
+    req1.flush({status: 'ready', full: false, indexed_commit: 'abc123'});
+    expect((await incremental)?.full).toBe(false);
+
+    const full = firstValueFrom(api.reindexDatasource('kb-1', true));
+    const req2 = httpMock.expectOne((r) => r.params.get('full') === 'true');
+    req2.flush({status: 'ready', full: true, indexed_commit: 'def456'});
+    expect((await full)?.full).toBe(true);
+  });
+
+  it('persists read-only access when linking an external KB to a project', async () => {
+    const pending = firstValueFrom(
+      api.linkProjectDatasource('project-1', 'kb-1', {read_only: true}),
+    );
+    const req = httpMock.expectOne((r) =>
+      r.url.endsWith('/projects/project-1/datasources/kb-1'),
+    );
+    expect(req.request.method).toBe('POST');
+    expect(req.request.body).toEqual({read_only: true});
+    req.flush({status: 'linked'});
+    expect(await pending).toEqual({status: 'linked'});
+  });
+});

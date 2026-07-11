@@ -155,6 +155,23 @@ def _datasource_row_to_dict(
     d = dict(row)
     if "credentials" in d:
         d["credentials"] = _decrypt_credentials_field(d["credentials"], field=field)
+    if "config" in d:
+        raw_config = d["config"]
+        if isinstance(raw_config, str):
+            try:
+                raw_config = json.loads(raw_config)
+            except (json.JSONDecodeError, ValueError) as exc:
+                logger.error("Failed to parse datasources.config JSON: %s", exc)
+                raw_config = {}
+        if raw_config is None:
+            raw_config = {}
+        if not isinstance(raw_config, dict):
+            logger.warning(
+                "Unexpected datasources.config type %s; treating as empty.",
+                type(raw_config).__name__,
+            )
+            raw_config = {}
+        d["config"] = raw_config
     return d
 
 
@@ -4355,7 +4372,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 f"""
                 SELECT id, name, description, type, connection_url, credentials,
-                       cli_hint, default_branch, job_id, created_by, is_global,
+                       config, cli_hint, default_branch, job_id, created_by, is_global,
                        created_at, updated_at
                 FROM datasources
                 {where_clause}
@@ -4385,7 +4402,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, name, description, type, connection_url, credentials,
-                       cli_hint, default_branch, job_id, created_by, is_global,
+                       config, cli_hint, default_branch, job_id, created_by, is_global,
                        created_at, updated_at
                 FROM datasources
                 WHERE id = $1
@@ -4407,6 +4424,7 @@ class PostgresDB:
         default_branch: str | None = None,
         created_by: str | None = None,
         is_global: bool = False,
+        config: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Create a new datasource.
 
@@ -4424,6 +4442,7 @@ class PostgresDB:
             default_branch: Branch to clone (repository type)
             created_by: Owner user UUID
             is_global: Whether this datasource is visible to all users
+            config: Non-secret type-specific configuration
 
         Returns:
             Created datasource dict
@@ -4439,11 +4458,11 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 INSERT INTO datasources (name, description, type, connection_url,
-                                         credentials, job_id, cli_hint, default_branch,
-                                         created_by, is_global)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                                         credentials, config, job_id, cli_hint,
+                                         default_branch, created_by, is_global)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
                 RETURNING id, name, description, type, connection_url, credentials,
-                          job_id, cli_hint, default_branch, created_by, is_global,
+                          config, job_id, cli_hint, default_branch, created_by, is_global,
                           created_at, updated_at
                 """,
                 name,
@@ -4451,6 +4470,7 @@ class PostgresDB:
                 ds_type,
                 connection_url,
                 _encrypt_credentials_dict(credentials),
+                json.dumps(config or {}),
                 job_uuid,
                 cli_hint,
                 default_branch,
@@ -4469,6 +4489,7 @@ class PostgresDB:
         credentials: Dict[str, Any] | None = None,
         cli_hint: str | None = None,
         default_branch: str | None = None,
+        config: Dict[str, Any] | None = None,
     ) -> bool:
         """Update a datasource.
 
@@ -4480,6 +4501,7 @@ class PostgresDB:
             credentials: New credentials
             cli_hint: New CLI hint
             default_branch: New default branch
+            config: New non-secret type-specific configuration
 
         Returns:
             True if updated, False if not found
@@ -4522,6 +4544,11 @@ class PostgresDB:
             param_count += 1
             updates.append(f"default_branch = ${param_count}")
             values.append(default_branch)
+
+        if config is not None:
+            param_count += 1
+            updates.append(f"config = ${param_count}::jsonb")
+            values.append(json.dumps(config))
 
         if not updates:
             return False
@@ -4596,7 +4623,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 """
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
-                    d.connection_url, d.credentials,
+                    d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch,
                     d.created_at, d.updated_at,
                     pd.read_only AS project_read_only
@@ -4617,12 +4644,13 @@ class PostgresDB:
             legacy = await conn.fetch(
                 """
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
-                    d.connection_url, d.credentials,
+                    d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch,
                     d.created_at, d.updated_at,
                     NULL::boolean AS project_read_only
                 FROM datasources d
                 WHERE d.job_id = $1
+                  AND d.type <> 'kb'
                 ORDER BY d.type, d.name
                 """,
                 job_uuid,
@@ -4675,7 +4703,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 """
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
-                    d.connection_url, d.credentials,
+                    d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch,
                     d.created_at, d.updated_at,
                     pd.read_only AS project_read_only
@@ -4775,7 +4803,7 @@ class PostgresDB:
 
         select_cols = """
             SELECT DISTINCT d.id, d.name, d.description, d.type,
-                d.connection_url, d.credentials, d.cli_hint,
+                d.connection_url, d.credentials, d.config, d.cli_hint,
                 d.default_branch, d.created_by, d.is_global,
                 d.created_at, d.updated_at
         """
@@ -4886,7 +4914,7 @@ class PostgresDB:
                 """
                 SELECT d.id, d.name,
                        COALESCE(pd.description, d.description) AS description,
-                       d.type, d.connection_url, d.credentials,
+                       d.type, d.connection_url, d.credentials, d.config,
                        d.cli_hint, d.default_branch,
                        d.job_id, d.created_at, d.updated_at,
                        pd.linked_at,
@@ -5161,6 +5189,7 @@ class PostgresDB:
         ds_type: str,
         connection_url: str,
         credentials: Dict[str, Any] | None = None,
+        config: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Create or update a system-seeded datasource (created_by=NULL).
 
@@ -5172,6 +5201,7 @@ class PostgresDB:
             ds_type: Datasource type
             connection_url: Connection URL
             credentials: Additional auth details
+            config: Non-secret type-specific configuration
 
         Returns:
             Created or updated datasource dict
@@ -5182,20 +5212,22 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 INSERT INTO datasources (name, type, connection_url, credentials,
-                                         created_by, is_global)
-                VALUES ($1, $2, $3, $4, NULL, TRUE)
+                                         config, created_by, is_global)
+                VALUES ($1, $2, $3, $4, $5::jsonb, NULL, TRUE)
                 ON CONFLICT (name, type, COALESCE(created_by, '00000000-0000-0000-0000-000000000000'))
                 DO UPDATE SET
                     connection_url = EXCLUDED.connection_url,
                     credentials = EXCLUDED.credentials,
+                    config = EXCLUDED.config,
                     is_global = TRUE
                 RETURNING id, name, description, type, connection_url, credentials,
-                          created_by, is_global, created_at, updated_at
+                          config, created_by, is_global, created_at, updated_at
                 """,
                 name,
                 ds_type,
                 connection_url,
                 creds_json,
+                json.dumps(config or {}),
             )
 
         return _datasource_row_to_dict(row)

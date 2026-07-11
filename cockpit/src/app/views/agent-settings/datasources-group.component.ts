@@ -32,8 +32,9 @@ export function activeDatasourceIds(
   return new Set(datasources.map(d => d.id));
 }
 
-/** Selected datasource IDs to submit: the active set, minus repository sources
- *  disabled by a lite backend and any ids not in the current datasource set. */
+/** Selected datasource IDs to submit: the active set, minus clone-based
+ *  repository sources disabled by a lite backend and stale ids. Centrally
+ *  indexed `kb` datasources remain available on every tier. */
 export function selectedDatasourceIds(
   datasources: Datasource[],
   selection: DatasourceSelection,
@@ -100,7 +101,9 @@ export function allDatasourcesSelected(
                   <span class="ds-desc">{{ ds.description }}</span>
                 }
               </span>
-              <span class="ds-type-badge">{{ ds.type }}</span>
+              <span class="ds-type-badge">
+                {{ 'datasources.filter.' + ds.type | transloco }}
+              </span>
             </label>
           }
         </div>
@@ -194,6 +197,7 @@ export function allDatasourcesSelected(
     .ds-type-neo4j { color: var(--success); }
     .ds-type-mongodb { color: var(--alert); }
     .ds-type-webdav { color: var(--info); }
+    .ds-type-kb { color: var(--accent-color); }
     .ds-info {
       display: flex;
       flex-direction: column;
@@ -239,9 +243,9 @@ export class DatasourcesGroupComponent {
   loading = input(false);
   disabled = input(false);
   /**
-   * When a lite workspace backend (virtual/none) is selected, repository
-   * datasources can't be cloned — they are shown disabled and excluded from
-   * the emitted selection.
+   * When a lite workspace backend (virtual/none) is selected, clone-based
+   * repository datasources are unavailable. `kb` repositories are indexed by
+   * the orchestrator, so they remain selectable.
    */
   isLiteBackend = input(false);
 
@@ -306,13 +310,14 @@ export class DatasourcesGroupComponent {
       neo4j: 'hub',
       mongodb: 'eco',
       webdav: 'cloud',
+      kb: 'menu_book',
     };
     return icons[type] || 'storage';
   }
 
   /**
-   * Selected datasource IDs, excluding repository sources disabled by a lite
-   * backend and any ids not in the current datasource set.
+   * Selected datasource IDs, excluding clone-based repository sources disabled
+   * by a lite backend and any ids not in the current datasource set.
    */
   getSelectedIds(): string[] {
     return selectedDatasourceIds(

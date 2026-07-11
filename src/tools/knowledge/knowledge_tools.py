@@ -1,6 +1,6 @@
 """Knowledge base tools for the Universal Agent.
 
-Provides tools for interacting with the project knowledge base:
+Provides tools for interacting with native and datasource-backed OKF knowledge bases:
 - Writing: kb_write, kb_update (write-through to Neo4j + pgvector)
 - Reading: kb_read, kb_list, kb_search
 - Graph: kb_related, kb_contradictions, kb_provenance, kb_unanswered
@@ -28,8 +28,9 @@ from ...services.knowledge_graph import (
     NOTE_TYPES,
     slugify,
 )
+from ...services.knowledge.bindings import KnowledgeBinding, split_note_handle
 from ..context import ToolContext
-from .chunker import embedding_version
+from .chunker import embedding_version_for_service
 from .gardener import (
     Finding,
     dead_url_findings,
@@ -196,13 +197,135 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 
 
 def _get_project_id(context: ToolContext) -> Optional[str]:
-    """Get primary project ID (for writes)."""
+    """Get the sole writable native KB id, preserving legacy contexts."""
+    bindings = _explicit_bindings(context)
+    if bindings:
+        for binding in bindings:
+            if binding.is_native and binding.writable:
+                return str(binding.kb_id)
+        return None
     return context.project_id
 
 
 def _get_project_ids(context: ToolContext) -> List[str]:
-    """Get all project IDs (for reads across multiple projects)."""
-    return context.project_ids
+    """Get every authorized KB id, preserving legacy project scoping."""
+    bindings = _explicit_bindings(context)
+    if bindings:
+        return [str(binding.kb_id) for binding in bindings]
+    return list(context.project_ids)
+
+
+def _explicit_bindings(context: ToolContext) -> List[KnowledgeBinding]:
+    """Return real runtime bindings without mistaking test mocks for them."""
+    value = getattr(context, "knowledge_bindings", None)
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [binding for binding in value if isinstance(binding, KnowledgeBinding)]
+
+
+def _read_bindings(context: ToolContext) -> List[KnowledgeBinding]:
+    """Authorized KBs, synthesized from project ids for old runtimes/tests."""
+    bindings = _explicit_bindings(context)
+    if bindings:
+        return bindings
+
+    result: List[KnowledgeBinding] = []
+    for index, raw_id in enumerate(context.project_ids):
+        try:
+            kb_id = uuid.UUID(str(raw_id))
+        except (TypeError, ValueError):
+            continue
+        alias = "project" if index == 0 else f"project-{kb_id.hex[:8]}"
+        result.append(
+            KnowledgeBinding(
+                kb_id=kb_id,
+                alias=alias,
+                name="Project Knowledge"
+                if index == 0
+                else f"Project Knowledge {kb_id.hex[:8]}",
+                kind="native",
+                writable=index == 0,
+                root_path="knowledge",
+            )
+        )
+    return result
+
+
+def _native_bindings(context: ToolContext) -> List[KnowledgeBinding]:
+    """Native project scopes eligible for graph-only operations."""
+    return [binding for binding in _read_bindings(context) if binding.is_native]
+
+
+def _resolve_binding(context: ToolContext, selector: str) -> Optional[KnowledgeBinding]:
+    needle = str(selector or "").strip().lower()
+    for binding in _read_bindings(context):
+        if binding.alias.lower() == needle or str(binding.kb_id).lower() == needle:
+            return binding
+    return None
+
+
+def _binding_choices(bindings: List[KnowledgeBinding]) -> str:
+    return ", ".join(f"{binding.alias} ({binding.name})" for binding in bindings)
+
+
+def _select_bindings(
+    context: ToolContext, selector: Optional[str]
+) -> tuple[List[KnowledgeBinding], Optional[str]]:
+    bindings = _read_bindings(context)
+    if not bindings:
+        return [], "Error: No project_id available."
+    if not selector:
+        return bindings, None
+    binding = _resolve_binding(context, selector)
+    if binding is None:
+        return [], (
+            f"Error: Knowledge base '{selector}' is not selected. Available: "
+            f"{_binding_choices(bindings)}."
+        )
+    return [binding], None
+
+
+def _write_scope_error(context: ToolContext) -> str:
+    if _explicit_bindings(context):
+        return (
+            "Error: No writable native knowledge base is selected. "
+            "External knowledge bases are read-only."
+        )
+    return "Error: No project_id available."
+
+
+def _native_scope_error(context: ToolContext) -> str:
+    if _explicit_bindings(context):
+        return "No native knowledge base with a Graph tier is selected."
+    return "Error: No project_id available."
+
+
+def _resolve_note_scope(
+    context: ToolContext,
+    note: str,
+    kb: Optional[str],
+) -> tuple[List[KnowledgeBinding], str, bool, Optional[str]]:
+    """Resolve a note handle and optional selector into authorized bindings."""
+    handle_alias, slug = split_note_handle(note)
+    if not slug:
+        return [], slug, False, "Error: A note slug is required."
+    if handle_alias and kb:
+        handle_binding = _resolve_binding(context, handle_alias)
+        kb_binding = _resolve_binding(context, kb)
+        if (
+            handle_binding is None
+            or kb_binding is None
+            or handle_binding.kb_id != kb_binding.kb_id
+        ):
+            return (
+                [],
+                slug,
+                False,
+                (f"Error: Note handle selects '{handle_alias}' but kb selects '{kb}'."),
+            )
+    selector = handle_alias or kb
+    bindings, error = _select_bindings(context, selector)
+    return bindings, slug, selector is not None, error
 
 
 # =============================================================================
@@ -390,6 +513,96 @@ def create_kb_tools(
     if not ks:
         raise ValueError("Knowledge tools require knowledge_store in ToolContext")
 
+    _has_bound_scopes = bool(_explicit_bindings(context))
+
+    def _read_from_binding(
+        binding: KnowledgeBinding, note_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read one note through the backend appropriate to its KB kind."""
+        if binding.is_native and kg is not None:
+            return kg.read_note(str(binding.kb_id), note_id)
+        return _run_async(ks.get_note_by_slug(binding.kb_id, note_id))
+
+    def _matching_notes(
+        bindings: List[KnowledgeBinding], note_id: str
+    ) -> List[tuple[KnowledgeBinding, Dict[str, Any]]]:
+        matches: List[tuple[KnowledgeBinding, Dict[str, Any]]] = []
+        for binding in bindings:
+            data = _read_from_binding(binding, note_id)
+            if data:
+                matches.append((binding, data))
+                # Legacy multi-project reads historically returned the first hit.
+                if not _has_bound_scopes:
+                    break
+        return matches
+
+    def _ambiguous_note(note_id: str, matches: List[Any]) -> str:
+        aliases = [
+            match[0].alias if isinstance(match, tuple) else match.alias
+            for match in matches
+        ]
+        handles = ", ".join(f"{alias}:{note_id}" for alias in aliases)
+        return (
+            f"Error: Note '{note_id}' is ambiguous across selected knowledge "
+            f"bases. Use a qualified handle or kb selector: {handles}."
+        )
+
+    def _qualified(binding: KnowledgeBinding, note_id: str) -> str:
+        return binding.handle(note_id) if _has_bound_scopes else note_id
+
+    def _external_snapshot_marker(bindings: List[KnowledgeBinding]) -> str:
+        """Best-effort convergence marker for external indexed content."""
+        snapshots: List[str] = []
+        for binding in bindings:
+            if binding.is_native:
+                continue
+            commit = (
+                binding.indexed_commit
+                if isinstance(binding.indexed_commit, str)
+                else None
+            )
+            status = "ready"
+            source_head: Optional[str] = None
+            try:
+                watermark = _run_async(ks.get_watermark(binding.kb_id))
+                live_commit = getattr(watermark, "indexed_commit", None)
+                if isinstance(live_commit, str) and live_commit:
+                    commit = live_commit
+                live_status = getattr(watermark, "status", None)
+                if isinstance(live_status, str) and live_status:
+                    status = live_status
+                live_head = getattr(watermark, "source_head", None)
+                if isinstance(live_head, str) and live_head:
+                    source_head = live_head
+            except Exception as e:
+                logger.debug(
+                    "Knowledge watermark lookup skipped for %s: %s",
+                    binding.alias,
+                    e,
+                )
+            if status != "ready":
+                last_clean = (
+                    f"last clean @ {commit[:12]}" if commit else "no clean commit"
+                )
+                attempted = f", source @ {source_head[:12]}" if source_head else ""
+                snapshots.append(
+                    f"[{binding.alias}] {status} — {last_clean}{attempted}"
+                )
+            else:
+                snapshots.append(
+                    f"[{binding.alias}] @ {commit[:12]}"
+                    if commit
+                    else f"[{binding.alias}] watermark unavailable"
+                )
+        if not snapshots:
+            return ""
+        label = (
+            "External indexed snapshot"
+            if len(snapshots) == 1
+            else "External indexed snapshots"
+        )
+        return f"**{label}:** {', '.join(snapshots)}"
+
     # =========================================================================
     # Write Tools
     # =========================================================================
@@ -413,7 +626,7 @@ def create_kb_tools(
         """
         project_id = _get_project_id(context)
         if not project_id:
-            return "Error: No project_id available."
+            return _write_scope_error(context)
 
         if status is not None and status not in NOTE_STATUSES:
             return f"Error: Invalid status: {status}"
@@ -525,7 +738,7 @@ def create_kb_tools(
 
         project_id = _get_project_id(context)
         if not project_id:
-            return "Error: No project_id available."
+            return _write_scope_error(context)
 
         try:
             updated = kg.update_note(
@@ -650,7 +863,7 @@ def create_kb_tools(
         """
         project_id = _get_project_id(context)
         if not project_id:
-            return "Error: No project_id available. Knowledge tools require a project context."
+            return _write_scope_error(context)
 
         # Exact-duplicate short-circuit (Step 1 hardening, docs §11.1): a
         # same-slug write with byte-identical content is a pure no-op for every
@@ -856,6 +1069,20 @@ def create_kb_tools(
         Returns:
             Confirmation or error message
         """
+        alias, note_slug = split_note_handle(note)
+        if alias and _has_bound_scopes:
+            binding = _resolve_binding(context, alias)
+            if binding is None:
+                return (
+                    f"Error: Knowledge base '{alias}' is not selected. Available: "
+                    f"{_binding_choices(_read_bindings(context))}."
+                )
+            if not binding.is_native or not binding.writable:
+                return (
+                    f"Error: Knowledge base '{binding.alias}' is read-only. "
+                    "External knowledge bases cannot be updated."
+                )
+            note = note_slug
         return _update_existing(
             note,
             content=content,
@@ -871,44 +1098,46 @@ def create_kb_tools(
     # =========================================================================
 
     @tool
-    def kb_read(note: str) -> str:
+    def kb_read(note: str, kb: Optional[str] = None) -> str:
         """Read a full knowledge note with metadata and relationships.
 
         Args:
-            note: Note slug ID (e.g. "chose-jwt-over-oauth")
+            note: Note slug or qualified ``alias:slug`` handle
+            kb: Optional selected knowledge-base alias or UUID
 
         Returns:
             Full note content with metadata, tags, and relationships
         """
-        project_ids = _get_project_ids(context)
-        if not project_ids:
-            return "Error: No project_id available."
+        bindings, note_slug, _scoped, error = _resolve_note_scope(context, note, kb)
+        if error:
+            return error
 
         try:
-            data = None
-            if kg is None:
-                # Neo4j-less: read the note from the pgvector index (kb_id ==
-                # project_id). Relationships are omitted (use kb_related).
-                for pid in project_ids:
-                    data = _run_async(ks.get_note_by_slug(uuid.UUID(pid), note))
-                    if data:
-                        break
-            else:
-                for pid in project_ids:
-                    data = kg.read_note(pid, note)
-                    if data:
-                        break
-            if not data:
+            matches = _matching_notes(bindings, note_slug)
+            if not matches:
                 return f"Note '{note}' not found."
+            if len(matches) > 1:
+                return _ambiguous_note(note_slug, matches)
+            binding, data = matches[0]
 
             # Format output
             lines = [
-                f"# {data.get('title', note)}",
+                f"# {data.get('title', note_slug)}",
                 "",
-                f"**ID:** {data.get('id', note)}",
+                f"**ID:** {data.get('id', note_slug)}",
                 f"**Type:** {data.get('type', 'unknown')}",
                 f"**Status:** {data.get('status', 'unknown')}",
             ]
+            if _has_bound_scopes:
+                lines.extend(
+                    [
+                        f"**Knowledge Base:** {binding.name} (`{binding.alias}`)",
+                        f"**Handle:** `{binding.handle(note_slug)}`",
+                    ]
+                )
+                snapshot_marker = _external_snapshot_marker([binding])
+                if snapshot_marker:
+                    lines.append(snapshot_marker)
 
             if data.get("confidence"):
                 lines.append(f"**Confidence:** {data['confidence']}")
@@ -932,16 +1161,20 @@ def create_kb_tools(
             if rels:
                 lines.extend(["", "## Outgoing Relationships"])
                 for r in rels:
+                    target = _qualified(binding, r["target"])
                     lines.append(
-                        f"- **{r['type']}** → [[{r['target']}]] ({r.get('target_title', '')})"
+                        f"- **{r['type']}** → [[{target}]] "
+                        f"({r.get('target_title', '')})"
                     )
 
             incoming = data.get("incoming_relationships", [])
             if incoming:
                 lines.extend(["", "## Incoming Relationships"])
                 for r in incoming:
+                    source = _qualified(binding, r["source"])
                     lines.append(
-                        f"- [[{r['source']}]] ({r.get('source_title', '')}) **{r['type']}** → this"
+                        f"- [[{source}]] ({r.get('source_title', '')}) "
+                        f"**{r['type']}** → this"
                     )
 
             return "\n".join(lines)
@@ -956,6 +1189,7 @@ def create_kb_tools(
         tag: Optional[str] = None,
         status: Optional[str] = None,
         job_id: Optional[str] = None,
+        kb: Optional[str] = None,
     ) -> str:
         """List knowledge notes with optional filters.
 
@@ -964,41 +1198,37 @@ def create_kb_tools(
             tag: Filter by tag name
             status: Filter by status (active, resolved, superseded, archived). Default: all
             job_id: Filter by creating job UUID
+            kb: Optional selected knowledge-base alias or UUID
 
         Returns:
             Formatted list of matching notes
         """
-        project_ids = _get_project_ids(context)
-        if not project_ids:
-            return "Error: No project_id available."
+        bindings, error = _select_bindings(context, kb)
+        if error:
+            return error
 
         try:
-            notes = []
-            if kg is None:
-                # Neo4j-less: list from the pgvector index (kb_id == project_id).
-                for pid in project_ids:
-                    notes.extend(
-                        _run_async(
-                            ks.list_notes(
-                                kb_id=uuid.UUID(pid),
-                                note_type=type,
-                                tag=tag,
-                                status=status,
-                                job_id=job_id,
-                            )
-                        )
+            notes: List[tuple[KnowledgeBinding, Dict[str, Any]]] = []
+            for binding in bindings:
+                if binding.is_native and kg is not None:
+                    found = kg.list_notes(
+                        project_id=str(binding.kb_id),
+                        note_type=type,
+                        tag=tag,
+                        status=status,
+                        job_id=job_id,
                     )
-            else:
-                for pid in project_ids:
-                    notes.extend(
-                        kg.list_notes(
-                            project_id=pid,
+                else:
+                    found = _run_async(
+                        ks.list_notes(
+                            kb_id=binding.kb_id,
                             note_type=type,
                             tag=tag,
                             status=status,
                             job_id=job_id,
                         )
                     )
+                notes.extend((binding, item) for item in found)
 
             if not notes:
                 filters = []
@@ -1013,13 +1243,21 @@ def create_kb_tools(
 
             lines = [f"**Knowledge Notes** ({len(notes)} results):", ""]
 
-            for n in notes:
+            for binding, n in notes:
                 status_icon = "●" if n.get("status") == "active" else "○"
                 confidence = f" [{n['confidence']}]" if n.get("confidence") else ""
+                note_id = n.get("id", "?")
+                handle = _qualified(binding, note_id)
+                source = f"[{binding.alias}] " if _has_bound_scopes else ""
                 lines.append(
-                    f"{status_icon} **{n.get('id', '?')}** — {n.get('title', '(untitled)')} "
+                    f"{status_icon} {source}**{handle}** — "
+                    f"{n.get('title', '(untitled)')} "
                     f"({n.get('type', '?')}{confidence})"
                 )
+
+            snapshot_marker = _external_snapshot_marker(bindings)
+            if snapshot_marker:
+                lines.extend(["", snapshot_marker])
 
             return "\n".join(lines)
 
@@ -1028,7 +1266,7 @@ def create_kb_tools(
             return f"Error listing notes: {e}"
 
     @tool
-    def kb_search(query: str, max_results: int = 10) -> str:
+    def kb_search(query: str, max_results: int = 10, kb: Optional[str] = None) -> str:
         """Search the project knowledge base using hybrid ranking.
 
         Combines semantic vector search, keyword matching, and recency
@@ -1038,26 +1276,23 @@ def create_kb_tools(
         Args:
             query: Search query (natural language or keywords)
             max_results: Maximum number of results (default 10)
+            kb: Optional selected knowledge-base alias or UUID
 
         Returns:
             Ranked search results with note summaries
         """
-        project_ids = _get_project_ids(context)
-        if not project_ids:
-            return "Error: No project_id available."
-
-        # A KB's id equals its project_id today (migration 0008 backfill).
-        kb_ids = [uuid.UUID(p) for p in project_ids]
+        bindings, error = _select_bindings(context, kb)
+        if error:
+            return error
+        kb_ids = [binding.kb_id for binding in bindings]
+        binding_by_id = {str(binding.kb_id): binding for binding in bindings}
 
         # Filter to the live pipeline stamp so mixed-model/chunker vectors can't
         # drift into the result set. Resolved from the same EmbeddingService that
         # embeds the query, so it matches what the reindexer stamped; fall back to
         # no filter if the service can't report a model (never over-filter blind).
         try:
-            current_version = embedding_version(
-                ks.embedding_service.model,
-                ks.embedding_service.expected_dimensions,
-            )
+            current_version = embedding_version_for_service(ks.embedding_service)
         except Exception:
             current_version = None
 
@@ -1075,10 +1310,10 @@ def create_kb_tools(
                 return f"No knowledge notes match '{query}'."
 
             header = f"**Search Results** ({len(results)} matches for '{query}')"
-            # Best-effort: stamp the index commit the results were served from so
-            # a caller can tell how fresh the index is. Only meaningful for a
-            # single KB; never let a watermark miss break search.
-            if len(kb_ids) == 1:
+            # Native single-KB compatibility header. External bindings use the
+            # richer convergence marker below so a partial mixed cache is never
+            # mislabeled as an immutable snapshot at the last clean commit.
+            if len(kb_ids) == 1 and bindings[0].is_native:
                 try:
                     wm = _run_async(ks.get_watermark(kb_ids[0]))
                     commit = getattr(wm, "indexed_commit", None)
@@ -1100,9 +1335,44 @@ def create_kb_tools(
                 if len(note.content) > 200:
                     preview += "..."
 
-                lines.append(f"**[{i}]** {note.note_id} — {note.title} ({meta})")
+                result_binding = binding_by_id.get(str(getattr(note, "kb_id", "")))
+                if result_binding is None and len(bindings) == 1:
+                    result_binding = bindings[0]
+                note_handle = note.note_id
+                source = ""
+                if _has_bound_scopes and result_binding is not None:
+                    note_handle = result_binding.handle(note.note_id)
+                    source = f"[{result_binding.alias}] "
+                lines.append(
+                    f"**[{i}]** {source}**{note_handle}** — {note.title} ({meta})"
+                )
                 lines.append(f"  {preview}")
                 lines.append("")
+
+            if _has_bound_scopes and len(kb_ids) > 1:
+                snapshots = []
+                for binding in (item for item in bindings if item.is_native):
+                    try:
+                        watermark = _run_async(ks.get_watermark(binding.kb_id))
+                        commit = getattr(watermark, "indexed_commit", None)
+                    except Exception as e:
+                        logger.debug(
+                            "kb_search watermark lookup skipped for %s: %s",
+                            binding.alias,
+                            e,
+                        )
+                        commit = None
+                    snapshots.append(
+                        f"[{binding.alias}] @ {str(commit)[:8]}"
+                        if commit
+                        else f"[{binding.alias}] unavailable"
+                    )
+                if snapshots:
+                    lines.append(f"**Native index snapshots:** {', '.join(snapshots)}")
+
+            snapshot_marker = _external_snapshot_marker(bindings)
+            if snapshot_marker:
+                lines.append(snapshot_marker)
 
             return "\n".join(lines)
 
@@ -1115,58 +1385,75 @@ def create_kb_tools(
     # =========================================================================
 
     @tool
-    def kb_related(note: str, max_hops: int = 2) -> str:
+    def kb_related(note: str, max_hops: int = 2, kb: Optional[str] = None) -> str:
         """Find notes related to a given note via graph traversal.
 
         Traverses all relationship types up to max_hops edges away.
 
         Args:
-            note: Note slug ID to find relatives of
+            note: Note slug or qualified ``alias:slug`` handle
             max_hops: Maximum relationship hops (1-3, default 2)
+            kb: Optional selected knowledge-base alias or UUID
 
         Returns:
             List of related notes with relationship types and distance
         """
-        project_ids = _get_project_ids(context)
-        if not project_ids:
-            return "Error: No project_id available."
+        bindings, note_slug, _scoped, error = _resolve_note_scope(context, note, kb)
+        if error:
+            return error
 
         try:
-            results = []
-            if kg is None:
-                # Neo4j-less degrade: 1-hop over the knowledge_links edge table
-                # (kb_id == project_id). Body markdown links only, so max_hops is
-                # not honoured — the graph traversal is a Graph-tier feature.
-                for pid in project_ids:
-                    results.extend(
-                        _run_async(
-                            ks.get_related_notes(kb_id=uuid.UUID(pid), note_id=note)
-                        )
-                    )
+            if _has_bound_scopes:
+                matches = _matching_notes(bindings, note_slug)
+                if not matches:
+                    return f"Note '{note}' not found."
+                if len(matches) > 1:
+                    return _ambiguous_note(note_slug, matches)
+                target_bindings = [matches[0][0]]
             else:
-                for pid in project_ids:
-                    results.extend(
-                        kg.get_related(
-                            project_id=pid,
-                            note_id=note,
-                            max_hops=max_hops,
-                        )
+                # Preserve the legacy cross-project aggregation contract.
+                target_bindings = bindings
+
+            results: List[tuple[KnowledgeBinding, Dict[str, Any]]] = []
+            for binding in target_bindings:
+                if binding.is_native and kg is not None:
+                    found = kg.get_related(
+                        project_id=str(binding.kb_id),
+                        note_id=note_slug,
+                        max_hops=max_hops,
                     )
+                else:
+                    # Datasource KBs and graph-less native KBs use the indexed
+                    # body-link table. It deliberately provides one hop only.
+                    found = _run_async(
+                        ks.get_related_notes(kb_id=binding.kb_id, note_id=note_slug)
+                    )
+                results.extend((binding, item) for item in found)
 
             if not results:
                 return f"No related notes found for '{note}'."
 
-            lines = [f"**Related to '{note}'** ({len(results)} notes):", ""]
-            for r in results:
+            display_note = _qualified(target_bindings[0], note_slug)
+            lines = [
+                f"**Related to '{display_note}'** ({len(results)} notes):",
+                "",
+            ]
+            for binding, r in results:
                 distance = r.get("distance", "?")
                 rel_types = r.get("rel_types", [])
                 rel_str = " → ".join(rel_types) if rel_types else "?"
                 status = f" [{r['status']}]" if r.get("status") != "active" else ""
+                related_id = _qualified(binding, r.get("id", "?"))
+                source = f"[{binding.alias}] " if _has_bound_scopes else ""
                 lines.append(
                     f"  ({distance} hop{'s' if distance != 1 else ''}) "
-                    f"**{r.get('id', '?')}** — {r.get('title', '?')} "
+                    f"{source}**{related_id}** — {r.get('title', '?')} "
                     f"({r.get('type', '?')}{status}) via {rel_str}"
                 )
+
+            snapshot_marker = _external_snapshot_marker(target_bindings)
+            if snapshot_marker:
+                lines.extend(["", snapshot_marker])
 
             return "\n".join(lines)
 
@@ -1188,24 +1475,27 @@ def create_kb_tools(
         if kg is None:
             return f"Contradiction detection {_GRAPH_TIER_MSG}"
 
-        project_ids = _get_project_ids(context)
-        if not project_ids:
-            return "Error: No project_id available."
+        bindings = _native_bindings(context)
+        if not bindings:
+            return _native_scope_error(context)
 
         try:
-            results = []
-            for pid in project_ids:
-                results.extend(kg.get_contradictions(pid))
+            results: List[tuple[KnowledgeBinding, Dict[str, Any]]] = []
+            for binding in bindings:
+                found = kg.get_contradictions(str(binding.kb_id))
+                results.extend((binding, item) for item in found)
 
             if not results:
                 return "No active contradictions found in the knowledge base."
 
             lines = [f"**Active Contradictions** ({len(results)}):", ""]
-            for r in results:
+            for binding, r in results:
+                note_a = _qualified(binding, r.get("note_a", "?"))
+                note_b = _qualified(binding, r.get("note_b", "?"))
                 lines.append(
-                    f"  **{r.get('note_a', '?')}** ({r.get('title_a', '?')}) "
+                    f"  **{note_a}** ({r.get('title_a', '?')}) "
                     f"⟷ CONTRADICTS ⟷ "
-                    f"**{r.get('note_b', '?')}** ({r.get('title_b', '?')})"
+                    f"**{note_b}** ({r.get('title_b', '?')})"
                 )
 
             return "\n".join(lines)
@@ -1230,23 +1520,37 @@ def create_kb_tools(
         if kg is None:
             return f"Provenance tracing {_GRAPH_TIER_MSG}"
 
-        project_ids = _get_project_ids(context)
-        if not project_ids:
-            return "Error: No project_id available."
+        alias, note_slug = split_note_handle(note)
+        if alias and _has_bound_scopes:
+            selected = _resolve_binding(context, alias)
+            if selected is None:
+                return (
+                    f"Error: Knowledge base '{alias}' is not selected. Available: "
+                    f"{_binding_choices(_read_bindings(context))}."
+                )
+            if not selected.is_native:
+                return f"Provenance tracing {_GRAPH_TIER_MSG}"
+            bindings = [selected]
+        else:
+            bindings = _native_bindings(context)
+        if not bindings:
+            return _native_scope_error(context)
 
         try:
-            results = []
-            for pid in project_ids:
-                results.extend(kg.get_provenance(pid, note))
+            results: List[tuple[KnowledgeBinding, Dict[str, Any]]] = []
+            for binding in bindings:
+                found = kg.get_provenance(str(binding.kb_id), note_slug)
+                results.extend((binding, item) for item in found)
 
             if not results:
                 return f"No provenance chain found for '{note}'."
 
             lines = [f"**Provenance of '{note}'**:", ""]
-            for r in results:
+            for binding, r in results:
                 depth = r.get("depth", "?")
+                result_id = _qualified(binding, r.get("id", "?"))
                 lines.append(
-                    f"  {'  ' * (depth - 1)}↑ **{r.get('id', '?')}** — "
+                    f"  {'  ' * (depth - 1)}↑ **{result_id}** — "
                     f"{r.get('title', '?')} ({r.get('type', '?')})"
                 )
 
@@ -1269,25 +1573,27 @@ def create_kb_tools(
         if kg is None:
             return f"Unanswered-question tracking {_GRAPH_TIER_MSG}"
 
-        project_ids = _get_project_ids(context)
-        if not project_ids:
-            return "Error: No project_id available."
+        bindings = _native_bindings(context)
+        if not bindings:
+            return _native_scope_error(context)
 
         try:
-            results = []
-            for pid in project_ids:
-                results.extend(kg.get_unanswered(pid))
+            results: List[tuple[KnowledgeBinding, Dict[str, Any]]] = []
+            for binding in bindings:
+                found = kg.get_unanswered(str(binding.kb_id))
+                results.extend((binding, item) for item in found)
 
             if not results:
                 return "No unanswered questions in the knowledge base."
 
             lines = [f"**Unanswered Questions** ({len(results)}):", ""]
-            for r in results:
+            for binding, r in results:
                 content = r.get("content", "")
                 preview = content[:150].replace("\n", " ")
                 if len(content) > 150:
                     preview += "..."
-                lines.append(f"  ❓ **{r.get('id', '?')}** — {r.get('title', preview)}")
+                result_id = _qualified(binding, r.get("id", "?"))
+                lines.append(f"  ❓ **{result_id}** — {r.get('title', preview)}")
 
             return "\n".join(lines)
 
@@ -1323,16 +1629,16 @@ def create_kb_tools(
                 "canonical OKF export."
             )
 
-        project_ids = _get_project_ids(context)
-        if not project_ids:
-            return "Error: No project_id available."
+        bindings = _native_bindings(context)
+        if not bindings:
+            return _native_scope_error(context)
 
         workspace = context.workspace_manager if context.has_workspace() else None
 
         try:
             notes = []
-            for pid in project_ids:
-                notes.extend(kg.get_all_notes_for_export(pid))
+            for binding in bindings:
+                notes.extend(kg.get_all_notes_for_export(str(binding.kb_id)))
             if not notes:
                 return "Knowledge base is empty — nothing to export."
 
@@ -1359,7 +1665,7 @@ def create_kb_tools(
 
             return (
                 f"Exported {exported} note(s) to `{path}/`.\n"
-                f"Open in Obsidian or any markdown viewer."
+                "Open in any OKF-compatible Markdown viewer."
             )
 
         except Exception as e:
@@ -1472,6 +1778,8 @@ def create_kb_tools(
         Returns:
             A status message naming the file written and note count.
         """
+        if _has_bound_scopes and not _get_project_id(context):
+            return _write_scope_error(context)
         if not context.has_workspace():
             return "Error: kb_index requires a workspace backend."
         ws = context.workspace_manager

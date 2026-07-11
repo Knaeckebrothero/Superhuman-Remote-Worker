@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 import orchestrator.main as orch_main
 from src.api.persistent_app import _load_expert_config
@@ -281,7 +282,20 @@ class TestSendSessionAttachPayload:
     @pytest.mark.asyncio
     async def test_payload_carries_config_name(self):
         _FakeAsyncClient.response_status = 500  # skip the DB-binding branch
-        with patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient):
+        thread = {"id": "tid-1", "user_id": None, "metadata": {}}
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
             ok = await orch_main._send_session_attach(
                 {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
                 "tid-1",
@@ -296,6 +310,94 @@ class TestSendSessionAttachPayload:
         assert call["url"] == "http://10.0.0.1:8001/session/attach"
         assert call["json"]["config_name"] == "persistent_defaults"
         assert call["json"]["thread_id"] == "tid-1"
+
+    @pytest.mark.asyncio
+    async def test_attach_refuses_revoked_persisted_datasource_before_http(self):
+        datasource_id = "11111111-2222-3333-4444-555555555555"
+        thread = {
+            "id": "tid-1",
+            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "metadata": {"datasource_ids": [datasource_id]},
+        }
+        denied = HTTPException(
+            status_code=403,
+            detail="One or more selected datasources are unavailable",
+        )
+
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_datasource_ids",
+                AsyncMock(side_effect=denied),
+            ) as revalidate,
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+                {},
+                [],
+                datasources=[{"type": "kb", "datasource_id": datasource_id}],
+                config_name="persistent_defaults",
+            )
+
+        assert ok is False
+        revalidate.assert_awaited_once_with(thread, [datasource_id])
+        assert _FakeAsyncClient.calls == []
+
+    @pytest.mark.asyncio
+    async def test_attach_refuses_revoked_native_project_before_http(self):
+        project_id = "99999999-2222-3333-4444-555555555555"
+        thread = {
+            "id": "tid-1",
+            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "metadata": {},
+        }
+        denied = HTTPException(
+            status_code=403,
+            detail="One or more attached projects are unavailable",
+        )
+
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_datasource_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main,
+                "_thread_project_ids",
+                AsyncMock(return_value=[project_id]),
+            ),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(side_effect=denied),
+            ) as revalidate,
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+                {},
+                [project_id],
+                datasources=None,
+                config_name="persistent_defaults",
+            )
+
+        assert ok is False
+        revalidate.assert_awaited_once_with(thread, [project_id])
+        assert _FakeAsyncClient.calls == []
 
 
 class TestAttachRoutesForwardConfigName:

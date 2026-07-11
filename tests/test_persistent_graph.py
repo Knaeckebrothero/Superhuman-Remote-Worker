@@ -1573,6 +1573,97 @@ class TestExecuteTurnMemoryRetrieval:
 
 class TestExecuteTurnKnowledgeRetrieval:
     @pytest.mark.asyncio
+    async def test_bound_kbs_use_chunk_search_and_source_aware_injection(self):
+        """Datasource bindings take the chunk-only multi-KB path."""
+        import uuid
+        from types import SimpleNamespace
+
+        from src.services.knowledge.bindings import KnowledgeBinding
+        from src.services.knowledge_store import KnowledgeRecord
+
+        native = KnowledgeBinding(
+            kb_id=uuid.uuid4(),
+            alias="project",
+            name="Project Knowledge",
+            kind="native",
+            writable=True,
+        )
+        docs = KnowledgeBinding(
+            kb_id=uuid.uuid4(),
+            alias="docs",
+            name="Docs",
+            kind="datasource",
+            writable=False,
+            indexed_commit="dispatch-head",
+        )
+        ks = MagicMock()
+        ks.embedding_service.model = "test-embed"
+        ks.embedding_service.expected_dimensions = 16
+
+        async def _search_chunks(**kwargs):
+            binding = native if kwargs["kb_ids"] == [native.kb_id] else docs
+            prefix = "native" if binding.is_native else "external"
+            count = 3 if binding.is_native else 2
+            return [
+                KnowledgeRecord(
+                    note_id=f"{prefix}-{index}",
+                    kb_id=binding.kb_id,
+                    title=f"{prefix.title()} {index}",
+                    note_type="learning",
+                    content="context",
+                )
+                for index in range(count)
+            ]
+
+        ks.search_chunks = AsyncMock(side_effect=_search_chunks)
+        ks.get_watermark = AsyncMock(
+            return_value=SimpleNamespace(indexed_commit="indexed-head")
+        )
+        ks.hybrid_search = AsyncMock()
+
+        captured = []
+
+        async def _astream(messages, **kwargs):
+            captured.append(list(messages))
+            yield AIMessage(content="ok")
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        context = MagicMock()
+        context.knowledge_bindings = [native, docs]
+        context.citation_engine = None
+        context.consume_freeze_request.return_value = None
+        config = _make_config()
+        config.llm.model = None
+
+        await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=[SystemMessage(content="sys"), HumanMessage(content="question")],
+            callbacks=_make_callbacks(),
+            llm_timeout=600,
+            auxiliary_llm=None,
+            config=config,
+            knowledge_store=ks,
+            tool_context=context,
+        )
+
+        assert ks.search_chunks.await_count == 2
+        ks.hybrid_search.assert_not_awaited()
+        injected = "\n".join(
+            str(message.content)
+            for message in captured[0]
+            if isinstance(message, ToolMessage)
+        )
+        assert "[project] project:native-0" in injected
+        assert "[docs] docs:external-0" in injected
+        assert "External snapshots (as of): [docs] indexed-head" in injected
+
+    @pytest.mark.asyncio
     async def test_knowledge_search_called_with_project_ids(self):
         """hybrid_search called with project_ids as UUIDs."""
         ks = MagicMock()

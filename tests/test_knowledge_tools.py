@@ -579,13 +579,18 @@ class TestKbSearchChunkCutover:
     def test_passes_kb_ids_and_current_embedding_version(self):
         pid = str(uuid.uuid4())
         ctx = self._ctx_with_store([], project_ids=[pid])
+        ctx.knowledge_store.embedding_service.profile_fingerprint = (
+            "pf-effective-profile"
+        )
         tools, _ = _make_tools(ctx)
         _invoke(_get_tool(tools, "kb_search"), {"query": "q"})
         kwargs = ctx.knowledge_store.search_chunks.call_args.kwargs
         assert kwargs["kb_ids"] == [uuid.UUID(pid)]
         # Version string must match what the reindexer stamped so the filter
         # doesn't silently zero out the live index.
-        assert kwargs["embedding_version"] == "qwen3-embedding-8b:4096:c1"
+        assert kwargs["embedding_version"] == (
+            "qwen3-embedding-8b:4096:c1:pf-effective-profile"
+        )
 
     def test_surfaces_indexed_commit_for_single_kb(self):
         wm = MagicMock()
