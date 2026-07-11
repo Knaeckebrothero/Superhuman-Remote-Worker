@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from main import _build_protected_cloud_mount
+
 
 def _project(
     *, project_id: str, is_default: bool = False, name: str = "Project"
@@ -892,3 +894,37 @@ async def test_collision_with_default_project_present():
     assert "projects/alpha-2" in paths
     # source_refs preserved in input order
     assert [r["source_ref"] for r in rows] == ["p-default", "p-1", "p-2"]
+
+
+def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
+    row = {
+        "backend": "nextcloud",
+        "reader_id": "srw-reader-abc",
+        "credentials": "app-pass-xyz",
+        "webdav_url": "https://nc.internal/remote.php/dav/files/srw-reader-abc/Proj/",
+        "auth_kind": "basic",
+        "status": "active",
+    }
+    payload = _build_protected_cloud_mount(row, thread_id="thread-1")
+    assert payload["driver"] == "rclone"
+    assert payload["protected"] is True
+    # overlay layout obeys the snapshot placement rule (design §11.3)
+    ov = payload["overlay"]
+    assert ov["upper"].startswith("/home/agent-host/.overlay")
+    assert ov["merged"] == "/cloud/merged"
+    assert ov["lower"] == "/cloud/lower"
+    # single RO lower mount, reader creds (NOT agent-service), read_only
+    assert len(payload["mounts"]) == 1
+    m = payload["mounts"][0]
+    assert m["access"] == "read_only"
+    assert m["target_path"] == "/cloud/lower"
+    assert m["source"]["config"]["url"] == row["webdav_url"]
+    assert m["source"]["config"]["user"] == "srw-reader-abc"
+    assert m["auth"] == {"type": "basic", "password": "app-pass-xyz"}
+    # tell the agent NOT to install workspace/cloud -> lower; the overlay owns it
+    assert payload["skip_workspace_links"] is True
+
+
+def test_protected_cloud_mount_none_for_inactive_or_non_nextcloud():
+    assert _build_protected_cloud_mount({"status": "revoked", "backend": "nextcloud"}, thread_id="t") is None
+    assert _build_protected_cloud_mount({"status": "active", "backend": "opencloud"}, thread_id="t") is None
