@@ -66,6 +66,15 @@ export const PERMISSION_MODES = [
   { value: 'autonomous', label: 'Autonomous', description: 'Agent runs without asking for approval' },
 ] as const;
 
+/** Image-quality tiers: resolution of images delivered to the model. Higher =
+ *  more visual detail + more image tokens. Mirrors backend
+ *  VALID_IMAGE_QUALITY_TIERS (src/core/loader.py) / image_downscale.py. */
+export const IMAGE_QUALITY_TIERS = [
+  { value: 'economy', label: 'Economy', description: 'Lowest resolution (~768px) — cheapest, coarse detail' },
+  { value: 'standard', label: 'Standard', description: 'Balanced (~1568px) — good detail for most tasks' },
+  { value: 'high', label: 'High', description: 'Model-family max — best for OCR, charts, UI screenshots' },
+] as const;
+
 /** Deep-read a nested path from a config object. */
 export function readConfigPath(config: Record<string, unknown>, path: string): unknown {
   return path.split('.').reduce((obj: any, key) => obj?.[key], config) ?? null;

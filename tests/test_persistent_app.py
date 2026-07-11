@@ -17,6 +17,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.api.persistent_app import (
+    _auto_title_after_first_turn,
+    _draft_title_from_prompt,
     _early_title_from_prompt,
     _excerpt_for_title,
     _extract_thinking,
@@ -1154,6 +1156,19 @@ class TestExtractThinking:
 
 
 class TestGenerateTitle:
+    @staticmethod
+    def _aux(title="Test Title", *, error=None):
+        """AuxiliaryLLM stub whose structured chain() yields a ConversationTitle
+        (or raises), mirroring the real structured-output path titling uses."""
+        from src.services.auxiliary import ConversationTitle
+
+        aux = MagicMock()
+        if error is not None:
+            aux.chain = AsyncMock(side_effect=error)
+        else:
+            aux.chain = AsyncMock(return_value=ConversationTitle(title=title))
+        return aux
+
     @pytest.mark.asyncio
     async def test_returns_none_when_aux_llm_none(self):
         result = await _generate_title(
@@ -1164,10 +1179,7 @@ class TestGenerateTitle:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_messages_empty(self):
-        result = await _generate_title(
-            messages=[],
-            auxiliary_llm=MagicMock(),
-        )
+        result = await _generate_title(messages=[], auxiliary_llm=MagicMock())
         assert result is None
 
     @pytest.mark.asyncio
@@ -1176,93 +1188,62 @@ class TestGenerateTitle:
         messages = [
             AIMessage(content=[{"type": "image_url", "image_url": {"url": "x"}}]),
         ]
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock()
+        aux = self._aux()
 
-        result = await _generate_title(messages, mock_llm)
+        result = await _generate_title(messages, aux)
         assert result is None
         # No extractable text -> short-circuits before invoking the model.
-        mock_llm.ainvoke.assert_not_called()
+        aux.chain.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_samples_first_10_messages(self):
-        """Only first 10 messages sampled."""
+        """Only first 10 messages sampled into the title task's text."""
         messages = [HumanMessage(content=f"msg {i}") for i in range(20)]
-        mock_response = MagicMock()
-        mock_response.content = "Test Title"
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        aux = self._aux()
 
-        await _generate_title(messages, mock_llm)
+        await _generate_title(messages, aux)
 
-        # The HumanMessage passed should only contain messages 0-9
-        call_args = mock_llm.ainvoke.call_args[0][0]
-        human_text = call_args[1].content  # second message is HumanMessage
-        assert "msg 9" in human_text
-        assert "msg 10" not in human_text
+        task = aux.chain.call_args[0][0]  # the GenerateTitleTask
+        assert "msg 9" in task.sample_text
+        assert "msg 10" not in task.sample_text
 
     @pytest.mark.asyncio
     async def test_excerpts_long_content_on_word_boundary(self):
         """Long message bodies are excerpted (word-boundary + ellipsis), not
         chopped mid-word — the mid-word chop made the model reply "cut off"."""
         words = " ".join(["word"] * 200)  # ~1000 chars of whole words
-        long_msg = HumanMessage(content=words)
-        mock_response = MagicMock()
-        mock_response.content = "Title"
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        aux = self._aux()
 
-        await _generate_title([long_msg], mock_llm)
+        await _generate_title([HumanMessage(content=words)], aux)
 
-        call_args = mock_llm.ainvoke.call_args[0][0]
-        human_text = call_args[1].content
+        task = aux.chain.call_args[0][0]
         # Body is bounded (excerpt cap ~240) and ends on a whole word + ellipsis,
         # never a partial token.
-        assert "…" in human_text
-        assert "wor…" not in human_text and "wo…" not in human_text
+        assert "…" in task.sample_text
+        assert "wor…" not in task.sample_text and "wo…" not in task.sample_text
 
     @pytest.mark.asyncio
     async def test_result_stripped_and_truncated_to_100(self):
         """Result is stripped and truncated to 100 chars."""
-        mock_response = MagicMock()
-        mock_response.content = "  " + "A" * 150 + "  "
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        aux = self._aux("  " + "A" * 150 + "  ")
 
-        result = await _generate_title(
-            [HumanMessage(content="hi")],
-            mock_llm,
-        )
+        result = await _generate_title([HumanMessage(content="hi")], aux)
 
         assert len(result) <= 100
         assert not result.startswith(" ")
 
     @pytest.mark.asyncio
     async def test_returns_none_on_empty_result(self):
-        """Returns None when LLM returns empty string."""
-        mock_response = MagicMock()
-        mock_response.content = ""
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
-
-        result = await _generate_title(
-            [HumanMessage(content="hi")],
-            mock_llm,
-        )
-
+        """Returns None when the model returns an empty title field."""
+        aux = self._aux("")
+        result = await _generate_title([HumanMessage(content="hi")], aux)
         assert result is None
 
     @pytest.mark.asyncio
     async def test_exception_returns_none(self):
         """Exception during title generation returns None."""
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("LLM error"))
-
-        result = await _generate_title(
-            [HumanMessage(content="hi")],
-            mock_llm,
-        )
-
+        aux = self._aux(error=RuntimeError("LLM error"))
+        result = await _generate_title([HumanMessage(content="hi")], aux)
         assert result is None
 
     @pytest.mark.parametrize(
@@ -1279,27 +1260,17 @@ class TestGenerateTitle:
     )
     @pytest.mark.asyncio
     async def test_rejects_conversational_reply(self, reply):
-        """A model that answers the sample instead of titling it yields no
-        title (placeholder stays; after-turn pass retries)."""
-        mock_response = MagicMock()
-        mock_response.content = reply
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
-
-        result = await _generate_title([HumanMessage(content="hi")], mock_llm)
-
+        """Even under a schema, a deflection stuffed into the title field is
+        rejected (placeholder/draft stays; after-turn pass retries)."""
+        aux = self._aux(reply)
+        result = await _generate_title([HumanMessage(content="hi")], aux)
         assert result is None
 
     @pytest.mark.asyncio
     async def test_accepts_normal_title(self):
         """A clean topic title is not rejected by the conversational guard."""
-        mock_response = MagicMock()
-        mock_response.content = "Vet bill letter to dog owner"
-        mock_llm = MagicMock()
-        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
-
-        result = await _generate_title([HumanMessage(content="hi")], mock_llm)
-
+        aux = self._aux("Vet bill letter to dog owner")
+        result = await _generate_title([HumanMessage(content="hi")], aux)
         assert result == "Vet bill letter to dog owner"
 
 
@@ -1398,77 +1369,177 @@ class TestEarlyTitleFromPrompt:
         return mock_session, mock_conn, mock_conn_ctx
 
     @pytest.mark.asyncio
-    async def test_titles_untitled_thread_from_prompt(self):
-        """Writes a title + broadcasts from the opening prompt alone."""
+    async def test_drafts_untitled_thread_from_prompt(self):
+        """Writes an LLM-free draft + broadcasts from the opening prompt words —
+        no aux call, so a bait-y prompt can't deflect into the title."""
+        prompt = "why can't external clients reach my svc?"
         mock_session, mock_conn, mock_conn_ctx = self._mock_session()
         with (
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._wire_session_aux_archiver"),
-            patch(
-                "src.api.persistent_app._generate_title",
-                AsyncMock(return_value="Reach external service"),
-            ) as gen,
+            patch("src.api.persistent_app._draft_title_value", None),
+            patch("src.api.persistent_app._generate_title", AsyncMock()) as gen,
             patch("src.api.persistent_app._broadcast") as bcast,
         ):
-            await _early_title_from_prompt("why can't external clients reach my svc?")
+            await _early_title_from_prompt(prompt)
 
-        # Titled from the prompt only — a single HumanMessage, no assistant turn.
-        assert len(gen.call_args[0][0]) == 1
+        # No LLM call on the submit path — the draft is a plain string slice.
+        gen.assert_not_called()
         mock_conn_ctx.execute.assert_awaited_once()
         assert bcast.call_args[0][0] == "title.updated"
-        assert bcast.call_args[0][1]["title"] == "Reach external service"
+        assert bcast.call_args[0][1]["title"] == _draft_title_from_prompt(prompt)
 
     @pytest.mark.asyncio
     async def test_skips_low_signal_prompt(self):
-        """A greeting is left to the after-turn fallback — no LLM call, no write."""
+        """A greeting is left to the after-turn pass — no draft, no write."""
         mock_session, mock_conn, mock_conn_ctx = self._mock_session()
         with (
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._generate_title", AsyncMock()) as gen,
+            patch("src.api.persistent_app._draft_title_value", None),
             patch("src.api.persistent_app._broadcast") as bcast,
         ):
             await _early_title_from_prompt("hi")
 
-        gen.assert_not_called()
         mock_conn_ctx.execute.assert_not_called()
         bcast.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_skips_when_already_titled(self):
-        """A resumed session with a real title is not re-titled or re-generated."""
+        """A resumed session with a real title is not re-drafted."""
         mock_session, mock_conn, mock_conn_ctx = self._mock_session(
             title="Existing real title"
         )
         with (
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._generate_title", AsyncMock()) as gen,
+            patch("src.api.persistent_app._draft_title_value", None),
             patch("src.api.persistent_app._broadcast") as bcast,
         ):
             await _early_title_from_prompt("a perfectly good titleable prompt")
 
-        gen.assert_not_called()
         mock_conn_ctx.execute.assert_not_called()
         bcast.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_generation_failure_non_fatal(self):
-        """A failed aux call must not raise out of the fire-and-forget task."""
-        mock_session, _, mock_conn_ctx = self._mock_session()
+    async def test_draft_failure_non_fatal(self):
+        """A DB failure on the draft path must not raise out of the
+        fire-and-forget task."""
+        mock_session, mock_conn, mock_conn_ctx = self._mock_session()
+        mock_conn.get_thread = AsyncMock(side_effect=RuntimeError("db down"))
         with (
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._wire_session_aux_archiver"),
-            patch(
-                "src.api.persistent_app._generate_title",
-                AsyncMock(side_effect=RuntimeError("aux down")),
-            ),
+            patch("src.api.persistent_app._draft_title_value", None),
         ):
             await _early_title_from_prompt("a perfectly good titleable prompt")
 
         mock_conn_ctx.execute.assert_not_called()
+
+
+class TestDraftTitleFromPrompt:
+    def test_takes_leading_words(self):
+        draft = _draft_title_from_prompt(
+            "Deploy the orchestrator to prod and watch the rollout closely please"
+        )
+        assert draft == "Deploy the orchestrator to prod and watch the"  # first 8
+
+    def test_collapses_whitespace_and_newlines(self):
+        assert _draft_title_from_prompt("  hello\n\n  world  ") == "hello world"
+
+    def test_bounds_on_char_cap_word_boundary(self):
+        draft = _draft_title_from_prompt("x" * 200 + " tail", max_chars=40)
+        # A single 200-char token exceeds the cap; it is cut on the char cap and
+        # never emits a partial second word.
+        assert len(draft) <= 40
+
+    def test_strips_wrapping_punctuation(self):
+        assert _draft_title_from_prompt('"quoted opening line here"').startswith(
+            "quoted"
+        )
+
+    @pytest.mark.parametrize("empty", ["", "   ", "\n\t"])
+    def test_returns_none_when_no_words(self, empty):
+        assert _draft_title_from_prompt(empty) is None
+
+
+class TestAutoTitleAfterFirstTurn:
+    def _mock_session(self, title="Untitled Session"):
+        mock_session = MagicMock()
+        mock_session.auxiliary_llm = MagicMock()
+        mock_session.messages = [HumanMessage(content="hi"), AIMessage(content="reply")]
+        mock_conn = AsyncMock()
+        mock_conn.get_thread = AsyncMock(return_value={"title": title})
+        acquire_cm = MagicMock()
+        mock_conn_ctx = AsyncMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=mock_conn_ctx)
+        acquire_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_conn.acquire = MagicMock(return_value=acquire_cm)
+        mock_session.postgres_conn = mock_conn
+        return mock_session, mock_conn, mock_conn_ctx
+
+    @pytest.mark.asyncio
+    async def test_overwrites_placeholder(self):
+        """Mints the grounded LLM title over a still-placeholder thread."""
+        import src.api.persistent_app as papp
+
+        mock_session, _, mock_conn_ctx = self._mock_session("Untitled Session")
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("src.api.persistent_app._draft_title_value", None),
+            patch(
+                "src.api.persistent_app._generate_title",
+                AsyncMock(return_value="Grounded LLM title"),
+            ),
+            patch("src.api.persistent_app._broadcast") as bcast,
+        ):
+            await _auto_title_after_first_turn()
+            assert papp._draft_title_value is None  # nothing to clear
+
+        mock_conn_ctx.execute.assert_awaited_once()
+        assert bcast.call_args[0][1]["title"] == "Grounded LLM title"
+
+    @pytest.mark.asyncio
+    async def test_overwrites_own_draft_and_clears_marker(self):
+        """Replaces the submit-time draft with the grounded title and clears the
+        outstanding-draft marker."""
+        import src.api.persistent_app as papp
+
+        mock_session, _, mock_conn_ctx = self._mock_session("why can't external")
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("src.api.persistent_app._draft_title_value", "why can't external"),
+            patch(
+                "src.api.persistent_app._generate_title",
+                AsyncMock(return_value="Grounded LLM title"),
+            ),
+            patch("src.api.persistent_app._broadcast") as bcast,
+        ):
+            await _auto_title_after_first_turn()
+            assert papp._draft_title_value is None  # marker cleared after write
+
+        mock_conn_ctx.execute.assert_awaited_once()
+        assert bcast.call_args[0][1]["title"] == "Grounded LLM title"
+
+    @pytest.mark.asyncio
+    async def test_leaves_manual_rename_untouched(self):
+        """A user rename (title is neither placeholder nor the outstanding draft)
+        is never overwritten — and the LLM isn't even invoked."""
+        mock_session, _, mock_conn_ctx = self._mock_session("My hand-picked title")
+        with (
+            patch("src.api.persistent_app._session", mock_session),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch("src.api.persistent_app._draft_title_value", "some old draft"),
+            patch("src.api.persistent_app._generate_title", AsyncMock()) as gen,
+            patch("src.api.persistent_app._broadcast") as bcast,
+        ):
+            await _auto_title_after_first_turn()
+
+        gen.assert_not_called()
+        mock_conn_ctx.execute.assert_not_called()
+        bcast.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

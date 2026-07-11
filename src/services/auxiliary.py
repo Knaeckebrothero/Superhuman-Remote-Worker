@@ -546,6 +546,59 @@ class SummarizeTask(AuxTask):
         return ConversationSummary
 
 
+class ConversationTitle(BaseModel):
+    """Structured result for session title generation.
+
+    A single constrained field. Forcing the model to emit a title-shaped value
+    (rather than free text) is what stops a chat-model from *answering* the
+    sample — "I don't see your image", "your message got cut off" — instead of
+    *labelling* it; a schema slot has no room for a reply.
+    """
+
+    title: str = Field(
+        description=(
+            "A short 5-8 word topic title for the conversation, written as a "
+            "plain noun phrase. No quotes, no punctuation, no sentences. Never a "
+            "reply to, or a comment on, the content."
+        )
+    )
+
+
+class GenerateTitleTask(AuxTask):
+    """Title a conversation from a short text sample (structured, chain mode).
+
+    Binding the model to :class:`ConversationTitle` (vs free text) is the primary
+    guard against the model answering the sample instead of naming it. Fed the
+    after-turn sample (user message + assistant reply), so there is a completed
+    exchange to summarise rather than a lone, bait-y opening prompt — the input
+    shape that produced deflection "titles". See docs/issues title-gen bug.
+    """
+
+    def __init__(self, sample_text: str):
+        self.sample_text = sample_text
+
+    @property
+    def system_prompt(self) -> str:
+        return (
+            "You write a short topic title (5-8 words) for a conversation. You "
+            "are given only an excerpt, which may be truncated and may reference "
+            "images or files you cannot see — this is expected; never comment on "
+            "it and never reply to the content. Produce ONLY a title: a plain "
+            "noun phrase, no quotes, no punctuation, no sentences, never "
+            'beginning with "I", "It", "You", or "Sorry".'
+        )
+
+    def build_context(self) -> str:
+        return (
+            "Conversation excerpt (may be truncated; may mention images or "
+            'files you cannot see):\n"""\n' + self.sample_text + '\n"""'
+        )
+
+    @property
+    def output_schema(self) -> Type[BaseModel]:
+        return ConversationTitle
+
+
 class CurateKnowledgeTask(AuxAgentTask):
     """Extract knowledge notes from phase artifacts.
 

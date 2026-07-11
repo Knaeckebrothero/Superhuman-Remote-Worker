@@ -1,11 +1,13 @@
 # MCP `list_knowledge_notes` crashes: `%` format applied to enum-string confidence
 
-**Status**: Fixed 2026-07-09 (pending deploy) — commit adds `_fmt_confidence()`
-in `orchestrator/services/formatters.py` and routes all three sites through it,
-plus `tests/test_formatters_confidence.py`. Filed + fixed same day, found live
-during the Better Resavio loop audit (project `68137e29`, main cluster). Reaches
-the main cluster on the next CI/CD → Fleet rollout; acceptance criterion #1
-(clean `list_knowledge_notes` for `68137e29`) verifies post-deploy.
+**Status**: Fixed + verified live 2026-07-11 on the main cluster. `_fmt_confidence()`
+in `orchestrator/services/formatters.py` routes all three sites; covered by
+`tests/test_formatters_confidence.py`. Filed 2026-07-09 during the Better Resavio
+loop audit (project `68137e29`). Acceptance criterion #1 confirmed post-deploy:
+`list_knowledge_notes` for `68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a` returns a clean
+50-of-2053 listing (`confidence: high`/`medium` render as enum strings, no-confidence
+notes omit the field), and `get_knowledge_note` renders `Confidence: medium` with
+no `%`-format crash.
 
 ## Context
 
