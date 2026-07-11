@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 # Remote command run on the agent host to inflate + unpack a snapshot.
 EXTRACT_REMOTE_CMD = "zstd -d | tar -xf - -C /"
 
+# Scoped variant for in-cluster IDE pods: extract only the agent-host home.
+# Snapshots also carry /usr/local (VM restores need it), but in a
+# workspace-image pod those files are root-owned and image-provided —
+# extracting them as agent-host yields per-file "Cannot open: File exists"
+# noise and tar rc=2 while the home content extracts fine. Members are
+# archived without a leading slash (tar strips it at capture), so the
+# member pattern is ``home/agent-host``.
+EXTRACT_HOME_REMOTE_CMD = "zstd -d | tar -xf - -C / home/agent-host"
+
 # Headscale/Tailscale mesh address space (CGNAT range). VM workspaces get
 # their SSH host from this range; only tailnet members (agent-pod sidecars)
 # can route to it.
@@ -103,6 +112,7 @@ async def stream_extract_snapshot(
     tar_path: str,
     *,
     key_path: Optional[str] = None,
+    remote_cmd: str = EXTRACT_REMOTE_CMD,
 ) -> tuple[int, bytes]:
     """Stream a local ``.tar.zst`` into ``zstd -d | tar -xf - -C /`` over SSH.
 
@@ -124,9 +134,7 @@ async def stream_extract_snapshot(
         )
         return 255, b"skipped: unroutable tailnet target from orchestrator"
 
-    ssh_cmd = build_agent_ssh_cmd(
-        ssh_host, ssh_port, EXTRACT_REMOTE_CMD, key_path=key_path
-    )
+    ssh_cmd = build_agent_ssh_cmd(ssh_host, ssh_port, remote_cmd, key_path=key_path)
     with open(tar_path, "rb") as f:
         proc = await asyncio.create_subprocess_exec(
             *ssh_cmd,

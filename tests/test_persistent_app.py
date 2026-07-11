@@ -18,9 +18,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 from src.api.persistent_app import (
     _early_title_from_prompt,
+    _excerpt_for_title,
     _extract_thinking,
     _generate_title,
     _is_low_signal_prompt,
+    _title_looks_conversational,
     _get_agent_metrics,
     _handle_archive,
     _handle_compact,
@@ -1200,9 +1202,11 @@ class TestGenerateTitle:
         assert "msg 10" not in human_text
 
     @pytest.mark.asyncio
-    async def test_truncates_content_to_200_chars(self):
-        """Each message content truncated to 200 chars."""
-        long_msg = HumanMessage(content="x" * 500)
+    async def test_excerpts_long_content_on_word_boundary(self):
+        """Long message bodies are excerpted (word-boundary + ellipsis), not
+        chopped mid-word — the mid-word chop made the model reply "cut off"."""
+        words = " ".join(["word"] * 200)  # ~1000 chars of whole words
+        long_msg = HumanMessage(content=words)
         mock_response = MagicMock()
         mock_response.content = "Title"
         mock_llm = MagicMock()
@@ -1212,7 +1216,10 @@ class TestGenerateTitle:
 
         call_args = mock_llm.ainvoke.call_args[0][0]
         human_text = call_args[1].content
-        assert len(human_text) <= 200
+        # Body is bounded (excerpt cap ~240) and ends on a whole word + ellipsis,
+        # never a partial token.
+        assert "…" in human_text
+        assert "wor…" not in human_text and "wo…" not in human_text
 
     @pytest.mark.asyncio
     async def test_result_stripped_and_truncated_to_100(self):
@@ -1257,6 +1264,82 @@ class TestGenerateTitle:
         )
 
         assert result is None
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            # Observed regressions (dog letter / cash-register image).
+            "It sounds like your message got cut off! It looks like you were "
+            "about to type something that starts",
+            "I don't see any attached image or table content in your "
+            "message—it looks like the file may not have",
+            "Sorry, I can't see the image you attached",
+            "I'm not able to view the file you mentioned",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_rejects_conversational_reply(self, reply):
+        """A model that answers the sample instead of titling it yields no
+        title (placeholder stays; after-turn pass retries)."""
+        mock_response = MagicMock()
+        mock_response.content = reply
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+
+        result = await _generate_title([HumanMessage(content="hi")], mock_llm)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_accepts_normal_title(self):
+        """A clean topic title is not rejected by the conversational guard."""
+        mock_response = MagicMock()
+        mock_response.content = "Vet bill letter to dog owner"
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+
+        result = await _generate_title([HumanMessage(content="hi")], mock_llm)
+
+        assert result == "Vet bill letter to dog owner"
+
+
+class TestTitleGuards:
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "It sounds like your message got cut off",
+            "I don't see any attached image",
+            "Sorry, I can't see that",
+            "As an AI I cannot view images",
+            # Over-long deflection (word-count structural guard).
+            "This is a very long sentence that clearly reads like a chat reply "
+            "and not a title",
+        ],
+    )
+    def test_conversational_detected(self, title):
+        assert _title_looks_conversational(title) is True
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Vet bill letter to dog owner",
+            "Cash register discrepancy analysis",
+            "Reach external service from client",
+            "Refactor title generation on submit",
+        ],
+    )
+    def test_real_title_allowed(self, title):
+        assert _title_looks_conversational(title) is False
+
+    def test_excerpt_cuts_on_word_boundary(self):
+        text = "one two three " * 40  # long, whole words
+        out = _excerpt_for_title(text, cap=30)
+        assert out.endswith("…")
+        assert "thre…" not in out  # never mid-word
+        assert len(out) <= 32
+
+    def test_excerpt_leaves_short_text_untouched(self):
+        assert _excerpt_for_title("short message") == "short message"
 
 
 # ---------------------------------------------------------------------------
