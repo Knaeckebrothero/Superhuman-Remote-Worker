@@ -1747,6 +1747,19 @@ git commit -m "feat(cloud): stack capture overlay on RO lower in protected sessi
 
 ---
 
+## Final-review fix wave (post-B9 — whole-branch review findings)
+
+The final whole-branch review returned "With fixes". Decisions:
+
+**Fixed in the wave (Task B10):**
+- **F-C1 (Critical): agent-side legacy sync fallback fail-close.** The workspace endpoint returns `nc_session_folder` unconditionally and `persistent_app.py`'s back-compat shim (`_legacy_nc_cloud_cfg`, ~:1023-1036) rebuilds a LIVE agent-service WebDAV sync whenever a session has no mount and no sync cfg — i.e. in every degraded-protected scenario (refused engage, flag-off, VM tier, overlay-failure teardown). Fix: the workspace response gains `"protected_cloud": bool(metadata.get("protected_cloud"))`; the agent gates the legacy shim AND any cloud_sync consumption on `not protected_cloud`; the endpoint's `cloud_sync_degraded` computation treats a protected thread with no mount as degraded (drop the `nc_session_folder` veto for protected threads). Endpoint-level (non-replica) test.
+- **F-I1 (Important): engage-vs-attach race.** Keep engage fire-and-forget at create (create latency stays flat) but hold a module-level reference `_protected_engage_tasks: dict[str, asyncio.Task]` (fixes the GC hazard too); in `_build_agent_cloud_mount`'s protected branch, when there's no row and no recorded error: await an in-flight registry task bounded (`asyncio.wait_for(asyncio.shield(task), 30)`), and if no task is registered (HA: other replica ran create) poll `get_ro_mount_by_thread` 3×3s before returning None. Residual cross-replica window ≤ ~9 s accepted for v1.
+- **F-I2 (Important): resume re-engage.** The Slice A reconciler revokes grants of ended threads; resume never re-engages, so end→resume permanently kills the protected mount. Fix: on thread resume, if marker set + flag on + no active row → schedule `_engage_protected_cloud_for_thread` (same registry). Locate the primary resume path (thread status flips back from ended) and hook there.
+- **F-M2:** `protected_cloud=true` at create with the flag OFF now records `protected_cloud_error` ("protected cloud mode is disabled on this deployment") so the degradation is explained.
+- **F-M6:** test pinning the overlay-failure→lower-teardown branch of `_setup_cloud_mount` (the B9 fail-safe deviation).
+
+**Explicitly deferred to Slice C (plan decision — was reviewer I3/I4/M1/M3/M5):** wiring the ENOTCONN monitor loop + heal (needs a new `RcloneMountManager.restart_mount`; today's live mode has no health monitor either, so protected v1 is at parity), fresh-workdir-per-epoch on heal/lazy-remount (latent until heal is wired; initial-mount exposure narrow because plain `-u` precedes `-uz`), shell quota-guard read/write asymmetry, passing `grant.reader_id` into the engage client factory, and a user-visible signal for the multi-mount-thread single-protected-mount v1 limit. The Slice C plan MUST carry these as tasks.
+
 ## Post-Slice-B manual validation (documented, not CI)
 
 Live validation is a manual step on k3d against real Nextcloud (design §11.4, matching Slice A's method): tilt live-syncs the code; create a protected session against a Nextcloud whose **groupfolders app is ≥ 20.1.2** (dev is 19.1.18 — bump first, per the memory note), verify: (1) `engage_ro_mount` passes the cured canary probe and persists a `cloud_ro_mounts` row; (2) the workspace pod mounts the RO rclone lower at `/cloud/lower` and fuse-overlayfs at `/cloud/merged`; (3) `echo x > workspace/cloud/probe.txt` lands in `/home/agent-host/.overlay/upper`, NOT in the cloud; (4) a snapshot captures the upperdir with whiteouts intact and 0 cloud bytes; (5) refresh + heal behave per §11.2. This is the Slice B live-validation gate before Slice C builds the review/apply UI on top.
