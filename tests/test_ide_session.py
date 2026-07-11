@@ -30,7 +30,9 @@ def service_factory():
 
 
 @pytest.mark.asyncio
-async def test_restore_session_uses_snapshot_container_for_pod_snapshot(service_factory):
+async def test_restore_session_uses_snapshot_container_for_pod_snapshot(
+    service_factory,
+):
     """Pod snapshots should go through the IDE pod restore path."""
     svc = service_factory
     svc._restore_snapshot_container = AsyncMock(return_value=True)
@@ -51,7 +53,9 @@ async def test_restore_session_uses_snapshot_container_for_pod_snapshot(service_
 
 
 @pytest.mark.asyncio
-async def test_restore_session_falls_back_to_gitea_when_pod_snapshot_restore_fails(service_factory):
+async def test_restore_session_falls_back_to_gitea_when_pod_snapshot_restore_fails(
+    service_factory,
+):
     """If pod snapshot restore fails, fallback to Gitea when possible."""
     svc = service_factory
     svc._restore_snapshot_container = AsyncMock(return_value=False)
@@ -99,7 +103,9 @@ async def test_restore_session_routes_vm_snapshot_to_vm(service_factory):
 
 
 @pytest.mark.asyncio
-async def test_restore_k8s_ide_container_fails_clone_marks_session_failed(service_factory):
+async def test_restore_k8s_ide_container_fails_clone_marks_session_failed(
+    service_factory,
+):
     """Gitea clone failures on the IDE pod should fail the IDE session."""
     svc = service_factory
     svc._container_provisioner.create_ide_pod = AsyncMock(return_value="10.0.0.10")
@@ -108,15 +114,16 @@ async def test_restore_k8s_ide_container_fails_clone_marks_session_failed(servic
     proc.returncode = 2
     proc.communicate = AsyncMock(return_value=(b"", b"permission denied"))
 
-    with patch(
-        "orchestrator.services.ide_session.build_agent_ssh_cmd",
-        return_value=["ssh", "-i", "k", "agent-host@10.0.0.10", "clone"],
-    ) as mock_build_ssh, patch(
-        "orchestrator.services.ide_session.resolve_ssh_key_path", return_value="k"
+    with (
+        patch(
+            "orchestrator.services.ide_session.build_agent_ssh_cmd",
+            return_value=["ssh", "-i", "k", "agent-host@10.0.0.10", "clone"],
+        ) as mock_build_ssh,
+        patch(
+            "orchestrator.services.ide_session.resolve_ssh_key_path", return_value="k"
+        ),
     ):
-        with patch(
-            "asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
-        ):
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
             with patch(
                 "orchestrator.services.ide_session.IdeSessionService._wait_for_code_server",
                 AsyncMock(return_value=True),

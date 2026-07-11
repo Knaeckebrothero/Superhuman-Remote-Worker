@@ -1,7 +1,25 @@
 # Open IDE on a reviewed job routes pod snapshots to a KubeVirt VM restore — which fails 100% of the time (120s wait vs ~3.5min boot, no orchestrator→tailnet route, reaper race) while the cockpit swallows the error; fix: restore snapshots into the in-cluster IDE pod
 
-**Status:** OPEN — root cause confirmed on live dev 2026-07-11, fix designed
-(this doc), not implemented.
+**Status:** IMPLEMENTED 2026-07-11 (all of P0+P1+P2), commits `c63e1d2b`
+(P0 snapshot→IDE-pod routing + gitea clone port fix + P1 cockpit error
+surfacing/poll cap) and `49aac739` (P2 reaper exemption via
+`ide_session_status` metadata, 420s VM wait, topology gate) + a review pass
+(uncommitted at time of writing): snapshot→gitea fallback resets the session
+to `restoring` so the cockpit poll doesn't report a transient `failed`;
+`get_session_status` maps a session-level `unavailable` (topology verdict)
+to a terminal error response instead of falling through to `available` and
+re-offering a doomed retry; `start_session` propagates the topology error in
+its idempotent return; ruff format. Unit-verified: 95 tests green in
+`tests/test_ide_session.py` + `tests/test_lifecycle_vm_manager.py`, ruff
+clean. **Live k3d/dev smoke NOT yet run** — the verification plan below is
+the remaining gate; re-test "Open IDE" on job `7e45c299` (or any
+pod-snapshot pending_review job) after the next dev rollout.
+**Review notes:** the daemon-side `code_server_connections` heartbeat field
+is still aspirational (`management-daemon.py` never sends it), so the
+P2 reaper exemption cannot be triggered by phantom heartbeat-written
+session statuses today — but if the daemon ever starts reporting it, the
+heartbeat handler (`nats_bridge.py:716-728`) must first be guarded (see
+"Contributing smell" below) or every heartbeating VM becomes unreapable.
 **Motivating incident:** user clicked "Open IDE" on job
 `7e45c299-435c-4fff-b9ef-f7706e7ce0d4` (pending_review since 2026-07-10, its
 workspace pod long since reaped). Cockpit spinner ran ~2 minutes, then stopped
