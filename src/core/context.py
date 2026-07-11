@@ -1728,9 +1728,13 @@ class ContextManager:
             if not content:
                 return False
             lower = content.lower()
-            return lower.startswith(
-                "[tool result elided by compaction"
-            ) or lower.startswith("[tool result truncated by compaction")
+            if lower.startswith("[tool result elided by compaction"):
+                return True
+            # The truncation marker is appended AFTER the kept head, so it
+            # must be detected in the content tail — otherwise every later
+            # compaction re-truncates the message and rewrites the marker's
+            # original-size provenance.
+            return "[tool result truncated by compaction" in lower[-600:]
 
         def _cap_keep_window_tool_results(
             tool_messages: List[BaseMessage],

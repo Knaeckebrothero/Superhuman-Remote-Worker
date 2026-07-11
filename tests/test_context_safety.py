@@ -1274,12 +1274,24 @@ class TestKeepWindowElision:
 
     @pytest.mark.asyncio
     async def test_already_truncated_tail_is_skipped(self, context_manager, mock_llm):
-        """Already-truncated tool results are recognized and left untouched."""
+        """Already-truncated tool results are recognized and left untouched.
+
+        Uses the REAL truncation shape — kept head first, marker appended at
+        the end — so a regression to a startswith-style check fails here.
+        """
         context_manager.config.keep_window_max_tool_result_chars = 20
+        already_truncated = (
+            "y"
+            * 20
+            + "\n\n[tool result truncated by compaction: kept 20 of 20,000 chars "
+            "(~5,000 tokens). Full content was saved to the workspace / is "
+            "re-fetchable — re-run the tool or read the saved file if the rest "
+            "is needed.]"
+        )
         messages = [
             HumanMessage(content="short", id="h1"),
             ToolMessage(
-                content="[tool result truncated by compaction: kept 10 of 20 chars (~3 tokens).]",
+                content=already_truncated,
                 tool_call_id="t1",
                 name="read_file",
                 id="t1",
