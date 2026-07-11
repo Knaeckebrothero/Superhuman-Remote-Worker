@@ -7,10 +7,18 @@ verb, with a positive read control so a dead credential cannot pass by 401ing
 everywhere. On ANY failure it revokes the grant and raises RoEngageRefused;
 only an ``ok`` probe persists the cloud_ro_mounts row.
 
-This is the first (and only) caller of ``ro_probe`` — the module shipped in
-Phase 0 with unit coverage but no wiring. The canary side channels still target
-synthetic ids until the §11.4 live-validation step supplies real version/trash
-ids, so a real run today lands ``inconclusive`` and — correctly — REFUSES.
+This is the first (and only) caller of ``ro_probe``. The write identity's
+``seed_canary_fixture`` (nextcloud.py) discovers real version/trash ids when
+the server exposes them for the canary, and this module passes them through
+to ``probe_read_only`` as ``version_ref``/``trash_ref`` — so the
+versions-restore/trash-restore side channels target ids the server actually
+knows, turning ``inconclusive`` into a verified ``403`` rejection on a
+correctly-RO reader. The uploads-finalize side channel is cured differently
+(it can't be by an injectable ref — its URL is reader-namespaced):
+``probe_read_only`` self-provisions a REAL reader-owned upload session via
+``MKCOL`` before probing it. Remaining inconclusives — the canary's server
+exposed no version/trash id, or the uploads MKCOL failed — still correctly
+REFUSE: fail-closed, not a config bug.
 """
 
 from __future__ import annotations
@@ -21,6 +29,29 @@ from . import ro_probe
 from .base import RoReaderGrant
 
 logger = logging.getLogger(__name__)
+
+
+def _dav_root_from_webdav_url(url: str) -> str:
+    """Derive the true DAV root from a reader's files-namespace WebDAV URL.
+
+    ``grant.webdav_url`` (Slice A ``mint_ro_grant``) is the files-namespace
+    URL — ``{origin}/remote.php/dav/files/{reader}/{mount}/`` — which is NOT
+    the root the versions/trashbin/uploads side channels live under (they
+    hang directly off ``{origin}/remote.php/dav``, not under ``files/...``).
+    Passing the files URL as ``dav_root`` builds nonsense side-channel URLs
+    like ``.../files/<reader>/<mount>/versions/...``. Splitting at the
+    ``/remote.php/dav`` marker and keeping the prefix up to and including it
+    recovers the real root. If the marker is absent (unexpected URL shape),
+    fall back to the url rstripped of a trailing slash — defensive, not a
+    silent success path: a malformed root still only produces requests that
+    fail closed (404/409 inconclusive, or a transport error) under the
+    strict engage gate, never a false "verified rejected".
+    """
+    marker = "/remote.php/dav"
+    idx = url.find(marker)
+    if idx == -1:
+        return url.rstrip("/")
+    return url[: idx + len(marker)]
 
 
 class RoEngageRefused(Exception):
@@ -61,15 +92,23 @@ async def engage_ro_mount(
                 f"version floor check failed: {floors.failures or floors.inconclusive}"
             )
 
-        # probe_read_only(client, base_url, path, *, dav_root=None, username=None)
-        # — `path` is the positional target (the canary file); the reader's
-        # WebDAV URL is both base_url and dav_root (ro_probe.py:240).
+        # probe_read_only(client, base_url, path, *, dav_root=None,
+        # username=None, version_ref=None, trash_ref=None) — `path` is the
+        # positional target (the canary file); `base_url` stays the
+        # reader's files-namespace WebDAV URL (that's the mount being
+        # verified read-only), but `dav_root` must be the TRUE DAV root
+        # (versions/trashbin/uploads live under it, not under
+        # `files/<reader>/<mount>/`) — see `_dav_root_from_webdav_url`.
+        # The canary's discovered refs (None if the server exposed none)
+        # pass straight through so the side channels target real ids.
         result = await ro_probe.probe_read_only(
             client,
             grant.webdav_url,
             canary.path,
-            dav_root=grant.webdav_url,
+            dav_root=_dav_root_from_webdav_url(grant.webdav_url),
             username=grant.reader_id,
+            version_ref=canary.version_ref,
+            trash_ref=canary.trash_ref,
         )
         if not result.ok:
             raise RoEngageRefused(

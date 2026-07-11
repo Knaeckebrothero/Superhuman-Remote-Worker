@@ -26,7 +26,9 @@ class _Resp:
         return self._json
 
 
-def _reader_client(*, all_rejected=True, read_control=207, nc_version="30.0.0"):
+def _reader_client(
+    *, all_rejected=True, read_control=207, nc_version="30.0.0", recorder=None
+):
     major, minor, micro = (int(x) for x in nc_version.split("."))
     caps = {
         "ocs": {
@@ -39,11 +41,17 @@ def _reader_client(*, all_rejected=True, read_control=207, nc_version="30.0.0"):
 
     class _Client:
         async def request(self, method, url, **kw):
+            if recorder is not None:
+                recorder.append((method, url, kw))
             if method == "GET" and "capabilities" in url:
                 return _Resp(200, caps)
             if method == "PROPFIND":  # positive read control (Depth:0)
                 return _Resp(read_control)
-            # any mutating verb / side channel
+            # Any other verb, including A2's uploads-finalize-session MKCOL:
+            # rejecting it here (like every other write) makes that side
+            # channel fall back to its synthetic transfer id — these
+            # engage-level tests are about the dav_root/refs wiring, not
+            # A2's own behavior (covered directly in test_ro_probe.py).
             return _Resp(403 if all_rejected else 201)
 
     return _Client()
@@ -74,7 +82,13 @@ class _FakeRoBackend:
         self.revoked.append(grant_handle)
 
     async def seed_canary_fixture(self, handle):
-        return CanaryFixture(path=".srw-ro-canary/probe.txt")
+        # A1/A3: a real canary carries real refs; the engage gate must pass
+        # them through to the probe rather than leaving them stranded.
+        return CanaryFixture(
+            path=".srw-ro-canary/probe.txt",
+            version_ref="99/1700000000",
+            trash_ref="probe.txt.d1700000000",
+        )
 
     async def remove_canary_fixture(self, handle, fixture):
         self.canary_removed = True
@@ -87,7 +101,10 @@ def _handle():
 @pytest.mark.asyncio
 async def test_engage_persists_and_returns_grant_when_probe_ok():
     backend = _FakeRoBackend()
-    probe_client = _reader_client(all_rejected=True, read_control=207)
+    recorded: list[tuple[str, str, dict]] = []
+    probe_client = _reader_client(
+        all_rejected=True, read_control=207, recorder=recorded
+    )
     db = AsyncMock()
     db.create_ro_mount = AsyncMock(return_value="row-1")
 
@@ -105,6 +122,34 @@ async def test_engage_persists_and_returns_grant_when_probe_ok():
     db.create_ro_mount.assert_awaited_once()
     assert backend.revoked == []  # not revoked on success
     assert backend.canary_removed is True  # canary always cleaned up
+
+    # A3: dav_root passed into the probe must be the true DAV root
+    # (https://nc/remote.php/dav) derived from grant.webdav_url, NOT the
+    # reader's files-namespace mount URL
+    # (https://nc/remote.php/dav/files/srw-reader-abc/Proj/) — every
+    # side-channel request the probe issued must hang directly off the
+    # root, not under `files/<reader>/<mount>/`.
+    side_channel_urls = [
+        url
+        for _method, url, _kw in recorded
+        if any(marker in url for marker in ("/versions/", "/trashbin/", "/uploads/"))
+    ]
+    assert side_channel_urls, "expected side-channel requests to have been issued"
+    for url in side_channel_urls:
+        assert url.startswith("https://nc/remote.php/dav")
+        assert "/files/srw-reader-abc/Proj/" not in url
+
+    # A1: the canary's real refs (from _FakeRoBackend.seed_canary_fixture)
+    # reached the versions-restore/trash-restore requests, not ro_probe's
+    # synthetic placeholders.
+    versions_move = next(
+        url for method, url, _kw in recorded if method == "MOVE" and "/versions/" in url
+    )
+    assert versions_move.endswith("/versions/99/1700000000")
+    trash_move = next(
+        url for method, url, _kw in recorded if method == "MOVE" and "/trashbin/" in url
+    )
+    assert trash_move.endswith("/trash/probe.txt.d1700000000")
 
 
 @pytest.mark.asyncio

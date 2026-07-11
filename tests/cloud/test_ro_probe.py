@@ -489,3 +489,155 @@ async def test_copy_probe_sends_destination_and_reads_403():
     )
     assert client.copy_headers and "Destination" in client.copy_headers
     assert not any("COPY" in f for f in res.failures), res.failures
+
+
+# ---------------------------------------------------------------------------
+# Amended scope A1 — real version_ref/trash_ref passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_side_channel_probes_use_real_refs_when_supplied():
+    probes = side_channel_probes(
+        "https://cloud/remote.php/dav",
+        "alice",
+        version_ref="12345/1699999999",
+        trash_ref="probe.txt.d1699999999",
+    )
+    versions_probe = next(p for p in probes if p[1] == "versions-restore")
+    assert versions_probe[2]["url"] == (
+        "https://cloud/remote.php/dav/versions/alice/versions/12345/1699999999"
+    )
+    trash_probe = next(p for p in probes if p[1] == "trash-restore")
+    assert trash_probe[2]["url"] == (
+        "https://cloud/remote.php/dav/trashbin/alice/trash/probe.txt.d1699999999"
+    )
+    assert trash_probe[2]["headers"]["Destination"] == (
+        "https://cloud/remote.php/dav/trashbin/alice/restore/probe.txt.d1699999999"
+    )
+
+
+def test_side_channel_probes_default_to_synthetic_ids_when_refs_absent():
+    probes = side_channel_probes("https://cloud/remote.php/dav", "alice")
+    versions_probe = next(p for p in probes if p[1] == "versions-restore")
+    assert "999999999/1" in versions_probe[2]["url"]
+    trash_probe = next(p for p in probes if p[1] == "trash-restore")
+    assert "srw-ro-probe-item" in trash_probe[2]["url"]
+    assert "srw-ro-probe-item" in trash_probe[2]["headers"]["Destination"]
+
+
+# ---------------------------------------------------------------------------
+# Amended scope A2 — uploads-finalize self-provisions a real upload session
+# ---------------------------------------------------------------------------
+
+
+class _UploadSessionClient:
+    """Models the reader's own ``uploads/{username}/...`` namespace.
+
+    ``mkcol_status`` controls whether provisioning a real session succeeds
+    (201) or not (any other status). Every other verb/side channel is
+    rejected (403) by default so only the uploads-finalize behavior is
+    under test; PROPFIND (positive read control) passes (207).
+    """
+
+    def __init__(self, mkcol_status: int):
+        self._mkcol_status = mkcol_status
+        self.mkcol_urls: list[str] = []
+        self.delete_urls: list[str] = []
+        self.uploads_move_requests: list[tuple[str, dict]] = []
+
+    async def request(self, method, url, **kw):
+        if method == "PROPFIND":
+            return _FakeResp(207)
+        # Only the /uploads/ namespace is the A2 provisioning path; the
+        # primary MUTATING_VERBS loop also probes MKCOL/DELETE against the
+        # canary target URL and those must stay ordinary rejected (403)
+        # writes, not be mistaken for session provisioning/cleanup.
+        if method == "MKCOL" and "/uploads/" in url:
+            self.mkcol_urls.append(url)
+            return _FakeResp(self._mkcol_status)
+        if method == "DELETE" and "/uploads/" in url:
+            self.delete_urls.append(url)
+            return _FakeResp(204)
+        if method == "MOVE" and "/uploads/" in url:
+            self.uploads_move_requests.append((url, kw))
+            # Real session provisioned -> a genuine RO reader gets 403.
+            # No session (fallback to synthetic id) -> server has never
+            # heard of it -> 404 (inconclusive), same as pre-A2 behavior.
+            return _FakeResp(403 if self._mkcol_status == 201 else 404)
+        return _FakeResp(403)
+
+
+@pytest.mark.asyncio
+async def test_uploads_finalize_targets_real_session_when_mkcol_succeeds():
+    client = _UploadSessionClient(mkcol_status=201)
+    res = await probe_read_only(
+        client,
+        "https://cloud/dav",
+        "f/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+    )
+    # MKCOL was attempted against the reader's own uploads namespace.
+    assert client.mkcol_urls == [
+        "https://cloud/remote.php/dav/uploads/alice/srw-ro-probe"
+    ]
+    # uploads-finalize MOVE landed on that same real session, and its 403
+    # counted as a verified rejection (not inconclusive).
+    assert len(client.uploads_move_requests) == 1
+    move_url, _ = client.uploads_move_requests[0]
+    assert move_url == "https://cloud/remote.php/dav/uploads/alice/srw-ro-probe/.file"
+    assert not any("uploads-finalize" in i for i in res.inconclusive)
+    assert not any("uploads-finalize" in f for f in res.failures)
+    # The provisioned session was cleaned up (best-effort DELETE).
+    assert client.delete_urls == [
+        "https://cloud/remote.php/dav/uploads/alice/srw-ro-probe"
+    ]
+    assert res.ok is True
+
+
+@pytest.mark.asyncio
+async def test_uploads_finalize_falls_back_to_synthetic_when_mkcol_fails():
+    client = _UploadSessionClient(mkcol_status=404)
+    res = await probe_read_only(
+        client,
+        "https://cloud/dav",
+        "f/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+    )
+    # MKCOL failed (not 201) -> no real session -> nothing to clean up.
+    assert client.delete_urls == []
+    # The finalize probe still ran (against the same synthetic-named URL —
+    # the URL shape doesn't change, only whether a real session backs it),
+    # and 404 lands in `inconclusive`, exactly as it did before A2.
+    assert any("uploads-finalize" in i and "404" in i for i in res.inconclusive), (
+        res.inconclusive
+    )
+    assert not any("uploads-finalize" in f for f in res.failures)
+
+
+@pytest.mark.asyncio
+async def test_mkcol_transport_error_is_not_recorded_as_a_probe_failure():
+    class _MkcolBoomClient:
+        async def request(self, method, url, **kw):
+            if method == "PROPFIND":
+                return _FakeResp(207)
+            if method == "MKCOL" and "/uploads/" in url:
+                raise ConnectionError("boom")
+            if method == "DELETE" and "/uploads/" in url:
+                raise AssertionError("no session was provisioned; must not DELETE")
+            return _FakeResp(404 if "/uploads/" in url else 403)
+
+    res = await probe_read_only(
+        _MkcolBoomClient(),
+        "https://cloud/dav",
+        "f/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+    )
+    # The MKCOL transport error itself must not appear as a failure entry —
+    # it's setup, not a verb probe. It simply falls back to synthetic.
+    assert not any("MKCOL" in f for f in res.failures), res.failures
+    assert any("uploads-finalize" in i and "404" in i for i in res.inconclusive), (
+        res.inconclusive
+    )
