@@ -197,6 +197,7 @@ export interface SkillUpdateRequest {
 export type DatasourceType =
   | 'generic'
   | 'repository'
+  | 'kb'
   | 'postgresql'
   | 'neo4j'
   | 'mongodb'
@@ -220,6 +221,46 @@ export interface CredentialFileEntry {
   env_var?: string;
 }
 
+/** Non-secret, type-specific datasource configuration. */
+export interface DatasourceConfig {
+  /** Repository-relative POSIX root containing OKF Markdown notes. */
+  root_path?: string;
+}
+
+export type DatasourceIndexState =
+  | 'pending'
+  | 'indexing'
+  | 'ready'
+  | 'partial'
+  | 'failed';
+
+/** Operational state of a centrally indexed OKF Knowledge Base datasource. */
+export interface DatasourceIndexStatus {
+  datasource_id: string;
+  status: DatasourceIndexState;
+  source_head: string | null;
+  indexed_commit: string | null;
+  pipeline_version: string | null;
+  repo_name?: string | null;
+  branch?: string | null;
+  last_attempt_at: string | null;
+  last_success_at: string | null;
+  /** Bounded, credential-redacted diagnostic supplied by the orchestrator. */
+  last_error: string | null;
+}
+
+/** Tolerant summary returned by a manual incremental/full KB reindex. */
+export interface DatasourceReindexResult {
+  status: string;
+  indexed_commit?: string | null;
+  full?: boolean;
+  upserted?: number;
+  deleted?: number;
+  reconciled?: number;
+  skipped?: number;
+  errors?: number;
+}
+
 /**
  * Datasource configuration from the orchestrator.
  */
@@ -238,7 +279,10 @@ export interface Datasource {
   credentials?: Record<string, unknown>;
   cli_hint: string | null;
   default_branch: string | null;
+  config?: DatasourceConfig;
   job_id: string | null;
+  /** Creator id is used only to gate owner/admin management actions in Cockpit. */
+  created_by?: string | null;
   /** Whether the datasource is visible to all users (vs owner/project only). */
   is_global?: boolean;
   created_at: string;
@@ -257,6 +301,7 @@ export interface DatasourceCreateRequest {
   job_id?: string;
   cli_hint?: string;
   default_branch?: string;
+  config?: DatasourceConfig;
 }
 
 /**
@@ -269,6 +314,7 @@ export interface DatasourceUpdateRequest {
   credentials?: Record<string, unknown>;
   cli_hint?: string;
   default_branch?: string;
+  config?: DatasourceConfig;
 }
 
 /**

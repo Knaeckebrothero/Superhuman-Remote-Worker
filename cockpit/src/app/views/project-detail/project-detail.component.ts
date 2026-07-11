@@ -450,7 +450,9 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 >
                   <option value="">{{ 'projectDetail.datasources.selectPlaceholder' | transloco }}</option>
                   @for (ds of availableDatasources(); track ds.id) {
-                    <option [value]="ds.id">{{ ds.name }} ({{ ds.type }})</option>
+                    <option [value]="ds.id">
+                      {{ ds.name }} ({{ 'datasources.filter.' + ds.type | transloco }})
+                    </option>
                   }
                 </app-select>
                 <app-button
@@ -482,7 +484,9 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       <tr>
                         <td>{{ ds.name }}</td>
                         <td>
-                          <span class="role-badge" [class]="'role-' + ds.type">{{ ds.type }}</span>
+                          <span class="role-badge" [class]="'role-' + ds.type">
+                            {{ 'datasources.filter.' + ds.type | transloco }}
+                          </span>
                         </td>
                         <td>
                           <app-input
@@ -493,15 +497,25 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           />
                         </td>
                         <td>
-                          <app-select
-                            size="sm"
-                            [value]="boolToText(ds.project_read_only)"
-                            (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
-                          >
-                            <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
-                            <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
-                            <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
-                          </app-select>
+                          @if (ds.type === 'kb') {
+                            <app-badge
+                              tone="info"
+                              size="sm"
+                              [title]="'projectDetail.datasources.accessKbReadOnlyHint' | transloco"
+                            >
+                              {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
+                            </app-badge>
+                          } @else {
+                            <app-select
+                              size="sm"
+                              [value]="boolToText(ds.project_read_only)"
+                              (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
+                            >
+                              <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
+                              <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
+                              <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
+                            </app-select>
+                          }
                         </td>
                         <td>
                           <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
@@ -1759,7 +1773,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   linkDatasource(): void {
     const dsId = this.dsLinkId();
     if (!dsId) return;
-    this.api.linkProjectDatasource(this.projectId, dsId).subscribe((res) => {
+    const datasource = this.allDatasources().find((ds) => ds.id === dsId);
+    const settings = datasource?.type === 'kb' ? {read_only: true} : {};
+    this.api.linkProjectDatasource(this.projectId, dsId, settings).subscribe((res) => {
       if (res) {
         this.dsLinkId.set('');
         this.loadProjectDatasources();
@@ -1776,6 +1792,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   updateDatasourceReadOnly(datasourceId: string, value: string): void {
+    if (this.projectDatasources().some((ds) => ds.id === datasourceId && ds.type === 'kb')) {
+      return;
+    }
     const readOnly = value === '' ? null : value === 'true';
     this.api.updateProjectDatasource(this.projectId, datasourceId, { read_only: readOnly }).subscribe((res) => {
       if (res) this.loadProjectDatasources();

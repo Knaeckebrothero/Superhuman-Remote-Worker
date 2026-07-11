@@ -484,6 +484,26 @@ class TestEligibleDatasourcesEndpoint:
 
 class TestLinkDatasourceToProjectEndpoint:
     @pytest.mark.asyncio
+    async def test_kb_link_is_forced_read_only(
+        self, user_a, project_a, datasource_a, fake_db, fake_request
+    ):
+        from main import ProjectDatasourceSettings, link_datasource_to_project
+
+        kb = {**datasource_a, "type": "kb"}
+        fake_db.get_datasource = AsyncMock(return_value=kb)
+        fake_db.link_datasource_to_project = AsyncMock(return_value=None)
+        with _patch_caller_and_db(user_a, fake_db):
+            with patch("main._sync_datasource_knowledge", AsyncMock()):
+                await link_datasource_to_project(
+                    fake_request,
+                    str(project_a["id"]),
+                    str(datasource_a["id"]),
+                    ProjectDatasourceSettings(read_only=False),
+                )
+
+        assert fake_db.link_datasource_to_project.await_args.kwargs["read_only"] is True
+
+    @pytest.mark.asyncio
     async def test_owner_links_their_own_datasource(
         self, user_a, project_a, datasource_a, fake_db, fake_request
     ):

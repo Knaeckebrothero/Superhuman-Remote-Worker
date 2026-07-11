@@ -5,7 +5,7 @@ tags:
   - agent-architecture
   - git-integration
   - tool-development
-status: draft
+status: active
 created: 2026-07-03
 aliases:
   - OKF knowledge base
@@ -39,7 +39,15 @@ addendum). **Slice-2 stragglers landed 2026-07-05** (see §11.1 addendum):
 `oversized-note`, `slug-forked`, embedding-backed `near-duplicate` (one pgvector
 self-join, `KnowledgeStore.find_near_duplicate_pairs`) and opt-in
 `dead-external-url` lint rules, plus distill-don't-dump + Garden-step direction
-in all five curation prompt forks. Slices 3–4 owed. Origin: design discussion 2026-07-03, building on the
+in all five curation prompt forks. **The Slice 3 substrate landed 2026-07-05/06**
+(chunk schema, structural chunker, git-watermarked reindexer, chunk-RRF retrieval,
+link index, Neo4j-optional tool paths, centroid near-duplicate support, and orphan
+reconciliation). **Slice 4 was decision-locked and implemented on 2026-07-11**:
+first-class `kb` datasources, provider-neutral credential-contained git ingestion,
+initial/manual/periodic reindexing with operational status, explicit runtime bindings,
+qualified handles, protected multi-KB passive retrieval, lite-tier support, and the
+Cockpit authoring/status flow. The automated feature suites are green; deployment/live
+verification remains separate operational evidence. Origin: design discussion 2026-07-03, building on the
 substrate findings in [[knowledge_base_substrate_decision]]; refined the same day by a
 six-agent research sweep (three codebase audits, three web — sources in §12).
 [[loop_repo_compounding_v2]] shipped the same day, which changes this doc's footing: the
@@ -54,15 +62,17 @@ notes into it.
 - **A knowledge base = an OKF/markdown git repo + a disposable Postgres index + a
   toolset.** Files are canonical; the index is a rebuildable cache over git; tools enforce
   at write time what a filesystem can't.
-- **KBs become datasources.** A KB datasource is a repository datasource with OKF
-  conventions, attachable to any number of projects (org wiki, a customer handoff vault,
-  this repo's own `docs/`). The *project KB* stops being a special Neo4j subsystem and
-  becomes an auto-provisioned KB datasource attached at project creation — one mechanism,
-  and cross-project knowledge sharing falls out for free.
-- **Access is split by operation, not by "files vs. tools":** reads go straight at the
-  cloned filesystem; writes go through `kb_*` tools that enforce integrity; queries go
-  through the index; maintenance is a background gardener, because a year of running our
-  own `docs/` vault proved the format does not self-maintain.
+- **KBs become datasources.** A KB datasource is a first-class `kb` datasource backed by
+  an OKF git repository, attachable to any number of projects (org wiki, a customer handoff vault,
+  this repo's own `docs/`). In the end state, the *project KB* stops being a special
+  subsystem and becomes an auto-provisioned KB datasource attached at project creation
+  — one mechanism, and cross-project knowledge sharing falls out for free. Slice 4 first
+  proves external read-only datasources; native-project migration follows separately.
+- **Access is split by operation, not by "files vs. tools":** native/project KB reads can
+  go straight at the filesystem; writes go through `kb_*` tools that enforce integrity;
+  queries go through the index; maintenance is a background gardener. External
+  datasource KBs are index-backed and credential-isolated in the first Slice 4 delivery
+  (no agent-side clone); external filesystem/write access is a later slice.
 - **Sync is one-way and incremental**: the index stores the commit SHA it was built from;
   a git tree-diff against HEAD yields exactly the changed notes (git's object model
   already *is* the Merkle tree you'd otherwise build). No bidirectional sync, ever.
@@ -70,6 +80,120 @@ notes into it.
   scaffolding; Neo4j goes dormant for KBs** (the citation network remains the separate
   open case). It flips the substrate doc's default from "Postgres-canonical ⇄ OKF export"
   to "OKF-canonical ⇄ Postgres index" — §5 below argues why.
+
+---
+
+## Slice 4 decision lock (2026-07-11)
+
+The following decisions are final for the first KB-datasource delivery. They replace
+the corresponding "leaning" language and open questions later in this document. See the
+[Slice 4 implementation plan](../superpowers/plans/2026-07-11-okf-kb-datasource-slice-4.md).
+
+1. **Name and format:** the product and code call this an **OKF Knowledge Base**. OKF
+   remains the formal format name; it is not relabelled as an Obsidian datasource.
+   The UI may explain that the repository is ordinary Markdown with frontmatter and
+   links, but `okf`/`kb` are the implementation terms.
+2. **Datasource shape:** add a first-class datasource type, `type = "kb"`. It reuses
+   repository URL, branch, token/SSH credential validation, and repository discovery,
+   but is not `repository + format=okf`. A separate type gives clear tool gating,
+   indexing lifecycle, access semantics, and Cockpit copy.
+3. **Identity and location:** for an external KB, `datasources.id` is its stable
+   `kb_id`. Its canonical location is the tuple **(repository URL, branch,
+   `config.root_path`)**. `root_path` is a normalized relative POSIX path, defaults to
+   the repository root, rejects `..`, and participates in the index pipeline version
+   so changing it forces a clean rebuild.
+4. **Attachment and rollout:** the existing project KB remains implicit, writable, and
+   scoped by `project_id` during the first delivery. External KB datasources follow the
+   datasource system's explicit-only selection model: project linkage makes them
+   eligible, while a job/session receives one only when selected. Runtime reads search
+   the native project KB plus the selected external KB ids. Turning the native project
+   KB into an auto-provisioned datasource is the end state, but a later migration — not
+   part of the first external-datasource slice.
+5. **Index ownership and freshness:** the orchestrator owns ingestion. A
+   provider-neutral git reader resolves HEAD, lists the tree, and fetches changed blobs;
+   the existing commit watermark/blob-SHA reindexer remains the indexing engine. Initial
+   indexing, a manual reindex endpoint, and the leader-gated periodic sweep ship first.
+   Provider webhooks are deferred. An external KB is searchable without first running
+   an agent and remains queryable on shell-less/lite workspaces. Reconciliation compares
+   the indexed path/blob map directly with the current immutable tree, so a force-push
+   does not require commit ancestry; parser/root/embedding pipeline changes still force
+   a full rebuild.
+6. **Credential boundary and v1 writes:** external KB datasources are **read-only in the
+   first delivery**. Their repository credentials stay in the orchestrator indexing
+   path and are not dispatched to agents; private external KBs are therefore not cloned
+   into agent workspaces in v1. Agents use `kb_search`, `kb_read`, `kb_list`, and related
+   query tools against the indexed snapshot. `kb_write`/`kb_update` continue targeting
+   the native project KB only. External write-back (branch/PR policy, conflicts, and
+   authenticated pushes) is a separate follow-up slice.
+7. **Source-aware tools:** runtime context carries explicit KB bindings (id, stable
+   alias/name, and access), separate from `project_ids`. Search and passive
+   injection may span all authorized bindings, but every result identifies its source.
+   Canonical note handles are `kb-alias:note-slug`; an unqualified slug is accepted only
+   when it resolves uniquely and otherwise returns an ambiguity error. Optional `kb`
+   selectors narrow search/list/read without proliferating tools. External read/search/
+   list/related surfaces fetch the live index watermark best-effort and show an explicit
+   indexed-snapshot marker; a binding's cached watermark is only a fallback.
+8. **Retrieval policy:** the native project KB keeps a protected share of the passive
+   injection budget so a large organization KB cannot drown out local project context.
+   Results from external KBs carry the last fully reconciled commit and are explicitly
+   described as indexed content. During `partial`/`indexing`/`failed` convergence, tools
+   also show status and the attempted source HEAD: successful per-note mutations may
+   already be present, so the cache must not be mislabeled as an immutable snapshot of
+   the prior commit. Full-note reads come from this indexed content in v1.
+9. **Backend tiers and Neo4j:** external KB query tools work on every workspace tier; no
+   repository clone is required. Neo4j is neither required nor canonical. Slice 4 builds
+   on the Postgres chunk/link index and does not add new graph behavior.
+10. **Embedding identity:** centrally indexed KB chunks and runtime KB queries use one
+    authoritative system-owned `KB_EMBEDDING_*` profile, distinct from the user's
+    `EMBEDDING_*` memory profile. That credential is dispatched only when a native or
+    selected external KB is in scope; reused agents clear stale KB profile fields. A
+    selected but unusable catalog profile fails loudly and never falls through to a
+    different environment model.
+11. **Git and lifecycle boundary:** public datasource URLs accept only HTTP(S), SSH, or
+    strict SCP syntax to an exact trusted host/port (`KB_GIT_ALLOWED_HOSTS`, with a small
+    default public-provider set); local/file/remotely executable helpers, IP literals,
+    loopback, arbitrary internal hosts, and URL-embedded credentials are rejected.
+    Tokens/passwords require HTTPS. SSH is deploy-key-only and isolated from ambient
+    agents/config. Deletion cancels local builds and takes the same local +
+    cross-replica index lock across vector cleanup and app-row deletion; stale sweep work
+    rechecks datasource liveness under that lock and cannot resurrect the index.
+12. **Attachment authorization:** persisted project/datasource IDs are selections, not
+    frozen grants. Thread creation, attach, and resume recheck the owner's current access;
+    child jobs re-authorize explicit and inherited IDs. Agent-created jobs derive their
+    user/project scope from an authoritative thread or parent (MCP uses its authenticated
+    forwarded user), and an originless shared-key job POST is rejected. External KBs also
+    reject legacy `job_id` assignment, preserving explicit-only attachment.
+
+These choices deliberately stage the end-state unification. They deliver the reusable
+datasource and retrieval model without coupling it to native-project migration or the
+much larger external-write conflict/security problem.
+
+### Slice 4 operational envelope
+
+- Periodic freshness uses `KB_REINDEX_SWEEP_SECONDS` (default 900 seconds); creation and
+  source-affecting updates also schedule an immediate best-effort full build, and owners
+  can trigger incremental/full rebuilds manually.
+- External Git bounds are 30 seconds for HEAD/tree/blob operations and 120 seconds for a
+  fetch. Captured output is capped at 1 MiB for HEAD/fetch diagnostics, 16 MiB for the
+  tree, and 8 MiB per Markdown blob. Timeout, output-limit, and cancellation paths kill
+  the full Git/SSH/helper process group and delete snapshot/auth directories.
+- Every changed run reads one immutable commit snapshot. Repository auth material stays
+  in temporary mode-restricted files/environment; SSH ignores ambient agents, user/system
+  SSH config, proxy commands, password auth, and default identities. Operators can set
+  `KB_GIT_SSH_KNOWN_HOSTS` to switch deploy-key remotes from isolated first-use
+  acceptance to strict host-key pinning.
+- A full rebuild may incur embedding cost, so Cockpit requires confirmation. V1 has no
+  provider webhook, separate note-count quota, or fetched-pack disk quota. Tree/blob
+  limits bound parser inputs and diagnostics, and fetch time is capped, but an unusually
+  large unfiltered-fallback pack remains an operational capacity consideration. Distinct
+  external Git/embed runs are bounded by `KB_EXTERNAL_REINDEX_CONCURRENCY` (default 2 per
+  orchestrator process); the leader sweeper itself remains sequential.
+- The first rollout of the effective-profile fingerprint changes every existing KB row
+  stamp. Trigger a full reindex during deployment or allow the default 15-minute sweep
+  to do so; old-stamp vectors are deliberately invisible to new-profile queries while
+  notes rebuild. A provider changing model weights behind the same unchanged
+  provider/model/endpoint identity is not externally observable, so that case requires
+  an operator-requested full rebuild.
 
 ---
 
@@ -95,12 +219,14 @@ KB  =  OKF git repo (canonical)  +  Postgres index (disposable)  +  kb_* toolset
 
 Consequences:
 
-- **KB datasource** — a new datasource type wrapping a git repo (clone/credential plumbing
+- **KB datasource** — a new datasource type wrapping a git repo (URL/auth validation
   shared with `repository`), flagged as OKF-conventioned so the `kb_*` tools bind to it.
-- **Project KB = a KB datasource auto-provisioned and auto-attached at project creation**,
-  exactly like the jobs repo and the default project's home Space. Deleting the special
-  case means: same tools, same index, same maintenance loop whether the KB is
-  project-private or an org-wide vault attached to 40 projects.
+  The first external-datasource slice indexes centrally and does not clone into agents.
+- **End state: Project KB = a KB datasource auto-provisioned and auto-attached at project
+  creation**, exactly like the jobs repo and the default project's home Space. Deleting
+  the special case means: same tools, same index, same maintenance loop whether the KB
+  is project-private or an org-wide vault attached to 40 projects. Per the 2026-07-11
+  lock, that native migration follows the external read-only datasource delivery.
 - **The loop's blackboard is the project's KB datasource.** The per-job-branch +
   squash-merge mechanics live in [[loop_repo_compounding_v2]]; scholar/critic KB notes and
   the retro collection are just notes merging to the KB's `main`.
@@ -118,6 +244,11 @@ The "clone-and-grep vs. abstraction layer" question dissolves when split per ope
 | **Write** | `kb_write` / `kb_update` (tool-mediated) | Where [[knowledge_base_substrate_decision]] §3's pains actually live. The tool enforces unique id, valid frontmatter, resolvable links, supersede semantics — then writes the `.md` and updates the index in one step. |
 | **Query** | `kb_query` / `search_knowledge` (index-backed) | Semantic search, `status != 'superseded'` filtering, anti-joins ("unanswered questions"), backlinks, tag algebra — the Appendix B schema of the substrate doc, nearly verbatim. |
 | **Maintenance** | Gardener utilities (background / curator), not inline tools | Lint (orphans, broken links, missing/invalid frontmatter, duplicate candidates), hierarchical `index.md` regeneration (OKF progressive disclosure), TTL re-verification sweeps ([[kb_convergence_ttl_reverification]]), stats. |
+
+**Slice 4 v1 exception for external datasources:** their canonical repository is read by
+the orchestrator indexer, while agents read the indexed snapshot through KB tools. The
+repository credentials are not dispatched and the private repo is not cloned into the
+agent workspace. Native project KB behavior stays filesystem-backed and writable.
 
 **The gardener redeems the curator.** Today the curator's only verb is "write more notes,"
 which produced the KB noise findings (F33/F38 in [[loop_review]]). Given lint/dedup/index
@@ -196,10 +327,10 @@ Design (mechanism corrected 2026-07-03 after the code audit — see §12):
 
 - The index stores **one watermark per KB: `indexed_commit`** (plus `blob_sha` per note
   row for idempotency and embedding gating), alongside a **`pipeline_version`** (config
-  hash: embedding model + chunker version + path-prefix). A watermark is valid only if
-  `indexed_commit` is an ancestor of HEAD **and** `pipeline_version` matches — a changed
-  embedding model or chunker silently invalidates every row, so it must force a full
-  rebuild (Zoekt rebuilds on repo-metadata change for exactly this reason).
+  hash: embedding model + chunker/parser version + path-prefix). A changed embedding
+  model, parser, chunker, or root invalidates every row and forces a full rebuild. Commit
+  ancestry is deliberately unnecessary: the index's stored path/blob map is reconciled
+  against the complete current tree, which is correct even after a force-push.
 - **Reindex = tree diff, NOT the compare API.** Gitea's `get_compare` drops the `files[]`
   array (`gitea.py:841-889` keeps only commits) and Gitea 1.22's compare endpoint 404s
   on raw SHAs — the original "`git diff --name-status` via `get_compare`" plan does not
@@ -211,30 +342,33 @@ Design (mechanism corrected 2026-07-03 after the code audit — see §12):
   delete removed, re-embed only changed blobs, advance the watermark. Cost is
   **O(tree listing + changed files)**: a 10k-document org vault with 500 changed notes
   fetches and re-embeds only the 500.
-- **Renames**: the tree diff reports a rename as delete+add, but the stable frontmatter
-  `id` (§6) re-matches them — same id reappearing on a new path ⇒ update `path` on the
-  existing row and **skip re-embedding** when the blob is unchanged. Process deletions
-  before additions inside one transaction so a rename can't collide on the id
-  uniqueness constraint.
+- **Renames**: the tree diff reports a rename as delete+add. A stable frontmatter `id`
+  (§6) may move the existing row only when its former path is confirmed absent from the
+  current tree; this prevents a duplicate-id file from stealing a still-canonical row.
+  Slice 4 re-embeds the added path even when the blob is unchanged (a bounded cost that
+  keeps the per-note durability pipeline simple), then deletes the vanished path. A
+  duplicate id makes the run partial and leaves the prior watermark unchanged.
 - **Staleness detection is O(1)**: compare `indexed_commit` to the branch HEAD SHA
   (`get_branch_head_sha`). Query results are honestly *as-of the watermark* — expose
   `indexed_commit` in `kb_query`/`search_knowledge` responses so agents can see
-  staleness themselves; reads-of-truth always hit files (org-roam has shipped this exact
-  posture since 2020).
-- **Triggers**: the loop's post-merge hook — concrete call site `_advance_project_loop`
+  staleness themselves. Native writes still target canonical files; external v1 full
+  reads deliberately come from the credential-isolated indexed snapshot and show its
+  watermark.
+- **Trigger end state (proposed in the original design):** the loop's post-merge hook — concrete call site `_advance_project_loop`
   directly after `merge_loop_job_branch` returns `merged` (`orchestrator/main.py:10095`,
   a `vector_db` handle already in scope there for TTL decrement); job-start catch-up
   check (SHA compare before the agent reads); a leader-gated periodic sweeper (the
   `run_when_leader` + tick shape of `stale_verification_sweeper.py`). A Gitea push
   webhook would be entirely new plumbing (no `create_hook` client support, no receiver
-  endpoint exists anywhere) — defer it; the three triggers above cover every write path
-  we control, and human out-of-band pushes are caught by the sweeper.
-- **Force-push / history rewrite / pipeline change**: watermark invalid → full rebuild —
-  safe because the index is disposable (`rebuild_from_notes`,
-  `knowledge_store.py:559-613`, is the existing full-rebuild primitive; re-point its
-  source from Neo4j to the git tree). Ship an operator-facing **`kb reindex --full`**
-  escape hatch in v1 — GitLab's identical watermark design needed exactly this in
-  production, and their troubleshooting docs show it gets used.
+  endpoint exists anywhere) — defer it. **As built**, native indexing has post-merge +
+  periodic + manual triggers (job-start catch-up remains deferred), while external Slice
+  4 has create/source-update + periodic + manual triggers. Human out-of-band pushes are
+  caught by the sweeper.
+- **Force-push / history rewrite / pipeline change**: history rewrites reconcile safely
+  from the current full tree without ancestry assumptions; pipeline/root changes force
+  a full rebuild because prior vectors or scope are incompatible. The index remains
+  disposable, and the operator-facing **`kb reindex --full`** escape hatch handles
+  recovery or deliberate rebuilds.
 - **Interrupted reindex self-heals**: per-row `blob_sha` makes re-runs skip already-current
   rows; the watermark only advances at the end.
 
@@ -252,10 +386,16 @@ Design (mechanism corrected 2026-07-03 after the code audit — see §12):
   as natural text (never raw YAML) — the highest-ROI cheap trick in the 2025-26
   literature (15–25-pt QA-accuracy gains reported; Khoj ships exactly this).
 - **`embedding_version` per embedded row from day one** (model id + dims + chunker
-  version); retrieval filters `WHERE embedding_version = current`. Mixed-model vectors
+  version + a secret-free effective-profile fingerprint over provider, normalized
+  endpoint, and catalog endpoint identity); retrieval filters
+  `WHERE embedding_version = current`. API keys are deliberately excluded, so key
+  rotation does not rebuild the corpus, while moving the same model label to another
+  transport does. Mixed-model/transport vectors
   cause silent "index drift" — great results on fresh rows, garbage on stale ones, no
-  error anywhere. No blue-green machinery needed: the index is disposable, so model
-  migration = bump version → per-KB rebuild → the filter flips per KB atomically. A full
+  error anywhere. No blue-green machinery is used: the index is disposable, so model
+  migration = bump version → per-KB rebuild. Old-version chunks are filtered immediately
+  and successfully rebuilt notes become searchable incrementally; the KB remains visibly
+  `indexing`/`partial` until the clean watermark advances. A full
   10⁵-note rebuild costs $0.50–$3.25 in embeddings — rebuild-on-doubt is economically
   free. Batch embedding API for full rebuilds, synchronous calls for incrementals (wire
   the existing-but-unused `embed_batch`, `embedding_service.py:146` — today's upsert
@@ -340,6 +480,9 @@ verb, cheap: emit OKF `log.md` from `git log main` — spec-native, newest-first
 history that survives shallow clones.)
 
 ## 8. Tiers — one toolset, one knob
+
+These are **KB substrate/deployment tiers**, not agent workspace tiers. A shell-less
+agent on a Full deployment still has index-backed KB query tools.
 
 | Tier | Substrate | What degrades |
 |---|---|---|
@@ -534,7 +677,8 @@ exactly the split-brain this design exists to kill.
      chunker (~400–512-token target, sibling merge-up, 10–15 % overlap only on
      forced mid-section splits), breadcrumb embed-text builder (title/type/tags/
      heading-path as natural text, never raw YAML), `embedding_version` stamping
-     (model id + dims + chunker version), wire the unused `embed_batch` for bulk.
+     (model id + dims + chunker version; later extended with the effective-profile
+     fingerprint), wire the unused `embed_batch` for bulk.
      **DONE 2026-07-05 (develop, TDD, uncommitted):** `src/tools/knowledge/chunker.py`
      — `chunk_note` (heading-stack breadcrumbs, greedy sibling merge-up to target,
      paragraph-packed forced splits with 12 % overlap seed; reuses
@@ -643,8 +787,9 @@ exactly the split-brain this design exists to kill.
        regenerated; migration verified applying against real pg15+pgvector.
      - **PR4b DONE — kb_search cutover.** `kb_search` now calls `search_chunks` (note-level
        `hybrid_search` is blind to reindexed notes — their embedding is NULL, vectors live
-       on chunks), passes the live `embedding_version` (`qwen3-embedding-8b:4096:c1`,
-       resolved from the query-time EmbeddingService so it matches the reindexer stamp),
+       on chunks), passes the live `embedding_version` (model + dimensions + chunker +
+       effective-profile fingerprint, resolved from the query-time EmbeddingService so
+       it matches the reindexer stamp),
        and surfaces the watermark `indexed_commit` in the header.
      - **PR4c-1 DONE — link table.** Migration `0010_knowledge_links.sql`
        (`knowledge_links`: source_note_row FK CASCADE, kb_id, source_id, target_id slug,
@@ -725,35 +870,52 @@ exactly the split-brain this design exists to kill.
    It archives orphans on the next clean reindex, so the bulk B-2 cleanup is retired as
    a no-op. Live loop-repo repairs (A-1 resurrection files, C-2 invalid-YAML backfill)
    await dev-cluster access (tunnel down 2026-07-06).
-4. **KB datasource type + auto-attach as project KB** — the unification; Neo4j export
-   migration for pre-existing notes. Mechanics (audited 2026-07-03 — most of the
-   substrate is already live):
-   - **Clone plumbing exists**: `repository` datasources are cloned to `repos/<name>/`
-     on the workspace backend at dispatch (`src/core/datasource_setup.py:659`). The KB
-     type adds only the OKF binding (`kb_*` tools take the root), index provisioning +
-     watermark reindex, and gardener coverage.
+4. **KB datasource type (implemented 2026-07-11; live verification pending)** — first ship external,
+   centrally indexed, read-only KB datasources; migrate the native project KB into the
+   same model afterward. Detailed implementation:
+   [Slice 4 implementation plan](../superpowers/plans/2026-07-11-okf-kb-datasource-slice-4.md).
+   As-built mechanics:
+   - **Repository credential plumbing exists**: `repository` datasources already support
+     token/SSH auth and external git URLs. Slice 4 reuses their validation/normalization
+     for an orchestrator-side git content source, but deliberately does **not** reuse the
+     agent-workspace clone path in v1. The KB boundary is stricter: tokens/passwords are
+     HTTPS-only; SSH/SCP requires an explicit deploy key and ignores ambient SSH agents,
+     identities, config, password auth, and proxies. A later external-write slice can
+     revisit cloning.
    - **Org-wide vaults are nearly free**: `datasources.is_global` already means
      "visible to all users" and `list_eligible_datasources` already returns
      owned + global + project-linked — an org wiki is a KB datasource with
      `is_global: true`. No new sharing machinery.
    - **Lite/backend tiers**: repository datasources currently *reject* shell-less
-     workspace backends; a KB datasource should instead degrade to query-only
-     (index-backed `search_knowledge`/`kb_query`, no clone, no filesystem reads). Four
-     enforcement sites, all keyed on `type=="repository"` (`main.py:2238, 2605, 6410,
-     6479`) — `kb` must branch there, not reuse `_repository_datasource_names` naively.
-   - **Schema gap (the one real migration)**: `datasources` has no config/extra column —
-     add a nullable `config JSONB` for path-prefix / OKF flag / tier. Do NOT overload
-     `credentials` (withheld for managed types), and keep `kb` OUT of `managed_types`
-     (`main.py:12480`) or the clone loses its auth.
-   - **Auto-attach hook**: `_ensure_project_cloud_resources` already auto-provisions a
-     per-project WebDAV datasource at project creation — the project KB follows that
-     precedent (create `type="kb"` pointing at the jobs-repo URL, prefix `knowledge/`,
-     then `link_datasource_to_project`). Per-project write policy lives on the existing
-     `project_datasources.read_only`.
-   - Cockpit touchpoints: type option/optgroup + filter chip
-     (`datasource-list.component.ts:136-150, 1345-1356`), the `=== 'repository'`
-     form-field conditionals (URL/branch/auth reused), icon/colour maps, and the
-     lite-disable exemption in `datasources-group.component.ts`.
+     workspace backends; a KB datasource is query-only in v1
+     (index-backed `search_knowledge`/`kb_query`, no clone, no filesystem reads) on
+     every tier. It must therefore stay out of every `type=="repository"` tier gate.
+   - **Schema/persistence**: `datasources.config` is non-null JSONB with `{}` as its
+     default and `root_path` as the only v1 KB key. Do NOT overload
+     `credentials`; `type="kb"` already carries the OKF meaning. Keep `kb` out of
+     managed-connector credential withholding: its credentials are consumed by the
+     orchestrator indexer and never included in the agent dispatch payload.
+   - **Auto-attach is deferred, not abandoned**: the native project KB remains the
+     implicit `project_id` binding during this slice. After external KBs are proven, a
+     migration creates one `type="kb"` datasource per project pointing at the jobs repo
+     with `root_path="knowledge"`, rekeys/rebuilds the index, and makes that binding
+     required. This avoids combining external ingestion with a live native-KB migration.
+   - **Cockpit**: the OKF form reuses repository URL/branch/token/SSH inputs, adds the
+     root path, exposes pending/indexing/ready/partial/failed state and reindex actions,
+     fixes external KB project access to read-only, and leaves `kb` selectable on lite
+     backends while clone-based `repository` remains disabled there.
+   - **Embedding/runtime identity**: the orchestrator indexer and KB query store share a
+     dedicated system `KB_EMBEDDING_*` profile. Personal memory keeps the user's separate
+     embedding preference; the system KB key is scoped to jobs/sessions that actually
+     bind knowledge and is authoritatively cleared on reused unscoped agents. The
+     row-level `embedding_version` includes a secret-free fingerprint of the effective
+     provider, normalized base URL, and catalog endpoint identity, so a same-name model
+     rerouted to a different transport cannot query stale vectors. API keys never enter
+     that fingerprint.
+   - **Deletion ordering**: request-spawned rebuilds are canceled/drained, then deletion
+     holds the same per-KB local/advisory claim across vector cleanup and app-row removal.
+     A stale remote sweeper checks the app row only after taking the claim, preventing
+     post-delete watermark/note resurrection.
 
 ### 11.1 First production night (2026-07-04) — run-8 evidence
 
@@ -856,12 +1018,15 @@ accumulates passively while the loop runs.
 
 ## Open questions
 
-- **Datasource shape**: new `kb` type vs. `repository` + `format: okf` flag. Leaning new
-  type (UX + tool-gating clarity), sharing the repository clone/credential plumbing.
-- **Org-vault write policy**: `is_global` solves *visibility*, not authorship. Leaning:
-  global KB datasources are read-only by default except owner/admin (the `read_only`
-  flag exists on the project link table, but a global KB reachable via the job picker
-  without a project link needs its own answer). Decide when slice 4 lands.
+- **Datasource shape — RESOLVED 2026-07-11:** a first-class `kb` type, sharing
+  repository credential validation but owning its indexing/tool semantics.
+- **Org-vault write policy — RESOLVED FOR V1 2026-07-11:** every external KB datasource
+  is read-only, including owner/global use. Credentials remain orchestrator-side and
+  `kb_write`/`kb_update` target only the native project KB. External write-back gets a
+  separate branch/PR design after read-only ingestion is proven.
+- **Multi-KB note addressing — RESOLVED 2026-07-11:** source-qualified
+  `kb-alias:note-slug` handles; unqualified reads must resolve uniquely. Search/list
+  return the source for every result and accept an optional KB selector.
 - **Where the default project KB lives** — RESOLVED 2026-07-03 by v2 shipping: the jobs
   repo is already the coordination repo and `retros/` already lives on its `main`, so the
   default project KB is `knowledge/` in the jobs repo. The general shape: **a KB root =

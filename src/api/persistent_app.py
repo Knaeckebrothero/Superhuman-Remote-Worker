@@ -1298,6 +1298,7 @@ async def _attach_session(
     datasources_dict: Dict[str, Any] = {}
     datasource_clients: Dict[str, Any] = {}
     repo_datasources: List[Dict[str, Any]] = []
+    kb_datasources: List[Dict[str, Any]] = []
     if datasources:
         from ..core.datasource_setup import (
             inject_datasource_index as _inject_ds_index,
@@ -1306,8 +1307,9 @@ async def _attach_session(
 
         # Separate repos (cloned later) from other datasources
         repo_datasources = [ds for ds in datasources if ds.get("type") == "repository"]
+        kb_datasources = [ds for ds in datasources if ds.get("type") == "kb"]
         non_repo_datasources = [
-            ds for ds in datasources if ds.get("type") != "repository"
+            ds for ds in datasources if ds.get("type") not in ("repository", "kb")
         ]
         datasources_dict, datasource_clients, cli_ds_types = process_datasources(
             non_repo_datasources
@@ -1515,32 +1517,45 @@ async def _attach_session(
         if _hydrated
         else (config_override.get("env_keys") if config_override else None)
     )
+    from ..services.embedding_service import (
+        KB_EMBEDDING_ENV_KEYS,
+        apply_kb_embedding_env,
+    )
+
+    # Pool agents are reused across threads. Treat the dedicated KB profile as
+    # a complete attach-time snapshot: clear the previous thread's transport
+    # even when this attach has no knowledge scope or the new provider omits a
+    # base URL/key that the previous endpoint needed.
+    apply_kb_embedding_env(_env_keys_src)
     if _env_keys_src:
         env_keys = _env_keys_src
-        embedding_keys = (
+        memory_embedding_keys = (
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
         )
+        embedding_keys = memory_embedding_keys + KB_EMBEDDING_ENV_KEYS
         if any(k in env_keys for k in embedding_keys):
-            for k in embedding_keys:
+            for k in memory_embedding_keys:
                 if k in env_keys and env_keys[k] is not None:
                     os.environ[k] = str(env_keys[k])
             from ..services import embedding_service as _embedding_module
 
-            _embedding_module._embedding_service = None
+            if any(k in env_keys for k in memory_embedding_keys):
+                _embedding_module._embedding_service = None
             logger.info(
-                "Embedding override applied: provider=%s, model=%s, base_url=%s",
-                env_keys.get(
-                    "EMBEDDING_PROVIDER", os.environ.get("EMBEDDING_PROVIDER")
-                ),
-                env_keys.get("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL")),
-                env_keys.get(
-                    "EMBEDDING_BASE_URL",
-                    os.environ.get("EMBEDDING_BASE_URL", "default"),
-                ),
+                "Embedding overrides applied: memory_model=%s, kb_model=%s",
+                os.environ.get("EMBEDDING_MODEL"),
+                os.environ.get("KB_EMBEDDING_MODEL"),
             )
+
+    from ..services.knowledge.bindings import build_knowledge_bindings
+
+    knowledge_bindings = build_knowledge_bindings(
+        project_ids=project_ids or [],
+        datasources=kb_datasources,
+    )
 
     # Create PersistentSession
     _session = PersistentSession(
@@ -1548,6 +1563,7 @@ async def _attach_session(
         config=effective_config,
         project_ids=project_ids or [],
         datasources=datasources_dict,
+        knowledge_bindings=knowledge_bindings,
         _datasource_clients=datasource_clients,
     )
     if project_ids:

@@ -108,6 +108,19 @@ orchestrator:
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"
+  # -- Additional exact Git host or host:port endpoints trusted for external
+  # OKF KB datasources. The built-in public-provider set remains enabled.
+  # Wildcards, IP literals, and localhost are rejected. Example:
+  # "gitea.example.com,gitea.internal:3000"
+  kbGitAllowedHosts: ""
+  # -- Optional OpenSSH known_hosts content for external OKF KB deploy-key
+  # remotes. Non-empty content switches SSH from accept-new to strict pinning.
+  kbGitSshKnownHosts: ""
+  # -- Maximum simultaneous external OKF Git snapshot/embed operations per
+  # orchestrator replica (create/update/manual/test plus the leader sweep).
+  kbExternalReindexConcurrency: 2
+  # -- Seconds between leader-gated native/external OKF freshness sweeps.
+  kbReindexSweepSeconds: 900
   # -- Per-store asyncpg connection pool sizing for the orchestrator's own
   # pools (control-plane app DB, pgvector, audit trail). The orchestrator does
   # NOT envFrom the shared ConfigMap, so these are wired as explicit env in

@@ -58,6 +58,13 @@ gitea:
   internalUrl: "https://git.internal.example.com"
   externalUrl: "https://git.internal.example.com"
 
+# Exact self-hosted Git endpoints approved for orchestrator-side OKF datasource
+# reads. Public github.com/gitlab.com/bitbucket.org/codeberg.org are built in.
+orchestrator:
+  kbGitAllowedHosts: "git.internal.example.com"
+  kbExternalReindexConcurrency: 2
+  kbReindexSweepSeconds: 900
+
 # -----------------------------------------------------------------------------
 # Databases — external managed instances. See README for required Secret keys.
 # -----------------------------------------------------------------------------

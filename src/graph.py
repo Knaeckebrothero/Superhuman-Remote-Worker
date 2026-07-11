@@ -1000,6 +1000,10 @@ def create_execute_node(
         if tool_context is not None:
             tool_context.set_current_phase("strategic" if is_strategic else "tactical")
 
+        from src.core.knowledge_injection import selected_knowledge_bindings
+
+        _kb_bindings = selected_knowledge_bindings(tool_context)
+
         logger.debug(f"[{job_id}] Execute iteration {iteration}")
 
         # Debug: log message types in state
@@ -1046,7 +1050,11 @@ def create_execute_node(
             injection_overhead_tokens += config.memory.budget_tokens
 
         # Add knowledge injection budget overhead (~2500 tokens for 5 notes)
-        if tool_context and tool_context.has_knowledge() and tool_context.project_id:
+        if (
+            tool_context
+            and tool_context.has_knowledge()
+            and (tool_context.project_id or _kb_bindings)
+        ):
             injection_overhead_tokens += 2500
 
         # Temporarily lower compaction thresholds to account for injection overhead
@@ -1195,6 +1203,7 @@ def create_execute_node(
         # (pinned by tests/test_memory_worker_equivalence.py) and are
         # skipped via the `memory_service is None` guard terms.
         _manager_payload = None
+        _manager_injection_messages = []
         _manager_memory_text = ""  # assembler's current_injection_text
         if memory_service is not None:
             from src.services.memory import AssembleRequest, TaskFrame
@@ -1228,6 +1237,17 @@ def create_execute_node(
                     model=config.llm.model,
                 )
             )
+            _manager_injection_messages = _manager_payload.messages()
+            if _kb_bindings:
+                # Bound KBs use the shared chunk-retrieval policy below. Keep
+                # manager-provided memories, but suppress its legacy note-level
+                # KB block so native notes are not injected twice.
+                _manager_injection_messages = [
+                    message
+                    for block in _manager_payload.blocks
+                    if block.kind != "knowledge"
+                    for message in block.messages
+                ]
             for _mm_block in _manager_payload.blocks:
                 if _mm_block.kind == "memory" and _mm_block.items:
                     _manager_memory_text = _mm_block.content
@@ -1316,7 +1336,59 @@ def create_execute_node(
             if tool_context and tool_context.has_knowledge()
             else None
         )
-        if memory_service is None and knowledge_store and tool_context.project_id:
+        if knowledge_store and _kb_bindings:
+            try:
+                # Build retrieval context from current todo + phase info.
+                pending_todos = todo_manager.list_pending()
+                kb_context_parts = []
+                if pending_todos:
+                    kb_context_parts.append(pending_todos[0].content)
+                kb_context_parts.append(
+                    f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}"
+                )
+                kb_context_text = " ".join(kb_context_parts)
+
+                from src.core.knowledge_injection import retrieve_bound_knowledge
+                from src.services.knowledge_store import KnowledgeStore as _KS
+
+                selection = await retrieve_bound_knowledge(
+                    knowledge_store,
+                    _kb_bindings,
+                    kb_context_text,
+                )
+                if selection.notes:
+                    _knowledge_block[0] = _KS.assemble_knowledge_block(
+                        selection.notes,
+                        model=config.llm.model,
+                        bindings=selection.bindings,
+                        external_watermarks=selection.external_watermarks,
+                    )
+                    logger.debug(
+                        f"[{job_id}] Knowledge injection: "
+                        f"{len(selection.notes)} notes retrieved "
+                        f"by binding={selection.counts_by_binding}"
+                    )
+                    inject_auditor = get_archiver()
+                    if inject_auditor:
+                        inject_auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="knowledge_inject",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "count": len(selection.notes),
+                                "counts_by_binding": selection.counts_by_binding,
+                            },
+                            metadata=state.get("metadata"),
+                            phase="strategic" if is_strategic else "tactical",
+                            phase_number=phase_number,
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
+                )
+        elif memory_service is None and knowledge_store and tool_context.project_id:
             try:
                 import uuid as _uuid
 
@@ -1403,7 +1475,7 @@ def create_execute_node(
             # when the manager is bound). Safety rebuilds re-call this into
             # a fresh list, so reusing the same pair objects is safe.
             if _manager_payload is not None:
-                block.extend(_manager_payload.messages())
+                block.extend(_manager_injection_messages)
 
             # Memory Light: inject recalled memories
             if _memory_block[0]:

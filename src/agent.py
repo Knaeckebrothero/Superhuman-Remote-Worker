@@ -784,9 +784,11 @@ class UniversalAgent:
             # orchestrator caps retries then fails — instead of silently running
             # with memory + KB disabled. See
             # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md.
-            _project_id = (self._job_metadata or {}).get("project_id")
+            _has_kb_scope = bool(
+                getattr(getattr(self, "_tool_context", None), "knowledge_bindings", [])
+            )
             _memory_missing = getattr(self, "_memory_degraded", False) or (
-                bool(_project_id) and getattr(self, "_kb_degraded", False)
+                _has_kb_scope and getattr(self, "_kb_degraded", False)
             )
             if self.config.memory.required and _memory_missing:
                 logger.error(
@@ -1734,11 +1736,22 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
                 "env_keys"
             )
-        if env_keys:
-            import os as _os
+        # KB embedding transport is authoritative per dispatch. Pool/loop agents
+        # can process a later job after the system profile changes (or a job with
+        # no knowledge scope), so clear every old field before applying the new
+        # in-flight block. Otherwise an omitted BASE_URL/API_KEY can survive and
+        # pair a new model with the previous endpoint/credential.
+        import os as _os
+        from src.services.embedding_service import (
+            KB_EMBEDDING_ENV_KEYS,
+            apply_kb_embedding_env,
+        )
 
+        apply_kb_embedding_env(env_keys)
+        if env_keys:
             for k, v in env_keys.items():
-                _os.environ[k] = v
+                if k not in KB_EMBEDDING_ENV_KEYS:
+                    _os.environ[k] = v
             # Log the key NAMES (never values) so a missing credential — e.g.
             # EMBEDDING_API_KEY, which silently disables memory + KB — is
             # greppable in the agent log.
@@ -2506,8 +2519,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # locally in the agent pod (the subprocess git-clone branch was
         # removed; see docs/features/no_workspace_agent_mode.md §9.4).
         repo_datasources = [ds for ds in ds_configs if ds.get("type") == "repository"]
+        kb_datasources = [ds for ds in ds_configs if ds.get("type") == "kb"]
         non_repo_datasources = [
-            ds for ds in ds_configs if ds.get("type") != "repository"
+            ds for ds in ds_configs if ds.get("type") not in ("repository", "kb")
         ]
 
         datasources_dict, client_registry, cli_ds_types = process_datasources(
@@ -2563,6 +2577,17 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "repo_name": (self._job_metadata or {}).get("repo_name"),
         }
 
+        from src.services.knowledge.bindings import build_knowledge_bindings
+
+        raw_project_id = (
+            self._job_metadata.get("project_id") if self._job_metadata else None
+        )
+        native_project_ids = [str(raw_project_id)] if raw_project_id else []
+        knowledge_bindings = build_knowledge_bindings(
+            project_ids=native_project_ids,
+            datasources=kb_datasources,
+        )
+
         context = ToolContext(
             workspace_manager=self._workspace_manager,
             todo_manager=self._todo_manager,
@@ -2575,9 +2600,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             _job_id=self._current_job_id,
             _llm_config=self.config.llm,
             _instruction_files=self.config.instruction_files,
+            knowledge_bindings=knowledge_bindings,
             orchestrator_client=self._orchestrator_client,
             _job_metadata=job_metadata,
         )
+        context.project_ids = native_project_ids
         self._tool_context = context
 
         # Initialize ShellManager for persistent terminal sessions. Shells run
@@ -2690,55 +2717,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     f"[embedding_provider={_provider}, model={_model}]"
                 )
 
-        # Initialize KnowledgeGraphDB + KnowledgeStore for project knowledge base
-        project_id = (
-            self._job_metadata.get("project_id") if self._job_metadata else None
-        )
-        if project_id:
-            try:
-                from src.services.knowledge_graph import KnowledgeGraphDB
-                from src.services.knowledge_store import KnowledgeStore
-                from src.services.embedding_service import get_embedding_service
-
-                kg = KnowledgeGraphDB()
-                if kg.connect():
-                    embedding_service = get_embedding_service()
-                    ks = KnowledgeStore(
-                        db=self.vector_conn,
-                        embedding_service=embedding_service,
-                    )
-                    context.knowledge_graph = kg
-                    context.knowledge_store = ks
-                    context.project_id = str(project_id)
-                    self._knowledge_graph = kg  # Track for cleanup
-                    logger.info(f"Knowledge base initialized for project {project_id}")
-                else:
-                    logger.warning(
-                        "Failed to connect to Neo4j — inline curation disabled"
-                    )
-            except Exception as e:
-                self._kb_degraded = True
-                from src.core.archiver import audit_unavailable as _audit_unavailable
-
-                _audit_unavailable(
-                    job_id=self._current_job_id,
-                    agent_type=self.config.agent_id,
-                    step_type="kb_unavailable",
-                    component="KnowledgeStore",
-                    error=e,
-                    node_name="setup_job_tools",
-                    extra={
-                        "project_id": str(project_id) if project_id else None,
-                        "embedding_provider": os.environ.get(
-                            "EMBEDDING_PROVIDER", "local"
-                        ),
-                    },
-                )
-                logger.warning(
-                    f"Failed to initialize knowledge base (non-fatal): {e} "
-                    f"[embedding_provider="
-                    f"{os.environ.get('EMBEDDING_PROVIDER', 'local')}]"
-                )
+        # Initialize the pgvector KnowledgeStore independently from the optional
+        # Neo4j Graph tier. Retrieval/read tools only require the store.
+        if knowledge_bindings:
+            self._setup_job_knowledge(
+                context, str(raw_project_id) if raw_project_id else None
+            )
 
         # Load tools from registry, gated by what the workspace backend can
         # actually support (no_workspace_agent_mode.md §3.2/§7): the lite tiers
@@ -2874,6 +2858,77 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._doc_registration_task = asyncio.create_task(
             self._register_initial_documents_background(context)
         )
+
+    def _setup_job_knowledge(
+        self, context: ToolContext, project_id: Optional[str]
+    ) -> None:
+        """Attach the required vector store and optional Graph tier to a job."""
+        if project_id:
+            context.project_id = project_id
+
+        try:
+            if self.vector_conn is None:
+                raise RuntimeError("Vector database connection is unavailable")
+
+            from src.services.embedding_service import get_kb_embedding_service
+            from src.services.knowledge_store import KnowledgeStore
+
+            embedding_service = get_kb_embedding_service()
+            context.knowledge_store = KnowledgeStore(
+                db=self.vector_conn,
+                embedding_service=embedding_service,
+            )
+            logger.info(
+                "Knowledge store initialized for %d KB binding(s)",
+                len(getattr(context, "knowledge_bindings", []) or [])
+                or (1 if project_id else 0),
+            )
+        except Exception as e:
+            self._kb_degraded = True
+            from src.core.archiver import audit_unavailable as _audit_unavailable
+
+            _audit_unavailable(
+                job_id=self._current_job_id,
+                agent_type=self.config.agent_id,
+                step_type="kb_unavailable",
+                component="KnowledgeStore",
+                error=e,
+                node_name="setup_job_tools",
+                extra={
+                    "project_id": project_id,
+                    "kb_ids": getattr(
+                        context, "kb_ids", [project_id] if project_id else []
+                    ),
+                    "embedding_provider": os.environ.get(
+                        "KB_EMBEDDING_PROVIDER",
+                        os.environ.get("EMBEDDING_PROVIDER", "local"),
+                    ),
+                },
+            )
+            logger.warning(
+                f"Failed to initialize knowledge store (non-fatal): {e} "
+                f"[embedding_provider="
+                f"{os.environ.get('KB_EMBEDDING_PROVIDER', os.environ.get('EMBEDDING_PROVIDER', 'local'))}]"
+            )
+
+        if not project_id:
+            return
+
+        try:
+            from src.services.knowledge_graph import KnowledgeGraphDB
+
+            kg = KnowledgeGraphDB()
+            if kg.connect():
+                context.knowledge_graph = kg
+                self._knowledge_graph = kg  # Track for cleanup
+                logger.info(
+                    f"Knowledge Graph tier initialized for project {project_id}"
+                )
+            else:
+                logger.warning("Failed to connect to Neo4j — Graph tier disabled")
+        except Exception as e:
+            # Neo4j is optional: do not mark vector search/read as degraded.
+            logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
 
     def _deploy_instruction_files(self, loaded_tool_names: List[str]) -> None:
         """Deploy instruction files to workspace with Jinja2 rendering.

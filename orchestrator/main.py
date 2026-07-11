@@ -590,6 +590,14 @@ _dispatch_lock = asyncio.Lock()
 # Track jobs with pending pause requests (prevent re-preemption)
 _pause_pending_job_ids: set[str] = set()
 
+# Keep best-effort initial/update KB datasource reindexes strongly referenced
+# until completion. Failures are recorded in the vector watermark and never
+# roll back datasource CRUD.
+_kb_datasource_tasks: set[asyncio.Task] = set()
+# Per-datasource view of the same tasks lets deletion cancel and await only the
+# source being removed. The global set remains the shutdown ownership set.
+_kb_datasource_tasks_by_id: dict[str, set[asyncio.Task]] = {}
+
 
 async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
     """Background task that reconciles agent state every 60 seconds.
@@ -1350,10 +1358,20 @@ async def _resolve_session_config(
             runner_user_id=user_id,
             project_ids=[project_id] if project_id else [],
         )
+        knowledge_project_ids = (
+            [project_id] if project_id else await _thread_project_ids(str(thread["id"]))
+        )
+        include_kb_profile = await _thread_has_knowledge_scope(
+            project_ids=knowledge_project_ids,
+            datasource_ids=metadata.get("datasource_ids"),
+        )
         delivered = await inject_blob_credentials(
             resolved,
             lambda co: _inject_thread_dispatch_credentials(
-                co, user_id=user_id, project_id=project_id
+                co,
+                user_id=user_id,
+                project_id=project_id,
+                include_kb_profile=include_kb_profile,
             ),
         )
         if status is not None:
@@ -1593,6 +1611,8 @@ async def _seed_registry_model_overrides(
 async def _inject_dispatch_credentials(
     job: dict[str, Any],
     config_override: dict[str, Any] | None,
+    *,
+    include_kb_profile: bool = False,
 ) -> dict[str, Any]:
     """Resolve and inject API keys, model routing, and capability defaults.
 
@@ -1917,6 +1937,26 @@ async def _inject_dispatch_credentials(
                     f"unavailable. Check the embedding endpoint (Admin → Models)."
                 )
 
+    if include_kb_profile:
+        _kb_emb_model = await _inject_system_kb_embedding_profile(_emb_env)
+        if _kb_emb_model:
+            if _emb_env.get("KB_EMBEDDING_API_KEY"):
+                logger.info(
+                    "Dispatch: injected system OKF KB embedding profile: %s (job %s)",
+                    _kb_emb_model,
+                    job_id,
+                )
+            else:
+                logger.error(
+                    "Dispatch: system OKF KB embedding model %r resolved no usable "
+                    "API key for job %s; knowledge retrieval will be unavailable.",
+                    _kb_emb_model,
+                    job_id,
+                )
+    else:
+        for key in [key for key in _emb_env if key.startswith("KB_EMBEDDING_")]:
+            del _emb_env[key]
+
     return config_override
 
 
@@ -2003,6 +2043,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         # Resolve datasources for this job (job > project > global)
         resolved_ds = await postgres_db.resolve_datasources_for_job(
             job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
+        )
+        has_knowledge_scope = bool(job.get("project_id")) or any(
+            str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
         )
         _apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = _build_datasources_payload(resolved_ds)
@@ -2236,7 +2279,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     )
                 resolved_config = await inject_blob_credentials(
                     _resolved,
-                    lambda co: _inject_dispatch_credentials(job, co),
+                    lambda co: _inject_dispatch_credentials(
+                        job,
+                        co,
+                        include_kb_profile=has_knowledge_scope,
+                    ),
                 )
                 await postgres_db.store_resolved_config(
                     job_id, redact_config_override(resolved_config)
@@ -2266,7 +2313,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         # Same helper drives both first-dispatch and resume so an orphaned
         # job re-dispatched to a fresh agent doesn't lose its credentials.
         # (Still injected into config_override for the no-blob fallback path.)
-        config_override = await _inject_dispatch_credentials(job, config_override)
+        config_override = await _inject_dispatch_credentials(
+            job,
+            config_override,
+            include_kb_profile=has_knowledge_scope,
+        )
         # Log injected env-key NAMES (never values) so a missing credential —
         # e.g. EMBEDDING_API_KEY, which silently disables memory + KB — is
         # greppable at dispatch (embedding_key_missing_silently_disables_memory_and_kb.md).
@@ -2381,6 +2432,9 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         resolved_ds = await postgres_db.resolve_datasources_for_job(
             job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
         )
+        has_knowledge_scope = bool(job.get("project_id")) or any(
+            str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
+        )
         job_context = job.get("context") or {}
         if isinstance(job_context, str):
             job_context = json.loads(job_context)
@@ -2442,7 +2496,11 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # call, an orphaned/paused job picked up by a fresh agent would have
         # no llm.api_key and the loader would silently fall back to
         # OPENAI_API_KEY=not-needed and 401 against the user's router.
-        config_override = await _inject_dispatch_credentials(job, config_override)
+        config_override = await _inject_dispatch_credentials(
+            job,
+            config_override,
+            include_kb_profile=has_knowledge_scope,
+        )
         logger.info(
             "Dispatch (resume): job %s injected env_key names=%s",
             job_id,
@@ -2751,13 +2809,50 @@ async def _send_session_attach(
     _sess_status: dict[str, Any] = {}
     try:
         _thread = await postgres_db.get_thread(thread_id)
+    except Exception:
+        logger.exception(
+            "Session attach: failed to load thread %s; refusing (fail closed)",
+            thread_id,
+        )
+        return False
+    if not _thread:
+        logger.warning("Session attach: thread %s vanished; refusing", thread_id)
+        return False
+
+    _meta = _thread.get("metadata") or {}
+    if isinstance(_meta, str):
+        try:
+            _meta = json.loads(_meta)
+        except (json.JSONDecodeError, TypeError):
+            _meta = {}
+
+    # Datasource selections are mutable authorization grants, not frozen
+    # capabilities. Re-check the owning user's current access immediately
+    # before every warm-pool attach so a revoked project membership/link cannot
+    # keep a private datasource (including an OKF KB) alive through a persisted
+    # metadata UUID. The generic denial deliberately avoids an enumeration
+    # oracle; datasource credentials never reach this log path.
+    try:
+        await _revalidate_thread_datasource_ids(_thread, _meta.get("datasource_ids"))
+        current_project_ids = await _thread_project_ids(thread_id)
+        project_ids = await _revalidate_thread_project_ids(_thread, current_project_ids)
+    except HTTPException:
+        logger.warning(
+            "Session attach denied for thread %s: its current knowledge/data "
+            "scope is no longer available",
+            thread_id,
+        )
+        return False
+    except Exception:
+        logger.exception(
+            "Session attach: access revalidation failed for thread %s; "
+            "refusing (fail closed)",
+            thread_id,
+        )
+        return False
+
+    try:
         if _thread:
-            _meta = _thread.get("metadata") or {}
-            if isinstance(_meta, str):
-                try:
-                    _meta = json.loads(_meta)
-                except (json.JSONDecodeError, TypeError):
-                    _meta = {}
             resolved_config = await _resolve_session_config(
                 _thread, _meta, config_override=config_override, status=_sess_status
             )
@@ -4243,12 +4338,91 @@ async def _inject_env_key_credentials(
         env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
 
 
+async def _inject_system_kb_embedding_profile(env_keys: dict[str, Any]) -> str | None:
+    """Inject the stable, system-owned embedding profile for knowledge bases.
+
+    The OKF datasource indexer runs in the orchestrator and therefore embeds
+    every repository with the admin-curated *system* embedding model. Agent
+    memory may instead use a user's embedding preference. Shipping the system
+    profile under a separate prefix lets KnowledgeStore query with the exact
+    model/transport used by the indexer without changing RecallStore semantics.
+
+    ``KB_EMBEDDING_*`` is intentionally authoritative: callers cannot pin a
+    different profile in ``config_override``, and persisted non-secret values
+    are refreshed after an administrator changes the system default.
+    """
+    prefix = "KB_EMBEDDING_"
+    for key in [key for key in env_keys if key.startswith(prefix)]:
+        del env_keys[key]
+
+    model_id = await postgres_db.resolve_default_for_capability("embedding")
+    if not model_id:
+        # Dev/compose compatibility: the central indexer historically used the
+        # orchestrator's EMBEDDING_* environment when no catalog pin existed.
+        # Materialize that *effective* profile into KB_* too; otherwise the
+        # indexer would use this env model while an agent fell back to its
+        # per-user model and filtered every indexed chunk out.
+        from src.services.embedding_service import EmbeddingService
+
+        fallback = EmbeddingService()
+        if not fallback.api_key:
+            return None
+        env_keys.update(
+            {
+                "KB_EMBEDDING_PROVIDER": fallback.provider,
+                "KB_EMBEDDING_MODEL": fallback.model,
+                "KB_EMBEDDING_BASE_URL": fallback.base_url,
+                "KB_EMBEDDING_API_KEY": fallback.api_key,
+                "KB_EMBEDDING_DIMENSIONS": str(fallback.expected_dimensions),
+            }
+        )
+        return fallback.model
+
+    # Built-in/catalog transports use system_api_keys. Do not reuse the job's
+    # already-resolved key map here: it includes project/user overrides and
+    # would recreate the same per-user profile skew this path prevents.
+    system_keys = await postgres_db.resolve_api_keys_for_job(
+        user_id=None,
+        project_id=None,
+    )
+    await _inject_env_key_credentials(
+        env_keys=env_keys,
+        prefix="KB_EMBEDDING",
+        model_id=model_id,
+        user_id=None,
+        resolved_keys=system_keys,
+        capability="embedding",
+    )
+
+    try:
+        meta = await _resolve_model(model_id, user_id=None, capability="embedding")
+    except UnknownModelError:
+        meta = None
+    env_keys["KB_EMBEDDING_PROVIDER"] = (
+        meta.provider if meta is not None and meta.provider else "local"
+    )
+    if meta is not None:
+        # Non-secret registry identity travels with the transport so central
+        # indexing and agent-side query filtering derive the same vector stamp.
+        # Prefer the concrete endpoint UUID; provider-key catalog rows fall
+        # back to their registry/key-reference identity (never the key value).
+        profile_anchor = meta.endpoint_id or meta.api_key_ref or meta.model_id
+        env_keys["KB_EMBEDDING_PROFILE_ID"] = f"{meta.origin}:{profile_anchor}"
+    env_keys["KB_EMBEDDING_DIMENSIONS"] = str(
+        os.environ.get("KB_EMBEDDING_DIMENSIONS")
+        or os.environ.get("EMBEDDING_DIMENSIONS")
+        or "4096"
+    )
+    return model_id
+
+
 async def _inject_thread_dispatch_credentials(
     config_override: dict[str, Any],
     *,
     user_id: str | None,
     project_id: str | None = None,
     user_settings: dict[str, Any] | None = None,
+    include_kb_profile: bool = False,
 ) -> dict[str, Any]:
     """Resolve + inject LLM / auxiliary / embedding credentials into a thread's
     ``config_override`` IN PLACE (creating sections as needed). Returns the dict.
@@ -4354,6 +4528,11 @@ async def _inject_thread_dispatch_credentials(
         and "openrouter" in resolved_keys
     ):
         env_keys_block.setdefault("OPENROUTER_API_KEY", resolved_keys["openrouter"])
+    if include_kb_profile:
+        await _inject_system_kb_embedding_profile(env_keys_block)
+    else:
+        for key in [key for key in env_keys_block if key.startswith("KB_EMBEDDING_")]:
+            del env_keys_block[key]
     if not env_keys_block:
         config_override.pop("env_keys", None)
 
@@ -5027,7 +5206,7 @@ class DatasourceCreate(BaseModel):
     name: str = Field(..., description="User-provided label")
     type: str = Field(
         ...,
-        description="Datasource type: generic, repository, postgresql, neo4j, mongodb, webdav, kubeconfig, ssh_key, generic_file",
+        description="Datasource type: generic, repository, kb, postgresql, neo4j, mongodb, webdav, kubeconfig, ssh_key, generic_file",
     )
     connection_url: str | None = Field(
         None, description="Connection string (nullable for generic)"
@@ -5042,7 +5221,11 @@ class DatasourceCreate(BaseModel):
         None, description="Suggested CLI command (e.g. 'psql $DATABASE_URL')"
     )
     default_branch: str | None = Field(
-        None, description="Branch to clone (repository type)"
+        None, description="Branch to read/clone (repository and kb types)"
+    )
+    config: dict[str, Any] | None = Field(
+        None,
+        description="Non-secret type-specific config (kb: root_path)",
     )
     is_global: bool = Field(
         False, description="Whether this datasource is visible to all users"
@@ -5058,6 +5241,10 @@ class DatasourceUpdate(BaseModel):
     credentials: dict[str, Any] | None = Field(None, description="New auth details")
     cli_hint: str | None = Field(None, description="New CLI hint")
     default_branch: str | None = Field(None, description="New default branch")
+    config: dict[str, Any] | None = Field(
+        None,
+        description="New non-secret type-specific config (kb: root_path)",
+    )
 
 
 class SSHKeyGenerateRequest(BaseModel):
@@ -6440,6 +6627,15 @@ async def lifespan(app: FastAPI):
     if audit_maintenance_task is not None:
         await audit_maintenance_task
 
+    # Initial/manual datasource reindexes are request-spawned rather than loop
+    # tasks. Cancel them before closing git/vector clients; the source context
+    # removes temporary repositories and auth material in its cancellation path.
+    pending_kb_tasks = list(_kb_datasource_tasks)
+    for task in pending_kb_tasks:
+        task.cancel()
+    if pending_kb_tasks:
+        await asyncio.gather(*pending_kb_tasks, return_exceptions=True)
+
     # Cleanup clients
     await nats_bridge.disconnect()
     await vm_provisioner.disconnect()
@@ -6787,6 +6983,152 @@ def _with_cloud_review_mode(job: dict[str, Any]) -> dict[str, Any]:
     return job
 
 
+_INTERNAL_JOB_SCOPE_DENIED = "Internal job origin scope is unavailable"
+
+
+async def _resolve_internal_job_creation_scope(
+    request: Request, job: JobCreate
+) -> tuple[dict[str, Any] | None, str | None, str | None, bool]:
+    """Derive an internal job's user/project scope from authoritative context.
+
+    ``X-Internal-Key`` authenticates the transport, not the user/project values
+    in a request body. Agent-created jobs therefore inherit identity and allowed
+    projects from ``thread_id`` and/or ``parent_job_id``. A valid MCP forwarded
+    user header is the remaining user-authenticated internal path. Originless
+    internal HTTP calls are rejected: the shared key reaches agent pods, so it
+    cannot establish a privileged "system job" identity. A userless child is
+    valid only when derived from an authoritative userless parent/thread.
+
+    Returns ``(principal, user_id, project_id, origin_bound)``. ``origin_bound``
+    suppresses the normal user-default-project fallback: an unscoped parent or
+    thread must not silently widen into its owner's unrelated default project.
+    """
+
+    def denied() -> HTTPException:
+        return HTTPException(status_code=403, detail=_INTERNAL_JOB_SCOPE_DENIED)
+
+    thread: dict[str, Any] | None = None
+    parent: dict[str, Any] | None = None
+    thread_projects: list[str] = []
+
+    if job.thread_id:
+        try:
+            thread = await postgres_db.get_thread(str(job.thread_id))
+        except Exception as exc:
+            raise denied() from exc
+        if thread is None:
+            raise denied()
+        try:
+            thread_projects = await _thread_project_ids(str(job.thread_id))
+            column_project = thread.get("project_id")
+            if column_project and str(column_project) not in thread_projects:
+                thread_projects.insert(0, str(column_project))
+            thread_projects = await _revalidate_thread_project_ids(
+                thread, thread_projects
+            )
+        except HTTPException as exc:
+            raise denied() from exc
+        except Exception as exc:
+            raise denied() from exc
+
+    if job.parent_job_id:
+        try:
+            parent = await postgres_db.get_job(str(job.parent_job_id))
+        except Exception as exc:
+            raise denied() from exc
+        if parent is None:
+            raise denied()
+
+    if thread is not None or parent is not None:
+        thread_user_id = (
+            str(thread["user_id"]) if thread and thread.get("user_id") else None
+        )
+        parent_user_id = (
+            str(parent["user_id"]) if parent and parent.get("user_id") else None
+        )
+        if thread is not None and parent is not None:
+            if thread_user_id != parent_user_id:
+                raise denied()
+        origin_user_id = parent_user_id if parent is not None else thread_user_id
+
+        forwarded_user_id = request.headers.get("X-MCP-User-Id")
+        if forwarded_user_id and str(forwarded_user_id) != str(origin_user_id or ""):
+            raise denied()
+        if job.user_id and str(job.user_id) != str(origin_user_id or ""):
+            raise denied()
+
+        if parent is not None:
+            parent_project = (
+                str(parent["project_id"]) if parent.get("project_id") else None
+            )
+            allowed_projects = {parent_project} if parent_project else set()
+            if thread is not None and parent_project not in set(thread_projects):
+                # Includes an unscoped parent paired with a project-scoped
+                # thread: the parent remains the stricter authority.
+                if parent_project is not None or thread_projects:
+                    raise denied()
+            default_project = parent_project
+        else:
+            allowed_projects = set(thread_projects)
+            column_project = thread.get("project_id") if thread else None
+            default_project = (
+                str(column_project)
+                if column_project and str(column_project) in allowed_projects
+                else (thread_projects[0] if thread_projects else None)
+            )
+
+        requested_project = str(job.project_id) if job.project_id else None
+        if requested_project and requested_project not in allowed_projects:
+            raise denied()
+        effective_project = requested_project or default_project
+
+        principal = None
+        if origin_user_id:
+            principal = await postgres_db.get_user(origin_user_id)
+            if principal is None:
+                raise denied()
+        return principal, origin_user_id, effective_project, True
+
+    # MCP forwards a separately authenticated user identity. Resolve it through
+    # the normal admission path; a bare internal key plus a body user_id is not
+    # equivalent and is rejected below.
+    forwarded_user_id = request.headers.get("X-MCP-User-Id")
+    if forwarded_user_id:
+        principal = await require_approved_user(request, postgres_db)
+        principal_id = str(principal["id"])
+        if job.user_id and str(job.user_id) != principal_id:
+            raise denied()
+        requested_project = str(job.project_id) if job.project_id else None
+        scoped_project = mcp_scope_project_id(principal)
+        if scoped_project is not None:
+            scoped_project_id = str(scoped_project)
+            if requested_project and requested_project != scoped_project_id:
+                raise denied()
+            requested_project = requested_project or scoped_project_id
+        return principal, principal_id, requested_project, False
+
+    raise denied()
+
+
+async def _require_job_project_access(
+    principal: dict[str, Any] | None,
+    project_id: str | None,
+    *,
+    denial_detail: str = _INTERNAL_JOB_SCOPE_DENIED,
+) -> None:
+    """Require current editor access for a user-bound project job."""
+    if principal is None or project_id is None or principal.get("is_admin"):
+        return
+    scoped_project = mcp_scope_project_id(principal)
+    if scoped_project is not None and str(scoped_project) != str(project_id):
+        raise HTTPException(status_code=403, detail=denial_detail)
+    role = await postgres_db.get_user_role_in_project(
+        str(project_id), str(principal["id"])
+    )
+    if role not in {"editor", "owner"}:
+        raise HTTPException(status_code=403, detail=denial_detail)
+
+
 def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     """Strip credential fields from a thread's ``metadata.config_override``
     before it leaves over REST. ``metadata`` is a JSONB column returned as a
@@ -6831,10 +7173,11 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
       is set, the caller must be at least an editor of that project; the
       submitted ``user_id`` is forced to ``caller.id`` so a malicious body
       can't create jobs attributed to someone else.
-    * Agent path (delegation child jobs from ``src/api/orchestrator_client.py``)
-      → bypass via ``X-Internal-Key``. The agent supplies the correct
-      ``user_id`` from the parent job's context; we trust the in-cluster
-      internal key here.
+    * Agent path (delegation/session child jobs) → transport authentication via
+      ``X-Internal-Key`` plus server-side user/project derivation from
+      ``parent_job_id`` or ``thread_id``. Body identity/scope is never trusted.
+      Originless internal HTTP calls are rejected; userless system children
+      must still derive scope from an authoritative parent/thread.
 
     Creates a job with status 'created'. The job must be assigned to an agent
     to start processing.
@@ -6846,6 +7189,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
     per-job repo.
     """
     internal_call = is_internal_call(request)
+    caller: dict[str, Any] | None = None
     if not internal_call:
         caller = await require_approved_user(request, postgres_db)
         # Force user_id to caller; never honor body.user_id from a cockpit
@@ -6872,31 +7216,29 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         if job.kickoff_message:
             context["kickoff_message"] = job.kickoff_message
 
-        # Inherit user_id (and optionally project_id) from the originating
-        # persistent-session thread when the caller didn't supply them.
-        # This is how session-spawned worker jobs (create_worker_job tool)
-        # get attributed to the right user; without it the dispatch path
-        # skips per-user model preferences and the worker boots with the
-        # YAML defaults pointing at api.openai.com with "not-needed".
-        effective_user_id = job.user_id
-        thread_project_id: str | None = None
-        if job.thread_id and not effective_user_id:
-            try:
-                thread_row = await postgres_db.get_thread(job.thread_id)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to load thread {job.thread_id} for user inheritance: {e}"
-                )
-                thread_row = None
-            if thread_row:
-                if thread_row.get("user_id"):
-                    effective_user_id = str(thread_row["user_id"])
-                if thread_row.get("project_id"):
-                    thread_project_id = str(thread_row["project_id"])
+        # Internal transport authentication is not user authorization. Derive
+        # agent-created job identity/scope from the originating thread/parent
+        # (or an authenticated MCP-forwarded user), never from body user/project
+        # fields. Even userless system children must have a server-resolved
+        # parent/thread; a bare shared-key HTTP request is never a principal.
+        internal_origin_bound = False
+        internal_principal: dict[str, Any] | None = None
+        if internal_call:
+            (
+                internal_principal,
+                effective_user_id,
+                scoped_project_id,
+                internal_origin_bound,
+            ) = await _resolve_internal_job_creation_scope(request, job)
+        else:
+            internal_principal = caller
+            effective_user_id = job.user_id
+            scoped_project_id = str(job.project_id) if job.project_id else None
 
-        # Resolve project_id: use provided, fall back to thread's, then user's default
-        project_id = job.project_id or thread_project_id
-        if not project_id and effective_user_id:
+        # Resolve project_id: authoritative internal origin / public request,
+        # then the user's default only when no thread/parent constrained scope.
+        project_id = scoped_project_id
+        if not project_id and effective_user_id and not internal_origin_bound:
             try:
                 user = await postgres_db.get_user(effective_user_id)
                 if user and user.get("default_project_id"):
@@ -6905,6 +7247,16 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 logger.warning(
                     f"Failed to resolve default project for user {effective_user_id}: {e}"
                 )
+
+        await _require_job_project_access(
+            internal_principal if internal_call else caller,
+            project_id,
+            denial_detail=(
+                _INTERNAL_JOB_SCOPE_DENIED
+                if internal_call
+                else "Project role 'editor' or higher required"
+            ),
+        )
 
         # Resolve project defaults (config name, config override)
         project = None
@@ -6947,14 +7299,64 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     creator = None
             await _check_vm_permission(creator, job_needs_vm=True)
 
+        # Resolve and authorize the effective selection before type inspection
+        # or job persistence. This prevents both datasource UUID attachment and
+        # a lite-tier type/name oracle. Inherited selections are re-authorized:
+        # a parent's/thread's access may have been revoked since its metadata or
+        # junction rows were written. Only a server-derived userless
+        # parent/thread origin retains the trusted datasource bypass.
+        explicit_datasource_ids: list[str] | None = None
+        if job.datasource_ids is not None:
+            if internal_principal is not None:
+                explicit_datasource_ids = await _authorize_thread_datasource_ids(
+                    internal_principal,
+                    job.datasource_ids,
+                    workspace_backend=None,
+                )
+            elif not internal_call and caller is not None:
+                explicit_datasource_ids = await _authorize_thread_datasource_ids(
+                    caller,
+                    job.datasource_ids,
+                    workspace_backend=None,
+                )
+            else:
+                explicit_datasource_ids = list(
+                    dict.fromkeys(str(value) for value in job.datasource_ids)
+                )
+
+        if explicit_datasource_ids is not None:
+            selected_ds_ids = explicit_datasource_ids
+        elif job.thread_id or job.parent_job_id:
+            selected_ds_ids = await _inherit_parent_datasource_ids(
+                thread_id=job.thread_id, parent_job_id=job.parent_job_id
+            )
+            if internal_principal is not None:
+                selected_ds_ids = await _authorize_thread_datasource_ids(
+                    internal_principal,
+                    selected_ds_ids,
+                    workspace_backend=None,
+                )
+            elif not internal_call and caller is not None:
+                selected_ds_ids = await _authorize_thread_datasource_ids(
+                    caller,
+                    selected_ds_ids,
+                    workspace_backend=None,
+                )
+            else:
+                selected_ds_ids = list(
+                    dict.fromkeys(str(value) for value in selected_ds_ids)
+                )
+        else:
+            selected_ds_ids = []
+
         # Lite-tier guard: virtual/none agents have no shell-capable workspace
         # to clone into, so a repository datasource is the tier boundary (§4).
         # Reject at submit time with a clear 400 instead of a silent dispatch
         # failure later. (The dispatcher re-checks resolved datasources too.)
         lite_backend = _backend_from_override(config_override)
-        if lite_backend in LITE_BACKENDS and job.datasource_ids:
+        if lite_backend in LITE_BACKENDS and explicit_datasource_ids:
             repo_names: list[str] = []
-            for ds_id in job.datasource_ids:
+            for ds_id in explicit_datasource_ids:
                 try:
                     ds = await postgres_db.get_datasource(ds_id)
                 except Exception:
@@ -7003,20 +7405,10 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             main_cloud_router=main_cloud_router,
         )
 
-        # Persist the explicit datasource selection as job_datasources links —
-        # the picker is the source of truth; resolution returns exactly these,
-        # nothing global/project force-attaches. When no selection is passed
-        # but the job has a parent (subjob / delegation), inherit the parent's
-        # selection so delegation keeps working; an explicit [] opts out.
+        # Persist the pre-authorized selection as job_datasources links — the
+        # picker is the source of truth; resolution returns exactly these,
+        # nothing global/project force-attaches. An explicit [] opts out.
         new_job_id = str(result["id"])
-        if job.datasource_ids is not None:
-            selected_ds_ids = list(job.datasource_ids)
-        elif job.thread_id or job.parent_job_id:
-            selected_ds_ids = await _inherit_parent_datasource_ids(
-                thread_id=job.thread_id, parent_job_id=job.parent_job_id
-            )
-        else:
-            selected_ds_ids = []
 
         # Lite tiers can't clone repos; drop any inherited repository
         # datasources (explicitly-attached repos were already rejected above
@@ -7040,35 +7432,12 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 filtered.append(ds_id)
             selected_ds_ids = filtered
 
-        # Link each selection, verifying the creator can see it (owner OR
-        # is_global OR member of a linked project). Internal/trusted callers
-        # (agent, MCP) bypass the per-user check. Skip + log the rest.
+        # Both explicit and inherited user-bound selections were authorized
+        # before job creation. Link only those normalized IDs. System jobs are
+        # only server-derived userless origins are the trusted bypass.
         if selected_ds_ids:
-            creator = None
-            if not internal_call and effective_user_id:
-                try:
-                    creator = await postgres_db.get_user(effective_user_id)
-                except Exception:
-                    creator = None
             for ds_id in selected_ds_ids:
                 try:
-                    if creator is not None:
-                        ds = await postgres_db.get_datasource(ds_id)
-                        if not ds:
-                            logger.warning("Skipping datasource %s: not found", ds_id)
-                            continue
-                        allowed = bool(ds.get("is_global")) or (
-                            await user_can_access_datasource(creator, postgres_db, ds)
-                        )
-                        if not allowed:
-                            logger.warning(
-                                "Skipping datasource %s for job %s: caller %s "
-                                "cannot access it",
-                                ds_id,
-                                new_job_id,
-                                effective_user_id,
-                            )
-                            continue
                     await postgres_db.link_datasource_to_job(new_job_id, ds_id)
                 except Exception as e:
                     logger.warning(
@@ -14470,14 +14839,24 @@ def _build_datasources_payload(
         if ds_type in managed_types and is_read_only:
             creds = {}
 
+        # External OKF KBs are centrally indexed and read-only in Slice 4 v1.
+        # The agent needs the stable index id + display metadata, never the
+        # remote URL or repository credentials.
+        if ds_type == "kb":
+            creds = {}
+            is_read_only = True
+
         entry = {
             "type": ds_type,
             "name": ds["name"],
             "description": ds.get("description"),
-            "connection_url": ds.get("connection_url"),
+            "connection_url": None if ds_type == "kb" else ds.get("connection_url"),
             "credentials": creds,
             "project_read_only": is_read_only,
         }
+        if ds_type == "kb":
+            entry["datasource_id"] = str(ds["id"])
+            entry["config"] = _normalize_kb_config(ds.get("config"))
         if ds.get("cli_hint"):
             entry["cli_hint"] = ds["cli_hint"]
         if ds.get("default_branch"):
@@ -14574,6 +14953,85 @@ def _normalize_datasource_credentials(
     except InvalidSSHKeyError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid ssh_key: {exc}") from exc
     return credentials
+
+
+def _normalize_kb_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate the non-secret v1 config for an OKF KB datasource.
+
+    ``root_path`` is relative to the configured repository root. Keep the
+    accepted shape intentionally small so misspelled future-looking keys do not
+    silently change indexing behavior.
+    """
+    raw = dict(config or {})
+    unknown = sorted(set(raw) - {"root_path"})
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown KB config field(s): {', '.join(unknown)}",
+        )
+
+    value = raw.get("root_path", "")
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="KB root_path must be a string")
+    if "\x00" in value:
+        raise HTTPException(status_code=400, detail="KB root_path contains NUL")
+
+    normalized = value.strip().replace("\\", "/")
+    if normalized.startswith("/") or urlparse(normalized).scheme:
+        raise HTTPException(
+            status_code=400,
+            detail="KB root_path must be a relative repository path",
+        )
+
+    parts: list[str] = []
+    for part in normalized.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise HTTPException(
+                status_code=400,
+                detail="KB root_path must not contain '..'",
+            )
+        parts.append(part)
+    return {"root_path": "/".join(parts)}
+
+
+def _validate_kb_repository_url(connection_url: str | None) -> str:
+    """Require a safe network Git URL with no embedded credentials."""
+    value = (connection_url or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail="OKF Knowledge Base datasources require a repository URL",
+        )
+    from services.kb_git_source import validate_git_remote_url
+
+    try:
+        return validate_git_remote_url(value, allow_local=False)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+
+def _validate_kb_repository_auth(
+    connection_url: str,
+    credentials: dict[str, Any] | None,
+) -> None:
+    """Reject unsafe OKF repository transport/auth combinations pre-persist."""
+    from services.kb_git_source import validate_git_auth_configuration
+
+    try:
+        validate_git_auth_configuration(
+            connection_url,
+            credentials,
+            allow_local=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post(
@@ -14680,6 +15138,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
     valid_types = {
         "generic",
         "repository",
+        "kb",
         "postgresql",
         "neo4j",
         "mongodb",
@@ -14693,26 +15152,49 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
             status_code=400,
             detail=f"Invalid type '{body.type}'. Must be one of: {', '.join(sorted(valid_types))}",
         )
+    if body.type == "kb" and body.job_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "OKF Knowledge Base datasources cannot set job_id; attach them "
+                "through the job's explicit datasource selection"
+            ),
+        )
 
     user = await require_approved_user(request, postgres_db)
     user_id = str(user["id"])
+
+    connection_url = body.connection_url
+    if body.type == "kb":
+        connection_url = _validate_kb_repository_url(connection_url)
+        datasource_config = _normalize_kb_config(body.config)
+    else:
+        if body.config:
+            raise HTTPException(
+                status_code=400,
+                detail="Datasource config is only supported for OKF Knowledge Bases",
+            )
+        datasource_config = dict(body.config or {})
 
     credentials = _normalize_datasource_credentials(body.credentials)
     try:
         credentials = normalize_credential_files(body.type, body.name, credentials)
     except CredentialFileValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.type == "kb":
+        _validate_kb_repository_auth(connection_url, credentials)
 
     try:
         created = await postgres_db.create_datasource(
             name=body.name,
             ds_type=body.type,
-            connection_url=body.connection_url,
+            connection_url=connection_url,
             description=body.description,
             credentials=credentials,
             job_id=body.job_id,
             cli_hint=body.cli_hint,
             default_branch=body.default_branch,
+            config=datasource_config,
             created_by=user_id,
             is_global=body.is_global,
         )
@@ -14726,6 +15208,9 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
                 detail=f"A datasource named '{body.name}' of type '{body.type}' already exists",
             ) from e
         raise HTTPException(status_code=500, detail=error_msg) from e
+    if body.type == "kb":
+        await _mark_kb_datasource_pending(str(created["id"]))
+        _schedule_kb_datasource_reindex(str(created["id"]), force_full=True)
     return redact_datasource(created)
 
 
@@ -14749,15 +15234,53 @@ async def update_datasource(
             )
         except CredentialFileValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    connection_url = body.connection_url
+    datasource_config = body.config
+    reindex_required = False
+    if existing_ds.get("type") == "kb":
+        if connection_url is not None:
+            connection_url = _validate_kb_repository_url(connection_url)
+            reindex_required = (
+                connection_url != str(existing_ds.get("connection_url") or "").strip()
+            )
+        if datasource_config is not None:
+            datasource_config = _normalize_kb_config(datasource_config)
+            existing_config = _normalize_kb_config(existing_ds.get("config"))
+            reindex_required = reindex_required or (
+                datasource_config != existing_config
+            )
+        if credentials is not None:
+            reindex_required = reindex_required or (
+                credentials != (existing_ds.get("credentials") or {})
+            )
+        if body.default_branch is not None:
+            reindex_required = reindex_required or (
+                (body.default_branch or None)
+                != (existing_ds.get("default_branch") or None)
+            )
+        effective_url = connection_url or str(existing_ds.get("connection_url") or "")
+        effective_credentials = (
+            credentials
+            if credentials is not None
+            else (existing_ds.get("credentials") or {})
+        )
+        _validate_kb_repository_auth(effective_url, effective_credentials)
+    elif datasource_config:
+        raise HTTPException(
+            status_code=400,
+            detail="Datasource config is only supported for OKF Knowledge Bases",
+        )
     try:
         success = await postgres_db.update_datasource(
             datasource_id=datasource_id,
             name=body.name,
             description=body.description,
-            connection_url=body.connection_url,
+            connection_url=connection_url,
             credentials=credentials,
             cli_hint=body.cli_hint,
             default_branch=body.default_branch,
+            config=datasource_config,
         )
         if not success:
             raise HTTPException(
@@ -14772,6 +15295,10 @@ async def update_datasource(
                 for pid in linked_projects:
                     await _sync_datasource_knowledge(pid, updated_ds)
 
+        if existing_ds.get("type") == "kb" and reindex_required:
+            await _mark_kb_datasource_pending(datasource_id)
+            _schedule_kb_datasource_reindex(datasource_id, force_full=True)
+
         return {"status": "updated"}
     except HTTPException:
         raise
@@ -14782,14 +15309,17 @@ async def update_datasource(
 @app.delete("/api/datasources/{datasource_id}")
 async def delete_datasource(request: Request, datasource_id: str) -> dict[str, str]:
     """Delete a datasource. F3: creator/admin only."""
-    await require_datasource_owner(request, postgres_db, datasource_id)
+    _, datasource = await require_datasource_owner(request, postgres_db, datasource_id)
     try:
         # Clean up knowledge entries for all linked projects before deletion
         linked_projects = await postgres_db.list_datasource_projects(datasource_id)
         for pid in linked_projects:
             await _delete_datasource_knowledge(pid, datasource_id)
 
-        success = await postgres_db.delete_datasource(datasource_id)
+        if datasource.get("type") == "kb":
+            success = await _delete_kb_datasource_with_index(datasource_id)
+        else:
+            success = await postgres_db.delete_datasource(datasource_id)
         if not success:
             raise HTTPException(
                 status_code=404, detail=f"Datasource '{datasource_id}' not found"
@@ -14817,6 +15347,49 @@ async def get_job_datasources(request: Request, job_id: str) -> list[dict[str, A
     return redact_datasources(rows)
 
 
+@app.get("/api/datasources/{datasource_id}/index-status")
+async def get_datasource_index_status(
+    request: Request, datasource_id: str
+) -> dict[str, Any]:
+    """Return credential-free indexing state for an OKF KB datasource."""
+    _, datasource = await require_datasource_access(request, postgres_db, datasource_id)
+    if datasource.get("type") != "kb":
+        raise HTTPException(
+            status_code=400, detail="Datasource is not an OKF Knowledge Base"
+        )
+    try:
+        from src.services.knowledge_store import KnowledgeStore
+
+        from services.kb_datasources import index_status_payload
+
+        watermark = await KnowledgeStore(
+            db=vector_db, embedding_service=None
+        ).get_watermark(UUID(datasource_id))
+        return index_status_payload(datasource_id, watermark)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/datasources/{datasource_id}/reindex")
+async def reindex_datasource_knowledge(
+    request: Request, datasource_id: str, full: bool = False
+) -> dict[str, Any]:
+    """Incrementally refresh an external OKF KB; owner/admin only."""
+    _, datasource = await require_datasource_owner(request, postgres_db, datasource_id)
+    if datasource.get("type") != "kb":
+        raise HTTPException(
+            status_code=400, detail="Datasource is not an OKF Knowledge Base"
+        )
+    try:
+        return await _reindex_kb_datasource_now(datasource, force_full=full)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.post("/api/datasources/{datasource_id}/test")
 async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
     """Test connectivity to a datasource.
@@ -14832,6 +15405,14 @@ async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any
         creds = ds.get("credentials") or {}
         if isinstance(creds, str):
             creds = json.loads(creds)
+
+        if ds_type == "kb":
+            from services.kb_datasources import test_kb_datasource as _test_kb
+
+            try:
+                return await _test_kb(ds)
+            except Exception as e:
+                return {"status": "error", "message": str(e)[-2000:]}
 
         if ds_type == "postgresql":
             try:
@@ -16634,6 +17215,7 @@ async def _build_thread_mount_rows(
 
 
 async def _resolve_thread_datasources(
+    thread: dict[str, Any],
     metadata: dict[str, Any],
     *,
     project_ids: list[str] | None = None,
@@ -16644,7 +17226,9 @@ async def _resolve_thread_datasources(
     by the caller. ``metadata`` still carries the explicit ``datasource_ids``
     list.
     """
-    ds_ids = metadata.get("datasource_ids")
+    ds_ids = await _revalidate_thread_datasource_ids(
+        thread, metadata.get("datasource_ids")
+    )
     if not ds_ids and not project_ids:
         return None
     resolved = await postgres_db.resolve_datasources_for_thread(
@@ -16724,7 +17308,12 @@ async def agent_get_thread_workspace(
     ws = metadata.get("workspace_container") or {}
     vm = metadata.get("vm") or {}
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
-    project_ids = await _thread_project_ids(thread_id)
+    project_ids = await _revalidate_thread_project_ids(
+        thread, await _thread_project_ids(thread_id)
+    )
+    datasources_payload = await _resolve_thread_datasources(
+        thread, metadata, project_ids=project_ids
+    )
     mount_rows = await postgres_db.list_thread_mounts(thread_id)
     cloud_mount_cfg = await _build_agent_cloud_mount(
         thread,
@@ -16770,11 +17359,16 @@ async def agent_get_thread_workspace(
     # plaintext stays on the agent trust boundary. Models/providers survive
     # stripping, so user_settings isn't needed to repopulate the keys.
     co = metadata.get("config_override") or {}
-    if co:
+    include_kb_profile = bool(project_ids) or any(
+        str(datasource.get("type") or "").lower() == "kb"
+        for datasource in datasources_payload or []
+    )
+    if co or include_kb_profile:
         co = await _inject_thread_dispatch_credentials(
             co,
             user_id=str(thread["user_id"]) if thread.get("user_id") else None,
             project_id=str(thread["project_id"]) if thread.get("project_id") else None,
+            include_kb_profile=include_kb_profile,
         )
     # Orchestrator-resolved config for cold/dedicated attach: the agent prefers
     # this fully-resolved, credential-injected blob over the config_override
@@ -16841,9 +17435,7 @@ async def agent_get_thread_workspace(
         # Project scoping
         "project_ids": project_ids,
         # Resolved datasources for the thread
-        "datasources": await _resolve_thread_datasources(
-            metadata, project_ids=project_ids
-        ),
+        "datasources": datasources_payload,
         # Raw project repository payload for internal session tools. Public
         # repository routes intentionally redact clone credentials.
         "repositories": await _resolve_thread_repositories(
@@ -17745,6 +18337,157 @@ class ThreadUpdateRequest(BaseModel):
     title: str | None = Field(None, description="New session title")
 
 
+async def _authorize_thread_datasource_ids(
+    user: dict[str, Any],
+    datasource_ids: list[str] | None,
+    *,
+    workspace_backend: str | None,
+) -> list[str]:
+    """Resolve and authorize an explicit persistent-session selection."""
+    selected: list[str] = []
+    seen: set[str] = set()
+    for raw_datasource_id in datasource_ids or []:
+        datasource = await postgres_db.get_datasource(raw_datasource_id)
+        if datasource is None:
+            raise HTTPException(
+                status_code=403,
+                detail="One or more selected datasources are unavailable",
+            )
+        allowed = bool(datasource.get("is_global")) or (
+            await user_can_access_datasource(user, postgres_db, datasource)
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=403,
+                detail="One or more selected datasources are unavailable",
+            )
+        if (
+            workspace_backend in LITE_BACKENDS
+            and str(datasource.get("type") or "").lower() == "repository"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Lite session backends cannot attach clone-based repository "
+                    "datasources; OKF Knowledge Base datasources remain available"
+                ),
+            )
+        normalized_id = str(datasource["id"])
+        if normalized_id not in seen:
+            selected.append(normalized_id)
+            seen.add(normalized_id)
+    return selected
+
+
+async def _revalidate_thread_datasource_ids(
+    thread: dict[str, Any], datasource_ids: list[str] | None
+) -> list[str]:
+    """Re-check a persisted thread selection against its current owner access.
+
+    Persistent metadata records which datasources were selected, not a durable
+    authorization grant. A datasource link or project membership can be revoked
+    after thread creation, so every attach/resume must resolve access again for
+    the user who owns the thread. Global datasources retain their internal
+    dispatch semantics through :func:`_authorize_thread_datasource_ids`.
+
+    Threads without a user are trusted internal/system threads. Preserve their
+    historical behavior while still normalizing duplicate IDs; deleted IDs are
+    naturally omitted by ``resolve_datasources_for_thread``. A non-system thread
+    whose owner row vanished fails closed with the same generic detail used at
+    create time, avoiding a datasource-enumeration oracle.
+    """
+    selected = list(dict.fromkeys(str(value) for value in datasource_ids or []))
+    if not selected:
+        return []
+
+    owner_id = thread.get("user_id")
+    if not owner_id:
+        return selected
+
+    owner = await postgres_db.get_user(str(owner_id))
+    if owner is None:
+        raise HTTPException(
+            status_code=403,
+            detail="One or more selected datasources are unavailable",
+        )
+
+    # workspace_backend=None intentionally skips the create-time lite/repository
+    # compatibility rule. Revalidation is only an access check and must not
+    # retroactively change existing non-KB datasource behavior.
+    return await _authorize_thread_datasource_ids(
+        owner, selected, workspace_backend=None
+    )
+
+
+async def _revalidate_thread_project_ids(
+    thread: dict[str, Any], project_ids: list[str] | None
+) -> list[str]:
+    """Re-check persisted project mounts against the thread owner's membership.
+
+    Project mounts grant the session its native knowledge base and repository
+    scope. Like explicit datasource selections, they are not frozen grants: a
+    revoked membership must take effect on the next attach/resume. Userless
+    internal/system threads retain their existing trusted behavior, and admins
+    retain the platform's normal all-project visibility.
+    """
+    owner_id = thread.get("user_id")
+    if not owner_id:
+        return list(dict.fromkeys(str(value) for value in project_ids or []))
+
+    owner = await postgres_db.get_user(str(owner_id))
+    if owner is None:
+        raise HTTPException(
+            status_code=403,
+            detail="One or more attached projects are unavailable",
+        )
+    return await _authorize_thread_project_ids(owner, project_ids)
+
+
+async def _authorize_thread_project_ids(
+    user: dict[str, Any], project_ids: list[str] | None
+) -> list[str]:
+    """Authorize project attachments without disclosing which ID failed."""
+    selected = list(dict.fromkeys(str(value) for value in project_ids or []))
+    if not selected:
+        return []
+
+    for project_id in selected:
+        project = await postgres_db.get_project(project_id)
+        allowed = bool(project) and bool(user.get("is_admin"))
+        if project and not allowed:
+            role = await postgres_db.get_user_role_in_project(
+                project_id, str(user["id"])
+            )
+            allowed = bool(role)
+        if not allowed:
+            raise HTTPException(
+                status_code=403,
+                detail="One or more attached projects are unavailable",
+            )
+    return selected
+
+
+async def _thread_has_knowledge_scope(
+    *,
+    project_ids: list[str] | None,
+    datasource_ids: list[str] | None,
+) -> bool:
+    """Whether a persistent-session dispatch needs the system KB credential.
+
+    Project scope exposes the native project knowledge base. For an
+    external-only session, inspect only the already-authorized/persisted
+    datasource IDs and opt in when one is an OKF KB datasource. This keeps the
+    system embedding key out of unrelated database/cloud/repository sessions.
+    """
+    if project_ids:
+        return True
+    for datasource_id in datasource_ids or []:
+        datasource = await postgres_db.get_datasource(str(datasource_id))
+        if datasource and str(datasource.get("type") or "").lower() == "kb":
+            return True
+    return False
+
+
 @app.post("/api/persistent/threads")
 async def create_thread(
     request_body: ThreadCreateRequest, request: Request
@@ -17860,9 +18603,28 @@ async def create_thread(
                 _default_session_workspace_backend(user_settings)
             )
 
-        # Normalize project_ids (backward compat: project_id → [project_id])
-        effective_project_ids = request_body.project_ids or (
-            [request_body.project_id] if request_body.project_id else []
+        # Normalize + authorize project attachments (backward compat:
+        # project_id → [project_id]). A project UUID is a selector, not an
+        # access grant; use one generic denial for missing/inaccessible rows.
+        effective_project_ids = await _authorize_thread_project_ids(
+            user,
+            request_body.project_ids
+            or ([request_body.project_id] if request_body.project_id else []),
+        )
+
+        # Datasource attachment is an authorization boundary, not merely a UI
+        # picker. Resolve every requested id before persisting the thread so a
+        # caller cannot attach a private datasource by guessing/leaking its UUID.
+        # Use one generic denial for missing and inaccessible ids to avoid
+        # turning this endpoint into a datasource-enumeration oracle.
+        selected_thread_datasource_ids = await _authorize_thread_datasource_ids(
+            user,
+            request_body.datasource_ids,
+            workspace_backend=_backend_from_override(config_override),
+        )
+        include_kb_profile = await _thread_has_knowledge_scope(
+            project_ids=effective_project_ids,
+            datasource_ids=selected_thread_datasource_ids,
         )
 
         # Layer 2 (fail loud at create): the requested config must fit the
@@ -17888,6 +18650,7 @@ async def create_thread(
             user_id=str(user["id"]),
             project_id=effective_project_ids[0] if effective_project_ids else None,
             user_settings=user_settings,
+            include_kb_profile=include_kb_profile,
         )
 
         # Keep the threads.permission_mode column in sync with the mode the
@@ -17921,8 +18684,8 @@ async def create_thread(
             # DB expert selection: resolved into the session config at attach
             # (_resolve_session_config reads metadata.expert_id).
             metadata_patch["expert_id"] = request_body.expert_id
-        if request_body.datasource_ids:
-            metadata_patch["datasource_ids"] = request_body.datasource_ids
+        if selected_thread_datasource_ids:
+            metadata_patch["datasource_ids"] = selected_thread_datasource_ids
         if request_body.protected_cloud:
             metadata_patch["protected_cloud"] = True
         if metadata_patch:
@@ -18168,7 +18931,7 @@ async def create_thread(
                     effective_config,
                     config_override,
                     effective_project_ids,
-                    request_body.datasource_ids,
+                    selected_thread_datasource_ids,
                 )
             )
         elif docker_provisioner.is_available:
@@ -18210,7 +18973,7 @@ async def create_thread(
                     thread_id,
                     config_override,
                     effective_project_ids,
-                    request_body.datasource_ids,
+                    selected_thread_datasource_ids,
                     request_body.config_name,
                 )
             )
@@ -18977,6 +19740,19 @@ async def resume_thread(
             status_code=409, detail=f"Thread is already {thread.get('status')}"
         )
 
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    # Validate before mutating the thread back to ``created``. A user should get
+    # one generic denial (rather than a half-resumed session that later fails to
+    # bind), and missing/private datasource/project UUIDs remain
+    # indistinguishable.
+    await _revalidate_thread_project_ids(thread, await _thread_project_ids(thread_id))
+    await _revalidate_thread_datasource_ids(thread, metadata.get("datasource_ids"))
+
     await postgres_db.resume_thread(thread_id)
 
     # Provision cloud session folder if missing (e.g. session was created
@@ -19110,12 +19886,21 @@ async def resume_thread(
                         if isinstance(md, dict)
                         else {}
                     )
+                    include_kb_profile = await _thread_has_knowledge_scope(
+                        project_ids=(
+                            [str(cur["project_id"])] if cur.get("project_id") else None
+                        ),
+                        datasource_ids=(
+                            md.get("datasource_ids") if isinstance(md, dict) else None
+                        ),
+                    )
                     co = await _inject_thread_dispatch_credentials(
                         co,
                         user_id=str(cur["user_id"]) if cur.get("user_id") else None,
                         project_id=str(cur["project_id"])
                         if cur.get("project_id")
                         else None,
+                        include_kb_profile=include_kb_profile,
                     )
                     # Pass the thread's explicit datasource selection (persisted
                     # in metadata) — without it, explicit-only resolution returns
@@ -26829,17 +27614,20 @@ async def link_datasource_to_project(
         )
 
     try:
+        effective_read_only = (
+            True if ds.get("type") == "kb" else (body.read_only if body else None)
+        )
         await postgres_db.link_datasource_to_project(
             project_id,
             datasource_id,
-            read_only=body.read_only if body else None,
+            read_only=effective_read_only,
             description=body.description if body else None,
         )
         # Build effective datasource dict for KB entry (apply overrides)
         effective_ds = dict(ds)
         if body:
-            if body.read_only is not None:
-                effective_ds["project_read_only"] = body.read_only
+            if body.read_only is not None or ds.get("type") == "kb":
+                effective_ds["project_read_only"] = effective_read_only
             if body.description is not None:
                 effective_ds["description"] = body.description
         await _sync_datasource_knowledge(project_id, effective_ds)
@@ -26860,10 +27648,16 @@ async def update_project_datasource(
     Pass null to clear an override and fall back to datasource defaults.
     """
     await require_project_owner(request, postgres_db, project_id)
+    ds = await postgres_db.get_datasource(datasource_id)
+    if not ds:
+        raise HTTPException(
+            status_code=404, detail=f"Datasource '{datasource_id}' not found"
+        )
+    effective_read_only = True if ds.get("type") == "kb" else body.read_only
     success = await postgres_db.update_project_datasource(
         project_id,
         datasource_id,
-        read_only=body.read_only,
+        read_only=effective_read_only,
         description=body.description,
     )
     if not success:
@@ -26873,14 +27667,12 @@ async def update_project_datasource(
         )
 
     # Re-sync knowledge entry with updated overrides
-    ds = await postgres_db.get_datasource(datasource_id)
-    if ds:
-        effective_ds = dict(ds)
-        if body.read_only is not None:
-            effective_ds["project_read_only"] = body.read_only
-        if body.description is not None:
-            effective_ds["description"] = body.description
-        await _sync_datasource_knowledge(project_id, effective_ds)
+    effective_ds = dict(ds)
+    if body.read_only is not None or ds.get("type") == "kb":
+        effective_ds["project_read_only"] = effective_read_only
+    if body.description is not None:
+        effective_ds["description"] = body.description
+    await _sync_datasource_knowledge(project_id, effective_ds)
 
     return {"status": "updated"}
 
@@ -27209,6 +28001,16 @@ def _build_datasource_note_content(ds: dict[str, Any]) -> str:
         return _build_generic_note(ds_name, desc, ds)
     elif ds_type == "repository":
         return _build_repository_note(ds_name, desc, ds)
+    elif ds_type == "kb":
+        root = str((ds.get("config") or {}).get("root_path") or "")
+        lines = [f"## OKF Knowledge Base: {ds_name}"]
+        if desc:
+            lines.append(desc)
+        lines.append("Centrally indexed and read-only to agents in this release.")
+        if root:
+            lines.append(f"OKF root: `{root}`")
+        lines.append("Attach this datasource explicitly, then use the `kb_*` tools.")
+        return "\n\n".join(lines)
     elif ds_type == "webdav":
         return _build_webdav_note(ds_name, desc, is_read_only)
     elif ds_type in ("postgresql", "neo4j", "mongodb"):
@@ -27387,6 +28189,12 @@ async def _sync_datasource_knowledge(
             f"git repo {ds_name}",
             f"How to access {ds_name} code",
             "available repositories",
+        ]
+    elif ds_type == "kb":
+        retrieval_messages = [
+            f"{ds_name} knowledge base",
+            f"Search {ds_name} with the KB tools",
+            "available OKF knowledge bases",
         ]
     elif ds_type == "generic":
         retrieval_messages = [
@@ -27671,26 +28479,206 @@ async def _build_kb_embedding_service():
     from src.services.embedding_service import EmbeddingService
 
     env: dict[str, Any] = {}
-    emb_model = await postgres_db.resolve_default_for_capability("embedding")
-    if emb_model:
-        await _inject_env_key_credentials(
-            env_keys=env,
-            prefix="EMBEDDING",
-            model_id=emb_model,
-            user_id=None,
-            resolved_keys=None,
-            capability="embedding",
-        )
-    if env.get("EMBEDDING_API_KEY"):
+    await _inject_system_kb_embedding_profile(env)
+    if env.get("KB_EMBEDDING_API_KEY"):
         return EmbeddingService(
-            model=env.get("EMBEDDING_MODEL"),
-            base_url=env.get("EMBEDDING_BASE_URL"),
-            api_key=env.get("EMBEDDING_API_KEY"),
+            model=env.get("KB_EMBEDDING_MODEL"),
+            base_url=env.get("KB_EMBEDDING_BASE_URL"),
+            api_key=env.get("KB_EMBEDDING_API_KEY"),
+            provider=env.get("KB_EMBEDDING_PROVIDER"),
+            expected_dimensions=int(env.get("KB_EMBEDDING_DIMENSIONS", "4096")),
+            profile_identity=env.get("KB_EMBEDDING_PROFILE_ID"),
         )
-    svc = EmbeddingService()
-    if svc.api_key:
-        return svc
+    # `_inject_system_kb_embedding_profile` already materializes the dev/env
+    # fallback when (and only when) there is no catalog pin. Reaching here means
+    # either no embedding transport exists or a selected catalog profile is
+    # incomplete. Never silently index with a different EMBEDDING_* model: the
+    # dispatched KB_* profile would then query incompatible vectors.
     return None
+
+
+async def _mark_kb_datasource_pending(datasource_id: str) -> None:
+    """Best-effort initial/update state; datasource CRUD remains available."""
+    try:
+        from src.services.knowledge_store import KnowledgeStore
+
+        from services.kb_reindex import kb_index_lock
+
+        kb_id = UUID(datasource_id)
+        store = KnowledgeStore(db=vector_db, embedding_service=None)
+        async with kb_index_lock(store, kb_id, wait=True) as lock_conn:
+            if await _kb_datasource_is_active(datasource_id):
+                await store.set_watermark_status(
+                    kb_id,
+                    "pending",
+                    repo_name=f"datasource:{datasource_id}",
+                    conn=lock_conn,
+                )
+    except Exception as exc:
+        logger.warning(
+            "Could not mark KB datasource %s pending: %s", datasource_id, exc
+        )
+
+
+async def _kb_datasource_is_active(datasource_id: str) -> bool:
+    """Re-check external-source ownership at the index mutation boundary."""
+    datasource = await postgres_db.get_datasource(datasource_id)
+    return bool(datasource and datasource.get("type") == "kb")
+
+
+async def _reindex_kb_datasource_now(
+    datasource: dict[str, Any], *, force_full: bool = False
+) -> dict[str, Any]:
+    """Resolve embeddings and run one credential-contained external rebuild."""
+    from src.services.knowledge_store import KnowledgeStore
+
+    from services.kb_datasources import reindex_kb_datasource
+    from services.kb_reindex import kb_index_lock
+
+    datasource_id = str(datasource["id"])
+    kb_id = UUID(datasource_id)
+    store = KnowledgeStore(db=vector_db, embedding_service=None)
+    svc = await _build_kb_embedding_service()
+    if svc is None:
+        indexed_commit: str | None = None
+        async with kb_index_lock(store, kb_id) as claimed:
+            if not claimed:
+                return {
+                    "status": "already-indexing",
+                    "indexed_commit": None,
+                    "full": False,
+                    "upserted": 0,
+                    "deleted": 0,
+                    "skipped": 0,
+                    "errors": 0,
+                }
+            if not await _kb_datasource_is_active(datasource_id):
+                return {
+                    "status": "source-deleted",
+                    "indexed_commit": None,
+                    "full": False,
+                    "upserted": 0,
+                    "deleted": 0,
+                    "skipped": 0,
+                    "errors": 0,
+                }
+            watermark = await store.get_watermark(kb_id)
+            indexed_commit = watermark.indexed_commit if watermark else None
+            await store.set_watermark_status(
+                kb_id,
+                "failed",
+                repo_name=f"datasource:{datasource_id}",
+                branch=datasource.get("default_branch") or None,
+                last_error="No embedding service is configured",
+            )
+        return {
+            "status": "no-embedding-service",
+            "indexed_commit": indexed_commit,
+            "full": False,
+            "upserted": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": 1,
+        }
+    store.embedding_service = svc
+    return await reindex_kb_datasource(
+        datasource,
+        store=store,
+        embedding_service=svc,
+        force_full=force_full,
+        is_active=lambda: _kb_datasource_is_active(datasource_id),
+    )
+
+
+async def _run_scheduled_kb_datasource_reindex(
+    datasource_id: str, *, force_full: bool
+) -> None:
+    try:
+        datasource = await postgres_db.get_datasource(datasource_id)
+        if not datasource or datasource.get("type") != "kb":
+            return
+        await _reindex_kb_datasource_now(datasource, force_full=force_full)
+    except Exception as exc:
+        # Source exceptions are credential-redacted by kb_git_source. Store a
+        # bounded diagnostic while retaining the previous indexed_commit.
+        logger.warning("KB datasource %s reindex failed: %s", datasource_id, exc)
+        try:
+            from src.services.knowledge_store import KnowledgeStore
+
+            from services.kb_reindex import kb_index_lock
+
+            kb_id = UUID(datasource_id)
+            store = KnowledgeStore(db=vector_db, embedding_service=None)
+            async with kb_index_lock(store, kb_id) as claimed:
+                if claimed and await _kb_datasource_is_active(datasource_id):
+                    await store.set_watermark_status(
+                        kb_id,
+                        "failed",
+                        repo_name=f"datasource:{datasource_id}",
+                        last_error=(str(exc)[-2000:] or "Indexing failed"),
+                    )
+        except Exception as status_exc:
+            logger.warning(
+                "Could not persist KB datasource %s failure status: %s",
+                datasource_id,
+                status_exc,
+            )
+
+
+def _schedule_kb_datasource_reindex(datasource_id: str, *, force_full: bool) -> None:
+    task = asyncio.create_task(
+        _run_scheduled_kb_datasource_reindex(datasource_id, force_full=force_full),
+        name=f"kb-datasource-reindex-{datasource_id[:8]}",
+    )
+    _kb_datasource_tasks.add(task)
+    datasource_tasks = _kb_datasource_tasks_by_id.setdefault(datasource_id, set())
+    datasource_tasks.add(task)
+
+    def forget_task(done: asyncio.Task) -> None:
+        _kb_datasource_tasks.discard(done)
+        current = _kb_datasource_tasks_by_id.get(datasource_id)
+        if current is None:
+            return
+        current.discard(done)
+        if not current:
+            _kb_datasource_tasks_by_id.pop(datasource_id, None)
+
+    task.add_done_callback(forget_task)
+
+
+async def _cancel_kb_datasource_reindexes(datasource_id: str) -> None:
+    """Cancel and drain request-spawned rebuilds for one external source."""
+    current_task = asyncio.current_task()
+    tasks = [
+        task
+        for task in _kb_datasource_tasks_by_id.get(datasource_id, ())
+        if task is not current_task and not task.done()
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _delete_kb_datasource_with_index(datasource_id: str) -> bool:
+    """Order datasource deletion after every writer of its disposable index.
+
+    The app and vector schemas live in separate databases, so this cannot be a
+    single SQL transaction. Holding the shared per-KB advisory claim across
+    vector cleanup and app-row deletion supplies the required ordering. A
+    stale sweeper that captured the row earlier subsequently fails its
+    under-lock liveness check and cannot recreate notes or a watermark.
+    """
+    from src.services.knowledge_store import KnowledgeStore
+
+    from services.kb_reindex import kb_index_lock
+
+    await _cancel_kb_datasource_reindexes(datasource_id)
+    kb_id = UUID(datasource_id)
+    store = KnowledgeStore(db=vector_db, embedding_service=None)
+    async with kb_index_lock(store, kb_id, wait=True) as lock_conn:
+        await store.delete_kb_index(kb_id, conn=lock_conn)
+        return await postgres_db.delete_datasource(datasource_id)
 
 
 async def _reindex_project_kb(

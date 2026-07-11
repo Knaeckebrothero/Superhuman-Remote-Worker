@@ -1,12 +1,10 @@
 """Tests for the ``create_worker_job`` orchestrator tool.
 
-The tool runs inside the persistent agent and POSTs to ``/api/jobs`` on the
-orchestrator. The orchestrator route has no auth, so the tool must propagate
-the originating session's identity. Without the ``thread_id`` field in the
-payload the orchestrator can't derive the calling user, dispatch skips the
-user-preference injection block, and the worker boots with the YAML default
-model + ``not-needed`` API key — which silently routes to api.openai.com and
-401s. Regression coverage for that flow lives here.
+The tool runs inside persistent and worker agents and POSTs to ``/api/jobs`` on
+the orchestrator. Internal transport auth is not a user/project grant, so the
+tool must propagate an authoritative ``thread_id`` and/or ``parent_job_id``.
+Without that origin the route rejects the request; accepting it would let an
+agent select arbitrary project/OKF datasource UUIDs under the shared key.
 """
 
 from __future__ import annotations
@@ -111,6 +109,58 @@ async def test_create_worker_job_omits_thread_id_when_not_in_context(
 
     _, body = capturing_client.posted[0]
     assert "thread_id" not in body
+
+
+@pytest.mark.asyncio
+async def test_worker_create_job_includes_authoritative_parent_job_id(
+    capturing_client,
+):
+    parent_job_id = "11111111-2222-3333-4444-555555555555"
+    ctx = ToolContext(_job_metadata={"job_id": parent_job_id})
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    await create.ainvoke(
+        {
+            "description": "worker child",
+            "project_id": "model-selected-project",
+            "datasource_ids": ["model-selected-datasource"],
+        }
+    )
+
+    _, body = capturing_client.posted[0]
+    assert body["parent_job_id"] == parent_job_id
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_can_send_thread_and_parent_origins(
+    capturing_client,
+):
+    parent_job_id = "11111111-2222-3333-4444-555555555555"
+    ctx = ToolContext(
+        _thread_id="thread-1",
+        _job_metadata={"job_id": parent_job_id},
+    )
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    await create.ainvoke({"description": "scoped child"})
+
+    _, body = capturing_client.posted[0]
+    assert body["thread_id"] == "thread-1"
+    assert body["parent_job_id"] == parent_job_id
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_omits_malformed_parent_metadata(capturing_client):
+    ctx = ToolContext(_job_metadata={"job_id": "not-a-uuid"})
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    await create.ainvoke({"description": "worker job"})
+
+    _, body = capturing_client.posted[0]
+    assert "parent_job_id" not in body
 
 
 @pytest.mark.asyncio
