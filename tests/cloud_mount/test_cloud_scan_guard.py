@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
-from src.services.cloud_mount.guardrails import detect_cloud_scan_risk
+from src.services.cloud_mount.guardrails import (
+    detect_cloud_delete_risk,
+    detect_cloud_scan_risk,
+)
 from src.tools.shell.shell_tools import create_shell_tools
 
 
@@ -133,6 +136,65 @@ def test_run_command_does_not_cache_check_non_cloud_command():
 
     assert "Cloud cache guard" not in result
     assert shell_manager.run_calls == ["git status --short"]
+
+
+def test_detects_rm_rf_over_cloud_mount():
+    assert detect_cloud_delete_risk("rm -rf /workspace/cloud/archive") is not None
+    assert detect_cloud_delete_risk("rm -r /cloud/merged/old") is not None
+
+
+def test_detects_find_delete_over_cloud_mount():
+    assert (
+        detect_cloud_delete_risk("find /workspace/cloud -name '*.tmp' -delete")
+        is not None
+    )
+
+
+def test_ignores_deletes_outside_cloud_and_single_file_rm_elsewhere():
+    assert detect_cloud_delete_risk("rm -rf /home/agent-host/workspace/build") is None
+    assert detect_cloud_delete_risk("rm /workspace/cloud/one.txt") is None  # single file, no -r
+
+
+def test_run_command_blocks_guarded_cloud_delete():
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(shell_manager, {"active": True, "scan_guard": "block"})
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "rm -rf /workspace/cloud/archive"})
+
+    assert "Cloud delete guard" in result
+    assert "was not run" in result
+    assert shell_manager.run_calls == []
+
+
+def test_run_command_warn_mode_allows_guarded_cloud_delete():
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(shell_manager, {"active": True, "scan_guard": "warn"})
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "rm -rf /workspace/cloud/archive"})
+
+    assert "Cloud delete guard" in result
+    assert "Exit code: 0" in result
+    assert shell_manager.run_calls == ["rm -rf /workspace/cloud/archive"]
+
+
+def test_run_command_allows_single_file_delete_outside_cloud():
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(shell_manager, {"active": True, "scan_guard": "block"})
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "rm -rf /home/agent-host/workspace/build"})
+
+    assert "Cloud delete guard" not in result
+    assert "Exit code: 0" in result
+    assert shell_manager.run_calls == ["rm -rf /home/agent-host/workspace/build"]
 
 
 def test_srw_cloud_status_reports_manager_status():
