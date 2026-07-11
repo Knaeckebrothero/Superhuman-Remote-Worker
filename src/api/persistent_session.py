@@ -218,6 +218,8 @@ class PersistentSession:
     # Lazy rclone cloud mounts (initialized from cloud_mount payload)
     cloud_mount_manager: Optional[Any] = None
     cloud_mount_error: Optional[str] = None
+    # Capture overlay stacked on the RO lower for protected sessions (B9)
+    overlay_mount_manager: Optional[Any] = None
 
     # Datasource connections keyed by type (for ToolContext)
     datasources: Dict[str, Any] = field(default_factory=dict)
@@ -481,7 +483,7 @@ class PersistentSession:
     async def _setup_cloud_mount(
         self, cloud_mount_cfg: Optional[Dict[str, Any]]
     ) -> None:
-        """Start rclone-backed cloud mounts for this session, if configured."""
+        """Start the RO rclone lower, then (protected mode) the capture overlay."""
         if not cloud_mount_cfg:
             return
         if not self.workspace_manager:
@@ -504,6 +506,46 @@ class PersistentSession:
             self.cloud_mount_error = str(e)
             self.cloud_mount_manager = None
             logger.warning("Failed to start cloud mount manager: %s", e)
+            return
+
+        if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
+            try:
+                from src.services.cloud_overlay import OverlayMountManager
+
+                self.overlay_mount_manager = OverlayMountManager(
+                    thread_id=self.thread_id,
+                    overlay_cfg=cloud_mount_cfg["overlay"],
+                    workspace_backend=self.workspace_manager.backend,
+                    workspace_root=self.workspace_manager.path,
+                )
+                # runs the mount script on the workspace pod over SSH
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self.overlay_mount_manager.mount)
+                logger.info(
+                    "Capture overlay mounted for protected session %s", self.thread_id
+                )
+            except Exception as e:
+                self.cloud_mount_error = f"overlay: {e}"
+                self.overlay_mount_manager = None
+                # Fail-safe: a protected session whose overlay failed to mount
+                # must NOT keep writing to the raw RO lower thinking it's
+                # protected. Tear down the rclone mount too so the session
+                # ends up with NO cloud access rather than a half-protected
+                # (unprotected) one (deviation from the brief's snippet,
+                # which left the lower mounted on overlay failure).
+                logger.warning(
+                    "Failed to mount capture overlay: %s — tearing down RO lower "
+                    "to avoid a half-protected session",
+                    e,
+                )
+                try:
+                    await self.cloud_mount_manager.aclose()
+                except Exception as close_err:
+                    logger.warning(
+                        "Error tearing down RO lower after overlay failure: %s",
+                        close_err,
+                    )
+                self.cloud_mount_manager = None
 
     def _deploy_instruction_files(self) -> None:
         """Deploy instruction files from config to workspace.
@@ -683,6 +725,10 @@ class PersistentSession:
                 "workspace_entry": "/workspace/cloud",
                 "scan_guard": self.config.extra.get("cloud_scan_guard", "block"),
                 "_manager": self.cloud_mount_manager,
+                "protected": bool(
+                    self.overlay_mount_manager and self.overlay_mount_manager.active
+                ),
+                "_overlay_manager": self.overlay_mount_manager,
             },
         }
         # Initialize session task manager
@@ -1305,6 +1351,14 @@ class PersistentSession:
 
     async def cleanup(self) -> None:
         """Clean up session resources."""
+        if self.overlay_mount_manager is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self.overlay_mount_manager.unmount)
+            except Exception:
+                logger.debug("overlay unmount failed", exc_info=True)
+            self.overlay_mount_manager = None
+
         if self.cloud_mount_manager:
             try:
                 await self.cloud_mount_manager.aclose()

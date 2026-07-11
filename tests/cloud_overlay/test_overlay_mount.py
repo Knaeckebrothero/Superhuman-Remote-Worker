@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from src.services.cloud_mount import RcloneMountManager
 from src.services.cloud_overlay.overlay_mount import (
     OverlayMountError,
     OverlayMountManager,
@@ -263,3 +264,71 @@ def test_over_quota_false_when_quota_bytes_zero():
     )
     assert mgr.over_quota() is False
     assert mgr.quota_guard_message() is None
+
+
+def test_protected_payload_mounts_lower_then_overlay():
+    """B9 seam test: a protected _build_protected_cloud_mount-shaped payload
+    drives RcloneMountManager (RO lower, skip_workspace_links) and then
+    OverlayMountManager (capture overlay + workspace/cloud -> merged symlink)
+    against ONE FakeRemoteBackend — mirrors what persistent_session's
+    _setup_cloud_mount does when it stacks the two managers.
+    """
+    backend = FakeRemoteBackend()
+    # This fixture's default exec_command output satisfies OverlayMountManager's
+    # sentinel (__SRW_OVERLAY_OK__); RcloneMountManager checks a different one
+    # (__SRW_RCLONE_MOUNT_OK__), so pin the rclone mount script's output too.
+    backend.outputs_by_script["mount_srw-thread-t-lower.sh"] = (
+        "__SRW_RCLONE_MOUNT_OK__\n"
+    )
+    cfg = {  # shape of _build_protected_cloud_mount output
+        "driver": "rclone",
+        "protected": True,
+        "skip_workspace_links": True,
+        "overlay": {
+            "lower": "/cloud/lower",
+            "upper": "/home/agent-host/.overlay/upper",
+            "work": "/home/agent-host/.overlay/work",
+            "merged": "/cloud/merged",
+            "quota_bytes": 8 * 1024**3,
+        },
+        "mounts": [
+            {
+                "mount_id": "protected-t",
+                "mount_kind": "protected_lower",
+                "target_path": "/cloud/lower",
+                "workspace_name": "lower",
+                "access": "read_only",
+                "backend": "nextcloud",
+                "source": {
+                    "type": "webdav",
+                    "config": {
+                        "url": "https://nc/x/",
+                        "vendor": "nextcloud",
+                        "user": "srw-reader-u",
+                    },
+                },
+                "auth": {"type": "basic", "password": "p"},
+            }
+        ],
+    }
+
+    rclone_mgr = RcloneMountManager(
+        thread_id="thread-t",
+        cloud_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    rclone_mgr._start_all_sync()
+    assert rclone_mgr.active is True
+    # overlay owns the symlink in protected mode -> rclone must not install one
+    assert not any(p.endswith("install_cloud_links.sh") for p in backend.files)
+
+    overlay_mgr = OverlayMountManager(
+        thread_id="thread-t",
+        overlay_cfg=cfg["overlay"],
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    overlay_mgr.mount()
+    assert overlay_mgr.active is True
+    assert any(p.endswith("overlay_mount.sh") for p in backend.files)
