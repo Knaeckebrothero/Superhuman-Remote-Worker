@@ -200,6 +200,7 @@ from services.cloud.reload import (  # noqa: E402
     fire_reload,
     run_listen_loop,
 )
+from services.cloud.ro_engage import engage_ro_mount, RoEngageRefused  # noqa: E402
 from services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
 from services import discovery as discovery_service  # noqa: E402
 from services import family_matcher  # noqa: E402
@@ -17721,6 +17722,15 @@ class ThreadCreateRequest(BaseModel):
             "honored as session tool group toggles."
         ),
     )
+    protected_cloud: bool = Field(
+        False,
+        description=(
+            "Protected cloud mode: mount the project cloud folder read-only with "
+            "a capture overlay so agent writes are staged for review, not live. "
+            "Nextcloud-only, container-runtime-only (design §3, §9.2). The New "
+            "Session checkbox that sets this lands in Slice C."
+        ),
+    )
 
 
 class ThreadUpdateRequest(BaseModel):
@@ -17907,6 +17917,8 @@ async def create_thread(
             metadata_patch["expert_id"] = request_body.expert_id
         if request_body.datasource_ids:
             metadata_patch["datasource_ids"] = request_body.datasource_ids
+        if request_body.protected_cloud:
+            metadata_patch["protected_cloud"] = True
         if metadata_patch:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -17929,6 +17941,25 @@ async def create_thread(
                 logger.warning(
                     "Thread %s: failed to seed thread_mounts: %s", thread_id, e
                 )
+
+        # Engage protected cloud mode ONCE at create (design §3.3/§11.4), fire-
+        # and-forget so create latency is unaffected — mirrors
+        # ``_provision_thread_workspace`` below. Fail-closed: a refusal or
+        # provisioning error is recorded on the thread's metadata inside
+        # ``_engage_protected_cloud_for_thread`` itself and never raises here;
+        # the session simply boots with no cloud mount.
+        if request_body.protected_cloud and _is_protected_cloud_mode_enabled():
+            seeded_rows = await postgres_db.list_thread_mounts(thread_id)
+
+            async def _engage_protected(tid: str) -> None:
+                await _engage_protected_cloud_for_thread(
+                    tid,
+                    user_id=str(user["id"]),
+                    mount_rows=seeded_rows,
+                    metadata={},
+                )
+
+            asyncio.create_task(_engage_protected(thread_id))
 
         # Provision workspace container + agent pod FIRST (non-blocking).
         # Start image pull / pod creation immediately so it runs in parallel
@@ -18552,6 +18583,137 @@ async def _build_rclone_session_mount(
     }
 
 
+async def _engage_protected_cloud_for_thread(
+    thread_id: str,
+    *,
+    user_id: str,
+    mount_rows: list[dict[str, Any]] | None,
+    metadata: dict[str, Any],
+) -> None:
+    """Engage protected cloud mode ONCE at thread create (design §3.3/§11.4).
+
+    Picks the first Nextcloud-backed project mount, provisions the per-user
+    reader + per-mount RO grant, and runs the fail-closed probe via
+    ``engage_ro_mount`` — persisting a ``cloud_ro_mounts`` row on success. On
+    refusal, records ``metadata.protected_cloud_error`` so the session boots
+    with NO cloud mount (never a live one) and the agent can say why."""
+    if not _is_protected_cloud_mode_enabled():
+        return
+    row = next(
+        (
+            r
+            for r in (mount_rows or [])
+            if r.get("backend_id") == "nextcloud" and r.get("cloud_handle")
+        ),
+        None,
+    )
+    if row is None:
+        await _record_protected_error(thread_id, "no Nextcloud project mount to protect")
+        return
+    backend = main_cloud_router.for_backend("nextcloud")
+    try:
+        handle = ProjectFolderHandle.from_db(row["cloud_handle"], backend="nextcloud")
+
+        def _reader_client(credentials: str | None):
+            # httpx client authenticated AS THE READER (basic auth), for the probe.
+            return httpx.AsyncClient(
+                base_url=backend._base_url,  # NC origin
+                auth=(f"srw-reader-{user_id}", credentials or ""),
+                timeout=30.0,
+            )
+
+        await engage_ro_mount(
+            backend=backend,
+            handle=handle,
+            user_key=user_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            postgres_db=postgres_db,
+            http_client_factory=_reader_client,
+        )
+    except RoEngageRefused as e:
+        await _record_protected_error(thread_id, f"protected mode refused: {e}")
+    except Exception as e:  # provisioning error — fail closed, no mount
+        logger.warning("Thread %s: protected engage failed: %s", thread_id, e)
+        await _record_protected_error(thread_id, f"protected engage error: {e}")
+
+
+async def _record_protected_error(thread_id: str, message: str) -> None:
+    async with postgres_db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET metadata = COALESCE(metadata,'{}') || $2::jsonb WHERE id=$1",
+            thread_id,
+            json.dumps({"protected_cloud_error": message}),
+        )
+
+
+# Protected-mode overlay layout (design §11.3): upper/work INSIDE the snapshot
+# scope (/home/agent-host), merged mount + raw rclone lower OUTSIDE it.
+_PROTECTED_OVERLAY_UPPER = "/home/agent-host/.overlay/upper"
+_PROTECTED_OVERLAY_WORK = "/home/agent-host/.overlay/work"
+_PROTECTED_OVERLAY_MERGED = "/cloud/merged"
+_PROTECTED_LOWER_TARGET = "/cloud/lower"
+_PROTECTED_UPPERDIR_QUOTA_BYTES = 8 * 1024 * 1024 * 1024  # < 10Gi emptyDir cliff
+
+
+def _build_protected_cloud_mount(
+    row: dict[str, Any], *, thread_id: str
+) -> Optional[dict[str, Any]]:
+    """Build the RO-lower + capture-overlay cloud_mount payload from an active
+    ``cloud_ro_mounts`` row (design §3.1). Nextcloud-only, read-only lower using
+    the per-mount READER credential — never agent-service. Returns None when the
+    row is not an active Nextcloud grant."""
+    if not row or row.get("status") != "active" or row.get("backend") != "nextcloud":
+        return None
+    return {
+        "version": 1,
+        "driver": "rclone",
+        "cloud_root": "/cloud",
+        "workspace_entry": "cloud",
+        "protected": True,
+        # The overlay manager owns workspace/cloud -> merged; the rclone manager
+        # must NOT install its own workspace/cloud -> lower symlink.
+        "skip_workspace_links": True,
+        "overlay": {
+            "lower": _PROTECTED_LOWER_TARGET,
+            "upper": _PROTECTED_OVERLAY_UPPER,
+            "work": _PROTECTED_OVERLAY_WORK,
+            "merged": _PROTECTED_OVERLAY_MERGED,
+            "quota_bytes": _PROTECTED_UPPERDIR_QUOTA_BYTES,
+        },
+        "fallback": False,
+        "mounts": [
+            {
+                "mount_id": f"protected-{thread_id}",
+                "mount_kind": "protected_lower",
+                "backend": "nextcloud",
+                "target_path": _PROTECTED_LOWER_TARGET,
+                "workspace_name": "lower",
+                "access": "read_only",
+                "source": {
+                    "type": "webdav",
+                    "config": {
+                        "url": row["webdav_url"],
+                        "vendor": "nextcloud",
+                        "user": row["reader_id"],
+                    },
+                },
+                "auth": {"type": "basic", "password": row["credentials"]},
+                "cache": {
+                    "vfs_cache_mode": "full",
+                    "vfs_cache_max_size": "10G",
+                    "vfs_cache_max_age": "24h",
+                    "dir_cache_time": "5m",
+                    "poll_interval": "1m",
+                    "vfs_read_chunk_size": "16M",
+                    "vfs_read_chunk_size_limit": "128M",
+                    "hard_cache_limit": "20G",
+                },
+            }
+        ],
+    }
+
+
 async def _build_agent_cloud_mount(
     thread: dict[str, Any],
     *,
@@ -18567,6 +18729,25 @@ async def _build_agent_cloud_mount(
     """
     if not _runtime_supports_rclone_mount(metadata):
         return None
+
+    # Protected cloud mode: if this thread was engaged for protected mode and an
+    # active RO grant exists, serve the RO-lower + overlay payload. VM tier is
+    # unsupported in v1 (the reader webdav_url is the internal NC URL a VM can't
+    # reach) — fail closed to no mount rather than a broken lower.
+    if _is_protected_cloud_mode_enabled() and metadata.get("protected_cloud"):
+        vm_ctx = metadata.get("vm") or {}
+        if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
+            logger.warning(
+                "Thread %s: protected cloud mode not supported on VM tier; no mount.",
+                thread.get("id"),
+            )
+            return None
+        row = await postgres_db.get_ro_mount_by_thread(str(thread.get("id")))
+        return (
+            _build_protected_cloud_mount(row, thread_id=str(thread.get("id")))
+            if row
+            else None
+        )
 
     # A cross-cluster VM runtime needs the public WebDAV URL (it can't reach the
     # internal service DNS) and defaults to a read-only mount (root tier). A
