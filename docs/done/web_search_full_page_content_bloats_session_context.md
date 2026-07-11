@@ -1,7 +1,21 @@
 # `web_search` inlines full page bodies and bloats session context
 
-**Status:** OPEN — hardened into an implementation brief 2026-07-11 (originally
-diagnosed 2026-07-10 alongside the codex context-window wedge, session `4b82e6db`).
+**Status:** ✅ RESOLVED 2026-07-11 — implemented and review-verified in
+`75fcba8d` (originally diagnosed 2026-07-10 alongside the codex
+context-window wedge, session `4b82e6db`; brief hardened in `ff186cd6`).
+All five decisions implemented as specified: web_search snippet+pointer with
+the Tavily flag still forwarded (the trap — covered by an explicit test
+asserting the constructor kwarg), extract_webpage 60K-char aggregate cap,
+crawl 500-char snippet+pointer, no-workspace bounded-excerpt fallback gated
+on the returned save path, constants not config. Review found one gap, fixed
+in the same commit: the `extract_webpage` LLM-facing docstring still promised
+unbounded full content. 60 web-tool tests (185 in `tests/tools/`) green,
+including the headline case: 10 × 200K-char raw results → output < 15K chars,
+zero raw text inlined, 10 exact `documents/external/` pointers, full content
+on disk. One nuance kept as-built: when a single extract result exceeds the
+remaining aggregate budget, the budget zeroes (fail-closed) rather than
+letting smaller later results fill it — simpler ordering semantics, same
+bound. Live smoke (heavy research session, flat context %) still pending.
 **Severity:** medium-high — it's the *trigger* that pushes sessions toward the
 model/transport context ceiling, and it silently multiplies cost (>272K input
 tokens bills 2× in / 1.5× out on OpenAI).
@@ -112,7 +126,7 @@ real need appears).
 |---|---|
 | `src/tools/research/web.py` | Constants (:18); capture save paths (:349–362, :472–479, :597–606); rework render loops (:364–405, :481–512, :608–629); docstrings (:127, :142, :161+) |
 | `src/tools/research/web.py` `RESEARCH_TOOLS_METADATA` (:22–56) | `web_search` + `extract_webpage` descriptions: content is archived; read the saved file / extract on demand |
-| `tests/test_web_tools.py` (NEW) | See verification |
+| `tests/tools/research/test_web_tools.py` | See verification |
 
 Explicitly NOT in scope: prompt/template mentions of `web_search`
 (`config/prompts/instructions.md:54` etc.) are generic and stay; the
