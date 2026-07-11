@@ -551,6 +551,146 @@ class TestSetupWorkspace:
 
 
 # ---------------------------------------------------------------------------
+# 2.4.1 _setup_cloud_mount() — protected overlay-failure fail-safe (F-M6)
+# ---------------------------------------------------------------------------
+
+
+def _protected_cloud_mount_cfg() -> dict:
+    return {
+        "version": 1,
+        "driver": "rclone",
+        "protected": True,
+        "skip_workspace_links": True,
+        "overlay": {
+            "lower": "/cloud/lower",
+            "upper": "/home/agent-host/.overlay/upper",
+            "work": "/home/agent-host/.overlay/work",
+            "merged": "/cloud/merged",
+            "quota_bytes": 8 * 1024**3,
+        },
+        "mounts": [
+            {
+                "mount_id": "protected-thread",
+                "mount_kind": "protected_lower",
+                "target_path": "/cloud/lower",
+                "workspace_name": "lower",
+                "access": "read_only",
+            }
+        ],
+    }
+
+
+class TestSetupCloudMountOverlayFailure:
+    """F-M6 (Task B10): pin the overlay-failure -> RO-lower-teardown branch
+    of ``_setup_cloud_mount``. This is the B9 fail-safe deviation from the
+    original brief (which left the RO lower mounted on overlay failure) —
+    a protected session whose overlay fails to mount must end up with NO
+    cloud access at all (cloud_mount_manager torn down + cleared) rather
+    than a half-protected session that still writes straight to the raw RO
+    lower thinking it's protected."""
+
+    @pytest.mark.asyncio
+    async def test_overlay_failure_tears_down_ro_lower(self):
+        session = _make_session(
+            workspace_manager=SimpleNamespace(path="/workspace", backend=MagicMock())
+        )
+        fake_rclone_manager = MagicMock()
+        fake_rclone_manager.start_all = AsyncMock(return_value=None)
+        fake_rclone_manager.mounts = []
+        fake_rclone_manager.aclose = AsyncMock(return_value=None)
+
+        fake_overlay_manager = MagicMock()
+        fake_overlay_manager.mount = MagicMock(
+            side_effect=RuntimeError("fuse-overlayfs: mount failed")
+        )
+
+        with (
+            patch(
+                "src.services.cloud_mount.RcloneMountManager",
+                return_value=fake_rclone_manager,
+            ),
+            patch(
+                "src.services.cloud_overlay.OverlayMountManager",
+                return_value=fake_overlay_manager,
+            ),
+        ):
+            await session._setup_cloud_mount(_protected_cloud_mount_cfg())
+
+        assert session.cloud_mount_error is not None
+        assert session.cloud_mount_error.startswith("overlay: ")
+        assert session.overlay_mount_manager is None
+        # No half-protected session: the RO lower is torn down AND cleared,
+        # not left mounted with no capture overlay on top.
+        fake_rclone_manager.aclose.assert_awaited_once()
+        assert session.cloud_mount_manager is None
+
+    @pytest.mark.asyncio
+    async def test_overlay_failure_clears_lower_even_if_teardown_also_fails(self):
+        """The teardown call itself failing (e.g. a stuck fusermount3 -uz)
+        must not leave cloud_mount_manager pointing at a live, unprotected
+        lower — the fail-safe still clears it."""
+        session = _make_session(
+            workspace_manager=SimpleNamespace(path="/workspace", backend=MagicMock())
+        )
+        fake_rclone_manager = MagicMock()
+        fake_rclone_manager.start_all = AsyncMock(return_value=None)
+        fake_rclone_manager.mounts = []
+        fake_rclone_manager.aclose = AsyncMock(side_effect=RuntimeError("umount: EBUSY"))
+
+        fake_overlay_manager = MagicMock()
+        fake_overlay_manager.mount = MagicMock(side_effect=RuntimeError("overlay boom"))
+
+        with (
+            patch(
+                "src.services.cloud_mount.RcloneMountManager",
+                return_value=fake_rclone_manager,
+            ),
+            patch(
+                "src.services.cloud_overlay.OverlayMountManager",
+                return_value=fake_overlay_manager,
+            ),
+        ):
+            await session._setup_cloud_mount(_protected_cloud_mount_cfg())
+
+        assert session.cloud_mount_error.startswith("overlay: ")
+        assert session.overlay_mount_manager is None
+        assert session.cloud_mount_manager is None
+
+    @pytest.mark.asyncio
+    async def test_successful_overlay_mount_keeps_both_managers(self):
+        """Control case: a clean overlay mount keeps the RO lower AND the
+        overlay manager live (regression guard for the failure-path tests
+        above — proves the teardown branch only fires on failure)."""
+        session = _make_session(
+            workspace_manager=SimpleNamespace(path="/workspace", backend=MagicMock())
+        )
+        fake_rclone_manager = MagicMock()
+        fake_rclone_manager.start_all = AsyncMock(return_value=None)
+        fake_rclone_manager.mounts = []
+        fake_rclone_manager.aclose = AsyncMock(return_value=None)
+
+        fake_overlay_manager = MagicMock()
+        fake_overlay_manager.mount = MagicMock(return_value=None)
+
+        with (
+            patch(
+                "src.services.cloud_mount.RcloneMountManager",
+                return_value=fake_rclone_manager,
+            ),
+            patch(
+                "src.services.cloud_overlay.OverlayMountManager",
+                return_value=fake_overlay_manager,
+            ),
+        ):
+            await session._setup_cloud_mount(_protected_cloud_mount_cfg())
+
+        assert session.cloud_mount_error is None
+        assert session.cloud_mount_manager is fake_rclone_manager
+        assert session.overlay_mount_manager is fake_overlay_manager
+        fake_rclone_manager.aclose.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # 2.5 _setup_tools()
 # ---------------------------------------------------------------------------
 

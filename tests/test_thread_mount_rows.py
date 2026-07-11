@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import main
 from main import _build_protected_cloud_mount
 
 
@@ -1044,17 +1045,29 @@ async def test_build_agent_cloud_mount_protected_marker_active_row_returns_paylo
 async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
     monkeypatch,
 ):
-    """(d) marker + flag ON + container runtime + no active row -> None."""
+    """(d) marker + flag ON + container runtime + no active row -> None.
+
+    No task is registered in ``_protected_engage_tasks`` for this thread_id
+    and no ``protected_cloud_error`` is recorded, so this exercises F-I1's
+    poll-exhaustion path (3x get_ro_mount_by_thread, sleep(3) between) —
+    ``asyncio.sleep`` is patched so the 9s worst case doesn't slow the suite.
+    Fail-closed: exhausting the poll still returns None, never a live mount.
+    """
     from main import _build_agent_cloud_mount
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    # Defensive: no in-flight engage task registered for this thread_id (a
+    # leaked registration from another test would take the await-task branch
+    # instead of the poll branch this test targets).
+    main._protected_engage_tasks.pop("thread-1", None)
     with (
         patch("main._is_protected_cloud_mode_enabled", return_value=True),
         patch(
             "main.postgres_db.get_ro_mount_by_thread",
             new=AsyncMock(return_value=None),
-        ),
+        ) as get_row,
+        patch("main.asyncio.sleep", new=AsyncMock()) as sleep,
     ):
         payload = await _build_agent_cloud_mount(
             {"id": "thread-1"},
@@ -1065,3 +1078,6 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
             },
         )
     assert payload is None
+    # Initial lookup + 3 poll attempts.
+    assert get_row.await_count == 4
+    assert sleep.await_count == 3

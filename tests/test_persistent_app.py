@@ -2949,6 +2949,142 @@ class TestAttachSessionCloudMount:
         build_sync.assert_not_called()
 
 
+class TestAttachSessionProtectedCloudFailClose:
+    """F-C1 (Task B10): a protected thread with no engageable cloud_mount
+    must NEVER fall back to the legacy nc_session_folder WebDAV sync shim,
+    even though the legacy field is still present in the workspace response
+    (refused engage / flag off / VM tier / overlay-failure teardown all
+    resolve cloud_mount=None while nc_session_folder stays set)."""
+
+    @staticmethod
+    def _fake_session_cls():
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                # No active cloud mount — mirrors a degraded-protected thread
+                # (engage refused, flag off, or VM tier all resolve to None).
+                self.cloud_mount_manager = None
+                self.cloud_mount_error = None
+                self.overlay_mount_manager = None
+                self.workspace_manager = SimpleNamespace(
+                    path=Path("/workspace"),
+                    backend=MagicMock(),
+                )
+                self.workspace_sync = None
+                self.postgres_conn = None
+                self.tool_context = None
+
+            async def setup(self, **kwargs):
+                return None
+
+        return FakeSession
+
+    @pytest.mark.asyncio
+    async def test_protected_thread_skips_legacy_shim_despite_nc_folder(self):
+        """protected_cloud=True + cloud_mount=None + nc_session_folder set
+        must NOT build the legacy sync coordinator."""
+        import src.api.persistent_app as mod
+
+        workspace_override = {
+            "remote": {"host": "10.42.0.10"},
+            "nc_session_folder": "Sessions/thread-1",
+            "cloud_mount": None,
+            "cloud_sync": None,
+            "protected_cloud": True,
+        }
+        fake_agent = SimpleNamespace(
+            config=object(),
+            _tactical_llm=None,
+            _llm=object(),
+            _auxiliary_llm=object(),
+            postgres_conn=None,
+            vector_conn=None,
+        )
+        fake_orchestrator = SimpleNamespace(
+            get_thread_workspace=AsyncMock(return_value=workspace_override)
+        )
+
+        mod._session = None
+        mod._thread_id = None
+        with (
+            patch.object(mod, "_agent", fake_agent),
+            patch.object(mod, "_orchestrator_client", fake_orchestrator),
+            patch.object(mod, "PersistentSession", self._fake_session_cls()),
+            patch.object(
+                mod,
+                "_poll_workspace_ready",
+                new=AsyncMock(return_value=workspace_override),
+            ),
+            patch.object(mod, "_build_sync_coordinator") as build_sync,
+            patch.object(mod, "_restore_session_messages", new=AsyncMock()),
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(mod, "_start_watchdogs"),
+        ):
+            try:
+                await mod._attach_session("thread-1")
+            finally:
+                mod._session = None
+                mod._thread_id = None
+
+        # The legacy shim (_legacy_nc_cloud_cfg -> _build_sync_coordinator)
+        # must never fire for a protected thread, regardless of a stale/
+        # still-set nc_session_folder.
+        build_sync.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_protected_thread_still_uses_legacy_shim(self):
+        """Regression guard: an ordinary (non-protected) thread with no
+        cloud_mount/cloud_sync but a live nc_session_folder still falls back
+        to the legacy shim — the new protected-only gate must not swallow
+        the existing back-compat path."""
+        import src.api.persistent_app as mod
+
+        workspace_override = {
+            "remote": {"host": "10.42.0.10"},
+            "nc_session_folder": "Sessions/thread-1",
+            "cloud_mount": None,
+            "cloud_sync": None,
+            "protected_cloud": False,
+        }
+        fake_agent = SimpleNamespace(
+            config=object(),
+            _tactical_llm=None,
+            _llm=object(),
+            _auxiliary_llm=object(),
+            postgres_conn=None,
+            vector_conn=None,
+        )
+        fake_orchestrator = SimpleNamespace(
+            get_thread_workspace=AsyncMock(return_value=workspace_override)
+        )
+
+        mod._session = None
+        mod._thread_id = None
+        with (
+            patch.object(mod, "_agent", fake_agent),
+            patch.object(mod, "_orchestrator_client", fake_orchestrator),
+            patch.object(mod, "PersistentSession", self._fake_session_cls()),
+            patch.object(
+                mod,
+                "_poll_workspace_ready",
+                new=AsyncMock(return_value=workspace_override),
+            ),
+            patch.object(mod, "_build_sync_coordinator") as build_sync,
+            patch.object(mod, "_restore_session_messages", new=AsyncMock()),
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(mod, "_start_watchdogs"),
+        ):
+            try:
+                await mod._attach_session("thread-1")
+            finally:
+                mod._session = None
+                mod._thread_id = None
+
+        build_sync.assert_called_once()
+        # The legacy translation ran (webdav_url built from nc_folder).
+        _, kwargs = build_sync.call_args
+        assert "Sessions/thread-1" in kwargs["cloud_cfg"]["webdav_url"]
+
+
 # ---------------------------------------------------------------------------
 # 3.17.3 Headless: attach-time readiness race (handle_persistent_websocket)
 # ---------------------------------------------------------------------------
