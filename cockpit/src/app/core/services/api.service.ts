@@ -126,7 +126,7 @@ export interface IdeSessionStatus {
   expires_at?: string;
   started_at?: string;
   source?: string;
-  restore_type?: 'vm' | 'container';
+  restore_type?: 'vm' | 'container' | 'k8s_container';
   error?: string;
 }
 

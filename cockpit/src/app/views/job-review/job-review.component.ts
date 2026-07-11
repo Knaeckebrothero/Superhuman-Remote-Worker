@@ -610,6 +610,8 @@ export class JobReviewComponent {
   readonly confirmingApprove = signal(false);
   readonly ideLoading = signal(false);
   readonly isExportingToCloud = signal(false);
+  private readonly maxIdePollAttempts = 100;
+  private idePollAttempts = 0;
   private confirmTimeout: ReturnType<typeof setTimeout> | null = null;
   private idePollingInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -704,6 +706,8 @@ export class JobReviewComponent {
     const jobId = currentJob.id;
 
     this.ideLoading.set(true);
+    this.resultMessage.set(null);
+    this.resultIsError.set(false);
 
     this.api.getIdeSession(jobId).subscribe((result) => {
       if (!result) {
@@ -721,7 +725,17 @@ export class JobReviewComponent {
 
       if (result.status === 'available' || result.status === 'expired' || result.status === 'failed') {
         this.api.startIdeSession(jobId).subscribe((startResult) => {
-          if (!startResult || startResult.status === 'unavailable' || startResult.status === 'failed') {
+          if (!startResult) {
+            this.resultMessage.set('Failed to start IDE session');
+            this.resultIsError.set(true);
+            this.ideLoading.set(false);
+            return;
+          }
+          if (startResult.status === 'unavailable' || startResult.status === 'failed') {
+            this.resultMessage.set(
+              startResult.error || 'Failed to start IDE session',
+            );
+            this.resultIsError.set(true);
             this.ideLoading.set(false);
             return;
           }
@@ -735,14 +749,29 @@ export class JobReviewComponent {
         return;
       }
 
+      if (result.status === 'unavailable') {
+        this.resultMessage.set('IDE session is currently unavailable');
+        this.resultIsError.set(true);
+      }
       this.ideLoading.set(false);
     });
   }
 
   private pollIdeSession(jobId: string): void {
     if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+    this.idePollAttempts = 0;
 
     this.idePollingInterval = setInterval(() => {
+      this.idePollAttempts += 1;
+      if (this.idePollAttempts > this.maxIdePollAttempts) {
+        if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+        this.idePollingInterval = null;
+        this.ideLoading.set(false);
+        this.resultMessage.set('IDE session still restoring after 5 minutes');
+        this.resultIsError.set(true);
+        return;
+      }
+
       this.api.getIdeSession(jobId).subscribe((result) => {
         if (!result) return;
 
@@ -757,6 +786,10 @@ export class JobReviewComponent {
           if (this.idePollingInterval) clearInterval(this.idePollingInterval);
           this.idePollingInterval = null;
           this.ideLoading.set(false);
+          this.resultMessage.set(
+            result.error || 'Failed to prepare IDE session',
+          );
+          this.resultIsError.set(true);
         }
       });
     }, 3000);
