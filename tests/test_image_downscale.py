@@ -57,6 +57,11 @@ class TestResolveMaxEdge:
         assert resolve_max_edge("high", None) == DEFAULT_FAMILY_MAX_EDGE_FALLBACK
         assert resolve_max_edge("high", 0) == DEFAULT_FAMILY_MAX_EDGE_FALLBACK
 
+    def test_non_numeric_family_cap_falls_back(self):
+        # Must never raise on a stray non-int cap (config typo, mock, etc.)
+        assert resolve_max_edge("high", "2576") == DEFAULT_FAMILY_MAX_EDGE_FALLBACK
+        assert resolve_max_edge("high", object()) == DEFAULT_FAMILY_MAX_EDGE_FALLBACK
+
     def test_unknown_tier_defaults_to_standard(self):
         assert normalize_tier("bogus") == "standard"
         assert resolve_max_edge("bogus", 2576) == 1568
@@ -188,3 +193,41 @@ class TestSeamIntegration:
         for b in blocks:
             payload = base64.b64decode(b["image_url"]["url"].split(",", 1)[1])
             assert max(_dims(payload)) == 768
+
+
+class _FakeLimits:
+    def __init__(self, max_edge):
+        self.image_tokens = {"max_edge": max_edge} if max_edge else None
+
+
+class _FakeConfig:
+    def __init__(self, tier, max_edge):
+        self.image_quality = tier
+        self.limits = _FakeLimits(max_edge)
+
+
+class TestResolveImageMaxEdgeFromConfig:
+    def test_high_uses_family_cap(self):
+        from src.services.image_content import resolve_image_max_edge
+
+        assert resolve_image_max_edge(_FakeConfig("high", 2576)) == 2576
+
+    def test_standard_plateaus(self):
+        from src.services.image_content import resolve_image_max_edge
+
+        assert resolve_image_max_edge(_FakeConfig("standard", 2576)) == 1568
+
+    def test_none_config_is_noop(self):
+        from src.services.image_content import resolve_image_max_edge
+
+        assert resolve_image_max_edge(None) is None
+
+    def test_missing_family_cap_falls_back(self):
+        from src.services.image_content import resolve_image_max_edge
+        from src.services.image_downscale import DEFAULT_FAMILY_MAX_EDGE_FALLBACK
+
+        # family declares no image_tokens.max_edge -> universal default
+        assert (
+            resolve_image_max_edge(_FakeConfig("high", None))
+            == DEFAULT_FAMILY_MAX_EDGE_FALLBACK
+        )

@@ -71,8 +71,8 @@ def resolve_max_edge(tier: object, family_max_edge: int | None) -> int:
     universal default is used). "high" resolves to exactly the family cap.
     """
     cap = (
-        family_max_edge
-        if (family_max_edge and family_max_edge > 0)
+        int(family_max_edge)
+        if isinstance(family_max_edge, (int, float)) and family_max_edge > 0
         else DEFAULT_FAMILY_MAX_EDGE_FALLBACK
     )
     nominal = _TIER_NOMINAL_EDGE.get(

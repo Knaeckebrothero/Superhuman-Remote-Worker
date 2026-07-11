@@ -420,6 +420,12 @@ delegation:
 # full | review | partial | guided | dependent
 autonomy: review
 
+# Image quality — resolution tier of images the agent receives
+# economy | standard | high (default standard). Higher = more visual detail and
+# more image tokens; resolved to a per-model-family max edge at the image seam.
+# See docs/issues/session_turn_hard_fails_on_transient_llm_outage.md (Track 1).
+image_quality: standard
+
 # Communication — agent-initiated messaging to humans via email
 # Messages stored in workspace/messages/ as markdown files with YAML frontmatter.
 communication:

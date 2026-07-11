@@ -42,7 +42,11 @@ from .llm.response_guards import (
     finalize_streamed_response,
     strip_removal_markers,
 )
-from .services.image_content import extract_image_tags, make_multimodal_user_message
+from .services.image_content import (
+    extract_image_tags,
+    make_multimodal_user_message,
+    resolve_image_max_edge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1862,6 +1866,7 @@ async def _execute_turn(
                         make_multimodal_user_message(
                             text=(f"Image content from tool call {tool_call_id}:"),
                             images=extracted_images,
+                            max_edge=resolve_image_max_edge(config),
                         )
                     )
                 )

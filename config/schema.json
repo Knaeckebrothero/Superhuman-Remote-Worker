@@ -863,6 +863,12 @@
       "enum": ["full", "review", "partial", "guided", "dependent"],
       "default": "partial",
       "description": "Controls when the agent pauses for human review. full=never, review=after job_complete, partial=after first strategic + job_complete, guided=after every strategic + job_complete, dependent=after every phase + job_complete."
+    },
+    "image_quality": {
+      "type": "string",
+      "enum": ["economy", "standard", "high"],
+      "default": "standard",
+      "description": "Resolution tier of images delivered to the model. economy=~768px, standard=~1568px, high=model-family max edge. Higher = more visual detail and more image tokens. Applied (downscale/re-encode) at the image seam; overridable per session/job."
     }
   },
   "additionalProperties": true,

@@ -21,6 +21,9 @@ from src.llm.reasoning_chat import ReasoningChatOpenAI
 logger = logging.getLogger(__name__)
 
 VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
+# Image-quality tiers the agent may receive; resolved to a per-family max edge
+# at the image seam. Kept in sync with src/services/image_downscale.py.
+VALID_IMAGE_QUALITY_TIERS = {"economy", "standard", "high"}
 
 
 # =============================================================================
@@ -1865,6 +1868,10 @@ class AgentConfig:
     interactive: InteractiveConfig = field(default_factory=InteractiveConfig)
     headless: HeadlessConfig = field(default_factory=HeadlessConfig)
     autonomy: str = "partial"
+    # Image-quality tier the agent receives (economy|standard|high). A
+    # user/session knob (default standard) resolved to a per-family max edge at
+    # the image seam. See docs/issues/session_turn_hard_fails_on_transient_llm_outage.md.
+    image_quality: str = "standard"
 
     # Additional agent-specific config (preserved from JSON)
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -2304,6 +2311,14 @@ def load_agent_config(
         logger.warning(f"Invalid autonomy level '{autonomy}', defaulting to 'partial'")
         autonomy = "partial"
 
+    # Parse image-quality tier (economy|standard|high)
+    image_quality = data.get("image_quality", "standard")
+    if image_quality not in VALID_IMAGE_QUALITY_TIERS:
+        logger.warning(
+            f"Invalid image_quality '{image_quality}', defaulting to 'standard'"
+        )
+        image_quality = "standard"
+
     # Collect extra fields (agent-specific config)
     known_fields = {
         "$schema",
@@ -2325,6 +2340,7 @@ def load_agent_config(
         "interactive",
         "headless",
         "autonomy",
+        "image_quality",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -2363,6 +2379,7 @@ def load_agent_config(
         interactive=interactive_config,
         headless=headless_config,
         autonomy=autonomy,
+        image_quality=image_quality,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -2526,6 +2543,14 @@ def load_agent_config_from_dict(
         logger.warning(f"Invalid autonomy level '{autonomy}', defaulting to 'partial'")
         autonomy = "partial"
 
+    # Parse image-quality tier (economy|standard|high)
+    image_quality = data.get("image_quality", "standard")
+    if image_quality not in VALID_IMAGE_QUALITY_TIERS:
+        logger.warning(
+            f"Invalid image_quality '{image_quality}', defaulting to 'standard'"
+        )
+        image_quality = "standard"
+
     # Collect extra fields
     known_fields = {
         "$schema",
@@ -2547,6 +2572,7 @@ def load_agent_config_from_dict(
         "interactive",
         "headless",
         "autonomy",
+        "image_quality",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -2585,6 +2611,7 @@ def load_agent_config_from_dict(
         interactive=interactive_config,
         headless=headless_config,
         autonomy=autonomy,
+        image_quality=image_quality,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
