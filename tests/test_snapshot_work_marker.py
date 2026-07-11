@@ -44,6 +44,11 @@ async def test_marker_written_to_thread_context_on_success():
     svc._db.merge_thread_workspace_context.assert_any_await(
         "t1", {"last_snapshot_turns": 7}
     )
+    # Verify capture tar command includes xattrs/acls for overlay whiteout round-trip
+    ssh_argv = cse.call_args.args
+    tar_cmd = ssh_argv[-1]  # remote command is last positional arg
+    assert "--xattrs" in tar_cmd
+    assert "--acls" in tar_cmd
 
 
 @pytest.mark.asyncio
