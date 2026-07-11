@@ -10,9 +10,14 @@ tags:
 
 # Fix spec — RemoteBackend `_exec` channel-window deadlock wedges jobs forever
 
-**Status:** Implemented on `develop` 2026-07-10 (Tasks 1-4: drain loop,
-heavy-op timeouts, search cap, SFTP/keepalive hardening). Detection net and
-drain watchdog remain open — see Non-goals.
+**Status:** DONE — implemented, reviewed ("Ready to merge"), pushed and
+verified working 2026-07-10/11. Commits (post-push SHAs):
+`fb1a1992` (drain loop + `RemoteCommandTimeoutError`), `cc5fbfce` (heavy-op
+timeouts), search cap + `a0131d4f` (capped summary only at exact cap),
+`ab90cc8a` (keepalive + SFTP timeout + honest read_file timeout), `74865bb6`
+(SFTP timeouts no longer masquerade as missing paths; drain deadline binds
+under sustained output). The detection-net non-goal has since landed
+separately — see Non-goals.
 
 **What this fixes:** any `_exec` command whose output exceeds paramiko's channel
 window (2 MiB default) deadlocks the agent thread **permanently**, wedging the
@@ -176,12 +181,23 @@ Normal `develop` → CI → agents cycle out via drain. No config, no schema, no
 orchestrator changes. Wedged pre-fix agents can be unstuck with the runbook
 above.
 
-## Non-goals (separate slices)
+## Non-goals (separate slices) — status as of move to done/
 
-- **Detection net:** a `get_stuck_jobs` variant flagging `processing` jobs
-  whose latest **audit entry** (not heartbeat) is older than a threshold —
-  catches every wedge class, not just this one. Third wedge-class bug in
-  recent memory (version-upgrade drain livelock, loop-advance wedge, this);
-  worth its own slice.
-- **Drain watchdog:** force-freeze when a drain intent has been pending for
-  hours with zero graph progress, so wedged jobs can't pin stale-image agents.
+- **Detection net: LANDED separately** (`03675d28`, 2026-07-10): heartbeats
+  now carry `graph_progress`, and
+  `mark_stalled_working_agents_by_graph_progress` transitions agents stuck
+  in `working` without graph progress back to `ready` after a configurable
+  stall window — closing the "heartbeat masks a wedged graph" blind spot
+  this incident exposed (a wedge like job `2dbe6854` now self-detects
+  instead of sitting invisible for 8 h).
+- **Drain watchdog:** largely superseded — the graph-progress stall handler
+  releases a pinned agent by marking it `ready`, and with I/O deadlines now
+  binding, silent graph wedges should no longer occur. Revisit only if a
+  drain is ever again observed blocked for hours.
+- **Small deferred cleanups** (cosmetic, from final review): invalidate the
+  shared SFTP session after a `socket.timeout` (a late response on the
+  still-open channel can desync some paramiko versions); honest timeout
+  messages in `delete_file`/`_get_home_dir` (currently raw `TimeoutError`,
+  loud but unpolished); structural "capped" signal from the backend instead
+  of inferring from `total == SEARCH_RESULT_HARD_CAP` (unparseable grep
+  lines can drop the capped notice).
