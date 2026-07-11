@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from services import resolve_ssh_key_path
 from services.ssh_helpers import (
+    EXTRACT_HOME_REMOTE_CMD,
     build_agent_ssh_cmd,
     orchestrator_can_reach,
     stream_extract_snapshot,
@@ -643,12 +644,17 @@ class IdeSessionService:
             )
             return False
 
-        # Clone the Gitea repo into the workspace via SSH
+        # Clone the Gitea repo into the workspace via SSH. The fallback chain
+        # must be idempotent: the workspace may be non-empty with origin
+        # already configured (retry after a failed attempt, or a partial
+        # snapshot extraction that landed a captured .git), and the captured
+        # remote URL may embed stale credentials — hence add-or-set-url.
         clone_cmd = (
             f"git clone --branch {branch} {clone_url} /home/agent-host/workspace "
             f"2>/dev/null || "
             f"(cd /home/agent-host/workspace && git init && "
-            f"git remote add origin {clone_url} && "
+            f"(git remote add origin {clone_url} 2>/dev/null || "
+            f"git remote set-url origin {clone_url}) && "
             f"git fetch origin {branch} && "
             f"git checkout FETCH_HEAD)"
         )
@@ -888,6 +894,7 @@ class IdeSessionService:
         if not extracted:
             return False
 
+        await self._repair_git_after_snapshot(job_id, job, pod_ip, 30022)
         await self._seed_ide_profile_for_user(job_id, job, pod_ip, 30022)
 
         # code-server should already be running from the workspace entrypoint
@@ -973,9 +980,26 @@ class IdeSessionService:
                     job_id,
                 )
             rc, stderr = await stream_extract_snapshot(
-                pod_ip, ssh_port, tar_path, key_path=key_path
+                pod_ip,
+                ssh_port,
+                tar_path,
+                key_path=key_path,
+                remote_cmd=EXTRACT_HOME_REMOTE_CMD,
             )
             if rc != 0:
+                # tar exits 2 on any per-file error even when the payload
+                # extracted fine (e.g. an unwritable stray path). Probe the
+                # workspace before declaring failure — a populated workspace
+                # beats a hard error for a browse tool.
+                if await self._workspace_populated(pod_ip, ssh_port):
+                    logger.warning(
+                        "Snapshot extraction for job %s exited rc=%d but the "
+                        "workspace is populated — continuing: %s",
+                        job_id,
+                        rc,
+                        stderr.decode(errors="replace")[:300],
+                    )
+                    return True
                 error_msg = (
                     f"Snapshot extraction failed for job {job_id} (rc={rc}): "
                     f"{stderr.decode(errors='replace')[:500]}"
@@ -991,6 +1015,75 @@ class IdeSessionService:
                 return False
 
         return True
+
+    async def _workspace_populated(self, ssh_host: str, ssh_port: int) -> bool:
+        """True when the pod's workspace directory exists and is non-empty."""
+        import asyncio
+
+        probe_cmd = 'test -n "$(ls -A /home/agent-host/workspace 2>/dev/null)"'
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *build_agent_ssh_cmd(ssh_host, ssh_port, probe_cmd),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return (await proc.wait()) == 0
+        except Exception:
+            return False
+
+    async def _repair_git_after_snapshot(
+        self, job_id: str, job: dict, ssh_host: str, ssh_port: int
+    ) -> None:
+        """Best-effort: refetch git objects after a snapshot restore.
+
+        Snapshot capture excludes ``.git/objects`` (snapshot_service's
+        exclude list — "re-cloned/regenerated on restore"), so the restored
+        workspace repo has config/refs/index but no objects. A fetch
+        repopulates them; the embedded-credential remote URL from capture
+        time may also be stale, so it is refreshed first. Failure only
+        degrades the Source Control panel, never the session.
+        """
+        import asyncio
+
+        repo_name = job.get("repo_name")
+        if not repo_name:
+            return
+
+        clone_url = self._build_gitea_clone_url(repo_name)
+        branch = job.get("branch_name") or "main"
+        # --refetch skips have/want negotiation, which can die on "bad
+        # object" here: local refs point at objects the capture excluded.
+        # Older git (<2.36) lacks the flag — fall back to a plain fetch.
+        cmd = (
+            "cd /home/agent-host/workspace && "
+            f"(git remote add origin {clone_url} 2>/dev/null || "
+            f"git remote set-url origin {clone_url}) && "
+            f"(git fetch --refetch origin {branch} 2>/dev/null || "
+            f"git fetch origin {branch})"
+        )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *build_agent_ssh_cmd(ssh_host, ssh_port, cmd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+            if proc.returncode != 0:
+                logger.info(
+                    "Git repair fetch failed for job %s (rc=%d): %s",
+                    job_id,
+                    proc.returncode,
+                    err.decode(errors="replace")[:200],
+                )
+        except asyncio.TimeoutError:
+            logger.info("Git repair fetch timed out for job %s", job_id)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.info("Git repair fetch failed for job %s: %s", job_id, e)
 
     async def _seed_ide_profile_for_user(
         self, job_id: str, job: dict, ssh_host: str, ssh_port: int

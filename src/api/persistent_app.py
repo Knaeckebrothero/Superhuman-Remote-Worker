@@ -5204,6 +5204,69 @@ async def _poll_vm_ready(
     return None
 
 
+def _excerpt_for_title(text: str, cap: int = 240) -> str:
+    """Trim a message to a short excerpt for titling.
+
+    Cuts on a word boundary (never mid-word) and appends an ellipsis when
+    trimmed, so the title model reads it as an excerpt rather than a message
+    that "got cut off". The old hard 200-char chop landed mid-word (e.g.
+    ``the dog has a "Que``), which made the aux chat-model reply "It sounds
+    like your message got cut off" — and that reply became the thread title.
+    """
+    text = text.strip()
+    if len(text) <= cap:
+        return text
+    head = text[:cap].rsplit(None, 1)[0]  # drop the partial trailing word
+    return f"{head} …"
+
+
+# Deflection phrases an aux chat-model emits when it "answers" the sample
+# instead of titling it — a truncated opener reads as cut-off, or the text
+# references an image/table the title call never received (list-of-blocks image
+# parts are dropped below). Matched as lowercased substrings; a hit means the
+# model replied instead of titling, so the "title" is rejected and the
+# after-turn pass (which has the assistant's real reply for context) retries.
+_CONVERSATIONAL_TITLE_MARKERS = (
+    "i don't see",
+    "i do not see",
+    "i can't see",
+    "i cannot see",
+    "don't see any",
+    "no attached",
+    "wasn't attached",
+    "isn't attached",
+    "didn't come through",
+    "did not come through",
+    "message got cut off",
+    "got cut off",
+    "it sounds like",
+    "your message",
+    "the file may not",
+    "appears to be empty",
+    "i'm sorry",
+    "i am sorry",
+    "sorry, ",
+    "as an ai",
+    "i'm not able",
+    "i am not able",
+)
+
+
+def _title_looks_conversational(title: str) -> bool:
+    """True when a generated "title" is really the aux model replying to the
+    sample (deflecting about a truncated message or a missing image/table)
+    rather than naming the topic. Such a reply must never become the title.
+    """
+    text = (title or "").strip().lower()
+    if not text:
+        return False
+    # A real title is a short fragment; a conversational reply runs long even
+    # after the 100-char clamp. Both observed regressions were 13+ words.
+    if len(text.split()) > 12:
+        return True
+    return any(marker in text for marker in _CONVERSATIONAL_TITLE_MARKERS)
+
+
 async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[str]:
     """Generate a short title from conversation using AuxiliaryLLM."""
     if not auxiliary_llm or not messages:
@@ -5222,16 +5285,18 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         for m in messages[:10]:
             content = getattr(m, "content", None)
             if isinstance(content, str) and content:
-                sample.append(content[:200])
+                sample.append(_excerpt_for_title(content))
             elif isinstance(content, list):
-                # Handle list-of-blocks content (e.g. responses API)
+                # Handle list-of-blocks content (e.g. responses API). Image
+                # parts have no "text" and are dropped — hence the prompt below
+                # warns the model the excerpt may reference images it can't see.
                 text_parts = [
                     b.get("text", "") if isinstance(b, dict) else str(b)
                     for b in content
                 ]
                 joined = " ".join(t for t in text_parts if t)
                 if joined:
-                    sample.append(joined[:200])
+                    sample.append(_excerpt_for_title(joined))
         if not sample:
             logger.debug(
                 "Title generation skipped: no text content in %d messages",
@@ -5243,13 +5308,34 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         # generation gets the same main-model fallback as every other aux task —
         # a dead dedicated aux model yields a title on the main model instead of
         # a silent "Untitled Session".
+        #
+        # The prompt firmly frames the sample as an excerpt to *label*, not a
+        # message to *answer*: without this, a chat-model treats a truncated
+        # opener or an image-referencing line as a live turn and its reply
+        # ("It sounds like your message got cut off", "I don't see any attached
+        # image") becomes the title.
         response = await auxiliary_llm.ainvoke(
             [
                 SM(
-                    content="Generate a short title (5-8 words) for this conversation. "
-                    "Return ONLY the title, no quotes or punctuation."
+                    content=(
+                        "You write a short topic title (5-8 words) for a "
+                        "conversation. You are given only the opening excerpt. "
+                        "It may be truncated mid-sentence and may reference "
+                        "images, files, or tables you cannot see — this is "
+                        "expected; never comment on it and never reply to the "
+                        "content. Output ONLY the title as a plain noun phrase: "
+                        "no quotes, no punctuation, no sentences, and never "
+                        'begin with "I", "It", "You", or "Sorry".'
+                    )
                 ),
-                HM(content="\n".join(sample)),
+                HM(
+                    content=(
+                        "Conversation excerpt (may be truncated; may mention "
+                        'images or files you cannot see):\n"""\n'
+                        + "\n".join(sample)
+                        + '\n"""'
+                    )
+                ),
             ],
             task_name="title_generation",
         )
@@ -5258,6 +5344,14 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         title = text.strip()[:100] if text.strip() else None
         if not title:
             logger.debug("Title generation returned empty response")
+            return None
+        # Reject a title that is really the model replying to the sample (a
+        # deflection about truncation or a missing attachment); leave the
+        # placeholder so the after-turn pass retries with the assistant's reply
+        # for context, rather than persisting the deflection as the title.
+        if _title_looks_conversational(title):
+            logger.info("Title generation rejected conversational reply: %r", title)
+            return None
         return title
     except Exception as e:
         if auxiliary_llm is not None:

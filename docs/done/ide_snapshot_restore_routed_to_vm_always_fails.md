@@ -9,11 +9,12 @@ to `restoring` so the cockpit poll doesn't report a transient `failed`;
 `get_session_status` maps a session-level `unavailable` (topology verdict)
 to a terminal error response instead of falling through to `available` and
 re-offering a doomed retry; `start_session` propagates the topology error in
-its idempotent return; ruff format. Unit-verified: 95 tests green in
-`tests/test_ide_session.py` + `tests/test_lifecycle_vm_manager.py`, ruff
-clean. **Live k3d/dev smoke NOT yet run** — the verification plan below is
-the remaining gate; re-test "Open IDE" on job `7e45c299` (or any
-pod-snapshot pending_review job) after the next dev rollout.
+its idempotent return; ruff format (committed as `e402d946`).
+**Live smoke round 1 (2026-07-11 13:12 dev) found two more defects** in the
+never-before-executed extraction/clone chain — see "Live smoke round 1"
+section at the end. Fixes (scoped extraction + populated-workspace probe +
+idempotent clone + git repair fetch) implemented, 136 tests green,
+**awaiting the next deploy + retest on job `7e45c299`**.
 **Review notes:** the daemon-side `code_server_connections` heartbeat field
 is still aspirational (`management-daemon.py` never sends it), so the
 P2 reaper exemption cannot be triggered by phantom heartbeat-written
@@ -329,3 +330,69 @@ makes any remaining failure visible instead of silent.
    proof).
 7. Regression: `pytest tests/ -k ide` + `ruff check src/ orchestrator/
    tests/`.
+
+## Live smoke round 1 (2026-07-11 13:12 dev) — two more defects in the never-executed chain
+
+First real execution of the new path on job `7e45c299`. The good news
+first: the IDE pod came up in **8 seconds**, SSH on 30022 connected, the
+S3 download worked, extraction ran, and the cockpit **displayed the error**
+(P1 working). The session still failed, from a two-stage cascade:
+
+1. **Extraction rc=2 on system paths** (13:13:00): the snapshot tarball
+   contains `usr/local/...` alongside `home/agent-host/...` — capture's
+   `include_dirs` is `["/home/agent-host/", "/usr/local/"]`
+   (`snapshot_service.py:370-373`), which VM restores need. In a
+   workspace-image pod those files are root-owned and image-provided;
+   extracting as `agent-host` produced per-file
+   `tar: usr/local/bin/entrypoint.sh: Cannot open: File exists` noise and
+   exit 2 — **while the entire home content extracted fine** (verified live
+   on the pod: full workspace tree + `.git` present).
+2. **Fallback tripped over the partial success**: rc≠0 → treated as failure
+   → gitea fallback on the same pod → `git clone` refused (non-empty dir) →
+   fallback chain's `git remote add origin` died with
+   `error: remote origin already exists` (rc=3) — origin came from the
+   extracted `.git/config`. That second error is what the user saw.
+
+Also surfaced by reading the capture code: `--exclude=.git/objects` means
+**every snapshot-restored repo is hollow** (config/refs/index but no
+objects) — by design ("re-cloned/regenerated on restore"), but nothing on
+the IDE restore path did the regenerating.
+
+### Round-1 fixes (uncommitted at time of writing)
+
+- `ssh_helpers.py`: `EXTRACT_HOME_REMOTE_CMD = "zstd -d | tar -xf - -C /
+  home/agent-host"` + `remote_cmd` param on `stream_extract_snapshot`
+  (default unchanged — VM resume restore still extracts everything).
+- `_extract_snapshot_to_k8s_pod`: uses the scoped command; on rc≠0 probes
+  `_workspace_populated` (SSH `ls -A` on the workspace) and continues with
+  a warning when content landed — a populated workspace beats a hard error
+  for a browse tool. Empty workspace still fails the session.
+- `_restore_snapshot_container`: after extraction, best-effort
+  `_repair_git_after_snapshot` — `git remote add || set-url` (also
+  refreshes the captured credential-embedded URL, which goes stale when the
+  Gitea admin password rotates) + `git fetch origin <branch>` with a 60s
+  cap, repopulating the excluded objects. Failure logs at INFO and never
+  fails the session.
+- `_restore_k8s_ide_container`: clone fallback chain made idempotent
+  (`git remote add … || git remote set-url …`) so retries against a
+  populated workspace survive.
+- 5 new tests (scoped cmd, probe-continue, probe-fail, idempotent chain,
+  repair-fetch invocation); 136 green across the IDE/lifecycle files.
+
+### Remaining verification
+
+Redeploy, then Open IDE on `7e45c299` again: the leaked `ide-7e45c299-435`
+pod gets reused (create is 409-idempotent), extraction (agent-host-owned
+files only) should exit 0, and the session should go active in ~30s with
+the full workspace tree AND a working git (repair fetch). Check
+`git -C /home/agent-host/workspace log --oneline -1` via the IDE terminal
+as the acceptance probe for the repair step.
+
+### Loose end (non-blocking)
+
+IDE pods from **failed** sessions leak: the TTL sweeper only expires
+`active`/`idle` sessions and `stop_session` refuses non-active ones, so a
+pod whose restore failed sits until manually deleted (currently harmless —
+it gets adopted by the next attempt via the 409 path, and it's 250m/512Mi).
+Candidate: extend `check_ttl_all` to reap `failed` sessions with a
+`container_name` older than the idle timeout.
