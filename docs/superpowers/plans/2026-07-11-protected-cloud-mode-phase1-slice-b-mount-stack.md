@@ -51,7 +51,13 @@ Slice A's `seed_canary_fixture` returns `CanaryFixture(path, version_ref=None, t
 
 **Files:**
 - Modify: `orchestrator/services/cloud/nextcloud.py:1385-1404` (`seed_canary_fixture`/`remove_canary_fixture`), add `_enumerate_canary_refs`
-- Test: `tests/cloud/test_ro_canary_nextcloud.py` (create)
+- Modify (scope amendment, see below): `orchestrator/services/cloud/ro_probe.py` (`side_channel_probes` + `probe_read_only` gain `version_ref`/`trash_ref`; uploads-finalize probes a real reader-created upload session), `orchestrator/services/cloud/ro_engage.py` (true dav_root derivation + ref passthrough)
+- Test: `tests/cloud/test_ro_canary_nextcloud.py` (create), `tests/cloud/test_ro_probe.py` + `tests/cloud/test_ro_engage.py` (extend)
+
+**Scope amendment (added during execution — B1 review caught a plan omission):** curing the fixture alone leaves the refs dead code. Three wiring pieces are required for the stated purpose ("inconclusive → verified 403 on live NC") and belong to B1:
+1. `side_channel_probes(dav_root, username, *, version_ref=None, trash_ref=None)` — when given, real refs replace `_SYNTHETIC_FILEID/_SYNTHETIC_VERSIONID` (versions-restore URL) and `_SYNTHETIC_TRASH_ITEM` (trash-restore URL). `probe_read_only` gains the same kwargs and passes them through.
+2. `engage_ro_mount` currently passes `dav_root=grant.webdav_url` — the files-namespace URL, which builds nonsense side-channel URLs (`.../files/<reader>/<mount>/versions/...`). Derive the true DAV root (`{origin}/remote.php/dav`) from `grant.webdav_url` (split at `/remote.php/dav`) and pass `version_ref=canary.version_ref, trash_ref=canary.trash_ref`.
+3. The uploads-finalize side channel can never be cured writer-side (the URL is reader-namespaced: `{dav}/uploads/{reader}/...`). Inside `probe_read_only`'s side-channel loop, before the uploads-finalize probe, MKCOL a real upload session `{dav_root}/uploads/{username}/srw-ro-probe` as the reader (MKCOL in one's own uploads namespace is a legitimate reader capability, not a folder write); on MKCOL 201, run the finalize MOVE against that real session (403/405 = rejected) and best-effort DELETE the session after; on MKCOL failure, fall back to the synthetic id (stays inconclusive, fail-closed). tus-create is unchanged (live status tuned at the manual validation gate).
 
 **Interfaces:**
 - Consumes: `CanaryFixture` (`base.py:382`), `self.put_project_folder_file_bytes`, `self.delete_project_folder_file`, `self._client` (httpx), `handle: ProjectFolderHandle`.
