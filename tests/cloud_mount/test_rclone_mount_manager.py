@@ -422,3 +422,21 @@ def test_unmount_script_removes_token_files():
     script = manager._unmount_script(state)
 
     assert f"rm -f {state.token_path} {state.token_helper_path}" in script
+
+
+def test_skip_workspace_links_omits_symlink_install():
+    """Protected mode sets skip_workspace_links; the overlay owns the
+    workspace/cloud symlink (pointing at the merged view), so the plain
+    rclone mount must not install its own install_cloud_links.sh."""
+    cfg = _cloud_mount_cfg()
+    cfg["skip_workspace_links"] = True
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    manager._start_all_sync()
+    link_scripts = [p for p in backend.files if p.endswith("install_cloud_links.sh")]
+    assert link_scripts == []  # overlay owns the symlink in protected mode
