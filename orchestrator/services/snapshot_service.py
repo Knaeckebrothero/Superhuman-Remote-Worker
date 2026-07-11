@@ -385,9 +385,14 @@ class SnapshotService:
                 "--exclude=*/node_modules/*",
             ]
 
-            # Build SSH tar command
+            # Build SSH tar command. --xattrs/--acls so fuse-overlayfs opaque-dir
+            # xattrs + whiteouts survive capture/restore (protected cloud mode,
+            # design §11.3). The capture roots already EXCLUDE the merged overlay
+            # mount (it lives at /cloud/merged, outside /home/agent-host) and
+            # INCLUDE the upperdir at /home/agent-host/.overlay/upper.
             tar_cmd = (
-                f"tar -cf - {' '.join(exclude_patterns)} {' '.join(include_dirs)} 2>/dev/null"
+                f"tar --xattrs --xattrs-include='*' --acls -cf - "
+                f"{' '.join(exclude_patterns)} {' '.join(include_dirs)} 2>/dev/null"
                 " | zstd -1 -T0"
             )
             key_path = resolve_ssh_key_path()

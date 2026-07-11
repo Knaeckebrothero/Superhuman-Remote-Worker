@@ -25,7 +25,10 @@ from services import resolve_ssh_key_path
 logger = logging.getLogger(__name__)
 
 # Remote command run on the agent host to inflate + unpack a snapshot.
-EXTRACT_REMOTE_CMD = "zstd -d | tar -xf - -C /"
+# --xattrs/--acls so fuse-overlayfs opaque-dir xattrs + whiteouts round-trip
+# (protected cloud mode, design §11.3). char(0,0) whiteouts survive without
+# them on emptyDir, but opaque markers and some rootfs variants need them.
+EXTRACT_REMOTE_CMD = "zstd -d | tar --xattrs --xattrs-include='*' --acls -xf - -C /"
 
 # Scoped variant for in-cluster IDE pods: extract only the agent-host home.
 # Snapshots also carry /usr/local (VM restores need it), but in a
