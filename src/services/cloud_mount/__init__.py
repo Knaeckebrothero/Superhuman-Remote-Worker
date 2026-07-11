@@ -219,6 +219,36 @@ class RcloneMountManager:
                 lines.append(f"  vfs/stats: {_compact_rc(vfs)}")
         return "\n".join(lines)
 
+    def refresh_vfs(self, mount_id: str | None = None, *, recursive: bool = True) -> None:
+        """Flush the rclone VFS so a subsequent read sees the live cloud.
+
+        Uses ``vfs/refresh`` (re-PROPFINDs, invalidates changed content) — NOT
+        ``vfs/forget``, which does not flush already-read file content (design
+        §11.2). Applies to every active mount when ``mount_id`` is None.
+        """
+        targets = [
+            s for s in self._states if mount_id is None or s.mount_id == mount_id
+        ]
+        for state in targets:
+            self._run_remote_script(
+                f"vfs_refresh_{state.remote_name}.sh",
+                self._vfs_refresh_script(state, recursive=recursive),
+                timeout=120,
+            )
+
+    def _vfs_refresh_script(self, state: RcloneMountState, *, recursive: bool) -> str:
+        rec = "true" if recursive else "false"
+        return f"""#!/usr/bin/env bash
+set +e
+rclone rc --rc-addr {shlex.quote(state.rc_addr)} --rc-user {shlex.quote(state.rc_user)} --rc-pass {shlex.quote(state.rc_pass)} vfs/refresh recursive={rec} >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "vfs/refresh failed rc=$rc" >&2
+  exit "$rc"
+fi
+echo "{_OK}"
+"""
+
     def cache_usages(self) -> list[RcloneCacheUsage]:
         """Return current per-mount VFS cache usage."""
         if not self._states:

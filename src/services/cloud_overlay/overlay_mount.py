@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,21 @@ class OverlayMountManager:
         finally:
             self._active = False
 
+    def refresh(self, refresh_lower: Callable[[], None]) -> None:
+        """Refresh the frozen lower without losing the upperdir (design §11.2).
+
+        CALLER MUST QUIESCE FIRST: held FDs across an unmount get silent stale
+        reads. Sequence: PLAIN-unmount the overlay (``fusermount3 -u`` EBUSYs
+        while an FD is held, so an un-quiesced agent surfaces as an
+        OverlayMountError instead of silent staleness — never ``-uz`` here) →
+        refresh the rclone lower (callback) → remount the overlay. The upperdir
+        is untouched throughout; the workspace/cloud symlink already points at
+        the merged path from the initial mount, so no symlink work is needed.
+        """
+        self._run("overlay_pre_refresh_unmount.sh", self._plain_unmount_script(), timeout=60)
+        refresh_lower()
+        self._run("overlay_remount.sh", self._mount_body_only_script(), timeout=120)
+
     # --------------------------------------------------------------- scripts
 
     def _mount_script(self) -> str:
@@ -146,6 +162,36 @@ fi
 if mountpoint -q {merged}; then
   fusermount3 -uz {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null
 fi
+echo "{_OVERLAY_OK}"
+"""
+
+    def _plain_unmount_script(self) -> str:
+        merged = shlex.quote(self.merged)
+        return f"""#!/usr/bin/env bash
+set -euo pipefail
+trap 'rc=$?; echo "{_OVERLAY_FAILED} rc=${{rc}}"; exit "${{rc}}"' ERR
+# PLAIN unmount — EBUSYs while an FD is held (the quiesce guard, design §11.2).
+fusermount3 -u {merged} || fusermount -u {merged}
+echo "{_OVERLAY_OK}"
+"""
+
+    def _mount_body_only_script(self) -> str:
+        """Remount the overlay over the (refreshed) lower; no symlink work —
+        the symlink already points at the merged path from the initial mount."""
+        upper = shlex.quote(self.upper)
+        work = shlex.quote(self.work)
+        merged = shlex.quote(self.merged)
+        lower = shlex.quote(self.lower)
+        opts = shlex.quote(
+            f"lowerdir={self.lower},upperdir={self.upper},workdir={self.work}"
+        )
+        return f"""#!/usr/bin/env bash
+set -euo pipefail
+trap 'rc=$?; echo "{_OVERLAY_FAILED} rc=${{rc}}"; exit "${{rc}}"' ERR
+mkdir -p {upper} {work} {merged}
+if ! mountpoint -q {lower}; then echo "{_OVERLAY_FAILED} rc=2 (lower not mounted)"; exit 2; fi
+fuse-overlayfs -o {opts} {merged}
+mountpoint -q {merged}
 echo "{_OVERLAY_OK}"
 """
 
