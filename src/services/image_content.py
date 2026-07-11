@@ -33,7 +33,11 @@ from typing import Optional, Sequence
 
 from langchain_core.messages import HumanMessage
 
-from src.services.image_downscale import DEFAULT_BYTE_THRESHOLD, downscale_image_b64
+from src.services.image_downscale import (
+    DEFAULT_BYTE_THRESHOLD,
+    downscale_image_b64,
+    resolve_max_edge,
+)
 
 # ---------------------------------------------------------------------------
 # Tag formats — single source of truth shared with src/tools/workspace/files.py
@@ -145,6 +149,22 @@ def make_multimodal_user_message(
             )
         )
     return HumanMessage(content=parts)
+
+
+def resolve_image_max_edge(config: object) -> int | None:
+    """Resolve the downscale max-edge (px) for images from an agent config.
+
+    Combines the user/session ``image_quality`` tier (default ``standard``)
+    with the model family's ``limits.image_tokens.max_edge`` cap. Duck-typed
+    (no hard config-type dependency); returns ``None`` when no config is
+    available, which leaves images untouched.
+    """
+    if config is None:
+        return None
+    limits = getattr(config, "limits", None)
+    image_tokens = getattr(limits, "image_tokens", None) or {}
+    tier = getattr(config, "image_quality", None) or "standard"
+    return resolve_max_edge(tier, image_tokens.get("max_edge"))
 
 
 # ---------------------------------------------------------------------------
