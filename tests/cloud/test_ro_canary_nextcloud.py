@@ -113,3 +113,92 @@ async def test_seed_canary_leaves_refs_none_when_server_exposes_none():
     fixture = await backend.seed_canary_fixture(_handle())
     assert fixture.version_ref is None  # no version href -> stays inconclusive
     assert fixture.trash_ref is None
+
+
+# ---------------------------------------------------------------------------
+# F1 (review fix) — OC-FileId leading-digit extraction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_seed_canary_takes_leading_digit_run_only_from_mixed_fileid():
+    # Real NC OC-FileId headers are `{fileid}{instance-suffix}` and the
+    # suffix can itself contain digits (e.g. "137occ7ab92kf"). Collecting
+    # EVERY digit char (the pre-fix bug) reads this as "137792" instead of
+    # the correct leading run "137". Only the PUT response is overridden;
+    # the versions/trashbin PROPFIND bodies are the base fake's (their
+    # content doesn't matter here — this test is only about the fileid
+    # extraction feeding into the `{fileid}/...` version_ref prefix).
+    class MixedFileId(FakeNcCanary):
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "PUT" and request.url.path.endswith(
+                "/.srw-ro-canary/probe.txt"
+            ):
+                self.put_path = request.url.path
+                return httpx.Response(201, headers={"OC-FileId": "137occ7ab92kf"})
+            return super().handler(request)
+
+    backend, _ = _nc_backend_with_fake(MixedFileId())
+    fixture = await backend.seed_canary_fixture(_handle())
+    assert fixture.version_ref is not None
+    assert fixture.version_ref.startswith("137/")
+    assert not fixture.version_ref.startswith("137792")
+
+
+# ---------------------------------------------------------------------------
+# F2 (review fix) — collection self-href must be filtered, not just the
+# first child. A Depth:1 PROPFIND always re-states the queried collection
+# itself as its own first <d:response>; the two brief-specified fakes above
+# never emit one (their bodies contain only the real child), so they don't
+# exercise `_first_child_leaf`'s self-href skip at all. This is a realistic
+# body shape: self-href FIRST, then the real item.
+# ---------------------------------------------------------------------------
+
+
+class FakeNcCanarySelfHrefFirst(FakeNcCanary):
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        method, path = request.method, request.url.path
+        if method == "PUT" and path.endswith("/.srw-ro-canary/probe.txt"):
+            self.put_path = path
+            return httpx.Response(201, headers={"OC-FileId": "12345"})
+        if method == "PROPFIND" and "/versions/" in path:
+            body = (
+                '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
+                "<d:response><d:href>/remote.php/dav/versions/agent-service/"
+                "versions/12345</d:href>"
+                "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
+                "</d:response>"
+                "<d:response><d:href>/remote.php/dav/versions/agent-service/"
+                "versions/12345/1699999999</d:href>"
+                "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
+                "</d:response></d:multistatus>"
+            )
+            return httpx.Response(207, text=body)
+        if method == "PROPFIND" and "/trashbin/" in path:
+            body = (
+                '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
+                "<d:response><d:href>/remote.php/dav/trashbin/agent-service/"
+                "trash/</d:href>"
+                "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
+                "</d:response>"
+                "<d:response><d:href>/remote.php/dav/trashbin/agent-service/"
+                "trash/probe.txt.d1699999999</d:href>"
+                "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
+                "</d:response></d:multistatus>"
+            )
+            return httpx.Response(207, text=body)
+        return httpx.Response(200, text="<d:multistatus xmlns:d='DAV:'/>")
+
+
+@pytest.mark.asyncio
+async def test_seed_canary_skips_collection_self_href_before_real_item():
+    backend, _ = _nc_backend_with_fake(FakeNcCanarySelfHrefFirst())
+    fixture = await backend.seed_canary_fixture(_handle())
+    # Versions namespace: self-href's trailing segment equals the fileid
+    # ("12345") — must be skipped in favor of the real version id.
+    assert fixture.version_ref == "12345/1699999999"
+    # Trashbin namespace: self-href's trailing segment is "trash" (the
+    # collection itself) — must be skipped in favor of the real item, not
+    # returned as the bogus trash_ref="trash" the pre-fix bug would emit.
+    assert fixture.trash_ref == "probe.txt.d1699999999"
+    assert fixture.trash_ref != "trash"

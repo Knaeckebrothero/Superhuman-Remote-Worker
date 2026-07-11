@@ -26,6 +26,7 @@ Uses two Nextcloud APIs:
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -1413,9 +1414,13 @@ class NextcloudBackend:
         fid = resp.headers.get("OC-FileId") if resp is not None else None
         if not fid:
             return None
-        # OC-FileId is a 20-char padded token on some builds; the versions API
-        # keys on the leading numeric id. Take the leading digits.
-        digits = "".join(ch for ch in fid if ch.isdigit())
+        # Real OC-FileId headers are `{fileid}{instance-suffix}` (e.g.
+        # "137occ7ab92kf") where the suffix can itself contain digits — a
+        # naive "collect every digit char" (the original bug here) would
+        # read that as "137792" instead of "137". The versions API keys on
+        # the LEADING numeric run only, so take the leading digit run and
+        # stop at the first non-digit.
+        digits = "".join(itertools.takewhile(str.isdigit, fid))
         return digits or None
 
     async def _put_project_folder_file_bytes_raw(

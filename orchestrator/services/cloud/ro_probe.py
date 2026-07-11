@@ -51,15 +51,23 @@ how it is cured:
 * ``skipped`` — the side channels were never attempted because
   ``dav_root``/``username`` weren't supplied to ``probe_read_only``.
   Curable: supply both.
-* ``inconclusive`` — a side channel came back 404/409. With the current
-  synthetic ids this is the *expected* outcome against live backends:
-  it proves the request round-tripped, not that the authz layer
-  rejected a real restore. Curable: Phase 1 probes REAL fixture ids
-  (the orchestrator-side write identity seeds a canary file, versions
-  it, and trashes it; the RO identity then attempts restore of those
-  real ids), and/or the design's §6.4 live-probe run
+* ``inconclusive`` — a side channel came back 404/409. ``side_channel_
+  probes``/``probe_read_only`` accept ``version_ref``/``trash_ref``
+  kwargs; when supplied (the orchestrator-side write identity's
+  ``seed_canary_fixture`` discovers them — see ``nextcloud.py``) the
+  versions-restore/trash-restore probes target those REAL ids instead of
+  the ``_SYNTHETIC_*`` placeholders, turning a 404 into a verified ``403``
+  rejection. When a ref is ``None`` (not supplied, or the server exposed
+  no real id for this canary) that probe falls back to the synthetic
+  placeholder and stays inconclusive — fail-closed, curable by supplying
+  the ref and/or the design's §6.4 live-probe run
   (docs/design/cloud_access_unification.md §6 item 4 — "Live RO probe")
-  tunes the status map from observed behavior.
+  tuning the status map from observed behavior. The uploads-finalize
+  side channel is different: it can never be cured by an injectable ref
+  (the URL is reader-namespaced), so ``probe_read_only`` instead
+  self-provisions a REAL reader-owned upload session via ``MKCOL`` before
+  probing it; only an MKCOL failure leaves it on the synthetic id
+  (still inconclusive, fail-closed).
 
 Phase 1 must call BOTH ``check_version_floors`` and ``probe_read_only``
 and require ``ok`` from each — passing one gate does not imply the
@@ -127,7 +135,11 @@ _SYNTHETIC_UPLOAD_TARGET = "srw-ro-probe-target"
 
 
 def side_channel_probes(
-    dav_root: str, username: str
+    dav_root: str,
+    username: str,
+    *,
+    version_ref: str | None = None,
+    trash_ref: str | None = None,
 ) -> list[tuple[str, str, dict[str, Any]]]:
     """Build the real restore/finalize requests for the RO-bypass CVE class.
 
@@ -136,6 +148,17 @@ def side_channel_probes(
     needed, ready to be passed to ``client.request(verb, **request_kwargs)``
     (after popping ``"url"`` for the positional slot — see
     ``probe_read_only``).
+
+    ``version_ref`` (shape ``"{fileid}/{versionid}"``) and ``trash_ref``
+    (shape ``"{trashed_item_name}"``), when supplied, replace the
+    ``_SYNTHETIC_FILEID``/``_SYNTHETIC_VERSIONID`` and
+    ``_SYNTHETIC_TRASH_ITEM`` placeholders in the versions-restore and
+    trash-restore requests (``trash_ref`` replaces the placeholder in BOTH
+    the URL and the ``Destination`` header) with ids the server actually
+    knows — turning a 404 ``inconclusive`` into a verified ``403``
+    rejection on a correctly-RO reader. ``None`` (the default) keeps the
+    synthetic placeholder, so that side channel stays inconclusive,
+    fail-closed.
 
     Four real operations, not a fourth generic-folder POST:
 
@@ -161,15 +184,18 @@ def side_channel_probes(
     the probe to run.
     """
     root = dav_root.rstrip("/")
+    version_segment = (
+        version_ref
+        if version_ref is not None
+        else f"{_SYNTHETIC_FILEID}/{_SYNTHETIC_VERSIONID}"
+    )
+    trash_segment = trash_ref if trash_ref is not None else _SYNTHETIC_TRASH_ITEM
     return [
         (
             "MOVE",
             "versions-restore",
             {
-                "url": (
-                    f"{root}/versions/{username}/versions/"
-                    f"{_SYNTHETIC_FILEID}/{_SYNTHETIC_VERSIONID}"
-                ),
+                "url": f"{root}/versions/{username}/versions/{version_segment}",
                 "headers": {
                     "Destination": f"{root}/versions/{username}/restore/target"
                 },
@@ -179,10 +205,10 @@ def side_channel_probes(
             "MOVE",
             "trash-restore",
             {
-                "url": f"{root}/trashbin/{username}/trash/{_SYNTHETIC_TRASH_ITEM}",
+                "url": f"{root}/trashbin/{username}/trash/{trash_segment}",
                 "headers": {
                     "Destination": (
-                        f"{root}/trashbin/{username}/restore/{_SYNTHETIC_TRASH_ITEM}"
+                        f"{root}/trashbin/{username}/restore/{trash_segment}"
                     )
                 },
             },
@@ -245,6 +271,8 @@ async def probe_read_only(
     *,
     dav_root: str | None = None,
     username: str | None = None,
+    version_ref: str | None = None,
+    trash_ref: str | None = None,
 ) -> RoProbeResult:
     """Verify a mount identity is read-only against ``base_url``+``path``.
 
@@ -271,6 +299,19 @@ async def probe_read_only(
     same as any other unexpected status; it is never classified as
     ``inconclusive`` (401 is not in ``_INCONCLUSIVE_STATUSES``) or silently
     dropped.
+
+    ``version_ref``/``trash_ref`` are passed straight through to
+    ``side_channel_probes`` (real ids in place of the synthetic
+    placeholders — see that function's docstring). Separately, when
+    ``dav_root``/``username`` are supplied, this function first attempts to
+    self-provision a REAL reader-owned upload session (``MKCOL
+    {dav_root}/uploads/{username}/srw-ro-probe``) before probing
+    uploads-finalize: a 201 retargets that probe at the real session so a
+    403/405 is a verified rejection instead of a synthetic-id 404; any
+    other MKCOL outcome (including a transport error, which is NOT itself
+    recorded as a probe failure — it's setup, not a verb probe) falls back
+    to the synthetic transfer id, same as before. The provisioned session
+    is best-effort deleted after the side-channel loop.
     """
     target = base_url.rstrip("/") + "/" + path.lstrip("/")
     failures: list[str] = []
@@ -329,7 +370,52 @@ async def probe_read_only(
             failures.append(f"{label} -> {resp.status_code} (expected 403/405)")
 
     if dav_root is not None and username is not None:
-        for verb, note, req in side_channel_probes(dav_root, username):
+        root = dav_root.rstrip("/")
+        # Reuses _SYNTHETIC_TRANSFER_ID as the session name whether or not
+        # MKCOL succeeds — the URL shape is identical either way; what
+        # differs is whether a real session exists behind it (tracked by
+        # `real_upload_session` below), not the name itself.
+        upload_session_url = f"{root}/uploads/{username}/{_SYNTHETIC_TRANSFER_ID}"
+        real_upload_session = False
+        try:
+            mkcol_resp = await client.request("MKCOL", upload_session_url)
+        except Exception:
+            # A transport error on this provisioning step is NOT a probe
+            # result — it's setup, not a verb probe. Fall back to the
+            # synthetic transfer id below (that side channel stays
+            # inconclusive, fail-closed) rather than recording a failure.
+            mkcol_resp = None
+        if mkcol_resp is not None and mkcol_resp.status_code == 201:
+            real_upload_session = True
+
+        probes = side_channel_probes(
+            dav_root, username, version_ref=version_ref, trash_ref=trash_ref
+        )
+        if real_upload_session:
+            # A real reader-owned session exists — retarget uploads-finalize
+            # at it so a 403/405 is a verified rejection, not a synthetic-id
+            # 404. MKCOL in one's own uploads namespace is a legitimate
+            # reader capability, not a folder write, so this doesn't
+            # contaminate the write-verb probes above.
+            probes = [
+                (verb, note, req)
+                if not (verb == "MOVE" and note == "uploads-finalize")
+                else (
+                    "MOVE",
+                    "uploads-finalize",
+                    {
+                        "url": f"{upload_session_url}/.file",
+                        "headers": {
+                            "Destination": (
+                                f"{root}/files/{username}/{_SYNTHETIC_UPLOAD_TARGET}"
+                            )
+                        },
+                    },
+                )
+                for verb, note, req in probes
+            ]
+
+        for verb, note, req in probes:
             label = f"{verb} ({note})"
             url = req["url"]
             kwargs = {k: v for k, v in req.items() if k != "url"}
@@ -345,8 +431,9 @@ async def probe_read_only(
                 continue
             if status in _INCONCLUSIVE_STATUSES:
                 inconclusive.append(
-                    f"{label} -> {status} (synthetic id; authz layer may not "
-                    "have been reached — inconclusive, not verified rejected)"
+                    f"{label} -> {status} (id not recognized by the server; "
+                    "authz layer may not have been reached — inconclusive, "
+                    "not verified rejected)"
                 )
                 continue
             # 401 falls through to here too (no longer in REJECTED_STATUSES
@@ -355,6 +442,15 @@ async def probe_read_only(
             # anomalous, and must fail closed rather than land in
             # `inconclusive` or go unclassified.
             failures.append(f"{label} -> {status} (expected 403/405; write path open)")
+
+        if real_upload_session:
+            # Best-effort cleanup of the session this probe provisioned;
+            # errors here are swallowed (not a probe result, and the probe's
+            # verdict is already fully determined by the loop above).
+            try:
+                await client.request("DELETE", upload_session_url)
+            except Exception:
+                pass
     else:
         # dav_root/username weren't supplied — the side channels were
         # never attempted, so the gate refuses until they are (see
