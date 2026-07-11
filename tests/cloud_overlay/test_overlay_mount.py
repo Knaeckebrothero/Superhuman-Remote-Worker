@@ -157,13 +157,40 @@ def test_health_check_true_on_ok_false_on_enotconn():
     assert _manager(dead).health_check() is False
 
 
+def test_health_check_false_when_no_sentinel_in_output():
+    backend = FakeRemoteBackend()
+    backend.outputs_by_script["overlay_probe.sh"] = "garbled output with no sentinel\n"
+    assert _manager(backend).health_check() is False
+
+
 def test_heal_lazy_unmounts_overlay_first_then_remounts_lower_then_overlay():
     backend = FakeRemoteBackend()
     mgr = _manager(backend)
-    order: list[str] = []
-    mgr.heal(lambda: order.append("lower-remounted"))
-    assert order == ["lower-remounted"]
-    unmount = next(b for p, b in backend.files.items() if p.endswith("overlay_heal_unmount.sh"))
+    mgr.mount()
+    starting_commands = len(backend.commands)
+    calls: list[int] = []
+
+    def _remount_lower() -> None:
+        # Record how many remote scripts have run since mount(): must be
+        # exactly 1 (the lazy heal-unmount) when this callback fires, proving
+        # order: lazy-unmount -> callback -> remount.
+        calls.append(len(backend.commands) - starting_commands)
+
+    mgr.heal(_remount_lower)
+    assert calls == [1], "callback must fire after exactly 1 script (heal-unmount)"
+
+    commands = [cmd for cmd, _timeout in backend.commands[starting_commands:]]
+    assert len(commands) == 2, "expected exactly 2 remote scripts: heal-unmount + remount"
+    assert "overlay_heal_unmount.sh" in commands[0]
+    assert "overlay_remount.sh" in commands[1]
+
+    unmount = next(
+        b for p, b in backend.files.items() if p.endswith("overlay_heal_unmount.sh")
+    )
     assert "fusermount3 -uz /cloud/merged" in unmount  # LAZY is correct on heal
-    remount = next(b for p, b in backend.files.items() if p.endswith("overlay_remount.sh"))
+
+    remount = next(
+        b for p, b in backend.files.items() if p.endswith("overlay_remount.sh")
+    )
     assert "fuse-overlayfs -o lowerdir=/cloud/lower" in remount
+    assert "fusermount3 -u" not in remount  # no unmount folded in
