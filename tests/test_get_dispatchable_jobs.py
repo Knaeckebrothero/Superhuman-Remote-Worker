@@ -63,6 +63,7 @@ async def db(pg_dsn):
                 project_id uuid,
                 parent_job_id uuid,
                 priority int NOT NULL DEFAULT 0,
+                runner_kind text NOT NULL DEFAULT 'user',
                 branch_name text,
                 context jsonb,
                 created_at timestamptz NOT NULL DEFAULT now(),

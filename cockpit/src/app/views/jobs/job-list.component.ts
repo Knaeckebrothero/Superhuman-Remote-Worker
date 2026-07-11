@@ -178,6 +178,11 @@ interface JobRow {
                         <span class="config-badge">{{ row.job.config_name }}</span>
                       }
                     </div>
+                    @if (row.job.status === 'failed' && row.job.error_message) {
+                      <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
+                        {{ 'jobs.failureReason' | transloco }}: {{ row.job.error_message }}
+                      </div>
+                    }
                   </td>
                   <td class="project-cell">
                     <span
@@ -765,6 +770,15 @@ interface JobRow {
         font-family: 'JetBrains Mono', monospace;
         font-size: 10px;
         color: var(--text-muted, #6c7086);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .job-error {
+        margin-top: 3px;
+        font-size: 10px;
+        color: var(--danger, #f38ba8);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;

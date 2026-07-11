@@ -2166,6 +2166,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         project_ids=[str(job["project_id"])]
                         if job.get("project_id")
                         else [],
+                        runner_kind=str(job.get("runner_kind") or "user"),
                     )
                 resolved_config = await inject_blob_credentials(
                     _resolved,
@@ -2352,6 +2353,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                     project_ids=[str(job["project_id"])]
                     if job.get("project_id")
                     else [],
+                    runner_kind=str(job.get("runner_kind") or "user"),
                 )
             except GrantDenied as gd:
                 logger.warning("Resume denied for job %s: %s", job.get("id"), gd)
@@ -3239,10 +3241,6 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
     # own-provisioned subjobs don't — leave them to the normal path.
     if not own_container and not own_vm:
         return ("proceed", None)
-    # Snapshot already usable (e.g. a critic spawned long after the parent pod
-    # went ready) — no refresh needed.
-    if own_container.get("status") == "ready" or own_vm.get("status") == "ready":
-        return ("proceed", None)
 
     try:
         parent = await postgres_db.get_job(str(parent_id))
@@ -3412,6 +3410,60 @@ def _grant_violations_detail(violations: list[str]) -> str:
     return "config exceeds your capability grants: " + "; ".join(violations)
 
 
+_PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
+    "automation_id",
+    "automation_name",
+    "automation_trigger",
+    "cloud_baseline",
+    "delegation_results",
+    "delegation_timed_out",
+    "git_remote_url",
+    "graft_output_path",
+    "lifecycle_marker",
+    "loop_campaign_id",
+    "loop_campaign_index",
+    "loop_id",
+    "loop_iteration",
+    "loop_remaining",
+    "loop_role",
+    "loop_seq_index",
+    "parent_job_id",
+    "runner_kind",
+    "runner_source",
+    "scholar_target",
+    "snapshot",
+    "verification_target",
+    "vm",
+    "workspace_container",
+}
+_PUBLIC_JOB_CONFIG_RESERVED_KEYS = {
+    "lifecycle_marker",
+    "parent_job_id",
+    "runner_kind",
+    "runner_source",
+}
+
+
+def _strip_public_job_reserved_markers(job: "JobCreate") -> None:
+    """Remove system-only job markers from public create payloads."""
+    job.parent_job_id = None
+    job.creation_order = None
+    job.worktree_path = None
+    job.delegation_context = None
+    if isinstance(job.context, dict):
+        job.context = {
+            key: value
+            for key, value in job.context.items()
+            if key not in _PUBLIC_JOB_CONTEXT_RESERVED_KEYS
+        }
+    if isinstance(job.config_override, dict):
+        job.config_override = {
+            key: value
+            for key, value in job.config_override.items()
+            if key not in _PUBLIC_JOB_CONFIG_RESERVED_KEYS
+        }
+
+
 async def _grant_project_ids(user: dict) -> list[str]:
     """Project scope ids for grant resolution. user_visible_project_ids returns
     'all' for admins (who bypass anyway) — treat as no project constraint."""
@@ -3474,22 +3526,49 @@ async def _enforce_expert_save(
     await _enforce_save_grants(config, user=user)
 
 
-async def _enforce_dispatch_grants(
-    merged: dict, *, runner_user_id: str | None, project_ids: list[str]
-) -> None:
-    """Authoritative dispatch PEP (decision 9): the merged config must fit the
-    RUNNER's grants. Raises GrantDenied on violation. Admin runner bypasses.
-    NOTE (v1 stance): runner = job owner (job['user_id']); for delegation children
-    inheriting a privileged owner this bypasses (spec defers transitive checks)."""
+async def _resolve_runner_grants(
+    *,
+    runner_user_id: str | None,
+    project_ids: list[str],
+    runner_kind: str = "user",
+) -> dict[str, Any] | None:
+    """Resolve effective dispatch grants for the job runner.
+
+    ``None`` means admin bypass. Lifecycle subjobs keep the owner's capability
+    grants but run with an elevated autonomy ceiling so system verification and
+    research jobs do not pause on the owner's review ceiling.
+    """
     user = await postgres_db.get_user(runner_user_id) if runner_user_id else None
     if user and user.get("is_admin"):
-        return
-    from src.core.capability_grants import evaluate
+        return None
     from services.grants_service import resolve_grants_for
 
     grants = await resolve_grants_for(
         postgres_db, user_id=runner_user_id, project_ids=project_ids
     )
+    if runner_kind == "lifecycle":
+        grants = dict(grants)
+        grants["autonomy_ceiling"] = "full"
+    return grants
+
+
+async def _enforce_dispatch_grants(
+    merged: dict,
+    *,
+    runner_user_id: str | None,
+    project_ids: list[str],
+    runner_kind: str = "user",
+) -> None:
+    """Authoritative dispatch PEP: merged config must fit runner grants."""
+    from src.core.capability_grants import evaluate
+
+    grants = await _resolve_runner_grants(
+        runner_user_id=runner_user_id,
+        project_ids=project_ids,
+        runner_kind=runner_kind,
+    )
+    if grants is None:
+        return
     violations = evaluate(merged, grants)
     if violations:
         raise GrantDenied(violations)
@@ -6655,12 +6734,14 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
     branched from the project's shared jobs repo instead of getting its own
     per-job repo.
     """
-    if not is_internal_call(request):
+    internal_call = is_internal_call(request)
+    if not internal_call:
         caller = await require_approved_user(request, postgres_db)
         # Force user_id to caller; never honor body.user_id from a cockpit
         # caller (F2 pattern). Project membership is checked below once we
         # know the resolved project_id.
         job.user_id = str(caller["id"])
+        _strip_public_job_reserved_markers(job)
         if job.project_id:
             await require_project_member(
                 request, postgres_db, str(job.project_id), min_role="editor"
@@ -6853,7 +6934,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         # (agent, MCP) bypass the per-user check. Skip + log the rest.
         if selected_ds_ids:
             creator = None
-            if not is_internal_call(request) and effective_user_id:
+            if not internal_call and effective_user_id:
                 try:
                     creator = await postgres_db.get_user(effective_user_id)
                 except Exception:
@@ -8918,6 +8999,7 @@ async def resume_job(
                 _rcap["merged_fragment"],
                 runner_user_id=str(job["user_id"]) if job.get("user_id") else None,
                 project_ids=[str(job["project_id"])] if job.get("project_id") else [],
+                runner_kind=str(job.get("runner_kind") or "user"),
             )
         except GrantDenied as gd:
             logger.warning("Resume denied for job %s: %s", job_id, gd)
@@ -9769,6 +9851,7 @@ async def _spawn_scholar_subjob(
         project_id=project_id,
         priority=10,
         user_id=str(job["user_id"]) if job.get("user_id") else None,
+        runner_kind="lifecycle",
     )
 
     scholar_job_id = str(scholar_job["id"])
@@ -10557,6 +10640,7 @@ async def _trigger_verification_on_complete(
             project_id=project_id,
             priority=10,
             user_id=str(job["user_id"]) if job.get("user_id") else None,
+            runner_kind="lifecycle",
         )
 
         critic_job_id = str(critic_job["id"])

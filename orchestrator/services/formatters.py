@@ -55,13 +55,16 @@ def format_jobs(jobs: list[dict[str, Any]]) -> str:
             "cancelled": "⛔",
         }.get(job.get("status", ""), "❓")
 
-        lines.append(
+        entry = (
             f"{status_icon} {job['id']}\n"
-            f"   Config: {job.get('config', 'N/A')}\n"
+            f"   Config: {job.get('config', job.get('config_name', 'N/A'))}\n"
             f"   Status: {job.get('status', 'N/A')}\n"
             f"   Created: {job.get('created_at', 'N/A')}\n"
             f"   Audit entries: {job.get('audit_count', 'N/A')}\n"
         )
+        if job.get("error_message"):
+            entry += f"   Error: {job['error_message']}\n"
+        lines.append(entry)
 
     return "\n".join(lines)
 
@@ -83,8 +86,9 @@ def format_job_detail(job: dict[str, Any]) -> str:
             description = description[:500] + "..."
         lines.append(f"\nDescription:\n{description}")
 
-    if job.get("error"):
-        lines.append(f"\nError: {job['error']}")
+    error_message = job.get("error_message") or job.get("error")
+    if error_message:
+        lines.append(f"\nError: {error_message}")
 
     return "\n".join(lines)
 
@@ -322,8 +326,9 @@ def format_job_summary(
             lines.append(
                 f"  Description: {desc[:200]}{'...' if len(desc) > 200 else ''}"
             )
-        if job.get("error"):
-            lines.append(f"  Error: {job['error']}")
+        error_message = job.get("error_message") or job.get("error")
+        if error_message:
+            lines.append(f"  Error: {error_message}")
     else:
         lines.append("  (no data)")
     lines.append("")

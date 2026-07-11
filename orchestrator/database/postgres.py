@@ -693,7 +693,8 @@ class PostgresDB:
                        j.config_name, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.repo_name, j.branch_name, j.merge_status,
-                       j.diff_status, j.exported_at, j.created_at,
+                       j.diff_status, j.exported_at, j.error_message,
+                       j.created_at,
                        j.context->'snapshot'->>'status' AS snapshot_status,
                        p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
@@ -779,7 +780,8 @@ class PostgresDB:
                        j.config_name, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority,
                        j.repo_name, j.branch_name, j.merge_status,
-                       j.diff_status, j.exported_at, j.created_at,
+                       j.diff_status, j.exported_at, j.error_message,
+                       j.created_at,
                        j.context->'snapshot'->>'status' AS snapshot_status,
                        p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
@@ -829,6 +831,7 @@ class PostgresDB:
                        j.cloud_diff_baseline_commit, j.diff_status,
                        j.exported_folder_handle, j.exported_at,
                        j.creation_order, j.worktree_path, j.delegation_context,
+                       j.error_message, j.error_details, j.runner_kind,
                        j.created_at, j.updated_at, j.description, j.context,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
                 FROM jobs j
@@ -858,6 +861,7 @@ class PostgresDB:
         worktree_path: str | None = None,
         delegation_context: str | None = None,
         expert_id: str | None = None,
+        runner_kind: str = "user",
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -888,9 +892,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind
                 """,
                 description,
                 document_path or document_dir,
@@ -908,6 +912,7 @@ class PostgresDB:
                 worktree_path,
                 delegation_context,
                 UUID(expert_id) if expert_id else None,
+                runner_kind,
             )
 
         return dict(row)
@@ -3237,7 +3242,7 @@ class PostgresDB:
                 """
                 SELECT j.id, j.description, j.status, j.config_name,
                        j.config_override, j.assigned_agent_id, j.user_id,
-                       j.project_id, j.parent_job_id, j.priority,
+                       j.project_id, j.parent_job_id, j.priority, j.runner_kind,
                        j.branch_name, j.context, j.created_at
                 FROM jobs j
                 -- These three terms are the partial index idx_jobs_dispatchable

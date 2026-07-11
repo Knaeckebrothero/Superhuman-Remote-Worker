@@ -13,6 +13,16 @@ import orchestrator.main as m
 _UID = "11111111-1111-1111-1111-111111111111"
 
 
+def _patch_grants_db(monkeypatch, *, user_rows=None, is_admin=False):
+    fake = AsyncMock()
+    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": is_admin})
+    fake.list_grants_for_scopes = AsyncMock(
+        return_value={"user": user_rows or [], "project": [], "global": []}
+    )
+    monkeypatch.setattr(m, "postgres_db", fake)
+    return fake
+
+
 def test_violations_detail_lists_keys():
     assert "shell_tools" in m._grant_violations_detail(
         ["shell_tools: tools.shell requires the shell_tools grant"]
@@ -44,12 +54,7 @@ async def test_enforce_save_grants_raises_422_for_ungranted(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_enforce_dispatch_grants_raises_grantdenied(monkeypatch):
-    fake = AsyncMock()
-    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": False})
-    fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": [], "project": [], "global": []}
-    )
-    monkeypatch.setattr(m, "postgres_db", fake)
+    _patch_grants_db(monkeypatch)
     with pytest.raises(m.GrantDenied) as ei:
         await m._enforce_dispatch_grants(
             {"tools": {"shell": ["ls"]}}, runner_user_id=_UID, project_ids=[]
@@ -59,9 +64,7 @@ async def test_enforce_dispatch_grants_raises_grantdenied(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_enforce_dispatch_grants_admin_bypass(monkeypatch):
-    fake = AsyncMock()
-    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": True})
-    monkeypatch.setattr(m, "postgres_db", fake)
+    _patch_grants_db(monkeypatch, is_admin=True)
     # No violation despite ungranted shell — admin runner bypasses.
     await m._enforce_dispatch_grants(
         {"tools": {"shell": ["ls"]}}, runner_user_id=_UID, project_ids=[]
@@ -70,25 +73,57 @@ async def test_enforce_dispatch_grants_admin_bypass(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_enforce_dispatch_grants_allows_when_granted(monkeypatch):
-    fake = AsyncMock()
-    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": False})
-    fake.list_grants_for_scopes = AsyncMock(
-        return_value={
-            "user": [
-                {"key": "shell_tools", "value_json": True},
-                {"key": "delegation", "value_json": True},
-            ],
-            "project": [],
-            "global": [],
-        }
+    _patch_grants_db(
+        monkeypatch,
+        user_rows=[
+            {"key": "shell_tools", "value_json": True},
+            {"key": "delegation", "value_json": True},
+        ],
     )
-    monkeypatch.setattr(m, "postgres_db", fake)
     # Granted shell + delegation -> the worker-base-shaped fragment passes.
     await m._enforce_dispatch_grants(
         {"tools": {"shell": ["ls"], "delegation": ["delegate_work"]}},
         runner_user_id=_UID,
         project_ids=[],
     )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_runner_allows_full_autonomy(monkeypatch):
+    _patch_grants_db(monkeypatch)
+    await m._enforce_dispatch_grants(
+        {"autonomy": "full"},
+        runner_user_id=_UID,
+        project_ids=[],
+        runner_kind="lifecycle",
+    )
+
+
+@pytest.mark.asyncio
+async def test_user_runner_still_denies_full_autonomy(monkeypatch):
+    _patch_grants_db(monkeypatch)
+    with pytest.raises(m.GrantDenied) as ei:
+        await m._enforce_dispatch_grants(
+            {"autonomy": "full"},
+            runner_user_id=_UID,
+            project_ids=[],
+            runner_kind="user",
+        )
+    assert "autonomy_ceiling" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_runner_keeps_owner_capability_limits(monkeypatch):
+    _patch_grants_db(monkeypatch)
+    with pytest.raises(m.GrantDenied) as ei:
+        await m._enforce_dispatch_grants(
+            {"autonomy": "full", "workspace": {"backend": "vm"}},
+            runner_user_id=_UID,
+            project_ids=[],
+            runner_kind="lifecycle",
+        )
+    assert "vm_workspace" in str(ei.value)
+    assert "autonomy_ceiling" not in str(ei.value)
 
 
 @pytest.mark.asyncio

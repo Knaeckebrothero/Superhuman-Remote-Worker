@@ -11,6 +11,9 @@ import pytest
 from orchestrator.services.formatters import (
     _fmt_confidence,
     format_frozen_job,
+    format_job_detail,
+    format_job_summary,
+    format_jobs,
     format_knowledge_note_detail,
     format_knowledge_notes,
 )
@@ -126,3 +129,44 @@ class TestFormatFrozenJob:
     def test_none_confidence_omits_line(self):
         out = format_frozen_job("job1", {"summary": "s"})
         assert "Confidence:" not in out
+
+
+class TestJobErrorFormatters:
+    def test_job_detail_uses_error_message(self):
+        out = format_job_detail(
+            {
+                "id": "job1",
+                "status": "failed",
+                "config_name": "critic",
+                "error_message": "workspace unavailable",
+            }
+        )
+        assert "Error: workspace unavailable" in out
+
+    def test_job_summary_uses_error_message(self):
+        out = format_job_summary(
+            {
+                "id": "job1",
+                "status": "failed",
+                "config_name": "critic",
+                "error_message": "grant denied",
+            },
+            None,
+            None,
+            None,
+            None,
+        )
+        assert "Error: grant denied" in out
+
+    def test_job_list_uses_error_message(self):
+        out = format_jobs(
+            [
+                {
+                    "id": "job1",
+                    "status": "failed",
+                    "config_name": "critic",
+                    "error_message": "clone failed",
+                }
+            ]
+        )
+        assert "Error: clone failed" in out

@@ -110,6 +110,7 @@ export interface JobSummary {
   project_id?: string | null;
   project_name?: string | null;
   parent_job_id?: string | null;
+  error_message?: string | null;
   creation_order?: number | null;
   repo_name?: string | null;
   branch_name?: string | null;
