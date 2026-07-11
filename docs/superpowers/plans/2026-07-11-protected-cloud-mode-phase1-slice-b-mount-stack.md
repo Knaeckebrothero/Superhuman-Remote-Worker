@@ -1352,11 +1352,19 @@ Expected: PASS.
 At the top of `_build_agent_cloud_mount` (after the `_runtime_supports_rclone_mount` guard, ~:18429), add the protected short-circuit. It runs a read-only DB lookup — no engage here (engage is at create, Step 7):
 
 ```python
-    # Protected cloud mode: if this thread was engaged for protected mode and an
-    # active RO grant exists, serve the RO-lower + overlay payload. VM tier is
-    # unsupported in v1 (the reader webdav_url is the internal NC URL a VM can't
-    # reach) — fail closed to no mount rather than a broken lower.
-    if _is_protected_cloud_mode_enabled() and metadata.get("protected_cloud"):
+    # Protected cloud mode: the marker ALONE routes a thread into this branch —
+    # never gate the branch on the feature flag, or a protected-marked thread
+    # served while the flag is OFF would fall through to the LIVE builders with
+    # agent-service credentials (B8 review finding; violates the fail-closed
+    # invariant). Flag off ⇒ protected threads get NO cloud, not live cloud.
+    if metadata.get("protected_cloud"):
+        if not _is_protected_cloud_mode_enabled():
+            logger.warning(
+                "Thread %s: protected_cloud marker present but "
+                "PROTECTED_CLOUD_MODE_ENABLED is off; refusing any cloud mount.",
+                thread.get("id"),
+            )
+            return None
         vm_ctx = metadata.get("vm") or {}
         if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
             logger.warning(
@@ -1367,6 +1375,23 @@ At the top of `_build_agent_cloud_mount` (after the `_runtime_supports_rclone_mo
         row = await postgres_db.get_ro_mount_by_thread(str(thread.get("id")))
         return _build_protected_cloud_mount(row, thread_id=str(thread.get("id"))) if row else None
 ```
+
+- [ ] **Step 5b: Fail-close the endpoint's cloud_sync fallback for protected threads (scope amendment — B8 review)**
+
+In `agent_get_thread_workspace` (~:16612-16621), when the protected branch yields no mount (flag off, VM tier, refused/absent grant), the `elif _cloud_workspace_driver() == "rclone_mount"` fallback would hand the thread a LIVE session-folder `cloud_sync` — a live write path on a thread the user marked protected. Guard the fork:
+
+```python
+    if cloud_mount_cfg:
+        cloud_sync_cfg = None
+    elif metadata.get("protected_cloud"):
+        # Protected thread with no engageable protected mount: NO live sync
+        # fallback of any kind (fail-closed; agent sees degraded-cloud state).
+        cloud_sync_cfg = None
+    elif _cloud_workspace_driver() == "rclone_mount":
+        ...
+```
+
+Test: extend the endpoint-level coverage (or the fork logic if extracted) so a `protected_cloud` thread with no mount payload gets `cloud_sync=None` (and the degraded flag set, since cloud is up but nothing resolved).
 
 - [ ] **Step 6: Write the failing engage-wiring test**
 
