@@ -16733,6 +16733,12 @@ async def agent_get_thread_workspace(
     )
     if cloud_mount_cfg:
         cloud_sync_cfg = None
+    elif metadata.get("protected_cloud"):
+        # Protected thread with no engageable protected mount (flag off, VM
+        # tier, or a refused/absent grant): NO live sync fallback of any kind
+        # (fail-closed; agent sees degraded-cloud state, never a live write
+        # path on a thread the user marked protected).
+        cloud_sync_cfg = None
     elif _cloud_workspace_driver() == "rclone_mount":
         # rclone requested but unavailable/unsupported: fall back to the
         # regular session folder only. Do not eagerly clone thread_mounts such
@@ -18730,11 +18736,19 @@ async def _build_agent_cloud_mount(
     if not _runtime_supports_rclone_mount(metadata):
         return None
 
-    # Protected cloud mode: if this thread was engaged for protected mode and an
-    # active RO grant exists, serve the RO-lower + overlay payload. VM tier is
-    # unsupported in v1 (the reader webdav_url is the internal NC URL a VM can't
-    # reach) — fail closed to no mount rather than a broken lower.
-    if _is_protected_cloud_mode_enabled() and metadata.get("protected_cloud"):
+    # Protected cloud mode: the marker ALONE routes a thread into this branch —
+    # never gate the branch on the feature flag, or a protected-marked thread
+    # served while the flag is OFF would fall through to the LIVE builders with
+    # agent-service credentials (B8 review finding; violates the fail-closed
+    # invariant). Flag off => protected threads get NO cloud, not live cloud.
+    if metadata.get("protected_cloud"):
+        if not _is_protected_cloud_mode_enabled():
+            logger.warning(
+                "Thread %s: protected_cloud marker present but "
+                "PROTECTED_CLOUD_MODE_ENABLED is off; refusing any cloud mount.",
+                thread.get("id"),
+            )
+            return None
         vm_ctx = metadata.get("vm") or {}
         if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
             logger.warning(
