@@ -6,6 +6,27 @@ dev cluster, 2026-07-06. Evidence and raw numbers in the memory note
 §11 (PR4). This file is the **execution tracker** — one item at a time, checked
 off as landed.
 
+## Status — 2026-07-11 (current — trust this over the 07-06 block below)
+- **All code fixes deployed & R-1 verified in prod-dev.** C-1/D-1/D-2/B-1 live on
+  `sha-ae0cddc`; **R-1** committed (`3d882661`) + deployed (rode `sha-f1f32eb`) and
+  **verified live**: 594 pathless ghosts self-archived, loop project down to a
+  steady-state handful. **B-2 retired** (R-1 automated it).
+- **A-1 — DONE (no edit needed).** Re-scan (07-11) showed the 2 (now 3) resurrection
+  files already read `status: superseded`, matching the DB. The loop re-committed
+  them correctly since the audit; the divergence was stale. No action taken.
+- **C-2 — DONE.** Not 5 but **6** invalid-YAML files (pre-C-1 notes the loop never
+  rewrote). Repaired frontmatter (quote `#`/`@`/`:`-bearing flow-seq elements,
+  paren-aware split, promote plain-CSV → lists) and committed to the loop repo
+  `main @ 551b0a73`. All 6 parse via the real `parse_note_md`; bodies untouched.
+  Bonus: 5 of the 6 had **pathless ghost rows** (adoption was blocked by the bad
+  YAML) — the fix makes them adoptable, so the next reindex converts ghosts → notes.
+- **Remaining:** **C-3** (low-pri file triage — 9 no-frontmatter + 11 no-`id`),
+  **D-3** (floor re-tune — needs a full reindex; do deliberately, not during an
+  active loop), plus separate task **#35** (Neo4j-less k3d E2E).
+- **Ops note:** a memory-heavy in-pod scan OOM-killed an orchestrator pod (HA
+  absorbed it). Heavy KB scans now run **locally via port-forward**, never in the
+  orchestrator pod. New issue doc: `docs/issues/pod_oom_kill_protection.md`.
+
 ## Status — 2026-07-06
 - **Shipped + deployed** on dev (`sha-ae0cddc`): **C-1** (`33396baa`), **D-1**, **D-2**,
   **B-1** (+ `get_note_by_slug`) — all four code guards are live.
@@ -50,8 +71,8 @@ Legend — **Type:** `code` (my repo, TDD) · `data` (live mutation, needs authz
 | D-2 | `find_near_duplicate_pairs`: add `embedding_version` equality guard | code | ☑ | — |
 | B-1 | `list_notes`: add `path IS NOT NULL` filter (durable ghost guard) | code | ☑ | — |
 | B-2 | Archive the 384 active pathless ghost rows | data | ⊘ skip | R-1 (do once, after) |
-| A-1 | Repair 2 resurrection files (`status: superseded`) | data | ☐ | — |
-| C-2 | Backfill the 5 invalid-YAML files | data | ☐ | C-1 landed+deployed |
+| A-1 | Repair 2 resurrection files (`status: superseded`) | data | ☑ resolved 07-11 (files already correct) | — |
+| C-2 | Backfill the invalid-YAML files (6, not 5) | data | ☑ done 07-11 (`main @ 551b0a73`) | C-1 landed+deployed |
 | C-3 | Triage 8 missing-frontmatter + 8 no-`id` files | data | ☐ | — |
 | D-3 | Final near-dup floor tuning against the centroid index | deferred | ☐ | PR4d deploy + reindex |
 | R-1 | Ghost reconciliation pass (root cause) | code | ☑ | — |
