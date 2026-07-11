@@ -911,8 +911,11 @@ def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
     # overlay layout obeys the snapshot placement rule (design §11.3)
     ov = payload["overlay"]
     assert ov["upper"].startswith("/home/agent-host/.overlay")
+    assert ov["work"] == "/home/agent-host/.overlay/work"
     assert ov["merged"] == "/cloud/merged"
     assert ov["lower"] == "/cloud/lower"
+    assert ov["quota_bytes"] == 8 * 1024**3
+    assert isinstance(ov["quota_bytes"], int)
     # single RO lower mount, reader creds (NOT agent-service), read_only
     assert len(payload["mounts"]) == 1
     m = payload["mounts"][0]
@@ -928,3 +931,137 @@ def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
 def test_protected_cloud_mount_none_for_inactive_or_non_nextcloud():
     assert _build_protected_cloud_mount({"status": "revoked", "backend": "nextcloud"}, thread_id="t") is None
     assert _build_protected_cloud_mount({"status": "active", "backend": "opencloud"}, thread_id="t") is None
+
+
+# ---------------------------------------------------------------------------
+# F1/F4 (B8 review) — _build_agent_cloud_mount fail-closed matrix for the
+# protected_cloud marker. The marker ALONE must route into the protected
+# branch; the branch must never fall through to the LIVE builders below it.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_NC_ROW = {
+    "backend": "nextcloud",
+    "reader_id": "srw-reader-abc",
+    "credentials": "app-pass-xyz",
+    "webdav_url": "https://nc.internal/remote.php/dav/files/srw-reader-abc/Proj/",
+    "auth_kind": "basic",
+    "status": "active",
+}
+
+# A live thread_mount row: if the protected branch ever fell through to the
+# live builders (the pre-fix bug), this would resolve to a real rw payload
+# instead of None/protected — every matrix case below asserts that never
+# happens regardless of what live rows are present.
+_LIVE_MOUNT_ROWS = [
+    {
+        "id": "mount-home",
+        "mount_kind": "project_default",
+        "target_path": "",
+        "source_ref": "p-default",
+        "backend_id": "nextcloud",
+        "cloud_handle": (
+            '{"backend":"nextcloud","native_id":"home:alice",'
+            '"vendor_meta":{"kind":"user_home","username":"alice"}}'
+        ),
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_protected_marker_flag_off_returns_none(
+    monkeypatch,
+):
+    """(a) marker present + flag OFF -> None, never the live builders."""
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    with patch("main._is_protected_cloud_mode_enabled", return_value=False):
+        payload = await _build_agent_cloud_mount(
+            {"id": "thread-1"},
+            mount_rows=_LIVE_MOUNT_ROWS,
+            metadata={
+                "protected_cloud": True,
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
+            },
+        )
+    assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_protected_marker_vm_tier_returns_none(
+    monkeypatch,
+):
+    """(b) marker + flag ON + VM-ready metadata -> None (v1 is
+    container-runtime-only; the reader webdav_url is internal-only)."""
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    with patch("main._is_protected_cloud_mode_enabled", return_value=True):
+        payload = await _build_agent_cloud_mount(
+            {"id": "thread-1"},
+            mount_rows=_LIVE_MOUNT_ROWS,
+            metadata={
+                "protected_cloud": True,
+                "vm": {"status": "ready", "ssh_host": "10.0.0.5"},
+            },
+        )
+    assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_protected_marker_active_row_returns_payload(
+    monkeypatch,
+):
+    """(c) marker + flag ON + container runtime + active NC row -> the
+    RO-lower + overlay payload, protected=True."""
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    with (
+        patch("main._is_protected_cloud_mode_enabled", return_value=True),
+        patch(
+            "main.postgres_db.get_ro_mount_by_thread",
+            new=AsyncMock(return_value=_ACTIVE_NC_ROW),
+        ),
+    ):
+        payload = await _build_agent_cloud_mount(
+            {"id": "thread-1"},
+            mount_rows=[],
+            metadata={
+                "protected_cloud": True,
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
+            },
+        )
+    assert payload is not None
+    assert payload["protected"] is True
+    assert payload["mounts"][0]["access"] == "read_only"
+    assert payload["mounts"][0]["source"]["config"]["user"] == "srw-reader-abc"
+
+
+@pytest.mark.asyncio
+async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
+    monkeypatch,
+):
+    """(d) marker + flag ON + container runtime + no active row -> None."""
+    from main import _build_agent_cloud_mount
+
+    monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
+    monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
+    with (
+        patch("main._is_protected_cloud_mode_enabled", return_value=True),
+        patch(
+            "main.postgres_db.get_ro_mount_by_thread",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        payload = await _build_agent_cloud_mount(
+            {"id": "thread-1"},
+            mount_rows=[],
+            metadata={
+                "protected_cloud": True,
+                "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
+            },
+        )
+    assert payload is None
