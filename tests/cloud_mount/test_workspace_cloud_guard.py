@@ -8,10 +8,12 @@ from src.tools.workspace.filesystem import create_filesystem_tools
 
 
 class FakeWorkspace:
-    def __init__(self) -> None:
+    def __init__(self, exists_result: bool = True) -> None:
         self.is_initialized = True
         self.search_calls: list[tuple[str, str, bool, list[str] | None]] = []
         self.exists_calls: list[str] = []
+        self.write_calls: list[tuple[str, str]] = []
+        self.exists_result = exists_result
 
     def search_files(
         self,
@@ -25,13 +27,16 @@ class FakeWorkspace:
 
     def exists(self, path: str) -> bool:
         self.exists_calls.append(path)
-        return True
+        return self.exists_result
 
     def get_path(self, path: str) -> Path:
         return Path("/workspace") / path
 
     def read_file(self, path: str) -> str:
         return "hello\n"
+
+    def write_file(self, path: str, content: str) -> None:
+        self.write_calls.append((path, content))
 
 
 class FakeCloudMountManager:
@@ -40,6 +45,14 @@ class FakeCloudMountManager:
 
     def cache_limit_message(self) -> str | None:
         return self.cache_message
+
+
+class FakeOverlayManager:
+    def __init__(self, quota_message: str | None = None) -> None:
+        self.quota_message = quota_message
+
+    def quota_guard_message(self) -> str | None:
+        return self.quota_message
 
 
 def _context(workspace: FakeWorkspace, cloud_mount: dict | None = None) -> ToolContext:
@@ -91,3 +104,75 @@ def test_read_file_blocks_cloud_path_when_cache_limit_reached():
 
     assert "Cloud cache guard: full" in result
     assert workspace.exists_calls == []
+
+
+def test_write_file_blocks_cloud_path_when_upperdir_over_quota():
+    workspace = FakeWorkspace()
+    tools = create_file_tools(
+        _context(
+            workspace,
+            {
+                "active": True,
+                "_overlay_manager": FakeOverlayManager("Cloud staging guard: full"),
+            },
+        )
+    )
+    write_file = next(tool for tool in tools if tool.name == "write_file")
+
+    result = write_file.invoke({"path": "cloud/notes/todo.md", "content": "hi"})
+
+    assert "Cloud staging guard: full" in result
+    assert workspace.exists_calls == []
+    assert workspace.write_calls == []
+
+
+def test_edit_file_blocks_cloud_path_when_upperdir_over_quota():
+    workspace = FakeWorkspace()
+    tools = create_file_tools(
+        _context(
+            workspace,
+            {
+                "active": True,
+                "_overlay_manager": FakeOverlayManager("Cloud staging guard: full"),
+            },
+        )
+    )
+    edit_file = next(tool for tool in tools if tool.name == "edit_file")
+
+    result = edit_file.invoke(
+        {"path": "cloud/notes/todo.md", "old_string": "hello", "new_string": "hi"}
+    )
+
+    assert "Cloud staging guard: full" in result
+    assert workspace.exists_calls == []
+
+
+def test_write_file_not_blocked_when_overlay_manager_absent():
+    workspace = FakeWorkspace(exists_result=False)
+    tools = create_file_tools(_context(workspace, {"active": True}))
+    write_file = next(tool for tool in tools if tool.name == "write_file")
+
+    result = write_file.invoke({"path": "cloud/notes/todo.md", "content": "hi"})
+
+    assert "Cloud staging guard" not in result
+    assert result == "Written: cloud/notes/todo.md"
+    assert workspace.write_calls == [("cloud/notes/todo.md", "hi")]
+
+
+def test_read_file_not_blocked_by_upperdir_guard():
+    workspace = FakeWorkspace()
+    tools = create_file_tools(
+        _context(
+            workspace,
+            {
+                "active": True,
+                "_overlay_manager": FakeOverlayManager("Cloud staging guard: full"),
+            },
+        )
+    )
+    read_file = next(tool for tool in tools if tool.name == "read_file")
+
+    result = read_file.invoke({"path": "cloud/notes/todo.md"})
+
+    assert "Cloud staging guard" not in result
+    assert workspace.exists_calls == ["cloud/notes/todo.md"]

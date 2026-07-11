@@ -92,6 +92,27 @@ def _cloud_cache_guard_for_path(context: ToolContext, path: str) -> Optional[str
         return None
 
 
+def _cloud_upperdir_guard_for_path(context: ToolContext, path: str) -> Optional[str]:
+    """WRITE-scoped sibling of ``_cloud_cache_guard_for_path``: blocks writes
+
+    that would copy-up into an over-quota overlay upperdir (design §7/§9.9).
+    Reads never copy-up, so this is only wired into write_file/edit_file.
+    """
+    cloud_mount_cfg = context.get_config("cloud_mount", {})
+    if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not workspace_path_touches_cloud(path):
+        return None
+    overlay = cloud_mount_cfg.get("_overlay_manager")
+    if overlay is None or not hasattr(overlay, "quota_guard_message"):
+        return None
+    try:
+        return overlay.quota_guard_message()
+    except Exception as exc:
+        logger.warning("Cloud upperdir guard check failed: %s", exc)
+        return None
+
+
 def _get_mime_type(file_path: Path) -> str:
     """Get MIME type for a file based on extension."""
     mime_type, _ = mimetypes.guess_type(str(file_path))
@@ -921,6 +942,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         if cache_guard_msg:
             return cache_guard_msg
 
+        upperdir_guard_msg = _cloud_upperdir_guard_for_path(context, path)
+        if upperdir_guard_msg:
+            return upperdir_guard_msg
+
         # Enforce word limit
         max_write_words = context.get_config("max_write_words", 10_000)
         word_count = len(content.split())
@@ -1002,6 +1027,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             cache_guard_msg = _cloud_cache_guard_for_path(context, path)
             if cache_guard_msg:
                 return cache_guard_msg
+
+            upperdir_guard_msg = _cloud_upperdir_guard_for_path(context, path)
+            if upperdir_guard_msg:
+                return upperdir_guard_msg
 
             if not workspace.exists(path):
                 return f"Error: File not found: {path}"
