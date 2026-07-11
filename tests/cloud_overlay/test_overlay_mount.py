@@ -79,7 +79,7 @@ def test_mount_refuses_when_lower_not_mounted():
         _manager(backend).mount()
 
 
-def test_unmount_is_plain_and_leaves_upperdir(monkeypatch):
+def test_unmount_is_plain_and_leaves_upperdir():
     backend = FakeRemoteBackend()
     mgr = _manager(backend)
     mgr.mount()
@@ -91,3 +91,25 @@ def test_unmount_is_plain_and_leaves_upperdir(monkeypatch):
     # unmount must NOT rm the upperdir/workdir
     assert "rm -rf /home/agent-host/.overlay/upper" not in u
     assert "rm -rf /home/agent-host/.overlay/work" not in u
+
+
+def test_mount_script_quotes_paths_with_spaces():
+    """Verify that paths with spaces are properly quoted in fuse-overlayfs -o option."""
+    backend = FakeRemoteBackend()
+    # Config with a space in the lower path
+    cfg = _cfg()
+    cfg["lower"] = "/cloud/low er"
+    mgr = OverlayMountManager(
+        thread_id="thread-12345678",
+        overlay_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    mgr.mount()
+    scripts = [b for p, b in backend.files.items() if p.endswith("overlay_mount.sh")]
+    assert len(scripts) == 1
+    s = scripts[0]
+    # The -o value should be quoted as ONE shell word, preserving the space
+    assert "'lowerdir=/cloud/low er,upperdir=/home/agent-host/.overlay/upper,workdir=/home/agent-host/.overlay/work'" in s
+    # The unquoted form must NOT appear
+    assert "-o lowerdir=/cloud/low er," not in s

@@ -90,6 +90,11 @@ class OverlayMountManager:
         work = shlex.quote(self.work)
         merged = shlex.quote(self.merged)
         workspace = shlex.quote(self.workspace_root)
+        # Quote the WHOLE -o value: raw interpolation would word-split on paths
+        # with spaces/metacharacters (B2 review finding).
+        opts = shlex.quote(
+            f"lowerdir={self.lower},upperdir={self.upper},workdir={self.work}"
+        )
         return f"""#!/usr/bin/env bash
 set -euo pipefail
 umask 077
@@ -111,7 +116,7 @@ if mountpoint -q {merged}; then
   fusermount3 -uz {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null || true
 fi
 
-fuse-overlayfs -o lowerdir={self.lower},upperdir={self.upper},workdir={self.work} {self.merged}
+fuse-overlayfs -o {opts} {merged}
 
 if ! mountpoint -q {merged}; then
   echo "{_OVERLAY_FAILED} rc=3 (overlay did not mount)"
