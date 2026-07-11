@@ -223,6 +223,24 @@ def test_status_reports_cache_and_rc_stats_without_credentials():
     assert manager.mounts[0].rc_pass not in status
 
 
+def test_refresh_vfs_issues_vfs_refresh_not_forget():
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    manager._start_all_sync()
+    manager.refresh_vfs()
+    scripts = [b for p, b in backend.files.items() if "vfs_refresh" in p]
+    assert scripts, "expected a vfs_refresh script"
+    s = scripts[0]
+    assert "vfs/refresh" in s
+    assert "recursive=true" in s
+    assert "vfs/forget" not in s  # forget does NOT flush file content (design §11.2)
+
+
 # ------------------------------------------------------- Keycloak bearer auth
 
 

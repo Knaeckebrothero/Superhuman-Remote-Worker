@@ -113,3 +113,36 @@ def test_mount_script_quotes_paths_with_spaces():
     assert "'lowerdir=/cloud/low er,upperdir=/home/agent-host/.overlay/upper,workdir=/home/agent-host/.overlay/work'" in s
     # The unquoted form must NOT appear
     assert "-o lowerdir=/cloud/low er," not in s
+
+
+def test_refresh_unmounts_overlay_refreshes_lower_then_remounts():
+    backend = FakeRemoteBackend()
+    mgr = _manager(backend)
+    mgr.mount()
+    starting_commands = len(backend.commands)
+    calls: list[int] = []
+
+    def _refresh_lower() -> None:
+        # Record how many remote scripts have run since mount(): must be
+        # exactly 1 (the plain unmount) when this callback fires, proving
+        # order: plain-unmount -> callback -> remount.
+        calls.append(len(backend.commands) - starting_commands)
+
+    mgr.refresh(_refresh_lower)
+    assert calls == [1]
+
+    commands = [cmd for cmd, _timeout in backend.commands[starting_commands:]]
+    assert len(commands) == 2, "expected exactly 2 remote scripts: pre-refresh unmount + remount"
+    assert "overlay_pre_refresh_unmount.sh" in commands[0]
+    assert "overlay_remount.sh" in commands[1]
+
+    unmount_script = next(
+        b for p, b in backend.files.items() if p.endswith("overlay_pre_refresh_unmount.sh")
+    )
+    assert "fusermount3 -u /cloud/merged" in unmount_script  # PLAIN unmount (not -uz)
+    assert "-uz" not in unmount_script
+
+    remount_script = next(
+        b for p, b in backend.files.items() if p.endswith("overlay_remount.sh")
+    )
+    assert "fuse-overlayfs -o lowerdir=/cloud/lower" in remount_script
