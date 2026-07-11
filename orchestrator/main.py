@@ -19455,6 +19455,13 @@ async def _engage_protected_cloud_for_thread(
             postgres_db=postgres_db,
             http_client_factory=_reader_client,
         )
+        # Success: clear any stale error from a prior refused/flag-off attempt
+        # so the attach-time poll fallback isn't suppressed on other replicas.
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET metadata = COALESCE(metadata,'{}') - 'protected_cloud_error' WHERE id=$1",
+                thread_id,
+            )
     except RoEngageRefused as e:
         await _record_protected_error(thread_id, f"protected mode refused: {e}")
     except Exception as e:  # provisioning error — fail closed, no mount

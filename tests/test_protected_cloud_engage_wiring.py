@@ -31,14 +31,51 @@ from services.cloud.ro_engage import RoEngageRefused
 @pytest.mark.asyncio
 async def test_engage_called_for_protected_thread_with_project_mount():
     mount_rows = [{"backend_id": "nextcloud", "cloud_handle": "handle::Proj"}]
+
+    # Mock postgres_db.acquire for the success-path metadata clear
+    mock_conn = AsyncMock()
+    mock_db_context = AsyncMock()
+    mock_db_context.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_db_context.__aexit__ = AsyncMock(return_value=None)
+
     with patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True), \
          patch.object(main, "engage_ro_mount", new=AsyncMock()) as engage, \
-         patch.object(main.main_cloud_router, "for_backend") as for_backend:
+         patch.object(main.main_cloud_router, "for_backend") as for_backend, \
+         patch.object(main.postgres_db, "acquire", return_value=mock_db_context):
         for_backend.return_value = object()
         await main._engage_protected_cloud_for_thread(
             "thread-1", user_id="user-1", mount_rows=mount_rows, metadata={}
         )
     engage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_engage_success_clears_stale_protected_cloud_error():
+    """After a successful engage, any stale protected_cloud_error from a
+    prior refused/flag-off attempt must be cleared so the attach-time poll
+    fallback isn't suppressed on other HA replicas."""
+    mount_rows = [{"backend_id": "nextcloud", "cloud_handle": "handle::Proj"}]
+
+    # Mock the postgres_db.acquire() context manager and connection
+    mock_conn = AsyncMock()
+    mock_db_context = AsyncMock()
+    mock_db_context.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_db_context.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True), \
+         patch.object(main, "engage_ro_mount", new=AsyncMock()), \
+         patch.object(main.main_cloud_router, "for_backend") as for_backend, \
+         patch.object(main.postgres_db, "acquire", return_value=mock_db_context):
+        for_backend.return_value = object()
+        await main._engage_protected_cloud_for_thread(
+            "thread-1", user_id="user-1", mount_rows=mount_rows, metadata={}
+        )
+
+    # Verify the metadata-key-delete statement was executed
+    mock_conn.execute.assert_awaited_once()
+    args = mock_conn.execute.await_args[0]
+    assert "- 'protected_cloud_error'" in args[0]
+    assert args[1] == "thread-1"
 
 
 @pytest.mark.asyncio
