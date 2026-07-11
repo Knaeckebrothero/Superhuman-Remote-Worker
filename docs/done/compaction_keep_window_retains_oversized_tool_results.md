@@ -1,6 +1,19 @@
 # Compaction keep-window retains oversized tool results — post-compact context stays near the ceiling
 
-**Status:** OPEN — design agreed 2026-07-10, ready for implementation.
+**Status:** ✅ RESOLVED 2026-07-11 — implemented in `b62b3e83` (2026-07-10):
+all three fix parts plus the gotchas (cap inside `summarize_and_compact`,
+early-return path with `compaction_runs` bump, full-conversation summary
+input with unchanged boundary id, guard math with tail savings, `name`
+preservation in `fresh_recent`, honest `after_tokens` stats, all four config
+layers threaded). Review pass 2026-07-11 confirmed the above and found one
+defect, fixed in `c3ee9f17`: the idempotency check used `startswith`, but
+the truncation marker is appended *after* the kept head — real truncation
+output was never recognized, so every later compaction re-truncated capped
+messages and rewrote the marker's original-size provenance ("of 344,770
+chars" became "of ~16,230"); regression test now uses the real
+head+trailing-marker shape. Unit suite green (162 context/loader tests).
+Live `/compact`-on-a-bloated-session smoke not yet observed — the unit
+integration tests cover the path end-to-end at the ContextManager level.
 **Motivating incident:** session `4b82e6db` lineage (see
 `docs/issues/web_search_full_page_content_bloats_session_context.md` and
 `docs/done/structured_output_method_mismatch_breaks_compaction_and_aux_tasks.md`).
