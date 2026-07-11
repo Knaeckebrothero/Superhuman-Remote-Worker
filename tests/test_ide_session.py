@@ -133,3 +133,71 @@ async def test_restore_k8s_ide_container_fails_clone_marks_session_failed(servic
     last_ctx = svc._db.merge_ide_session_context.await_args_list[-1]
     assert last_ctx.kwargs == {}
     assert last_ctx.args[1]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_restore_session_uses_long_vm_wait_estimate(service_factory):
+    """VM source snapshots report the longer, realistic restore estimate."""
+    svc = service_factory
+    svc._db.get_job = AsyncMock(
+        return_value={
+            "id": "job-0005",
+            "context": {"snapshot": {"status": "available", "source_type": "vm"}},
+        }
+    )
+    svc._restore_session = AsyncMock(return_value=True)
+
+    result = await svc.start_session("job-0005")
+
+    assert result["status"] == "restoring"
+    assert result["estimated_seconds"] == 420
+
+
+@pytest.mark.asyncio
+async def test_restore_vm_session_marks_unavailable_when_orchestrator_cannot_reach(
+    service_factory,
+):
+    """Topology failures in VM restore should surface as unavailable, not timeout."""
+    svc = service_factory
+    svc._vm_provisioner.create_vm = AsyncMock(return_value=True)
+    svc._wait_for_vm_ready = AsyncMock(return_value=(None, None))
+    svc._get_job = AsyncMock(
+        return_value={
+            "id": "job-0006",
+            "context": {"vm": {"ssh_host": "100.64.23.44"}},
+        }
+    )
+
+    with patch(
+        "orchestrator.services.ide_session.orchestrator_can_reach",
+        return_value=False,
+    ):
+        await svc._restore_vm_session(
+            "job-0006", {"id": "job-0006"}, "snapshot", 8, "16Gi"
+        )
+
+    last_ctx = svc._db.merge_ide_session_context.await_args_list[-1]
+    assert last_ctx.kwargs == {}
+    assert last_ctx.args[1]["status"] == "unavailable"
+    assert last_ctx.args[1]["error"] == "VM restore not supported on this topology"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_vm_ready_returns_none_on_unroutable_host(service_factory):
+    """The wait loop should abandon VM restore as soon as host is unroutable."""
+    svc = service_factory
+    svc._get_job = AsyncMock(
+        return_value={
+            "id": "job-0007",
+            "context": {"vm": {"ssh_host": "100.64.23.44", "status": "creating"}},
+        }
+    )
+
+    with patch(
+        "orchestrator.services.ide_session.orchestrator_can_reach",
+        return_value=False,
+    ):
+        ssh_host, ssh_port = await svc._wait_for_vm_ready("job-0007", timeout=5)
+
+    assert ssh_host is None
+    assert ssh_port is None

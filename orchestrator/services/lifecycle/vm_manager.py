@@ -200,6 +200,9 @@ class VMInstanceManager:
     async def is_idle(self, inst: Instance) -> bool:
         if inst.metadata.get("has_live_shared_child"):
             return False
+        ide_session_status = inst.metadata.get("ide_session_status")
+        if ide_session_status in ("restoring", "active", "idle"):
+            return False
         job_status = inst.metadata.get("job_status")
         thread_status = inst.metadata.get("thread_status")
         if job_status:
@@ -240,6 +243,9 @@ class VMInstanceManager:
         docs/issues/reviewing_parent_pod_reaped_under_critic.md.
         """
         if inst.metadata.get("has_live_shared_child"):
+            return False
+        ide_session_status = inst.metadata.get("ide_session_status")
+        if ide_session_status in ("restoring", "active", "idle"):
             return False
         if inst.metadata.get("job_dispatchable"):
             return False
@@ -573,6 +579,9 @@ class VMInstanceManager:
                     "owner_updated_at": r.get("updated_at"),
                     "job_dispatchable": dispatchable,
                     "vm_ctx": vm_ctx,
+                    "ide_session_status": _coerce_jsonb(ctx.get("ide_session")).get(
+                        "status"
+                    ),
                     "snapshot_status": _coerce_jsonb(ctx.get("snapshot")).get("status"),
                 }
             )
@@ -587,6 +596,9 @@ class VMInstanceManager:
                     "bound_id": str(r["id"]),
                     "owner_status": r.get("status"),
                     "vm_ctx": vm_ctx,
+                    "ide_session_status": _coerce_jsonb(md.get("ide_session")).get(
+                        "status"
+                    ),
                     "total_turns": r.get("total_turns") or 0,
                     "snapshot_status": _coerce_jsonb(md.get("snapshot")).get("status"),
                 }
@@ -623,6 +635,7 @@ class VMInstanceManager:
             "ssh_host": vm_ctx.get("ssh_host") or vm_ctx.get("host"),
             "ssh_port": vm_ctx.get("ssh_port") or vm_ctx.get("port"),
             "provisioner": vm_ctx.get("provisioner"),
+            "ide_session_status": row.get("ide_session_status"),
             # Reap-path inputs (mirror WorkspaceInstanceManager).
             "last_snapshot_turns": vm_ctx.get("last_snapshot_turns"),
             "snapshot_attempts": vm_ctx.get("snapshot_attempts") or 0,

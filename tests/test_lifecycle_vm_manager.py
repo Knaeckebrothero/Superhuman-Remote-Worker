@@ -142,6 +142,20 @@ class TestListInstances:
         assert inst.metadata["provisioner"] == "kubevirt"
 
     @pytest.mark.asyncio
+    async def test_row_includes_ide_session_status(self):
+        job = {
+            "id": "job-uuid-2",
+            "status": "pending_review",
+            "context": {
+                "vm": {"status": "ready", "ssh_host": "10.0.0.42"},
+                "ide_session": {"status": "active"},
+            },
+        }
+        mgr, *_ = _make_manager(job_rows=[job])
+        inst = (await mgr.list_instances())[0]
+        assert inst.metadata["ide_session_status"] == "active"
+
+    @pytest.mark.asyncio
     async def test_returns_thread_vm(self):
         thread = {
             "id": "thread-uuid-1",
@@ -466,6 +480,20 @@ class TestIsIdle:
         assert await mgr.is_idle(inst) is False
 
     @pytest.mark.asyncio
+    async def test_active_ide_session_is_not_idle(self):
+        for status in ("restoring", "active", "idle"):
+            mgr, *_ = _make_manager()
+            inst = Instance(
+                kind="vm",
+                id="x",
+                metadata={
+                    "job_status": "pending_review",
+                    "ide_session_status": status,
+                },
+            )
+            assert await mgr.is_idle(inst) is False, status
+
+    @pytest.mark.asyncio
     async def test_processing_job_is_not_idle(self):
         mgr, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", metadata={"job_status": "processing"})
@@ -765,6 +793,17 @@ class TestIsReapable:
                     "job_dispatchable": False,
                     "has_live_shared_child": True,
                 },
+            )
+            assert await mgr.is_reapable(inst) is False, status
+
+    @pytest.mark.asyncio
+    async def test_active_ide_session_is_not_reapable(self):
+        for status in ("restoring", "active", "idle"):
+            mgr, *_ = _make_manager()
+            inst = Instance(
+                kind="vm",
+                id="x",
+                metadata={"job_status": "completed", "ide_session_status": status},
             )
             assert await mgr.is_reapable(inst) is False, status
 
