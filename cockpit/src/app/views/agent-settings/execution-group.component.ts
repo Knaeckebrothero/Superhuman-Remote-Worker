@@ -6,6 +6,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {
   AUTONOMY_LEVELS,
   CRITIC_ROUND_OPTIONS,
+  IMAGE_QUALITY_TIERS,
   PERMISSION_MODES,
   readConfigPath,
   SettingsMode,
@@ -71,6 +72,29 @@ import type {GrantCatalog} from '../../core/models/api.model';
           <span class="field-hint">{{ effectivePermissionDesc() }}</span>
         </div>
       }
+
+      <!-- Image quality (applies to both jobs and sessions) -->
+      <div class="field-row" [class.modified]="imageQuality() !== null">
+        <label class="field-label">{{ 'agentSettings.execution.imageQuality' | transloco }}</label>
+        <div class="field-control">
+          <select
+            class="form-input"
+            [ngModel]="imageQuality() ?? resolvedImageQuality()"
+            (ngModelChange)="onImageQualityChange($event)"
+            [disabled]="disabled()"
+          >
+            @for (q of imageQualityTiers; track q.value) {
+              <option [value]="q.value">{{ 'agentSettings.imageQuality.' + q.value + '.label' | transloco }}</option>
+            }
+          </select>
+          @if (imageQuality() !== null) {
+            <button type="button" class="reset-btn" (click)="imageQuality.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
+              <app-icon size="xs">close</app-icon>
+            </button>
+          }
+        </div>
+        <span class="field-hint">{{ effectiveImageQualityDesc() }}</span>
+      </div>
 
       <!-- Scholar toggle -->
       @if (mode() === 'job') {
@@ -270,6 +294,7 @@ export class ExecutionGroupComponent {
   readonly autonomyLevels = AUTONOMY_LEVELS;
   readonly criticRoundOptions = CRITIC_ROUND_OPTIONS;
   readonly permissionModes = PERMISSION_MODES;
+  readonly imageQualityTiers = IMAGE_QUALITY_TIERS;
 
   /** Autonomy levels at/below the granted ceiling. The currently-selected value
    *  is always kept visible (an admin-authored expert may pin a higher level). */
@@ -299,6 +324,7 @@ export class ExecutionGroupComponent {
   readonly critic = signal<boolean | null>(null);
   readonly criticRounds = signal<number | null>(null);
   readonly projectMemory = signal<boolean | null>(null);
+  readonly imageQuality = signal<string | null>(null);
 
   // Resolved defaults from config
   readonly resolvedAutonomy = computed(() =>
@@ -318,6 +344,9 @@ export class ExecutionGroupComponent {
   );
   readonly resolvedProjectMemory = computed(() =>
     (readConfigPath(this.config(), 'memory.project_scoped') as boolean) ?? true
+  );
+  readonly resolvedImageQuality = computed(() =>
+    (readConfigPath(this.config(), 'image_quality') as string) ?? 'standard'
   );
 
   readonly effectiveAutonomyDesc = computed(() => {
@@ -340,6 +369,14 @@ export class ExecutionGroupComponent {
     this.critic() ?? this.resolvedCritic()
   );
 
+  readonly effectiveImageQualityDesc = computed(() => {
+    this.activeLang();
+    const val = this.imageQuality() ?? this.resolvedImageQuality();
+    const known = this.imageQualityTiers.find(q => q.value === val);
+    if (!known) return '';
+    return this.transloco.translate(`agentSettings.imageQuality.${val}.description`);
+  });
+
   /** Number of fields that differ from defaults. */
   readonly modifiedCount = computed(() => {
     let count = 0;
@@ -349,6 +386,7 @@ export class ExecutionGroupComponent {
     if (this.critic() !== null) count++;
     if (this.criticRounds() !== null) count++;
     if (this.projectMemory() !== null) count++;
+    if (this.imageQuality() !== null) count++;
     return count;
   });
 
@@ -385,6 +423,11 @@ export class ExecutionGroupComponent {
     this.change.emit();
   }
 
+  onImageQualityChange(value: string): void {
+    this.imageQuality.set(value === this.resolvedImageQuality() ? null : value);
+    this.change.emit();
+  }
+
   resetCritic(): void {
     this.critic.set(null);
     this.criticRounds.set(null);
@@ -415,6 +458,10 @@ export class ExecutionGroupComponent {
       }
     }
 
+    // Image quality is a top-level knob honored by both worker and persistent
+    // agents, so it applies regardless of mode.
+    if (this.imageQuality() !== null) o['image_quality'] = this.imageQuality();
+
     return o;
   }
 
@@ -426,5 +473,6 @@ export class ExecutionGroupComponent {
     this.critic.set(null);
     this.criticRounds.set(null);
     this.projectMemory.set(null);
+    this.imageQuality.set(null);
   }
 }

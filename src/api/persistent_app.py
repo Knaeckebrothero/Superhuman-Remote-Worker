@@ -169,6 +169,14 @@ _loop_interrupt_flag: Optional[str] = None
 _hard_interrupt_event: Optional[asyncio.Event] = None
 _loop_last_user_content: List[str] = [""]
 
+# The LLM-free draft title written at submit time (_early_title_from_prompt), so
+# the authoritative after-turn pass knows it may overwrite *this* value while
+# still leaving a manual rename untouched. None once no draft is outstanding
+# (never written, or already replaced by the real title). Process memory only:
+# if the pod restarts between the two passes the draft simply sticks, which is a
+# fine title — not worth a DB column.
+_draft_title_value: Optional[str] = None
+
 # True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
 # pick hard vs graceful mode. Set in _loop_on_tool_start, cleared in
 # _loop_on_tool_result.
@@ -5277,9 +5285,6 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         )
         return None
     try:
-        from langchain_core.messages import HumanMessage as HM
-        from langchain_core.messages import SystemMessage as SM
-
         # Grab first few exchanges for title generation
         sample = []
         for m in messages[:10]:
@@ -5304,51 +5309,24 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
             )
             return None
 
-        # Route through AuxiliaryLLM.ainvoke (not .llm.ainvoke) so title
-        # generation gets the same main-model fallback as every other aux task —
-        # a dead dedicated aux model yields a title on the main model instead of
-        # a silent "Untitled Session".
-        #
-        # The prompt firmly frames the sample as an excerpt to *label*, not a
-        # message to *answer*: without this, a chat-model treats a truncated
-        # opener or an image-referencing line as a live turn and its reply
-        # ("It sounds like your message got cut off", "I don't see any attached
-        # image") becomes the title.
-        response = await auxiliary_llm.ainvoke(
-            [
-                SM(
-                    content=(
-                        "You write a short topic title (5-8 words) for a "
-                        "conversation. You are given only the opening excerpt. "
-                        "It may be truncated mid-sentence and may reference "
-                        "images, files, or tables you cannot see — this is "
-                        "expected; never comment on it and never reply to the "
-                        "content. Output ONLY the title as a plain noun phrase: "
-                        "no quotes, no punctuation, no sentences, and never "
-                        'begin with "I", "It", "You", or "Sorry".'
-                    )
-                ),
-                HM(
-                    content=(
-                        "Conversation excerpt (may be truncated; may mention "
-                        'images or files you cannot see):\n"""\n'
-                        + "\n".join(sample)
-                        + '\n"""'
-                    )
-                ),
-            ],
-            task_name="title_generation",
-        )
+        # Structured output (single-field ConversationTitle) is the primary
+        # guard against the model *answering* the sample instead of *labelling*
+        # it: a schema slot has no room for "I don't see your image". Routed
+        # through AuxiliaryLLM.chain — the same structured path (with per-family
+        # method + recovery) as every other aux task, so it also inherits the
+        # main-model fallback rather than a silent "Untitled Session".
+        from src.services.auxiliary import GenerateTitleTask
+
+        result = await auxiliary_llm.chain(GenerateTitleTask("\n".join(sample)))
         auxiliary_llm.health.record_success("title_generation")
-        text = getattr(response, "content", None) or ""
-        title = text.strip()[:100] if text.strip() else None
+        raw_title = (getattr(result, "title", None) or "").strip()
+        title = raw_title[:100] if raw_title else None
         if not title:
             logger.debug("Title generation returned empty response")
             return None
-        # Reject a title that is really the model replying to the sample (a
-        # deflection about truncation or a missing attachment); leave the
-        # placeholder so the after-turn pass retries with the assistant's reply
-        # for context, rather than persisting the deflection as the title.
+        # Backstop: even under a schema a model can occasionally stuff a
+        # deflection into the title field. Reject it and leave the current title
+        # (placeholder or draft) so nothing conversational is ever persisted.
         if _title_looks_conversational(title):
             logger.info("Title generation rejected conversational reply: %r", title)
             return None
@@ -5420,17 +5398,28 @@ def _is_low_signal_prompt(content: str) -> bool:
     return text.rstrip("?!. ") in _LOW_SIGNAL_PROMPTS
 
 
-async def _write_title_if_placeholder(title: str, *, origin: str) -> bool:
-    """Write ``title`` only while the thread is still untitled, then broadcast.
+async def _write_title_if_placeholder(
+    title: str, *, origin: str, allow_draft_overwrite: bool = False
+) -> bool:
+    """Write ``title`` while the thread is still untitled — or, when
+    ``allow_draft_overwrite``, while it still shows the LLM-free draft — then
+    broadcast.
 
-    The placeholder re-check under the same guard makes the early-prompt and
-    after-turn passes idempotent against each other and against a manual rename.
-    Returns True iff the title was written.
+    The re-check under this shared guard makes the draft and after-turn passes
+    idempotent against each other and against a manual rename: a title that is
+    neither a placeholder nor the outstanding draft (i.e. a user rename) is left
+    untouched. Returns True iff the title was written.
     """
     if not title or not _session or not _session.postgres_conn or not _thread_id:
         return False
     thread = await _session.postgres_conn.get_thread(_thread_id)
-    if not _title_is_placeholder(thread.get("title", "") if thread else ""):
+    current = thread.get("title", "") if thread else ""
+    writable = _title_is_placeholder(current) or (
+        allow_draft_overwrite
+        and _draft_title_value is not None
+        and current == _draft_title_value
+    )
+    if not writable:
         return False
     async with _session.postgres_conn.acquire() as conn:
         await conn.execute(
@@ -5443,53 +5432,79 @@ async def _write_title_if_placeholder(title: str, *, origin: str) -> bool:
     return True
 
 
-async def _early_title_from_prompt(content: str) -> None:
-    """Title the thread from the user's opening prompt, before the (possibly
-    long) first turn runs — so the cockpit header fills in on submit instead of
-    only after the agent's answer lands.
+def _draft_title_from_prompt(
+    content: str, *, max_words: int = 8, max_chars: int = 60
+) -> Optional[str]:
+    """A cheap, LLM-free draft title lifted straight from the opening prompt.
 
-    Primary titling path. Fire-and-forget from _accept_user_input; must never
-    block input acceptance. Low-signal prompts are skipped and left to
-    _auto_title_after_first_turn, which titles them from real content later.
+    Deliberately no aux call: a lone, possibly-truncated or image-referencing
+    prompt is exactly the input that baits a chat-model into replying ("I don't
+    see your image") instead of titling, and that reply used to land as the
+    title. A string slice can't deflect. Takes the first few words, bounded on a
+    word boundary. Returns None when the prompt has no usable words.
     """
+    text = " ".join((content or "").split())  # collapse whitespace/newlines
+    if not text:
+        return None
+    draft = " ".join(text.split(" ")[:max_words])
+    if len(draft) > max_chars:
+        draft = draft[:max_chars].rsplit(" ", 1)[0]
+    draft = draft.strip(" -–—:;,\"'")
+    return draft or None
+
+
+async def _early_title_from_prompt(content: str) -> None:
+    """Fill the cockpit header the instant the user submits, with an LLM-free
+    draft taken from the opening prompt — so it fills on submit instead of only
+    after the (possibly long) first turn lands.
+
+    Primary *placeholder* path. Fire-and-forget from _accept_user_input; must
+    never block input acceptance. The authoritative, grounded, schema-bound LLM
+    title is minted later by _auto_title_after_first_turn, which replaces this
+    draft. Low-signal prompts get no draft and are left to that pass.
+    """
+    global _draft_title_value
     try:
         if not _session or not _session.postgres_conn or not _thread_id:
             return
         if _is_low_signal_prompt(content):
             return
-        # Cheap early-out before spending an aux-LLM call on an already-titled
-        # thread (e.g. a resumed session).
+        # Cheap early-out on an already-titled thread (e.g. a resumed session).
         thread = await _session.postgres_conn.get_thread(_thread_id)
         if not _title_is_placeholder(thread.get("title", "") if thread else ""):
             return
-        # after-turn normally wires the aux archiver; we run before the first
-        # turn completes, so wire it here (idempotent) for the same aux fallback.
-        _wire_session_aux_archiver()
-        from langchain_core.messages import HumanMessage as HM
-
-        title = await _generate_title([HM(content=content)], _session.auxiliary_llm)
-        if title:
-            await _write_title_if_placeholder(title, origin="Early")
+        draft = _draft_title_from_prompt(content)
+        if draft and await _write_title_if_placeholder(draft, origin="Draft"):
+            _draft_title_value = draft
     except Exception as e:
-        logger.warning(f"Early title generation failed (non-fatal): {e}")
+        logger.warning(f"Early draft title failed (non-fatal): {e}")
 
 
 async def _auto_title_after_first_turn() -> None:
-    """Fallback title pass, fired from _loop_on_turn_complete on the first few
-    turns. Primary titling now happens at prompt-accept time
-    (_early_title_from_prompt); this covers what that skipped — a low-signal
-    opening prompt, or an early pass that failed/returned empty — and titles
-    from the full message sample. The shared placeholder guard makes it a no-op
-    once a real title already exists.
+    """Authoritative title pass, fired from _loop_on_turn_complete on the first
+    few turns. Mints the real title from the grounded sample
+    (``_session.messages`` — user message *plus* the assistant's reply, a
+    completed exchange) via structured output, and replaces the LLM-free draft
+    written at submit time.
+
+    Titling from a completed exchange is the input shape that never baited the
+    model into replying, which is why the authoritative pass lives here and the
+    submit-time pass only drafts. A no-op once a real, non-draft title exists
+    (e.g. a manual rename) — see _write_title_if_placeholder's shared guard.
     """
+    global _draft_title_value
     try:
         if not _session or not _session.postgres_conn or not _thread_id:
             return
         thread = await _session.postgres_conn.get_thread(_thread_id)
-        if not _title_is_placeholder(thread.get("title", "") if thread else ""):
-            return  # already has a real title (e.g. from the early pass)
+        current = thread.get("title", "") if thread else ""
+        # Overwrite a placeholder or our own draft — never a manual rename.
+        if not _title_is_placeholder(current) and current != _draft_title_value:
+            return
         title = await _generate_title(_session.messages, _session.auxiliary_llm)
-        if title:
-            await _write_title_if_placeholder(title, origin="Auto")
+        if title and await _write_title_if_placeholder(
+            title, origin="Auto", allow_draft_overwrite=True
+        ):
+            _draft_title_value = None
     except Exception as e:
         logger.warning(f"Auto-title generation failed (non-fatal): {e}")
