@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
 from src.services.cloud_mount.guardrails import (
+    CloudScanRisk,
     detect_cloud_delete_risk,
     detect_cloud_scan_risk,
+    format_cloud_delete_guard_message,
 )
 from src.tools.shell.shell_tools import create_shell_tools
 
@@ -155,6 +157,27 @@ def test_ignores_deletes_outside_cloud_and_single_file_rm_elsewhere():
     assert detect_cloud_delete_risk("rm /workspace/cloud/one.txt") is None  # single file, no -r
 
 
+def test_format_cloud_delete_guard_message_live_by_default():
+    risk = CloudScanRisk("recursive rm over a cloud mount whiteouts each file")
+    message = format_cloud_delete_guard_message(
+        "rm -rf /workspace/cloud/archive", risk, protected=False
+    )
+
+    assert "LIVE" in message
+    assert "STAGED" not in message
+    assert "untouched until you apply" not in message
+
+
+def test_format_cloud_delete_guard_message_staged_when_protected():
+    risk = CloudScanRisk("recursive rm over a cloud mount whiteouts each file")
+    message = format_cloud_delete_guard_message(
+        "rm -rf /workspace/cloud/archive", risk, protected=True
+    )
+
+    assert "STAGED" in message
+    assert "LIVE: a delete removes the real" not in message
+
+
 def test_run_command_blocks_guarded_cloud_delete():
     shell_manager = FakeShellManager()
     tools = create_shell_tools(
@@ -195,6 +218,36 @@ def test_run_command_allows_single_file_delete_outside_cloud():
     assert "Cloud delete guard" not in result
     assert "Exit code: 0" in result
     assert shell_manager.run_calls == ["rm -rf /home/agent-host/workspace/build"]
+
+
+def test_run_command_cloud_delete_guard_defaults_to_live_wording():
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(shell_manager, {"active": True, "scan_guard": "block"})
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "rm -rf /workspace/cloud/archive"})
+
+    assert "LIVE" in result
+    assert "STAGED" not in result
+    assert "untouched until you apply" not in result
+
+
+def test_run_command_cloud_delete_guard_staged_wording_when_protected():
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(
+            shell_manager,
+            {"active": True, "scan_guard": "block", "protected": True},
+        )
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "rm -rf /workspace/cloud/archive"})
+
+    assert "STAGED" in result
+    assert "LIVE: a delete removes the real" not in result
 
 
 def test_srw_cloud_status_reports_manager_status():

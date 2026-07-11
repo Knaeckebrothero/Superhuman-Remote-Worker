@@ -104,16 +104,31 @@ def detect_cloud_delete_risk(command: str) -> CloudScanRisk | None:
     return None
 
 
-def format_cloud_delete_guard_message(command: str, risk: CloudScanRisk) -> str:
+def format_cloud_delete_guard_message(
+    command: str, risk: CloudScanRisk, *, protected: bool
+) -> str:
+    """The staged-semantics sentence is TRUE only under the capture overlay —
+    on a live rw mount a delete is immediate and irreversible. The message must
+    never claim safety the session doesn't have (B5 review finding)."""
+    if protected:
+        semantics = (
+            "In protected mode a delete is STAGED (the cloud is untouched until "
+            "you apply the diff), but whiteouting each file still costs a "
+            "backend round-trip and may download its body first."
+        )
+    else:
+        semantics = (
+            "This session's cloud mount is LIVE: a delete removes the real "
+            "cloud files immediately and is only recoverable via the cloud's "
+            "own version history/trash, if any."
+        )
     return (
         "Cloud delete guard: this command was not run because a broad delete "
-        "over cloud storage is expensive under the capture overlay.\n"
+        "over cloud storage is risky/expensive.\n"
         f"Reason: {risk.reason}.\n"
         f"Command: {command}\n\n"
-        "In protected mode a delete is STAGED (the cloud is untouched until you "
-        "apply the diff), but whiteouting each file still costs a backend "
-        "round-trip and may download its body first. Narrow the path, delete "
-        "specific files, or confirm with the operator before a bulk delete."
+        f"{semantics} Narrow the path, delete specific files, or confirm with "
+        "the operator before a bulk delete."
     )
 
 
