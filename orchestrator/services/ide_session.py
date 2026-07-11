@@ -19,9 +19,16 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from services import resolve_ssh_key_path
-from services.ssh_helpers import build_agent_ssh_cmd, stream_extract_snapshot
+from services.ssh_helpers import (
+    build_agent_ssh_cmd,
+    orchestrator_can_reach,
+    stream_extract_snapshot,
+)
 
 logger = logging.getLogger(__name__)
+
+_VM_READY_TIMEOUT_SECONDS = 420
+_VM_RESTORE_TOPOLOGY_ERROR = "VM restore not supported on this topology"
 
 
 def _build_code_server_url(
@@ -223,7 +230,7 @@ class IdeSessionService:
         # Determine restore method
         if snapshot_ctx.get("status") == "available":
             source = "snapshot"
-            estimated_seconds = 30 if snapshot_type == "pod" else 25
+            estimated_seconds = 30 if snapshot_type == "pod" else _VM_READY_TIMEOUT_SECONDS
         elif job.get("repo_name"):
             source = "gitea"
             estimated_seconds = 45
@@ -504,8 +511,23 @@ class IdeSessionService:
         )
 
         # Wait for VM to become ready (poll context.vm.status)
-        ssh_host, ssh_port = await self._wait_for_vm_ready(job_id, timeout=120)
+        ssh_host, ssh_port = await self._wait_for_vm_ready(
+            job_id, timeout=_VM_READY_TIMEOUT_SECONDS
+        )
         if not ssh_host:
+            current = await self._get_job(job_id)
+            current_ctx = self._parse_context(current).get("vm", {}) if current else {}
+            vm_host = current_ctx.get("ssh_host") or current_ctx.get("pod_ip")
+            if vm_host and not orchestrator_can_reach(vm_host):
+                await self._set_session_context(
+                    job_id,
+                    {
+                        "status": "unavailable",
+                        "error": _VM_RESTORE_TOPOLOGY_ERROR,
+                    },
+                )
+                return
+
             await self._set_session_context(
                 job_id,
                 {
@@ -990,7 +1012,7 @@ class IdeSessionService:
             )
 
     async def _wait_for_vm_ready(
-        self, job_id: str, timeout: int = 120
+        self, job_id: str, timeout: int = _VM_READY_TIMEOUT_SECONDS
     ) -> tuple[Optional[str], Optional[int]]:
         """Poll job context until VM is ready, return (ssh_host, ssh_port)."""
         import asyncio
@@ -1003,9 +1025,11 @@ class IdeSessionService:
 
             ctx = self._parse_context(job)
             vm_ctx = ctx.get("vm", {})
+            ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
+            if ssh_host and not orchestrator_can_reach(ssh_host):
+                return None, None
 
             if vm_ctx.get("status") == "ready":
-                ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
                 ssh_port = vm_ctx.get("ssh_port") or 22
                 if ssh_host:
                     return ssh_host, int(ssh_port)
