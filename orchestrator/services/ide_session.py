@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from services import resolve_ssh_key_path
-from services.ssh_helpers import stream_extract_snapshot
+from services.ssh_helpers import build_agent_ssh_cmd, stream_extract_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +223,7 @@ class IdeSessionService:
         # Determine restore method
         if snapshot_ctx.get("status") == "available":
             source = "snapshot"
-            estimated_seconds = 25 if snapshot_type == "vm" else 60
+            estimated_seconds = 30 if snapshot_type == "pod" else 25
         elif job.get("repo_name"):
             source = "gitea"
             estimated_seconds = 45
@@ -408,6 +408,38 @@ class IdeSessionService:
             if source == "gitea":
                 # Lightweight container path — no VM needed
                 await self._restore_gitea_container(job_id, job)
+            elif source == "snapshot":
+                snapshot_ctx = self._parse_context(job).get("snapshot", {})
+                snapshot_type = snapshot_ctx.get("source_type", "vm")
+
+                if snapshot_type == "vm":
+                    # Legacy VM snapshots remain in the VM restore flow
+                    await self._restore_vm_session(
+                        job_id, job, source, cpu_cores, memory
+                    )
+                    return
+
+                restored = False
+                if self._container_provisioner and self._container_provisioner.is_available:
+                    restored = await self._restore_snapshot_container(job_id, job)
+
+                if not restored:
+                    if not job.get("repo_name"):
+                        if source == "snapshot":
+                            await self._set_session_context(
+                                job_id,
+                                {
+                                    "status": "failed",
+                                    "error": "Pod snapshot restore failed and no Gitea repo is available",
+                                },
+                            )
+                        return
+
+                    logger.warning(
+                        "Pod snapshot restore failed for job %s; falling back to Gitea clone",
+                        job_id,
+                    )
+                    await self._restore_gitea_container(job_id, job)
             else:
                 # Full VM path — provision VM, extract snapshot
                 await self._restore_vm_session(job_id, job, source, cpu_cores, memory)
@@ -489,43 +521,7 @@ class IdeSessionService:
         elif source == "gitea":
             await self._clone_gitea_to_vm(job_id, job, ssh_host, ssh_port)
 
-        # Seed the user's saved code-server config. The per-user store wins over
-        # whatever the snapshot carried — IDE prefs are a user-level concept.
-        try:
-            from services.ide_settings import seed_ide_config_for_user
-
-            await seed_ide_config_for_user(
-                self._db, job.get("user_id"), ssh_host, ssh_port
-            )
-
-            # Restore license/globalStorage + non-Open-VSX bytes into the VM
-            # (Phase B). Best-effort; no-ops when S3 is unavailable.
-            user_id = job.get("user_id")
-            if (
-                user_id
-                and self._snapshot_service
-                and self._snapshot_service.is_available
-            ):
-                from services.ide_profile_store import IdeProfileStore
-                from services.ide_settings import IdeSettingsStore, seed_ide_profile
-
-                items = await IdeSettingsStore(self._db).get_extensions(str(user_id))
-                profile = IdeProfileStore(
-                    self._snapshot_service._s3, self._snapshot_service._bucket
-                )
-                await seed_ide_profile(
-                    user_id=str(user_id),
-                    ssh_host=ssh_host,
-                    ssh_port=ssh_port,
-                    profile_store=profile,
-                    ext_items=items,
-                )
-        except Exception:
-            logger.warning(
-                "Failed to seed code-server config for IDE session %s",
-                job_id,
-                exc_info=True,
-            )
+        await self._seed_ide_profile_for_user(job_id, job, ssh_host, ssh_port)
 
         # Code-server should already be running from base image
         code_server_url = _build_code_server_url(job_id)
@@ -542,7 +538,7 @@ class IdeSessionService:
 
         logger.info("IDE session active (VM) for job %s: %s", job_id, code_server_url)
 
-    async def _restore_gitea_container(self, job_id: str, job: dict) -> None:
+    async def _restore_gitea_container(self, job_id: str, job: dict) -> bool:
         """Restore an IDE session via a lightweight code-server container.
 
         Spins up a code-server container, clones the Gitea repo into it,
@@ -563,17 +559,19 @@ class IdeSessionService:
                     "error": "No Gitea repo available",
                 },
             )
-            return
+            return False
 
         # Route to K8s or local container path
         if self._container_provisioner and self._container_provisioner.is_available:
-            await self._restore_k8s_ide_container(job_id, job, repo_name, branch)
+            return await self._restore_k8s_ide_container(
+                job_id, job, repo_name, branch
+            )
         else:
-            await self._restore_local_ide_container(job_id, repo_name, branch)
+            return await self._restore_local_ide_container(job_id, repo_name, branch)
 
     async def _restore_k8s_ide_container(
         self, job_id: str, job: dict, repo_name: str, branch: str
-    ) -> None:
+    ) -> bool:
         """Create an IDE pod on Kubernetes, clone the repo, return code-server URL."""
         import asyncio
 
@@ -598,7 +596,7 @@ class IdeSessionService:
                     "error": "IDE pod did not become ready within timeout",
                 },
             )
-            return
+            return False
 
         # Clone the Gitea repo into the workspace via SSH
         clone_cmd = (
@@ -610,37 +608,46 @@ class IdeSessionService:
             f"git checkout FETCH_HEAD)"
         )
 
-        key_path = resolve_ssh_key_path()
-        ssh_cmd = [
-            "ssh",
-            *(["-i", key_path] if key_path else []),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "ConnectTimeout=10",
-            f"agent-host@{pod_ip}",
-            clone_cmd,
-        ]
-
         try:
+            async_ssh_cmd = build_agent_ssh_cmd(pod_ip, 30022, clone_cmd)
             proc = await asyncio.create_subprocess_exec(
-                *ssh_cmd,
+                *async_ssh_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            _stdout, stderr = await proc.communicate()
 
             if proc.returncode != 0:
-                logger.warning(
-                    "Git clone for IDE session had errors (job %s, rc=%d): %s",
-                    job_id,
-                    proc.returncode,
-                    stderr.decode(errors="replace")[:300],
+                error_msg = (
+                    f"Git clone failed for IDE session (rc={proc.returncode}): "
+                    f"{stderr.decode(errors='replace')[:300]}"
                 )
+                logger.error(
+                    "Git clone for IDE session failed (job %s): %s",
+                    job_id,
+                    error_msg,
+                )
+                await self._set_session_context(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "error": error_msg,
+                        "pod_ip": pod_ip,
+                    },
+                )
+                return False
         except Exception as e:
+            error_msg = f"SSH git clone failed for IDE session: {e}"
             logger.warning("SSH git clone failed for IDE session job %s: %s", job_id, e)
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": error_msg,
+                    "pod_ip": pod_ip,
+                },
+            )
+            return False
 
         # code-server is already running from the workspace entrypoint
         code_server_url = _build_code_server_url(job_id)
@@ -669,10 +676,11 @@ class IdeSessionService:
             job_id,
             code_server_url,
         )
+        return True
 
     async def _restore_local_ide_container(
         self, job_id: str, repo_name: str, branch: str
-    ) -> None:
+    ) -> bool:
         """Fallback: run code-server via local podman/docker (dev environments)."""
         import asyncio
 
@@ -742,7 +750,7 @@ class IdeSessionService:
                         "error": f"Container start failed: {error_msg}",
                     },
                 )
-                return
+                return False
 
             ready = await self._wait_for_code_server(
                 f"http://localhost:{host_port}", timeout=30
@@ -756,7 +764,7 @@ class IdeSessionService:
                     },
                 )
                 await self._remove_container(runtime, container_name)
-                return
+                return False
 
             code_server_url = (
                 f"http://localhost:{host_port}/?folder=/home/coder/workspace"
@@ -778,6 +786,7 @@ class IdeSessionService:
                 job_id,
                 code_server_url,
             )
+            return True
 
         except Exception as e:
             logger.exception("Container IDE session failed for job %s", job_id)
@@ -793,6 +802,192 @@ class IdeSessionService:
                 await self._remove_container(runtime, container_name)
             except Exception:
                 pass
+            return False
+
+    async def _restore_snapshot_container(self, job_id: str, job: dict) -> bool:
+        """Restore an IDE session via in-cluster pod from an in-cluster snapshot."""
+        pod_name = f"ide-{job_id[:12]}"
+
+        await self._set_session_context(
+            job_id,
+            {
+                "container_name": pod_name,
+                "restore_type": "k8s_container",
+            },
+        )
+
+        if (
+            not self._container_provisioner
+            or not getattr(self._container_provisioner, "is_available", True)
+        ):
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "IDE pod provisioner not available",
+                },
+            )
+            return False
+
+        pod_ip = await self._container_provisioner.create_ide_pod(job_id)
+        if not pod_ip:
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "IDE pod did not become ready within timeout",
+                },
+            )
+            return False
+
+        extracted = await self._extract_snapshot_to_k8s_pod(job_id, pod_ip, 30022)
+        if not extracted:
+            return False
+
+        await self._seed_ide_profile_for_user(job_id, job, pod_ip, 30022)
+
+        # code-server should already be running from the workspace entrypoint
+        code_server_url = _build_code_server_url(job_id)
+
+        # Verify code-server is responding before marking active.
+        ready = await self._wait_for_code_server(f"http://{pod_ip}:38080", timeout=15)
+        if not ready:
+            logger.warning(
+                "code-server not responding on IDE pod %s — setting active anyway",
+                pod_name,
+            )
+
+        await self._set_session_context(
+            job_id,
+            {
+                "status": "active",
+                "code_server_url": code_server_url,
+                "restore_type": "k8s_container",
+                "pod_ip": pod_ip,
+                "last_activity": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+        logger.info(
+            "IDE session active (K8s container snapshot restore) for job %s: %s",
+            job_id,
+            code_server_url,
+        )
+        return True
+
+    async def _extract_snapshot_to_k8s_pod(
+        self, job_id: str, pod_ip: str, ssh_port: int = 30022
+    ) -> bool:
+        """Download S3 snapshot and extract into the IDE pod via SSH."""
+        import tempfile
+
+        if not self._snapshot_service:
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "Snapshot service not available",
+                },
+            )
+            return False
+
+        if not getattr(self._snapshot_service, "is_available", True):
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "Snapshot service is unavailable",
+                },
+            )
+            return False
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".tar.zst", delete=True, prefix=f"restore_{job_id[:8]}_"
+        ) as tmp:
+            tar_path = tmp.name
+
+            ok = await self._snapshot_service.download_snapshot(job_id, tar_path)
+            if not ok:
+                error_msg = "Failed to download snapshot"
+                logger.warning(
+                    "Failed to download snapshot for job %s",
+                    job_id,
+                )
+                await self._set_session_context(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "error": error_msg,
+                    },
+                )
+                return False
+
+            key_path = resolve_ssh_key_path()
+            if not key_path:
+                logger.warning(
+                    "No SSH key available for snapshot extraction for job %s",
+                    job_id,
+                )
+            rc, stderr = await stream_extract_snapshot(
+                pod_ip, ssh_port, tar_path, key_path=key_path
+            )
+            if rc != 0:
+                error_msg = (
+                    f"Snapshot extraction failed for job {job_id} (rc={rc}): "
+                    f"{stderr.decode(errors='replace')[:500]}"
+                )
+                logger.warning(error_msg)
+                await self._set_session_context(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "error": error_msg,
+                    },
+                )
+                return False
+
+        return True
+
+    async def _seed_ide_profile_for_user(
+        self, job_id: str, job: dict, ssh_host: str, ssh_port: int
+    ) -> None:
+        """Seed IDE config and profile for restored IDE pods."""
+        try:
+            from services.ide_settings import seed_ide_config_for_user
+
+            await seed_ide_config_for_user(
+                self._db, job.get("user_id"), ssh_host, ssh_port
+            )
+
+            # Restore license/globalStorage + non-Open-VSX bytes into the IDE
+            # workspace. Best-effort; no-ops when optional dependencies
+            # are unavailable.
+            user_id = job.get("user_id")
+            if (
+                user_id
+                and self._snapshot_service
+                and getattr(self._snapshot_service, "is_available", True)
+            ):
+                from services.ide_profile_store import IdeProfileStore
+                from services.ide_settings import IdeSettingsStore, seed_ide_profile
+
+                items = await IdeSettingsStore(self._db).get_extensions(str(user_id))
+                profile = IdeProfileStore(
+                    self._snapshot_service._s3, self._snapshot_service._bucket
+                )
+                await seed_ide_profile(
+                    user_id=str(user_id),
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    profile_store=profile,
+                    ext_items=items,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to seed code-server config for IDE session %s",
+                job_id,
+                exc_info=True,
+            )
 
     async def _wait_for_vm_ready(
         self, job_id: str, timeout: int = 120
