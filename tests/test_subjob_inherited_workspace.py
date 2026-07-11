@@ -76,11 +76,13 @@ class TestNonInheriting:
 
     @pytest.mark.asyncio
     async def test_own_snapshot_already_ready_proceeds(self, patch_get_job):
-        """Critic spawned after the parent pod went ready — snapshot is usable."""
-        mock = patch_get_job(None)
+        """A ready child snapshot is trusted only after parent liveness is rechecked."""
+        mock = patch_get_job(
+            {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
+        )
         job = _subjob({"workspace_container": dict(READY_CONTAINER)})
         assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
-        mock.assert_not_awaited()
+        mock.assert_awaited_once_with("parent-uuid")
 
 
 class TestContainerInheritance:
@@ -134,6 +136,19 @@ class TestContainerInheritance:
             }
         )
         job = _subjob({"workspace_container": dict(STALE_CONTAINER)})
+        action, msg = await main._resolve_subjob_inherited_workspace(job)
+        assert action == "fail"
+        assert "unavailable" in msg
+
+    @pytest.mark.asyncio
+    async def test_ready_snapshot_with_dead_parent_fails_fast(self, patch_get_job):
+        patch_get_job(
+            {
+                "status": "failed",
+                "context": {"workspace_container": {"status": "deleted"}},
+            }
+        )
+        job = _subjob({"workspace_container": dict(READY_CONTAINER)})
         action, msg = await main._resolve_subjob_inherited_workspace(job)
         assert action == "fail"
         assert "unavailable" in msg

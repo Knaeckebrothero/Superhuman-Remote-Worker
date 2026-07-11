@@ -276,6 +276,7 @@
     "colActions": "Aktionen",
     "projectNone": "Kein Projekt",
     "projectUnknown": "Unbekanntes Projekt",
+    "failureReason": "Grund",
     "filter": {
       "all": "Alle",
       "pending_review": "Prüfung",
