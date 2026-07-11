@@ -110,6 +110,45 @@ class OverlayMountManager:
             return False
         return _OVERLAY_OK in out
 
+    def upperdir_usage_bytes(self) -> int:
+        """Best-effort ``du -sb`` probe of the upperdir (design §7/§9.9).
+
+        Runs with ``require_ok=False``: a probe failure (e.g. du missing, path
+        gone) must never raise and block the caller — it degrades to 0 so
+        ``over_quota``/``quota_guard_message`` fail open rather than wedging
+        the shell preflight on an unrelated probe error.
+        """
+        out = self._run("overlay_usage.sh", self._usage_script(), timeout=30, require_ok=False)
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.startswith("__SRW_"):
+                continue
+            head = line.split()[0]
+            if head.isdigit():
+                return int(head)
+        return 0
+
+    def over_quota(self) -> bool:
+        quota = int(self.cfg.get("quota_bytes") or 0)
+        return bool(quota) and self.upperdir_usage_bytes() >= quota
+
+    def quota_guard_message(self) -> str | None:
+        """Mirrors ``RcloneMountManager.cache_limit_message``: block message or None."""
+        quota = int(self.cfg.get("quota_bytes") or 0)
+        if not quota:
+            return None
+        used = self.upperdir_usage_bytes()
+        if used < quota:
+            return None
+        return (
+            "Cloud staging guard: this write was blocked because the protected-"
+            "mode staging area (upperdir) has reached its cap.\n"
+            f"Used {used} bytes of {quota} allowed.\n\n"
+            "Staged changes are held locally until you review/apply them. Apply "
+            "or reject the pending cloud diff to free space, or ask the operator "
+            "to raise the cap."
+        )
+
     def heal(self, remount_lower: Callable[[], None]) -> None:
         """Recover a dead rclone lower under a live overlay (design §11.2).
 
@@ -238,6 +277,14 @@ echo "{_OVERLAY_OK}"
 set +e
 # LAZY unmount is correct on heal (dead lower => held reads ENOTCONN loudly).
 fusermount3 -uz {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null
+echo "{_OVERLAY_OK}"
+"""
+
+    def _usage_script(self) -> str:
+        upper = shlex.quote(self.upper)
+        return f"""#!/usr/bin/env bash
+set +e
+du -sb {upper} 2>/dev/null
 echo "{_OVERLAY_OK}"
 """
 

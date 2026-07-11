@@ -194,3 +194,60 @@ def test_heal_lazy_unmounts_overlay_first_then_remounts_lower_then_overlay():
     )
     assert "fuse-overlayfs -o lowerdir=/cloud/lower" in remount
     assert "fusermount3 -u" not in remount  # no unmount folded in
+
+
+def test_upperdir_usage_parses_du_and_flags_over_quota():
+    backend = FakeRemoteBackend()
+    backend.outputs_by_script["overlay_usage.sh"] = (
+        "9663676416\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    )
+    mgr = _manager(backend)  # quota_bytes = 8 GiB
+    assert mgr.upperdir_usage_bytes() == 9663676416
+    assert mgr.over_quota() is True
+    assert mgr.quota_guard_message() is not None
+
+
+def test_under_quota_has_no_guard_message():
+    backend = FakeRemoteBackend()
+    backend.outputs_by_script["overlay_usage.sh"] = "1024\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    mgr = _manager(backend)
+    assert mgr.over_quota() is False
+    assert mgr.quota_guard_message() is None
+
+
+def test_upperdir_usage_skips_sentinel_and_junk_lines_falls_back_to_zero():
+    backend = FakeRemoteBackend()
+    backend.outputs_by_script["overlay_usage.sh"] = "du: cannot access: No such file\n__SRW_OVERLAY_OK__\n"
+    mgr = _manager(backend)
+    assert mgr.upperdir_usage_bytes() == 0
+    assert mgr.over_quota() is False
+
+
+def test_over_quota_false_when_quota_bytes_absent():
+    backend = FakeRemoteBackend()
+    backend.outputs_by_script["overlay_usage.sh"] = "999999999999\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    cfg = _cfg()
+    del cfg["quota_bytes"]
+    mgr = OverlayMountManager(
+        thread_id="thread-12345678",
+        overlay_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    assert mgr.over_quota() is False
+    assert mgr.quota_guard_message() is None
+
+
+def test_over_quota_false_when_quota_bytes_zero():
+    backend = FakeRemoteBackend()
+    backend.outputs_by_script["overlay_usage.sh"] = "999999999999\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    cfg = _cfg()
+    cfg["quota_bytes"] = 0
+    mgr = OverlayMountManager(
+        thread_id="thread-12345678",
+        overlay_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    assert mgr.over_quota() is False
+    assert mgr.quota_guard_message() is None
