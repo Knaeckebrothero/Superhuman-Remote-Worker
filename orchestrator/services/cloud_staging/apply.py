@@ -27,9 +27,11 @@ Reject never touches the cloud — it just resets the agent-side overlay
 way. No baseline re-capture (nothing changed on the cloud side).
 
 Known v1 limitation: apply/reject resets the *live* agent's overlay via an
-HTTP call to the workspace pod (``reset_agent_overlay``), which is a no-op
-when the pod is dead — normal, not fatal (see ``main._reset_thread_overlay``
-docstring). If the pod is dead at apply/reject time, the overlay inside the
+HTTP call to the AGENT pod's app — ``reset_agent_overlay`` resolves the
+bound agent's ``pod_ip``/``pod_port`` via ``get_agent`` (see
+``main._reset_thread_overlay``); the agent app then tears down the overlay
+it manages. The call is a no-op when that pod is dead — normal, not fatal.
+If the pod is dead at apply/reject time, the overlay inside the
 *last workspace snapshot* still carries the old upperdir; a later resume
 restores that snapshot, and the next turn-end stage push re-stages the
 already-applied (or already-rejected) content against the fresh baseline —
