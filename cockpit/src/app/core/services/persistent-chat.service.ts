@@ -2,7 +2,7 @@ import {computed, DestroyRef, effect, inject, Injectable, NgZone, signal, untrac
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
-import {ThreadStatus} from '../models/api.model';
+import {ThreadCloudDiffSummary, ThreadStatus} from '../models/api.model';
 import {FilePreview, ThreadUploadedFile, UploadStatus} from '../models/file.model';
 import {
     AssistantTurn,
@@ -531,6 +531,19 @@ export class PersistentChatService {
     readonly ncSessionFolder = signal<string | null>(null);
     readonly cloudSessionUrl = signal<string | null>(null);
 
+    // --- Protected cloud mode (Slice C, Task 14): status-bar badge + review
+    //     drawer for the thread's staged cloud-diff. `protectedCloud` comes
+    //     from the loaded Thread's metadata; the count + mount name come from
+    //     the diff summary (refreshed on load and debounced after each
+    //     turn.completed — see refreshCloudDiffCount / _scheduleCloudDiffRefresh). ---
+    private readonly _protectedCloud = signal(false);
+    readonly protectedCloud = computed(() => this._protectedCloud());
+    readonly cloudChangesCount = signal(0);
+    readonly protectedMountName = signal<string | null>(null);
+    readonly cloudDiffPanelOpen = signal(false);
+    private cloudDiffRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+    private static readonly CLOUD_DIFF_REFRESH_DEBOUNCE_MS = 2000;
+
     // --- Lifecycle state from the row (drives the resume card) ---
     readonly threadStatus = signal<ThreadStatus | null>(null);
     readonly endedAt = signal<string | null>(null);
@@ -702,6 +715,10 @@ export class PersistentChatService {
             this.runningTool.set(null);
             this.citationsByCid.set(new Map());
             this.citationsLoaded.set(false);
+            this._protectedCloud.set(false);
+            this.cloudChangesCount.set(0);
+            this.protectedMountName.set(null);
+            this.cloudDiffPanelOpen.set(false);
 
             this.threadId.set(threadId);
             await this.loadHistory(threadId);
@@ -982,9 +999,50 @@ export class PersistentChatService {
             this.cloudSessionUrl.set(thread.cloud_session_url || null);
             this.threadStatus.set((thread.status as ThreadStatus) || null);
             this.endedAt.set(thread.ended_at || thread.last_activity || null);
+            this._protectedCloud.set(!!thread.metadata?.protected_cloud);
+            if (this._protectedCloud()) {
+                void this.refreshCloudDiffCount();
+            }
         } catch {
             // Non-fatal — UI will show fallback values
         }
+    }
+
+    /**
+     * Refresh the staged protected-cloud diff count + mount name from the
+     * summary endpoint (Slice C, Task 14). Called on thread load and
+     * (debounced) after each turn.completed while protected — staging runs
+     * at turn end, so that's the natural refresh edge. Best-effort: a
+     * failed fetch (getThreadCloudDiff already swallows errors to null)
+     * just leaves the previous count/mount in place.
+     */
+    async refreshCloudDiffCount(): Promise<void> {
+        const threadId = this.threadId();
+        if (!threadId) return;
+        const summary = await firstValueFrom(this.api.getThreadCloudDiff(threadId));
+        if (this.threadId() !== threadId) return; // stale response after a thread switch
+        if (summary) {
+            this.cloudChangesCount.set(cloudCountFromSummary(summary));
+            this.protectedMountName.set(summary.protected_mount);
+        }
+    }
+
+    /** Cloud-diff review panel resolved (applied or rejected) — clear the
+     *  badge and close the drawer. */
+    onCloudDiffResolved(): void {
+        this.cloudChangesCount.set(0);
+        this.cloudDiffPanelOpen.set(false);
+    }
+
+    /** Debounced refreshCloudDiffCount() after a turn.completed frame — see
+     *  the call site in _handleEvent for why the 2s window. */
+    private _scheduleCloudDiffRefresh(): void {
+        if (this.cloudDiffRefreshTimer) clearTimeout(this.cloudDiffRefreshTimer);
+        const threadId = this.threadId();
+        this.cloudDiffRefreshTimer = setTimeout(() => {
+            this.cloudDiffRefreshTimer = null;
+            if (threadId && this.threadId() === threadId) void this.refreshCloudDiffCount();
+        }, PersistentChatService.CLOUD_DIFF_REFRESH_DEBOUNCE_MS);
     }
 
     // ── SSE receive path ─────────────────────────────────────────────────
@@ -1572,6 +1630,10 @@ export class PersistentChatService {
         this._stopSseWatchdog();
         this._stopControlWsWatchdog();
         this._clearSendKickstart();
+        if (this.cloudDiffRefreshTimer) {
+            clearTimeout(this.cloudDiffRefreshTimer);
+            this.cloudDiffRefreshTimer = null;
+        }
         // Supersede any _openSse still awaiting its cursor read so it can't
         // resurrect a stream after we've torn down.
         this.sseGeneration++;
@@ -1618,6 +1680,10 @@ export class PersistentChatService {
         this.tasks.set([]);
         this.undoAvailable.set(false);
         this.isSessionPaused.set(false);
+        this._protectedCloud.set(false);
+        this.cloudChangesCount.set(0);
+        this.protectedMountName.set(null);
+        this.cloudDiffPanelOpen.set(false);
     }
 
     /**
@@ -2389,6 +2455,14 @@ export class PersistentChatService {
                 // A compaction never outlives its turn — clear a stale block
                 // (e.g. the pod died mid-fold and the turn was closed).
                 this.compaction.set(null);
+                // Protected cloud mode (Slice C, Task 14): the agent stages
+                // its cloud-diff overlay at turn end, so this is the natural
+                // edge to refresh the badge count. Debounced — a burst of
+                // rapid turns (e.g. auto-continue) shouldn't fire one GET per
+                // turn.
+                if (this.protectedCloud()) {
+                    this._scheduleCloudDiffRefresh();
+                }
                 break;
             }
 
@@ -2885,6 +2959,16 @@ function mergeMessagesById(a: HistoryMessage[], b: HistoryMessage[]): HistoryMes
         if (t !== 0) return t;
         return x.id.localeCompare(y.id);
     });
+}
+
+/**
+ * Total staged-change count from a thread cloud-diff summary (Slice C,
+ * Task 14) — the sum of added/modified/deleted, driving the status-bar
+ * badge. `null` (not loaded, or the thread isn't protected) counts as 0.
+ */
+export function cloudCountFromSummary(s: ThreadCloudDiffSummary | null): number {
+    if (!s) return 0;
+    return s.counts.added + s.counts.modified + s.counts.deleted;
 }
 
 // Synthetic image-delivery messages ("Image content from tool call <id>:")

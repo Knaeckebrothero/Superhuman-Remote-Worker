@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { diffApiFor, isBinaryEntry } from './job-diff-review.component';
 
 /**
  * Unit tests for the pure helpers used by JobDiffReviewComponent.
@@ -7,6 +8,10 @@ import { describe, it, expect } from 'vitest';
  * extension-to-language inference and status mapping. Full component
  * behavior is exercised via the cluster Playwright smoke run when
  * Slice 3b is ready to verify.
+ *
+ * `diffApiFor` / `isBinaryEntry` are imported (not duplicated) from the
+ * component — Task 14's thread-mode generalization — so this spec exercises
+ * the real implementation the component uses.
  */
 
 function languageFromPath(path: string): string {
@@ -85,5 +90,47 @@ describe('JobDiffReviewComponent helpers', () => {
     it('returns M for modified', () => {
       expect(statusGlyph('modified')).toBe('M');
     });
+  });
+});
+
+describe('diffApiFor', () => {
+  it('returns "job" when only jobId is set', () => {
+    expect(diffApiFor('job-1', null)).toBe('job');
+  });
+
+  it('returns "thread" when only threadId is set', () => {
+    expect(diffApiFor(null, 'thread-1')).toBe('thread');
+  });
+
+  it('throws when both jobId and threadId are set (host wiring bug)', () => {
+    expect(() => diffApiFor('job-1', 'thread-1')).toThrow();
+  });
+
+  it('throws when neither jobId nor threadId is set (host wiring bug)', () => {
+    expect(() => diffApiFor(null, null)).toThrow();
+  });
+});
+
+describe('isBinaryEntry', () => {
+  it('is true when the file-tree entry is flagged binary', () => {
+    expect(isBinaryEntry({ binary: true }, null)).toBe(true);
+  });
+
+  it('is true when the loaded file reports old_binary', () => {
+    expect(isBinaryEntry({}, { old_binary: true, new_binary: false })).toBe(true);
+  });
+
+  it('is true when the loaded file reports new_binary', () => {
+    expect(isBinaryEntry({}, { old_binary: false, new_binary: true })).toBe(true);
+  });
+
+  it('is false for a plain-text entry with no file loaded yet', () => {
+    expect(isBinaryEntry({}, null)).toBe(false);
+  });
+
+  it('is false when neither the entry nor the loaded file are flagged binary', () => {
+    expect(
+      isBinaryEntry({ binary: false }, { old_binary: false, new_binary: false }),
+    ).toBe(false);
   });
 });

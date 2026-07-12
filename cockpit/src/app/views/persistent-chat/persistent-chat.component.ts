@@ -64,6 +64,7 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {AppBadgeComponent} from '../../ui/badge';
 import {CitationsPanelComponent} from './citations-panel/citations-panel.component';
+import {JobDiffReviewComponent} from '../job-diff-review/job-diff-review.component';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
@@ -264,6 +265,16 @@ export function canComposeDuringSession(
     return isConnected || isStartingSession || isDraftSession;
 }
 
+/**
+ * Whether the status-bar "Cloud changes" badge should show (Slice C,
+ * Task 14). Both conditions are needed: `protectedCloud` alone doesn't mean
+ * anything is staged yet, and a nonzero count must not survive a switch to
+ * an unprotected thread (stale signal from the previous session).
+ */
+export function cloudBadgeVisible(protectedCloud: boolean, count: number): boolean {
+    return protectedCloud && count > 0;
+}
+
 export function canSendMessage(canCompose: boolean, text: string, attachmentCount: number): boolean {
     return canCompose && (text.trim().length > 0 || attachmentCount > 0);
 }
@@ -458,6 +469,7 @@ export function clearDraft(threadId: string | null): void {
         AppReadAloudComponent,
         AppInlineEditableTextComponent,
         CitationsPanelComponent,
+        JobDiffReviewComponent,
     ],
     template: `
     <div class="chat-container"
@@ -593,6 +605,13 @@ export function clearDraft(threadId: string | null): void {
           @if (chat.compaction(); as comp) {
             <app-badge tone="warning" size="sm">{{ 'chat.compactionLive.footer' | transloco:{ current: comp.currentPass > 0 ? comp.currentPass : 1, total: comp.nPasses, elapsed: compactionElapsed() } }}</app-badge>
           }
+          @if (cloudBadgeShown()) {
+            <app-badge tone="accent" size="sm" role="button"
+                       [title]="'chat.status.cloudChangesTooltip' | transloco:{ mount: chat.protectedMountName() }"
+                       (click)="chat.cloudDiffPanelOpen.set(true)">
+              {{ 'chat.status.cloudChanges' | transloco:{ count: chat.cloudChangesCount() } }}
+            </app-badge>
+          }
           <app-badge tone="accent" size="sm">{{ chat.permissionMode() | titlecase }}</app-badge>
         </div>
       }
@@ -688,6 +707,35 @@ export function clearDraft(threadId: string | null): void {
       @if (showCitations()) {
         <div class="settings-panel citations-panel-wrap">
           <app-citations-panel (close)="showCitations.set(false)" />
+        </div>
+      }
+
+      <!-- Cloud-diff review drawer (Slice C, Task 14): staged protected-cloud
+           changes. Reuses the citations panel's container classes (no new
+           persistent-chat.component.scss — that file is already near its
+           anyComponentStyle budget); the drawer's own chrome is inline,
+           mirroring citations-panel.component.ts's styles-array pattern. -->
+      @if (chat.cloudDiffPanelOpen()) {
+        <div class="settings-panel citations-panel-wrap"
+             style="display:flex;flex-direction:column;height:70vh;min-height:0;">
+          <div style="display:flex;align-items:center;justify-content:space-between;
+                      flex:0 0 auto;padding:0.5rem 0.75rem;
+                      border-bottom:1px solid var(--border-color, rgba(127,127,127,0.2));">
+            <span style="font-weight:600;font-size:0.9rem;">
+              {{ 'chat.status.cloudChanges' | transloco:{ count: chat.cloudChangesCount() } }}
+            </span>
+            <button type="button" (click)="chat.cloudDiffPanelOpen.set(false)"
+                    [title]="'chat.citations.close' | transloco"
+                    style="background:none;border:none;cursor:pointer;color:inherit;
+                           display:inline-flex;padding:0.15rem;">
+              <app-icon size="sm">close</app-icon>
+            </button>
+          </div>
+          <app-job-diff-review
+            style="flex:1 1 auto;min-height:0;"
+            [threadId]="chat.threadId()"
+            (resolved)="chat.onCloudDiffResolved()"
+          />
         </div>
       }
 
@@ -1780,6 +1828,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.chat.isStartingSession(),
             this.chat.isDraftSession(),
         ),
+    );
+
+    /** Status-bar "Cloud changes" badge visibility (Slice C, Task 14). */
+    readonly cloudBadgeShown = computed(() =>
+        cloudBadgeVisible(this.chat.protectedCloud(), this.chat.cloudChangesCount()),
     );
 
     stepIcon(state: 'done' | 'active' | 'todo'): string {

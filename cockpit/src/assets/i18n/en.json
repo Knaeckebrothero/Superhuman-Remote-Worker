@@ -1017,7 +1017,9 @@
     "status": {
       "temp": "temp {{value}}",
       "turn": "Turn {{count}}",
-      "agentQuiet": "Working — no output for {{seconds}}s"
+      "agentQuiet": "Working — no output for {{seconds}}s",
+      "cloudChanges": "Cloud changes ({{count}})",
+      "cloudChangesTooltip": "Staged on {{mount}} — click to review"
     },
     "turn": {
       "collapsedEmpty": "Tool calls only",
@@ -1869,6 +1871,7 @@
     "subtitleSingular": "{{count}} file changed in this job. Review and decide.",
     "loading": "Loading diff…",
     "empty": "No changes to review — the agent didn't modify the project folder.",
+    "staleNotice": "The staged diff changed since you loaded it — reloaded the latest version.",
     "fileTree": {
       "header": "Files",
       "statusAdded": "Added",
@@ -1883,7 +1886,8 @@
       "labelChanged": "Agent edit",
       "deletedNote": "This file will be deleted from the cloud folder on accept.",
       "addedNote": "This file will be created in the cloud folder on accept.",
-      "monacoUnavailable": "The diff editor failed to load. Showing plain content instead."
+      "monacoUnavailable": "The diff editor failed to load. Showing plain content instead.",
+      "binaryPlaceholder": "Binary file — applied byte-for-byte, no preview"
     },
     "conflict": {
       "title": "Cloud folder was modified externally",
@@ -1900,6 +1904,7 @@
     "actions": {
       "accept": "Accept all changes",
       "accepting": "Applying changes…",
+      "applyToCloud": "Apply to cloud",
       "reject": "Reject all",
       "rejecting": "Rejecting…",
       "confirmAcceptTitle": "Apply these changes to your cloud folder?",
@@ -2294,6 +2299,11 @@
       "deleteFailed": "Couldn't delete the session.",
       "createFailed": "Couldn't create the session.",
       "renameFailed": "Couldn't rename the session."
+    },
+    "cloudDiff": {
+      "applyFailed": "Couldn't apply the staged changes.",
+      "rejectFailed": "Couldn't reject the staged changes.",
+      "restageFailed": "Couldn't refresh the staged diff."
     }
   },
   "toasts": {
