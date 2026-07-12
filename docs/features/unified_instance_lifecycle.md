@@ -13,6 +13,19 @@ Not yet implemented.
 > (see its *Deferral log*). A status-repair **stopgap** is being added 2026-06-23
 > to stop the bleeding; it does **not** discharge this work.
 
+> **Third motivating incident (2026-07-12):**
+> [`docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md`](../issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md)
+> — a bind-type bug in one sweep inside `stale_agent_detector`'s single `try`
+> block silently disabled orphan-job recovery (and four other reconciliation
+> concerns) cluster-wide for ~36 h; two loop jobs wedged permanently. Two
+> requirements this adds to the design: (1) the detector's agent sweeps fold
+> into the reconciler as **isolated per-concern reconciliations** — one broken
+> concern must degrade only itself; (2) each concern exposes a
+> `last_successful_tick` in `/health`/admin so a rotting reconciler is
+> *observable*, not just logged. Note the job-side complement designed
+> separately: [`job_execution_lease.md`](job_execution_lease.md) removes job
+> recovery's dependency on agent-table reconciliation entirely.
+
 ## Problem (summary)
 
 Agents, workspace pods, and VMs are three families of stateful instances

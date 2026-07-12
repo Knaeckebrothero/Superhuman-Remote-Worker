@@ -606,36 +606,62 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
     Finally, offline agents older than 24h are GC'd to keep the table small.
     """
     logger.info("Stale agent detector started")
+
+    async def _step(name: str, coro) -> Any:
+        """Run one reconciliation step isolated from its siblings.
+
+        Every step here repairs an INDEPENDENT inconsistency; a bug in one
+        must degrade only that dimension. The 2026-07-11 incident proved the
+        alternative: a bind-type bug in the graph-progress sweep silently
+        disabled orphan-job recovery (and everything else after it) for ~36h
+        because all steps shared one try block. See
+        docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+        Returns None on failure — callers treat that as "no rows".
+        """
+        try:
+            return await coro
+        except Exception as e:
+            logger.error(f"Stale agent detector step '{name}' failed: {e}")
+            return None
+
     while not shutdown_event.is_set():
         try:
             # 1. Heartbeat-based: mark non-responsive agents offline
-            count = await postgres_db.mark_stale_agents_offline(timeout_minutes=3)
-            if count > 0:
+            count = await _step(
+                "offline_marking",
+                postgres_db.mark_stale_agents_offline(timeout_minutes=3),
+            )
+            if count:
                 logger.info(
                     f"Marked {count} agent(s) as offline due to missed heartbeats"
                 )
 
             # 2. Consistency-based: release slots held by zombie agents
-            stuck_working = await postgres_db.mark_stuck_working_agents_ready()
-            if stuck_working > 0:
+            stuck_working = await _step(
+                "stuck_working", postgres_db.mark_stuck_working_agents_ready()
+            )
+            if stuck_working:
                 logger.info(
                     f"Released {stuck_working} agent(s) stuck in 'working' with no job"
                 )
                 _trigger_dispatch()
-            stalled_working = (
-                await postgres_db.mark_stalled_working_agents_by_graph_progress(
+            stalled_working = await _step(
+                "graph_progress_stall",
+                postgres_db.mark_stalled_working_agents_by_graph_progress(
                     stall_minutes=10
-                )
+                ),
             )
-            if stalled_working > 0:
+            if stalled_working:
                 logger.info(
                     "Released %d working agent(s) with no graph-progress "
                     "for the stall interval",
                     stalled_working,
                 )
                 _trigger_dispatch()
-            stuck_session = await postgres_db.mark_stuck_session_agents_ready()
-            if stuck_session > 0:
+            stuck_session = await _step(
+                "stuck_session", postgres_db.mark_stuck_session_agents_ready()
+            )
+            if stuck_session:
                 logger.info(
                     f"Released {stuck_session} agent(s) stuck in 'session' "
                     f"on ended thread"
@@ -651,11 +677,15 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             # (the 2026-06-10 incident). Proper fix = the intent/observed split
             # in docs/features/unified_instance_lifecycle.md. Tracking:
             # docs/issues/lifecycle_session_agents_without_thread_never_drain.md
-            orphaned_sessions = await postgres_db.reap_orphaned_session_agents(
-                grace_minutes=5
+            orphaned_sessions = await _step(
+                "orphaned_session_reap",
+                postgres_db.reap_orphaned_session_agents(grace_minutes=5),
             )
-            for orphan in orphaned_sessions:
-                deleted = await agent_provisioner.delete_agent_pod(orphan["hostname"])
+            for orphan in orphaned_sessions or []:
+                deleted = await _step(
+                    "orphaned_session_pod_delete",
+                    agent_provisioner.delete_agent_pod(orphan["hostname"]),
+                )
                 logger.warning(
                     "Reaped orphaned session agent %s (pod=%s, deleted=%s): "
                     "'session' with no thread/job past grace",
@@ -665,39 +695,56 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 )
 
             # 3. Propagate: threads bound to offline agents → 'ended'
-            ended_ids = await postgres_db.mark_orphaned_threads_ended()
+            ended_ids = await _step(
+                "orphaned_threads_ended", postgres_db.mark_orphaned_threads_ended()
+            )
             if ended_ids:
                 logger.info(f"Marked {len(ended_ids)} thread(s) as ended (orphaned)")
                 # The DB transition leaves workspace + agent pods alive — release
                 # them here so we don't depend on the idle sweeper as the only
                 # backstop (it's disabled whenever S3 snapshots are unavailable).
                 for thread_id in ended_ids:
-                    await _release_thread_resources(thread_id)
+                    await _step(
+                        "release_thread_resources",
+                        _release_thread_resources(thread_id),
+                    )
 
             # 3b. Propagate: PAUSED threads (awaiting_user / suspended) bound to
             # offline agents → 'suspended' with agent_id cleared, so the next
             # open re-provisions instead of 409-looping. These are the paused
             # states mark_orphaned_threads_ended intentionally skips; suspend
             # (not release) keeps them resumable.
-            suspended_ids = await postgres_db.mark_orphaned_threads_suspended()
+            suspended_ids = await _step(
+                "orphaned_threads_suspended",
+                postgres_db.mark_orphaned_threads_suspended(),
+            )
             if suspended_ids:
                 logger.info(f"Suspended {len(suspended_ids)} orphaned paused thread(s)")
                 for thread_id in suspended_ids:
-                    await _suspend_thread_resources(thread_id)
+                    await _step(
+                        "suspend_thread_resources",
+                        _suspend_thread_resources(thread_id),
+                    )
 
             # 4. Propagate: jobs assigned to offline agents → paused
-            recovered = await postgres_db.recover_orphaned_jobs()
-            if recovered > 0:
+            recovered = await _step(
+                "orphaned_job_recovery", postgres_db.recover_orphaned_jobs()
+            )
+            if recovered:
                 logger.info(
                     f"Recovered {recovered} orphaned job(s) from offline agents"
                 )
                 _trigger_dispatch()
 
             # 5. GC: drop offline agent rows older than 24h
-            gc_count = await postgres_db.gc_offline_agents(retention_hours=24)
-            if gc_count > 0:
+            gc_count = await _step(
+                "offline_gc", postgres_db.gc_offline_agents(retention_hours=24)
+            )
+            if gc_count:
                 logger.info(f"GC'd {gc_count} offline agent record(s) > 24h old")
         except Exception as e:
+            # Last resort — individual steps are isolated above, so anything
+            # landing here is a bug in the loop scaffolding itself.
             logger.error(f"Error in stale agent detector: {e}")
 
         # Wait 60 seconds or until shutdown

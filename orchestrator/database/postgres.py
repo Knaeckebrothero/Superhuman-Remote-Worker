@@ -3830,7 +3830,7 @@ class PostgresDB:
                   AND current_job_id IS NOT NULL
                   AND metadata ? 'graph_progress_seen_at'
                   AND (metadata->>'graph_progress_seen_at')::timestamptz
-                        < NOW() - ($1 || ' minutes')::INTERVAL
+                        < NOW() - make_interval(mins => $1)
                 """,
                 stall_minutes,
             )

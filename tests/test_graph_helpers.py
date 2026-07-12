@@ -632,6 +632,61 @@ class TestClassifyLlmError:
         )
         assert _classify_llm_error(err) == "rate_limit"
 
+    def test_400_minimax_bad_request_error_is_permanent(self):
+        """MiniMax says type='bad_request_error' where OpenAI-compatible
+        providers say 'invalid_request_error'. The 2026-07-11 wedge: a
+        deterministic "invalid function arguments json string" 400 was
+        classified transient and pause/backoff-looped forever — see
+        docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md
+        (Finding 3)."""
+        err = _make_sdk_error(
+            "BadRequestError",
+            400,
+            body={
+                "error": {
+                    "type": "bad_request_error",
+                    "message": (
+                        "invalid params, invalid function arguments json "
+                        "string, tool_call_id: call_E7U6VHuNDwmxi6Hl8jkjkrG8"
+                    ),
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_400_bad_request_rate_disguised_stays_rate_limit(self):
+        err = _make_sdk_error(
+            "BadRequestError",
+            400,
+            body={
+                "error": {
+                    "type": "bad_request_error",
+                    "code": "rate_limit_exceeded",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "rate_limit"
+
+    def test_stringified_bad_request_error_is_permanent(self):
+        """Stringified provider errors that lost their exception class
+        (observed in production audit logs) must still fail fast via the
+        text fallback."""
+        err = Exception(
+            "Error code: 400 - {'type': 'error', 'error': {'type': "
+            "'bad_request_error', 'message': 'invalid params, invalid "
+            "function arguments json string', 'http_code': '400'}}"
+        )
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_stringified_tool_use_failed_stays_transient(self):
+        """The text fallback must not swallow Groq's recoverable
+        tool_use_failed into 'permanent'."""
+        err = Exception(
+            "Error code: 400 - {'error': {'type': 'invalid_request_error', "
+            "'code': 'tool_use_failed'}}"
+        )
+        assert _classify_llm_error(err) == "transient"
+
     def test_429_is_rate_limit(self):
         err = _make_sdk_error("RateLimitError", 429)
         assert _classify_llm_error(err) == "rate_limit"

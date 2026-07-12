@@ -27,6 +27,12 @@ body {
   height: 100%;
   width: 100%;
   overflow: hidden;
+  // App shell, not a document: kill double-tap-to-zoom (and the legacy 300ms
+  // tap delay) everywhere, including Safari tabs that ignore the viewport
+  // meta's zoom lock. Pinch-zoom prevention itself comes from the meta in
+  // index.html; zoom gestures check the whole ancestor chain, so setting this
+  // on the root covers every element despite touch-action not inheriting.
+  touch-action: manipulation;
   background: var(--app-bg);
   color: var(--text-primary);
   font-family: v.$font-family-base;
