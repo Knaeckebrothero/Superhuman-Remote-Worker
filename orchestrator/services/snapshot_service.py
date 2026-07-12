@@ -297,6 +297,33 @@ class SnapshotService:
             logger.debug("get_blob miss (key=%s): %s", key, e)
             return None
 
+    async def upload_blob_file(self, key: str, local_path: str) -> bool:
+        """Upload a local file to an arbitrary bucket key (staging tars).
+
+        Unlike ``save_blob``, this targets an explicit ``key`` rather than a
+        content-addressed one — callers (e.g. cloud_staging.stage) need a
+        deterministic, overwritable location.
+        """
+        if not self._available:
+            return False
+        try:
+            await asyncio.to_thread(self._s3.upload_file, local_path, self._bucket, key)
+            return True
+        except Exception as e:
+            logger.error(f"S3 upload_blob_file failed for {key}: {e}")
+            return False
+
+    async def delete_blob(self, key: str) -> bool:
+        """Delete the object at an arbitrary bucket ``key``."""
+        if not self._available:
+            return False
+        try:
+            await asyncio.to_thread(self._s3.delete_object, Bucket=self._bucket, Key=key)
+            return True
+        except Exception as e:
+            logger.error(f"S3 delete_blob failed for {key}: {e}")
+            return False
+
     async def capture_vm_snapshot(
         self,
         job_id: str,
