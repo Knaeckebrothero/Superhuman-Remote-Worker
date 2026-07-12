@@ -61,21 +61,23 @@ def _reader_client(
 class _FakeRoBackend:
     backend_id = "nextcloud"
 
-    def __init__(self, *, baseline=None, baseline_error=None):
+    def __init__(self, *, baseline=None, baseline_error=None, reader_id=None):
         self.revoked: list[str] = []
         self.canary_removed = False
         self._baseline = {"a.txt": "e1"} if baseline is None else baseline
         self._baseline_error = baseline_error
+        # Overridable so a test can mint a reader name the caller could NOT
+        # re-derive from user_key — proving grant.reader_id is what flows.
+        self._reader_id = reader_id
 
     async def ensure_ro_reader(self, *, user_key):
-        return f"srw-reader-{user_key}"
+        return self._reader_id or f"srw-reader-{user_key}"
 
     async def mint_ro_grant(self, handle, *, user_key, grant_key):
+        reader = self._reader_id or f"srw-reader-{user_key}"
         return RoReaderGrant(
-            reader_id=f"srw-reader-{user_key}",
-            grant_handle=json.dumps(
-                {"group_id": "g1", "reader_id": f"srw-reader-{user_key}"}
-            ),
+            reader_id=reader,
+            grant_handle=json.dumps({"group_id": "g1", "reader_id": reader}),
             webdav_url="https://nc/remote.php/dav/files/srw-reader-abc/Proj/",
             credentials="pw",
             auth_kind="basic",
@@ -180,6 +182,9 @@ async def test_engage_refuses_and_revokes_when_a_write_succeeds():
     db.create_ro_mount.assert_not_awaited()
     assert backend.revoked  # grant was rolled back
     assert backend.canary_removed is True
+    # Pre-persist refusal: there is no row yet, so the row-aware rollback
+    # must not fire a spurious mark_ro_mount_revoked.
+    db.mark_ro_mount_revoked.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -276,11 +281,44 @@ async def test_engage_refuses_when_baseline_capture_fails():
     # and the baseline must never be persisted.
     assert backend.revoked
     db.update_ro_mount_baseline.assert_not_awaited()
+    # ... and the already-persisted row must not survive as status='active'
+    # with dead credentials and a NULL baseline — the rollback is row-aware.
+    db.mark_ro_mount_revoked.assert_awaited_once_with("row-1")
+
+
+@pytest.mark.asyncio
+async def test_engage_refuses_when_baseline_persist_reports_inactive_row():
+    # update_ro_mount_baseline returning False means the row is no longer
+    # active (e.g. the Slice A reconciler revoked it mid-engage) — the
+    # baseline did NOT persist, so engage must refuse with the same
+    # rollback, never report success without a baseline on the row.
+    backend = _FakeRoBackend()
+    probe_client = _reader_client(all_rejected=True, read_control=207)
+    db = AsyncMock()
+    db.create_ro_mount = AsyncMock(return_value="row-1")
+    db.update_ro_mount_baseline = AsyncMock(return_value=False)
+
+    with pytest.raises(RoEngageRefused):
+        await engage_ro_mount(
+            backend=backend,
+            handle=_handle(),
+            user_key="abc",
+            thread_id="t1",
+            user_id="u1",
+            postgres_db=db,
+            http_client_factory=lambda creds, reader_id: probe_client,
+        )
+
+    assert backend.revoked
+    db.mark_ro_mount_revoked.assert_awaited_once_with("row-1")
 
 
 @pytest.mark.asyncio
 async def test_engage_passes_reader_id_to_client_factory():
-    backend = _FakeRoBackend()
+    # The fake mints a reader name that CANNOT be re-derived from
+    # user_key/user_id ("srw-reader-u1" would collapse the two) — only
+    # grant.reader_id itself can reach the factory with this value.
+    backend = _FakeRoBackend(reader_id="reader-xyz-distinct")
     probe_client = _reader_client(all_rejected=True, read_control=207)
     recorder: list[tuple[str | None, str]] = []
 
@@ -301,5 +339,5 @@ async def test_engage_passes_reader_id_to_client_factory():
         http_client_factory=factory,
     )
 
-    assert grant.reader_id == "srw-reader-u1"
-    assert recorder == [(grant.credentials, "srw-reader-u1")]
+    assert grant.reader_id == "reader-xyz-distinct"
+    assert recorder == [(grant.credentials, "reader-xyz-distinct")]
