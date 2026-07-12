@@ -46,3 +46,6 @@ ingress:
   className: traefik
   tls:
     enabled: false
+
+garage:
+  enabled: true
