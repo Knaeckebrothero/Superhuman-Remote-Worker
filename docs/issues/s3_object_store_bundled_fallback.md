@@ -35,7 +35,7 @@ host value is a cockpit deep-link only). Prod-private brings its own MinIO
 install with none of these silently loses virtual sessions, snapshots, and
 suspension — each failing at a different, late point.
 
-## Proposal (tackle another day)
+## Proposal
 
 1. Add an **opt-in bundled S3 store** to the Helm chart — a small
    single-node Garage or MinIO deployment + PVC, wired automatically into
