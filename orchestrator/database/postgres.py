@@ -9562,6 +9562,35 @@ class PostgresDB:
             logger.exception("vm grant read failed; fall back to can_use_vm column")
         return bool(user.get("can_use_vm"))
 
+    async def user_can_publish_datasource(self, user: dict) -> bool:
+        """Effective public_datasources grant (publish is_global datasources).
+
+        Admins short-circuit to True. Unlike user_can_use_vm there is no
+        legacy-column fallback (new capability, deny-by-default) and the
+        fail mode is CLOSED: publishing hands the publisher's credentials
+        to every user's agents, so a grant-read failure must deny.
+        Spec: docs/features/public_datasources.md.
+        """
+        if user.get("is_admin"):
+            return True
+        try:
+            scoped = await self.list_grants_for_scopes(
+                user_id=str(user["id"]), project_ids=[]
+            )
+            from src.core.capability_grants import resolve_grants
+
+            g = resolve_grants(
+                user_rows=scoped["user"],
+                project_rows=scoped["project"],
+                global_rows=scoped["global"],
+            )
+            return bool(g.get("public_datasources"))
+        except Exception:
+            logger.exception(
+                "public_datasources grant read failed; denying publish"
+            )
+            return False
+
     # Max-level user-scope grants for admins. Admins bypass the PDP at every
     # PEP, so these rows change no enforcement outcome — they make the DATA
     # tell the truth (Grants UI, and any future admin-agnostic caller) instead
