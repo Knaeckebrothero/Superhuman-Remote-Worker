@@ -17538,6 +17538,42 @@ async def agent_get_thread_workspace(
     }
 
 
+# Slice C (docs/design/cloud_access_unification.md §5): module-level registry
+# of in-flight turn-end staging tasks, keyed by thread_id. Same fire-and-
+# forget-task-GC hazard as ``_protected_engage_tasks`` above, plus de-dupe —
+# a slow stage from one turn must not be raced by a second ping landing
+# before it finishes (``stage_thread_cloud_diff`` itself also debounces via
+# its own ``_inflight`` set, but skipping the duplicate ``asyncio.create_task``
+# here avoids piling up redundant scheduled coroutines under a fast turn
+# cadence).
+_cloud_stage_tasks: dict[str, "asyncio.Task[None]"] = {}
+
+
+@app.post("/api/agents/threads/{thread_id}/cloud-stage")
+async def agent_trigger_cloud_stage(request: Request, thread_id: str) -> dict[str, Any]:
+    """Internal — agent turn-end ping. Fire-and-forget staging of the thread's
+    protected-cloud upperdir to S3 (Slice C spec §5). Ingress strips this path.
+    """
+    await require_internal(request)
+    if not _is_protected_cloud_mode_enabled():
+        return {"skipped": "flag_off"}
+    from services.cloud_staging.stage import stage_thread_cloud_diff
+
+    async def _run() -> None:
+        try:
+            await stage_thread_cloud_diff(
+                thread_id=thread_id,
+                postgres_db=postgres_db,
+                snapshot_service=snapshot_service,
+            )
+        finally:
+            _cloud_stage_tasks.pop(thread_id, None)
+
+    if thread_id not in _cloud_stage_tasks:
+        _cloud_stage_tasks[thread_id] = asyncio.create_task(_run())
+    return {"scheduled": True}
+
+
 @app.get("/api/agents/threads/{thread_id}/lifecycle")
 async def agent_get_thread_lifecycle(
     request: Request, thread_id: str

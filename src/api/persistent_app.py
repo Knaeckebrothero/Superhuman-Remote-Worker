@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
 
+import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
@@ -3428,6 +3429,38 @@ def _wire_session_aux_archiver() -> None:
         logger.debug(f"Could not wire session aux archiver (non-fatal): {e}")
 
 
+def _should_notify_cloud_stage() -> bool:
+    """True when the session's protected-cloud capture overlay is mounted and
+    active — gates the turn-end staging ping (Slice C, design §5). Split out
+    from ``_loop_on_turn_complete`` for unit-testability; overlay absence or
+    inactivity (unprotected session, or a protected one whose overlay failed
+    to mount — see Slice B's fail-safe in persistent_session.py) is the
+    common case and must be a silent no-op, never an error."""
+    overlay = getattr(_session, "overlay_mount_manager", None)
+    return overlay is not None and overlay.active
+
+
+async def _notify_cloud_stage() -> None:
+    """Fire-and-forget turn-end staging ping (protected cloud, Slice C).
+
+    Never raises — staging failure must not touch the turn. Mirrors the
+    internal-call header pattern in
+    ``src/tools/communication/messaging.py:197-226``.
+    """
+    orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
+    headers: dict[str, str] = {}
+    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+    if internal_key:
+        headers["X-Internal-Key"] = internal_key
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+            await client.post(
+                f"{orchestrator_url}/api/agents/threads/{_thread_id}/cloud-stage"
+            )
+    except Exception as e:
+        logger.debug(f"cloud-stage ping failed (non-fatal): {e}")
+
+
 async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
     if _session is None:
         return
@@ -3473,6 +3506,12 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
             "push", _session.workspace_sync.push_all, turn_id
         ):
             _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
+
+    # Slice C (design §5): ping the orchestrator to stage the protected
+    # session's upperdir diff to S3. Fire-and-forget — never blocks the next
+    # turn on a slow SSH+tar+upload round-trip.
+    if _should_notify_cloud_stage():
+        asyncio.create_task(_notify_cloud_stage())
 
 
 def _loop_archive_llm_call(prepared: Any, response: Any, metrics: dict) -> None:
