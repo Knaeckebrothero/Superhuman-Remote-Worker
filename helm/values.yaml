@@ -1350,6 +1350,38 @@ s3:
   snapshotRetentionDays: "90"
 
 # =============================================================================
+# Bundled object store (Garage) — NOT FOR PRODUCTION
+# =============================================================================
+# Single-node Garage S3 for self-host installs with no external object store.
+# When enabled AND the matching external endpoint is unset, the chart auto-wires
+# this store into snapshots (S3_ENDPOINT/s3.bucket) and the virtual workspace
+# tier (VIRTUAL_WORKSPACE_*). Single replica, PVC-bound, NO replication/erasure
+# — external S3 (s3.endpoint, virtualWorkspace.s3.endpoint) remains the
+# recommended production path and always overrides this store when set.
+garage:
+  enabled: false
+  image: dxflrs/garage:v1.0.1        # pinned; admin API is "v1" for this tag
+  replicas: 1                         # single-node layout — DO NOT raise
+  storageClass: ""
+  dataStorageSize: "20Gi"             # one PVC backs meta + data + both buckets
+  # Single-node layout capacity advertised to Garage, in BYTES. Keep <= dataStorageSize.
+  capacityBytes: 21474836480          # 20 GiB
+  buckets:
+    # Snapshot bucket reuses s3.bucket (single source of truth). Only the
+    # virtual-tier workspace bucket is named here.
+    workspaces: "srw-workspaces"
+  bootstrap:
+    # Shell+curl image for the admin-API bootstrap Job (garage image is
+    # shell-less). Must have /bin/sh + curl; no runtime package installs.
+    image: curlimages/curl:8.11.0
+    resources:
+      requests: { memory: "32Mi", cpu: "10m" }
+      limits:   { memory: "128Mi", cpu: "200m" }
+  resources:
+    requests: { memory: "256Mi", cpu: "100m" }
+    limits:   { memory: "1Gi",   cpu: "1000m" }
+
+# =============================================================================
 # Virtual workspace tier (no_workspace_agent_mode.md §4/§5)
 # =============================================================================
 # Object store backing `workspace.backend: virtual` agents — file tools over
