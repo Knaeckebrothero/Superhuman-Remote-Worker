@@ -1,6 +1,6 @@
 import {describe, it, expect} from 'vitest';
 import {TestBed} from '@angular/core/testing';
-import {of} from 'rxjs';
+import {NEVER, of} from 'rxjs';
 import {CapabilitiesService} from './capabilities.service';
 import {ApiService} from './api.service';
 import type {GrantCatalog, UserCapabilities} from '../models/api.model';
@@ -50,5 +50,44 @@ describe('CapabilitiesService', () => {
     const svc = make(null);
     expect(svc.permissionModes()).toEqual(['supervised', 'auto_accept', 'autonomous']);
     expect(svc.permissionRestricted()).toBe(false);
+  });
+});
+
+describe('CapabilitiesService.canPublishDatasources', () => {
+  it('is true for admins (grants === null)', () => {
+    const svc = make({is_admin: true, grants: null, catalog: CATALOG});
+    expect(svc.canPublishDatasources()).toBe(true);
+  });
+
+  it('is true when the grant resolves true', () => {
+    const svc = make({
+      is_admin: false,
+      grants: {public_datasources: true},
+      catalog: CATALOG,
+    });
+    expect(svc.canPublishDatasources()).toBe(true);
+  });
+
+  it('is false when the grant is absent (deny-by-default)', () => {
+    const svc = make({is_admin: false, grants: {}, catalog: CATALOG});
+    expect(svc.canPublishDatasources()).toBe(false);
+  });
+
+  it('fails CLOSED on fetch error, unlike the fail-open mode helpers', () => {
+    // Publishing exposes credentials org-wide; on error the section hides
+    // (the server gate is the backstop either way).
+    const svc = make(null);
+    expect(svc.canPublishDatasources()).toBe(false);
+  });
+
+  it('fails closed while loading', () => {
+    TestBed.configureTestingModule({
+      providers: [
+        CapabilitiesService,
+        {provide: ApiService, useValue: {getMyCapabilities: () => NEVER}},
+      ],
+    });
+    const svc = TestBed.inject(CapabilitiesService);
+    expect(svc.canPublishDatasources()).toBe(false);
   });
 });

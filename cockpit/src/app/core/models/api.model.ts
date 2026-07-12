@@ -285,6 +285,9 @@ export interface Datasource {
   created_by?: string | null;
   /** Whether the datasource is visible to all users (vs owner/project only). */
   is_global?: boolean;
+  /** Declared read-only flag for public datasources (null = not applicable).
+   *  Declarative — credentials are the enforcement boundary. */
+  read_only?: boolean | null;
   created_at: string;
   updated_at: string;
 }
@@ -302,6 +305,10 @@ export interface DatasourceCreateRequest {
   cli_hint?: string;
   default_branch?: string;
   config?: DatasourceConfig;
+  /** Publish org-wide; requires the public_datasources capability. */
+  is_global?: boolean;
+  /** Declared read-only flag; defaults to true server-side on publish. */
+  read_only?: boolean;
 }
 
 /**
@@ -315,6 +322,10 @@ export interface DatasourceUpdateRequest {
   cli_hint?: string;
   default_branch?: string;
   config?: DatasourceConfig;
+  /** Publish (true) / unpublish (false); publishing requires the capability. */
+  is_global?: boolean;
+  /** Declared read-only flag (kb: always true). */
+  read_only?: boolean;
 }
 
 /**
