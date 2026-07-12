@@ -1340,12 +1340,40 @@ class PostgresDB:
             )
         return result == "UPDATE 1"
 
+    async def update_ro_mount_baseline(self, row_id: str, baseline: dict[str, str]) -> bool:
+        """Persist the etag baseline (engage-time capture / post-apply re-capture)."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE cloud_ro_mounts SET etag_baseline = $2::jsonb "
+                "WHERE id = $1 AND status = 'active'",
+                row_id, json.dumps(baseline),
+            )
+        return result == "UPDATE 1"
+
+    async def update_ro_mount_staging(
+        self, row_id: str, *, staged_epoch: int, staged_summary: dict | None
+    ) -> bool:
+        """Advance the staging epoch. staged_summary=None clears the staged state."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE cloud_ro_mounts SET staged_epoch = $2, "
+                "staged_summary = $3::jsonb, "
+                "staged_at = CASE WHEN $3::text IS NULL THEN NULL ELSE now() END "
+                "WHERE id = $1 AND status = 'active'",
+                row_id, staged_epoch,
+                json.dumps(staged_summary) if staged_summary is not None else None,
+            )
+        return result == "UPDATE 1"
+
     @staticmethod
     def _ro_mount_row(row) -> dict:
         d = dict(row)
         d["credentials"] = _decrypt_stored(
             d.get("credentials"), field="cloud_ro_mounts.credentials"
         )
+        for _jf in ("etag_baseline", "staged_summary"):
+            if isinstance(d.get(_jf), str):
+                d[_jf] = json.loads(d[_jf])
         return d
 
     async def update_job_exported_folder(
