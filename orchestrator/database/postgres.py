@@ -4373,7 +4373,7 @@ class PostgresDB:
                 f"""
                 SELECT id, name, description, type, connection_url, credentials,
                        config, cli_hint, default_branch, job_id, created_by, is_global,
-                       created_at, updated_at
+                       read_only, created_at, updated_at
                 FROM datasources
                 {where_clause}
                 ORDER BY created_at DESC
@@ -4403,7 +4403,7 @@ class PostgresDB:
                 """
                 SELECT id, name, description, type, connection_url, credentials,
                        config, cli_hint, default_branch, job_id, created_by, is_global,
-                       created_at, updated_at
+                       read_only, created_at, updated_at
                 FROM datasources
                 WHERE id = $1
                 """,
@@ -4424,6 +4424,7 @@ class PostgresDB:
         default_branch: str | None = None,
         created_by: str | None = None,
         is_global: bool = False,
+        read_only: bool | None = None,
         config: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Create a new datasource.
@@ -4442,6 +4443,8 @@ class PostgresDB:
             default_branch: Branch to clone (repository type)
             created_by: Owner user UUID
             is_global: Whether this datasource is visible to all users
+            read_only: Declared read-only flag for public datasources
+                       (None = not applicable; declarative only)
             config: Non-secret type-specific configuration
 
         Returns:
@@ -4459,11 +4462,12 @@ class PostgresDB:
                 """
                 INSERT INTO datasources (name, description, type, connection_url,
                                          credentials, config, job_id, cli_hint,
-                                         default_branch, created_by, is_global)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+                                         default_branch, created_by, is_global,
+                                         read_only)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
                 RETURNING id, name, description, type, connection_url, credentials,
                           config, job_id, cli_hint, default_branch, created_by, is_global,
-                          created_at, updated_at
+                          read_only, created_at, updated_at
                 """,
                 name,
                 description,
@@ -4476,6 +4480,7 @@ class PostgresDB:
                 default_branch,
                 owner_uuid,
                 is_global,
+                read_only,
             )
 
         return _datasource_row_to_dict(row)
@@ -4490,6 +4495,8 @@ class PostgresDB:
         cli_hint: str | None = None,
         default_branch: str | None = None,
         config: Dict[str, Any] | None = None,
+        is_global: bool | None = None,
+        read_only: bool | None = None,
     ) -> bool:
         """Update a datasource.
 
@@ -4502,6 +4509,8 @@ class PostgresDB:
             cli_hint: New CLI hint
             default_branch: New default branch
             config: New non-secret type-specific configuration
+            is_global: Publish (True) / unpublish (False); None = unchanged
+            read_only: Declared read-only flag; None = unchanged
 
         Returns:
             True if updated, False if not found
@@ -4549,6 +4558,18 @@ class PostgresDB:
             param_count += 1
             updates.append(f"config = ${param_count}::jsonb")
             values.append(json.dumps(config))
+
+        # `is not None` keeps explicit False working — unpublish and
+        # RW-declare both pass False.
+        if is_global is not None:
+            param_count += 1
+            updates.append(f"is_global = ${param_count}")
+            values.append(is_global)
+
+        if read_only is not None:
+            param_count += 1
+            updates.append(f"read_only = ${param_count}")
+            values.append(read_only)
 
         if not updates:
             return False
@@ -4624,7 +4645,7 @@ class PostgresDB:
                 """
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
                     d.connection_url, d.credentials, d.config,
-                    d.cli_hint, d.default_branch,
+                    d.cli_hint, d.default_branch, d.read_only,
                     d.created_at, d.updated_at,
                     pd.read_only AS project_read_only
                 FROM job_datasources jd
@@ -4645,7 +4666,7 @@ class PostgresDB:
                 """
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
                     d.connection_url, d.credentials, d.config,
-                    d.cli_hint, d.default_branch,
+                    d.cli_hint, d.default_branch, d.read_only,
                     d.created_at, d.updated_at,
                     NULL::boolean AS project_read_only
                 FROM datasources d
@@ -4704,7 +4725,7 @@ class PostgresDB:
                 """
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
                     d.connection_url, d.credentials, d.config,
-                    d.cli_hint, d.default_branch,
+                    d.cli_hint, d.default_branch, d.read_only,
                     d.created_at, d.updated_at,
                     pd.read_only AS project_read_only
                 FROM datasources d
@@ -4804,7 +4825,7 @@ class PostgresDB:
         select_cols = """
             SELECT DISTINCT d.id, d.name, d.description, d.type,
                 d.connection_url, d.credentials, d.config, d.cli_hint,
-                d.default_branch, d.created_by, d.is_global,
+                d.default_branch, d.created_by, d.is_global, d.read_only,
                 d.created_at, d.updated_at
         """
 
@@ -4916,7 +4937,8 @@ class PostgresDB:
                        COALESCE(pd.description, d.description) AS description,
                        d.type, d.connection_url, d.credentials, d.config,
                        d.cli_hint, d.default_branch,
-                       d.job_id, d.created_at, d.updated_at,
+                       d.job_id, d.created_by, d.is_global, d.read_only,
+                       d.created_at, d.updated_at,
                        pd.linked_at,
                        pd.read_only AS project_read_only,
                        pd.description AS project_description
@@ -5212,16 +5234,18 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 INSERT INTO datasources (name, type, connection_url, credentials,
-                                         config, created_by, is_global)
-                VALUES ($1, $2, $3, $4, $5::jsonb, NULL, TRUE)
+                                         config, created_by, is_global, read_only)
+                VALUES ($1, $2, $3, $4, $5::jsonb, NULL, TRUE, TRUE)
                 ON CONFLICT (name, type, COALESCE(created_by, '00000000-0000-0000-0000-000000000000'))
                 DO UPDATE SET
                     connection_url = EXCLUDED.connection_url,
                     credentials = EXCLUDED.credentials,
                     config = EXCLUDED.config,
-                    is_global = TRUE
+                    is_global = TRUE,
+                    read_only = TRUE
                 RETURNING id, name, description, type, connection_url, credentials,
-                          config, created_by, is_global, created_at, updated_at
+                          config, created_by, is_global, read_only, created_at,
+                          updated_at
                 """,
                 name,
                 ds_type,
