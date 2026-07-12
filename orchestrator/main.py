@@ -19514,11 +19514,14 @@ async def _engage_protected_cloud_for_thread(
     try:
         handle = ProjectFolderHandle.from_db(row["cloud_handle"], backend="nextcloud")
 
-        def _reader_client(credentials: str | None):
-            # httpx client authenticated AS THE READER (basic auth), for the probe.
+        def _reader_client(credentials: str | None, reader_id: str):
+            # httpx client authenticated AS THE READER (basic auth), for the
+            # probe. reader_id is grant.reader_id (Slice C) — never
+            # re-derived here, since ensure_ro_reader/mint_ro_grant are the
+            # sole source of truth for the reader's actual username.
             return httpx.AsyncClient(
                 base_url=backend._base_url,  # NC origin
-                auth=(f"srw-reader-{user_id}", credentials or ""),
+                auth=(reader_id, credentials or ""),
                 timeout=30.0,
             )
 

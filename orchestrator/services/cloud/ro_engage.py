@@ -70,11 +70,15 @@ async def engage_ro_mount(
 ) -> RoReaderGrant:
     """Provision + verify a read-only mount grant, fail-closed.
 
-    ``http_client_factory(credentials)`` returns an httpx-like client
-    authenticated AS THE READER (so the probe exercises the reader's real
-    rights). On success the ``cloud_ro_mounts`` row is persisted and the grant
-    returned; on any failure the grant is revoked and ``RoEngageRefused`` is
-    raised.
+    ``http_client_factory(credentials, reader_id)`` returns an httpx-like
+    client authenticated AS THE READER (so the probe exercises the reader's
+    real rights) — ``reader_id`` is ``grant.reader_id`` itself, never
+    re-derived by the caller. On success the ``cloud_ro_mounts`` row is
+    persisted, the etag baseline (design §3.4) is captured and persisted
+    against it, and the grant is returned; on any failure (including a
+    baseline capture failure — without one neither the staged-diff manifest
+    nor the apply conflict gate can classify writes) the grant is revoked and
+    ``RoEngageRefused`` is raised.
     """
     await backend.ensure_ro_reader(user_key=user_key)
     grant = await backend.mint_ro_grant(handle, user_key=user_key, grant_key=thread_id)
@@ -82,7 +86,7 @@ async def engage_ro_mount(
     try:
         canary = await backend.seed_canary_fixture(handle)
         # Probe AS THE READER using its freshly minted credential.
-        client = http_client_factory(grant.credentials)
+        client = http_client_factory(grant.credentials, grant.reader_id)
 
         floors = await ro_probe.check_version_floors(
             client, grant.webdav_url, backend=backend.backend_id
@@ -128,6 +132,18 @@ async def engage_ro_mount(
             auth_kind=grant.auth_kind,
         )
         logger.info("RO mount engaged for thread %s (row %s)", thread_id, row_id)
+
+        # Etag baseline (design §3.4): without it neither the staged-diff
+        # manifest nor the apply conflict gate can classify writes, so a
+        # capture failure here is itself an engage refusal — the outer
+        # except below revokes the grant just like every other refusal in
+        # this function (no second cleanup path).
+        try:
+            baseline = await backend.capture_etag_baseline(handle)
+        except Exception as e:
+            raise RoEngageRefused(f"etag baseline capture failed: {e}") from e
+        await postgres_db.update_ro_mount_baseline(row_id, baseline)
+
         return grant
     except Exception:
         # Fail closed: roll the grant back so no partial RO access lingers.
