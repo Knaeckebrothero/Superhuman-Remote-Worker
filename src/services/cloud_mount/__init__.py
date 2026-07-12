@@ -591,10 +591,18 @@ echo "{_OK}"
             "create",
             state.remote_name,
             source_type,
+            "--obscure",
+            "--non-interactive",
+            # POSIX end-of-options: every following token is a positional
+            # ``key value`` pair. Without this, rclone (cobra) parses any
+            # config VALUE that begins with ``-`` as a flag — and ``pass`` is a
+            # random Nextcloud reader credential that can legitimately start
+            # with ``-`` (e.g. ``-Yi9OE…``), which aborts the mount with
+            # "unknown shorthand flag". Flags must precede ``--``.
+            "--",
         ]
         for key, value in source_config.items():
             create_args.extend([str(key), str(value)])
-        create_args.extend(["--obscure", "--non-interactive"])
 
         cache = self._cache_for_mount(mount)
         mount_args = [
