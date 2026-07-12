@@ -14,7 +14,7 @@
 #      on Tilt-built tags. Disable for Tilt.
 #
 # Everything else carries over from values-local.yaml (LLM keys, dev
-# passwords, sessionRouter wiring, the OpenCloud hostAliases trick).
+# passwords, sessionRouter wiring, the Nextcloud-only cloud backend).
 # =============================================================================
 
 image:
