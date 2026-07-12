@@ -300,6 +300,12 @@
       .messages {
         flex: 1;
         overflow-y: auto;
+        // overflow-y:auto alone computes overflow-x to auto too, so one
+        // too-wide child (an unbreakable token in a thought, an oversized
+        // image) turns the whole pane into a horizontal panner on mobile.
+        // Clamp it: wide content must scroll inside its own box (pre, table,
+        // katex already do) — the pane itself never scrolls sideways.
+        overflow-x: hidden;
         padding: 16px;
         display: flex;
         flex-direction: column;
@@ -588,6 +594,9 @@
         font-size: var(--chat-body-font-size, 15px);
         line-height: 1.6;
         min-width: 0;
+        /* Long unbroken tokens (URLs, paths, hashes) in rendered markdown must
+           wrap rather than widen the pane — mirrors .user-text's break-word. */
+        overflow-wrap: break-word;
       }
 
       /* User: speech bubble — soft tinted background using the theme's
@@ -919,6 +928,11 @@
         line-height: 1.5;
         color: var(--text-muted);
         white-space: pre-wrap;
+        // Raw reasoning text is full of long unbroken runs (URLs, JSON,
+        // ASCII tables); pre-wrap alone can't break those and the expanded
+        // thought was the widest thing on the phone screen. anywhere also
+        // lets the intrinsic width shrink, unlike break-word.
+        overflow-wrap: anywhere;
         max-height: 300px;
         overflow-y: auto;
       }
