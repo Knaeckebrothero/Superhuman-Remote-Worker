@@ -28,8 +28,8 @@ is held to fail-closed standards throughout:
   unreachable server must never be read as "read-only verified".
 * **Version floors are enforced, not assumed.** ``check_version_floors``
   turns the CVE-fix versions from the spec (Nextcloud server >= 28.0.3,
-  groupfolders >= 20.1.2) into a runtime capabilities check instead of a
-  documentation-only assumption.
+  groupfolders per-branch >= ``GROUPFOLDERS_PATCHED``) into a runtime
+  capabilities check instead of a documentation-only assumption.
 * **Side channels are real requests, not decoys.** ``side_channel_probes``
   builds the actual DAV MOVE/POST requests a real restore/finalize
   operation would issue (dedicated ``versions``/``trashbin``/``uploads``
@@ -101,11 +101,47 @@ _INCONCLUSIVE_STATUSES = frozenset({404, 409})
 # Version floors from docs/design/cloud_access_unification.md §3.3: the
 # releases that fixed the RO-bypass CVEs this module probes for.
 #   nextcloud    >= 28.0.3  (GHSA-5mq8-738w-5942, versions-restore)
-#   groupfolders >= 20.1.2  (GHSA-2vrq-fhmf-c49m, trash-restore)
+#   groupfolders per-branch (GHSA-2vrq-fhmf-c49m, trash-restore) — see
+#   GROUPFOLDERS_PATCHED below.
 VERSION_FLOORS: dict[str, tuple[int, int, int]] = {
     "nextcloud": (28, 0, 3),
-    "groupfolders": (20, 1, 2),
 }
+
+# groupfolders ships one release branch per Nextcloud major (18.x -> NC 30,
+# 19.x -> NC 31, 20.x -> NC 32, ...; each branch's info.xml pins
+# min-version = max-version), and GHSA-2vrq-fhmf-c49m was fixed in EVERY
+# maintained branch, not only 20.x. A single (20, 1, 2) floor is therefore
+# branch-blind: NC 31 can never run groupfolders 20.x, so a fully patched
+# 19.1.x install would be refused forever (caught live on k3d NC 31.0.14 /
+# groupfolders 19.1.18, 2026-07-12). First patched release per branch,
+# verbatim from the advisory's patched-versions list. Branches NEWER than
+# the table were created after the fix and carry it from their first
+# release; branches OLDER than the table have no known-safe release and
+# refuse (fail-closed).
+GROUPFOLDERS_PATCHED: dict[int, tuple[int, int, int]] = {
+    14: (14, 0, 11),
+    15: (15, 3, 12),
+    16: (16, 0, 15),
+    17: (17, 0, 14),
+    18: (18, 1, 8),
+    19: (19, 1, 8),
+    20: (20, 1, 2),
+}
+
+
+def groupfolders_floor(major: int) -> tuple[int, int, int] | None:
+    """CVE floor for the groupfolders release branch ``major``.
+
+    Returns the first GHSA-2vrq-fhmf-c49m-patched release of that branch,
+    ``(major, 0, 0)`` for branches born after the fix, or ``None`` for
+    branches older than the advisory's patched set — there is no known-safe
+    release on those, so the caller must refuse.
+    """
+    if major in GROUPFOLDERS_PATCHED:
+        return GROUPFOLDERS_PATCHED[major]
+    if major > max(GROUPFOLDERS_PATCHED):
+        return (major, 0, 0)
+    return None
 
 # (verb, note, body-or-None). note documents the side channel; body used
 # for endpoints that need a payload to be a fair test. The historical
@@ -544,9 +580,11 @@ def _capabilities_origin(base_url: str) -> str:
 async def check_version_floors(client, base_url: str, *, backend: str) -> RoProbeResult:
     """Runtime-check the version floors that fixed the RO-bypass CVEs.
 
-    docs/design/cloud_access_unification.md §3.3 (verbatim): "Version
-    floors: Nextcloud server >= 28.0.3, groupfolders >= 20.1.2. The probe
-    converts version-assumption risk into a runtime check."
+    docs/design/cloud_access_unification.md §3.3: Nextcloud server
+    >= 28.0.3; groupfolders >= the first patched release of its OWN
+    branch (``GROUPFOLDERS_PATCHED`` — the advisory fixed every
+    maintained branch, and each branch is pinned to one NC major). "The
+    probe converts version-assumption risk into a runtime check."
 
     Backend allowlist, fail-closed: ``"nextcloud"`` runs the floor
     checks below; ``"opencloud"`` returns ok with no failures — the spec
@@ -636,11 +674,16 @@ async def check_version_floors(client, base_url: str, *, backend: str) -> RoProb
             "groupfolders version unverifiable via capabilities (fail-closed)"
         )
     else:
-        floor = VERSION_FLOORS["groupfolders"]
-        if groupfolders_tuple < floor:
+        floor = groupfolders_floor(groupfolders_tuple[0])
+        if floor is None:
+            failures.append(
+                f"groupfolders branch {groupfolders_tuple[0]}.x has no "
+                "GHSA-2vrq-fhmf-c49m-patched release (fail-closed)"
+            )
+        elif groupfolders_tuple < floor:
             failures.append(
                 f"groupfolders {'.'.join(map(str, groupfolders_tuple))} below "
-                f"floor {'.'.join(map(str, floor))} (GHSA-2vrq-fhmf-c49m)"
+                f"branch floor {'.'.join(map(str, floor))} (GHSA-2vrq-fhmf-c49m)"
             )
 
     return RoProbeResult(failures=failures)

@@ -3,9 +3,11 @@ import pytest
 
 from orchestrator.services.cloud.ro_probe import (
     check_version_floors,
+    groupfolders_floor,
     probe_read_only,
     side_channel_probes,
     RoProbeResult,
+    GROUPFOLDERS_PATCHED,
     MUTATING_VERBS,
     VERSION_FLOORS,
 )
@@ -234,7 +236,29 @@ class _FakeCapabilitiesClient:
 
 def test_version_floors_constant():
     assert VERSION_FLOORS["nextcloud"] == (28, 0, 3)
-    assert VERSION_FLOORS["groupfolders"] == (20, 1, 2)
+    # groupfolders is branch-aware, not a single floor: GHSA-2vrq-fhmf-c49m
+    # was patched in every maintained branch (each pinned to one NC major).
+    assert "groupfolders" not in VERSION_FLOORS
+    assert GROUPFOLDERS_PATCHED == {
+        14: (14, 0, 11),
+        15: (15, 3, 12),
+        16: (16, 0, 15),
+        17: (17, 0, 14),
+        18: (18, 1, 8),
+        19: (19, 1, 8),
+        20: (20, 1, 2),
+    }
+
+
+def test_groupfolders_floor_per_branch():
+    # In-table branches return their own patched release.
+    assert groupfolders_floor(19) == (19, 1, 8)
+    assert groupfolders_floor(20) == (20, 1, 2)
+    # Branches born after the fix are safe from their first release.
+    assert groupfolders_floor(21) == (21, 0, 0)
+    assert groupfolders_floor(22) == (22, 0, 0)
+    # Branches older than the patched set have no safe release.
+    assert groupfolders_floor(13) is None
 
 
 @pytest.mark.asyncio
@@ -411,18 +435,57 @@ async def test_groupfolders_appversion_at_floor_is_ok():
 
 
 @pytest.mark.asyncio
-async def test_groupfolders_appversion_below_floor_reports_the_real_version():
-    # 19.1.18 is what dev actually runs — must be READ (not "unverifiable")
-    # and reported as below the floor.
+async def test_groupfolders_appversion_below_branch_floor_reports_the_real_version():
+    # 19.1.7 predates the 19.x branch fix (19.1.8) — must be READ (not
+    # "unverifiable") and reported as below the branch floor.
+    client = _FakeCapabilitiesClient(
+        _nc_capabilities(31, 0, 14, groupfolders={"appVersion": "19.1.7"})
+    )
+    res = await check_version_floors(
+        client, "https://cloud/remote.php/dav", backend="nextcloud"
+    )
+    assert res.ok is False
+    assert any("19.1.7" in f and "below" in f for f in res.failures), res.failures
+    assert not any("unverifiable" in f for f in res.failures), res.failures
+
+
+@pytest.mark.asyncio
+async def test_groupfolders_patched_nc31_branch_is_ok():
+    # THE live regression (k3d NC 31.0.14, 2026-07-12): groupfolders 20.x is
+    # NC 32-only, so on NC 31 the patched 19.1.x branch must pass — a single
+    # 20.1.2 floor would refuse every fully patched NC 31 install forever.
     client = _FakeCapabilitiesClient(
         _nc_capabilities(31, 0, 14, groupfolders={"appVersion": "19.1.18"})
     )
     res = await check_version_floors(
         client, "https://cloud/remote.php/dav", backend="nextcloud"
     )
+    assert res.ok, res.failures
+
+
+@pytest.mark.asyncio
+async def test_groupfolders_branch_born_after_fix_is_ok():
+    # Branches newer than the advisory's table carry the fix from .0.0.
+    client = _FakeCapabilitiesClient(
+        _nc_capabilities(33, 0, 1, groupfolders={"appVersion": "21.0.9"})
+    )
+    res = await check_version_floors(
+        client, "https://cloud/remote.php/dav", backend="nextcloud"
+    )
+    assert res.ok, res.failures
+
+
+@pytest.mark.asyncio
+async def test_groupfolders_branch_predating_patched_set_refuses():
+    # 13.x has no GHSA-2vrq-fhmf-c49m-patched release at all — fail-closed.
+    client = _FakeCapabilitiesClient(
+        _nc_capabilities(28, 0, 3, groupfolders={"appVersion": "13.1.8"})
+    )
+    res = await check_version_floors(
+        client, "https://cloud/remote.php/dav", backend="nextcloud"
+    )
     assert res.ok is False
-    assert any("19.1.18" in f and "below" in f for f in res.failures), res.failures
-    assert not any("unverifiable" in f for f in res.failures), res.failures
+    assert any("13.x" in f and "fail-closed" in f for f in res.failures), res.failures
 
 
 # --- Finding B: PROPPATCH 207 is the multistatus envelope; read inner status ---
