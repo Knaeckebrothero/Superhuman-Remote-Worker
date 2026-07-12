@@ -764,6 +764,11 @@ import {UserService} from '../../core/services/user.service';
                       <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
                         {{ scopeLabelKey(ds) | transloco }}
                       </app-badge>
+                      @if (ds.is_global && ds.read_only === false) {
+                        <app-badge class="ds-scope-inline" tone="warning" size="xs">
+                          {{ 'datasources.table.badgeRw' | transloco }}
+                        </app-badge>
+                      }
                     }
                   </td>
                   <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
@@ -771,6 +776,11 @@ import {UserService} from '../../core/services/user.service';
                     <app-badge [tone]="scopeTone(ds)" size="xs">
                       {{ scopeLabelKey(ds) | transloco }}
                     </app-badge>
+                    @if (ds.is_global && ds.read_only === false) {
+                      <app-badge tone="warning" size="xs">
+                        {{ 'datasources.table.badgeRw' | transloco }}
+                      </app-badge>
+                    }
                   </td>
                   <td class="actions-cell">
                     @if (canManage(ds) && viewport.isMobile()) {
