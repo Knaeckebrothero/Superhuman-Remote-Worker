@@ -1457,6 +1457,20 @@ async def _attach_session(
                 f"temperature={effective_config.llm.temperature}"
             )
 
+    # Task 15: thread protected_cloud into config.extra via the same channel
+    # _cli_datasources uses (loader.py reads config.extra["_protected_cloud"]
+    # at render time — loader.py:3913-3915), so the interactive prompt's
+    # honesty block renders for this session. Applied once, after
+    # effective_config is fully resolved (hydrated / config_override-merged /
+    # config_name-loaded / plain boot config) rather than folded into the
+    # config_override merge above — pushing it through config_override would
+    # make an otherwise-empty override truthy and force every protected
+    # thread through the `elif config_override:` deep-merge/rebuild branch
+    # even when no other override exists. hasattr guards a boot config
+    # object that (only in tests) may not be a real AgentConfig dataclass.
+    if protected_cloud and hasattr(effective_config, "extra"):
+        effective_config.extra["_protected_cloud"] = True
+
     # Auxiliary LLM rebuild. The boot-time _agent._auxiliary_llm is built from
     # config.auxiliary.model in the YAML default — for persistent sessions
     # without an override that's RedHatAI/... with no transport, which routes
