@@ -126,6 +126,74 @@ class TestSessionWorkspaceBackendOverride:
         )
         assert ws == {"max_read_words": 10}
 
+
+class TestSessionWorkspaceBackendDefaultChain:
+    """Instant-landing defaults chain (docs/features/instant_landing_session.md):
+    explicit request > owner's saved ``persistent_agent.workspace_backend`` >
+    platform default (virtual). Sessions are never implicitly sandbox."""
+
+    def test_platform_default_is_virtual(self):
+        assert orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND == "virtual"
+        assert (
+            orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND
+            in orch_main.SESSION_WORKSPACE_BACKENDS
+        )
+
+    def test_no_settings_falls_back_to_platform_default(self):
+        assert orch_main._default_session_workspace_backend({}) == "virtual"
+        assert orch_main._default_session_workspace_backend(None) == "virtual"
+
+    @pytest.mark.parametrize("backend", ["sandbox", "virtual", "none"])
+    def test_saved_user_default_wins_over_platform_default(self, backend):
+        assert (
+            orch_main._default_session_workspace_backend({"workspace_backend": backend})
+            == backend
+        )
+
+    @pytest.mark.parametrize("junk", ["vm", "bogus", "", 3, {"backend": "vm"}])
+    def test_junk_saved_value_falls_back_to_platform_default(self, junk):
+        # Legacy/hand-edited settings rows must not brick session creation.
+        assert (
+            orch_main._default_session_workspace_backend({"workspace_backend": junk})
+            == "virtual"
+        )
+
+    def test_settings_patch_accepts_valid_workspace_backend(self):
+        upd = orch_main.UserSettingsUpdate(
+            persistent_agent={"workspace_backend": "sandbox", "model": "m"}
+        )
+        assert upd.persistent_agent == {"workspace_backend": "sandbox", "model": "m"}
+
+    @pytest.mark.parametrize("bad", ["vm", "bogus", ""])
+    def test_settings_patch_rejects_invalid_workspace_backend(self, bad):
+        with pytest.raises(ValueError):
+            orch_main.UserSettingsUpdate(persistent_agent={"workspace_backend": bad})
+
+    def test_settings_patch_leaves_other_keys_free_form(self):
+        # Phase 6 contract: persistent_agent stays a free dict for other keys.
+        upd = orch_main.UserSettingsUpdate(
+            persistent_agent={"headless_mode": "eager", "greeting": "hi"}
+        )
+        assert upd.persistent_agent == {"headless_mode": "eager", "greeting": "hi"}
+
+    def test_resolved_preference_defaults_surface_workspace_backend(self):
+        # The Settings UI shows the resolved system default as the placeholder;
+        # it must match what create_thread will actually apply.
+        import asyncio
+
+        with patch.object(
+            orch_main,
+            "postgres_db",
+            SimpleNamespace(
+                resolve_default_for_capability=AsyncMock(return_value=None)
+            ),
+        ):
+            resolved = asyncio.run(orch_main._resolve_preference_defaults())
+        assert (
+            resolved["persistent_agent"]["workspace_backend"]
+            == orch_main.SESSION_DEFAULT_WORKSPACE_BACKEND
+        )
+
     def test_fleet_management_tools_override_passes_through(self):
         tools = orch_main._validated_session_fleet_tools_override(
             {"tools": {"orchestrator": []}}

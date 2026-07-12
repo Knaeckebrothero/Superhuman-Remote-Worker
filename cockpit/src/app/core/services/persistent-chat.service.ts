@@ -54,6 +54,17 @@ import {AppToastService} from '../../ui/toast';
 const CONTROL_WS_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000];
 const CONTROL_WS_RECONNECT_MAX_ATTEMPTS = 8;
 
+/** Session title from a landing draft's first message: first line, collapsed
+ *  whitespace, capped at 60 chars (on a word boundary when one is near). */
+export function draftTitleFrom(message: string): string {
+    const line = message.split('\n')[0].replace(/\s+/g, ' ').trim();
+    if (!line) return 'Untitled Session';
+    if (line.length <= 60) return line;
+    const cut = line.slice(0, 60);
+    const lastSpace = cut.lastIndexOf(' ');
+    return (lastSpace > 30 ? cut.slice(0, lastSpace) : cut) + '…';
+}
+
 // Control-WS liveness watchdog. The agent's subscriber pump sends a
 // `ws.ping` frame every ~20s of idle (src/api/persistent_app.py,
 // _WS_PING_INTERVAL_S); if the socket claims OPEN but nothing arrived in
@@ -573,6 +584,17 @@ export class PersistentChatService {
     // --- Creating state (thread being created via API before connect) ---
     readonly isCreating = signal(false);
 
+    // --- Draft session (instant landing at `/`) ---
+    // The composer is open but no thread exists yet; the first send creates
+    // the session with a minimal body and the orchestrator resolves the
+    // owner's defaults (docs/features/instant_landing_session.md). Distinct
+    // from the composer's persisted text "draft" (localStorage).
+    readonly isDraftSession = signal(false);
+    // Default project prefetched on draft entry; attached to the create body
+    // if it resolved by first-send time (best-effort).
+    private draftProjectIds: string[] | null = null;
+    private creatingFromDraft = false;
+
     // --- Session paused (idle timeout received) ---
     readonly isSessionPaused = signal(false);
 
@@ -654,6 +676,7 @@ export class PersistentChatService {
     ): Promise<void> {
         const sameThread = this.threadId() === threadId && this.historyLoaded();
         this.disconnect();
+        this.isDraftSession.set(false);
         this.connectionState.set('connecting');
         this.error.set(null);
         this.cloudSyncDegraded.set(false);
@@ -703,6 +726,64 @@ export class PersistentChatService {
         this.intentionalClose = false;
         await this._openSse(threadId);
         await this._openControlWs(threadId);
+    }
+
+    /**
+     * Enter the instant-landing draft state: an open composer with no thread.
+     * Detaches any still-connected session the same way a thread switch does —
+     * the server-side session stays alive and resumable from the sessions
+     * list. Nothing is created server-side until the first send
+     * (_createFromDraftSession).
+     */
+    enterDraftSession(): void {
+        this.disconnect();
+        this.dispatch({type: 'reset', threadId: null});
+        this.threadId.set(null);
+        this.outbox.set([]);
+        this.sessionReady.set(false);
+        this.startupPhase.set(null);
+        this.sessionTitle.set(null);
+        this.error.set(null);
+        this.creatingFromDraft = false;
+        this.isDraftSession.set(true);
+        // Prefetch the default project (best-effort, non-blocking) so the
+        // first send can attach it — parity with the New Session form's
+        // auto-selected default project.
+        this.draftProjectIds = null;
+        this.api.getProjects().subscribe({
+            next: (projects) => {
+                const def = projects.find((p) => p.is_default);
+                this.draftProjectIds = def ? [def.id] : null;
+            },
+            error: () => {
+                // Default project is a nicety; the create body omits it.
+            },
+        });
+    }
+
+    /**
+     * Create the session backing a landing-page draft (first send). Minimal
+     * body by design: the orchestrator resolves the owner's saved defaults
+     * (model, permission mode, workspace backend — virtual unless configured
+     * otherwise). The queued first message rides the outbox into the new
+     * thread (createAndConnect carries it) and flushes on session-ready.
+     */
+    private async _createFromDraftSession(firstMessage: string): Promise<void> {
+        if (this.creatingFromDraft) return;
+        this.creatingFromDraft = true;
+        this.isDraftSession.set(false);
+        const body: Record<string, any> = {title: draftTitleFrom(firstMessage)};
+        if (this.draftProjectIds?.length) body['project_ids'] = this.draftProjectIds;
+        try {
+            await this.createAndConnect(body);
+        } catch {
+            // createAndConnect surfaced the error state and re-showed the
+            // queued bubbles; re-enter draft so the next send retries the
+            // create with the same outbox.
+            this.isDraftSession.set(true);
+        } finally {
+            this.creatingFromDraft = false;
+        }
     }
 
     /**
@@ -1715,6 +1796,13 @@ export class PersistentChatService {
             },
         ]);
         this.isWaitingForInput.set(false);
+        if (this.isDraftSession()) {
+            // First send from the landing draft: create the session now. The
+            // queued item above flushes via markSessionReady like any early
+            // send; no _flushOutbox needed here (session isn't ready yet).
+            void this._createFromDraftSession(trimmed);
+            return true;
+        }
         void this._flushOutbox();
         return true;
     }

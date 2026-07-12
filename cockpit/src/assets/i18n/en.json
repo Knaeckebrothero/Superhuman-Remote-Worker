@@ -209,6 +209,7 @@
     "returnToChat": "Return to chat",
     "loading": "Loading sessions...",
     "empty": "No sessions yet. Create one to get started.",
+    "emptyCta": "Start chatting",
     "emptyFilterActive": "No active sessions.",
     "emptyFilterEnded": "No ended sessions.",
     "untitledSession": "Untitled Session",
@@ -616,6 +617,11 @@
       "permissionSupervised": "Supervised",
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
+      "workspaceBackend": "Default Workspace",
+      "workspaceBackendHint": "Where new sessions keep their files. Virtual starts in seconds and can be upgraded to a container mid-session; Container has full shell and git from the start but takes longer to provision.",
+      "workspaceVirtual": "Virtual — instant, cloud file storage",
+      "workspaceSandbox": "Container — full shell & git, slower start",
+      "workspaceNone": "None — chat only, no files",
       "configDefault": "Default",
       "configDeveloper": "Developer",
       "configScholar": "Scholar",
@@ -1083,6 +1089,11 @@
     "empty": {
       "title": "What shall we conquer today?",
       "subtitle": "The agent is connected and listening. Issue a brief, or pick a starting point below."
+    },
+    "draft": {
+      "title": "What shall we conquer today?",
+      "subtitle": "Just start typing — your session spins up when you send.",
+      "advanced": "Advanced options"
     },
     "ended": {
       "eyebrow": "Resumable",
