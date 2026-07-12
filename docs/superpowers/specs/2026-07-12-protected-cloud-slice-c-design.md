@@ -24,7 +24,7 @@ Nextcloud-only (§9.2: OpenCloud dropped from protected mode). Jobs stay on Mode
 
 ## 3. Scope
 
-**In:** toggle UI + badge, turn-end staging pipeline (internal endpoint → SSH tar stream → S3 + manifest), `DiffSource` protocol with `GiteaDiffSource` (behavior-preserving refactor) and `UpperdirDiffSource`, thread-scoped review/apply/reject/restage endpoints, Cockpit review panel reusing `job-diff-review`, whole-diff apply engine with conflict gate + post-apply refresh, agent honesty prompt copy, migration 0056, and the six Slice B deferrals (§9 below).
+**In:** toggle UI + badge, turn-end staging pipeline (internal endpoint → SSH tar stream → S3 + manifest), `DiffSource` protocol with `GiteaDiffSource` (behavior-preserving refactor) and `UpperdirDiffSource`, thread-scoped review/apply/reject/restage endpoints, Cockpit review panel reusing `job-diff-review`, whole-diff apply engine with conflict gate + post-apply refresh, agent honesty prompt copy, migration 0057, and the six Slice B deferrals (§9 below).
 
 **Out (explicitly):** per-file accept/reject; agent-invoked submit tool; mid-session toggle flip; staging history/epoch retention; default-project (user-home) protection; OpenCloud/GDrive/MS365 protected paths; jobs adopting the mount (Phase 2); apply lease for concurrent stagings; retiring the Mode A Gitea pipeline.
 
@@ -57,7 +57,7 @@ The classification rules are shared with `whiteout.py` (stdlib-pure). The plan p
 
 Manifest shape: `{epoch, staged_at, entries: [{path, status, size, binary}], counts: {added, modified, deleted}}`. `binary` = null-byte sniff of the first 8 KiB of the member.
 
-**Bookkeeping.** Migration `0056`: four columns on `cloud_ro_mounts` — `etag_baseline JSONB` (the path→etag map from `capture_etag_baseline`, captured at engage and re-captured after each apply; **nothing persists this today** — code exploration 2026-07-12 confirmed `capture_etag_baseline` has no orchestrator persistence caller, so Slice C adds both the column and the engage-time capture), `staged_epoch INTEGER NOT NULL DEFAULT 0` (monotonic — bumped on every successful stage push, apply, and reject), `staged_at TIMESTAMPTZ`, `staged_summary JSONB` (manifest `counts` + content signature only — entry lists live in the S3 manifest, not the DB row). `schema_current.sql` regenerated via `scripts/schema-snapshot.sh app`, never hand-edited.
+**Bookkeeping.** Migration `0057`: four columns on `cloud_ro_mounts` — `etag_baseline JSONB` (the path→etag map from `capture_etag_baseline`, captured at engage and re-captured after each apply; **nothing persists this today** — code exploration 2026-07-12 confirmed `capture_etag_baseline` has no orchestrator persistence caller, so Slice C adds both the column and the engage-time capture), `staged_epoch INTEGER NOT NULL DEFAULT 0` (monotonic — bumped on every successful stage push, apply, and reject), `staged_at TIMESTAMPTZ`, `staged_summary JSONB` (manifest `counts` + content signature only — entry lists live in the S3 manifest, not the DB row). `schema_current.sql` regenerated via `scripts/schema-snapshot.sh app`, never hand-edited.
 
 **Cadence.** Every turn end (debounced) + once at thread teardown (before the workspace snapshot, best-effort) + on-demand via the `restage` endpoint (review panel's Refresh button). Empty upperdir → delete both S3 objects, zero the summary (badge shows 0).
 

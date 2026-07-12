@@ -1,10 +1,10 @@
--- migration:     0055_datasources_read_only.sql
+-- migration:     0056_datasources_read_only.sql
 -- description:   Declarative read-only flag for published (is_global) data-
 --                sources. NULL = not applicable (private/job-scoped rows).
 --                Publishing defaults it to TRUE; type='kb' is always TRUE.
 --                Declarative only — credentials remain the enforcement
 --                boundary (docs/features/public_datasources.md).
--- depends-on:    0054_datasource_config.sql
+-- depends-on:    0055_datasource_config.sql
 -- expected:      < 1s; brief table lock for ADD COLUMN (nullable, no default
 --                value rewrite).
 -- locks:         Brief ACCESS EXCLUSIVE on datasources.
