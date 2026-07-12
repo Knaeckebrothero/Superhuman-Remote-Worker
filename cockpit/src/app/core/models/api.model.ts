@@ -1467,12 +1467,71 @@ export interface JobAcceptPartialFailure {
   errors: string[];
 }
 
-/** Outcome shape the cockpit uses to drive the diff-review UI state. */
+/** Outcome shape the cockpit uses to drive the diff-review UI state. Shared
+ *  between the job-mode (`acceptJobDiff`) and thread-mode
+ *  (`applyThreadCloudDiff`) apply calls — see api.model.ts's
+ *  `ThreadCloudApplyResult` doc comment for why `ok.data` is a union. */
 export type JobAcceptOutcome =
-  | { kind: 'ok'; data: JobAcceptResult }
+  | { kind: 'ok'; data: JobAcceptResult | ThreadCloudApplyResult }
   | { kind: 'conflict'; data: JobAcceptConflict }
   | { kind: 'partial'; data: JobAcceptPartialFailure }
+  /** 409 epoch_stale (protected cloud mode only, Task 10): someone else
+   *  applied/rejected/restaged since the caller last read the summary. The
+   *  component reloads the diff and shows a "changed — reloaded" notice. */
+  | { kind: 'stale'; staged_epoch: number }
   | { kind: 'error'; status: number; detail: string };
+
+// =============================================================================
+// Protected cloud mode (Slice C, Task 8/10) — thread cloud-diff review
+// =============================================================================
+//
+// Thread-mode counterpart to the Mode A job diff review above: the same
+// JobDiffReviewComponent, generalized to also drive against a persistent
+// thread's staged protected-cloud diff instead of a job's Gitea-baseline
+// diff. See .superpowers/sdd/task-8-brief.md / task-10-brief.md for the
+// endpoint contracts and docs/design/cloud_access_unification.md §5/§11.
+
+/**
+ * Staged protected-cloud diff summary for a thread (GET
+ * .../agents/threads/{id}/cloud-diff). `epoch` must be threaded back into
+ * apply/reject as an optimistic-concurrency pin. All-zero/epoch-0/empty
+ * `files` (never null from the endpoint) means nothing has been staged yet.
+ */
+export interface ThreadCloudDiffSummary {
+  thread_id: string;
+  epoch: number;
+  staged_at: string | null;
+  counts: { added: number; modified: number; deleted: number };
+  protected_mount: string | null;
+  files: Array<{ path: string; status: 'added' | 'modified' | 'deleted'; binary: boolean }>;
+}
+
+/** One staged file's old/new content for the thread cloud-diff viewer. */
+export interface ThreadCloudDiffFile {
+  thread_id: string;
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+  old_content: string | null;
+  new_content: string | null;
+  old_binary: boolean;
+  new_binary: boolean;
+}
+
+/**
+ * Success body of POST .../cloud-diff/apply. Deliberately NOT shaped like
+ * `JobAcceptResult` (no job_id/diff_status/status — a thread isn't a job):
+ * `JobAcceptOutcome`'s `ok.data` is a union of the two so the single tagged
+ * outcome type can be reused verbatim for both `acceptJobDiff` and
+ * `applyThreadCloudDiff`, per the Task 14 brief.
+ */
+export interface ThreadCloudApplyResult {
+  thread_id: string;
+  applied: number;
+  deleted: number;
+  errors: string[];
+  epoch: number;
+  overlay_reset: boolean;
+}
 
 /**
  * Job progress with ETA calculation.

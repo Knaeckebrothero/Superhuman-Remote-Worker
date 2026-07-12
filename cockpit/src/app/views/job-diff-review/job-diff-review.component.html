@@ -117,7 +117,11 @@
               {{ 'jobDiffReview.viewer.addedNote' | transloco }}
             </div>
           }
-          @if (monacoFailed()) {
+          @if (isBinary()) {
+            <div class="diff-review__viewer-note">
+              {{ 'jobDiffReview.viewer.binaryPlaceholder' | transloco }}
+            </div>
+          } @else if (monacoFailed()) {
             <div class="diff-review__monaco-fallback">
               <p class="diff-review__viewer-note">
                 {{ 'jobDiffReview.viewer.monacoUnavailable' | transloco }}
@@ -159,11 +163,7 @@
         [loading]="accepting()"
         (clicked)="onAcceptClick()"
       >
-        {{
-          (accepting()
-            ? 'jobDiffReview.actions.accepting'
-            : 'jobDiffReview.actions.accept') | transloco
-        }}
+        {{ acceptLabel() | transloco }}
       </app-button>
     </footer>
   }

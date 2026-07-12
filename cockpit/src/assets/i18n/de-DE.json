@@ -1017,7 +1017,9 @@
     "status": {
       "temp": "Temp. {{value}}",
       "turn": "Zug {{count}}",
-      "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s"
+      "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",
+      "cloudChanges": "Cloud-Änderungen ({{count}})",
+      "cloudChangesTooltip": "Auf {{mount}} bereitgestellt — zum Prüfen klicken"
     },
     "turn": {
       "collapsedEmpty": "Nur Werkzeugaufrufe",
@@ -1869,6 +1871,7 @@
     "subtitleSingular": "{{count}} Datei wurde in diesem Job geändert. Prüfen und entscheiden.",
     "loading": "Diff wird geladen…",
     "empty": "Keine Änderungen zu prüfen — der Agent hat den Projektordner nicht angefasst.",
+    "staleNotice": "Der gespeicherte Diff hat sich geändert, seit du ihn geladen hast — die neueste Version wurde nachgeladen.",
     "fileTree": {
       "header": "Dateien",
       "statusAdded": "Hinzugefügt",
@@ -1883,7 +1886,8 @@
       "labelChanged": "Agent-Änderung",
       "deletedNote": "Diese Datei wird beim Annehmen aus dem Cloud-Ordner gelöscht.",
       "addedNote": "Diese Datei wird beim Annehmen im Cloud-Ordner angelegt.",
-      "monacoUnavailable": "Der Diff-Editor konnte nicht geladen werden. Inhalt wird als Text angezeigt."
+      "monacoUnavailable": "Der Diff-Editor konnte nicht geladen werden. Inhalt wird als Text angezeigt.",
+      "binaryPlaceholder": "Binärdatei — wird byteidentisch übernommen, keine Vorschau"
     },
     "conflict": {
       "title": "Cloud-Ordner wurde extern geändert",
@@ -1900,6 +1904,7 @@
     "actions": {
       "accept": "Alle Änderungen annehmen",
       "accepting": "Wird angewandt…",
+      "applyToCloud": "In die Cloud übernehmen",
       "reject": "Alle verwerfen",
       "rejecting": "Wird verworfen…",
       "confirmAcceptTitle": "Diese Änderungen in deinen Cloud-Ordner schreiben?",
@@ -2294,6 +2299,11 @@
       "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
       "createFailed": "Sitzung konnte nicht erstellt werden.",
       "renameFailed": "Sitzung konnte nicht umbenannt werden."
+    },
+    "cloudDiff": {
+      "applyFailed": "Änderungen konnten nicht übernommen werden.",
+      "rejectFailed": "Änderungen konnten nicht verworfen werden.",
+      "restageFailed": "Diff konnte nicht aktualisiert werden."
     }
   },
   "toasts": {

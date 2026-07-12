@@ -57,6 +57,9 @@ import {
     StuckJob,
     TableDataResponse,
     TableInfo,
+    ThreadCloudApplyResult,
+    ThreadCloudDiffFile,
+    ThreadCloudDiffSummary,
     User,
     UserCapabilities,
     VoiceCapabilities,
@@ -2109,6 +2112,110 @@ export class ApiService {
         catchError((err) => {
           console.error(`Failed to reject job ${jobId} diff:`, err);
           this.toast.danger(this.errors.translate(err, 'errors.jobs.rejectFailed'));
+          return of(null);
+        }),
+      );
+  }
+
+  // ===== Protected cloud mode: thread cloud-diff review (Slice C, Task 8/10) =====
+  //
+  // Thread-mode counterpart to the Mode A diff review above — same
+  // JobDiffReviewComponent, different backend surface:
+  // GET/POST .../agents/threads/{id}/cloud-diff[...]. See
+  // .superpowers/sdd/task-8-brief.md / task-10-brief.md for the response
+  // shapes this mirrors.
+
+  /**
+   * Fetch the staged protected-cloud diff summary for a thread. The
+   * endpoint itself never 404s for "nothing staged" — it returns the
+   * all-zero/epoch-0/empty-files shape — so `null` here means a hard
+   * failure (network, thread not protected, not the owner).
+   */
+  getThreadCloudDiff(threadId: string): Observable<ThreadCloudDiffSummary | null> {
+    return this.http
+      .get<ThreadCloudDiffSummary>(`${this.baseUrl}/agents/threads/${threadId}/cloud-diff`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /**
+   * Fetch one staged file's old/new content for the thread cloud-diff
+   * viewer. Mirrors getJobDiffFile's per-segment path encoding.
+   */
+  getThreadCloudDiffFile(threadId: string, filePath: string): Observable<ThreadCloudDiffFile | null> {
+    const encoded = filePath.split('/').map(encodeURIComponent).join('/');
+    return this.http
+      .get<ThreadCloudDiffFile>(`${this.baseUrl}/agents/threads/${threadId}/cloud-diff/${encoded}`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /**
+   * Apply the staged protected-cloud diff, pinned to the epoch the caller
+   * last observed via getThreadCloudDiff. Mirrors acceptJobDiff's tagged
+   * outcome (conflict / partial / error), plus a `stale` variant for the
+   * epoch pin's 409 — someone else applied/rejected/restaged since the
+   * summary was read; the caller should reload and retry.
+   */
+  applyThreadCloudDiff(threadId: string, epoch: number): Observable<JobAcceptOutcome> {
+    return this.http
+      .post<ThreadCloudApplyResult>(
+        `${this.baseUrl}/agents/threads/${threadId}/cloud-diff/apply`, { epoch },
+      )
+      .pipe(
+        map((data): JobAcceptOutcome => ({ kind: 'ok', data })),
+        catchError((err: HttpErrorResponse): Observable<JobAcceptOutcome> => {
+          // FastAPI wraps custom 409 / 410 / 502 payloads under {detail: {...}}.
+          const detail = err.error?.detail;
+          if (err.status === 409 && detail && typeof detail === 'object' &&
+              detail.code === 'external_modifications_detected') {
+            return of({ kind: 'conflict', data: detail as JobAcceptConflict });
+          }
+          if (err.status === 409 && detail && typeof detail === 'object' &&
+              detail.code === 'epoch_stale') {
+            return of({ kind: 'stale', staged_epoch: detail.staged_epoch as number });
+          }
+          if (err.status === 502 && detail && typeof detail === 'object' &&
+              detail.code === 'partial_write_failure') {
+            return of({ kind: 'partial', data: detail as JobAcceptPartialFailure });
+          }
+          const message = typeof detail === 'string'
+            ? detail
+            : this.errors.translate(err, 'errors.cloudDiff.applyFailed');
+          return of({ kind: 'error', status: err.status, detail: message });
+        }),
+      );
+  }
+
+  /**
+   * Reject the staged protected-cloud diff, same epoch pin as apply. Never
+   * touches the cloud — just discards the staged upperdir capture.
+   */
+  rejectThreadCloudDiff(threadId: string, epoch: number): Observable<{ rejected: boolean } | null> {
+    return this.http
+      .post<{ rejected: boolean }>(
+        `${this.baseUrl}/agents/threads/${threadId}/cloud-diff/reject`, { epoch },
+      )
+      .pipe(
+        catchError((err) => {
+          console.error(`Failed to reject thread ${threadId} cloud diff:`, err);
+          this.toast.danger(this.errors.translate(err, 'errors.cloudDiff.rejectFailed'));
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Owner-triggered re-stage (fresh overlay capture) of a thread's
+   * protected-cloud diff. Fire-and-forget on the orchestrator side
+   * (schedules a background task); the caller re-polls getThreadCloudDiff
+   * to observe the refreshed summary.
+   */
+  restageThreadCloudDiff(threadId: string): Observable<unknown> {
+    return this.http
+      .post(`${this.baseUrl}/agents/threads/${threadId}/cloud-diff/restage`, {})
+      .pipe(
+        catchError((err) => {
+          console.error(`Failed to restage thread ${threadId} cloud diff:`, err);
+          this.toast.danger(this.errors.translate(err, 'errors.cloudDiff.restageFailed'));
           return of(null);
         }),
       );
