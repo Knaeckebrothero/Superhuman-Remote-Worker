@@ -66,6 +66,19 @@ export function isBinaryEntry(
 }
 
 /**
+ * Transloco key for the reject-confirmation body, by mode. Job mode's copy
+ * references the Gitea commits that survive as an audit trail; thread mode
+ * (protected cloud) has NO Gitea history — rejecting permanently discards
+ * the staged changes — so its copy must say exactly that instead of
+ * promising a nonexistent safety net.
+ */
+export function rejectBodyKeyFor(mode: 'job' | 'thread'): string {
+  return mode === 'thread'
+    ? 'jobDiffReview.actions.confirmRejectBodyCloud'
+    : 'jobDiffReview.actions.confirmRejectBody';
+}
+
+/**
  * Mode A / protected-cloud-mode diff review.
  *
  * Job mode (`jobId` bound): project-attached jobs in `pending_review`,
@@ -375,6 +388,11 @@ export class JobDiffReviewComponent {
     return this.mode() === 'thread'
       ? 'jobDiffReview.actions.applyToCloud'
       : 'jobDiffReview.actions.accept';
+  }
+
+  /** Reject-confirmation body copy, mode-branched — see rejectBodyKeyFor. */
+  protected rejectBodyKey(): string {
+    return rejectBodyKeyFor(this.mode());
   }
 
   protected statusTone(status: DiffFileEntry['status']): BadgeTone {

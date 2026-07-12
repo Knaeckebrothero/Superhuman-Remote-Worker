@@ -1019,7 +1019,7 @@
       "turn": "Zug {{count}}",
       "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",
       "cloudChanges": "Cloud-Änderungen ({{count}})",
-      "cloudChangesTooltip": "Auf {{mount}} bereitgestellt — zum Prüfen klicken"
+      "cloudChangesTooltip": "Auf {{mount}} bereitgestellt · zuletzt {{stagedAt}} — zum Prüfen klicken"
     },
     "turn": {
       "collapsedEmpty": "Nur Werkzeugaufrufe",
@@ -1911,6 +1911,7 @@
       "confirmAcceptBody": "{{count}} Datei(en) werden in den Projektordner geschrieben. Diese Aktion ist aus dem Cockpit nicht reversibel.",
       "confirmRejectTitle": "Alle Änderungen verwerfen?",
       "confirmRejectBody": "Die Bearbeitungen des Agents werden verworfen. Die Gitea-Commits bleiben als Audit-Trail erhalten.",
+      "confirmRejectBodyCloud": "Die bereitgestellten Änderungen werden endgültig verworfen. In deine Cloud wurde nichts geschrieben.",
       "cancel": "Abbrechen",
       "confirm": "Fortfahren"
     }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { diffApiFor, isBinaryEntry } from './job-diff-review.component';
+import { diffApiFor, isBinaryEntry, rejectBodyKeyFor } from './job-diff-review.component';
 
 /**
  * Unit tests for the pure helpers used by JobDiffReviewComponent.
@@ -132,5 +132,15 @@ describe('isBinaryEntry', () => {
     expect(
       isBinaryEntry({ binary: false }, { old_binary: false, new_binary: false }),
     ).toBe(false);
+  });
+});
+
+describe('rejectBodyKeyFor', () => {
+  it('uses the Gitea-audit-trail copy in job mode', () => {
+    expect(rejectBodyKeyFor('job')).toBe('jobDiffReview.actions.confirmRejectBody');
+  });
+
+  it('uses the permanent-discard copy in thread mode (no Gitea commits exist there)', () => {
+    expect(rejectBodyKeyFor('thread')).toBe('jobDiffReview.actions.confirmRejectBodyCloud');
   });
 });
