@@ -507,3 +507,63 @@ Neo4j Bolt URL — internal cluster service or external URL.
 {{- required "databases.neo4j.externalUrl is required when databases.neo4j.internal=false" .Values.databases.neo4j.externalUrl }}
 {{- end }}
 {{- end }}
+
+{{/*
+Effective S3 endpoint for snapshots. External (s3.endpoint) wins; otherwise the
+bundled Garage service when enabled; otherwise empty (snapshots disabled).
+*/}}
+{{- define "srw.effectiveS3Endpoint" -}}
+{{- if .Values.s3.endpoint -}}
+{{- .Values.s3.endpoint -}}
+{{- else if .Values.garage.enabled -}}
+{{- printf "http://%s:3900" (include "srw.serviceName" (dict "context" . "component" "garage")) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective virtual-workspace S3 endpoint. External wins; else bundled Garage.
+*/}}
+{{- define "srw.effectiveVwEndpoint" -}}
+{{- if .Values.virtualWorkspace.s3.endpoint -}}
+{{- .Values.virtualWorkspace.s3.endpoint -}}
+{{- else if .Values.garage.enabled -}}
+{{- printf "http://%s:3900" (include "srw.serviceName" (dict "context" . "component" "garage")) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective rclone backend type for the virtual tier. Explicit value wins; else
+"s3" when Garage is bundled; else "" (tier disabled).
+*/}}
+{{- define "srw.effectiveVwRcloneType" -}}
+{{- if .Values.virtualWorkspace.rclone.type -}}
+{{- .Values.virtualWorkspace.rclone.type -}}
+{{- else if .Values.garage.enabled -}}
+{{- "s3" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective rclone root (bucket) for the virtual tier. Explicit value wins; else
+the bundled Garage workspace bucket.
+*/}}
+{{- define "srw.effectiveVwRcloneRoot" -}}
+{{- if .Values.virtualWorkspace.rclone.root -}}
+{{- .Values.virtualWorkspace.rclone.root -}}
+{{- else if .Values.garage.enabled -}}
+{{- .Values.garage.buckets.workspaces -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Effective rclone S3 provider profile. When auto-wiring to bundled Garage (no
+external vw endpoint), use "Other" (Garage's rclone-compatible profile,
+path-style). Otherwise the configured provider (default "Minio").
+*/}}
+{{- define "srw.effectiveVwProvider" -}}
+{{- if and .Values.garage.enabled (not .Values.virtualWorkspace.s3.endpoint) -}}
+{{- "Other" -}}
+{{- else -}}
+{{- .Values.virtualWorkspace.s3.provider | default "Minio" -}}
+{{- end -}}
+{{- end -}}

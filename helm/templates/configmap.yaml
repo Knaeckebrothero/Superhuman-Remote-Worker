@@ -171,7 +171,7 @@ data:
   {{- end }}
 
   # S3 / Object Storage
-  S3_ENDPOINT: {{ .Values.s3.endpoint | quote }}
+  S3_ENDPOINT: {{ include "srw.effectiveS3Endpoint" . | quote }}
   S3_BUCKET: {{ .Values.s3.bucket | quote }}
   S3_REGION: {{ .Values.s3.region | quote }}
   SNAPSHOT_MAX_SIZE_GB: {{ .Values.s3.snapshotMaxSizeGb | quote }}
@@ -228,11 +228,11 @@ data:
   # job/session then fails fast). For s3, endpoint/region/provider are non-secret
   # (here); credentials are the Secret keys VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID /
   # _SECRET_ACCESS_KEY, wired separately on the orchestrator pod.
-  VIRTUAL_WORKSPACE_RCLONE_TYPE: {{ .Values.virtualWorkspace.rclone.type | default "" | quote }}
-  VIRTUAL_WORKSPACE_RCLONE_ROOT: {{ .Values.virtualWorkspace.rclone.root | default "" | quote }}
-  VIRTUAL_WORKSPACE_S3_ENDPOINT: {{ .Values.virtualWorkspace.s3.endpoint | default "" | quote }}
+  VIRTUAL_WORKSPACE_RCLONE_TYPE: {{ include "srw.effectiveVwRcloneType" . | quote }}
+  VIRTUAL_WORKSPACE_RCLONE_ROOT: {{ include "srw.effectiveVwRcloneRoot" . | quote }}
+  VIRTUAL_WORKSPACE_S3_ENDPOINT: {{ include "srw.effectiveVwEndpoint" . | quote }}
   VIRTUAL_WORKSPACE_S3_REGION: {{ .Values.virtualWorkspace.s3.region | default "us-east-1" | quote }}
-  VIRTUAL_WORKSPACE_S3_PROVIDER: {{ .Values.virtualWorkspace.s3.provider | default "Minio" | quote }}
+  VIRTUAL_WORKSPACE_S3_PROVIDER: {{ include "srw.effectiveVwProvider" . | quote }}
   {{- if .Values.cloud.nextcloudRcloneUserHomeUsername }}
   NEXTCLOUD_RCLONE_USER_HOME_USERNAME: {{ .Values.cloud.nextcloudRcloneUserHomeUsername | quote }}
   {{- end }}
