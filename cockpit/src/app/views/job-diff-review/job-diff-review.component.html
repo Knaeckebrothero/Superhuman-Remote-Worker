@@ -191,7 +191,7 @@
     [title]="'jobDiffReview.actions.confirmRejectTitle' | transloco"
     size="sm"
   >
-    <p>{{ 'jobDiffReview.actions.confirmRejectBody' | transloco }}</p>
+    <p>{{ rejectBodyKey() | transloco }}</p>
     <ng-container appDialogActions>
       <app-button variant="ghost" (clicked)="showRejectConfirm.set(false)">
         {{ 'jobDiffReview.actions.cancel' | transloco }}

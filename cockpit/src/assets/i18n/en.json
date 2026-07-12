@@ -1019,7 +1019,7 @@
       "turn": "Turn {{count}}",
       "agentQuiet": "Working — no output for {{seconds}}s",
       "cloudChanges": "Cloud changes ({{count}})",
-      "cloudChangesTooltip": "Staged on {{mount}} — click to review"
+      "cloudChangesTooltip": "Staged on {{mount}} · last staged {{stagedAt}} — click to review"
     },
     "turn": {
       "collapsedEmpty": "Tool calls only",
@@ -1911,6 +1911,7 @@
       "confirmAcceptBody": "{{count}} file(s) will be written to the project's cloud folder. This action is not reversible from the cockpit.",
       "confirmRejectTitle": "Discard all changes?",
       "confirmRejectBody": "The agent's edits will be discarded. The Gitea commits stay as an audit trail.",
+      "confirmRejectBodyCloud": "The staged changes will be permanently discarded. Nothing has been written to your cloud.",
       "cancel": "Cancel",
       "confirm": "Continue"
     }

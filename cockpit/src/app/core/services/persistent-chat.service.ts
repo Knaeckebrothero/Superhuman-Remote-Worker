@@ -540,6 +540,10 @@ export class PersistentChatService {
     readonly protectedCloud = computed(() => this._protectedCloud());
     readonly cloudChangesCount = signal(0);
     readonly protectedMountName = signal<string | null>(null);
+    /** ISO timestamp the current staged diff was captured at (the summary's
+     *  `staged_at`) — surfaces staging staleness in the badge tooltip. Null
+     *  when nothing is staged (or the summary hasn't loaded yet). */
+    readonly cloudStagedAt = signal<string | null>(null);
     readonly cloudDiffPanelOpen = signal(false);
     private cloudDiffRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly CLOUD_DIFF_REFRESH_DEBOUNCE_MS = 2000;
@@ -718,6 +722,7 @@ export class PersistentChatService {
             this._protectedCloud.set(false);
             this.cloudChangesCount.set(0);
             this.protectedMountName.set(null);
+            this.cloudStagedAt.set(null);
             this.cloudDiffPanelOpen.set(false);
 
             this.threadId.set(threadId);
@@ -1024,6 +1029,7 @@ export class PersistentChatService {
         if (summary) {
             this.cloudChangesCount.set(cloudCountFromSummary(summary));
             this.protectedMountName.set(summary.protected_mount);
+            this.cloudStagedAt.set(summary.staged_at);
         }
     }
 
@@ -1683,6 +1689,7 @@ export class PersistentChatService {
         this._protectedCloud.set(false);
         this.cloudChangesCount.set(0);
         this.protectedMountName.set(null);
+        this.cloudStagedAt.set(null);
         this.cloudDiffPanelOpen.set(false);
     }
 
