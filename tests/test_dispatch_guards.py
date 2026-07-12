@@ -126,7 +126,7 @@ class TestVmGoldenWaitDecision:
     DataVolume import (~30 min after an agent-vm-base bump — longer than
     timeout_s). Polling must not consume provision attempts, and recycling is
     meaningless (nothing exists to tear down). See
-    docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md.
+    docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md.
     """
 
     def _decide(

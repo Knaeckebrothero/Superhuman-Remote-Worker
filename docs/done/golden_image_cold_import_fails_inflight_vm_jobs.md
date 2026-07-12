@@ -12,8 +12,10 @@ tags:
 
 # Investigation — a cold golden-image import (triggered by any `agent-vm-base` image bump) fails every in-flight VM job of the current loop iteration
 
-**Status: IMPLEMENTED (2026-07-09, uncommitted on `develop`) — root cause confirmed
-live, fixes built per §Chosen fix below.** All three findings addressed: (A)
+**Status: RESOLVED (2026-07-12) — fix committed `5f8b6047`, pushed, and deployed
+on both sides of the dev stack since 2026-07-10** (orchestrator `sha-2a71df3` on
+`main`/`superhuman-remote-worker`, vm-controller `sha-f1f32eb` on `vm`/`agent-vms`;
+both contain `5f8b6047`). All three findings addressed: (A)
 controller `_do_create` no longer blocks on the golden import — it returns a new
 `waiting_golden` status and the dispatcher polls create without consuming provision
 attempts (`VM_GOLDEN_POLL`, bounded by `VM_GOLDEN_WAIT_TIMEOUT_S=2700` →
@@ -24,8 +26,16 @@ AlreadyExists is idempotent success in the controller (deterministic name
 cannot reach — force-delete on the first tick instead of a ~5-min snapshot-retry
 stall. 446 tests green across the five affected suites
 (`test_vm_controller`, `test_dispatch_guards`, `test_vm_provisioner`,
-`test_nats_bridge`, `test_lifecycle_vm_manager`), ruff clean. Remaining: deploy →
-live smoke on the next `agent-vm-base` bump (§Acceptance criteria).
+`test_nats_bridge`, `test_lifecycle_vm_manager`), ruff clean.
+
+**⚠️ Live-verification caveat:** as of 2026-07-12 the new `waiting_golden` path has
+**never fired in production** — two golden cold imports occurred since deploy
+(2026-07-10, e.g. `agent-vm-golden-33df2ec74f6a` for `sha-01bf2c9`) but no VM
+create coincided with an import window (0 `deferring VM create` in controller
+logs, 8 VM creates all against warm goldens). The deployed fix is
+unit-verified + rollout-verified, not incident-verified. Coverage inventory and
+the manual live-smoke runbook:
+[`../../tests/golden_cold_import_provisioning_validation.md`](../../tests/golden_cold_import_provisioning_validation.md).
 
 **Mechanism refinement discovered during implementation:** Findings A and B share
 one root — the controller's `handle_create` *blocked up to 900 s* inside
@@ -41,7 +51,7 @@ VM.)
 
 Surfaced while watching the first VM
 provisioning round after the "VMs not reachable" fix
-([`vm_ssh_readiness_probe_unroutable_from_orchestrator.md`](vm_ssh_readiness_probe_unroutable_from_orchestrator.md))
+([`vm_ssh_readiness_probe_unroutable_from_orchestrator.md`](../issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md))
 rolled out. That fix shipped a **new `agent-vm-base` image (`sha-e375179`)**, which
 forced the vm-controller to import a **fresh golden DataVolume** — a ~30-minute cold
 import. The two loop jobs dispatched into that window (`c40a4ebf`, `427dbc57`) both
@@ -62,10 +72,10 @@ delay). It recurs on **every** agent-vm-base image rollout and will hit `srw-pro
 the same way.
 
 **Related (read alongside):**
-[`vm_ssh_readiness_probe_unroutable_from_orchestrator.md`](vm_ssh_readiness_probe_unroutable_from_orchestrator.md)
+[`vm_ssh_readiness_probe_unroutable_from_orchestrator.md`](../issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md)
 — its F3 (park → fail the job) is what let the loop advance here; its no-tailnet-route root
 cause is why Finding C's reaper snapshot fails. ·
-[`../done/deleted_job_orphans_workspace_pod.md`](../done/deleted_job_orphans_workspace_pod.md)
+[`../done/deleted_job_orphans_workspace_pod.md`](deleted_job_orphans_workspace_pod.md)
 — the VM orphan-reap backstop (`vm_manager.reap_orphans`) being live-verified; this incident
 is its first real exercise (Finding C). ·
 [`../features/vm_golden_image_boot_acceleration.md`](../features/vm_golden_image_boot_acceleration.md)

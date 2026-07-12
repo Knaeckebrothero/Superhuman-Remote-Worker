@@ -712,7 +712,7 @@ class TestHandleCreate:
         The VM name is agent-vm-<job_id>, so an existing live VM IS this
         job's VM (a duplicate/racing create lost to one that succeeded).
         Propagating the 409 as 'failed' parked two healthy loop jobs — see
-        docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md §B.
+        docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md §B.
         """
         conflict = _FakeApiException(status=409, body="already exists")
 
@@ -1881,7 +1881,7 @@ class TestGoldenStateNowait:
     Unlike _ensure_golden (kept for pre-warm), this must NEVER sleep waiting
     for CDI: a create handler blocked for a cold import (~30 min) outlives
     every orchestrator budget and races later creates into 409 collisions —
-    see docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md.
+    see docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md.
     """
 
     @staticmethod

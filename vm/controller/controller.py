@@ -235,7 +235,7 @@ class VMController:
         # while stale handlers were still parked in the wait; when the golden
         # finally succeeded, the racers collided in 409 AlreadyExists and failed
         # two loop jobs. The orchestrator polls create until the golden is
-        # ready (see docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md).
+        # ready (see docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
         # Checked FIRST so a poll doesn't mint a fresh Headscale auth key every
         # ~30s for the whole import window.
         #
