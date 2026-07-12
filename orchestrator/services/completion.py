@@ -297,7 +297,7 @@ ERROR_IMMUNE_FREEZE_TYPES: frozenset[str] = AUTO_REDISPATCH_FREEZE_TYPES | froze
 # ancestor, but that is temporary — the subjob re-dispatches once the parent
 # resumes — so only the permanent terminals wedge a paused subjob forever. A
 # drain-frozen subjob under such a parent must resolve terminally, not pause.
-# docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+# docs/done/coincident_infra_error_overrides_reported_job_outcome.md
 _PARENT_TERMINAL_BLOCKING: frozenset[str] = frozenset({"failed", "cancelled"})
 
 # Substrings that mark an error as a workspace/VM *teardown* (connectivity) blip
@@ -306,7 +306,7 @@ _PARENT_TERMINAL_BLOCKING: frozenset[str] = frozenset({"failed", "cancelled"})
 # error must not override an outcome the agent already reported as complete.
 # Kept deliberately narrow (connectivity/teardown only) — widen on evidence, not
 # on suspicion (the "cleanup hiccup vs real failure" line, signed off 2026-07-12).
-# docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+# docs/done/coincident_infra_error_overrides_reported_job_outcome.md
 _TEARDOWN_ERROR_PATTERNS: tuple[str, ...] = (
     "failed to connect to workspace",
     "workspace i/o timed out",
@@ -608,7 +608,7 @@ def determine_job_status(
         # (Carve-out (2) below handles the single-report dual-payload case; this
         # covers the already-persisted row regardless of which trailing op raised
         # the error.) Return "no change" so the successful status stands.
-        # docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+        # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
         if job.get("status") == "completed" or job.get("merge_status") == "merged":
             logger.warning(
                 "Job %s: ignoring a coincident error on an already-successful job "
@@ -633,7 +633,7 @@ def determine_job_status(
         #      deliverables already landed (merge/graft ran); the completion branch
         #      below resolves it exactly as it would with no error. A NON-teardown
         #      error (real mid-run crash) still fails, even on a completion report.
-        #      docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+        #      docs/done/coincident_infra_error_overrides_reported_job_outcome.md
         redispatchable = (
             should_stop
             and job.get("parent_job_id") is None
@@ -682,7 +682,7 @@ def determine_job_status(
         # freezes — memory/kb/llm — are deferred: their retry-cap/ceiling counters
         # are top-level-scoped; they stay on the visible pending_review fallback
         # until per-subjob counters are wired.)
-        # docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+        # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
         if freeze_type == "version_upgrade":
             if parent_status in _PARENT_TERMINAL_BLOCKING:
                 return ("completed" if goal_achieved else "cancelled", None)

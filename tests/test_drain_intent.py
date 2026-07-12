@@ -588,7 +588,7 @@ class TestVersionUpgradeFreeze:
 class TestCoincidentInfraErrorOverride:
     """A coincident infra/teardown error must not override a reported outcome.
 
-    docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+    docs/done/coincident_infra_error_overrides_reported_job_outcome.md
     Slice C (top-level completion masked by a post-completion teardown blip) and
     Slice B (drained subjob mis-routed to pending_review instead of re-dispatch).
     """
