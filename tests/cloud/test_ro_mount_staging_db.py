@@ -1,4 +1,4 @@
-"""cloud_ro_mounts staging columns (Slice C migration 0056) — DB accessors.
+"""cloud_ro_mounts staging columns (Slice C migration 0057) — DB accessors.
 
 _ro_mount_row must json.loads JSONB payloads (asyncpg returns raw JSON
 strings); update_ro_mount_staging must NULL staged_at when clearing.
