@@ -25,16 +25,36 @@ export class CapabilitiesService {
   readonly grants = signal<Record<string, unknown> | null | undefined>(undefined);
   readonly catalog = signal<GrantCatalog>({});
 
+  // True when the capabilities fetch errored (ApiService catches to a null
+  // emission, which would otherwise be indistinguishable from an admin's
+  // null grants). Fail-closed consumers (publish gating) branch on this;
+  // the permission-mode helpers keep their deliberate fail-open behavior.
+  private readonly loadFailed = signal(false);
+
   constructor() {
     this.load();
   }
 
   load(): void {
     this.api.getMyCapabilities().subscribe((c) => {
+      this.loadFailed.set(c === null);
       this.grants.set(c ? c.grants : null);
       if (c?.catalog) this.catalog.set(c.catalog);
     });
   }
+
+  /** Whether the datasource Visibility (publish) section may render. Unlike
+   * the permission-mode helpers this FAILS CLOSED while loading and on fetch
+   * error — the section stays hidden until a successful capabilities fetch
+   * proves entitlement (the server gate is the real backstop either way).
+   * Spec: docs/features/public_datasources.md. */
+  readonly canPublishDatasources = computed(() => {
+    if (this.loadFailed()) return false;
+    const g = this.grants();
+    if (g === null) return true; // admin/unrestricted
+    if (g === undefined) return false; // loading
+    return g['public_datasources'] === true;
+  });
 
   /** permission_mode options at/below the user's ceiling (admin/loading ⇒ all). */
   readonly permissionModes = computed(() =>
