@@ -583,6 +583,7 @@ export interface ResolvedDefaults {
     permission_mode?: string;
     idle_timeout_minutes?: number;
     config_name?: string;
+    workspace_backend?: string;
   };
 }
 
@@ -634,6 +635,8 @@ export interface ReadAloudSettings {
 export interface PersistentAgentSettings {
     model?: string | null;
     permission_mode?: string | null;
+    /** Default session workspace tier; null tracks the system default (virtual). */
+    workspace_backend?: 'virtual' | 'sandbox' | 'none' | null;
     config_name?: string | null;
     greeting?: string | null;
     idle_timeout_minutes?: number | null;

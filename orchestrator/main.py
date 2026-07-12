@@ -2868,6 +2868,30 @@ def _is_lite_config_override(config_override: Any) -> bool:
     return _backend_from_override(config_override) in LITE_BACKENDS
 
 
+# Session workspace tiers selectable at create time (vm is upgrade-only) and
+# the platform default applied when neither the request nor the owner's saved
+# settings.persistent_agent.workspace_backend pick one. An S3 object store is
+# an assumed platform prerequisite (docs/issues/s3_object_store_bundled_fallback.md),
+# so the default is the instant lite tier — see
+# docs/features/instant_landing_session.md.
+SESSION_WORKSPACE_BACKENDS = ("sandbox", "virtual", "none")
+SESSION_DEFAULT_WORKSPACE_BACKEND = "virtual"
+
+
+def _default_session_workspace_backend(user_settings: dict[str, Any] | None) -> str:
+    """The owner's saved default session tier, else the platform default.
+
+    ``user_settings`` is the ``settings.persistent_agent`` sub-object. Unknown
+    or absent values fall back to the platform default rather than erroring —
+    the PATCH validator (``UserSettingsUpdate``) keeps stored values sane, this
+    just guards legacy/hand-edited rows.
+    """
+    backend = (user_settings or {}).get("workspace_backend")
+    if backend in SESSION_WORKSPACE_BACKENDS:
+        return backend
+    return SESSION_DEFAULT_WORKSPACE_BACKEND
+
+
 def _validated_session_workspace_override(
     config_override: Any,
 ) -> Optional[dict[str, Any]]:
@@ -2897,7 +2921,7 @@ def _validated_session_workspace_override(
                 "session on the Virtual tier and upgrade it to VM."
             ),
         )
-    if backend is not None and backend not in ("sandbox", "virtual", "none"):
+    if backend is not None and backend not in SESSION_WORKSPACE_BACKENDS:
         raise HTTPException(
             status_code=400, detail=f"Invalid workspace backend '{backend}'"
         )
@@ -5630,7 +5654,8 @@ class UserSettingsUpdate(BaseModel):
     # Phase 6: persistent_agent sub-object covers headless_mode,
     # headless_attention_sleep_minutes, notification_channels, plus the
     # existing model/permission_mode/greeting/idle_timeout_minutes/command_allowlist
-    # keys already read in create_thread. Patch-replaces the whole sub-object.
+    # keys already read in create_thread. Also workspace_backend — the user's
+    # default session workspace tier. Patch-replaces the whole sub-object.
     persistent_agent: dict[str, Any] | None = None
     # Read-aloud rewrite preferences: {reasoning_level, custom_prompt}. Controls
     # how the auxiliary LLM rewrites a message for speech — reasoning_level (off
@@ -5638,6 +5663,26 @@ class UserSettingsUpdate(BaseModel):
     # standing style/summarization instructions). Read by services/tts.py's
     # rewrite path. Patch-replaces the whole sub-object.
     read_aloud: dict[str, Any] | None = None
+
+    @field_validator("persistent_agent")
+    @classmethod
+    def _validate_persistent_agent(
+        cls, v: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Guard the persistent_agent sub-object: workspace_backend must be a
+        create-time-selectable tier — a typo here would otherwise misconfigure
+        every future session created from the user's defaults. Other keys stay
+        free-form (Phase 6 contract)."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("persistent_agent must be an object")
+        backend = v.get("workspace_backend")
+        if backend is not None and backend not in SESSION_WORKSPACE_BACKENDS:
+            raise ValueError(
+                f"workspace_backend must be one of {list(SESSION_WORKSPACE_BACKENDS)}"
+            )
+        return v
 
     @field_validator("read_aloud")
     @classmethod
@@ -17688,9 +17733,16 @@ async def create_thread(
     try:
         user = await require_approved_user(request, postgres_db)
 
-        # Build config_override: user settings as base, request fields win
+        # Build config_override: user settings as base, request fields win.
+        # NB: the auth-path user dict carries no `settings` column
+        # (get_user_by_keycloak_sub selects identity/admission fields only), so
+        # preferences must be fetched explicitly — `user.get("settings")` here
+        # was always None, silently disabling every saved persistent_agent
+        # default (model, permission_mode, …) at create time (found 2026-07-12
+        # smoke-testing the workspace_backend defaults chain).
         config_override = {}
-        user_settings = (user.get("settings") or {}).get("persistent_agent", {})
+        all_user_settings = await postgres_db.get_user_settings(str(user["id"]))
+        user_settings = (all_user_settings or {}).get("persistent_agent") or {}
         if user_settings:
             if user_settings.get("model"):
                 config_override["llm"] = {"model": user_settings["model"]}
@@ -17770,6 +17822,18 @@ async def create_thread(
         )
         if req_tool_groups:
             config_override.setdefault("tools", {}).update(req_tool_groups)
+
+        # Workspace-backend default chain (docs/features/instant_landing_session.md):
+        # explicit request > owner's saved default > platform default. Sessions
+        # are never implicitly sandbox anymore — an omitted backend means "the
+        # owner's default", so minimal create bodies (instant landing, MCP) get
+        # the same tier the owner picked in Settings. Safe to inject before the
+        # grant check below: the PDP gates only `vm`, which
+        # _validated_session_workspace_override already rejects.
+        if not (config_override.get("workspace") or {}).get("backend"):
+            config_override.setdefault("workspace", {})["backend"] = (
+                _default_session_workspace_backend(user_settings)
+            )
 
         # Normalize project_ids (backward compat: project_id → [project_id])
         effective_project_ids = request_body.project_ids or (
@@ -24068,6 +24132,7 @@ async def _resolve_preference_defaults() -> dict[str, Any]:
             "permission_mode": "supervised",
             "idle_timeout_minutes": 30,
             "config_name": "",
+            "workspace_backend": SESSION_DEFAULT_WORKSPACE_BACKEND,
         },
     }
 

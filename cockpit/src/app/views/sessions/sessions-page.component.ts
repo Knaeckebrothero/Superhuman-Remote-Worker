@@ -143,6 +143,9 @@ interface Project {
           <div class="empty-state">
             <app-icon size="inherit" class="empty-icon">chat_bubble_outline</app-icon>
             <p>{{ 'sessions.empty' | transloco }}</p>
+            <app-button variant="primary" size="sm" (clicked)="goToDraft()">
+              {{ 'sessions.emptyCta' | transloco }}
+            </app-button>
           </div>
         } @else {
           <!-- Filter tabs -->
@@ -727,6 +730,12 @@ export class SessionsPageComponent implements OnInit {
 
     goToCreate(): void {
         this.router.navigate(['/sessions/new']);
+    }
+
+    goToDraft(): void {
+        // Instant landing: `/` is an open draft chat — type first, the
+        // session is created on send (docs/features/instant_landing_session.md).
+        this.router.navigate(['/']);
     }
 
     returnToActive(): void {

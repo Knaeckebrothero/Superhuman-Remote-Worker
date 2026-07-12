@@ -256,8 +256,12 @@ export function textSizeToCss(size: ChatTextSize): string {
     }
 }
 
-export function canComposeDuringSession(isConnected: boolean, isStartingSession: boolean): boolean {
-    return isConnected || isStartingSession;
+export function canComposeDuringSession(
+    isConnected: boolean,
+    isStartingSession: boolean,
+    isDraftSession = false,
+): boolean {
+    return isConnected || isStartingSession || isDraftSession;
 }
 
 export function canSendMessage(canCompose: boolean, text: string, attachmentCount: number): boolean {
@@ -1023,6 +1027,24 @@ export function clearDraft(threadId: string | null): void {
                     </div>
                   }
                 </div>
+              } @else if (chat.isDraftSession()) {
+                <div class="empty-inner">
+                  <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
+                  <h2 class="empty-title">{{ 'chat.draft.title' | transloco }}</h2>
+                  <p class="empty-subtitle">{{ 'chat.draft.subtitle' | transloco }}</p>
+                  @if (displayedSuggestions().length > 0) {
+                    <div class="suggestion-grid">
+                      @for (s of displayedSuggestions(); track $index) {
+                        <button type="button" class="suggestion-chip"
+                                (click)="pickSuggestion(s)">
+                          <app-icon size="lg" class="suggestion-icon">{{ s.icon }}</app-icon>
+                          <span class="suggestion-text">{{ s.text }}</span>
+                        </button>
+                      }
+                    </div>
+                  }
+                  <a class="draft-advanced" routerLink="/sessions/new">{{ 'chat.draft.advanced' | transloco }}</a>
+                </div>
               } @else if (chat.isStartingSession()) {
                 <div class="startup-wrapper">
                   <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
@@ -1749,11 +1771,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     /**
      * Whether the composer accepts input: during startup (type + queue +
-     * flush on ready) and while connected; false during a mid-session
-     * reconnect.
+     * flush on ready), while connected, and in the landing draft (type first,
+     * session created on send); false during a mid-session reconnect.
      */
     readonly canCompose = computed(() =>
-        canComposeDuringSession(this.chat.isConnected(), this.chat.isStartingSession()),
+        canComposeDuringSession(
+            this.chat.isConnected(),
+            this.chat.isStartingSession(),
+            this.chat.isDraftSession(),
+        ),
     );
 
     stepIcon(state: 'done' | 'active' | 'todo'): string {
@@ -1994,6 +2020,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly inputPlaceholder = computed(() => {
         // Track language changes so placeholder re-translates when i18n switches.
         this.i18n.activeLang();
+        if (this.chat.isDraftSession()) {
+            return this.transloco.translate(
+                this.viewport.isMobile() ? 'chat.input.defaultMobile' : 'chat.input.default',
+            );
+        }
         if (this.isShowingReconnectBanner()) return this.transloco.translate('chat.input.reconnecting');
         if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');

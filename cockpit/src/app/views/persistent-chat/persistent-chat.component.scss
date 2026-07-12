@@ -413,6 +413,18 @@
         flex: 1;
       }
 
+      .draft-advanced {
+        margin-top: 26px;
+        font-size: 14px;
+        color: var(--text-muted);
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+
+      .draft-advanced:hover {
+        color: var(--text-primary);
+      }
+
       @media (max-width: 600px) {
         .suggestion-grid {
           grid-template-columns: 1fr;

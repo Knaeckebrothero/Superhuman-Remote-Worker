@@ -28,9 +28,11 @@ import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
 
 export const routes: Routes = [
-  // Builder removed (see docs/features/builder_to_sessions_consolidation.md).
-  // Sessions is the primary surface; root redirects there.
-  { path: '', redirectTo: 'sessions', pathMatch: 'full' },
+  // Instant landing (docs/features/instant_landing_session.md): the root is a
+  // fresh draft chat — open composer, nothing created until the first send.
+  // (Replaces the sessions-list redirect left by the builder removal, see
+  // docs/features/builder_to_sessions_consolidation.md.)
+  { path: '', component: ChatPageComponent, canActivate: [authGuard], data: { draft: true } },
     {path: 'sessions', component: SessionsPageComponent, canActivate: [authGuard]},
     {path: 'sessions/new', component: SessionCreateComponent, canActivate: [authGuard]},
     {path: 'sessions/:threadId', component: ChatPageComponent, canActivate: [authGuard]},
