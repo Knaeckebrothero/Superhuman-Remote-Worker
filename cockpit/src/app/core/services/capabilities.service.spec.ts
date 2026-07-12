@@ -91,3 +91,35 @@ describe('CapabilitiesService.canPublishDatasources', () => {
     expect(svc.canPublishDatasources()).toBe(false);
   });
 });
+
+describe('CapabilitiesService.protectedCloudAvailable', () => {
+  it('is true when the deployment feature flag is on', () => {
+    const svc = make({
+      is_admin: false,
+      grants: {},
+      catalog: CATALOG,
+      features: {protected_cloud: true},
+    });
+    expect(svc.protectedCloudAvailable()).toBe(true);
+  });
+
+  it('is false when the flag is off', () => {
+    const svc = make({
+      is_admin: false,
+      grants: {},
+      catalog: CATALOG,
+      features: {protected_cloud: false},
+    });
+    expect(svc.protectedCloudAvailable()).toBe(false);
+  });
+
+  it('is false when features is absent from the payload', () => {
+    const svc = make({is_admin: true, grants: null, catalog: CATALOG});
+    expect(svc.protectedCloudAvailable()).toBe(false);
+  });
+
+  it('is false while loading / on fetch error', () => {
+    const svc = make(null);
+    expect(svc.protectedCloudAvailable()).toBe(false);
+  });
+});

@@ -23,6 +23,23 @@ interface Project {
   status: string;
   description?: string;
   is_default?: boolean;
+  main_cloud_backend?: string | null;
+}
+
+/**
+ * Whether the protected-cloud session-create checkbox should render.
+ *
+ * Visible only when the deployment flag is on AND at least one selected
+ * project is a non-default Nextcloud project (spec §2/§4: default projects
+ * excluded in v1; Nextcloud-only per design §9.2).
+ */
+export function protectedCloudToggleVisible(
+  featureOn: boolean,
+  selected: Array<{ is_default?: boolean; main_cloud_backend?: string | null }>,
+): boolean {
+  return featureOn && selected.some(
+    (p) => !p.is_default && p.main_cloud_backend === 'nextcloud',
+  );
 }
 
 interface Expert {
@@ -97,6 +114,18 @@ interface ExpertDetail extends Expert {
               }
             </div>
           </app-form-field>
+        }
+
+        <!-- Protected cloud toggle: only for non-default Nextcloud projects,
+             gated on the deployment feature flag (Slice C). -->
+        @if (protectedCloudVisible()) {
+          <label class="protected-cloud-toggle">
+            <input type="checkbox" [checked]="protectedCloud()"
+                   [disabled]="creating()"
+                   (change)="protectedCloud.set($any($event.target).checked)" />
+            {{ 'sessions.create.protectedCloud' | transloco }}
+          </label>
+          <span class="field-hint">{{ 'sessions.create.protectedCloudHint' | transloco }}</span>
         }
 
         <!-- Expert selector -->
@@ -207,6 +236,14 @@ interface ExpertDetail extends Expert {
       flex-wrap: wrap;
       gap: 6px;
     }
+    .protected-cloud-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-primary, var(--text-primary));
+      cursor: pointer;
+    }
     .loading-hint {
       font-size: 12px;
       color: var(--text-muted, #6c7086);
@@ -313,6 +350,13 @@ export class SessionCreateComponent implements OnInit {
   readonly creating = signal(false);
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectIds = signal<Set<string>>(new Set());
+  readonly selectedProjects = computed(() =>
+    this.projects().filter(p => this.selectedProjectIds().has(p.id)),
+  );
+  readonly protectedCloud = signal(false);
+  readonly protectedCloudVisible = computed(() =>
+    protectedCloudToggleVisible(this.capabilities.protectedCloudAvailable(), this.selectedProjects()),
+  );
   readonly experts = signal<Expert[]>([]);
   readonly selectedExpert = signal<Expert | null>(null);
   readonly expertDetail = signal<ExpertDetail | null>(null);
@@ -464,6 +508,10 @@ export class SessionCreateComponent implements OnInit {
     // Datasource IDs
     const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
     if (dsIds.length > 0) body['datasource_ids'] = dsIds;
+
+    if (this.protectedCloud() && this.protectedCloudVisible()) {
+      body['protected_cloud'] = true;
+    }
 
     // Navigate immediately to chat view with spinner, create thread in background
     this.router.navigate(['/sessions', '_creating'], {state: {createBody: body}});
