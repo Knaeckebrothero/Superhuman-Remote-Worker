@@ -1,6 +1,6 @@
 # Protected Cloud Mode — Phase 1 Slice C: staging → review → apply + toggle
 
-**Status:** IMPLEMENTED on develop 2026-07-12 (16 tasks, subagent-driven; live k3d gate pending). Design approved by owner 2026-07-12.
+**Status:** IMPLEMENTED + **LIVE k3d GATE PASSED** 2026-07-12 (16 tasks subagent-driven + final-review fix wave). Full pipeline exercised against real minio + real Nextcloud — see **§14**. Design approved by owner 2026-07-12. Slice C at `dc5f0336` on develop; a prod-affecting mount-stack bug the gate surfaced is fixed in `d57ee928` (§14). Both unpushed.
 **Master design:** `docs/design/cloud_access_unification.md` (§3.4 review seam, §8.1 settled decisions, §9 open questions — several resolved here).
 **Builds on:** Slice A (`docs/superpowers/plans/2026-07-09-protected-cloud-mode-phase1-slice-a-cloud-plumbing.md` — RO reader/grant/probe/engage, `cloud_ro_mounts`, etag baseline) and Slice B (`docs/superpowers/plans/2026-07-11-protected-cloud-mode-phase1-slice-b-mount-stack.md` — capture overlay stack, guards, snapshot xattrs, fail-closed wiring; live-gate PASSED 2026-07-12 on k3d vs real Nextcloud 31.0.14).
 
@@ -148,3 +148,27 @@ CI (Py3.12, no /dev/fuse, no live cloud, all mocked — the standing gate):
 ## 13. Rollout
 
 Behind the existing `PROTECTED_CLOUD_MODE_ENABLED` flag (dev ON / prod OFF). Prod stays OFF until prod Nextcloud's groupfolders is on a patched branch (the `GROUPFOLDERS_PATCHED` floor enforces it regardless). No new helm values beyond what Slice B added; the S3 prefix rides the existing snapshot bucket. Mode A jobs unaffected (GiteaDiffSource refactor is behavior-preserving; its existing endpoint tests are the regression net).
+
+## 14. Live k3d gate results (2026-07-12)
+
+Ran §12's manual gate on local k3d against real minio (S3) + real Nextcloud 31 / groupfolders 19.1.18. Test substrate: project **"Slice C Gate"** (cloud-backed, groupfolder id 8), thread `e14c9890`, user `admin@localhost`.
+
+**Exercised live, end-to-end (all PASS):**
+
+- **Toggle UI** — protected-cloud checkbox appears only for a non-default Nextcloud project (hidden for the default project); protected session created from Cockpit.
+- **Engage** (Slice A/B) — per-user RO reader + per-thread RO grant + the full read-only probe (every write vector — PUT/DELETE/MKCOL/MOVE/COPY — returns 403/405); `cloud_ro_mounts` row active, etag baseline captured.
+- **Overlay** — `/cloud/lower` (rclone ro) + `/cloud/merged` (fuse-overlayfs) mounted on the workspace pod; the agent wrote files into it **via a real LLM turn**; the **turn-end staging ping fired live** (`POST /api/agents/threads/{id}/cloud-stage 200`).
+- **Review** — cloud-diff summary (counts, `protected_mount`) + per-file diff with `old_content` fetched from live Nextcloud and `new_content` from the staged S3 tar; `tar_sha256` binding verified; a binary file (`logo.bin`) correctly flagged `binary:true` with a null-content placeholder.
+- **Apply** — real bytes written back to the Nextcloud groupfolder (add + modify + binary); epoch-pinned + conflict gate passed; baseline re-captured (now includes the new files); staging cleared (epoch bumped); both S3 blobs deleted. `overlay_reset` was best-effort false (workspace overlay not live at apply time — expected, non-blocking).
+- **Reject** — zero cloud writes (NC untouched), staging cleared, blobs deleted.
+- **I3 (revoked-row / ended-thread)** — review + apply succeeded on a **reconciler-revoked** mount (the real >15-min-post-session-end state); bookkeeping ran via `require_active=False` (without the fix it would silently no-op on a revoked row).
+- **I2 (resume)** — resuming the session preserved the live staging + baseline (re-engage did not recapture past a pending staging).
+
+**Two real bugs surfaced by the gate — both fixed:**
+
+1. **Migration ledger wedge (cross-environment).** The Slice C renumber (`0054/0055_datasource_config…` → `0055/0056…`, migration 0057 added) left any DB that had already applied the OLD-named migrations with a `schema_migrations` ledger that trips `migrate.py`'s drift guard ("applied but missing on disk") → orchestrator crashloop on boot. Fixed on the local DB by realigning the two rows (filename + checksum; SQL bodies were byte-identical, only header comments changed). **Any environment that applied the pre-renumber migrations needs the same one-transaction realignment on its next deploy.**
+2. **rclone mount fails on a `-`-leading reader credential (prod-affecting) — `fix(cloud-mount)` `d57ee928`.** `cloud_mount` built its `rclone config create` command with each config value as a bare positional arg; a `pass` (Nextcloud reader app-password) beginning with `-` (this run's was `-Yi9OE…`) was parsed by rclone/cobra as a flag → `__SRW_RCLONE_MOUNT_FAILED__ rc=2` → no overlay for the whole session. Fix: flags ahead of a POSIX `--` end-of-options marker so every following token is positional. Verified against the live rclone binary + a regression test (`tests/cloud_mount/test_rclone_mount_manager.py`). This is base-mount-stack (Slice B / pre-existing), probabilistic on the credential's first character, and affects prod.
+
+**Dev-k3d-only caveats (environmental, not Slice C, not prod):** the automatic turn→ping→stage→apply chain could not complete unattended on this stack due to (a) offline `tiktoken` DNS crashing turns, (b) the `0444 /run/secrets/vm-ssh-key` perm that breaks the orchestrator→pod SSH used by the staging **tar transport** (same issue that breaks snapshots on dev-k3d root images; prod non-root is unaffected), and (c) session idle-churn wiping the ephemeral overlay. Per owner call, the staging tar transport was bypassed via **faithful artifact injection** — build the upper tar, run the real `derive_manifest` + real S3 upload + DB `staged_summary` — so every net-new review/apply/reject/revoked-row path ran against real S3 + real NC; only the dev-broken SSH tar step was substituted.
+
+**Not visually confirmed / minor:** the status-bar change **badge** did not render for the injected staging (its data source — the cloud-diff endpoint — returns the correct count, and the component has vitest coverage; it most likely keys off the live stage-*success* event, which the dev SSH blocks). Separately, baseline etags are stored HTML-escaped (`&quot;…&quot;`) — the apply conflict gate passed regardless, but the escaping is worth a follow-up look.
