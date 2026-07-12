@@ -251,7 +251,9 @@
       "cancel": "Cancel",
       "expertLabel": "Expert",
       "expertLoading": "Loading experts...",
-      "createSession": "Create Session"
+      "createSession": "Create Session",
+      "protectedCloud": "Protected cloud — agent writes are staged for your review",
+      "protectedCloudHint": "The agent gets read-only cloud access; its changes wait for your approval in the review panel."
     }
   },
   "jobs": {
