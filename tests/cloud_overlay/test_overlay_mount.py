@@ -197,6 +197,36 @@ def test_heal_lazy_unmounts_overlay_first_then_remounts_lower_then_overlay():
     assert "fusermount3 -u" not in remount  # no unmount folded in
 
 
+def test_mount_body_script_freshens_workdir_not_upper():
+    """Task 11: heal/refresh remounts must wipe+recreate the workdir (a
+    fuse-overlayfs workdir must never be reused across mounts) but MUST NOT
+    touch the upperdir — staged data has to survive a heal (design §11.2/§11.6)."""
+    backend = FakeRemoteBackend()
+    mgr = _manager(backend)
+    mgr.mount()
+    starting_commands = len(backend.commands)
+
+    calls: list[int] = []
+
+    def _remount_lower() -> None:
+        calls.append(len(backend.commands) - starting_commands)
+
+    mgr.heal(_remount_lower)
+    assert calls == [1]
+
+    remount_script = next(
+        b for p, b in backend.files.items() if p.endswith("overlay_remount.sh")
+    )
+    assert "rm -rf /home/agent-host/.overlay/work" in remount_script
+    assert "mkdir -p /home/agent-host/.overlay/work" in remount_script
+    # the rm must land BEFORE the fuse-overlayfs mount line
+    rm_idx = remount_script.index("rm -rf /home/agent-host/.overlay/work")
+    mount_idx = remount_script.index("fuse-overlayfs -o")
+    assert rm_idx < mount_idx
+    # upperdir must NEVER be wiped by this script
+    assert "rm -rf /home/agent-host/.overlay/upper" not in remount_script
+
+
 def test_upperdir_usage_parses_du_and_flags_over_quota():
     backend = FakeRemoteBackend()
     backend.outputs_by_script["overlay_usage.sh"] = (
