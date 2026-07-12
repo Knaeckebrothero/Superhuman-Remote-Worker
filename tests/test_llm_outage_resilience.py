@@ -25,6 +25,7 @@ from orchestrator.services.completion import (  # noqa: E402
     determine_job_status,
     evaluate_llm_outage,
     llm_outage_backoff_seconds,
+    llm_outage_fingerprint,
 )
 
 NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -224,3 +225,103 @@ class TestDetermineJobStatusLlmUnavailable:
         # should_stop False -> job keeps running, no pause.
         status, err = determine_job_status(_llm_job({}), {"should_stop": False})
         assert status is None
+
+
+# =============================================================================
+# Determinism fingerprint — fail identical 4xx on the 2nd consecutive cycle
+# (docs/features/outbound_message_hygiene.md, layer 3)
+# =============================================================================
+
+MINIMAX_400 = (
+    "Error code: 400 - {'type': 'error', 'error': {'type': 'bad_request_error', "
+    "'message': 'invalid params, invalid function arguments json string, "
+    "tool_call_id: call_E7U6VHuNDwmxi6Hl8jkjkrG8 (2013)', 'http_code': '400'}, "
+    "'request_id': '06a12d1aed49504c11643e132559ac86'}"
+)
+
+
+class TestLlmOutageFingerprint:
+    def test_deterministic_400_fingerprints(self):
+        assert llm_outage_fingerprint({"error_summary": MINIMAX_400}) is not None
+
+    def test_ids_and_numbers_normalized_away(self):
+        other = (
+            MINIMAX_400.replace(
+                "call_E7U6VHuNDwmxi6Hl8jkjkrG8", "call_Zq9XkPl2MnB4vC7dW1aY5eR8"
+            )
+            .replace(
+                "06a12d1aed49504c11643e132559ac86",
+                "aaaabbbbccccddddeeeeffff00001111",
+            )
+            .replace("(2013)", "(999)")
+        )
+        assert llm_outage_fingerprint(
+            {"error_summary": MINIMAX_400}
+        ) == llm_outage_fingerprint({"error_summary": other})
+
+    def test_different_error_types_fingerprint_differently(self):
+        a = "Error code: 400 - {'error': {'type': 'bad_request_error', 'message': 'x'}}"
+        b = "Error code: 400 - {'error': {'type': 'invalid_api_key_error', 'message': 'x'}}"
+        assert llm_outage_fingerprint({"error_summary": a}) != llm_outage_fingerprint(
+            {"error_summary": b}
+        )
+
+    def test_connection_error_is_not_fingerprinted(self):
+        assert llm_outage_fingerprint({"error_summary": "Connection error."}) is None
+
+    def test_rate_limit_texts_are_not_fingerprinted(self):
+        assert (
+            llm_outage_fingerprint(
+                {"error_summary": "Error code: 429 - too many requests"}
+            )
+            is None
+        )
+        assert (
+            llm_outage_fingerprint({"error_summary": "400: rate limit reached"}) is None
+        )
+
+    def test_5xx_is_not_fingerprinted(self):
+        assert (
+            llm_outage_fingerprint(
+                {"error_summary": "Error code: 503 - upstream unavailable"}
+            )
+            is None
+        )
+
+
+class TestDeterminismFailFast:
+    def _job_with_fp(self, fp, summary):
+        ctx = _real_outage_ctx(1, 300, 60)
+        ctx["llm_outage"]["fingerprint"] = fp
+        job = _llm_job(ctx)
+        job["freeze_data"]["error_summary"] = summary
+        return job
+
+    def test_repeat_identical_400_fails(self):
+        fp = llm_outage_fingerprint({"error_summary": MINIMAX_400})
+        status, err = determine_job_status(self._job_with_fp(fp, MINIMAX_400), STOP)
+        assert status == "failed"
+        assert "deterministic" in err.lower()
+
+    def test_first_400_still_pauses(self):
+        status, err = determine_job_status(self._job_with_fp(None, MINIMAX_400), STOP)
+        assert status == "paused"
+        assert err is None
+
+    def test_different_400_after_first_pauses(self):
+        fp = llm_outage_fingerprint({"error_summary": MINIMAX_400})
+        other = (
+            "Error code: 400 - {'error': {'type': 'bad_request_error', "
+            "'message': 'image exceeds maximum allowed dimensions'}}"
+        )
+        status, err = determine_job_status(self._job_with_fp(fp, other), STOP)
+        assert status == "paused"
+
+    def test_identical_connection_error_streak_keeps_pausing(self):
+        # A genuine outage repeats identical generic text across cycles —
+        # it must NEVER trip the determinism fail-fast (pause-not-fail is
+        # the outage feature's whole purpose).
+        status, err = determine_job_status(
+            self._job_with_fp(None, "Connection error."), STOP
+        )
+        assert status == "paused"

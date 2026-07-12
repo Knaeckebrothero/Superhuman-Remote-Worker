@@ -1,7 +1,14 @@
 # Stale-agent-detector SQL crash disables every recovery sweep — loop jobs wedge permanently in `processing`
 
-**Status**: FIX BUILT + locally verified 2026-07-12, uncommitted — awaiting
-push/deploy. The now-batch (F1, F2, F3, F8, F9) is implemented; verification:
+**Status**: ✅ RESOLVED — now-batch deployed to prod 2026-07-12
+(orchestrator `sha-0a3ba7c`) and live-verified: detector ticks cleanly, job
+`a35b1fc2` auto-recovered within a minute of rollout and resumed from its
+checkpoint (iteration 24 → 36+, no OOM recurrence), loop running. Roadmap
+items delivered same day (uncommitted at move time): message hygiene
+(`docs/features/outbound_message_hygiene.md`, implemented) and the job
+execution lease stages 1–3 (`docs/features/job_execution_lease.md`). Still
+open from this doc: **F4** (audit-span honesty in the debug view) and **F7**
+(agent OOM attribution — observation-driven). The now-batch (F1, F2, F3, F8, F9) is implemented; verification:
 targeted unit tests green (classifier cases, detector step-isolation,
 non-loop draining heartbeat), the F8 real-Postgres sweep test passes AND
 provably fails when F1 is reverted, and a k3d synthetic-orphan smoke
@@ -271,12 +278,16 @@ elsewhere so it survives this doc's move to `docs/done/`:
   Liveness by renewal instead of a four-link inference chain; makes the
   dispatcher's no-rollback design sound (pickup TTL supersedes F6); single
   self-contained expiry sweep with no cross-table ordering dependency.
-- **Next — outbound message hygiene**: validate/repair tool-call arguments at
-  AIMessage finalization (nothing malformed reaches the checkpoint), send-time
-  sanitize as backstop, bundled with the gpt-5.5 tool-pairing sanitize (same
-  seam). Plus a determinism fingerprint on LLM errors (same request + same
-  error N times → permanent, regardless of classifier verdict) so the F3-class
-  enum gap can never wedge a job for more than minutes again.
+- **Next — outbound message hygiene**:
+  [`docs/features/outbound_message_hygiene.md`](../features/outbound_message_hygiene.md).
+  Validate/repair tool-call arguments at AIMessage finalization (nothing
+  malformed reaches the checkpoint), send-time sanitize as backstop, plus a
+  determinism fingerprint on LLM errors (same fingerprint across two
+  pause/resume cycles → permanent, regardless of classifier verdict) so the
+  F3-class enum gap can never cost more than one backoff cycle again. (The
+  gpt-5.5 tool-pairing repair turned out to already be shipped —
+  `persistent_graph.py:1150`; the hygiene doc covers the remaining argument
+  gap.)
 - **Eventually — agents as a reconciler kind**:
   [`docs/features/unified_instance_lifecycle.md`](../features/unified_instance_lifecycle.md)
   (already the plan of record, deferred twice). Fold the detector's sweeps

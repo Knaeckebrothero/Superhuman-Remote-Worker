@@ -637,7 +637,7 @@ class TestClassifyLlmError:
         providers say 'invalid_request_error'. The 2026-07-11 wedge: a
         deterministic "invalid function arguments json string" 400 was
         classified transient and pause/backoff-looped forever — see
-        docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md
+        docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md
         (Finding 3)."""
         err = _make_sdk_error(
             "BadRequestError",

@@ -519,6 +519,7 @@ CREATE TABLE public.jobs (
     exported_at timestamp with time zone,
     expert_id uuid,
     runner_kind text DEFAULT 'user'::text NOT NULL,
+    lease_expires_at timestamp with time zone,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT valid_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'processing'::character varying, 'completed'::character varying, 'failed'::character varying, 'cancelled'::character varying, 'pending_review'::character varying, 'paused'::character varying, 'reviewing'::character varying, 'waiting'::character varying, 'waiting_for_reply'::character varying])::text[])))
@@ -2756,6 +2757,13 @@ CREATE INDEX idx_user_api_keys_user ON public.user_api_keys USING btree (user_id
 --
 
 CREATE INDEX idx_users_keycloak_sub ON public.users USING btree (keycloak_sub);
+
+
+--
+-- Name: jobs_lease_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX jobs_lease_expiry_idx ON public.jobs USING btree (lease_expires_at) WHERE ((status)::text = 'processing'::text);
 
 
 --

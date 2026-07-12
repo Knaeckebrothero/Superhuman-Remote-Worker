@@ -70,7 +70,9 @@ from .core.context import (
     ContextManager,
     ContextConfig,
     ToolRetryManager,
+    repair_tool_call_arguments,
     sanitize_message_history,
+    scrub_history_tool_call_arguments,
 )
 from .core.loader import (
     AgentConfig,
@@ -1159,6 +1161,10 @@ def create_execute_node(
         # Sanitize message history to remove orphaned ToolMessages
         # (can occur from improper context compaction or checkpoint corruption)
         messages = sanitize_message_history(messages)
+        # Backstop: scrub malformed tool-call arguments already sitting in the
+        # checkpoint (poison predating the ingestion repair) so a resumed job
+        # sends clean history instead of dying on a deterministic 400.
+        messages = scrub_history_tool_call_arguments(messages)
 
         # Add full conversation history in specific order (stable prefix first,
         # per-turn transients last — prompt-cache friendly):
@@ -1591,6 +1597,12 @@ def create_execute_node(
                 # Reset failure streaks on a successful LLM response.
                 _tool_use_failed_streak[0] = 0
                 _llm_error_streak[0] = 0
+
+                # Repair/scrub malformed tool-call arguments BEFORE anything
+                # else reads the response — an unparseable call otherwise
+                # reaches the checkpoint raw and poisons every subsequent
+                # request (docs/features/outbound_message_hygiene.md).
+                response = repair_tool_call_arguments(response)
 
                 tool_calls_count = (
                     len(response.tool_calls)

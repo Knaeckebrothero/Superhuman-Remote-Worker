@@ -2,8 +2,21 @@
 
 ## Status
 
+Stages 1–3 IMPLEMENTED 2026-07-12 (same-day as the design), uncommitted:
+migration `0054_jobs_execution_lease.sql` (+ `schema_current.sql` regen),
+pickup lease in `claim_job_for_agent` (verified: the sole
+`status='processing'` writer), throttled renewal in the heartbeat DB method
+(writes at most every ~30s per job via the remaining-TTL predicate),
+`recover_expired_lease_jobs` as an isolated detector step (4b), with
+`recover_orphaned_jobs` retained as belt-and-suspenders per the rollout.
+Verified: detector unit tests + a real-Postgres lifecycle test
+(claim→lease set; fresh lease untouched; expired→paused/unassigned;
+NULL-lease legacy rows left alone). **Remaining: stages 4–5** (completion
+CAS + `lost_lease` heartbeat intent, then demote the legacy sweep to
+assertion mode after soak).
+
 Design proposal — 2026-07-12. Motivated by
-[`docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md`](../issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md)
+[`docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md`](../done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md)
 (two loop jobs permanently wedged in `processing` within 24 h, via two
 unrelated agent deaths). Not yet implemented. Complementary to — not competing
 with — [`unified_instance_lifecycle.md`](unified_instance_lifecycle.md): the

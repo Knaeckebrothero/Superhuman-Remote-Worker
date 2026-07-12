@@ -11,8 +11,10 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from src.core.context import (
     ContextManager,
     ContextConfig,
+    repair_tool_call_arguments,
     repair_tool_pairing,
     sanitize_message_history,
+    scrub_history_tool_call_arguments,
 )
 
 
@@ -692,3 +694,169 @@ class TestUpdateLimits:
         mgr.update_limits(ContextConfig(), "gpt-5.3-codex-spark")
         assert mgr.token_counter is mgr._default_counter
         assert mgr.token_counter is not old_counter
+
+
+# =============================================================================
+# repair_tool_call_arguments / scrub_history_tool_call_arguments
+# (docs/features/outbound_message_hygiene.md — the 2026-07-11 `6a186c76`
+#  poisoned-checkpoint incident)
+# =============================================================================
+
+
+def _poisoned_ai_message(
+    raw_args: str, *, call_id: str = "call_bad1", name: str = "file_exists"
+):
+    """AIMessage shaped like incident A: malformed arguments in BOTH
+    invalid_tool_calls (LangChain's parse failure) and the raw
+    additional_kwargs entry that gets re-serialized to the provider."""
+    return AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {
+                "name": name,
+                "args": raw_args,
+                "id": call_id,
+                "error": "Function call arguments were not valid JSON",
+                "type": "invalid_tool_call",
+            }
+        ],
+        additional_kwargs={
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": raw_args},
+                    "index": 0,
+                }
+            ]
+        },
+    )
+
+
+class TestRepairToolCallArguments:
+    def test_wellformed_message_untouched(self):
+        msg = AIMessage(
+            content="hi",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {"path": "a.md"},
+                    "id": "c1",
+                    "type": "tool_call",
+                }
+            ],
+            additional_kwargs={
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path": "a.md"}',
+                        },
+                    }
+                ]
+            },
+        )
+        out = repair_tool_call_arguments(msg)
+        assert out.tool_calls[0]["args"] == {"path": "a.md"}
+        assert out.content == "hi"
+        assert not out.invalid_tool_calls
+
+    def test_repairable_truncation_promoted_to_tool_call(self):
+        # Mid-string truncation — the closer-unwinding repair path.
+        msg = _poisoned_ai_message('{"path": "archive/phase_1_retro')
+        out = repair_tool_call_arguments(msg)
+        assert out.tool_calls and out.tool_calls[0]["name"] == "file_exists"
+        assert out.tool_calls[0]["args"] == {"path": "archive/phase_1_retro"}
+        assert not out.invalid_tool_calls
+        # Raw entry rewritten to valid JSON — nothing malformed goes back out.
+        import json as _json
+
+        raw = out.additional_kwargs["tool_calls"][0]["function"]["arguments"]
+        assert _json.loads(raw) == {"path": "archive/phase_1_retro"}
+
+    def test_trailing_comma_repaired(self):
+        msg = _poisoned_ai_message('{"path": "a.md",}')
+        out = repair_tool_call_arguments(msg)
+        assert out.tool_calls[0]["args"] == {"path": "a.md"}
+
+    def test_unrepairable_dropped_everywhere_with_note(self):
+        msg = _poisoned_ai_message("not json at all — no braces")
+        out = repair_tool_call_arguments(msg)
+        assert not out.tool_calls
+        assert not out.invalid_tool_calls
+        assert out.additional_kwargs["tool_calls"] == []
+        assert "discarded" in out.content
+        assert "file_exists" in out.content
+
+    def test_raw_only_poison_without_invalid_list(self):
+        # Checkpoint round-trips can lose invalid_tool_calls while the raw
+        # kwargs entry survives — the sweep must still catch it.
+        msg = AIMessage(
+            content="thinking...",
+            additional_kwargs={
+                "tool_calls": [
+                    {
+                        "id": "call_raw1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "###garbage###",
+                        },
+                    }
+                ]
+            },
+        )
+        out = repair_tool_call_arguments(msg)
+        assert out.additional_kwargs["tool_calls"] == []
+        assert "discarded" in out.content
+
+    def test_good_call_kept_when_sibling_dropped(self):
+        msg = _poisoned_ai_message("no braces here")
+        msg.tool_calls = [
+            {
+                "name": "read_file",
+                "args": {"path": "b.md"},
+                "id": "c_good",
+                "type": "tool_call",
+            }
+        ]
+        msg.additional_kwargs["tool_calls"].append(
+            {
+                "id": "c_good",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "b.md"}'},
+            }
+        )
+        out = repair_tool_call_arguments(msg)
+        assert [tc["id"] for tc in out.tool_calls] == ["c_good"]
+        assert [e["id"] for e in out.additional_kwargs["tool_calls"]] == ["c_good"]
+
+    def test_history_scrub_no_note_on_nonempty_content(self):
+        poisoned = _poisoned_ai_message("no braces")
+        poisoned.content = "some prior visible answer"
+        history = [
+            HumanMessage(content="q"),
+            poisoned,
+            AIMessage(content="later"),
+        ]
+        out = scrub_history_tool_call_arguments(history)
+        assert out[1].additional_kwargs["tool_calls"] == []
+        # note=False: historical content untouched when non-empty
+        assert out[1].content == "some prior visible answer"
+
+    def test_history_scrub_stubs_empty_message(self):
+        history = [_poisoned_ai_message("no braces")]
+        out = scrub_history_tool_call_arguments(history)
+        # Now-empty assistant turn gets a stub so strict providers don't 400.
+        assert out[0].content
+        assert not out[0].tool_calls
+
+    def test_non_ai_messages_untouched(self):
+        history = [
+            HumanMessage(content="q"),
+            ToolMessage(content="r", tool_call_id="x"),
+        ]
+        out = scrub_history_tool_call_arguments(history)
+        assert out[0].content == "q" and out[1].content == "r"

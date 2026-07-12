@@ -38,6 +38,7 @@ async def db(pg_dsn):
                 id uuid PRIMARY KEY,
                 status text NOT NULL,
                 assigned_agent_id uuid,
+                lease_expires_at timestamptz,
                 updated_at timestamptz DEFAULT now()
             )
             """

@@ -28,7 +28,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from .core.context import ContextManager, extract_summary_text, repair_tool_pairing
+from .core.context import (
+    ContextManager,
+    extract_summary_text,
+    repair_tool_call_arguments,
+    repair_tool_pairing,
+    scrub_history_tool_call_arguments,
+)
 from .core.summarizer import count_text_tokens
 from .core.workspace_backend import WorkspaceUnavailableError
 from .core.workspace_injection import find_tail_injection_anchor
@@ -1148,6 +1154,10 @@ async def _execute_turn(
         # repairs on restore (persistent_app). This is the equivalent guard for
         # the live turn loop, which previously had none.
         prepared = repair_tool_pairing(prepared)
+        # Backstop: scrub malformed tool-call arguments already persisted in
+        # history (docs/features/outbound_message_hygiene.md) — MiniMax
+        # validates historical tool calls on input and 400s otherwise.
+        prepared = scrub_history_tool_call_arguments(prepared)
 
         # --- LLM call with streaming ---
         response_content = ""
@@ -1756,6 +1766,11 @@ async def _execute_turn(
             if isinstance(response.content, str):
                 response.content += _trunc_notice
             await callbacks.on_token(_trunc_notice)
+
+        # Repair/scrub malformed tool-call arguments before the response
+        # becomes durable state — a raw unparseable call in history poisons
+        # every later request (docs/features/outbound_message_hygiene.md).
+        response = repair_tool_call_arguments(response)
 
         # Add AI response to message history
         messages.append(response)
