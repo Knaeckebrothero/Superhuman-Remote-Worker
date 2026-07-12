@@ -208,3 +208,97 @@ class TestCreatePublishGate:
         assert exc.value.status_code == 400
         assert "read-only" in exc.value.detail
         fake_db.create_datasource.assert_not_awaited()
+
+
+def _existing_private():
+    return _created_row(is_global=False, read_only=None)
+
+
+def _existing_public(read_only=True):
+    return _created_row(is_global=True, read_only=read_only)
+
+
+def _wire_owner_update(fake_db, user, existing):
+    """require_datasource_owner resolves via get_datasource + creator check."""
+    existing = {**existing, "created_by": str(user["id"])}
+    fake_db.get_datasource = AsyncMock(return_value=existing)
+    fake_db.update_datasource = AsyncMock(return_value=True)
+    fake_db.list_datasource_projects = AsyncMock(return_value=[])
+    return existing
+
+
+class TestUpdatePublishGate:
+    async def test_publish_flip_without_grant_403(
+        self, user_a, fake_db, fake_request
+    ):
+        from main import DatasourceUpdate, update_datasource
+
+        existing = _wire_owner_update(fake_db, user_a, _existing_private())
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
+        with _patch_caller_and_db(user_a, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await update_datasource(
+                    fake_request, existing["id"], DatasourceUpdate(is_global=True)
+                )
+        assert exc.value.status_code == 403
+        fake_db.update_datasource.assert_not_awaited()
+
+    async def test_publish_flip_with_grant_defaults_read_only(
+        self, user_a, fake_db, fake_request
+    ):
+        from main import DatasourceUpdate, update_datasource
+
+        existing = _wire_owner_update(fake_db, user_a, _existing_private())
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await update_datasource(
+                fake_request, existing["id"], DatasourceUpdate(is_global=True)
+            )
+        assert result == {"status": "updated"}
+        kwargs = fake_db.update_datasource.await_args.kwargs
+        assert kwargs["is_global"] is True
+        assert kwargs["read_only"] is True
+
+    async def test_unpublish_needs_no_grant(self, user_a, fake_db, fake_request):
+        from main import DatasourceUpdate, update_datasource
+
+        existing = _wire_owner_update(fake_db, user_a, _existing_public())
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await update_datasource(
+                fake_request, existing["id"], DatasourceUpdate(is_global=False)
+            )
+        assert result == {"status": "updated"}
+        fake_db.user_can_publish_datasource.assert_not_awaited()
+        assert fake_db.update_datasource.await_args.kwargs["is_global"] is False
+
+    async def test_ro_to_rw_flip_needs_no_grant(
+        self, user_a, fake_db, fake_request
+    ):
+        # Spec: friction for RO→RW is the client-side typed confirmation;
+        # the server gate is only on the publish transition.
+        from main import DatasourceUpdate, update_datasource
+
+        existing = _wire_owner_update(fake_db, user_a, _existing_public())
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await update_datasource(
+                fake_request, existing["id"], DatasourceUpdate(read_only=False)
+            )
+        assert result == {"status": "updated"}
+        fake_db.user_can_publish_datasource.assert_not_awaited()
+        assert fake_db.update_datasource.await_args.kwargs["read_only"] is False
+
+    async def test_kb_read_write_flag_400(self, user_a, fake_db, fake_request):
+        from main import DatasourceUpdate, update_datasource
+
+        existing = _wire_owner_update(
+            fake_db, user_a, _created_row(type="kb", is_global=True)
+        )
+        with _patch_caller_and_db(user_a, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await update_datasource(
+                    fake_request, existing["id"], DatasourceUpdate(read_only=False)
+                )
+        assert exc.value.status_code == 400
+        fake_db.update_datasource.assert_not_awaited()
