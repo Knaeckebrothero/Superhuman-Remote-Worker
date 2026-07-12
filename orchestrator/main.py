@@ -20010,6 +20010,105 @@ async def restage_thread_cloud_diff(
     return {"scheduled": True}
 
 
+async def _reset_thread_overlay(thread_id: str, thread: dict[str, Any]) -> bool:
+    """POST the bound agent's ``/cloud-overlay/reset`` after an apply/reject
+    (Task 9's agent route, ``src/api/persistent_app.py``).
+
+    Same agent host/port resolution as ``_thread_turn_in_flight`` below
+    (``postgres_db.get_agent`` -> ``pod_ip``/``pod_port``) — this module has
+    no dedicated "proxy to the bound agent" helper to reuse verbatim; that
+    pattern is what every other thread->agent HTTP call in this file
+    (``/session/status``, ``/job/*``, ``/system/info``) already uses.
+
+    Best-effort and never fatal: a dead/unreachable pod is the NORMAL case
+    (v1 limitation — see ``services.cloud_staging.apply`` module docstring).
+    Any failure (no agent bound, pod gone, non-200, timeout, exception)
+    returns ``False``; only an actual 200 from the agent returns ``True``.
+    """
+    agent_id = thread.get("agent_id")
+    if not agent_id:
+        return False
+    try:
+        agent = await postgres_db.get_agent(str(agent_id))
+        if not agent or not agent.get("pod_ip"):
+            return False
+        url = f"http://{agent['pod_ip']}:{agent['pod_port']}/cloud-overlay/reset"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(url)
+        return response.status_code == 200
+    except Exception as e:
+        logger.warning(
+            "cloud-overlay reset failed for thread %s (agent %s): %s",
+            thread_id,
+            agent_id,
+            e,
+        )
+        return False
+
+
+@app.post("/api/agents/threads/{thread_id}/cloud-diff/apply")
+async def apply_thread_cloud_diff(
+    request: Request, thread_id: str, body: dict = Body(...)
+) -> dict[str, Any]:
+    """Owner-triggered apply of the staged protected-cloud diff (Task 10).
+
+    Whole-diff, epoch-pinned write-back to the real cloud folder — see
+    ``services.cloud_staging.apply`` module docstring for the full flow and
+    its invariants (conflict gate, deletes-first, fail-soft partial writes,
+    baseline re-capture on full success).
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    _require_protected(thread)
+
+    from services.cloud_staging.apply import StagedApplyError, apply_staged_diff
+
+    epoch = int(body.get("epoch", -1))
+    try:
+        result = await apply_staged_diff(
+            thread_id=thread_id,
+            epoch=epoch,
+            postgres_db=postgres_db,
+            main_cloud_router=main_cloud_router,
+            snapshot_service=snapshot_service,
+            reset_agent_overlay=lambda: _reset_thread_overlay(thread_id, thread),
+        )
+    except StagedApplyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    if result.get("errors"):
+        raise HTTPException(
+            status_code=502, detail={"code": "partial_write_failure", **result}
+        )
+    return {"thread_id": thread_id, **result}
+
+
+@app.post("/api/agents/threads/{thread_id}/cloud-diff/reject")
+async def reject_thread_cloud_diff(
+    request: Request, thread_id: str, body: dict = Body(...)
+) -> dict[str, Any]:
+    """Owner-triggered rejection of the staged protected-cloud diff (Task 10).
+
+    Same epoch pin as apply, but never touches the cloud — see
+    ``services.cloud_staging.apply`` module docstring.
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    _require_protected(thread)
+
+    from services.cloud_staging.apply import StagedApplyError, reject_staged_diff
+
+    epoch = int(body.get("epoch", -1))
+    try:
+        result = await reject_staged_diff(
+            thread_id=thread_id,
+            epoch=epoch,
+            postgres_db=postgres_db,
+            snapshot_service=snapshot_service,
+            reset_agent_overlay=lambda: _reset_thread_overlay(thread_id, thread),
+        )
+    except StagedApplyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    return {"thread_id": thread_id, **result}
+
+
 async def _thread_turn_in_flight(thread: dict) -> bool:
     """Best-effort probe: is the thread's agent currently executing a turn?
 
