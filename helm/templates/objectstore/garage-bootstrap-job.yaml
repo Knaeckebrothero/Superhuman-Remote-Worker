@@ -48,7 +48,7 @@ spec:
             - name: GARAGE_SVC
               value: {{ include "srw.fullname" . }}-garage
             - name: GARAGE_CAPACITY_BYTES
-              value: {{ .Values.garage.capacityBytes | quote }}
+              value: {{ .Values.garage.capacityBytes | int64 | quote }}
             - name: SNAPSHOT_BUCKET
               value: {{ .Values.s3.bucket | quote }}
             - name: WORKSPACE_BUCKET
