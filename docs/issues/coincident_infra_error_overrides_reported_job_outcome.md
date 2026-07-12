@@ -234,17 +234,42 @@ regardless.
 
 ## Implementation roadmap
 
-**As-built (2026-07-12, uncommitted):** Phases 0-2 IMPLEMENTED + unit-verified.
+**As-built (2026-07-12, uncommitted):** Phases 0-3 IMPLEMENTED + unit-verified.
 `orchestrator/services/completion.py` gained `is_teardown_infra_error()` +
 `_TEARDOWN_ERROR_PATTERNS` + `_PARENT_TERMINAL_BLOCKING`; `determine_job_status`
-hoists `is_completion`, widens the error carve-out (Slice C — a completion whose
-only error is a teardown blip keeps its outcome), and re-routes a drain-frozen
-subjob to `paused`/terminal (Slice B) via a new `parent_status` kwarg;
-`orchestrator/main.py:complete_job` fetches the parent status and passes it. 12 new
-tests in `tests/test_drain_intent.py::TestCoincidentInfraErrorOverride`. **Verify:**
-45 drain + 239 completion/loop/llm/delegation tests green; `ruff check` +
-`ruff format --check` clean. **Remaining:** Phase 3 (idempotency backstop), Phase 4
-(k3d drill — the gate), Phase 5 (infra), Phase 6 (deploy/observe).
+now (a) hoists `is_completion`, (b) **Phase 3** — idempotency backstop: a row that
+is already `status='completed'` or `merge_status='merged'` returns `(None, None)`
+on any error report instead of being downgraded to `failed`, (c) **Slice C** —
+widens the error carve-out so a completion whose only error is a teardown blip
+keeps its outcome, (d) **Slice B** — re-routes a drain-frozen subjob to
+`paused`/terminal via a new `parent_status` kwarg. `orchestrator/main.py:complete_job`
+fetches the parent status and passes it. 16 tests in
+`tests/test_drain_intent.py::TestCoincidentInfraErrorOverride`. **Verify:** 288
+tests green across drain + completion + loop + llm + delegation suites; `ruff check`
++ `ruff format --check` clean; `main.py` compiles. Placement note: Phase 3 landed in
+the pure resolver (not the handler as first sketched) — returning `(None, None)`
+cleanly no-ops the write and all downstream side-effects, and is unit-testable.
+
+**Phase 4 (k3d endpoint drill) — PASSED 2026-07-12.** Uncommitted code confirmed
+synced into the live orchestrator pod (Tilt); real `POST /api/jobs/{id}/complete`
+against real Postgres, disposable jobs, all with HTTP 200:
+- **C1** completion (`job_completed`) + verbatim SSH-timeout teardown error →
+  `completed` (was `failed`). The e15fab1f fix, end-to-end.
+- **C2** completion + a real `AssertionError` → `failed`. Carve-out stays narrow.
+- **P3** already-`completed` row + late teardown error → stays `completed` (Phase 3).
+- **B1** drained subjob (`version_upgrade`) under a live parent → `paused`, and its
+  `freeze_data` was shed to NULL. The da9d5917 fix (was `pending_review`).
+- **B2** drained subjob under a `failed` parent → `cancelled` (parent-terminal guard).
+- Dispatchability check: a paused subjob (freeze NULL, agent NULL) under a
+  `processing` parent satisfies the `get_dispatchable_jobs` predicate
+  (`base_ok ∧ cascade_ok`) → it genuinely re-dispatches, not a silent wedge.
+Drill script: `scratchpad/k3d_drill.sh`. NOT covered (accepted): a full live
+drain-mid-subjob and a real VM-teardown race — the *decision* logic is proven above
+and the re-dispatch/resume *mechanism* (dispatcher re-pick, resume-clear,
+resolve-at-dispatch) is pre-existing code this change does not touch.
+
+**Remaining:** Phase 5 (infra hardening — clone retry, no workspace op after VM
+delete), Phase 6 (commit + deploy + observe). Safe to commit.
 
 Sequenced so every phase is independently verifiable and the risky part (subjob
 re-dispatch, teardown races) is gated behind a live drill, not just unit tests.
