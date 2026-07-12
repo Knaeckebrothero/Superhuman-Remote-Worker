@@ -19827,6 +19827,189 @@ async def update_thread(
     return {"status": "updated", "title": title}
 
 
+# =============================================================================
+# Protected cloud mode (Slice C, Task 8): owner-facing cloud-diff review.
+#
+# Three endpoints share one gate (``_require_protected``) and one resolver
+# (``_thread_cloud_diff_source``) that builds a Task 7 ``UpperdirDiffSource``
+# from the thread's ``cloud_ro_mounts`` row + selected ``thread_mounts`` row.
+# See docs/design/cloud_access_unification.md §5/§11 and
+# .superpowers/sdd/task-8-brief.md for the response-shape contract Cockpit
+# (Task 14) depends on.
+# =============================================================================
+
+_EMPTY_CLOUD_DIFF_COUNTS = {"added": 0, "modified": 0, "deleted": 0}
+
+
+def _require_protected(thread: dict[str, Any]) -> dict[str, Any]:
+    """404s unless ``thread`` is protected-cloud AND the flag is on.
+
+    Returns the parsed metadata dict (asyncpg can hand JSONB back as a raw
+    string — see the isinstance guard repeated throughout this module) so
+    callers that need it further (restage's workspace-host check) don't have
+    to re-parse.
+    """
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    if not metadata.get("protected_cloud") or not _is_protected_cloud_mode_enabled():
+        raise HTTPException(
+            status_code=404, detail="Thread is not in protected cloud mode."
+        )
+    return metadata
+
+
+async def _thread_cloud_diff_source(thread_id: str, thread: dict[str, Any]):
+    """(mount_row, UpperdirDiffSource|None, protected_mount_name|None) for a
+    protected thread — shared by the summary and per-file endpoints below.
+
+    Deliberately does NOT require ``row["status"] == "active"``: revoked-but-
+    staged rows (ended threads, grant already reconciled away by the
+    reconciler) stay reviewable — spec §11. Only restage/apply-side workspace
+    steps need a live pod.
+    """
+    from services.cloud_staging import select_protected_mount
+    from services.diff_source import UpperdirDiffSource
+
+    row = await postgres_db.get_ro_mount_by_thread(thread_id)
+    if not row:
+        return None, None, None
+    mount_rows = await postgres_db.list_thread_mounts(thread_id)
+    sel = select_protected_mount(mount_rows)
+    backend = main_cloud_router.for_backend(row["backend"])
+    handle = (
+        ProjectFolderHandle.from_db(str(sel["cloud_handle"]), backend=row["backend"])
+        if sel
+        else None
+    )
+    src = UpperdirDiffSource(
+        thread_id=thread_id,
+        mount_row=row,
+        backend=backend,
+        handle=handle,
+        snapshot_service=snapshot_service,
+    )
+    # ``mountpoint``/``workspace_name`` are NOT real ``thread_mounts`` columns
+    # (verified against postgres.list_thread_mounts' SELECT — real rows carry
+    # backend_id/cloud_handle/target_path); ``target_path`` is the fallback
+    # that actually resolves to something on live rows.
+    name = (
+        (sel or {}).get("mountpoint")
+        or (sel or {}).get("workspace_name")
+        or (sel or {}).get("target_path")
+    )
+    return row, src, name
+
+
+@app.get("/api/agents/threads/{thread_id}/cloud-diff")
+async def get_thread_cloud_diff_summary(
+    thread_id: str, request: Request
+) -> dict[str, Any]:
+    """Protected cloud mode diff summary — owner-facing review surface (Task 8).
+
+    Reads work for ENDED threads too (mount row revoked, ``staged_summary``
+    still present) — spec §11; only restage below needs a live workspace.
+    Returns ``epoch=0``/empty ``files``/all-zero ``counts`` when nothing has
+    been staged yet (no mount row, or a mount row with no staged_summary).
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    _require_protected(thread)
+
+    _, src, protected_mount = await _thread_cloud_diff_source(thread_id, thread)
+    summary = await src.summary() if src is not None else None
+    if summary is None:
+        return {
+            "thread_id": thread_id,
+            "epoch": 0,
+            "staged_at": None,
+            "counts": dict(_EMPTY_CLOUD_DIFF_COUNTS),
+            "protected_mount": protected_mount,
+            "files": [],
+        }
+    return {
+        "thread_id": thread_id,
+        "epoch": summary.meta.get("epoch") or 0,
+        "staged_at": summary.meta.get("staged_at"),
+        "counts": summary.meta.get("counts") or dict(_EMPTY_CLOUD_DIFF_COUNTS),
+        "protected_mount": protected_mount,
+        "files": [
+            {"path": f.path, "status": f.status, "binary": f.binary}
+            for f in summary.files
+        ],
+    }
+
+
+@app.get("/api/agents/threads/{thread_id}/cloud-diff/{file_path:path}")
+async def get_thread_cloud_diff_file(
+    thread_id: str, file_path: str, request: Request
+) -> dict[str, Any]:
+    """Protected cloud mode per-file diff content (Task 8).
+
+    404 when the path isn't in the staged diff, including "nothing staged at
+    all" — ``UpperdirDiffSource.file()`` returns ``None`` for both.
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    _require_protected(thread)
+
+    _, src, _ = await _thread_cloud_diff_source(thread_id, thread)
+    content = await src.file(file_path) if src is not None else None
+    if content is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Path '{file_path}' is not in the staged diff.",
+        )
+    return {
+        "thread_id": thread_id,
+        "path": content.path,
+        "status": content.status,
+        "old_content": content.old_content,
+        "new_content": content.new_content,
+        "old_binary": content.old_binary,
+        "new_binary": content.new_binary,
+    }
+
+
+@app.post("/api/agents/threads/{thread_id}/cloud-diff/restage")
+async def restage_thread_cloud_diff(
+    thread_id: str, request: Request
+) -> dict[str, Any]:
+    """Owner-triggered refresh of the staged protected-cloud diff (Task 8).
+
+    Schedules the same ``stage_thread_cloud_diff`` background task the
+    turn-end internal ping uses (``_cloud_stage_tasks`` registry, Task 5),
+    fire-and-forget. Unlike the read endpoints above, restage needs a LIVE
+    workspace: 409 ``{"code": "no_workspace"}`` when the thread's workspace
+    host can't be resolved (ended thread, pod not yet ready, etc).
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    metadata = _require_protected(thread)
+
+    from services.cloud_staging.stage import (
+        _resolve_workspace_ssh,
+        stage_thread_cloud_diff,
+    )
+
+    if _resolve_workspace_ssh(metadata) is None:
+        raise HTTPException(status_code=409, detail={"code": "no_workspace"})
+
+    async def _run() -> None:
+        try:
+            await stage_thread_cloud_diff(
+                thread_id=thread_id,
+                postgres_db=postgres_db,
+                snapshot_service=snapshot_service,
+            )
+        finally:
+            _cloud_stage_tasks.pop(thread_id, None)
+
+    if thread_id not in _cloud_stage_tasks:
+        _cloud_stage_tasks[thread_id] = asyncio.create_task(_run())
+    return {"scheduled": True}
+
+
 async def _thread_turn_in_flight(thread: dict) -> bool:
     """Best-effort probe: is the thread's agent currently executing a turn?
 
