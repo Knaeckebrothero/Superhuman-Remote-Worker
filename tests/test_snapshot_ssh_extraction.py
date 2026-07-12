@@ -143,7 +143,10 @@ class TestStreamExtractSnapshot:
         assert "agent-host@10.0.0.9" in argv
         assert argv[-1] == EXTRACT_REMOTE_CMD
         # Verify extract command includes xattrs/acls for overlay whiteout round-trip
-        assert EXTRACT_REMOTE_CMD == "zstd -d | tar --xattrs --xattrs-include='*' --acls -xf - -C /"
+        assert (
+            EXTRACT_REMOTE_CMD
+            == "zstd -d | tar --xattrs --xattrs-include='*' --acls -xf - -C /"
+        )
 
     @pytest.mark.asyncio
     async def test_returns_rc_and_stderr_on_failure(self, tar_file):

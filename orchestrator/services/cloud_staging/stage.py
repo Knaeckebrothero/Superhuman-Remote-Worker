@@ -193,7 +193,9 @@ async def _stream_tar_to_file(cmd: list[str], dest_path: str) -> bool:
 
     if process.returncode != 0 and total_bytes == 0:
         stderr = (await process.stderr.read()).decode(errors="replace")
-        logger.error("stage: ssh tar failed (rc=%s): %s", process.returncode, stderr[:500])
+        logger.error(
+            "stage: ssh tar failed (rc=%s): %s", process.returncode, stderr[:500]
+        )
         return False
 
     return True
@@ -220,7 +222,9 @@ async def stage_thread_cloud_diff(
     _inflight.add(thread_id)
     try:
         return await _stage_thread_cloud_diff(
-            thread_id=thread_id, postgres_db=postgres_db, snapshot_service=snapshot_service
+            thread_id=thread_id,
+            postgres_db=postgres_db,
+            snapshot_service=snapshot_service,
         )
     except Exception:
         logger.exception("stage: unhandled error staging thread %s", thread_id)
@@ -251,7 +255,9 @@ async def _stage_thread_cloud_diff(
     if raw is None:
         logger.warning(
             "stage: signature probe failed for thread %s (%s:%d)",
-            thread_id, ssh_host, ssh_port,
+            thread_id,
+            ssh_host,
+            ssh_port,
         )
         return None
     signature = raw.decode(errors="replace").strip()
@@ -314,7 +320,9 @@ async def _stage_thread_cloud_diff(
         # in stage_thread_cloud_diff → logged, returns None (never raises).
         manifest["tar_sha256"] = await asyncio.to_thread(_sha256_file, tar_path)
 
-        if not await snapshot_service.upload_blob_file(staging_tar_key(thread_id), tar_path):
+        if not await snapshot_service.upload_blob_file(
+            staging_tar_key(thread_id), tar_path
+        ):
             logger.error("stage: tar upload failed for thread %s", thread_id)
             return None
 

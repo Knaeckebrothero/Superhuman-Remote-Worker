@@ -38,10 +38,12 @@ async def test_engage_called_for_protected_thread_with_project_mount():
     mock_db_context.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_db_context.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True), \
-         patch.object(main, "engage_ro_mount", new=AsyncMock()) as engage, \
-         patch.object(main.main_cloud_router, "for_backend") as for_backend, \
-         patch.object(main.postgres_db, "acquire", return_value=mock_db_context):
+    with (
+        patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True),
+        patch.object(main, "engage_ro_mount", new=AsyncMock()) as engage,
+        patch.object(main.main_cloud_router, "for_backend") as for_backend,
+        patch.object(main.postgres_db, "acquire", return_value=mock_db_context),
+    ):
         for_backend.return_value = object()
         await main._engage_protected_cloud_for_thread(
             "thread-1", user_id="user-1", mount_rows=mount_rows, metadata={}
@@ -62,10 +64,12 @@ async def test_engage_success_clears_stale_protected_cloud_error():
     mock_db_context.__aenter__ = AsyncMock(return_value=mock_conn)
     mock_db_context.__aexit__ = AsyncMock(return_value=None)
 
-    with patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True), \
-         patch.object(main, "engage_ro_mount", new=AsyncMock()), \
-         patch.object(main.main_cloud_router, "for_backend") as for_backend, \
-         patch.object(main.postgres_db, "acquire", return_value=mock_db_context):
+    with (
+        patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True),
+        patch.object(main, "engage_ro_mount", new=AsyncMock()),
+        patch.object(main.main_cloud_router, "for_backend") as for_backend,
+        patch.object(main.postgres_db, "acquire", return_value=mock_db_context),
+    ):
         for_backend.return_value = object()
         await main._engage_protected_cloud_for_thread(
             "thread-1", user_id="user-1", mount_rows=mount_rows, metadata={}
@@ -82,13 +86,18 @@ async def test_engage_success_clears_stale_protected_cloud_error():
 async def test_engage_refusal_records_error_and_does_not_raise():
     mount_rows = [{"backend_id": "nextcloud", "cloud_handle": "handle::Proj"}]
     recorded: list[str] = []
-    with patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True), \
-         patch.object(main, "engage_ro_mount", new=AsyncMock(side_effect=RoEngageRefused("floor"))), \
-         patch.object(main.main_cloud_router, "for_backend", return_value=object()), \
-         patch.object(
-             main, "_record_protected_error",
-             new=AsyncMock(side_effect=lambda tid, msg: recorded.append(msg)),
-         ):
+    with (
+        patch.object(main, "_is_protected_cloud_mode_enabled", return_value=True),
+        patch.object(
+            main, "engage_ro_mount", new=AsyncMock(side_effect=RoEngageRefused("floor"))
+        ),
+        patch.object(main.main_cloud_router, "for_backend", return_value=object()),
+        patch.object(
+            main,
+            "_record_protected_error",
+            new=AsyncMock(side_effect=lambda tid, msg: recorded.append(msg)),
+        ),
+    ):
         # must NOT raise — a refusal is recorded, the session boots with no mount
         await main._engage_protected_cloud_for_thread(
             "thread-1", user_id="user-1", mount_rows=mount_rows, metadata={}

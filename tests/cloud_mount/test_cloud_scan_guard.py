@@ -162,7 +162,9 @@ def test_run_command_blocks_cloud_write_when_upperdir_over_quota():
     )
     run_command = next(tool for tool in tools if tool.name == "run_command")
 
-    result = run_command.invoke({"command": "cp report.pdf /workspace/cloud/report.pdf"})
+    result = run_command.invoke(
+        {"command": "cp report.pdf /workspace/cloud/report.pdf"}
+    )
 
     assert "Cloud staging guard: full" in result
     assert shell_manager.run_calls == []
@@ -201,7 +203,9 @@ def test_run_command_upperdir_guard_exception_fails_open():
     )
     run_command = next(tool for tool in tools if tool.name == "run_command")
 
-    result = run_command.invoke({"command": "cp report.pdf /workspace/cloud/report.pdf"})
+    result = run_command.invoke(
+        {"command": "cp report.pdf /workspace/cloud/report.pdf"}
+    )
 
     assert "Cloud staging guard" not in result
     assert shell_manager.run_calls == ["cp report.pdf /workspace/cloud/report.pdf"]
@@ -214,7 +218,9 @@ def test_run_command_no_overlay_manager_skips_upperdir_guard():
     )
     run_command = next(tool for tool in tools if tool.name == "run_command")
 
-    result = run_command.invoke({"command": "cp report.pdf /workspace/cloud/report.pdf"})
+    result = run_command.invoke(
+        {"command": "cp report.pdf /workspace/cloud/report.pdf"}
+    )
 
     assert "Cloud staging guard" not in result
     assert shell_manager.run_calls == ["cp report.pdf /workspace/cloud/report.pdf"]
@@ -234,7 +240,9 @@ def test_detects_find_delete_over_cloud_mount():
 
 def test_ignores_deletes_outside_cloud_and_single_file_rm_elsewhere():
     assert detect_cloud_delete_risk("rm -rf /home/agent-host/workspace/build") is None
-    assert detect_cloud_delete_risk("rm /workspace/cloud/one.txt") is None  # single file, no -r
+    assert (
+        detect_cloud_delete_risk("rm /workspace/cloud/one.txt") is None
+    )  # single file, no -r
 
 
 def test_format_cloud_delete_guard_message_live_by_default():
@@ -371,7 +379,9 @@ def test_read_only_commands_pass_at_quota():
 
     for cmd in read_commands:
         result = run_command.invoke({"command": cmd})
-        assert "Cloud staging guard: full" not in result, f"Read command '{cmd}' should not trigger upperdir guard"
+        assert "Cloud staging guard: full" not in result, (
+            f"Read command '{cmd}' should not trigger upperdir guard"
+        )
         assert "Exit code: 0" in result, f"Read command '{cmd}' should execute"
         assert cmd in shell_manager.run_calls, f"Command '{cmd}' should have been run"
 
@@ -409,8 +419,12 @@ def test_write_commands_blocked_at_quota():
     for cmd in write_commands:
         shell_manager.run_calls.clear()
         result = run_command.invoke({"command": cmd})
-        assert "Cloud staging guard: full" in result, f"Write command '{cmd}' should trigger upperdir guard"
-        assert shell_manager.run_calls == [], f"Command '{cmd}' should not have been run"
+        assert "Cloud staging guard: full" in result, (
+            f"Write command '{cmd}' should trigger upperdir guard"
+        )
+        assert shell_manager.run_calls == [], (
+            f"Command '{cmd}' should not have been run"
+        )
 
 
 def test_pipeline_with_redirect_detected():

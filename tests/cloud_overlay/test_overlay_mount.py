@@ -111,7 +111,10 @@ def test_mount_script_quotes_paths_with_spaces():
     assert len(scripts) == 1
     s = scripts[0]
     # The -o value should be quoted as ONE shell word, preserving the space
-    assert "'lowerdir=/cloud/low er,upperdir=/home/agent-host/.overlay/upper,workdir=/home/agent-host/.overlay/work'" in s
+    assert (
+        "'lowerdir=/cloud/low er,upperdir=/home/agent-host/.overlay/upper,workdir=/home/agent-host/.overlay/work'"
+        in s
+    )
     # The unquoted form must NOT appear
     assert "-o lowerdir=/cloud/low er," not in s
 
@@ -133,12 +136,16 @@ def test_refresh_unmounts_overlay_refreshes_lower_then_remounts():
     assert calls == [1]
 
     commands = [cmd for cmd, _timeout in backend.commands[starting_commands:]]
-    assert len(commands) == 2, "expected exactly 2 remote scripts: pre-refresh unmount + remount"
+    assert len(commands) == 2, (
+        "expected exactly 2 remote scripts: pre-refresh unmount + remount"
+    )
     assert "overlay_pre_refresh_unmount.sh" in commands[0]
     assert "overlay_remount.sh" in commands[1]
 
     unmount_script = next(
-        b for p, b in backend.files.items() if p.endswith("overlay_pre_refresh_unmount.sh")
+        b
+        for p, b in backend.files.items()
+        if p.endswith("overlay_pre_refresh_unmount.sh")
     )
     assert "fusermount3 -u /cloud/merged" in unmount_script  # PLAIN unmount (not -uz)
     assert "-uz" not in unmount_script
@@ -181,7 +188,9 @@ def test_heal_lazy_unmounts_overlay_first_then_remounts_lower_then_overlay():
     assert calls == [1], "callback must fire after exactly 1 script (heal-unmount)"
 
     commands = [cmd for cmd, _timeout in backend.commands[starting_commands:]]
-    assert len(commands) == 2, "expected exactly 2 remote scripts: heal-unmount + remount"
+    assert len(commands) == 2, (
+        "expected exactly 2 remote scripts: heal-unmount + remount"
+    )
     assert "overlay_heal_unmount.sh" in commands[0]
     assert "overlay_remount.sh" in commands[1]
 
@@ -240,7 +249,9 @@ def test_upperdir_usage_parses_du_and_flags_over_quota():
 
 def test_under_quota_has_no_guard_message():
     backend = FakeRemoteBackend()
-    backend.outputs_by_script["overlay_usage.sh"] = "1024\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    backend.outputs_by_script["overlay_usage.sh"] = (
+        "1024\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    )
     mgr = _manager(backend)
     assert mgr.over_quota() is False
     assert mgr.quota_guard_message() is None
@@ -248,7 +259,9 @@ def test_under_quota_has_no_guard_message():
 
 def test_upperdir_usage_skips_sentinel_and_junk_lines_falls_back_to_zero():
     backend = FakeRemoteBackend()
-    backend.outputs_by_script["overlay_usage.sh"] = "du: cannot access: No such file\n__SRW_OVERLAY_OK__\n"
+    backend.outputs_by_script["overlay_usage.sh"] = (
+        "du: cannot access: No such file\n__SRW_OVERLAY_OK__\n"
+    )
     mgr = _manager(backend)
     assert mgr.upperdir_usage_bytes() == 0
     assert mgr.over_quota() is False
@@ -256,7 +269,9 @@ def test_upperdir_usage_skips_sentinel_and_junk_lines_falls_back_to_zero():
 
 def test_over_quota_false_when_quota_bytes_absent():
     backend = FakeRemoteBackend()
-    backend.outputs_by_script["overlay_usage.sh"] = "999999999999\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    backend.outputs_by_script["overlay_usage.sh"] = (
+        "999999999999\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    )
     cfg = _cfg()
     del cfg["quota_bytes"]
     mgr = OverlayMountManager(
@@ -283,7 +298,9 @@ def test_over_quota_true_at_exact_quota_boundary():
 
 def test_over_quota_false_when_quota_bytes_zero():
     backend = FakeRemoteBackend()
-    backend.outputs_by_script["overlay_usage.sh"] = "999999999999\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    backend.outputs_by_script["overlay_usage.sh"] = (
+        "999999999999\t/home/agent-host/.overlay/upper\n__SRW_OVERLAY_OK__\n"
+    )
     cfg = _cfg()
     cfg["quota_bytes"] = 0
     mgr = OverlayMountManager(

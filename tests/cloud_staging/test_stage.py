@@ -58,7 +58,10 @@ _ACTIVE_ROW = {
 
 def _make_db(*, thread_metadata=None, mount_row=None):
     db = MagicMock()
-    thread = {"id": "thread-1", "metadata": thread_metadata if thread_metadata is not None else {}}
+    thread = {
+        "id": "thread-1",
+        "metadata": thread_metadata if thread_metadata is not None else {},
+    }
     db.get_thread = AsyncMock(return_value=thread)
     db.get_ro_mount_by_thread = AsyncMock(return_value=mount_row)
     db.update_ro_mount_staging = AsyncMock(return_value=True)
@@ -191,7 +194,9 @@ async def test_unchanged_signature_skips_upload(monkeypatch):
     }
     db = _make_db(thread_metadata=_PROTECTED_METADATA, mount_row=row)
     svc = _make_snapshot_service()
-    monkeypatch.setattr(stage, "_run_ssh_capture", AsyncMock(return_value=b"deadbeef\n"))
+    monkeypatch.setattr(
+        stage, "_run_ssh_capture", AsyncMock(return_value=b"deadbeef\n")
+    )
     stream_mock = AsyncMock()
     monkeypatch.setattr(stage, "_stream_tar_to_file", stream_mock)
 
@@ -216,9 +221,12 @@ async def test_stage_unchanged_skip_restages_when_blobs_missing(tmp_path, monkey
     through to a full re-stage instead of leaving the review/apply path
     reading "staged" against nothing.
     """
-    real_tar = _build_tar(tmp_path, [
-        ("upper/new.txt", "file", b"hello", None),
-    ])
+    real_tar = _build_tar(
+        tmp_path,
+        [
+            ("upper/new.txt", "file", b"hello", None),
+        ],
+    )
     row = {
         **_ACTIVE_ROW,
         "staged_epoch": 5,
@@ -231,7 +239,9 @@ async def test_stage_unchanged_skip_restages_when_blobs_missing(tmp_path, monkey
     db = _make_db(thread_metadata=_PROTECTED_METADATA, mount_row=row)
     svc = _make_snapshot_service()
     svc.get_blob = AsyncMock(return_value=None)  # manifest blob missing
-    monkeypatch.setattr(stage, "_run_ssh_capture", AsyncMock(return_value=b"deadbeef\n"))
+    monkeypatch.setattr(
+        stage, "_run_ssh_capture", AsyncMock(return_value=b"deadbeef\n")
+    )
 
     async def _fake_stream(cmd, dest_path):
         shutil.copyfile(real_tar, dest_path)
@@ -262,7 +272,9 @@ async def test_stage_unchanged_skip_restages_when_blobs_missing(tmp_path, monkey
         staged_summary={
             "counts": {"added": 1, "modified": 0, "deleted": 0},
             "signature": "deadbeef",
-            "tar_sha256": hashlib.sha256(uploaded[stage.staging_tar_key("thread-1")]).hexdigest(),
+            "tar_sha256": hashlib.sha256(
+                uploaded[stage.staging_tar_key("thread-1")]
+            ).hexdigest(),
         },
     )
 
@@ -277,12 +289,17 @@ async def test_empty_upperdir_clears_staging(monkeypatch):
     row = {
         **_ACTIVE_ROW,
         "staged_epoch": 3,
-        "staged_summary": {"counts": {"added": 1, "modified": 0, "deleted": 0}, "signature": "deadbeef"},
+        "staged_summary": {
+            "counts": {"added": 1, "modified": 0, "deleted": 0},
+            "signature": "deadbeef",
+        },
     }
     db = _make_db(thread_metadata=_PROTECTED_METADATA, mount_row=row)
     svc = _make_snapshot_service()
     monkeypatch.setattr(
-        stage, "_run_ssh_capture", AsyncMock(return_value=(stage._EMPTY_SIGNATURE + "\n").encode())
+        stage,
+        "_run_ssh_capture",
+        AsyncMock(return_value=(stage._EMPTY_SIGNATURE + "\n").encode()),
     )
 
     result = await stage.stage_thread_cloud_diff(
@@ -307,7 +324,9 @@ async def test_empty_upperdir_when_nothing_staged_is_pure_noop(monkeypatch):
     db = _make_db(thread_metadata=_PROTECTED_METADATA, mount_row=row)
     svc = _make_snapshot_service()
     monkeypatch.setattr(
-        stage, "_run_ssh_capture", AsyncMock(return_value=(stage._EMPTY_SIGNATURE + "\n").encode())
+        stage,
+        "_run_ssh_capture",
+        AsyncMock(return_value=(stage._EMPTY_SIGNATURE + "\n").encode()),
     )
 
     result = await stage.stage_thread_cloud_diff(
@@ -326,10 +345,18 @@ async def test_empty_upperdir_when_nothing_staged_is_pure_noop(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_push_derives_manifest_uploads_and_bumps_epoch(tmp_path, monkeypatch):
-    real_tar = _build_tar(tmp_path, [
-        ("upper/new.txt", "file", b"hello", None),
-    ])
-    row = {**_ACTIVE_ROW, "staged_epoch": 5, "staged_summary": None, "etag_baseline": {}}
+    real_tar = _build_tar(
+        tmp_path,
+        [
+            ("upper/new.txt", "file", b"hello", None),
+        ],
+    )
+    row = {
+        **_ACTIVE_ROW,
+        "staged_epoch": 5,
+        "staged_summary": None,
+        "etag_baseline": {},
+    }
     db = _make_db(thread_metadata=_PROTECTED_METADATA, mount_row=row)
     svc = _make_snapshot_service()
 

@@ -318,7 +318,9 @@ class SnapshotService:
         if not self._available:
             return False
         try:
-            await asyncio.to_thread(self._s3.delete_object, Bucket=self._bucket, Key=key)
+            await asyncio.to_thread(
+                self._s3.delete_object, Bucket=self._bucket, Key=key
+            )
             return True
         except Exception as e:
             logger.error(f"S3 delete_blob failed for {key}: {e}")

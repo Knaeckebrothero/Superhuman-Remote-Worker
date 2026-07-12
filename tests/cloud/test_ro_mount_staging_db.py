@@ -37,9 +37,12 @@ def _mock_conn():
 
 def test_ro_mount_row_parses_jsonb_strings():
     row = {
-        "id": "x", "credentials": None,
+        "id": "x",
+        "credentials": None,
         "etag_baseline": json.dumps({"a.txt": "et1"}),
-        "staged_summary": json.dumps({"counts": {"added": 1, "modified": 0, "deleted": 0}}),
+        "staged_summary": json.dumps(
+            {"counts": {"added": 1, "modified": 0, "deleted": 0}}
+        ),
     }
     d = PostgresDB._ro_mount_row(row)
     assert d["etag_baseline"] == {"a.txt": "et1"}
@@ -47,8 +50,9 @@ def test_ro_mount_row_parses_jsonb_strings():
 
 
 def test_ro_mount_row_leaves_none_jsonb_as_none():
-    d = PostgresDB._ro_mount_row({"id": "x", "credentials": None,
-                                  "etag_baseline": None, "staged_summary": None})
+    d = PostgresDB._ro_mount_row(
+        {"id": "x", "credentials": None, "etag_baseline": None, "staged_summary": None}
+    )
     assert d["etag_baseline"] is None
     assert d["staged_summary"] is None
 
@@ -73,7 +77,9 @@ async def test_update_ro_mount_staging_clears_staged_at_when_summary_none():
     conn.execute = AsyncMock(return_value="UPDATE 1")
     db = _make_db_with_conn(conn)
 
-    result = await db.update_ro_mount_staging("row-1", staged_epoch=2, staged_summary=None)
+    result = await db.update_ro_mount_staging(
+        "row-1", staged_epoch=2, staged_summary=None
+    )
 
     assert result is True
     args = conn.execute.call_args.args

@@ -22,7 +22,9 @@ def _patch_capabilities(
     *, user: dict, flag: bool, grants: dict | None = None
 ) -> ExitStack:
     stack = ExitStack()
-    stack.enter_context(patch("main.require_approved_user", AsyncMock(return_value=user)))
+    stack.enter_context(
+        patch("main.require_approved_user", AsyncMock(return_value=user))
+    )
     stack.enter_context(patch("main._is_protected_cloud_mode_enabled", lambda: flag))
     # _grant_project_ids -> user_visible_project_ids -> postgres_db; short-
     # circuit it so the non-admin branch doesn't need a real db.

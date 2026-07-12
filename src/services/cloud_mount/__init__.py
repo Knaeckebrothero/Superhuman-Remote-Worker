@@ -225,7 +225,9 @@ class RcloneMountManager:
                 lines.append(f"  vfs/stats: {_compact_rc(vfs)}")
         return "\n".join(lines)
 
-    def refresh_vfs(self, mount_id: str | None = None, *, recursive: bool = True) -> None:
+    def refresh_vfs(
+        self, mount_id: str | None = None, *, recursive: bool = True
+    ) -> None:
         """Flush the rclone VFS so a subsequent read sees the live cloud.
 
         Uses ``vfs/refresh`` (re-PROPFINDs, invalidates changed content) — NOT

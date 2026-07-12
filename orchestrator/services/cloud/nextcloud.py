@@ -1563,9 +1563,7 @@ class NextcloudBackend:
             return None
         if resp.status_code != 207:
             return None
-        hrefs = re.findall(
-            r"<d:href>([^<]+)</d:href>", resp.text, flags=re.IGNORECASE
-        )
+        hrefs = re.findall(r"<d:href>([^<]+)</d:href>", resp.text, flags=re.IGNORECASE)
         leaves = [unquote(h.rstrip("/").split("/")[-1]) for h in hrefs]
         # `{basename}.d{ts}` — newest (max) is the item we just seeded.
         matches = sorted(
