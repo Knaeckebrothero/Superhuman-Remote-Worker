@@ -2170,6 +2170,35 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             logger.exception(f"Failed to detach session for thread {thread_id}")
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    @app.post("/cloud-overlay/reset")
+    async def cloud_overlay_reset():
+        """Discard the staged upperdir and remount fresh after the user
+        Applies or Rejects a staged cloud diff (Task 10's orchestrator apply
+        flow calls this). In-cluster only, no auth — mirrors the other
+        session-control routes above.
+        """
+        from src.services.cloud_overlay.overlay_mount import OverlayMountError
+
+        overlay = getattr(_session, "overlay_mount_manager", None)
+        if _session is None or overlay is None:
+            return JSONResponse({"error": "no cloud overlay"}, status_code=404)
+        try:
+            await asyncio.to_thread(_session.reset_cloud_overlay)
+            return JSONResponse({"ok": True})
+        except OverlayMountError as e:
+            # A real script failure (e.g. remount) — NOT the "no active
+            # overlay" precondition below. Must not be caught as 404 even
+            # though OverlayMountError subclasses RuntimeError.
+            logger.exception("Cloud overlay reset script failed for thread %s", _thread_id)
+            return JSONResponse({"error": str(e)}, status_code=500)
+        except RuntimeError as e:
+            # reset_cloud_overlay raises a plain RuntimeError when the overlay
+            # exists but isn't active (mount failed, or already torn down).
+            return JSONResponse({"error": str(e)}, status_code=404)
+        except Exception as e:
+            logger.exception("Failed to reset cloud overlay for thread %s", _thread_id)
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     # --- Headless REST input endpoints (phase 2) ---
     #
     # Counterparts to the WS-receive-loop methods, exposed so the orchestrator's
