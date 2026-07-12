@@ -787,6 +787,53 @@ class TestRenderInstructionContentCLI:
         assert "HAS_CLI" not in result
 
 
+class TestRenderInstructionContentProtectedCloud:
+    """Tests for the F-C1 protected-cloud honesty block (Task 15)."""
+
+    PROTECTED_BLOCK_TEMPLATE = (
+        "Workspace:\n"
+        "- Your workspace is your persistent working area.\n"
+        "{% if protected_cloud %}\n"
+        "Protected cloud mode:\n"
+        "- The cloud folder (workspace/cloud) is in PROTECTED mode: everything "
+        "you write there is STAGED for the user's review — nothing is saved to "
+        "the cloud or visible to anyone else until the user applies it in the "
+        "review panel.\n"
+        '- Never say a cloud file is "saved", "uploaded", or "shared". Say it '
+        'is "staged for your review".\n'
+        "- When a piece of work is ready, tell the user so they can open the "
+        'review panel ("Cloud changes" in the session header) and apply it.\n'
+        "{% endif %}\n"
+        "Conversation style:\n"
+    )
+
+    def test_protected_block_rendered_when_flag_true(self):
+        from src.core.loader import render_instruction_content
+
+        result = render_instruction_content(
+            self.PROTECTED_BLOCK_TEMPLATE, [], protected_cloud=True
+        )
+        assert "staged for your review" in result
+        assert "{%" not in result
+        assert "{}" not in result
+
+    def test_protected_block_absent_when_flag_false(self):
+        from src.core.loader import render_instruction_content
+
+        result = render_instruction_content(
+            self.PROTECTED_BLOCK_TEMPLATE, [], protected_cloud=False
+        )
+        assert "staged for your review" not in result
+        assert "{%" not in result
+
+    def test_protected_block_absent_by_default(self):
+        from src.core.loader import render_instruction_content
+
+        result = render_instruction_content(self.PROTECTED_BLOCK_TEMPLATE, [])
+        assert "staged for your review" not in result
+        assert "{%" not in result
+
+
 # =============================================================================
 # Credential Structure Validation
 # =============================================================================
