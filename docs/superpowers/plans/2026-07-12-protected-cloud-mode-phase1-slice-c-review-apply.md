@@ -30,7 +30,7 @@
 
 | Path | Role |
 |---|---|
-| `orchestrator/database/migrations/app/0056_cloud_ro_mounts_staging.sql` | NEW — 4 staging columns on `cloud_ro_mounts` |
+| `orchestrator/database/migrations/app/0057_cloud_ro_mounts_staging.sql` | NEW — 4 staging columns on `cloud_ro_mounts` |
 | `orchestrator/database/postgres.py` | +`update_ro_mount_baseline`, `update_ro_mount_staging`; `_ro_mount_row` JSONB loads |
 | `orchestrator/services/cloud_staging/__init__.py` | NEW — `select_protected_mount` shared helper |
 | `orchestrator/services/cloud_staging/manifest.py` | NEW — tar → manifest derivation (pure) |
@@ -58,10 +58,10 @@
 
 ---
 
-### Task 1: Migration 0056 + PostgresDB staging accessors
+### Task 1: migration 0057 + PostgresDB staging accessors
 
 **Files:**
-- Create: `orchestrator/database/migrations/app/0056_cloud_ro_mounts_staging.sql`
+- Create: `orchestrator/database/migrations/app/0057_cloud_ro_mounts_staging.sql`
 - Modify: `orchestrator/database/postgres.py` (methods live near `create_ro_mount` at :1259; `_ro_mount_row` at :1329)
 - Modify (generated): `orchestrator/database/schema_current.sql`
 - Test: `tests/cloud/test_ro_mount_staging_db.py` (new)
@@ -78,7 +78,7 @@
 - [ ] **Step 2: Write the failing tests** in `tests/cloud/test_ro_mount_staging_db.py`. Adapt the fixture import to what Step 1 found; the assertions below are the requirements:
 
 ```python
-"""cloud_ro_mounts staging columns (Slice C migration 0056) — DB accessors.
+"""cloud_ro_mounts staging columns (Slice C migration 0057) — DB accessors.
 
 _ro_mount_row must json.loads JSONB payloads (asyncpg returns raw JSON
 strings); update_ro_mount_staging must NULL staged_at when clearing.
@@ -111,10 +111,10 @@ Plus two async accessor tests using Step 1's fake-conn pattern: `update_ro_mount
 
 - [ ] **Step 3: Run to verify failure.** `pytest tests/cloud/test_ro_mount_staging_db.py -v` → FAIL (KeyError / AttributeError: no such methods; `_ro_mount_row` returns the raw string).
 
-- [ ] **Step 4: Write the migration** — `orchestrator/database/migrations/app/0056_cloud_ro_mounts_staging.sql` (header convention matches 0052–0055):
+- [ ] **Step 4: Write the migration** — `orchestrator/database/migrations/app/0057_cloud_ro_mounts_staging.sql` (header convention matches 0052–0055):
 
 ```sql
--- migration:     0056_cloud_ro_mounts_staging.sql
+-- migration:     0057_cloud_ro_mounts_staging.sql
 -- description:   Protected cloud Slice C staging state on cloud_ro_mounts:
 --                persisted etag baseline (conflict gate + manifest
 --                classification) and staged-epoch bookkeeping for the
@@ -180,10 +180,10 @@ COMMENT ON COLUMN cloud_ro_mounts.staged_summary IS 'manifest counts + content s
 - [ ] **Step 8: Commit** (path-scoped):
 
 ```bash
-git add orchestrator/database/migrations/app/0056_cloud_ro_mounts_staging.sql \
+git add orchestrator/database/migrations/app/0057_cloud_ro_mounts_staging.sql \
         orchestrator/database/postgres.py orchestrator/database/schema_current.sql \
         tests/cloud/test_ro_mount_staging_db.py
-git commit -m "feat(cloud): migration 0056 — staging columns + accessors on cloud_ro_mounts"
+git commit -m "feat(cloud): migration 0057 — staging columns + accessors on cloud_ro_mounts"
 ```
 
 ---

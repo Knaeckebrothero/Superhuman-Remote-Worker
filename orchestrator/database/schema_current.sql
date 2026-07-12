@@ -338,7 +338,11 @@ CREATE TABLE public.cloud_ro_mounts (
     auth_kind text NOT NULL,
     status text DEFAULT 'active'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    revoked_at timestamp with time zone
+    revoked_at timestamp with time zone,
+    etag_baseline jsonb,
+    staged_epoch integer DEFAULT 0 NOT NULL,
+    staged_at timestamp with time zone,
+    staged_summary jsonb
 );
 
 
@@ -347,6 +351,34 @@ CREATE TABLE public.cloud_ro_mounts (
 --
 
 COMMENT ON TABLE public.cloud_ro_mounts IS 'Per-mount read-only reader grants for protected cloud mode. One row per protected session mount; the reconciler revokes active grants whose thread is gone. Credentials are encrypted at rest (postgres._encrypt_optional).';
+
+
+--
+-- Name: COLUMN cloud_ro_mounts.etag_baseline; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.cloud_ro_mounts.etag_baseline IS 'path->etag map (files only) captured at engage, re-captured after each apply';
+
+
+--
+-- Name: COLUMN cloud_ro_mounts.staged_epoch; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.cloud_ro_mounts.staged_epoch IS 'monotonic staging epoch: bumped on every successful stage push, apply, and reject';
+
+
+--
+-- Name: COLUMN cloud_ro_mounts.staged_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.cloud_ro_mounts.staged_at IS 'when the current epoch was pushed; NULL when nothing staged';
+
+
+--
+-- Name: COLUMN cloud_ro_mounts.staged_summary; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.cloud_ro_mounts.staged_summary IS 'manifest counts + content signature for the current epoch (entry lists live in S3); NULL when nothing staged';
 
 
 --

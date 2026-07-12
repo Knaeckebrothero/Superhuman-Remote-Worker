@@ -1,9 +1,9 @@
--- migration:     0056_cloud_ro_mounts_staging.sql
+-- migration:     0057_cloud_ro_mounts_staging.sql
 -- description:   Protected cloud Slice C staging state on cloud_ro_mounts:
 --                persisted etag baseline (conflict gate + manifest
 --                classification) and staged-epoch bookkeeping for the
 --                S3 staging pipeline (design spec 2026-07-12 §5).
--- depends-on:    0055_datasources_read_only.sql
+-- depends-on:    0056_datasources_read_only.sql
 -- expected:      < 1s
 -- locks:         Brief ACCESS EXCLUSIVE on cloud_ro_mounts (ADD COLUMN, no rewrite)
 -- transactional: yes
