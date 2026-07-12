@@ -1,6 +1,6 @@
 # Protected Cloud Mode — Phase 1 Slice C: staging → review → apply + toggle
 
-**Status:** design approved by owner 2026-07-12 (this doc formalizes that conversation).
+**Status:** IMPLEMENTED on develop 2026-07-12 (16 tasks, subagent-driven; live k3d gate pending). Design approved by owner 2026-07-12.
 **Master design:** `docs/design/cloud_access_unification.md` (§3.4 review seam, §8.1 settled decisions, §9 open questions — several resolved here).
 **Builds on:** Slice A (`docs/superpowers/plans/2026-07-09-protected-cloud-mode-phase1-slice-a-cloud-plumbing.md` — RO reader/grant/probe/engage, `cloud_ro_mounts`, etag baseline) and Slice B (`docs/superpowers/plans/2026-07-11-protected-cloud-mode-phase1-slice-b-mount-stack.md` — capture overlay stack, guards, snapshot xattrs, fail-closed wiring; live-gate PASSED 2026-07-12 on k3d vs real Nextcloud 31.0.14).
 
