@@ -292,6 +292,43 @@ ERROR_IMMUNE_FREEZE_TYPES: frozenset[str] = AUTO_REDISPATCH_FREEZE_TYPES | froze
     {"llm_unavailable"}
 )
 
+# Parent statuses that PERMANENTLY block a subjob's re-dispatch. The dispatcher's
+# cascade guard (get_dispatchable_jobs, postgres.py) also blocks on a 'paused'
+# ancestor, but that is temporary — the subjob re-dispatches once the parent
+# resumes — so only the permanent terminals wedge a paused subjob forever. A
+# drain-frozen subjob under such a parent must resolve terminally, not pause.
+# docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+_PARENT_TERMINAL_BLOCKING: frozenset[str] = frozenset({"failed", "cancelled"})
+
+# Substrings that mark an error as a workspace/VM *teardown* (connectivity) blip
+# rather than a genuine mid-run failure. On completion the VM is reaped, and a
+# trailing SSH/SFTP/stat op can time out against the gone workspace; that trailing
+# error must not override an outcome the agent already reported as complete.
+# Kept deliberately narrow (connectivity/teardown only) — widen on evidence, not
+# on suspicion (the "cleanup hiccup vs real failure" line, signed off 2026-07-12).
+# docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+_TEARDOWN_ERROR_PATTERNS: tuple[str, ...] = (
+    "failed to connect to workspace",
+    "workspace i/o timed out",
+    "workspace is unavailable",
+    "key-exchange timed out",
+    "waiting for key negotiation",
+    "[gone]",
+)
+
+
+def is_teardown_infra_error(message: str | None) -> bool:
+    """True if ``message`` looks like a workspace/VM teardown-connectivity blip.
+
+    Used to tell a "finished the work, then a teardown hiccup" completion report
+    apart from a genuine mid-run crash: only the former may keep its reported
+    (successful) outcome when a coincident error rides the same report.
+    """
+    if not message:
+        return False
+    low = message.lower()
+    return any(pattern in low for pattern in _TEARDOWN_ERROR_PATTERNS)
+
 
 def auto_continue_drain_update(
     context: dict[str, Any], freeze_data: dict[str, Any], *, cap: int
@@ -519,12 +556,20 @@ def llm_outage_backoff_seconds(
 def determine_job_status(
     job: dict[str, Any],
     result: dict[str, Any],
+    *,
+    parent_status: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Determine the new job status from the graph execution result.
 
     The orchestrator is the single authority for job status. Agents report
     facts (should_stop, goal_achieved, freeze_data) and this function
     determines the DB status.
+
+    Args:
+        parent_status: For a subjob (``parent_job_id`` set), the parent's current
+            status. Lets a drain-frozen subjob resolve terminally instead of
+            pausing into a cascade-guard wedge when the parent has permanently
+            failed. ``None`` for top-level jobs (or when unknown).
 
     Returns:
         ``(new_status, error_message)`` — either or both may be ``None``
@@ -543,28 +588,51 @@ def determine_job_status(
             fd = {}
     freeze_type = fd.get("freeze_type")
 
+    # Did the agent's report DECLARE a genuine completion? Resolved up-front so the
+    # error short-circuit can tell a "finished the work, then a teardown blip"
+    # report apart from a mid-run crash — the former keeps its completed outcome.
+    is_completion = (
+        goal_achieved
+        or freeze_type == "job_complete"
+        or fd.get("status") == "job_completed"
+    )
+
     if error:
         error_msg = (
             error.get("message", str(error)) if isinstance(error, dict) else str(error)
         )
-        # A coincident error must not mask a clean-boundary freeze whose own
-        # branch below owns the pause-vs-fail decision (drain Continue-as-New,
-        # memory/KB retry caps, LLM-outage ceiling). Scoped to top-level jobs
-        # that actually stopped: critic subjobs (parent_job_id) keep failing on
-        # error as before, and a stale row freeze can't shield a crashed run
-        # (should_stop is False there, so the guard falls through to failed).
-        # docs/done/version_upgrade_drain_masked_by_coincident_error.md
-        if not (
+        # A coincident error must not mask an outcome the agent already reported.
+        # Two carve-outs let the report's own branch below own the decision:
+        #  (1) a clean-boundary auto-redispatch / outage freeze on a top-level job
+        #      (drain Continue-as-New, memory/KB retry caps, LLM-outage ceiling) —
+        #      the work is checkpointed and re-dispatch resumes it. Critic subjobs
+        #      keep failing on error as before, and a stale row freeze can't shield
+        #      a crashed run (should_stop is False there → falls through to failed).
+        #      docs/done/version_upgrade_drain_masked_by_coincident_error.md
+        #  (2) a genuine completion whose only error is a post-completion
+        #      workspace/VM *teardown* blip: the VM is reaped on completion and a
+        #      trailing SSH/IO op then times out against the gone workspace. The
+        #      deliverables already landed (merge/graft ran); the completion branch
+        #      below resolves it exactly as it would with no error. A NON-teardown
+        #      error (real mid-run crash) still fails, even on a completion report.
+        #      docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+        redispatchable = (
             should_stop
             and job.get("parent_job_id") is None
             and freeze_type in ERROR_IMMUNE_FREEZE_TYPES
-        ):
+        )
+        completed_despite_teardown = (
+            should_stop and is_completion and is_teardown_infra_error(error_msg)
+        )
+        if not (redispatchable or completed_despite_teardown):
             return ("failed", error_msg)
         logger.warning(
-            "Job %s: '%s' freeze accompanied by coincident error — routing the "
-            "freeze, not the error: %s",
+            "Job %s: routing the reported outcome over a coincident error "
+            "(freeze_type=%r, is_completion=%s, teardown=%s): %s",
             job.get("id"),
             freeze_type,
+            is_completion,
+            completed_despite_teardown,
             error_msg[:200],
         )
 
@@ -585,17 +653,24 @@ def determine_job_status(
                 fd_status,
             )
             return (fd_status, None)
+        # A drain (version_upgrade) freeze on a subjob is re-dispatchable exactly
+        # like a top-level job — but this short-circuit historically routed it to
+        # pending_review because the freeze table below is unreachable for subjobs
+        # (the "drained-critic → pending_review" gap). Pause so the dispatcher
+        # re-picks it onto a fresh-version pod. Guard the parent-terminal case: if
+        # the parent has permanently failed, the dispatcher's cascade guard will
+        # never re-dispatch the subjob (a silent paused wedge, strictly worse than
+        # the visible pending_review), so resolve terminally instead. (Outage
+        # freezes — memory/kb/llm — are deferred: their retry-cap/ceiling counters
+        # are top-level-scoped; they stay on the visible pending_review fallback
+        # until per-subjob counters are wired.)
+        # docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+        if freeze_type == "version_upgrade":
+            if parent_status in _PARENT_TERMINAL_BLOCKING:
+                return ("completed" if goal_achieved else "cancelled", None)
+            return ("paused", None)
         # No explicit status in freeze_data — infer from goal_achieved
         return ("completed" if goal_achieved else "pending_review", None)
-
-    # Check if this is a job completion.
-    # freeze_data may come from the DB (job dict) or from the request (result);
-    # freeze_type was resolved above.
-    is_completion = (
-        goal_achieved
-        or freeze_type == "job_complete"
-        or fd.get("status") == "job_completed"
-    )
 
     # Unattended project-loop jobs must never land on the human-review gate:
     # the loop's advance hook fires only on TERMINAL statuses, so a
