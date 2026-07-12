@@ -268,8 +268,23 @@ drain-mid-subjob and a real VM-teardown race — the *decision* logic is proven 
 and the re-dispatch/resume *mechanism* (dispatcher re-pick, resume-clear,
 resolve-at-dispatch) is pre-existing code this change does not touch.
 
-**Remaining:** Phase 5 (infra hardening — clone retry, no workspace op after VM
-delete), Phase 6 (commit + deploy + observe). Safe to commit.
+**Phase 5 (infra hardening) — Part 1 DONE, Part 2 DEFERRED (2026-07-12).**
+- *Part 1 — clone retry:* `src/core/workspace.py` gained `_clone_repo_with_retry`
+  (`_CLONE_ATTEMPTS=3`, backoff `(2s, 5s)`, read at call time so tests stub to 0);
+  the jobs-repo clone in `initialize_project_workspace` routes through it. F29 hard-
+  fail preserved (fires only after retries exhaust). Kills the 73e68890-class
+  single-shot clone failure. Tests: `test_workspace_git.py` — updated F29 test
+  asserts `_CLONE_ATTEMPTS` calls before raising + new
+  `test_project_jobs_clone_succeeds_after_transient_failure`; 17 green, ruff clean.
+- *Part 2 — no workspace op after VM delete:* **deferred, deliberately.** Phases
+  0-4 already made this trigger *harmless* (the trailing teardown error no longer
+  fails the job), so it's now cosmetic (log noise), and the exact trailing-op
+  caller is still unpinned (see "The infra layer" §1). Implementing it blind risks
+  a regression for no correctness gain. Separate follow-up: pin the caller, then
+  sequence teardown so no workspace op is issued once the VM is scheduled for
+  reaping. Reconcile with `agent_fast_freeze_on_dead_workspace.md`.
+
+**Remaining:** Phase 6 (commit + deploy + observe); Phase 5 Part 2 follow-up.
 
 Sequenced so every phase is independently verifiable and the risky part (subjob
 re-dispatch, teardown races) is gated behind a live drill, not just unit tests.

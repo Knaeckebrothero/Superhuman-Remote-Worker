@@ -81,8 +81,19 @@ class TestWorkspaceGitInitialization:
         disconnected workspace — that path rebuilt from scratch and lost every
         push on teardown in loop runs 5 & 6.
         """
-        # Simulate an unreachable/broken clone (e.g. the F29 URL problem).
-        monkeypatch.setattr(GitManager, "clone", lambda *a, **k: None)
+        import src.core.workspace as ws_mod
+
+        # No real backoff waits in the test.
+        monkeypatch.setattr(ws_mod, "_CLONE_BACKOFF_SECONDS", (0, 0))
+        # Simulate a persistently unreachable/broken clone (the F29 URL problem):
+        # every attempt fails, so the bounded retry exhausts and F29 hard-fails.
+        calls = {"n": 0}
+
+        def _always_none(*a, **k):
+            calls["n"] += 1
+            return None
+
+        monkeypatch.setattr(GitManager, "clone", _always_none)
         ws = WorkspaceManager(
             job_id="test-job",
             config=WorkspaceManagerConfig(
@@ -101,9 +112,35 @@ class TestWorkspaceGitInitialization:
         )
         with pytest.raises(RuntimeError, match="Failed to clone project jobs repo"):
             ws.initialize_project_workspace()
-        # Must NOT have silently fallen back to a local git init.
+        # Retried before giving up (bounded), then hard-failed — did NOT silently
+        # fall back to a local git init.
+        assert calls["n"] == ws_mod._CLONE_ATTEMPTS
         assert ws.git_manager is None
         assert ws._initialized is False
+
+    def test_project_jobs_clone_succeeds_after_transient_failure(
+        self, temp_base, monkeypatch
+    ):
+        """A transient clone blip (e.g. a reachability miss during an image
+        rollout) must not kill the job: the bounded retry recovers on a later
+        attempt instead of hard-failing on the first miss.
+        """
+        import src.core.workspace as ws_mod
+
+        monkeypatch.setattr(ws_mod, "_CLONE_BACKOFF_SECONDS", (0, 0))
+        sentinel = object()
+        calls = {"n": 0}
+
+        def _fail_twice_then_ok(*a, **k):
+            calls["n"] += 1
+            return sentinel if calls["n"] >= 3 else None
+
+        monkeypatch.setattr(GitManager, "clone", _fail_twice_then_ok)
+        mgr = ws_mod._clone_repo_with_retry(
+            "http://srw-gitea:3000/x/proj-jobs.git", temp_base, backend=None
+        )
+        assert mgr is sentinel
+        assert calls["n"] == 3
 
     def test_git_directory_created(self, temp_base):
         """Test that .git directory is created."""

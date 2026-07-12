@@ -22,6 +22,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,55 @@ if TYPE_CHECKING:
     from .workspace_backend import WorkspaceBackend
 
 logger = logging.getLogger(__name__)
+
+# Bounded retry for the jobs-repo clone. GitManager.clone returns None on any
+# failure without distinguishing transient (a momentary reachability blip during
+# an image rollout — the common case) from permanent (bad auth/URL), so we retry
+# blindly a few times: a permanent failure only costs a couple of cheap extra
+# attempts before the caller's F29 hard-fail. Removes the single-shot clone that
+# turned a rollout-window blip into a dead project job.
+# docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+_CLONE_ATTEMPTS = 3
+_CLONE_BACKOFF_SECONDS = (2.0, 5.0)  # waits before attempts 2 and 3
+
+
+def _clone_repo_with_retry(
+    url: str,
+    target_path: "Path",
+    *,
+    backend=None,
+    remote_cwd=None,
+    attempts: int = _CLONE_ATTEMPTS,
+) -> Optional["GitManager"]:
+    """Clone with a bounded retry + backoff; returns the GitManager or None.
+
+    ``_CLONE_BACKOFF_SECONDS`` and ``time.sleep`` are read at call time (not bound
+    as defaults) so tests can stub the backoff to zero.
+    """
+    try:
+        from ..managers.git_manager import GitManager
+    except ImportError:
+        from src.managers.git_manager import GitManager
+
+    mgr = None
+    for attempt in range(1, attempts + 1):
+        mgr = GitManager.clone(url, target_path, backend=backend, remote_cwd=remote_cwd)
+        if mgr is not None:
+            if attempt > 1:
+                logger.info("Clone succeeded on attempt %d/%d", attempt, attempts)
+            return mgr
+        if attempt < attempts:
+            delay = _CLONE_BACKOFF_SECONDS[
+                min(attempt - 1, len(_CLONE_BACKOFF_SECONDS) - 1)
+            ]
+            logger.warning(
+                "Clone attempt %d/%d failed; retrying in %.0fs",
+                attempt,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+    return mgr
 
 
 @dataclass
@@ -403,13 +453,10 @@ class WorkspaceManager:
             self.initialize()
             return
 
-        try:
-            from ..managers.git_manager import GitManager
-        except ImportError:
-            from src.managers.git_manager import GitManager
-
-        # 1. Clone jobs repo as workspace root
-        git_mgr = GitManager.clone(
+        # 1. Clone jobs repo as workspace root (bounded retry+backoff — a momentary
+        #    reachability blip during an image rollout must not hard-fail the job on
+        #    the first miss; docs/issues/coincident_infra_error_overrides_reported_job_outcome.md)
+        git_mgr = _clone_repo_with_retry(
             jobs_repo["repo_url"], self._workspace_path, backend=self._backend
         )
         if not git_mgr:
