@@ -129,3 +129,118 @@ def test_reset_upper_raises_on_remount_failure():
 
     with pytest.raises(OverlayMountError):
         mgr.reset_upper(refresh_lower=lambda: None)
+
+
+# ---------------------------------------------------------------------------
+# Session method + POST /cloud-overlay/reset route (status-code contract)
+#
+# Task 10's orchestrator apply flow trusts these codes: 404 = precondition
+# (no overlay to reset — give up), 500 = real failure (retry/alert). The
+# manager error types (OverlayMountError, RcloneMountError) both subclass
+# RuntimeError, so the route must never branch on RuntimeError — that
+# swallowed real failures into the 404 branch (reviewer Critical).
+# ---------------------------------------------------------------------------
+
+
+class _FakeRcloneManager:
+    """Stands in for RcloneMountManager: records refresh_vfs calls, optionally
+    raising — mirrors the real signature (cloud_mount/__init__.py:222)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls = 0
+
+    def refresh_vfs(self, mount_id: str | None = None, *, recursive: bool = True) -> None:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+
+
+def _stub_session(overlay, rclone):
+    """A minimal object carrying the REAL PersistentSession.reset_cloud_overlay
+    (bound), so route tests exercise the genuine session→overlay→refresh chain
+    without constructing a full PersistentSession."""
+    from src.api.persistent_session import PersistentSession
+
+    class _StubSession:
+        reset_cloud_overlay = PersistentSession.reset_cloud_overlay
+
+        def __init__(self) -> None:
+            self.overlay_mount_manager = overlay
+            self.cloud_mount_manager = rclone
+
+    return _StubSession()
+
+
+@pytest.fixture
+def post_reset(monkeypatch):
+    """Install a session stub on the persistent_app module and POST the route."""
+    import src.api.persistent_app as app_mod
+    from fastapi.testclient import TestClient
+
+    app = app_mod.create_persistent_app("dummy_config", "thread-12345678")
+
+    def _post(session):
+        monkeypatch.setattr(app_mod, "_session", session)
+        return TestClient(app).post("/cloud-overlay/reset")
+
+    return _post
+
+
+def test_reset_cloud_overlay_raises_unavailable_when_missing_or_inactive():
+    from src.api.persistent_session import CloudOverlayUnavailable
+
+    # overlay manager present but never mounted -> inactive
+    with pytest.raises(CloudOverlayUnavailable):
+        _stub_session(_manager(FakeRemoteBackend()), _FakeRcloneManager()).reset_cloud_overlay()
+    # no overlay manager at all
+    with pytest.raises(CloudOverlayUnavailable):
+        _stub_session(None, _FakeRcloneManager()).reset_cloud_overlay()
+
+
+def test_route_404_when_no_session_or_no_active_overlay(post_reset):
+    assert post_reset(None).status_code == 404
+    # overlay attr exists but the overlay never mounted -> precondition 404
+    inactive = _stub_session(_manager(FakeRemoteBackend()), _FakeRcloneManager())
+    resp = post_reset(inactive)
+    assert resp.status_code == 404
+    assert "no active cloud overlay" in resp.json()["error"]
+
+
+def test_route_500_on_overlay_mount_error(post_reset):
+    backend = FakeRemoteBackend()
+    mgr = _manager(backend)
+    mgr.mount()
+    backend.outputs_by_script["overlay_remount.sh"] = "__SRW_OVERLAY_FAILED__ rc=3\n"
+
+    resp = post_reset(_stub_session(mgr, _FakeRcloneManager()))
+    assert resp.status_code == 500
+    assert "overlay_remount.sh" in resp.json()["error"]
+
+
+def test_route_500_on_rclone_refresh_error(post_reset):
+    """THE reviewer Critical: RcloneMountError subclasses RuntimeError — a
+    failed lower vfs/refresh must surface as 500 (retry/alert), never be
+    misreported as the 404 give-up branch."""
+    from src.services.cloud_mount import RcloneMountError
+
+    backend = FakeRemoteBackend()
+    mgr = _manager(backend)
+    mgr.mount()
+    rclone = _FakeRcloneManager(error=RcloneMountError("vfs/refresh failed rc=1"))
+
+    resp = post_reset(_stub_session(mgr, rclone))
+    assert resp.status_code == 500
+    assert "vfs/refresh failed" in resp.json()["error"]
+
+
+def test_route_success_returns_ok_true(post_reset):
+    backend = FakeRemoteBackend()
+    mgr = _manager(backend)
+    mgr.mount()
+    rclone = _FakeRcloneManager()
+
+    resp = post_reset(_stub_session(mgr, rclone))
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert rclone.calls == 1  # lower refreshed exactly once, all mounts

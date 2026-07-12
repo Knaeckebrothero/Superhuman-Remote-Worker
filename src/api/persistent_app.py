@@ -27,6 +27,7 @@ from .orchestrator_client import (
     create_orchestrator_client_from_env,
 )
 from .persistent_session import (
+    CloudOverlayUnavailable,
     MemoryUnavailableError,
     PersistentSession,
     resolve_memory_extraction_prompt,
@@ -2177,25 +2178,22 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         flow calls this). In-cluster only, no auth — mirrors the other
         session-control routes above.
         """
-        from src.services.cloud_overlay.overlay_mount import OverlayMountError
-
         overlay = getattr(_session, "overlay_mount_manager", None)
         if _session is None or overlay is None:
             return JSONResponse({"error": "no cloud overlay"}, status_code=404)
         try:
             await asyncio.to_thread(_session.reset_cloud_overlay)
             return JSONResponse({"ok": True})
-        except OverlayMountError as e:
-            # A real script failure (e.g. remount) — NOT the "no active
-            # overlay" precondition below. Must not be caught as 404 even
-            # though OverlayMountError subclasses RuntimeError.
-            logger.exception("Cloud overlay reset script failed for thread %s", _thread_id)
-            return JSONResponse({"error": str(e)}, status_code=500)
-        except RuntimeError as e:
-            # reset_cloud_overlay raises a plain RuntimeError when the overlay
-            # exists but isn't active (mount failed, or already torn down).
+        except CloudOverlayUnavailable as e:
+            # Precondition only (overlay exists but isn't active — mount
+            # failed, or already torn down): 404 = give up, don't retry.
             return JSONResponse({"error": str(e)}, status_code=404)
         except Exception as e:
+            # EVERYTHING else is a real failure and must surface as 500
+            # (retry/alert). This includes OverlayMountError (remount/wipe
+            # script) and RcloneMountError (vfs/refresh) — both subclass
+            # RuntimeError, so no RuntimeError-shaped clause may sit above
+            # this one or real failures get misreported as 404 give-up.
             logger.exception("Failed to reset cloud overlay for thread %s", _thread_id)
             return JSONResponse({"error": str(e)}, status_code=500)
 

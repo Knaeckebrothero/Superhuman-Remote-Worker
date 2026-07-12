@@ -53,6 +53,19 @@ class MemoryUnavailableError(RuntimeError):
     """
 
 
+class CloudOverlayUnavailable(Exception):
+    """Precondition signal for ``POST /cloud-overlay/reset``: no session, no
+    overlay manager, or an inactive overlay — the reset target simply isn't
+    there (route maps it to 404 "give up", never retry).
+
+    Deliberately NOT a ``RuntimeError`` subclass: the mount managers' real
+    failure types (``OverlayMountError``, ``RcloneMountError``) both subclass
+    ``RuntimeError``, so a RuntimeError-based precondition would let a genuine
+    remount/vfs-refresh failure be swallowed into the 404 branch instead of
+    surfacing as a 500 (retry/alert) to the orchestrator caller.
+    """
+
+
 def resolve_memory_extraction_prompt(config: AgentConfig) -> str:
     """Load the memory-extraction prompt through the prompt matrix.
 
@@ -558,7 +571,7 @@ class PersistentSession:
         """
         overlay = self.overlay_mount_manager
         if overlay is None or not overlay.active:
-            raise RuntimeError("no active cloud overlay")
+            raise CloudOverlayUnavailable("no active cloud overlay")
         overlay.reset_upper(refresh_lower=lambda: self.cloud_mount_manager.refresh_vfs())
 
     def _deploy_instruction_files(self) -> None:
