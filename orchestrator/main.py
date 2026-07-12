@@ -14142,9 +14142,10 @@ async def get_job_diff(request: Request, job_id: str) -> dict[str, Any]:
         )
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available.")
-    from services.job_cloud_baseline import get_diff_summary
+    from services.diff_source import GiteaDiffSource
 
-    summary = await get_diff_summary(job=job, gitea_client=gitea_client)
+    diff_source = GiteaDiffSource(job=job, gitea_client=gitea_client)
+    summary = await diff_source.summary()
     if summary is None:
         raise HTTPException(
             status_code=404,
@@ -14153,7 +14154,9 @@ async def get_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     return {
         "job_id": job_id,
         "diff_status": job.get("diff_status"),
-        **summary,
+        "baseline_commit": summary.meta["baseline_commit"],
+        "head_commit": summary.meta["head_commit"],
+        "files": [{"path": f.path, "status": f.status} for f in summary.files],
     }
 
 
@@ -14186,18 +14189,19 @@ async def get_job_diff_file(
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available.")
     repo_name = job.get("repo_name")
-    branch = job.get("branch_name") or "main"
     if not repo_name:
         raise HTTPException(status_code=404, detail="Job repo not found.")
 
-    # Pull the diff summary to learn the file's status (added/modified/deleted).
-    from services.job_cloud_baseline import get_diff_summary
+    from services.diff_source import GiteaDiffSource
 
-    summary = await get_diff_summary(job=job, gitea_client=gitea_client)
+    diff_source = GiteaDiffSource(job=job, gitea_client=gitea_client)
+
+    # Pull the diff summary to learn the file's status (added/modified/deleted).
+    summary = await diff_source.summary()
     if summary is None:
         raise HTTPException(status_code=404, detail="Diff unavailable for this job.")
     file_entry = next(
-        (f for f in summary.get("files", []) if f["path"] == file_path),
+        (f for f in summary.files if f.path == file_path),
         None,
     )
     if file_entry is None:
@@ -14205,23 +14209,19 @@ async def get_job_diff_file(
             status_code=404,
             detail=f"Path '{file_path}' is not in the diff.",
         )
-    status = file_entry["status"]
-    old_content = None
-    new_content = None
-    if status in ("modified", "deleted"):
-        old_content = await gitea_client.get_file_content(
-            repo_name, file_path, ref=baseline
-        )
-    if status in ("modified", "added"):
-        new_content = await gitea_client.get_file_content(
-            repo_name, file_path, ref=branch
+
+    content = await diff_source.file(file_path)
+    if content is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Path '{file_path}' is not in the diff.",
         )
     return {
         "job_id": job_id,
         "path": file_path,
-        "status": status,
-        "old_content": old_content,
-        "new_content": new_content,
+        "status": content.status,
+        "old_content": content.old_content,
+        "new_content": content.new_content,
     }
 
 
