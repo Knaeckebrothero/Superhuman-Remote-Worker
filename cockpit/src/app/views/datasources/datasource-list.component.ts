@@ -21,6 +21,8 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppDialogComponent} from '../../ui/dialog';
+import {AppConfirmNameDialogComponent} from '../../ui/confirm-name-dialog';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
@@ -43,6 +45,7 @@ import {UserService} from '../../core/services/user.service';
     AppSpinnerComponent,
     AppFormFieldComponent,
     AppDialogComponent,
+    AppConfirmNameDialogComponent,
     AppMenuComponent,
     AppMenuItemComponent,
     AppMenuTriggerDirective,
@@ -589,6 +592,51 @@ import {UserService} from '../../core/services/user.service';
               </div>
             }
 
+            <!-- Visibility (publish) — rendered only with the public_datasources
+                 capability; the server enforces regardless. -->
+            @if (capabilities.canPublishDatasources()) {
+              <div class="form-row">
+                <app-form-field
+                  [label]="'datasources.form.visibilityLabel' | transloco"
+                  [hint]="formData.is_global
+                    ? ((formData.type === 'kb'
+                        ? 'datasources.form.visibilityKbHint'
+                        : 'datasources.form.visibilityCredentialHint') | transloco)
+                    : ''"
+                >
+                  <div class="visibility-controls">
+                    <label class="visibility-toggle">
+                      <input
+                        type="checkbox"
+                        [checked]="formData.is_global"
+                        (change)="formData.is_global = $any($event.target).checked"
+                        [disabled]="isSaving()"
+                      >
+                      {{ 'datasources.form.visibilityPublic' | transloco }}
+                    </label>
+                    @if (formData.is_global) {
+                      <div class="access-radio">
+                        <label>
+                          <input type="radio" name="ds-access"
+                            [checked]="formData.read_only"
+                            (change)="formData.read_only = true"
+                            [disabled]="isSaving()">
+                          {{ 'datasources.form.accessReadOnly' | transloco }}
+                        </label>
+                        <label>
+                          <input type="radio" name="ds-access"
+                            [checked]="!formData.read_only"
+                            (change)="formData.read_only = false"
+                            [disabled]="isSaving() || formData.type === 'kb'">
+                          {{ 'datasources.form.accessReadWrite' | transloco }}
+                        </label>
+                      </div>
+                    }
+                  </div>
+                </app-form-field>
+              </div>
+            }
+
             <div class="form-row form-footer">
               <div class="form-actions">
                 @if (formData.type !== 'generic' && formData.type !== 'repository' && !isCredentialFileType()) {
@@ -831,6 +879,21 @@ import {UserService} from '../../core/services/user.service';
         </div>
       }
     </div>
+
+    <!-- Publish confirmation (two tiers: warn / type-the-name) -->
+    <app-confirm-name-dialog
+      [open]="showPublishConfirm()"
+      [title]="'datasources.publishDialog.title' | transloco"
+      [message]="(publishConfirmName() !== null
+        ? 'datasources.publishDialog.rwMessage'
+        : 'datasources.publishDialog.message') | transloco"
+      [requiredName]="publishConfirmName()"
+      [namePrompt]="'datasources.publishDialog.namePrompt' | transloco"
+      [confirmLabel]="'datasources.publishDialog.confirm' | transloco"
+      [cancelLabel]="'datasources.publishDialog.cancel' | transloco"
+      (confirmed)="onPublishConfirmed()"
+      (dismissed)="showPublishConfirm.set(false)"
+    />
 
     <!-- Generated SSH public-key dialog -->
     <app-dialog
@@ -1129,6 +1192,28 @@ import {UserService} from '../../core/services/user.service';
         flex-shrink: 0;
         margin-top: 1px;
         color: var(--warning, var(--text-primary));
+      }
+
+      /* Visibility (publish) section */
+      .visibility-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .visibility-toggle,
+      .access-radio label {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        font-size: 13px;
+        color: var(--text-primary);
+      }
+
+      .access-radio {
+        display: flex;
+        gap: 20px;
       }
 
       /* Repeatable file editor for generic_file type */
@@ -1434,6 +1519,7 @@ export class DatasourceListComponent implements OnInit {
   private readonly transloco = inject(TranslocoService);
   private readonly userService = inject(UserService);
   protected readonly viewport = inject(ViewportService);
+  protected readonly capabilities = inject(CapabilitiesService);
 
   // State signals
   readonly datasources = signal<Datasource[]>([]);
@@ -1441,6 +1527,11 @@ export class DatasourceListComponent implements OnInit {
   readonly typeFilter = signal<string>('all');
   readonly showForm = signal(false);
   readonly editingId = signal<string | null>(null);
+  /** Original datasource in edit mode — publishConfirmTier compares against it. */
+  private editingOriginal: Datasource | null = null;
+  readonly showPublishConfirm = signal(false);
+  /** Name to type in the confirm dialog; null = warn tier (no input). */
+  readonly publishConfirmName = signal<string | null>(null);
   readonly testResults = signal<Record<string, DatasourceTestResult>>({});
   readonly testingIds = signal<Set<string>>(new Set());
   readonly indexStatuses = signal<Record<string, DatasourceIndexStatus>>({});
@@ -1557,6 +1648,8 @@ export class DatasourceListComponent implements OnInit {
     cli_hint: string;
     default_branch: string;
     root_path: string;
+    is_global: boolean;
+    read_only: boolean;
   } = {
     name: '',
     type: 'generic',
@@ -1565,6 +1658,8 @@ export class DatasourceListComponent implements OnInit {
     cli_hint: '',
     default_branch: '',
     root_path: '',
+    is_global: false,
+    read_only: true,
   };
 
   formCredentials: { username: string; password: string } = {
@@ -1607,6 +1702,7 @@ export class DatasourceListComponent implements OnInit {
   }
 
   openEditForm(ds: Datasource): void {
+    this.editingOriginal = ds;
     this.formData = {
       name: ds.name,
       type: ds.type,
@@ -1615,6 +1711,8 @@ export class DatasourceListComponent implements OnInit {
       cli_hint: ds.cli_hint || '',
       default_branch: ds.default_branch || '',
       root_path: ds.config?.root_path || '',
+      is_global: ds.is_global ?? false,
+      read_only: ds.read_only ?? true,
     };
     // F3 (docs/multi_tenancy.md): credentials never come back from the
     // API. The user re-enters them only if they want to change the stored
@@ -1648,6 +1746,7 @@ export class DatasourceListComponent implements OnInit {
     this.showForm.set(false);
     this.editingId.set(null);
     this.formTestResult.set(null);
+    this.showPublishConfirm.set(false);
     this.cancelGenerateSshKey();
     this.closePublicKeyDialog();
     this.resetFormData();
@@ -1752,6 +1851,8 @@ export class DatasourceListComponent implements OnInit {
   onTypeSelect(value: DatasourceType | null): void {
     if (value) {
       this.formData.type = value;
+      // kb datasources are read-only by architecture (OKF org-vault policy).
+      if (value === 'kb') this.formData.read_only = true;
       this.onTypeChange();
     }
   }
@@ -1808,7 +1909,38 @@ export class DatasourceListComponent implements OnInit {
     }
   }
 
+  /** Which confirmation the pending save needs.
+   *  'name' — read-write publish or RO→RW flip (typed-name gate)
+   *  'warn' — newly public, read-only (plain warning)
+   *  null   — private saves, unpublish, RW→RO (exposure-reducing) */
+  publishConfirmTier(): 'name' | 'warn' | null {
+    if (!this.formData.is_global) return null;
+    const prev = this.editingId() ? this.editingOriginal : null;
+    const wasPublic = prev?.is_global === true;
+    const wasRw = wasPublic && prev?.read_only === false;
+    const isRw = !this.formData.read_only && this.formData.type !== 'kb';
+    if (isRw && !wasRw) return 'name';
+    if (!wasPublic) return 'warn';
+    return null;
+  }
+
   saveForm(): void {
+    if (!this.formData.name) return;
+    const tier = this.publishConfirmTier();
+    if (tier) {
+      this.publishConfirmName.set(tier === 'name' ? this.formData.name : null);
+      this.showPublishConfirm.set(true);
+      return;
+    }
+    this.doSave();
+  }
+
+  onPublishConfirmed(): void {
+    this.showPublishConfirm.set(false);
+    this.doSave();
+  }
+
+  doSave(): void {
     if (!this.formData.name) return;
 
     // Warn when creating a repository without credentials
@@ -1834,6 +1966,10 @@ export class DatasourceListComponent implements OnInit {
         config: this.formData.type === 'kb'
           ? {root_path: this.formData.root_path.trim()}
           : undefined,
+        is_global: this.formData.is_global,
+        read_only: this.formData.is_global
+          ? (this.formData.type === 'kb' ? true : this.formData.read_only)
+          : undefined,
       };
 
       this.api.updateDatasource(editId, update).subscribe({
@@ -1847,9 +1983,14 @@ export class DatasourceListComponent implements OnInit {
             this.errorMessage.set(this.transloco.translate('datasources.messages.updateFailed'));
           }
         },
-        error: () => {
+        error: (err) => {
           this.isSaving.set(false);
-          this.errorMessage.set(this.transloco.translate('datasources.messages.updateError'));
+          // Surface the server detail (e.g. the publish-capability 403)
+          // instead of the generic message — mirrors the create path.
+          const detail = err?.error?.detail;
+          this.errorMessage.set(
+            detail || this.transloco.translate('datasources.messages.updateError'),
+          );
         },
       });
     } else {
@@ -1863,6 +2004,10 @@ export class DatasourceListComponent implements OnInit {
         default_branch: this.formData.default_branch || undefined,
         config: this.formData.type === 'kb'
           ? {root_path: this.formData.root_path.trim()}
+          : undefined,
+        is_global: this.formData.is_global,
+        read_only: this.formData.is_global
+          ? (this.formData.type === 'kb' ? true : this.formData.read_only)
           : undefined,
       };
 
@@ -2194,7 +2339,10 @@ export class DatasourceListComponent implements OnInit {
       cli_hint: '',
       default_branch: '',
       root_path: '',
+      is_global: false,
+      read_only: true,
     };
+    this.editingOriginal = null;
     this.formCredentials = { username: '', password: '' };
     this.gitAuthMethod = 'token';
     this.gitSshKey = '';
