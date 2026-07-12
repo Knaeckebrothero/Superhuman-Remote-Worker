@@ -6,7 +6,8 @@ workspace pod. Classification mirrors src/services/cloud_overlay/whiteout.py
 `.wh..wh..opq` sentinel) — constants re-declared because the orchestrator image
 does not ship src/. Whiteouts/opaque dirs are expanded against the etag
 baseline to per-file deletes; targets never in the baseline are no-ops
-(design §11.6 amendment #2).
+(design §11.6 amendment #2). Non-regular members (symlinks/hardlinks/specials)
+cannot exist on WebDAV and are surfaced in `skipped`, never silently dropped.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ _BINARY_SNIFF_BYTES = 8192
 
 
 def _rel(name: str) -> str | None:
-    name = name.lstrip("./")
+    name = name.removeprefix("./")
     if not name.startswith(_UPPER_PREFIX):
         return None
     return name[len(_UPPER_PREFIX):].rstrip("/") or None
@@ -46,6 +47,7 @@ def derive_manifest(
     staged: dict[str, dict] = {}          # rel -> {size, binary}
     whiteout_targets: set[str] = set()    # file-or-dir paths whited out
     opaque_dirs: set[str] = set()
+    skipped: list[dict] = []
 
     with tarfile.open(tar_path, "r") as tf:
         for member in tf:
@@ -64,6 +66,15 @@ def derive_manifest(
                     opaque_dirs.add(rel)
                 continue
             if not member.isreg():
+                # WebDAV/Nextcloud has no symlink/device concept — these can
+                # never be applied to the cloud. Surface them instead of
+                # silently narrowing the review.
+                kind = (
+                    "symlink" if member.issym()
+                    else "hardlink" if member.islnk()
+                    else "special"
+                )
+                skipped.append({"path": rel, "kind": kind})
                 continue
             if base == _OPAQUE_SENTINEL:
                 parent = posixpath.dirname(rel)
@@ -99,4 +110,11 @@ def derive_manifest(
     counts = {"added": 0, "modified": 0, "deleted": 0}
     for e in entries:
         counts[e["status"]] += 1
-    return {"epoch": epoch, "staged_at": staged_at, "counts": counts, "entries": entries}
+    skipped.sort(key=lambda e: e["path"])
+    return {
+        "epoch": epoch,
+        "staged_at": staged_at,
+        "counts": counts,
+        "entries": entries,
+        "skipped": skipped,
+    }
