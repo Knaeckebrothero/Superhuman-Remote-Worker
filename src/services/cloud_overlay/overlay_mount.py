@@ -79,7 +79,10 @@ class OverlayMountManager:
     def unmount(self) -> None:
         try:
             self._run(
-                "overlay_unmount.sh", self._unmount_script(), timeout=45, require_ok=False
+                "overlay_unmount.sh",
+                self._unmount_script(),
+                timeout=45,
+                require_ok=False,
             )
         finally:
             self._active = False
@@ -95,7 +98,9 @@ class OverlayMountManager:
         is untouched throughout; the workspace/cloud symlink already points at
         the merged path from the initial mount, so no symlink work is needed.
         """
-        self._run("overlay_pre_refresh_unmount.sh", self._plain_unmount_script(), timeout=60)
+        self._run(
+            "overlay_pre_refresh_unmount.sh", self._plain_unmount_script(), timeout=60
+        )
         refresh_lower()
         self._run("overlay_remount.sh", self._mount_body_only_script(), timeout=120)
 
@@ -105,7 +110,9 @@ class OverlayMountManager:
         A readdir over the merged view is the only reliable liveness signal —
         /proc/mounts and ``mountpoint -q`` both report "mounted" over a dead
         rclone endpoint (design §11.2)."""
-        out = self._run("overlay_probe.sh", self._probe_script(), timeout=30, require_ok=False)
+        out = self._run(
+            "overlay_probe.sh", self._probe_script(), timeout=30, require_ok=False
+        )
         if _OVERLAY_DEAD in out:
             return False
         return _OVERLAY_OK in out
@@ -118,7 +125,9 @@ class OverlayMountManager:
         ``over_quota``/``quota_guard_message`` fail open rather than wedging
         the shell preflight on an unrelated probe error.
         """
-        out = self._run("overlay_usage.sh", self._usage_script(), timeout=30, require_ok=False)
+        out = self._run(
+            "overlay_usage.sh", self._usage_script(), timeout=30, require_ok=False
+        )
         for line in out.splitlines():
             line = line.strip()
             if not line or line.startswith("__SRW_"):
@@ -155,7 +164,12 @@ class OverlayMountManager:
         Lazy-unmount the overlay FIRST (safe here: the dead lower makes every
         held-FD read fail loudly with ENOTCONN — no silent-staleness window),
         remount the lower via the callback, then remount the overlay."""
-        self._run("overlay_heal_unmount.sh", self._heal_unmount_script(), timeout=60, require_ok=False)
+        self._run(
+            "overlay_heal_unmount.sh",
+            self._heal_unmount_script(),
+            timeout=60,
+            require_ok=False,
+        )
         remount_lower()
         self._run("overlay_remount.sh", self._mount_body_only_script(), timeout=120)
 
@@ -347,7 +361,9 @@ echo "{_OVERLAY_OK}"
 
     # ----------------------------------------------------------- remote exec
 
-    def _run(self, name: str, script: str, *, timeout: int = 30, require_ok: bool = True) -> str:
+    def _run(
+        self, name: str, script: str, *, timeout: int = 30, require_ok: bool = True
+    ) -> str:
         rel = f".cache/srw/overlay/{self.thread_id}/scripts/{name}"
         self.workspace_backend.write_home_file(rel, script)
         script_path = self.workspace_backend.resolve_home_path(rel)

@@ -49,16 +49,17 @@ def _db_with_grant_rows(scoped):
 class TestUserCanPublishDatasource:
     async def test_admin_short_circuits_without_grant_read(self):
         db = _db_with_grant_rows(EMPTY_SCOPES)
-        assert await db.user_can_publish_datasource(
-            {"id": "u1", "is_admin": True}
-        ) is True
+        assert (
+            await db.user_can_publish_datasource({"id": "u1", "is_admin": True}) is True
+        )
         db.list_grants_for_scopes.assert_not_awaited()
 
     async def test_no_rows_denies_by_default(self):
         db = _db_with_grant_rows(EMPTY_SCOPES)
-        assert await db.user_can_publish_datasource(
-            {"id": "u1", "is_admin": False}
-        ) is False
+        assert (
+            await db.user_can_publish_datasource({"id": "u1", "is_admin": False})
+            is False
+        )
 
     async def test_user_scope_grant_allows(self):
         db = _db_with_grant_rows(
@@ -68,16 +69,18 @@ class TestUserCanPublishDatasource:
                 "global": [],
             }
         )
-        assert await db.user_can_publish_datasource(
-            {"id": "u1", "is_admin": False}
-        ) is True
+        assert (
+            await db.user_can_publish_datasource({"id": "u1", "is_admin": False})
+            is True
+        )
 
     async def test_grant_read_failure_fails_closed(self):
         db = PostgresDB.__new__(PostgresDB)
         db.list_grants_for_scopes = AsyncMock(side_effect=RuntimeError("db down"))
-        assert await db.user_can_publish_datasource(
-            {"id": "u1", "is_admin": False}
-        ) is False
+        assert (
+            await db.user_can_publish_datasource({"id": "u1", "is_admin": False})
+            is False
+        )
 
 
 def _created_row(**overrides):
@@ -167,9 +170,7 @@ class TestCreatePublishGate:
             )
         assert fake_db.create_datasource.await_args.kwargs["read_only"] is False
 
-    async def test_private_create_never_calls_gate(
-        self, user_a, fake_db, fake_request
-    ):
+    async def test_private_create_never_calls_gate(self, user_a, fake_db, fake_request):
         from main import DatasourceCreate, create_datasource
 
         fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
@@ -228,9 +229,7 @@ def _wire_owner_update(fake_db, user, existing):
 
 
 class TestUpdatePublishGate:
-    async def test_publish_flip_without_grant_403(
-        self, user_a, fake_db, fake_request
-    ):
+    async def test_publish_flip_without_grant_403(self, user_a, fake_db, fake_request):
         from main import DatasourceUpdate, update_datasource
 
         existing = _wire_owner_update(fake_db, user_a, _existing_private())
@@ -272,9 +271,7 @@ class TestUpdatePublishGate:
         fake_db.user_can_publish_datasource.assert_not_awaited()
         assert fake_db.update_datasource.await_args.kwargs["is_global"] is False
 
-    async def test_ro_to_rw_flip_needs_no_grant(
-        self, user_a, fake_db, fake_request
-    ):
+    async def test_ro_to_rw_flip_needs_no_grant(self, user_a, fake_db, fake_request):
         # Spec: friction for RO→RW is the client-side typed confirmation;
         # the server gate is only on the publish transition.
         from main import DatasourceUpdate, update_datasource

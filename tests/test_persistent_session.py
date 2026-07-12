@@ -635,7 +635,9 @@ class TestSetupCloudMountOverlayFailure:
         fake_rclone_manager = MagicMock()
         fake_rclone_manager.start_all = AsyncMock(return_value=None)
         fake_rclone_manager.mounts = []
-        fake_rclone_manager.aclose = AsyncMock(side_effect=RuntimeError("umount: EBUSY"))
+        fake_rclone_manager.aclose = AsyncMock(
+            side_effect=RuntimeError("umount: EBUSY")
+        )
 
         fake_overlay_manager = MagicMock()
         fake_overlay_manager.mount = MagicMock(side_effect=RuntimeError("overlay boom"))

@@ -73,9 +73,15 @@ def test_reset_upper_script_order_and_content():
         b for p, b in backend.files.items() if p.endswith("overlay_wipe_upper.sh")
     )
     # rm -rf of BOTH upper and work
-    assert "rm -rf /home/agent-host/.overlay/upper /home/agent-host/.overlay/work" in wipe_script
+    assert (
+        "rm -rf /home/agent-host/.overlay/upper /home/agent-host/.overlay/work"
+        in wipe_script
+    )
     # mkdir -p of both, recreated fresh
-    assert "mkdir -p /home/agent-host/.overlay/upper /home/agent-host/.overlay/work" in wipe_script
+    assert (
+        "mkdir -p /home/agent-host/.overlay/upper /home/agent-host/.overlay/work"
+        in wipe_script
+    )
     # NEVER touch the merged mountpoint or the lower
     assert "/cloud/merged" not in wipe_script
     assert "/cloud/lower" not in wipe_script
@@ -150,7 +156,9 @@ class _FakeRcloneManager:
         self.error = error
         self.calls = 0
 
-    def refresh_vfs(self, mount_id: str | None = None, *, recursive: bool = True) -> None:
+    def refresh_vfs(
+        self, mount_id: str | None = None, *, recursive: bool = True
+    ) -> None:
         self.calls += 1
         if self.error is not None:
             raise self.error
@@ -192,7 +200,9 @@ def test_reset_cloud_overlay_raises_unavailable_when_missing_or_inactive():
 
     # overlay manager present but never mounted -> inactive
     with pytest.raises(CloudOverlayUnavailable):
-        _stub_session(_manager(FakeRemoteBackend()), _FakeRcloneManager()).reset_cloud_overlay()
+        _stub_session(
+            _manager(FakeRemoteBackend()), _FakeRcloneManager()
+        ).reset_cloud_overlay()
     # no overlay manager at all
     with pytest.raises(CloudOverlayUnavailable):
         _stub_session(None, _FakeRcloneManager()).reset_cloud_overlay()

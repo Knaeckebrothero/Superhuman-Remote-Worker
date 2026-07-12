@@ -49,7 +49,9 @@ def _make_user() -> dict:
     }
 
 
-def _make_thread(*, protected: bool = True, workspace: bool = True, **meta_over) -> dict:
+def _make_thread(
+    *, protected: bool = True, workspace: bool = True, **meta_over
+) -> dict:
     metadata = {"protected_cloud": protected}
     if workspace:
         metadata["workspace_container"] = {"pod_ip": "10.0.0.5", "port": 30022}
@@ -99,7 +101,11 @@ def _thread_mounts_row(*, mountpoint="MyProject", cloud_handle="proj-1") -> dict
     # those two keys. ``mountpoint`` is NOT a real column (real rows carry
     # ``target_path`` instead); it's included here to drive the display-name
     # resolution the same way tests/cloud_staging/test_manifest.py does.
-    return {"backend_id": "nextcloud", "cloud_handle": cloud_handle, "mountpoint": mountpoint}
+    return {
+        "backend_id": "nextcloud",
+        "cloud_handle": cloud_handle,
+        "mountpoint": mountpoint,
+    }
 
 
 def _snapshot_service(blobs: dict[str, bytes] | None = None):
@@ -136,9 +142,7 @@ def _patch_endpoint(
         )
     else:
         stack.enter_context(
-            patch(
-                "main.require_thread_owner", AsyncMock(return_value=(user, thread))
-            )
+            patch("main.require_thread_owner", AsyncMock(return_value=(user, thread)))
         )
     db = MagicMock()
     db.get_ro_mount_by_thread = AsyncMock(return_value=ro_mount_row)
@@ -167,16 +171,22 @@ class TestCloudDiffSummary:
     async def test_summary_returns_counts_epoch_and_files(self, fake_request):
         user = _make_user()
         thread = _make_thread()
-        tar_bytes = _build_tar([("upper/new.txt", b"hello"), ("upper/mod.txt", b"world")])
+        tar_bytes = _build_tar(
+            [("upper/new.txt", b"hello"), ("upper/mod.txt", b"world")]
+        )
         entries = [
             {"path": "new.txt", "status": "added", "size": 5, "binary": False},
             {"path": "mod.txt", "status": "modified", "size": 5, "binary": False},
         ]
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=7, staged_at="ts-7")
-        row = _mount_row(staged_summary={"signature": "sig", "tar_sha256": "irrelevant"})
+        row = _mount_row(
+            staged_summary={"signature": "sig", "tar_sha256": "irrelevant"}
+        )
         svc = _snapshot_service(
             {
-                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(manifest).encode(),
+                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(
+                    manifest
+                ).encode(),
                 f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
             }
         )
@@ -241,15 +251,21 @@ class TestCloudDiffSummary:
         user = _make_user()
         thread = _make_thread(workspace=False)  # ended thread has no live pod
         tar_bytes = _build_tar([("upper/del.txt", b"")])
-        entries = [{"path": "gone.txt", "status": "deleted", "size": 0, "binary": False}]
-        manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=4, staged_at="ts-ended")
+        entries = [
+            {"path": "gone.txt", "status": "deleted", "size": 0, "binary": False}
+        ]
+        manifest = _manifest(
+            entries, tar_bytes=tar_bytes, epoch=4, staged_at="ts-ended"
+        )
         row = _mount_row(
             status="revoked",
             staged_summary={"signature": "sig", "tar_sha256": "irrelevant"},
         )
         svc = _snapshot_service(
             {
-                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(manifest).encode(),
+                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(
+                    manifest
+                ).encode(),
                 f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
             }
         )
@@ -281,12 +297,18 @@ class TestCloudDiffFile:
         user = _make_user()
         thread = _make_thread()
         tar_bytes = _build_tar([("upper/mod.txt", b"newv")])
-        entries = [{"path": "mod.txt", "status": "modified", "size": 4, "binary": False}]
+        entries = [
+            {"path": "mod.txt", "status": "modified", "size": 4, "binary": False}
+        ]
         manifest = _manifest(entries, tar_bytes=tar_bytes)
-        row = _mount_row(staged_summary={"signature": "sig", "tar_sha256": "irrelevant"})
+        row = _mount_row(
+            staged_summary={"signature": "sig", "tar_sha256": "irrelevant"}
+        )
         svc = _snapshot_service(
             {
-                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(manifest).encode(),
+                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(
+                    manifest
+                ).encode(),
                 f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
             }
         )
@@ -320,12 +342,18 @@ class TestCloudDiffFile:
         user = _make_user()
         thread = _make_thread()
         tar_bytes = _build_tar([("upper/mod.txt", b"newv")])
-        entries = [{"path": "mod.txt", "status": "modified", "size": 4, "binary": False}]
+        entries = [
+            {"path": "mod.txt", "status": "modified", "size": 4, "binary": False}
+        ]
         manifest = _manifest(entries, tar_bytes=tar_bytes)
-        row = _mount_row(staged_summary={"signature": "sig", "tar_sha256": "irrelevant"})
+        row = _mount_row(
+            staged_summary={"signature": "sig", "tar_sha256": "irrelevant"}
+        )
         svc = _snapshot_service(
             {
-                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(manifest).encode(),
+                f"cloud-staging/{THREAD_ID}/manifest.json": json.dumps(
+                    manifest
+                ).encode(),
                 f"cloud-staging/{THREAD_ID}/upper.tar": tar_bytes,
             }
         )
@@ -356,8 +384,9 @@ class TestCloudDiffRestage:
         stack, _db = _patch_endpoint(user=user, thread=thread)
         stage_mock = AsyncMock(return_value={"epoch": 1, "counts": {}})
         main._cloud_stage_tasks.clear()
-        with stack, patch(
-            "services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock
+        with (
+            stack,
+            patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock),
         ):
             result = await main.restage_thread_cloud_diff(THREAD_ID, fake_request)
             assert result == {"scheduled": True}
@@ -395,7 +424,9 @@ class TestCloudDiffRestage:
 class TestOwnerAuthPropagation:
     @pytest.mark.asyncio
     async def test_owner_auth_denied_for_other_user(self, fake_request):
-        denied = AsyncMock(side_effect=HTTPException(status_code=403, detail="Not your thread"))
+        denied = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Not your thread")
+        )
         stack, _db = _patch_endpoint(
             user=_make_user(),
             thread=_make_thread(),

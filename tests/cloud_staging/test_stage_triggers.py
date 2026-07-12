@@ -184,9 +184,7 @@ class TestTeardownStageHook:
         svc, snapshot_service, _ = _make_suspension_service(db)
 
         stage_mock = AsyncMock(side_effect=RuntimeError("ssh capture failed"))
-        with patch(
-            "services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock
-        ):
+        with patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock):
             result = await svc.suspend_thread_workspace("thread-1")
 
         assert result is True
@@ -210,9 +208,7 @@ class TestTeardownStageHook:
         svc, snapshot_service, _ = _make_suspension_service(db)
 
         stage_mock = AsyncMock(return_value={"epoch": 1})
-        with patch(
-            "services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock
-        ):
+        with patch("services.cloud_staging.stage.stage_thread_cloud_diff", stage_mock):
             result = await svc.suspend_thread_workspace("thread-1")
 
         assert result is True

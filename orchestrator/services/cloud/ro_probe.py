@@ -149,6 +149,7 @@ def groupfolders_floor(major: int) -> tuple[int, int, int] | None:
         return (major, 0, 0)
     return None
 
+
 # (verb, note, body-or-None). note documents the side channel; body used
 # for endpoints that need a payload to be a fair test. The historical
 # versions-restore/trash-restore CVE class is NOT covered by a verb here
@@ -530,9 +531,7 @@ async def probe_read_only(
                 # the item out of trash (incl. any 2xx) is a real bypass. The
                 # effect check fails closed — an unverifiable trashbin read is
                 # treated as "not still present" => recorded as a failure.
-                if await _trash_item_still_present(
-                    client, root, username, trash_ref
-                ):
+                if await _trash_item_still_present(client, root, username, trash_ref):
                     continue
                 failures.append(
                     f"{label} -> {status} (item no longer in trash; restore "

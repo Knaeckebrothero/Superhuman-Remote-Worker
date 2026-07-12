@@ -106,7 +106,9 @@ def detect_cloud_delete_risk(command: str) -> CloudScanRisk | None:
             "recursive rm over a cloud mount whiteouts each file (O(files) backend round-trips)"
         )
     if name == "find" and _contains_any(argv, {"-delete"}):
-        return CloudScanRisk("find -delete over a cloud mount whiteouts matches one by one")
+        return CloudScanRisk(
+            "find -delete over a cloud mount whiteouts matches one by one"
+        )
     return None
 
 

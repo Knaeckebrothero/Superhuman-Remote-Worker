@@ -134,7 +134,9 @@ async def apply_staged_diff(
     if sel is None:
         raise StagedApplyError(409, {"code": "no_protected_mount"})
     backend = main_cloud_router.for_backend(row["backend"])
-    handle = ProjectFolderHandle.from_db(str(sel["cloud_handle"]), backend=row["backend"])
+    handle = ProjectFolderHandle.from_db(
+        str(sel["cloud_handle"]), backend=row["backend"]
+    )
 
     src = UpperdirDiffSource(
         thread_id=thread_id,

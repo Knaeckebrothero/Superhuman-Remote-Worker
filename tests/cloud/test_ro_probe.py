@@ -117,9 +117,7 @@ def test_uploads_finalize_destination_targets_the_mount_not_home():
     probes = side_channel_probes(
         "https://cloud/remote.php/dav", "alice", mount_url=mount
     )
-    finalize = next(
-        req for verb, note, req in probes if note == "uploads-finalize"
-    )
+    finalize = next(req for verb, note, req in probes if note == "uploads-finalize")
     assert finalize["headers"]["Destination"].startswith(mount)
     # never the reader's own files/<user> home root
     assert "/files/alice/srw-ro-probe" not in finalize["headers"]["Destination"]
@@ -463,9 +461,13 @@ async def test_trash_restore_500_but_item_still_trashed_is_rejected():
             return _FakeResp(403)
 
     res = await probe_read_only(
-        _Client(), "https://cloud/dav", "f/",
-        dav_root="https://cloud/remote.php/dav", username="alice",
-        version_ref="12345/1", trash_ref=_TRASH_ITEM,
+        _Client(),
+        "https://cloud/dav",
+        "f/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+        version_ref="12345/1",
+        trash_ref=_TRASH_ITEM,
     )
     assert not any("trash-restore" in f for f in res.failures), res.failures
 
@@ -489,9 +491,13 @@ async def test_trash_restore_item_gone_from_trash_is_failure():
             return _FakeResp(403)
 
     res = await probe_read_only(
-        _Client(), "https://cloud/dav", "f/",
-        dav_root="https://cloud/remote.php/dav", username="alice",
-        version_ref="12345/1", trash_ref=_TRASH_ITEM,
+        _Client(),
+        "https://cloud/dav",
+        "f/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+        version_ref="12345/1",
+        trash_ref=_TRASH_ITEM,
     )
     assert res.ok is False
     assert any("trash-restore" in f and "write path open" in f for f in res.failures)
@@ -517,9 +523,13 @@ async def test_trash_restore_unverifiable_trashbin_fails_closed():
             return _FakeResp(403)
 
     res = await probe_read_only(
-        _Client(), "https://cloud/dav", "f/",
-        dav_root="https://cloud/remote.php/dav", username="alice",
-        version_ref="12345/1", trash_ref=_TRASH_ITEM,
+        _Client(),
+        "https://cloud/dav",
+        "f/",
+        dav_root="https://cloud/remote.php/dav",
+        username="alice",
+        version_ref="12345/1",
+        trash_ref=_TRASH_ITEM,
     )
     assert res.ok is False
     assert any("trash-restore" in f for f in res.failures)

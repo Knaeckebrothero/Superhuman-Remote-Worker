@@ -30,7 +30,7 @@ def _rel(name: str) -> str | None:
     name = name.removeprefix("./")
     if not name.startswith(_UPPER_PREFIX):
         return None
-    return name[len(_UPPER_PREFIX):].rstrip("/") or None
+    return name[len(_UPPER_PREFIX) :].rstrip("/") or None
 
 
 def _is_opaque(member: tarfile.TarInfo) -> bool:
@@ -44,8 +44,8 @@ def _is_opaque(member: tarfile.TarInfo) -> bool:
 def derive_manifest(
     tar_path: str, *, baseline: dict[str, str], epoch: int, staged_at: str
 ) -> dict:
-    staged: dict[str, dict] = {}          # rel -> {size, binary}
-    whiteout_targets: set[str] = set()    # file-or-dir paths whited out
+    staged: dict[str, dict] = {}  # rel -> {size, binary}
+    whiteout_targets: set[str] = set()  # file-or-dir paths whited out
     opaque_dirs: set[str] = set()
     skipped: list[dict] = []
 
@@ -70,8 +70,10 @@ def derive_manifest(
                 # never be applied to the cloud. Surface them instead of
                 # silently narrowing the review.
                 kind = (
-                    "symlink" if member.issym()
-                    else "hardlink" if member.islnk()
+                    "symlink"
+                    if member.issym()
+                    else "hardlink"
+                    if member.islnk()
                     else "special"
                 )
                 skipped.append({"path": rel, "kind": kind})
@@ -82,11 +84,13 @@ def derive_manifest(
                     opaque_dirs.add(parent)
                 continue
             if base.startswith(_WH_PREFIX):
-                remainder = base[len(_WH_PREFIX):]
+                remainder = base[len(_WH_PREFIX) :]
                 if not remainder:
                     raise ValueError(f"bare whiteout prefix in upperdir tar: {rel!r}")
                 parent = posixpath.dirname(rel)
-                whiteout_targets.add(posixpath.join(parent, remainder) if parent else remainder)
+                whiteout_targets.add(
+                    posixpath.join(parent, remainder) if parent else remainder
+                )
                 continue
             f = tf.extractfile(member)
             head = f.read(_BINARY_SNIFF_BYTES) if f else b""
@@ -102,8 +106,12 @@ def derive_manifest(
                 deleted.add(path)
 
     entries = [
-        {"path": p, "status": "modified" if p in baseline else "added",
-         "size": meta["size"], "binary": meta["binary"]}
+        {
+            "path": p,
+            "status": "modified" if p in baseline else "added",
+            "size": meta["size"],
+            "binary": meta["binary"],
+        }
         for p, meta in staged.items()
     ] + [{"path": p, "status": "deleted", "size": 0, "binary": False} for p in deleted]
     entries.sort(key=lambda e: e["path"])

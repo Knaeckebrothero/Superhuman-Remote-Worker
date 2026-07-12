@@ -930,8 +930,18 @@ def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
 
 
 def test_protected_cloud_mount_none_for_inactive_or_non_nextcloud():
-    assert _build_protected_cloud_mount({"status": "revoked", "backend": "nextcloud"}, thread_id="t") is None
-    assert _build_protected_cloud_mount({"status": "active", "backend": "opencloud"}, thread_id="t") is None
+    assert (
+        _build_protected_cloud_mount(
+            {"status": "revoked", "backend": "nextcloud"}, thread_id="t"
+        )
+        is None
+    )
+    assert (
+        _build_protected_cloud_mount(
+            {"status": "active", "backend": "opencloud"}, thread_id="t"
+        )
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------
