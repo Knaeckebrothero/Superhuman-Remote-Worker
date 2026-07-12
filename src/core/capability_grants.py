@@ -19,6 +19,10 @@ CATALOG: dict[str, dict[str, Any]] = {
     "vm_workspace": {"type": "bool", "default": False, "restrict_only": True},
     "shell_tools": {"type": "bool", "default": False, "restrict_only": True},
     "delegation": {"type": "bool", "default": False, "restrict_only": True},
+    # Publish datasources org-wide (is_global). Deny-by-default: publishing
+    # hands the publisher's stored credentials to every user's agents.
+    # Spec: docs/features/public_datasources.md
+    "public_datasources": {"type": "bool", "default": False, "restrict_only": True},
     "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
     "browser": {"type": "bool", "default": True, "restrict_only": True},
     "model_selection": {"type": "list", "default": None, "restrict_only": True},
