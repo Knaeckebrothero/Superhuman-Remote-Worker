@@ -167,6 +167,20 @@ SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 # ``migrations_dir`` constructor kwarg on ``PostgresDB``; lifespan + init
 # wire each instance to its own subdir.
 MIGRATIONS_APP_DIR = Path(__file__).parent / "migrations" / "app"
+
+# --- Job execution lease (docs/features/job_execution_lease.md) -------------
+# Pickup lease: set atomically by claim_job_for_agent, covers the dispatch
+# POST + agent init + workspace connect. If the pod is dead or never accepts,
+# nothing renews and the job recovers by expiry — this is what makes the
+# dispatcher's claim-then-notify-without-rollback design sound.
+JOB_LEASE_PICKUP_SECONDS = 180
+# Run lease: renewed by the agent's 5s heartbeats (18 missed beats of slack).
+JOB_LEASE_RUN_SECONDS = 90
+# Renewal write throttle: skip the UPDATE while more than this much lease
+# remains, so the 5s heartbeat doesn't churn the row (trigger bumps
+# updated_at + the partial index makes lease writes non-HOT). Effective
+# renewal write rate: about one per (RUN - THROTTLE) = 30s per running job.
+JOB_LEASE_RENEW_BELOW_SECONDS = 60
 MIGRATIONS_VECTOR_DIR = Path(__file__).parent / "migrations" / "vector"
 MIGRATIONS_AUDIT_DIR = Path(__file__).parent / "migrations" / "audit"
 
@@ -1722,7 +1736,12 @@ class PostgresDB:
         return int(new_round) if new_round is not None else 0
 
     async def increment_job_llm_outage_attempt(
-        self, job_id: str, *, now: datetime, reset_window_seconds: int
+        self,
+        job_id: str,
+        *,
+        now: datetime,
+        reset_window_seconds: int,
+        fingerprint: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Atomically advance ``context.llm_outage`` for an ``llm_unavailable`` pause.
 
@@ -1791,6 +1810,11 @@ class PostgresDB:
                     "attempt": attempt,
                     "first_failed_at": first_dt.isoformat(),
                     "last_failed_at": now_utc.isoformat(),
+                    # Determinism fail-fast (completion.llm_outage_fingerprint):
+                    # overwritten every pause, so the comparison in
+                    # determine_job_status is strictly consecutive-identical.
+                    # None (non-4xx / outage-shaped error) breaks any streak.
+                    "fingerprint": fingerprint,
                 }
                 await conn.execute(
                     """
@@ -2713,6 +2737,33 @@ class PostgresDB:
             if result != "UPDATE 1":
                 return None
 
+            # Job execution lease renewal (docs/features/job_execution_lease.md):
+            # a heartbeat that carries a job renews that job's lease — liveness
+            # by renewal, no dependency on agent-row reconciliation. The
+            # assigned_agent_id guard fences an agent that lost the job (it
+            # cannot extend a lease it no longer owns); the throttle predicate
+            # skips the write while >JOB_LEASE_RENEW_BELOW_SECONDS remain so
+            # 5s heartbeats don't churn the row.
+            if job_uuid is not None and status == "working":
+                await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET lease_expires_at = NOW() + make_interval(secs => $3::int)
+                     WHERE id = $1
+                       AND assigned_agent_id = $2
+                       AND status = 'processing'
+                       AND (
+                           lease_expires_at IS NULL
+                           OR lease_expires_at
+                              < NOW() + make_interval(secs => $4::int)
+                       )
+                    """,
+                    job_uuid,
+                    uuid_val,
+                    JOB_LEASE_RUN_SECONDS,
+                    JOB_LEASE_RENEW_BELOW_SECONDS,
+                )
+
             if prev_status == "draining":
                 effective_status = "draining"
             elif prev_status == "offline":
@@ -2955,6 +3006,42 @@ class PostgresDB:
             count += int(result4.split()[1])
         return count
 
+    async def recover_expired_lease_jobs(self) -> List[str]:
+        """Pause processing jobs whose execution lease has expired.
+
+        The lease is the direct liveness signal (docs/features/
+        job_execution_lease.md): ``claim_job_for_agent`` sets a pickup lease,
+        the assigned agent's heartbeats renew it, and expiry — checked purely
+        against the DATABASE clock — IS the definition of orphaned. Unlike
+        :meth:`recover_orphaned_jobs` this needs no join to ``agents``, no
+        offline-marking to have run first, and no sweep ordering; it is the
+        primary recovery path, with the agents-table sweep kept as
+        belt-and-suspenders during the soak (see the feature doc's rollout).
+
+        ``lease_expires_at IS NOT NULL`` keeps pre-lease rows (claimed before
+        the deploy, never backfilled) with the legacy sweep instead of
+        recovering them instantly.
+
+        Returns:
+            The recovered job ids (callers log each — an expired lease is an
+            incident signal, not routine noise).
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE jobs
+                   SET status = 'paused',
+                       assigned_agent_id = NULL,
+                       lease_expires_at = NULL,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE status = 'processing'
+                   AND lease_expires_at IS NOT NULL
+                   AND lease_expires_at < NOW()
+                RETURNING id
+                """
+            )
+        return [str(row["id"]) for row in rows]
+
     async def cancel_stale_verification_subjobs(self, stale_hours: int = 6) -> int:
         """Cancel orphaned critic/verification subjobs that can never progress.
 
@@ -3090,6 +3177,9 @@ class PostgresDB:
                 UPDATE jobs
                    SET status = 'processing',
                        assigned_agent_id = $2,
+                       lease_expires_at = NOW() + make_interval(
+                           secs => $3::int
+                       ),
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1
                    AND assigned_agent_id IS NULL
@@ -3098,6 +3188,7 @@ class PostgresDB:
                 """,
                 job_uuid,
                 agent_uuid,
+                JOB_LEASE_PICKUP_SECONDS,
             )
             return row is not None
 

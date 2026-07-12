@@ -175,7 +175,7 @@ class TestCancelHardKillResets:
 
 class TestFinalIdleStatusOnExit:
     """Finding 5 of
-    docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md:
+    docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md:
     a one-shot worker's final heartbeat must not assert 'ready' — the process
     exits ~2s later, and a fresh-looking 'ready' row lets the dispatcher
     claim a job for the dead pod during the ~3-min offline window."""

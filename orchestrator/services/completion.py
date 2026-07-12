@@ -12,10 +12,12 @@ such as scholar spawning.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import random
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -393,6 +395,40 @@ def _parse_ts(value: Any) -> datetime | None:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
+def llm_outage_fingerprint(fd: dict[str, Any]) -> str | None:
+    """Fingerprint a deterministic request-rejection error, or None.
+
+    Feeds the fail-fast in ``determine_job_status``: an ``llm_unavailable``
+    pause whose normalized error text is IDENTICAL to the previous pause's is
+    deterministic — retrying cannot fix the input (the 2026-07-11 `6a186c76`
+    poisoned-tool-call incident burned 12 requests + would have burned the
+    whole give-up ceiling; see docs/features/outbound_message_hygiene.md).
+
+    Deliberately narrow: only request-shaped 4xx rejections qualify. A genuine
+    endpoint outage (timeouts, connection errors, 5xx) repeats an identical
+    generic message the whole time the provider is down and MUST keep
+    pausing/retrying — that is the outage feature's entire purpose. 429/rate
+    texts are excluded too (they have their own handling upstream).
+
+    Normalization strips long ids (request ids, tool_call ids, uuids) and all
+    digits so two cycles of the same rejection hash identically.
+    """
+    src = str(fd.get("error_summary") or fd.get("reason") or "")
+    if not src:
+        return None
+    low = src.lower()
+    if "429" in low or "rate limit" in low or "too many requests" in low:
+        return None
+    if not re.search(r"\b4\d\d\b", low):
+        return None
+    # {20,} not shorter: ids (uuids, request ids, tool_call ids) are 20+ chars
+    # while semantic tokens like 'bad_request_error' (17) must survive so
+    # different error TYPES keep distinct fingerprints.
+    norm = re.sub(r"[a-z0-9_-]{20,}", "<tok>", low)
+    norm = re.sub(r"\d+", "<n>", norm)
+    return hashlib.sha256(norm[:500].encode("utf-8")).hexdigest()[:16]
+
+
 def evaluate_llm_outage(ctx: dict[str, Any], now: datetime) -> dict[str, Any]:
     """Decide an ``llm_unavailable`` freeze: apply the auto-reset + give-up ceiling.
 
@@ -657,6 +693,26 @@ def determine_job_status(
                 + (f" (model '{model}')" if model else "")
                 + ". Check the model endpoint/provider (Admin → Models).",
             )
+        # Determinism fail-fast: a request-shaped 4xx whose normalized text is
+        # identical to the PREVIOUS pause's is deterministic — a third, fourth,
+        # ... cycle can only burn the give-up ceiling. Genuine outages never
+        # enter here (llm_outage_fingerprint returns None for connection/5xx/
+        # rate errors). docs/features/outbound_message_hygiene.md (layer 3).
+        fp = llm_outage_fingerprint(fd)
+        if fp is not None:
+            prior = _parse_context(job).get("llm_outage")
+            if isinstance(prior, dict) and prior.get("fingerprint") == fp:
+                summary = fd.get("error_summary") or fd.get("reason") or "LLM error"
+                return (
+                    "failed",
+                    "Deterministic LLM request rejection — the identical "
+                    "(normalized) error failed two consecutive backoff cycles; "
+                    f"retrying cannot fix this input. Last error: "
+                    f"{str(summary)[:200]}. The request/history is likely "
+                    "poisoned or the model config is wrong — resume with "
+                    "feedback (compacts context) or fix the model "
+                    "(Admin → Models).",
+                )
         return ("paused", None)
     if is_loop_job:
         # Non-completion stop with no recognized freeze on an unattended loop

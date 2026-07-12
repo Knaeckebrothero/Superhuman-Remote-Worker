@@ -29,6 +29,7 @@ def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
     db.mark_orphaned_threads_ended = AsyncMock(return_value=[])
     db.mark_orphaned_threads_suspended = AsyncMock(return_value=[])
     db.recover_orphaned_jobs = AsyncMock(return_value=0)
+    db.recover_expired_lease_jobs = AsyncMock(return_value=[])
     db.gc_offline_agents = AsyncMock(return_value=0)
     return db
 
@@ -87,7 +88,7 @@ async def test_step_failure_does_not_block_downstream_recovery():
     Regression for the 2026-07-11 incident: a bind-type crash in the
     graph-progress sweep aborted the shared try block and silently disabled
     recover_orphaned_jobs (and every other downstream step) for ~36h. See
-    docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+    docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
     """
     shutdown_event = asyncio.Event()
     db = _mock_db(shutdown_event)
@@ -111,4 +112,45 @@ async def test_step_failure_does_not_block_downstream_recovery():
     db.mark_orphaned_threads_ended.assert_awaited_once()
     db.mark_orphaned_threads_suspended.assert_awaited_once()
     db.recover_orphaned_jobs.assert_awaited_once()
+    db.recover_expired_lease_jobs.assert_awaited_once()
+    db.gc_offline_agents.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lease_expiry_recovery_runs_and_triggers_dispatch():
+    """Expired-lease jobs are recovered and re-dispatched, independent of the
+    agents-table sweeps (docs/features/job_execution_lease.md)."""
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.recover_expired_lease_jobs = AsyncMock(return_value=["job-a", "job-b"])
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch") as trigger_dispatch,
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    db.recover_expired_lease_jobs.assert_awaited_once()
+    trigger_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_lease_recovery_survives_orphan_recovery_failure():
+    """The lease sweep is the PRIMARY recovery path — a failure in the legacy
+    agents-join sweep must not take it down (per-step isolation)."""
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.recover_orphaned_jobs = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch", MagicMock()),
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    db.recover_expired_lease_jobs.assert_awaited_once()
     db.gc_offline_agents.assert_awaited_once()

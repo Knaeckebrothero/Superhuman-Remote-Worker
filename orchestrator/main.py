@@ -615,7 +615,7 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
         alternative: a bind-type bug in the graph-progress sweep silently
         disabled orphan-job recovery (and everything else after it) for ~36h
         because all steps shared one try block. See
-        docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+        docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
         Returns None on failure — callers treat that as "no rows".
         """
         try:
@@ -734,6 +734,24 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 logger.info(
                     f"Recovered {recovered} orphaned job(s) from offline agents"
                 )
+                _trigger_dispatch()
+
+            # 4b. Job execution lease: expired lease == orphaned, decided
+            # purely by the DB clock — no agents-table join, no dependency on
+            # step 1 having run. Primary recovery going forward; step 4 stays
+            # as belt-and-suspenders during the soak
+            # (docs/features/job_execution_lease.md).
+            expired = await _step(
+                "lease_expiry_recovery", postgres_db.recover_expired_lease_jobs()
+            )
+            for _job_id in expired or []:
+                logger.warning(
+                    "Job %s recovered by lease expiry — its agent stopped "
+                    "renewing (pod died, wedged, or a failed dispatch handoff); "
+                    "re-queued for dispatch",
+                    _job_id,
+                )
+            if expired:
                 _trigger_dispatch()
 
             # 5. GC: drop offline agent rows older than 24h
@@ -12313,6 +12331,7 @@ async def complete_job(
                 from services.completion import (
                     LLM_OUTAGE_RESET_WINDOW_SECONDS,
                     llm_outage_backoff_seconds,
+                    llm_outage_fingerprint,
                 )
 
                 _now = datetime.now(timezone.utc)
@@ -12320,6 +12339,7 @@ async def complete_job(
                     job_id,
                     now=_now,
                     reset_window_seconds=LLM_OUTAGE_RESET_WINDOW_SECONDS,
+                    fingerprint=llm_outage_fingerprint(_lfd),
                 )
                 _attempt = _adv["attempt"]
                 _ra = _lfd.get("retry_after_seconds")

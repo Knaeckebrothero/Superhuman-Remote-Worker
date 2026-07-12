@@ -14,7 +14,7 @@ Not yet implemented.
 > to stop the bleeding; it does **not** discharge this work.
 
 > **Third motivating incident (2026-07-12):**
-> [`docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md`](../issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md)
+> [`docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md`](../done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md)
 > — a bind-type bug in one sweep inside `stale_agent_detector`'s single `try`
 > block silently disabled orphan-job recovery (and four other reconciliation
 > concerns) cluster-wide for ~36 h; two loop jobs wedged permanently. Two

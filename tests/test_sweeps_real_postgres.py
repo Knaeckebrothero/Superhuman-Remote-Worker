@@ -1,7 +1,7 @@
 """Execute every background-sweep query against a REAL Postgres server.
 
 Regression guard for the 2026-07-11 incident
-(docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md):
+(docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md):
 a bind-type bug (`($1 || ' minutes')::INTERVAL` typed $1 as text, caller
 passed int) shipped because the unit tests mock ``conn.execute`` — asyncpg's
 parameter typing is only exercised against a real server. Running each sweep
@@ -68,6 +68,7 @@ SWEEPS = [
         lambda db: db.mark_orphaned_threads_suspended(),
     ),
     ("recover_orphaned_jobs", lambda db: db.recover_orphaned_jobs()),
+    ("recover_expired_lease_jobs", lambda db: db.recover_expired_lease_jobs()),
     ("gc_offline_agents", lambda db: db.gc_offline_agents(retention_hours=24)),
     (
         "cancel_stale_verification_subjobs",
@@ -152,3 +153,94 @@ async def test_all_sweeps_prepare_and_bind_against_real_postgres():
     assert not failures, "sweep queries failed against real Postgres:\n" + "\n".join(
         failures
     )
+
+
+@pytest.mark.asyncio
+async def test_job_execution_lease_lifecycle_against_real_postgres():
+    """Semantic check of the lease (docs/features/job_execution_lease.md):
+    claim sets a pickup lease; an expired lease recovers to paused/unassigned;
+    NULL-lease (pre-deploy) rows are left to the legacy sweep."""
+    import asyncpg
+
+    from orchestrator.database.postgres import PostgresDB
+
+    test_db_name = f"srw_lease_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(SWEEP_TEST_PG_DSN)
+    try:
+        await admin.execute(f'CREATE DATABASE "{test_db_name}"')
+    finally:
+        await admin.close()
+
+    base, _, _ = SWEEP_TEST_PG_DSN.rpartition("/")
+    test_dsn = f"{base}/{test_db_name}"
+
+    db = None
+    try:
+        schema_conn = await asyncpg.connect(test_dsn)
+        try:
+            await schema_conn.execute(SCHEMA_FILE.read_text())
+        finally:
+            await schema_conn.close()
+
+        db = PostgresDB(
+            connection_string=test_dsn, min_connections=1, max_connections=2
+        )
+        await db.connect()
+
+        async with db.acquire() as conn:
+            job_id = await conn.fetchval(
+                "INSERT INTO jobs (description, status) "
+                "VALUES ('lease test', 'created') RETURNING id"
+            )
+            agent_id = await conn.fetchval(
+                "INSERT INTO agents (config_name, hostname, status) "
+                "VALUES ('defaults', 'lease-test-agent', 'ready') RETURNING id"
+            )
+
+        # Claim sets the pickup lease.
+        assert await db.claim_job_for_agent(str(job_id), str(agent_id))
+        async with db.acquire() as conn:
+            lease = await conn.fetchval(
+                "SELECT lease_expires_at FROM jobs WHERE id = $1", job_id
+            )
+        assert lease is not None
+
+        # Fresh lease: the sweep must NOT touch it.
+        assert await db.recover_expired_lease_jobs() == []
+
+        # Expired lease: recovered to paused/unassigned.
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET lease_expires_at = NOW() - interval '1 second' "
+                "WHERE id = $1",
+                job_id,
+            )
+        recovered = await db.recover_expired_lease_jobs()
+        assert recovered == [str(job_id)]
+        async with db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, assigned_agent_id, lease_expires_at "
+                "FROM jobs WHERE id = $1",
+                job_id,
+            )
+        assert row["status"] == "paused"
+        assert row["assigned_agent_id"] is None
+        assert row["lease_expires_at"] is None
+
+        # NULL-lease processing row (pre-deploy shape): left alone.
+        async with db.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO jobs (description, status) "
+                "VALUES ('legacy processing', 'processing')"
+            )
+        assert await db.recover_expired_lease_jobs() == []
+    finally:
+        if db is not None:
+            await db.disconnect()
+        admin = await asyncpg.connect(SWEEP_TEST_PG_DSN)
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{test_db_name}" WITH (FORCE)'
+            )
+        finally:
+            await admin.close()

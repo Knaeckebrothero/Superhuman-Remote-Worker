@@ -14,8 +14,10 @@ References:
 - LangGraph: Manage Conversation History
 """
 
+import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
@@ -341,6 +343,207 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
             f"result(s), stripped {stripped_calls} orphaned tool call(s)"
         )
     return repaired
+
+
+def _try_repair_json_object(raw: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort repair of a malformed JSON-object string.
+
+    Handles the shapes models actually emit when a generation degrades:
+    prose/markdown fences around the object, trailing commas, and mid-string
+    truncation. Returns the parsed dict, or None if the string can't be
+    coaxed into a JSON object (non-object JSON also returns None — tool
+    arguments must be objects).
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+
+    def _loads(text: str) -> Optional[Dict[str, Any]]:
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    parsed = _loads(s)
+    if parsed is not None:
+        return parsed
+
+    # Trim prose/fences around the outermost object.
+    start = s.find("{")
+    if start == -1:
+        return None
+    s = s[start:]
+    end = s.rfind("}")
+    if end != -1:
+        parsed = _loads(s[: end + 1])
+        if parsed is not None:
+            return parsed
+
+    # Trailing commas: {"a": 1,} / [1, 2,].
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    parsed = _loads(s)
+    if parsed is not None:
+        return parsed
+
+    # Truncation: close an open string, then unwind the bracket stack.
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for ch in s:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    candidate = s + ('"' if in_string else "") + "".join(reversed(stack))
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    return _loads(candidate)
+
+
+def repair_tool_call_arguments(msg: BaseMessage, *, note: bool = True) -> BaseMessage:
+    """Repair or scrub tool calls whose arguments are not valid JSON.
+
+    Models occasionally emit a tool call whose ``arguments`` string is broken
+    JSON (observed from MiniMax-M3 after a 441s generation — the 2026-07-11
+    job `6a186c76` incident). LangChain parks the parse failure in
+    ``invalid_tool_calls``, but the RAW malformed string survives in
+    ``additional_kwargs["tool_calls"]`` — and once checkpointed it is
+    replayed to the provider on every subsequent request. MiniMax validates
+    history tool calls on input and rejects its own prior output with a
+    deterministic ``400 bad_request_error: invalid function arguments json
+    string``, permanently poisoning the job/session
+    (docs/features/outbound_message_hygiene.md).
+
+    Repair-first: a call whose arguments ``_try_repair_json_object`` can fix
+    is promoted into ``tool_calls`` (raw entry rewritten) so it executes
+    normally. Unrepairable calls are removed everywhere; with ``note=True``
+    (ingestion) a short note is appended to the message content so the model
+    knows the call was discarded. Pairing stays intact by construction — an
+    invalid call never had a result message.
+
+    Mutates ``msg`` in place (AIMessage and AIMessageChunk) and returns it.
+    No-ops on non-AI messages and well-formed messages.
+    """
+    if not isinstance(msg, AIMessage):
+        return msg
+
+    kwargs = getattr(msg, "additional_kwargs", None)
+    raw_entries = kwargs.get("tool_calls") if isinstance(kwargs, dict) else None
+    if not isinstance(raw_entries, list):
+        raw_entries = None
+
+    repaired_names: List[str] = []
+    dropped_names: List[str] = []
+
+    def _raw_rewrite(call_id: Optional[str], fixed: Dict[str, Any]) -> None:
+        for entry in raw_entries or []:
+            fn = entry.get("function") if isinstance(entry, dict) else None
+            if isinstance(fn, dict) and (call_id is None or entry.get("id") == call_id):
+                if (
+                    call_id is not None
+                    or _try_repair_json_object(fn.get("arguments")) == fixed
+                ):
+                    fn["arguments"] = json.dumps(fixed)
+
+    def _raw_remove(call_id: Optional[str]) -> None:
+        if raw_entries is None:
+            return
+        if call_id is not None:
+            raw_entries[:] = [
+                e
+                for e in raw_entries
+                if not (isinstance(e, dict) and e.get("id") == call_id)
+            ]
+
+    # 1. LangChain-detected parse failures.
+    for itc in list(getattr(msg, "invalid_tool_calls", None) or []):
+        name = itc.get("name") or "unknown_tool"
+        call_id = itc.get("id")
+        fixed = _try_repair_json_object(itc.get("args"))
+        if fixed is not None:
+            msg.tool_calls = list(msg.tool_calls or []) + [
+                {"name": name, "args": fixed, "id": call_id, "type": "tool_call"}
+            ]
+            _raw_rewrite(call_id, fixed)
+            repaired_names.append(name)
+        else:
+            _raw_remove(call_id)
+            dropped_names.append(name)
+    if getattr(msg, "invalid_tool_calls", None):
+        msg.invalid_tool_calls = []
+
+    # 2. Raw-entry sweep — catches malformed arguments that bypassed
+    #    LangChain's parser (checkpoint round-trips, provider quirks).
+    for entry in list(raw_entries or []):
+        fn = entry.get("function") if isinstance(entry, dict) else None
+        raw_args = fn.get("arguments") if isinstance(fn, dict) else None
+        if not isinstance(raw_args, str):
+            continue
+        try:
+            if isinstance(json.loads(raw_args), dict):
+                continue
+        except (ValueError, TypeError):
+            pass
+        name = fn.get("name") or "unknown_tool"
+        fixed = _try_repair_json_object(raw_args)
+        if fixed is not None:
+            fn["arguments"] = json.dumps(fixed)
+            repaired_names.append(name)
+        else:
+            raw_entries.remove(entry)
+            call_id = entry.get("id")
+            if call_id and msg.tool_calls:
+                msg.tool_calls = [
+                    tc for tc in msg.tool_calls if tc.get("id") != call_id
+                ]
+            dropped_names.append(name)
+
+    if not repaired_names and not dropped_names:
+        return msg
+
+    logger.warning(
+        f"repair_tool_call_arguments: repaired {repaired_names or 'none'}, "
+        f"discarded {dropped_names or 'none'} (malformed JSON arguments)"
+    )
+    if dropped_names:
+        notice = (
+            f"[system note: {len(dropped_names)} tool call(s) "
+            f"({', '.join(dropped_names)}) had unparseable JSON arguments and "
+            f"were discarded — re-issue with valid JSON if still needed]"
+        )
+        if note and isinstance(msg.content, str):
+            msg.content = f"{msg.content}\n\n{notice}" if msg.content else notice
+        elif not msg.content and not msg.tool_calls:
+            # History scrub of a now-empty assistant message: keep a stub so
+            # providers that reject empty assistant turns don't 400.
+            msg.content = notice
+    return msg
+
+
+def scrub_history_tool_call_arguments(
+    messages: List[BaseMessage],
+) -> List[BaseMessage]:
+    """Send-time backstop: run the argument repair over every AIMessage.
+
+    Catches poison already sitting in old checkpoints (jobs/sessions frozen
+    before the ingestion repair shipped) and anything a future ingestion-path
+    bug lets through. Cost: one ``json.loads`` per historical raw tool call —
+    negligible against an LLM round-trip. Mutations self-heal the checkpoint
+    at its next write.
+    """
+    for m in messages:
+        if isinstance(m, AIMessage):
+            repair_tool_call_arguments(m, note=False)
+    return messages
 
 
 # Try to import tiktoken for accurate token counting
