@@ -78,3 +78,133 @@ class TestUserCanPublishDatasource:
         assert await db.user_can_publish_datasource(
             {"id": "u1", "is_admin": False}
         ) is False
+
+
+def _created_row(**overrides):
+    row = {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "name": "Org Wiki",
+        "description": None,
+        "type": "repository",
+        "connection_url": "https://github.com/org/wiki",
+        "credentials": {"auth_method": "token", "token": "secret"},
+        "config": {},
+        "job_id": None,
+        "cli_hint": None,
+        "default_branch": None,
+        "created_by": "user-a",
+        "is_global": True,
+        "read_only": True,
+        "created_at": "2026-07-11T00:00:00Z",
+        "updated_at": "2026-07-11T00:00:00Z",
+    }
+    row.update(overrides)
+    return row
+
+
+class TestCreatePublishGate:
+    async def test_publish_without_grant_403(self, user_a, fake_db, fake_request):
+        from main import DatasourceCreate, create_datasource
+
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
+        fake_db.create_datasource = AsyncMock()
+        with _patch_caller_and_db(user_a, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await create_datasource(
+                    DatasourceCreate(
+                        name="Org Wiki",
+                        type="repository",
+                        connection_url="https://github.com/org/wiki",
+                        is_global=True,
+                    ),
+                    fake_request,
+                )
+        assert exc.value.status_code == 403
+        assert "public_datasources" in exc.value.detail
+        fake_db.create_datasource.assert_not_awaited()
+
+    async def test_publish_with_grant_defaults_read_only_true(
+        self, user_a, fake_db, fake_request
+    ):
+        from main import DatasourceCreate, create_datasource
+
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
+        fake_db.create_datasource = AsyncMock(return_value=_created_row())
+        with _patch_caller_and_db(user_a, fake_db):
+            result = await create_datasource(
+                DatasourceCreate(
+                    name="Org Wiki",
+                    type="repository",
+                    connection_url="https://github.com/org/wiki",
+                    is_global=True,
+                ),
+                fake_request,
+            )
+        kwargs = fake_db.create_datasource.await_args.kwargs
+        assert kwargs["is_global"] is True
+        assert kwargs["read_only"] is True  # defaulted on publish
+        assert "secret" not in str(result.get("credentials"))  # still redacted
+
+    async def test_publish_read_write_with_grant_keeps_false(
+        self, user_a, fake_db, fake_request
+    ):
+        from main import DatasourceCreate, create_datasource
+
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
+        fake_db.create_datasource = AsyncMock(
+            return_value=_created_row(read_only=False)
+        )
+        with _patch_caller_and_db(user_a, fake_db):
+            await create_datasource(
+                DatasourceCreate(
+                    name="Org Wiki",
+                    type="repository",
+                    connection_url="https://github.com/org/wiki",
+                    is_global=True,
+                    read_only=False,
+                ),
+                fake_request,
+            )
+        assert fake_db.create_datasource.await_args.kwargs["read_only"] is False
+
+    async def test_private_create_never_calls_gate(
+        self, user_a, fake_db, fake_request
+    ):
+        from main import DatasourceCreate, create_datasource
+
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=False)
+        fake_db.create_datasource = AsyncMock(
+            return_value=_created_row(is_global=False, read_only=None)
+        )
+        with _patch_caller_and_db(user_a, fake_db):
+            await create_datasource(
+                DatasourceCreate(
+                    name="Mine",
+                    type="repository",
+                    connection_url="https://github.com/me/mine",
+                ),
+                fake_request,
+            )
+        fake_db.user_can_publish_datasource.assert_not_awaited()
+        assert fake_db.create_datasource.await_args.kwargs["read_only"] is None
+
+    async def test_kb_read_write_flag_400(self, user_a, fake_db, fake_request):
+        from main import DatasourceCreate, create_datasource
+
+        fake_db.user_can_publish_datasource = AsyncMock(return_value=True)
+        fake_db.create_datasource = AsyncMock()
+        with _patch_caller_and_db(user_a, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await create_datasource(
+                    DatasourceCreate(
+                        name="Org KB",
+                        type="kb",
+                        connection_url="https://github.com/org/kb",
+                        is_global=True,
+                        read_only=False,
+                    ),
+                    fake_request,
+                )
+        assert exc.value.status_code == 400
+        assert "read-only" in exc.value.detail
+        fake_db.create_datasource.assert_not_awaited()
