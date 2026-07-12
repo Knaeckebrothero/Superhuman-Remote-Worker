@@ -1,6 +1,6 @@
 # Public Datasources: grant-gated org-wide publishing
 
-Status: **PROPOSED / DESIGN — approved in review 2026-07-11, not implemented**
+Status: **IMPLEMENTED on develop 2026-07-12 — pending dev-deploy verification**
 Date: 2026-07-11
 Scope: orchestrator (grant catalog, datasource create/update API, one migration),
 Cockpit (datasource modal, badges, confirmation dialogs). Builds on
