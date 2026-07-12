@@ -52,7 +52,7 @@ One new entry in the grant catalog (`src/core/capability_grants.py::CATALOG`):
 
 ### 2. Data model
 
-One new column (migration `0055_datasources_read_only.sql`):
+One new column (migration `0056_datasources_read_only.sql`):
 
 ```sql
 ALTER TABLE datasources ADD COLUMN IF NOT EXISTS read_only BOOLEAN;
