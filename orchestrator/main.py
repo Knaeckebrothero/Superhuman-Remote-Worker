@@ -5253,6 +5253,18 @@ class DatasourceUpdate(BaseModel):
         None,
         description="New non-secret type-specific config (kb: root_path)",
     )
+    is_global: bool | None = Field(
+        None,
+        description=(
+            "Publish (true) or unpublish (false). Publishing requires the "
+            "'public_datasources' capability; unpublishing needs only "
+            "creator/admin."
+        ),
+    )
+    read_only: bool | None = Field(
+        None,
+        description="Declared read-only flag (kb: always true; declarative only)",
+    )
 
 
 class SSHKeyGenerateRequest(BaseModel):
@@ -15250,7 +15262,38 @@ async def update_datasource(
     request: Request, datasource_id: str, body: DatasourceUpdate
 ) -> dict[str, str]:
     """Update a datasource. F3: creator/admin only; null/empty credentials preserved."""
-    _, existing_ds = await require_datasource_owner(request, postgres_db, datasource_id)
+    user, existing_ds = await require_datasource_owner(
+        request, postgres_db, datasource_id
+    )
+    # Publish gate (spec: docs/features/public_datasources.md). Only the
+    # false→true transition needs the capability; unpublishing must always
+    # work for creator/admin (a revoked grant must not trap a public row).
+    if body.is_global is True and not existing_ds.get("is_global"):
+        if not await postgres_db.user_can_publish_datasource(user):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Publishing public datasources requires the "
+                    "'public_datasources' capability"
+                ),
+            )
+    read_only = body.read_only
+    if existing_ds.get("type") == "kb" and read_only is False:
+        raise HTTPException(
+            status_code=400,
+            detail="Knowledge-base datasources are always read-only",
+        )
+    effective_global = (
+        body.is_global
+        if body.is_global is not None
+        else bool(existing_ds.get("is_global"))
+    )
+    if (
+        effective_global
+        and read_only is None
+        and existing_ds.get("read_only") is None
+    ):
+        read_only = True  # invariant: public ⇒ read_only set
     # F3: if body.credentials is None or {}, do NOT touch the stored value.
     # The cockpit's edit form sends an empty creds dict when the user
     # didn't re-enter; passing that through would clobber the secret.
@@ -15312,6 +15355,8 @@ async def update_datasource(
             cli_hint=body.cli_hint,
             default_branch=body.default_branch,
             config=datasource_config,
+            is_global=body.is_global,
+            read_only=read_only,
         )
         if not success:
             raise HTTPException(
