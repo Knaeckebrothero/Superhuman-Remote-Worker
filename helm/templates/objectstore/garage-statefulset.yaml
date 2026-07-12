@@ -43,6 +43,10 @@ spec:
       containers:
         - name: garage
           image: {{ .Values.garage.image }}
+          # The dxflrs/garage image sets no ENTRYPOINT, so the binary path must
+          # be explicit — `args: ["server"]` alone execs "server" and fails
+          # with "executable file not found in $PATH".
+          command: ["/garage"]
           args: ["server"]
           ports:
             - name: s3
