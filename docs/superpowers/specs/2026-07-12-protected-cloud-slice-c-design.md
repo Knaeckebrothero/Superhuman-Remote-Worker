@@ -57,7 +57,7 @@ The classification rules are shared with `whiteout.py` (stdlib-pure). The plan p
 
 Manifest shape: `{epoch, staged_at, entries: [{path, status, size, binary}], counts: {added, modified, deleted}}`. `binary` = null-byte sniff of the first 8 KiB of the member.
 
-**Bookkeeping.** Migration `0056`: three columns on `cloud_ro_mounts` — `staged_epoch INTEGER NOT NULL DEFAULT 0` (monotonic, incremented per successful push), `staged_at TIMESTAMPTZ`, `staged_summary JSONB` (the manifest's `counts` + `entries` paths/statuses only — no bytes). `schema_current.sql` regenerated via `scripts/schema-snapshot.sh app`, never hand-edited.
+**Bookkeeping.** Migration `0056`: four columns on `cloud_ro_mounts` — `etag_baseline JSONB` (the path→etag map from `capture_etag_baseline`, captured at engage and re-captured after each apply; **nothing persists this today** — code exploration 2026-07-12 confirmed `capture_etag_baseline` has no orchestrator persistence caller, so Slice C adds both the column and the engage-time capture), `staged_epoch INTEGER NOT NULL DEFAULT 0` (monotonic — bumped on every successful stage push, apply, and reject), `staged_at TIMESTAMPTZ`, `staged_summary JSONB` (manifest `counts` + content signature only — entry lists live in the S3 manifest, not the DB row). `schema_current.sql` regenerated via `scripts/schema-snapshot.sh app`, never hand-edited.
 
 **Cadence.** Every turn end (debounced) + once at thread teardown (before the workspace snapshot, best-effort) + on-demand via the `restage` endpoint (review panel's Refresh button). Empty upperdir → delete both S3 objects, zero the summary (badge shows 0).
 
@@ -97,7 +97,7 @@ POST /api/agents/threads/{thread_id}/cloud-diff/restage      # manual refresh (p
 - Order: **deletes before creates** (whiteout-before-create, §9.8 — handles opaque-dir renames).
 - Sequential, fail-soft, idempotent: PUT overwrites, DELETE `if_exists=True`; parents auto-created.
 - **Partial failure:** upperdir + S3 epoch retained, per-file errors returned (`{applied, deleted, errors[]}` like Mode A); retry = re-apply the same epoch (idempotency makes that safe). No "partially applied" DB state — the staged set simply remains staged until a fully clean apply.
-- **Full success:** (1) clear the upperdir on the workspace pod via SSH script **and create a fresh workdir for the new epoch** (deferral #2 lands here — quiesce, unmount overlay `fusermount3 -u`, wipe `upper` + `work`, remount with fresh dirs); (2) re-capture the etag baseline (`capture_etag_baseline`) and persist it; (3) `rclone rc vfs/refresh recursive=true` so the merged view equals the just-applied cloud; (4) delete the S3 epoch objects, zero `staged_summary`, increment `staged_epoch`. Pod already dead → steps run S3/DB-only (apply from S3 with orchestrator creds — "review at your leisure" holds; the mount is gone, nothing to refresh).
+- **Full success:** (1) clear the upperdir **via the agent process** — the overlay scripts live in the agent-side `OverlayMountManager`, so the orchestrator calls a small agent-app endpoint (`POST /cloud-overlay/reset` on `persistent_app`, reached the same way the SSE proxy reaches the agent pod) which unmounts the overlay (`fusermount3 -u`), wipes `upper` + `work` **and creates a fresh workdir for the new epoch** (deferral #2 lands here), refreshes the lower, and remounts; (2) re-capture the etag baseline (`capture_etag_baseline`) and persist it; (3) `rclone rc vfs/refresh recursive=true` so the merged view equals the just-applied cloud; (4) delete the S3 epoch objects, zero `staged_summary`, increment `staged_epoch`. Pod already dead → steps run S3/DB-only (apply from S3 with orchestrator creds — "review at your leisure" holds; the mount is gone, nothing to refresh).
 
 **Reject:** same epoch pin; discard = clear upperdir + fresh workdir (pod alive), delete S3 objects, zero summary, increment epoch. Cloud untouched; baseline left as-is.
 
@@ -116,7 +116,7 @@ Slice B's delete-guard and quota-guard messages are already mode-honest (LIVE vs
 3. **Quota-guard read alignment:** the shell upperdir-quota guard currently blocks *reads* at cap; align with the write-only rationale (reads always allowed at cap).
 4. **`grant.reader_id` into engage `http_client_factory`:** stop re-deriving the reader identity inside the factory; pass it from the grant (naming currently duplicated).
 5. **Multi-mount signal:** protected threads with multiple cloud mounts protect only the first NC mount in v1 — the badge tooltip (§4) names it, and the engage path records which mount is protected.
-6. **Replica-test re-pins:** re-pin the orchestrator-HA replica-safety tests that Slice B's wiring touched.
+6. ~~Replica-test re-pins~~ — **struck 2026-07-12**: verified against the Slice B plan's fix-wave section; the deferral list has exactly five items and no replica-test item exists (it was a memory-index artifact). The only test re-pins Slice B called for (snapshot `EXTRACT_REMOTE_CMD` assertions) were done inside Slice B itself.
 
 ## 10. Security invariants (unchanged, restated as acceptance criteria)
 
