@@ -8,9 +8,15 @@ strictly on explicit user action (owner-only endpoints in ``main.py``).
 Both flows share the same epoch pin (spec §7): the caller passes the
 ``epoch`` it last observed via the summary endpoint (Task 8), and a stale
 epoch — someone else applied/rejected/restaged since — is a hard 409 before
-any read or write happens. Apply additionally re-checks the cloud folder
-against the mount's etag baseline, scoped to only the paths the staged diff
-touches (``detect_external_mods_against_baseline``,
+any read or write happens. That pin is checked twice: once against the DB
+row (``_load_pinned_mount_row``, before any S3 read) and again against the
+S3 manifest's own recorded ``epoch`` once ``summary()`` returns (post-review
+hardening, 2026-07-12) — a concurrent turn-end stage can overwrite the S3
+manifest/tar pair (and bump the DB row's epoch) in the gap between those two
+reads, and without the second check apply would silently apply a diff that
+no longer matches the epoch it validated against. Apply additionally
+re-checks the cloud folder against the mount's etag baseline, scoped to only
+the paths the staged diff touches (``detect_external_mods_against_baseline``,
 ``services.job_cloud_baseline``); any divergence is a hard 409 with no force
 flag — the user must resolve manually (restage or investigate) and retry.
 
@@ -38,6 +44,29 @@ already-applied (or already-rejected) content against the fresh baseline —
 surfacing as modified-with-identical-content entries the user re-rejects.
 Accepted for v1 (spec §7); a v2 fix would need the resume path itself to
 clear the upperdir before the workspace comes back up.
+
+Known v1 limitation: full-success tail-crash window. The cloud writes
+(deletes/creates) commit before the baseline is re-captured and staging is
+cleared (see the ordering comment on the full-success tail below). If
+``capture_etag_baseline``/``update_ro_mount_baseline`` raises or returns
+False after the writes already landed (backend blip mid-tail), the row is
+left with the OLD (pre-apply) baseline and the OLD ``staged_summary``/
+``staged_epoch``, even though the cloud already reflects the new content.
+**Restage alone does not clear this wedge**: ``reset_agent_overlay`` already
+ran (it's first in the tail) and succeeded, so the upperdir is empty and a
+restage diffs against cloud content that now matches what was just
+applied — it stages an *empty* diff and clears ``staged_summary``, but it
+never touches ``etag_baseline``, so the stale baseline persists and keeps
+false-409ing (``external_modifications_detected``) against any future real
+diff. The correct recovery is to END the thread and RESUME it: re-engage
+(``services.cloud.ro_engage.engage_ro_mount``) re-captures the baseline from
+the live cloud content whenever the row's ``staged_summary`` is ``None`` —
+its guard only *skips* recapture while a staging is still live, precisely
+so it never clobbers the baseline a pending review is classifying against
+(see that module's docstring). Accepted for v1; a v2 fix would retry the
+baseline recapture until it succeeds as part of the tail itself, or expose
+an explicit "repair" endpoint, instead of requiring an end/resume
+round-trip.
 """
 
 from __future__ import annotations
@@ -116,10 +145,25 @@ async def apply_staged_diff(
     )
     summary = await src.summary()
     if summary is None:
-        # DB says staged but the S3 blobs are gone (or the tar/manifest
-        # content-binding check failed — a torn multi-replica pair reads the
-        # same way). The user restages.
+        # DB says staged but the manifest blob is gone (or unparseable). The
+        # user restages. NOTE: since summary() reads only the manifest
+        # (post-review hardening — see UpperdirDiffSource docstring), a torn
+        # tar/manifest content-binding mismatch does NOT surface here
+        # anymore; the ``ensure_tar_bound()`` probe below is what catches
+        # that, before any write.
         raise StagedApplyError(410, {"code": "staging_missing"})
+
+    # Second epoch pin: ``_load_pinned_mount_row`` above validated the
+    # caller's epoch against the DB row BEFORE any S3 read. A concurrent
+    # turn-end stage can overwrite the S3 manifest/tar pair (and bump the
+    # row's epoch) in the gap between that DB read and this S3 read — so
+    # re-validate the manifest's own recorded epoch against the same row
+    # snapshot. A mismatch here means the summary we just read no longer
+    # corresponds to the epoch we're pinned to; the caller must refetch.
+    if summary.meta.get("epoch") != row["staged_epoch"]:
+        raise StagedApplyError(
+            409, {"code": "epoch_stale", "staged_epoch": row["staged_epoch"]}
+        )
 
     touched_paths = {f.path for f in summary.files}
     diverged = await detect_external_mods_against_baseline(
@@ -140,6 +184,16 @@ async def apply_staged_diff(
                 "diverged": diverged,
             },
         )
+
+    # Force tar materialization + content-binding verification NOW, before
+    # any write. summary() (above) is manifest-only and can't catch a torn
+    # tar/manifest pair (post-review hardening — see UpperdirDiffSource
+    # docstring); without this probe a torn tar would only be discovered
+    # per-file, mid-sequence, via raw_new_bytes() returning None during the
+    # create loop — AFTER the delete loop (which runs first) had already
+    # committed. This preserves "a torn staging writes NOTHING."
+    if not await src.ensure_tar_bound():
+        raise StagedApplyError(410, {"code": "staging_missing"})
 
     # Deletes first (whiteout-before-create), children before parents —
     # harmless ordering for plain files, correct if a future backend ever
@@ -189,15 +243,38 @@ async def apply_staged_diff(
     # baseline from what's now actually on the cloud, persist it, drop the
     # staged blobs, and only then clear the staging row — so a crash
     # mid-sequence never leaves staging cleared without a fresh baseline.
+    #
+    # require_active=False: this bookkeeping must still run on a REVOKED
+    # row. The idle-drain reconciler revokes an ended thread's
+    # cloud_ro_mounts row within ~15min regardless of a pending review
+    # (reads already tolerate a revoked row — Task 8), so a user reviewing
+    # an ended thread can still apply; without this the UPDATE would
+    # silently no-op (WHERE status='active' matches nothing) and leave
+    # staging/baseline stuck even though the cloud writes above already
+    # landed.
     overlay_reset = await reset_agent_overlay()
     new_baseline = await backend.capture_etag_baseline(handle)
-    await postgres_db.update_ro_mount_baseline(row["id"], new_baseline)
+    if not await postgres_db.update_ro_mount_baseline(
+        row["id"], new_baseline, require_active=False
+    ):
+        logger.warning(
+            "apply: thread %s baseline update matched no row (id=%s) — "
+            "row may have been deleted out from under us",
+            thread_id,
+            row["id"],
+        )
     await snapshot_service.delete_blob(staging_tar_key(thread_id))
     await snapshot_service.delete_blob(staging_manifest_key(thread_id))
     new_epoch = row["staged_epoch"] + 1
-    await postgres_db.update_ro_mount_staging(
-        row["id"], staged_epoch=new_epoch, staged_summary=None
-    )
+    if not await postgres_db.update_ro_mount_staging(
+        row["id"], staged_epoch=new_epoch, staged_summary=None, require_active=False
+    ):
+        logger.warning(
+            "apply: thread %s staging update matched no row (id=%s) — "
+            "row may have been deleted out from under us",
+            thread_id,
+            row["id"],
+        )
     logger.info(
         "apply: thread %s applied %d, deleted %d, epoch -> %d (overlay_reset=%s)",
         thread_id,
@@ -237,9 +314,18 @@ async def reject_staged_diff(
     await snapshot_service.delete_blob(staging_tar_key(thread_id))
     await snapshot_service.delete_blob(staging_manifest_key(thread_id))
     new_epoch = row["staged_epoch"] + 1
-    await postgres_db.update_ro_mount_staging(
-        row["id"], staged_epoch=new_epoch, staged_summary=None
-    )
+    # require_active=False: same rationale as apply's bookkeeping — the
+    # idle-drain reconciler can revoke this row before the user reviews an
+    # ended thread's staged diff; reject must still be able to clear it.
+    if not await postgres_db.update_ro_mount_staging(
+        row["id"], staged_epoch=new_epoch, staged_summary=None, require_active=False
+    ):
+        logger.warning(
+            "reject: thread %s staging update matched no row (id=%s) — "
+            "row may have been deleted out from under us",
+            thread_id,
+            row["id"],
+        )
     logger.info(
         "reject: thread %s rejected staged diff, epoch -> %d (overlay_reset=%s)",
         thread_id,

@@ -81,3 +81,70 @@ async def test_update_ro_mount_staging_clears_staged_at_when_summary_none():
     # param is NULL (i.e. staged_summary=None clears staged_at).
     assert "staged_at" in args[0] and "NULL" in args[0]
     assert args[-1] is None  # json.dumps(staged_summary) short-circuits to None
+
+
+# --------------------------------------------------------------------------- #
+# require_active — post-review hardening: apply/reject bookkeeping must
+# still reach a row the idle-drain reconciler already revoked (reads are
+# revoked-tolerant — Task 8 — writes were not, until this).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_update_ro_mount_baseline_default_scopes_to_active():
+    conn = _mock_conn()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    db = _make_db_with_conn(conn)
+
+    await db.update_ro_mount_baseline("row-1", {"a.txt": "et1"})
+
+    sql = conn.execute.call_args.args[0]
+    assert "status = 'active'" in sql
+
+
+@pytest.mark.asyncio
+async def test_update_ro_mount_baseline_require_active_false_drops_status_clause():
+    conn = _mock_conn()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    db = _make_db_with_conn(conn)
+
+    result = await db.update_ro_mount_baseline(
+        "row-1", {"a.txt": "et1"}, require_active=False
+    )
+
+    assert result is True
+    sql = conn.execute.call_args.args[0]
+    assert "status" not in sql
+    # The rest of the query is unchanged.
+    assert "etag_baseline" in sql
+    args = conn.execute.call_args.args
+    assert json.dumps({"a.txt": "et1"}) in args
+
+
+@pytest.mark.asyncio
+async def test_update_ro_mount_staging_default_scopes_to_active():
+    conn = _mock_conn()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    db = _make_db_with_conn(conn)
+
+    await db.update_ro_mount_staging("row-1", staged_epoch=2, staged_summary=None)
+
+    sql = conn.execute.call_args.args[0]
+    assert "status = 'active'" in sql
+
+
+@pytest.mark.asyncio
+async def test_update_ro_mount_staging_require_active_false_drops_status_clause():
+    conn = _mock_conn()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    db = _make_db_with_conn(conn)
+
+    result = await db.update_ro_mount_staging(
+        "row-1", staged_epoch=2, staged_summary=None, require_active=False
+    )
+
+    assert result is True
+    sql = conn.execute.call_args.args[0]
+    assert "status" not in sql
+    # staged_at clearing logic is unaffected by dropping the status clause.
+    assert "staged_at" in sql and "NULL" in sql

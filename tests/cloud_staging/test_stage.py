@@ -70,6 +70,10 @@ def _make_snapshot_service():
     svc.save_blob = AsyncMock(return_value="some-key")
     svc.upload_blob_file = AsyncMock(return_value=True)
     svc.delete_blob = AsyncMock(return_value=True)
+    # Default: the manifest blob exists (used by the "unchanged" skip's
+    # existence check, I5) — individual tests override to simulate a
+    # missing blob.
+    svc.get_blob = AsyncMock(return_value=b"{}")
     return svc
 
 
@@ -199,6 +203,68 @@ async def test_unchanged_signature_skips_upload(monkeypatch):
     stream_mock.assert_not_called()
     svc.upload_blob_file.assert_not_called()
     db.update_ro_mount_staging.assert_not_called()
+    # The skip is conditional on the manifest blob actually existing (I5) —
+    # the default fixture returns a truthy blob, so the existence check
+    # passed and the skip fired.
+    svc.get_blob.assert_awaited_once_with(stage.staging_manifest_key("thread-1"))
+
+
+@pytest.mark.asyncio
+async def test_stage_unchanged_skip_restages_when_blobs_missing(tmp_path, monkeypatch):
+    """Same unchanged signature, but the manifest blob is gone (e.g. an
+    out-of-band deletion) — the skip must not be trusted; stage falls
+    through to a full re-stage instead of leaving the review/apply path
+    reading "staged" against nothing.
+    """
+    real_tar = _build_tar(tmp_path, [
+        ("upper/new.txt", "file", b"hello", None),
+    ])
+    row = {
+        **_ACTIVE_ROW,
+        "staged_epoch": 5,
+        "staged_summary": {
+            "counts": {"added": 1, "modified": 0, "deleted": 0},
+            "signature": "deadbeef",
+        },
+        "etag_baseline": {},
+    }
+    db = _make_db(thread_metadata=_PROTECTED_METADATA, mount_row=row)
+    svc = _make_snapshot_service()
+    svc.get_blob = AsyncMock(return_value=None)  # manifest blob missing
+    monkeypatch.setattr(stage, "_run_ssh_capture", AsyncMock(return_value=b"deadbeef\n"))
+
+    async def _fake_stream(cmd, dest_path):
+        shutil.copyfile(real_tar, dest_path)
+        return True
+
+    monkeypatch.setattr(stage, "_stream_tar_to_file", _fake_stream)
+
+    uploaded = {}
+
+    async def _fake_upload(key, local_path):
+        with open(local_path, "rb") as f:
+            uploaded[key] = f.read()
+        return True
+
+    svc.upload_blob_file = AsyncMock(side_effect=_fake_upload)
+
+    result = await stage.stage_thread_cloud_diff(
+        thread_id="thread-1", postgres_db=db, snapshot_service=svc
+    )
+
+    # Did NOT skip — a full re-stage ran instead.
+    assert result == {"epoch": 6, "counts": {"added": 1, "modified": 0, "deleted": 0}}
+    assert stage.staging_tar_key("thread-1") in uploaded
+    assert stage.staging_manifest_key("thread-1") in uploaded
+    db.update_ro_mount_staging.assert_awaited_once_with(
+        "mount-1",
+        staged_epoch=6,
+        staged_summary={
+            "counts": {"added": 1, "modified": 0, "deleted": 0},
+            "signature": "deadbeef",
+            "tar_sha256": hashlib.sha256(uploaded[stage.staging_tar_key("thread-1")]).hexdigest(),
+        },
+    )
 
 
 # =============================================================================

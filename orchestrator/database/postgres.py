@@ -1340,26 +1340,52 @@ class PostgresDB:
             )
         return result == "UPDATE 1"
 
-    async def update_ro_mount_baseline(self, row_id: str, baseline: dict[str, str]) -> bool:
-        """Persist the etag baseline (engage-time capture / post-apply re-capture)."""
+    async def update_ro_mount_baseline(
+        self, row_id: str, baseline: dict[str, str], *, require_active: bool = True
+    ) -> bool:
+        """Persist the etag baseline (engage-time capture / post-apply re-capture).
+
+        ``require_active=True`` (default, used by engage) scopes the UPDATE to
+        ``status = 'active'`` — engage must never resurrect a row the
+        reconciler already revoked. Apply/reject's post-write bookkeeping
+        passes ``require_active=False``: the reconciler revokes an
+        idle/ended thread's row within ~15min regardless of a pending
+        review, reads already tolerate a revoked row (Task 8), and a
+        revoked-but-otherwise-live staging must still be clearable so a
+        late apply/reject on an ended thread doesn't wedge behind a status
+        clause that reads have no such gate for.
+        """
+        query = "UPDATE cloud_ro_mounts SET etag_baseline = $2::jsonb WHERE id = $1"
+        if require_active:
+            query += " AND status = 'active'"
         async with self.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE cloud_ro_mounts SET etag_baseline = $2::jsonb "
-                "WHERE id = $1 AND status = 'active'",
-                row_id, json.dumps(baseline),
-            )
+            result = await conn.execute(query, row_id, json.dumps(baseline))
         return result == "UPDATE 1"
 
     async def update_ro_mount_staging(
-        self, row_id: str, *, staged_epoch: int, staged_summary: dict | None
+        self,
+        row_id: str,
+        *,
+        staged_epoch: int,
+        staged_summary: dict | None,
+        require_active: bool = True,
     ) -> bool:
-        """Advance the staging epoch. staged_summary=None clears the staged state."""
+        """Advance the staging epoch. staged_summary=None clears the staged state.
+
+        See ``update_ro_mount_baseline`` for the ``require_active`` contract —
+        same rationale, same default.
+        """
+        query = (
+            "UPDATE cloud_ro_mounts SET staged_epoch = $2, "
+            "staged_summary = $3::jsonb, "
+            "staged_at = CASE WHEN $3::text IS NULL THEN NULL ELSE now() END "
+            "WHERE id = $1"
+        )
+        if require_active:
+            query += " AND status = 'active'"
         async with self.acquire() as conn:
             result = await conn.execute(
-                "UPDATE cloud_ro_mounts SET staged_epoch = $2, "
-                "staged_summary = $3::jsonb, "
-                "staged_at = CASE WHEN $3::text IS NULL THEN NULL ELSE now() END "
-                "WHERE id = $1 AND status = 'active'",
+                query,
                 row_id, staged_epoch,
                 json.dumps(staged_summary) if staged_summary is not None else None,
             )

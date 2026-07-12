@@ -26,6 +26,7 @@ depend on these dataclasses staying exactly as defined.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -39,6 +40,13 @@ from services.cloud_staging.stage import staging_manifest_key, staging_tar_key
 # Sentinel for the summary/manifest/tar memo fields below: distinguishes "not
 # computed yet" from a computed-and-cached ``None`` (no diff available).
 _UNSET: Any = object()
+
+
+def _sha256_hex(data: bytes) -> str:
+    """``hashlib.sha256(...).hexdigest()`` as a plain function — a thread
+    target for ``asyncio.to_thread`` (the staged tar can be GBs; hashing it
+    inline on the event loop would stall every other request)."""
+    return hashlib.sha256(data).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -125,9 +133,18 @@ class UpperdirDiffSource:
     Tasks 3/4); new-side bytes from the staged ``upper.tar``; old-side bytes
     from the live cloud backend via the same ``get_project_folder_file_bytes``
     read path ``export_job_to_shared_folder`` uses. One instance is scoped to
-    a single request: the tar is downloaded and content-verified at most once
-    (first touch, from either ``summary()`` or ``file()``/``raw_new_bytes()``),
-    and ``summary()`` is memoized like ``GiteaDiffSource``.
+    a single request; both the manifest and the tar are memoized (first
+    touch, cached for the life of the instance) like ``GiteaDiffSource``.
+
+    **Manifest-only summaries (post-review hardening, 2026-07-12):**
+    ``summary()`` reads and validates ONLY the manifest — no tar download, no
+    hash. The badge/status endpoint polls this every turn, and a staged
+    upperdir tar can be multiple GiB (up to the 9 GiB stage cap); downloading
+    and hashing it just to answer "how many files changed" risked OOMing the
+    orchestrator (2 GiB memory limit). The tar download + content-binding
+    check happen lazily on first actual tar touch instead — ``file()``,
+    ``raw_new_bytes()``, or the explicit ``ensure_tar_bound()`` probe — all
+    funneled through ``_get_tar()``.
 
     **Content binding** (multi-replica torn-pair defense, design §5 addendum
     2026-07-12): the manifest and tar are two independent S3 objects at
@@ -135,11 +152,20 @@ class UpperdirDiffSource:
     written by two non-atomic PUTs (``cloud_staging.stage``). With two
     orchestrator replicas, two concurrent stagings for the same thread can
     interleave those PUTs, leaving a manifest at the deterministic key that
-    doesn't describe the tar sitting next to it. Every read here verifies
-    ``sha256(tar_bytes) == manifest["tar_sha256"]`` before trusting either;
-    on mismatch or an absent hash, the whole staging is treated as missing —
-    both ``summary()`` and ``file()`` return ``None``. A manifest must never
-    be served against a tar it doesn't describe.
+    doesn't describe the tar sitting next to it. ``_get_tar()`` verifies
+    ``sha256(tar_bytes) == manifest["tar_sha256"]`` (hashed off-loop via
+    ``asyncio.to_thread``) before trusting the tar; on mismatch, a missing
+    tar blob, or an absent hash, the tar is treated as unusable — ``file()``
+    returns ``None`` for any entry that needs new-side bytes,
+    ``raw_new_bytes()`` returns ``None``, and ``ensure_tar_bound()`` returns
+    ``False``. The failure is cached: once ``_get_tar()`` resolves to
+    "unusable" for this instance, it stays that way. ``summary()`` itself
+    never fails this way — a valid manifest always yields a summary, even if
+    the tar behind it turns out to be torn. Security invariant: apply
+    (Task 10) never writes unverified bytes — every write funnels through
+    ``raw_new_bytes()``, which sits behind this gate; apply also calls
+    ``ensure_tar_bound()`` up front (before any delete/create) so a torn tar
+    is caught before any destructive action, not discovered mid-sequence.
     """
 
     def __init__(
@@ -158,18 +184,23 @@ class UpperdirDiffSource:
         self._snapshot_service = snapshot_service
         self._manifest_cache: dict[str, Any] | None = _UNSET
         self._summary_cache: DiffSummary | None = _UNSET
-        # Populated as a side effect of a successful content-binding check
-        # inside ``_load_and_bind_manifest``; stays ``_UNSET`` if the
-        # manifest is missing/unbound, so it never opens a mismatched tar.
+        # Set by ``_get_tar()`` on first actual tar touch — ``None`` for
+        # "attempted and unusable" (missing blob / absent hash / mismatch),
+        # a real ``TarFile`` for "attempted and bound", ``_UNSET`` for "not
+        # touched yet". ``summary()`` never populates this (manifest-only).
         self._tar_cache: tarfile.TarFile | None = _UNSET
 
     async def _get_manifest(self) -> dict[str, Any] | None:
         if self._manifest_cache is not _UNSET:
             return self._manifest_cache
-        self._manifest_cache = await self._load_and_bind_manifest()
+        self._manifest_cache = await self._load_manifest()
         return self._manifest_cache
 
-    async def _load_and_bind_manifest(self) -> dict[str, Any] | None:
+    async def _load_manifest(self) -> dict[str, Any] | None:
+        """Manifest-only read: no tar download, no hash — see class docstring
+        ("Manifest-only summaries"). ``summary()`` is the only caller that
+        matters for cost; keeping this function tar-free is the whole point.
+        """
         if self._mount_row.get("staged_summary") is None:
             return None
         raw = await self._snapshot_service.get_blob(
@@ -178,27 +209,52 @@ class UpperdirDiffSource:
         if raw is None:
             return None
         try:
-            manifest = json.loads(raw)
+            return json.loads(raw)
         except (ValueError, TypeError):
             return None
 
+    async def _get_tar(self) -> tarfile.TarFile | None:
+        """Download the tar and verify content-binding (design §5 addendum),
+        first-touch, cached. Reached only by callers that need actual tar
+        bytes — ``file()``, ``raw_new_bytes()``, ``ensure_tar_bound()`` —
+        never by ``summary()``. See class docstring.
+        """
+        if self._tar_cache is not _UNSET:
+            return self._tar_cache
+        manifest = await self._get_manifest()
+        if manifest is None:
+            self._tar_cache = None
+            return None
         expected_sha = manifest.get("tar_sha256")
         if not expected_sha:
+            self._tar_cache = None
             return None
         tar_bytes = await self._snapshot_service.get_blob(
             staging_tar_key(self._thread_id)
         )
         if tar_bytes is None:
+            self._tar_cache = None
             return None
-        if hashlib.sha256(tar_bytes).hexdigest() != expected_sha:
+        actual_sha = await asyncio.to_thread(_sha256_hex, tar_bytes)
+        if actual_sha != expected_sha:
+            self._tar_cache = None
             return None
-
         self._tar_cache = tarfile.open(fileobj=io.BytesIO(tar_bytes))
-        return manifest
+        return self._tar_cache
 
-    async def _get_tar(self) -> tarfile.TarFile | None:
-        await self._get_manifest()
-        return None if self._tar_cache is _UNSET else self._tar_cache
+    async def ensure_tar_bound(self) -> bool:
+        """Force tar materialization + content-binding verification without
+        reading any particular member.
+
+        Apply (Task 10) must prove the staging is intact BEFORE taking any
+        destructive action — reaching the binding gate lazily, per-file, in
+        the middle of a delete-then-create sequence would let earlier writes
+        land before a later file discovers the tar is torn. Calling this
+        once, up front, turns that into a single boolean gate. Cached like
+        every other ``_get_tar()`` caller (a subsequent ``file()``/
+        ``raw_new_bytes()`` call in the same request reuses the result).
+        """
+        return await self._get_tar() is not None
 
     async def _tar_member_bytes(self, path: str) -> bytes | None:
         tar = await self._get_tar()
@@ -245,6 +301,15 @@ class UpperdirDiffSource:
         new_content: str | None = None
         new_binary = False
         if entry.status in ("added", "modified"):
+            tar = await self._get_tar()
+            if tar is None:
+                # Content-binding failed (or the tar blob is gone) — this
+                # entry needs new-side bytes and the tar can't be trusted,
+                # so treat the whole read as staging-missing rather than
+                # silently showing a blank diff for a torn pair. Kept as a
+                # protection "at the tar layer" (see class docstring) even
+                # though summary() itself no longer fails this way.
+                return None
             raw_new = await self._tar_member_bytes(path)
             if raw_new is not None:
                 if entry.binary:
