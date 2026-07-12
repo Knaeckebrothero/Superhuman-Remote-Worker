@@ -83,6 +83,26 @@
         "enabled": { "type": "boolean" },
         "transport": { "type": "string", "enum": ["http", "nats", "both"] }
       }
+    },
+    "garage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": { "type": "string" },
+        "replicas": { "type": "integer", "minimum": 1, "maximum": 1 },
+        "storageClass": { "type": "string" },
+        "dataStorageSize": { "type": "string" },
+        "capacityBytes": { "type": "integer", "minimum": 1 },
+        "buckets": {
+          "type": "object",
+          "properties": { "workspaces": { "type": "string" } }
+        },
+        "bootstrap": {
+          "type": "object",
+          "properties": { "image": { "type": "string" } }
+        }
+      }
     }
   }
 }
