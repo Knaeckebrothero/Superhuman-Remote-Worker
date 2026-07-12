@@ -928,11 +928,13 @@ def render_instruction_content(
     content: str,
     tool_names: List[str],
     cli_datasources: Optional[List[str]] = None,
+    protected_cloud: bool = False,
 ) -> str:
     """Render Jinja2 template markers in instruction file content.
 
     Supports ``{% if has_tool("kb_write") %}`` conditionals,
-    ``{% if cli_datasources %}`` for read-write datasource access, and
+    ``{% if cli_datasources %}`` for read-write datasource access,
+    ``{% if protected_cloud %}`` for the protected-cloud honesty block, and
     ``{{ tools }}`` variable access.  Non-templated content (no ``{%``
     or ``{{`` markers) passes through unchanged with zero overhead.
 
@@ -943,6 +945,12 @@ def render_instruction_content(
             (e.g. ``["postgresql", "neo4j"]``).  Enables
             ``{% if cli_datasources %}`` and ``has_cli_datasource("postgresql")``
             conditionals in templates.
+        protected_cloud: Whether the session's cloud folder is in F-C1
+            protected mode (writes staged for review, never live-saved).
+            Enables the ``{% if protected_cloud %}`` honesty block that
+            instructs the agent to describe cloud writes as "staged", never
+            "saved"/"uploaded"/"shared". Defaults to False so a non-protected
+            session never sees the block.
 
     Returns:
         Rendered content with conditionals resolved.
@@ -961,6 +969,7 @@ def render_instruction_content(
         has_tool=lambda name: name in tool_set,
         cli_datasources=list(ds_set),
         has_cli_datasource=lambda ds_type: ds_type in ds_set,
+        protected_cloud=protected_cloud,
     )
 
 
@@ -3911,9 +3920,13 @@ def get_phase_system_prompt(
 
         # Render Jinja2 conditionals
         cli_ds_interactive = config.extra.get("_cli_datasources", [])
+        protected_cloud_interactive = bool(config.extra.get("_protected_cloud"))
         if tool_names is not None:
             template = render_instruction_content(
-                template, tool_names, cli_datasources=cli_ds_interactive
+                template,
+                tool_names,
+                cli_datasources=cli_ds_interactive,
+                protected_cloud=protected_cloud_interactive,
             )
 
         # Slice-2 skills menu (L1): fenced, untrusted user content. Empty when no
