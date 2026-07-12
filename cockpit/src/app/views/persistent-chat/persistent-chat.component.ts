@@ -607,7 +607,7 @@ export function clearDraft(threadId: string | null): void {
           }
           @if (cloudBadgeShown()) {
             <app-badge tone="accent" size="sm" role="button"
-                       [title]="'chat.status.cloudChangesTooltip' | transloco:{ mount: chat.protectedMountName() }"
+                       [title]="'chat.status.cloudChangesTooltip' | transloco:{ mount: chat.protectedMountName(), stagedAt: formatStagedAt(chat.cloudStagedAt()) }"
                        (click)="chat.cloudDiffPanelOpen.set(true)">
               {{ 'chat.status.cloudChanges' | transloco:{ count: chat.cloudChangesCount() } }}
             </app-badge>
@@ -1747,6 +1747,22 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         try {
             return new Intl.DateTimeFormat(lang, {
                 dateStyle: 'long',
+                timeStyle: 'short',
+            }).format(new Date(value));
+        } catch {
+            return value;
+        }
+    }
+
+    /** Badge-tooltip timestamp for the staged cloud-diff (Slice C, Task 14).
+     *  Same Intl approach as formatEndedAt (medium date fits a tooltip);
+     *  em-dash when nothing is staged / the summary hasn't reported one. */
+    formatStagedAt(value: string | null): string {
+        if (!value) return '—';
+        const lang = this.i18n.activeLang();
+        try {
+            return new Intl.DateTimeFormat(lang, {
+                dateStyle: 'medium',
                 timeStyle: 'short',
             }).format(new Date(value));
         } catch {
