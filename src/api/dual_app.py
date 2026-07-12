@@ -347,7 +347,7 @@ def _final_idle_status() -> str:
     leaves a dispatchable-looking row for up to the 3-min offline threshold
     after the process is gone — the dispatcher claiming a job for that dead
     pod is Finding 5 of
-    docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+    docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
     'draining' is agent-assertable (same vocabulary as the drain-intent
     path), excluded from get_available_agents, and the row falls to
     'offline' via the normal heartbeat timeout after the exit.
