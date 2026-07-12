@@ -159,6 +159,26 @@ class OverlayMountManager:
         remount_lower()
         self._run("overlay_remount.sh", self._mount_body_only_script(), timeout=120)
 
+    def reset_upper(self, refresh_lower: Callable[[], None]) -> None:
+        """Discard the staged upperdir after an apply/reject and remount with a
+        FRESH workdir (a workdir must never be reused across overlay instances
+        — design §11.2, fresh-workdir-per-epoch).
+
+        Unmount (plain first, lazy fallback — the overlay is being torn down
+        either way, so unlike ``refresh``'s FD-hold quiesce guard there is no
+        reason to insist on a clean plain unmount here) → wipe AND recreate
+        both upperdir and workdir → refresh the lower (callback) → remount.
+        Never touches the merged mountpoint or the lower directory itself."""
+        self._run(
+            "overlay_reset_unmount.sh",
+            self._reset_unmount_script(),
+            timeout=60,
+            require_ok=False,
+        )
+        self._run("overlay_wipe_upper.sh", self._wipe_upper_script(), timeout=60)
+        refresh_lower()
+        self._run("overlay_remount.sh", self._mount_body_only_script(), timeout=120)
+
     # --------------------------------------------------------------- scripts
 
     def _mount_script(self) -> str:
@@ -277,6 +297,32 @@ echo "{_OVERLAY_OK}"
 set +e
 # LAZY unmount is correct on heal (dead lower => held reads ENOTCONN loudly).
 fusermount3 -uz {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null
+echo "{_OVERLAY_OK}"
+"""
+
+    def _reset_unmount_script(self) -> str:
+        """PLAIN unmount first; LAZY as fallback. No FD-hold quiesce guard is
+        needed here (unlike ``refresh``'s plain-only unmount) — the overlay is
+        being discarded and rebuilt either way, so a lazy fallback is safe."""
+        merged = shlex.quote(self.merged)
+        return f"""#!/usr/bin/env bash
+set +e
+fusermount3 -u {merged} 2>/dev/null || fusermount3 -uz {merged} 2>/dev/null || fusermount -u {merged} 2>/dev/null || fusermount -uz {merged} 2>/dev/null
+echo "{_OVERLAY_OK}"
+"""
+
+    def _wipe_upper_script(self) -> str:
+        """Wipe BOTH upperdir and workdir and recreate them fresh — a workdir
+        must never be reused across overlay instances (design §11.2,
+        fresh-workdir-per-epoch). Deliberately never references the merged
+        mountpoint or the lower — only ``upper``/``work``."""
+        upper = shlex.quote(self.upper)
+        work = shlex.quote(self.work)
+        return f"""#!/usr/bin/env bash
+set -euo pipefail
+trap 'rc=$?; echo "{_OVERLAY_FAILED} rc=${{rc}}"; exit "${{rc}}"' ERR
+rm -rf {upper} {work}
+mkdir -p {upper} {work}
 echo "{_OVERLAY_OK}"
 """
 

@@ -547,6 +547,20 @@ class PersistentSession:
                     )
                 self.cloud_mount_manager = None
 
+    def reset_cloud_overlay(self) -> None:
+        """Post-apply/reject reset: discard the staged upperdir and remount
+        with a fresh workdir, then refresh the RO lower.
+
+        Blocking (runs remote scripts over SSH) — the route/caller must run
+        this via ``asyncio.to_thread``. Called by the orchestrator via
+        ``POST /cloud-overlay/reset`` after a user applies or rejects a
+        staged cloud diff (Task 10).
+        """
+        overlay = self.overlay_mount_manager
+        if overlay is None or not overlay.active:
+            raise RuntimeError("no active cloud overlay")
+        overlay.reset_upper(refresh_lower=lambda: self.cloud_mount_manager.refresh_vfs())
+
     def _deploy_instruction_files(self) -> None:
         """Deploy instruction files from config to workspace.
 
