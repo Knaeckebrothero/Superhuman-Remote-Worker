@@ -131,6 +131,11 @@ _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
 _FLEET_MANAGEMENT_CONTROL_TOOLS = {"request_workspace_upgrade"}
 
+# ENOTCONN watchdog probe interval for the protected-mode capture overlay
+# (design §11.6 #3). Module-level so tests can monkeypatch it down to a tiny
+# value instead of sleeping through the real 60s.
+_CLOUD_OVERLAY_MONITOR_INTERVAL_SECONDS = 60.0
+
 
 def _fleet_management_enabled(config: Any) -> bool:
     """Return whether SRW control-plane tools should be exposed.
@@ -233,6 +238,13 @@ class PersistentSession:
     cloud_mount_error: Optional[str] = None
     # Capture overlay stacked on the RO lower for protected sessions (B9)
     overlay_mount_manager: Optional[Any] = None
+    # mount_id of the protected_lower rclone mount, read from the mount
+    # payload at overlay-creation time (never re-derived) so the ENOTCONN
+    # monitor can target restart_mount() at the right mount (Task 11).
+    _protected_mount_id: Optional[str] = None
+    # ENOTCONN watchdog task for the capture overlay; started alongside the
+    # overlay mount, cancelled in cleanup() (Task 11).
+    _cloud_overlay_monitor_task: Optional[asyncio.Task] = None
 
     # Datasource connections keyed by type (for ToolContext)
     datasources: Dict[str, Any] = field(default_factory=dict)
@@ -525,6 +537,17 @@ class PersistentSession:
             try:
                 from src.services.cloud_overlay import OverlayMountManager
 
+                # Read the protected_lower mount_id from the payload the
+                # session actually received — never re-derive the
+                # f"protected-{thread_id}" format (Task 11).
+                self._protected_mount_id = next(
+                    (
+                        str(m.get("mount_id"))
+                        for m in cloud_mount_cfg.get("mounts") or []
+                        if m.get("mount_kind") == "protected_lower"
+                    ),
+                    None,
+                )
                 self.overlay_mount_manager = OverlayMountManager(
                     thread_id=self.thread_id,
                     overlay_cfg=cloud_mount_cfg["overlay"],
@@ -537,9 +560,16 @@ class PersistentSession:
                 logger.info(
                     "Capture overlay mounted for protected session %s", self.thread_id
                 )
+                # ENOTCONN watchdog (design §11.6 #3) — started here alongside
+                # the overlay, cancelled in cleanup() alongside the unmount.
+                self._cloud_overlay_monitor_task = asyncio.create_task(
+                    self._cloud_overlay_monitor_loop(),
+                    name=f"cloud-overlay-monitor-{self.thread_id[:8]}",
+                )
             except Exception as e:
                 self.cloud_mount_error = f"overlay: {e}"
                 self.overlay_mount_manager = None
+                self._protected_mount_id = None
                 # Fail-safe: a protected session whose overlay failed to mount
                 # must NOT keep writing to the raw RO lower thinking it's
                 # protected. Tear down the rclone mount too so the session
@@ -559,6 +589,45 @@ class PersistentSession:
                         close_err,
                     )
                 self.cloud_mount_manager = None
+
+    async def _cloud_overlay_monitor_loop(self) -> None:
+        """ENOTCONN watchdog for the protected overlay (design §11.6 #3).
+
+        Every probe interval, when the overlay is active: probe with
+        ``health_check()``; on a dead lower, log and heal via
+        ``overlay.heal(remount_lower=...)``, where the callback restarts the
+        one rclone mount backing the lower (never the whole manager). Started
+        alongside the overlay mount in ``_setup_cloud_mount`` and cancelled in
+        ``cleanup()``. Must never die from an exception — a health_check or
+        heal failure is logged and simply retried on the next tick.
+        """
+        while True:
+            # Everything after the sleep is guarded (mirrors
+            # RcloneMountManager._token_refresh_loop): an unexpected failure
+            # anywhere here — including reading overlay_mount_manager/.active,
+            # not just the health_check/heal calls — must not kill the task.
+            try:
+                await asyncio.sleep(_CLOUD_OVERLAY_MONITOR_INTERVAL_SECONDS)
+                overlay = self.overlay_mount_manager
+                if overlay is None or not overlay.active:
+                    continue
+                healthy = await asyncio.to_thread(overlay.health_check)
+                if healthy:
+                    continue
+                logger.warning(
+                    "cloud overlay unhealthy (ENOTCONN) — healing thread=%s",
+                    self.thread_id,
+                )
+                await asyncio.to_thread(
+                    overlay.heal,
+                    lambda: self.cloud_mount_manager.restart_mount(
+                        self._protected_mount_id
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("overlay heal failed (will retry next probe): %s", e)
 
     def reset_cloud_overlay(self) -> None:
         """Post-apply/reject reset: discard the staged upperdir and remount
@@ -1378,6 +1447,16 @@ class PersistentSession:
 
     async def cleanup(self) -> None:
         """Clean up session resources."""
+        if self._cloud_overlay_monitor_task is not None:
+            self._cloud_overlay_monitor_task.cancel()
+            try:
+                await self._cloud_overlay_monitor_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("cloud overlay monitor task exit", exc_info=True)
+            self._cloud_overlay_monitor_task = None
+
         if self.overlay_mount_manager is not None:
             try:
                 loop = asyncio.get_running_loop()

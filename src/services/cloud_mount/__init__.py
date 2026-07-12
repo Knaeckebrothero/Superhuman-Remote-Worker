@@ -176,6 +176,12 @@ class RcloneMountManager:
         self._token_clients: dict[int, KeycloakTokenClient] = {}
         self._initial_tokens: dict[int, str] = {}
         self._refresh_task: asyncio.Task | None = None
+        # Original mount dicts + their index, retained so restart_mount() can
+        # re-run the same generators (_unmount_script/_mount_script) that
+        # _start_all_sync used, keyed by mount_id (design §11.6 #1 — Slice B
+        # deferral: RcloneMountManager retained no mount dicts before this).
+        self._mounts_by_id: dict[str, dict[str, Any]] = {}
+        self._mount_index_by_id: dict[str, int] = {}
 
     @property
     def active(self) -> bool:
@@ -448,6 +454,8 @@ echo "{_OK}"
             )
             self._run_remote_script(f"mount_{state.remote_name}.sh", script, timeout=90)
             states.append(state)
+            self._mounts_by_id[state.mount_id] = mount
+            self._mount_index_by_id[state.mount_id] = index
             logger.info(
                 "rclone cloud mount started: thread=%s mount_id=%s target=%s",
                 self.thread_id,
@@ -458,6 +466,43 @@ echo "{_OK}"
         if not self.cloud_cfg.get("skip_workspace_links"):
             self._install_workspace_links(states)
         self._states = states
+
+    def restart_mount(self, mount_id: str) -> None:
+        """Unmount then remount ONE mount in place (ENOTCONN heal path).
+
+        Synchronous like ``_start_all_sync`` — callers run this via
+        ``asyncio.to_thread``/an executor, never from the event loop directly.
+        Re-runs the same ``_unmount_script``/``_mount_script`` generators
+        against the retained mount dict + state, so the remount is
+        byte-identical to the original mount. Raises ``RcloneMountError`` for
+        an unknown ``mount_id`` or when the remount script itself fails (the
+        unmount step is best-effort — the target may already be wedged/dead,
+        which is exactly why we're here).
+        """
+        index = self._mount_index_by_id.get(mount_id)
+        mount = self._mounts_by_id.get(mount_id)
+        state = self._state_for_index(index) if index is not None else None
+        if index is None or mount is None or state is None:
+            raise RcloneMountError(
+                f"restart_mount: unknown or inactive mount_id {mount_id!r}"
+            )
+
+        self._run_remote_script(
+            f"unmount_{state.remote_name}.sh",
+            self._unmount_script(state),
+            timeout=45,
+            require_ok=False,
+        )
+        script = self._mount_script(
+            mount, state, initial_token=self._initial_tokens.get(index)
+        )
+        self._run_remote_script(f"mount_{state.remote_name}.sh", script, timeout=90)
+        logger.info(
+            "rclone cloud mount restarted: thread=%s mount_id=%s target=%s",
+            self.thread_id,
+            state.mount_id,
+            state.target_path,
+        )
 
     def _state_for_mount(self, mount: dict[str, Any], index: int) -> RcloneMountState:
         cache = self._cache_for_mount(mount)
@@ -730,6 +775,8 @@ exit 1
                     exc_info=True,
                 )
         self._states = []
+        self._mounts_by_id = {}
+        self._mount_index_by_id = {}
 
     def _unmount_script(self, state: RcloneMountState) -> str:
         return f"""#!/usr/bin/env bash
