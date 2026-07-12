@@ -6,7 +6,32 @@ dev cluster, 2026-07-06. Evidence and raw numbers in the memory note
 §11 (PR4). This file is the **execution tracker** — one item at a time, checked
 off as landed.
 
-## Status — 2026-07-11 (current — trust this over the 07-06 block below)
+## Status — 2026-07-12 (FEATURE COMPLETE — trust this over the blocks below)
+- **D-3 — DONE (no reindex needed).** Measured the live centroid index read-only
+  (port-forward to `srw-pgvector-0`, loop left running, zero mutation): active-note
+  centroid coverage is already **97.4 %** (781/802). The running loop churns the
+  corpus fast enough that the PR4d centroids are effectively complete, so the
+  deferred "full reindex first" precondition turned out unnecessary. Near-dup
+  distribution over **300,700** version-matched active pairs: ≥0.99→**2**, ≥0.98→**5**,
+  **≥0.97→8**, ≥0.96→26, ≥0.95→50, ≥0.93→173, ≥0.90→685. The two ≥0.99 pairs are true
+  slug-suffix/job-id duplicates (`…-334bac.md`, `…-job-968785c8-…`); the 0.97–0.98
+  band is sequential archive-finding phase-twins (boilerplate-heavy but distinct
+  records). **0.97 sits at the natural precision elbow (26→8→5→2) and is validated —
+  keep it.** Lowering to 0.95 triples findings into topical noise; raising to 0.99
+  drops near-dupes at 0.97–0.98. Residual: 21 active notes + 5 null-version rows lack
+  centroids — self-heals as the loop touches them; not worth racing the active loop
+  with a full reindex.
+- **C-3 — SKIPPED (cosmetic, by decision).** The no-frontmatter / no-`id` files are
+  **not broken**: unlike the C-2 invalid-YAML files (which the reindexer *skips*),
+  these index fine — `note_fields` derives the id from the filename stem, the title
+  from the first H1, and applies default type/status. Only cost is less-rich
+  metadata; no lost or broken notes. Same disposition as B-2.
+- **#34 CLOSED.** Every actionable finding is remediated: C-1/D-1/D-2/B-1 deployed,
+  R-1 verified (594 ghosts archived), A-1 resolved, C-2 done + adopted, B-2
+  auto-retired, D-3 validated, C-3 triaged → skip. #35 (Neo4j-less E2E) closed
+  separately.
+
+## Status — 2026-07-11 (superseded by the 07-12 block above)
 - **All code fixes deployed & R-1 verified in prod-dev.** C-1/D-1/D-2/B-1 live on
   `sha-ae0cddc`; **R-1** committed (`3d882661`) + deployed (rode `sha-f1f32eb`) and
   **verified live**: 594 pathless ghosts self-archived, loop project down to a
@@ -73,8 +98,8 @@ Legend — **Type:** `code` (my repo, TDD) · `data` (live mutation, needs authz
 | B-2 | Archive the 384 active pathless ghost rows | data | ⊘ skip | R-1 (do once, after) |
 | A-1 | Repair 2 resurrection files (`status: superseded`) | data | ☑ resolved 07-11 (files already correct) | — |
 | C-2 | Backfill the invalid-YAML files (6, not 5) | data | ☑ done 07-11 (`main @ 551b0a73`) | C-1 landed+deployed |
-| C-3 | Triage 8 missing-frontmatter + 8 no-`id` files | data | ☐ | — |
-| D-3 | Final near-dup floor tuning against the centroid index | deferred | ☐ | PR4d deploy + reindex |
+| C-3 | Triage 8 missing-frontmatter + 8 no-`id` files | data | ⊘ skip 07-12 (index fine, cosmetic) | — |
+| D-3 | Final near-dup floor tuning against the centroid index | deferred | ☑ 07-12 (0.97 validated, no reindex; 97.4% covered) | PR4d deploy + reindex |
 | R-1 | Ghost reconciliation pass (root cause) | code | ☑ | — |
 
 ---
@@ -164,15 +189,29 @@ Sequence after C-1 is landed+deployed, else a curator re-write could re-break th
 - **Op:** rewrite each frontmatter with quoted keywords (hand-fix or re-emit via the
   fixed renderer). The 5 slugs are in the audit output / memory note.
 
-### C-3 — Triage 8 missing-frontmatter + 8 no-`id` files  ·  data · low priority
-Also unindexable (reindexer needs `id`/`type`). Some may be intentional
-(`index.md` is reserved and correctly excluded). Triage: real notes get frontmatter;
-genuine non-notes get moved/removed.
+### C-3 — Triage 8 missing-frontmatter + 8 no-`id` files  ·  data · ⊘ **SKIPPED 07-12 (cosmetic)**
+**Premise correction:** these files are **not** unindexable. Verified against the
+live reindexer: `parse_note_md` returns `(None, text)` for a no-frontmatter file (it
+only *raises* on a *present-but-invalid* YAML block — that's the C-2 class), and
+`note_fields` (`kb_reindex.py:147`) does `fm = fm or {}`, deriving the `id` from the
+filename stem, the title from the first H1, and safe `type`/`status` defaults. So the
+no-frontmatter / no-`id` files index fine with derived metadata — the only cost is
+less-rich fields (no tags/type), never a lost or skipped note. `index.md`/`log.md`
+are reserved and correctly excluded. **Disposition: skip** — same as B-2; not worth a
+live loop-repo edit for a cosmetic metadata backfill.
 
-### D-3 — Final near-dup floor tuning  ·  deferred (PR4d deploy + reindex)
-After PR4d ships and a full reindex writes centroids, re-run the self-join
-(ghosts archived, version-guarded) and confirm 0.97. Record the outcome in
-`okf_knowledge_base.md` §11.1. Preliminary read already supports 0.97.
+### D-3 — Final near-dup floor tuning  ·  deferred → ☑ **DONE 07-12 (0.97 validated, no reindex)**
+Resolved by a **read-only** measurement of the live centroid index (port-forward to
+`srw-pgvector-0`, loop untouched) — the deferred "full reindex first" precondition
+proved unnecessary because centroid coverage is already **97.4 %** (781/802 active
+notes; the running loop keeps them fresh). Version-matched self-join over 300,700
+active pairs: ≥0.99→2, ≥0.98→5, **≥0.97→8**, ≥0.96→26, ≥0.95→50, ≥0.93→173, ≥0.90→685.
+Top-of-distribution eyeball: the 2 pairs ≥0.99 are true slug-suffix/job-id duplicates;
+0.97–0.98 are sequential archive-finding phase-twins (boilerplate-heavy, distinct).
+**0.97 sits at the precision elbow (26→8→5→2) and is confirmed — no change.** 0.95
+triples findings into topical noise; 0.99 misses the 0.97–0.98 near-dupes. Residual
+21 active notes + 5 null-version rows lack centroids; self-heals as the loop touches
+them. Query: session scratchpad `d3_measure.sql`.
 
 ### R-1 — Ghost reconciliation  ·  code · ☑ **DONE (uncommitted)**
 Reframed by the design as an **adoption/reconciliation gap** (not a delete gap): the

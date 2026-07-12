@@ -122,21 +122,27 @@ secrets:
     GITEA_ADMIN_PASSWORD: "dev_gitea_admin"
 
     # OIDC client secrets — only the ones whose service is enabled.
-    # gitea + mcp are on by default; opencloud's env ref is optional so the
-    # stub is just for fresh runs that flip opencloud on. Add
-    # NEXTCLOUD_OIDC_CLIENT_SECRET / PGADMIN_OIDC_CLIENT_SECRET only when
-    # you set `nextcloud.enabled=true` / `pgadmin.enabled=true`.
+    # gitea + mcp are on by default; nextcloud is the local cloud backend
+    # (nextcloud.enabled=true below) so its secret is REQUIRED. The opencloud
+    # entry is a realm-export placeholder stub (OpenCloud itself is disabled
+    # below). Add PGADMIN_OIDC_CLIENT_SECRET only with `pgadmin.enabled=true`.
     GITEA_OIDC_CLIENT_SECRET: "dev_gitea_oidc_secret"
     MCP_OIDC_CLIENT_SECRET: "dev_mcp_oidc_secret"
+    NEXTCLOUD_OIDC_CLIENT_SECRET: "dev_nextcloud_oidc_secret"
     OPENCLOUD_KEYCLOAK_CLIENT_SECRET: "dev_opencloud_oidc"
 
-    # OpenCloud service account
+    # Cloud service account (agent's cloud user; Keycloak bootstrap reads
+    # these regardless of which cloud backend is enabled)
     CLOUD_SERVICE_USER: "agent"
     CLOUD_SERVICE_PASSWORD: "dev_cloud_password"
 
-    # Nextcloud stubs (disabled but chart still wires the keys)
-    NEXTCLOUD_ADMIN_PASSWORD: "stub"
-    NEXTCLOUD_AGENT_PASSWORD: "stub"
+    # Nextcloud (main-cloud backend on local k3d — see nextcloud: block below).
+    # The same Secret feeds both the Nextcloud pod (its setup hook creates the
+    # agent-service user with NEXTCLOUD_AGENT_PASSWORD) and the orchestrator
+    # (admin = OCS/groupfolders, agent = WebDAV). They MUST match.
+    NEXTCLOUD_ADMIN_PASSWORD: "dev_nc_admin"
+    NEXTCLOUD_AGENT_PASSWORD: "dev_nc_agent"
+    # S3 keys unused while nextcloud.objectStore.enabled=false (filesystem on PVC).
     NEXTCLOUD_S3_ACCESS_KEY: "stub"
     NEXTCLOUD_S3_SECRET_KEY: "stub"
 
@@ -206,6 +212,9 @@ agent:
 # Resource trims — keep chart defaults for everything not listed
 # -----------------------------------------------------------------------------
 orchestrator:
+  # Chart default is 2 (HA). One replica on k3d: half the footprint, one pod
+  # to roll per rebuild, no leader-election noise.
+  replicas: 1
   resources:
     requests:
       memory: "256Mi"
@@ -221,16 +230,19 @@ databases:
     storageSize: "5Gi"
   audit:
     storageSize: "2Gi"
-  mongodb:
-    storageSize: "2Gi"
   neo4j:
+    # Disabled for a lighter dev stack (JVM + ~1Gi working memory + 5Gi PVC).
+    # The configmap drops the Neo4j URL and the orchestrator degrades to
+    # kg=None — knowledge-graph/OKF-KB features are OFF locally. Re-enable
+    # when working on KG features.
+    enabled: false
     storageSize: "5Gi"
   keycloak:
     storageSize: "2Gi"
 
 # -----------------------------------------------------------------------------
 # Codex OAuth proxy (CLIProxyAPI) — transport for gpt-5.x / Codex subscription
-# models. Off by default (chart default). Flip enabled to reproduce/debug
+# models. OFF for a lighter dev stack. Flip enabled to reproduce/debug
 # Codex-routed issues locally; the orchestrator already points CODEX_PROXY_URL
 # at the in-cluster service and reads CODEX_MANAGEMENT_KEY from the dev secret
 # above. Image pinned to match dev (chart default is :latest, which drifts
@@ -238,19 +250,20 @@ databases:
 # Codex login (tokens persist in the codex-proxy-auth PVC).
 # -----------------------------------------------------------------------------
 codexProxy:
-  enabled: true
+  enabled: false
   image: docker.io/eceasy/cli-proxy-api:v7.2.61
 
 # -----------------------------------------------------------------------------
 # Workspace PVC — single-node k3d uses local-path, which is RWO-only.
 #
-# networkPolicy.extraEgress: in-cluster Traefik hairpin for OpenCloud
-# uploads. The tus PATCH targets https://cloud.localhost/data, which
-# coredns-custom resolves to the Traefik ClusterIP — inside the cluster
-# CIDRs the tier policies deny. This re-allows exactly the Traefik pods
-# (post-DNAT pod ports: websecure=8443, web=8000). Real deployments resolve
-# the public hostname externally and don't need this. Pairs with
-# opencloud.mountInsecureTls below for the mkcert cert on the same hop.
+# networkPolicy.extraEgress: in-cluster Traefik hairpin — lets workspace
+# pods reach the PUBLIC https://*.localhost URLs, which coredns-custom
+# resolves to the Traefik ClusterIP; inside the cluster CIDRs the tier
+# policies deny. This re-allows exactly the Traefik pods (post-DNAT pod
+# ports: websecure=8443, web=8000). Real deployments resolve the public
+# hostname externally and don't need this. Needed for any flow that uses
+# the public cloud URL instead of the internal service (e.g. VM-runtime
+# rclone mounts).
 # -----------------------------------------------------------------------------
 workspace:
   accessMode: "ReadWriteOnce"
@@ -296,36 +309,30 @@ sessionRouter:
     traefik.ingress.kubernetes.io/router.tls: "true"
 
 # -----------------------------------------------------------------------------
-# OpenCloud — local-dev OIDC workaround.
+# Main cloud backend — Nextcloud ONLY on local k3d. With opencloud.enabled=false
+# below, the configmap selects MAIN_CLOUD_BACKEND=nextcloud and the
+# orchestrator's NEXTCLOUD_* env block turns on. replicas:1 (chart default is
+# 0). objectStore.enabled:false stores files on the PVC (no MinIO in k3d).
 #
-# OpenCloud's proxy dereferences OC_OIDC_ISSUER (must stay public, since it
-# string-matches the `iss` claim on every JWT) to fetch JWKS / discovery from
-# inside the pod. On k3d, `auth.localhost` resolves to the pod's own loopback
-# (RFC 6761), so the verifier can't reach Keycloak and every request 401s
-# with "failed to verify access token". Same wound as a customer's air-gapped
-# server VLAN where the public hostname only resolves on the corporate LAN.
-#
-# Two-knob workaround:
-#   1. hostAliases routes `auth.localhost` to Traefik's ClusterIP, so the
-#      proxy hits the cluster's own ingress instead of its loopback.
-#   2. oidcInsecureTls lets the proxy accept the mkcert-issued cert Traefik
-#      presents (OpenCloud's bundled CAs don't include the local root).
-#
-# Traefik's ClusterIP is stable for the life of the cluster but changes after
-# `k3d cluster delete && create`. Re-grab it with:
-#   kubectl -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'
+# Protected cloud (RO mounts): engage enforces a groupfolders >= 20.1.2 CVE
+# floor (ro_probe.check_version_floors). The Nextcloud setup hook runs
+# `occ app:update groupfolders` so an existing install gets bumped past it —
+# see helm/templates/services/nextcloud.yaml.
+# -----------------------------------------------------------------------------
+nextcloud:
+  enabled: true
+  internal: true
+  replicas: 1
+  objectStore:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# OpenCloud — REMOVED from the local stack: Nextcloud (above) is the only
+# cloud backend on k3d. The chart default is enabled:true and the configmap
+# prefers opencloud over nextcloud, so this override must stay to keep it off.
 # -----------------------------------------------------------------------------
 opencloud:
-  oidcInsecureTls: true
-  # rclone mounts pass --no-check-certificate so the tus upload hop —
-  # ocdav forwards upload bodies to the PUBLIC data-gateway URL, which
-  # presents the mkcert edge cert locally — passes TLS verification.
-  # Local-only; pairs with workspace.networkPolicy.extraEgress below.
-  mountInsecureTls: true
-  hostAliases:
-    - ip: "10.43.248.175"
-      hostnames:
-        - "auth.localhost"
+  enabled: false
 
 logLevel: "DEBUG"
 # Local k3d keeps human-readable logs ("json" once Loki lands — see
