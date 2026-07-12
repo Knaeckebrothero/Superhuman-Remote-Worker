@@ -113,6 +113,16 @@ spec:
       ports:
         - protocol: TCP
           port: 7688
+    {{- if .Values.garage.enabled }}
+    # Bundled Garage object store — virtual-tier S3 (file tools over rclone).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "garage") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3900
+    {{- end }}
     {{- if .Values.nextcloud.enabled }}
     # Nextcloud — cloud file sync / control-plane WebDAV + OCS.
     - to:
