@@ -807,6 +807,58 @@ class TestCoincidentInfraErrorOverride:
             status, _ = determine_job_status(job, result, parent_status="processing")
             assert status == expected, f"{fd_status} -> {status}"
 
+    # --- Phase 3: terminal-status idempotency backstop ---
+
+    def test_already_completed_job_not_downgraded_by_late_error(self):
+        # A second /complete (or a trailing teardown error) arriving after the row
+        # is already 'completed' must not flip it to failed → "no change".
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "j", "parent_job_id": None, "status": "completed"}
+        result = {"should_stop": True, "error": {"message": self._SSH_TIMEOUT}}
+        status, err = determine_job_status(job, result)
+        assert status is None
+        assert err is None
+
+    def test_already_merged_job_not_downgraded_by_late_error(self):
+        # merge_status='merged' means the work landed — a late non-teardown error
+        # still must not overwrite the success.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "j", "parent_job_id": None, "merge_status": "merged"}
+        result = {"should_stop": True, "error": {"message": "AssertionError: late"}}
+        status, _ = determine_job_status(job, result)
+        assert status is None
+
+    def test_processing_job_with_error_still_fails(self):
+        # The backstop is narrow: a row that has NOT yet succeeded still fails on a
+        # genuine error (guard requires status=completed or merge_status=merged).
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "j", "parent_job_id": None, "status": "processing"}
+        result = {"should_stop": True, "error": {"message": "real crash"}}
+        status, msg = determine_job_status(job, result)
+        assert status == "failed"
+        assert msg == "real crash"
+
+    def test_first_completion_on_processing_row_unaffected(self):
+        # The guard never touches the first, legitimate completion of a running job.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {
+            "id": "j",
+            "parent_job_id": None,
+            "status": "processing",
+            "resolved_config": self._NO_VERIFY,
+        }
+        result = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "freeze_data": {"status": "job_completed"},
+        }
+        status, _ = determine_job_status(job, result)
+        assert status == "completed"
+
 
 # =============================================================================
 # Auto-continue resume-clear — the version_upgrade drain livelock + its fix

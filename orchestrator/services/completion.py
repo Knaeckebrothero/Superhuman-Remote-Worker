@@ -601,6 +601,24 @@ def determine_job_status(
         error_msg = (
             error.get("message", str(error)) if isinstance(error, dict) else str(error)
         )
+        # Terminal-status idempotency backstop: a job that ALREADY reached success
+        # must never be downgraded to 'failed' by a late/duplicate report or a
+        # post-completion teardown error — a second /complete, or a trailing
+        # SSH/IO timeout after the completion side-effects already merged the work.
+        # (Carve-out (2) below handles the single-report dual-payload case; this
+        # covers the already-persisted row regardless of which trailing op raised
+        # the error.) Return "no change" so the successful status stands.
+        # docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+        if job.get("status") == "completed" or job.get("merge_status") == "merged":
+            logger.warning(
+                "Job %s: ignoring a coincident error on an already-successful job "
+                "(status=%s, merge_status=%s): %s",
+                job.get("id"),
+                job.get("status"),
+                job.get("merge_status"),
+                error_msg[:200],
+            )
+            return (None, None)
         # A coincident error must not mask an outcome the agent already reported.
         # Two carve-outs let the report's own branch below own the decision:
         #  (1) a clean-boundary auto-redispatch / outage freeze on a top-level job
