@@ -334,7 +334,7 @@ class VMInstanceManager:
         # max_attempts × tick (~5 min observed) while the dead VM holds cluster
         # capacity. Skip straight to exhausted. Honors the
         # ORCHESTRATOR_HAS_TAILNET_ROUTE escape hatch via orchestrator_can_reach
-        # (see docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md §C
+        # (see docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md §C
         # and vm_ssh_readiness_probe_unroutable_from_orchestrator.md §F4).
         host = inst.metadata.get("ssh_host")
         if host and not orchestrator_can_reach(host):
