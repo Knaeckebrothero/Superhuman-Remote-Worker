@@ -1,6 +1,6 @@
 ---
 tags:
-  - issue
+  - done
   - jobs
   - orchestrator
   - completion
@@ -15,9 +15,14 @@ tags:
 
 **Filed:** 2026-07-12, while triaging three "failed" jobs the user flagged on the
 Better-Resavio ERP self-improvement loop (project `68137e29`, main cluster).
-**Status:** root-caused, **unfixed**. One slice of this weakness was already fixed
-(`4ff91c7c`); two more slices are open. Symbols/line numbers current as of this
-date against `orchestrator/services/completion.py`.
+**Status:** ✅ **RESOLVED — shipped to `develop` 2026-07-12** (commits `8a561f94`
+Slices B+C, `254bf2a3` Phase 3 idempotency, `2831202a` Phase 5 Part 1 clone
+retry). Slice A was already fixed earlier (`4ff91c7c`). Verified: 346 unit tests
++ a live k3d endpoint drill (see "Implementation roadmap → Phase 4"). Deferred
+follow-ups (non-blocking): live-observe the loop after rollout, the full live
+drain/teardown drill, and Phase 5 Part 2 — tracked in
+`tests/coincident_infra_error_test_coverage.md`. Symbols/line numbers current as
+of this date against `orchestrator/services/completion.py`.
 
 ## TL;DR
 
@@ -32,8 +37,8 @@ This is *one* weakness with *three* faces:
 | Slice | Shape | Result | Status |
 |---|---|---|---|
 | **A** | top-level job + auto-redispatch freeze (`version_upgrade`/outage) + coincident interrupt error | should pause+re-dispatch; used to `failed` | **FIXED** `4ff91c7c` (`ERROR_IMMUNE_FREEZE_TYPES`, guarded error short-circuit) |
-| **B** | **sub**job + drain/outage freeze | `pending_review` instead of pause+re-dispatch | **OPEN** |
-| **C** | top-level job + `job_complete` (work done **and merged**) + coincident teardown error | `failed` — overwrites an already-successful completion | **OPEN** |
+| **B** | **sub**job + drain/outage freeze | `pending_review` instead of pause+re-dispatch | **FIXED** `8a561f94` (`version_upgrade` subjob → `paused`/terminal via `parent_status`) |
+| **C** | top-level job + `job_complete` (work done **and merged**) + coincident teardown error | `failed` — overwrites an already-successful completion | **FIXED** `8a561f94` + `254bf2a3` (teardown carve-out + idempotency backstop) |
 
 Slice A's fix (`docs/done/version_upgrade_drain_masked_by_coincident_error.md`)
 hoisted freeze-resolution above the `if error` short-circuit but scoped the carve-out
