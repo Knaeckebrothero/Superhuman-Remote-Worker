@@ -88,3 +88,50 @@ def test_sweep_covers_the_known_offenders():
         "config/experts/designer/tactical.txt",
     ):
         assert f in swept, f"{f} not covered by the brace-safety sweep"
+
+
+# Task 15 (F-C1 protected cloud): the interactive variants carry a
+# `{% if protected_cloud %}` honesty block that the main sweep above never
+# takes (it renders with the flag defaulting to False). Sweep the real files
+# with the flag ON too, so a Jinja typo inside the block in any variant is
+# caught here rather than at session attach.
+_INTERACTIVE_PROMPTS = sorted(
+    _REPO_ROOT.glob("config/prompts/systemprompt_interactive*.txt")
+)
+
+
+@pytest.mark.parametrize(
+    "prompt_path",
+    _INTERACTIVE_PROMPTS,
+    ids=lambda p: str(p.relative_to(_REPO_ROOT)),
+)
+def test_interactive_prompt_protected_cloud_block_renders(prompt_path: Path):
+    """protected_cloud=True must render the staged-for-review block with no
+    Jinja residue; False must drop it entirely."""
+    content = prompt_path.read_text()
+    tools = _has_tool_names(content)
+    on = render_placeholders(
+        render_instruction_content(content, tools, protected_cloud=True),
+        **_KNOWN,
+    )
+    off = render_placeholders(
+        render_instruction_content(content, tools, protected_cloud=False),
+        **_KNOWN,
+    )
+    assert "staged for your review" in on, f"{prompt_path}: block missing when ON"
+    assert "{%" not in on, f"{prompt_path}: Jinja residue when ON"
+    assert "staged for your review" not in off, f"{prompt_path}: block leaked when OFF"
+    assert "{%" not in off, f"{prompt_path}: Jinja residue when OFF"
+
+
+def test_protected_cloud_sweep_covers_all_interactive_variants():
+    """Guards the glob: all four shipped interactive variants must be swept."""
+    names = {p.name for p in _INTERACTIVE_PROMPTS}
+    expected = {
+        "systemprompt_interactive.txt",
+        "systemprompt_interactive_deepseek.txt",
+        "systemprompt_interactive_glm.txt",
+        "systemprompt_interactive_gpt_5.txt",
+    }
+    missing = expected - names
+    assert not missing, f"interactive variants missing from sweep: {missing}"

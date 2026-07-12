@@ -1466,10 +1466,29 @@ async def _attach_session(
     # config_override merge above — pushing it through config_override would
     # make an otherwise-empty override truthy and force every protected
     # thread through the `elif config_override:` deep-merge/rebuild branch
-    # even when no other override exists. hasattr guards a boot config
-    # object that (only in tests) may not be a real AgentConfig dataclass.
-    if protected_cloud and hasattr(effective_config, "extra"):
-        effective_config.extra["_protected_cloud"] = True
+    # even when no other override exists.
+    #
+    # NEVER mutate effective_config in place here: on the plain-boot path
+    # (no resolved_config / config_name / config_override) effective_config
+    # IS the module-singleton _agent.config, which pool-mode pods reuse
+    # across sequential session attaches — an in-place write would leak
+    # _protected_cloud into every later NON-protected session on the pod
+    # (whose live cloud files really are saved, making the honesty block a
+    # lie). Clone via dataclasses.replace with a copied extra dict instead;
+    # the new object is assigned back to the local, so all downstream use
+    # in this function picks it up. The guards skip test stubs that aren't
+    # real AgentConfig dataclasses.
+    import dataclasses
+
+    if (
+        protected_cloud
+        and hasattr(effective_config, "extra")
+        and dataclasses.is_dataclass(effective_config)
+    ):
+        effective_config = dataclasses.replace(
+            effective_config,
+            extra={**effective_config.extra, "_protected_cloud": True},
+        )
 
     # Auxiliary LLM rebuild. The boot-time _agent._auxiliary_llm is built from
     # config.auxiliary.model in the YAML default — for persistent sessions

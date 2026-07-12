@@ -3085,6 +3085,119 @@ class TestAttachSessionProtectedCloudFailClose:
         assert "Sessions/thread-1" in kwargs["cloud_cfg"]["webdav_url"]
 
 
+class TestAttachSessionProtectedCloudSingletonIsolation:
+    """Task 15 review fix: the protected_cloud honesty flag must never be
+    written into the pool-mode singleton ``_agent.config``.
+
+    On the plain-boot attach path (no resolved_config / config_name /
+    config_override) ``effective_config`` aliases ``_agent.config``, which a
+    pool pod reuses across sequential session attaches. An in-place
+    ``extra["_protected_cloud"]`` write would leak the flag into every later
+    NON-protected session on the same pod — whose live cloud files really are
+    saved, making the honesty block ("staged for your review") a lie. The fix
+    clones via ``dataclasses.replace``; this pins both sides: the protected
+    session's own config carries the flag, while the singleton (and therefore
+    a subsequent non-protected session) never sees it.
+    """
+
+    @staticmethod
+    def _fake_session_cls(captured_configs: list):
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                captured_configs.append(kwargs.get("config"))
+                self.cloud_mount_manager = None
+                self.cloud_mount_error = None
+                self.overlay_mount_manager = None
+                self.workspace_manager = SimpleNamespace(
+                    path=Path("/workspace"),
+                    backend=MagicMock(),
+                )
+                self.workspace_sync = None
+                self.postgres_conn = None
+                self.tool_context = None
+
+            async def setup(self, **kwargs):
+                return None
+
+        return FakeSession
+
+    @staticmethod
+    def _workspace_override(protected: bool) -> dict:
+        # No resolved_config / config_override / config_name anywhere: keeps
+        # the attach on the plain-boot path where effective_config starts as
+        # the _agent.config singleton itself.
+        return {
+            "remote": {"host": "10.42.0.10"},
+            "cloud_mount": None,
+            "cloud_sync": None,
+            "protected_cloud": protected,
+        }
+
+    async def _attach_once(self, mod, fake_agent, workspace_override, captured):
+        fake_orchestrator = SimpleNamespace(
+            get_thread_workspace=AsyncMock(return_value=workspace_override)
+        )
+        mod._session = None
+        mod._thread_id = None
+        with (
+            patch.object(mod, "_agent", fake_agent),
+            patch.object(mod, "_orchestrator_client", fake_orchestrator),
+            patch.object(
+                mod, "PersistentSession", self._fake_session_cls(captured)
+            ),
+            patch.object(
+                mod,
+                "_poll_workspace_ready",
+                new=AsyncMock(return_value=workspace_override),
+            ),
+            patch.object(mod, "_build_sync_coordinator"),
+            patch.object(mod, "_restore_session_messages", new=AsyncMock()),
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(mod, "_start_watchdogs"),
+        ):
+            try:
+                await mod._attach_session("thread-1")
+            finally:
+                mod._session = None
+                mod._thread_id = None
+
+    @pytest.mark.asyncio
+    async def test_sequential_pool_reuse_does_not_leak_protected_flag(self):
+        """Attach protected session A, then non-protected session B, through
+        the same _agent: B and the singleton must never carry the flag."""
+        import src.api.persistent_app as mod
+        from src.core.loader import AgentConfig
+
+        singleton = AgentConfig(agent_id="pool-pod", display_name="Pool Pod")
+        fake_agent = SimpleNamespace(
+            config=singleton,
+            _tactical_llm=None,
+            _llm=object(),
+            _auxiliary_llm=object(),
+            postgres_conn=None,
+            vector_conn=None,
+        )
+
+        captured: list = []
+        await self._attach_once(
+            mod, fake_agent, self._workspace_override(True), captured
+        )
+        await self._attach_once(
+            mod, fake_agent, self._workspace_override(False), captured
+        )
+
+        config_a, config_b = captured
+        # Session A's own config carries the flag (honesty block renders)…
+        assert config_a.extra.get("_protected_cloud") is True
+        # …via a clone — never by mutating the singleton itself.
+        assert config_a is not singleton
+        # The singleton was never polluted…
+        assert "_protected_cloud" not in singleton.extra
+        # …so session B (which aliases it on this path) never inherits it.
+        assert config_b is singleton
+        assert "_protected_cloud" not in config_b.extra
+
+
 # ---------------------------------------------------------------------------
 # 3.17.3 Headless: attach-time readiness race (handle_persistent_websocket)
 # ---------------------------------------------------------------------------
