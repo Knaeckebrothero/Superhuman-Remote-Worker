@@ -104,6 +104,13 @@ export function allDatasourcesSelected(
               <span class="ds-type-badge">
                 {{ 'datasources.filter.' + ds.type | transloco }}
               </span>
+              @if (ds.is_global) {
+                <span class="ds-type-badge" [class.ds-rw-badge]="ds.read_only === false">
+                  {{ (ds.read_only === false
+                    ? 'datasources.table.badgeRw'
+                    : 'datasources.table.badgeRo') | transloco }}
+                </span>
+              }
             </label>
           }
         </div>
@@ -227,6 +234,11 @@ export function allDatasourcesSelected(
       background: rgba(255, 255, 255, 0.06);
       color: var(--text-muted, var(--text-muted));
       flex-shrink: 0;
+    }
+    /* Public read-write chip — warning tone so attachers see write access. */
+    .ds-rw-badge {
+      color: var(--warning, var(--text-primary));
+      background: var(--warning-tint, rgba(255, 255, 255, 0.06));
     }
     .ds-loading {
       display: flex;
