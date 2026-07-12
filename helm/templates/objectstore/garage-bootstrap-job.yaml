@@ -97,20 +97,33 @@ spec:
               [ -n "$NODE" ] || { echo "could not parse node id"; cat /tmp/status; exit 1; }
               echo "node=$NODE"
 
-              # 2. Assign single-node layout if this node has no role yet.
+              # 2. Assign single-node layout if none is APPLIED yet. Decide on
+              # the applied layout version, NOT a raw node-id grep: a
+              # staged-but-not-applied role (e.g. a stage that succeeded then an
+              # apply that failed and retried) leaves the node id in the JSON
+              # while version stays 0, so a grep would falsely skip and the Job
+              # would exit 0 over a store with no active layout. version only
+              # advances on a successful apply.
               curl -sf -H "$AUTH" "$ADMIN/v1/layout" >/tmp/layout
               VER=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' /tmp/layout | head -1)
               VER=${VER:-0}
-              if ! grep -q "\"$NODE\"" /tmp/layout; then
+              if [ "$VER" -lt 1 ]; then
+                # stage this node's role (tolerate an already-staged retry) ...
                 curl -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                   -d "[{\"id\":\"$NODE\",\"zone\":\"dc1\",\"capacity\":${GARAGE_CAPACITY_BYTES},\"tags\":[]}]" \
-                  "$ADMIN/v1/layout" >/dev/null
-                NEXT=$((VER+1))
+                  "$ADMIN/v1/layout" >/dev/null || true
+                # ... then apply it.
                 curl -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
-                  -d "{\"version\":${NEXT}}" "$ADMIN/v1/layout/apply" >/dev/null
-                echo "layout applied v${NEXT}"
+                  -d "{\"version\":$((VER+1))}" "$ADMIN/v1/layout/apply" >/dev/null
+                # Verify the apply actually took — never report success over a
+                # store whose layout is still unapplied.
+                curl -sf -H "$AUTH" "$ADMIN/v1/layout" >/tmp/layout2
+                NEWVER=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' /tmp/layout2 | head -1)
+                NEWVER=${NEWVER:-0}
+                [ "$NEWVER" -ge 1 ] || { echo "layout apply did not take (version=$NEWVER)"; cat /tmp/layout2; exit 1; }
+                echo "layout applied v${NEWVER}"
               else
-                echo "layout already assigned"
+                echo "layout already applied (v${VER})"
               fi
 
               # 3. Bucket + scoped-key setup.
