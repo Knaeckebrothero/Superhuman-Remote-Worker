@@ -871,6 +871,7 @@ export interface Project {
   nextcloud_folder_id?: number | null;
   cloud_storage_read_only?: boolean;
   cloud_storage_url?: string | null;
+  main_cloud_backend?: string | null;
   network_tier?: ProjectNetworkTier;
   created_at: string;
   updated_at: string;
@@ -1582,11 +1583,18 @@ export interface GrantCatalogEntry {
 
 export type GrantCatalog = Record<string, GrantCatalogEntry>;
 
+/** Deployment-level feature flags surfaced alongside the caller's grants
+ * (e.g. protected cloud mode — Slice C's session-create toggle gate). */
+export interface UserCapabilityFeatures {
+  protected_cloud?: boolean;
+}
+
 /** GET /api/users/me/capabilities */
 export interface UserCapabilities {
   is_admin: boolean;
   grants: Record<string, unknown> | null; // null ⇒ admin (unrestricted)
   catalog: GrantCatalog;
+  features?: UserCapabilityFeatures;
 }
 
 /** GET /api/voice/capabilities — whether a usable TTS/STT model is configured

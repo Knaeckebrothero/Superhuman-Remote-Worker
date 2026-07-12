@@ -1,6 +1,6 @@
 import {computed, inject, Injectable, signal} from '@angular/core';
 import {ApiService} from './api.service';
-import type {GrantCatalog} from '../models/api.model';
+import type {GrantCatalog, UserCapabilityFeatures} from '../models/api.model';
 import {allowedEnumOptions} from '../../views/agent-settings/capability-gates';
 
 /** Permission modes, lowest→highest autonomy (mirrors the backend
@@ -24,6 +24,7 @@ export class CapabilitiesService {
   // undefined = loading; null = admin / unrestricted; else the resolved grants dict.
   readonly grants = signal<Record<string, unknown> | null | undefined>(undefined);
   readonly catalog = signal<GrantCatalog>({});
+  readonly features = signal<UserCapabilityFeatures>({});
 
   // True when the capabilities fetch errored (ApiService catches to a null
   // emission, which would otherwise be indistinguishable from an admin's
@@ -40,6 +41,7 @@ export class CapabilitiesService {
       this.loadFailed.set(c === null);
       this.grants.set(c ? c.grants : null);
       if (c?.catalog) this.catalog.set(c.catalog);
+      this.features.set(c?.features ?? {});
     });
   }
 
@@ -70,4 +72,10 @@ export class CapabilitiesService {
   readonly permissionRestricted = computed(
     () => this.permissionModes().length < PERMISSION_MODES.length,
   );
+
+  /** Whether protected cloud mode is enabled at the deployment level (Slice
+   * C's session-create toggle gate). Fails closed while loading / on error,
+   * same posture as `canPublishDatasources` — the flag only flips true after
+   * a successful fetch confirms it. */
+  readonly protectedCloudAvailable = computed(() => !!this.features().protected_cloud);
 }

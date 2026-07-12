@@ -27112,14 +27112,15 @@ async def my_capabilities(request: Request) -> dict:
     user = await require_approved_user(request, postgres_db)
     from src.core.capability_grants import CATALOG
 
+    features = {"protected_cloud": _is_protected_cloud_mode_enabled()}
     if user.get("is_admin"):
-        return {"is_admin": True, "grants": None, "catalog": CATALOG}
+        return {"is_admin": True, "grants": None, "catalog": CATALOG, "features": features}
     from services.grants_service import resolve_grants_for
 
     grants = await resolve_grants_for(
         postgres_db, user_id=str(user["id"]), project_ids=await _grant_project_ids(user)
     )
-    return {"is_admin": False, "grants": grants, "catalog": CATALOG}
+    return {"is_admin": False, "grants": grants, "catalog": CATALOG, "features": features}
 
 
 # =============================================================================

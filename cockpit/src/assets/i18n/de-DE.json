@@ -251,7 +251,9 @@
       "cancel": "Abbrechen",
       "expertLabel": "Experte",
       "expertLoading": "Experten werden geladen...",
-      "createSession": "Sitzung erstellen"
+      "createSession": "Sitzung erstellen",
+      "protectedCloud": "Geschützte Cloud — Agenten-Änderungen werden zur Überprüfung bereitgestellt",
+      "protectedCloudHint": "Der Agent erhält schreibgeschützten Cloud-Zugriff; seine Änderungen warten im Prüfbereich auf Ihre Freigabe."
     }
   },
   "jobs": {
