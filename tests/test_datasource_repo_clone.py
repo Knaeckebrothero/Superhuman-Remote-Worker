@@ -193,3 +193,34 @@ class TestProcessDatasourcesRepoGuard:
         assert any(
             "ignored by process_datasources" in r.message for r in caplog.records
         )
+
+
+class TestDeclaredReadOnlyIndexNote:
+    """Public datasources declared read-only get an advisory index note
+    (docs/features/public_datasources.md — declarative, not enforced)."""
+
+    def test_declared_ro_repo_notes_in_index(self):
+        ws = make_workspace_manager()
+        ws.read_file.side_effect = FileNotFoundError
+        written = {}
+        ws.write_file.side_effect = lambda path, content: written.update(
+            {path: content}
+        )
+        ds = token_ds(name="Org Wiki")
+        ds["read_only"] = True
+
+        inject_datasource_index([ds], ws)
+
+        assert "declared read-only" in written["datasources.md"]
+
+    def test_private_repo_has_no_ro_note(self):
+        ws = make_workspace_manager()
+        ws.read_file.side_effect = FileNotFoundError
+        written = {}
+        ws.write_file.side_effect = lambda path, content: written.update(
+            {path: content}
+        )
+
+        inject_datasource_index([token_ds(name="Mine")], ws)
+
+        assert "declared read-only" not in written["datasources.md"]
