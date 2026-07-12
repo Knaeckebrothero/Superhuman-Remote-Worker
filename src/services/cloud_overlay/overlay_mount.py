@@ -258,7 +258,17 @@ echo "{_OVERLAY_OK}"
 
     def _mount_body_only_script(self) -> str:
         """Remount the overlay over the (refreshed) lower; no symlink work —
-        the symlink already points at the merged path from the initial mount."""
+        the symlink already points at the merged path from the initial mount.
+
+        Freshens the WORKDIR (wipe + recreate) immediately before the
+        fuse-overlayfs mount line — a fuse-overlayfs workdir must never be
+        reused across mount instances (design §11.2/§11.6 #2). Deliberately
+        NEVER touches ``upper``: staged data must survive a heal/refresh
+        remount. ``reset_upper`` already wipes both upper and work via
+        ``_wipe_upper_script`` before calling this method for its own
+        remount — re-freshening work here is redundant-but-harmless for that
+        caller and is exactly what's needed for the other caller, ``heal``,
+        which never wipes work otherwise."""
         upper = shlex.quote(self.upper)
         work = shlex.quote(self.work)
         merged = shlex.quote(self.merged)
@@ -269,8 +279,9 @@ echo "{_OVERLAY_OK}"
         return f"""#!/usr/bin/env bash
 set -euo pipefail
 trap 'rc=$?; echo "{_OVERLAY_FAILED} rc=${{rc}}"; exit "${{rc}}"' ERR
-mkdir -p {upper} {work} {merged}
+mkdir -p {upper} {merged}
 if ! mountpoint -q {lower}; then echo "{_OVERLAY_FAILED} rc=2 (lower not mounted)"; exit 2; fi
+rm -rf {work} && mkdir -p {work}
 fuse-overlayfs -o {opts} {merged}
 mountpoint -q {merged}
 echo "{_OVERLAY_OK}"
