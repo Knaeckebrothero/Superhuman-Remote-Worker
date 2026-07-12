@@ -19535,14 +19535,9 @@ async def _engage_protected_cloud_for_thread(
     with NO cloud mount (never a live one) and the agent can say why."""
     if not _is_protected_cloud_mode_enabled():
         return
-    row = next(
-        (
-            r
-            for r in (mount_rows or [])
-            if r.get("backend_id") == "nextcloud" and r.get("cloud_handle")
-        ),
-        None,
-    )
+    from services.cloud_staging import select_protected_mount
+
+    row = select_protected_mount(mount_rows)
     if row is None:
         await _record_protected_error(thread_id, "no Nextcloud project mount to protect")
         return
