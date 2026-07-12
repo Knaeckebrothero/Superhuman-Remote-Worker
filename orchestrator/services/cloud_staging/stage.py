@@ -20,6 +20,7 @@ no-op dict, a success dict, or ``None`` on hard failure (logged here).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -107,6 +108,16 @@ def _parse_metadata(thread: dict | None) -> dict:
         except (ValueError, TypeError):
             metadata = {}
     return metadata
+
+
+def _sha256_file(path: str) -> str:
+    """Streamed sha256 of a file in 1 MiB chunks (synchronous, run in a
+    thread) — the staged tar can be GBs, so never read it whole into memory."""
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
 
 
 # =============================================================================
@@ -279,6 +290,15 @@ async def _stage_thread_cloud_diff(
             staged_at=datetime.now(timezone.utc).isoformat(),
         )
         manifest["signature"] = signature
+        # Content binding (multi-replica torn-pair defense): with 2
+        # orchestrator replicas, two concurrent stagings can interleave the
+        # two non-atomic S3 PUTs, leaving a manifest at the deterministic key
+        # that doesn't describe the tar next to it. Binding the manifest to
+        # the exact tar bytes lets readers (UpperdirDiffSource / apply) verify
+        # the downloaded tar and treat a mismatch as staging-missing.
+        # A hashing failure (e.g. OSError) propagates to the outer catch-all
+        # in stage_thread_cloud_diff → logged, returns None (never raises).
+        manifest["tar_sha256"] = await asyncio.to_thread(_sha256_file, tar_path)
 
         if not await snapshot_service.upload_blob_file(staging_tar_key(thread_id), tar_path):
             logger.error("stage: tar upload failed for thread %s", thread_id)
@@ -299,7 +319,11 @@ async def _stage_thread_cloud_diff(
         await postgres_db.update_ro_mount_staging(
             row["id"],
             staged_epoch=manifest["epoch"],
-            staged_summary={"counts": manifest["counts"], "signature": signature},
+            staged_summary={
+                "counts": manifest["counts"],
+                "signature": signature,
+                "tar_sha256": manifest["tar_sha256"],
+            },
         )
         return {"epoch": manifest["epoch"], "counts": manifest["counts"]}
     finally:
