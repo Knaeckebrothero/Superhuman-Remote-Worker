@@ -344,3 +344,91 @@ def test_srw_cloud_status_reports_manager_status():
 
     assert "Cloud mount status" in result
     assert "home mounted" in result
+
+
+def test_read_only_commands_pass_at_quota():
+    """Read-only commands should not trigger the upperdir quota guard, even when over quota."""
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(
+            shell_manager,
+            {
+                "active": True,
+                "scan_guard": "warn",
+                "_overlay_manager": FakeOverlayManager("Cloud staging guard: full"),
+            },
+        )
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    # Test various read-only commands (must use absolute paths for guard detection)
+    read_commands = [
+        "cat /workspace/cloud/a.txt",
+        "ls -la /workspace/cloud",
+        "grep r foo /workspace/cloud",
+        "du -sh /workspace/cloud",
+    ]
+
+    for cmd in read_commands:
+        result = run_command.invoke({"command": cmd})
+        assert "Cloud staging guard: full" not in result, f"Read command '{cmd}' should not trigger upperdir guard"
+        assert "Exit code: 0" in result, f"Read command '{cmd}' should execute"
+        assert cmd in shell_manager.run_calls, f"Command '{cmd}' should have been run"
+
+
+def test_write_commands_blocked_at_quota():
+    """Write-indicating commands should trigger the upperdir quota guard when over quota."""
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(
+            shell_manager,
+            {
+                "active": True,
+                "scan_guard": "warn",
+                "_overlay_manager": FakeOverlayManager("Cloud staging guard: full"),
+            },
+        )
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    # Test various write-indicating commands (must use absolute paths for guard detection)
+    write_commands = [
+        "echo hi > /workspace/cloud/x",
+        "tee /workspace/cloud/x",
+        "rm /workspace/cloud/x",
+        "cp a /workspace/cloud/",
+        "mv a /workspace/cloud/",
+        "touch /workspace/cloud/x",
+        "mkdir /workspace/cloud/d",
+        "sed -i s/a/b/ /workspace/cloud/x",
+        "rsync a /workspace/cloud/",
+        "dd of /workspace/cloud/x",
+        "truncate -s0 /workspace/cloud/x",
+    ]
+
+    for cmd in write_commands:
+        shell_manager.run_calls.clear()
+        result = run_command.invoke({"command": cmd})
+        assert "Cloud staging guard: full" in result, f"Write command '{cmd}' should trigger upperdir guard"
+        assert shell_manager.run_calls == [], f"Command '{cmd}' should not have been run"
+
+
+def test_pipeline_with_redirect_detected():
+    """Pipelines with redirect operators should be detected as write operations."""
+    shell_manager = FakeShellManager()
+    tools = create_shell_tools(
+        _context(
+            shell_manager,
+            {
+                "active": True,
+                "scan_guard": "warn",
+                "_overlay_manager": FakeOverlayManager("Cloud staging guard: full"),
+            },
+        )
+    )
+    run_command = next(tool for tool in tools if tool.name == "run_command")
+
+    result = run_command.invoke({"command": "sort a | uniq >> /workspace/cloud/out"})
+
+    assert "Cloud staging guard: full" in result
+    assert shell_manager.run_calls == []

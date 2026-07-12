@@ -25,6 +25,7 @@ from .coding_tools import _truncate_output
 from .shell_manager import SUDO_FREEZE_SENTINEL
 from ..context import ToolContext
 from ...services.cloud_mount.guardrails import (
+    command_may_write_cloud,
     command_touches_cloud_mount,
     detect_cloud_delete_risk,
     detect_cloud_scan_risk,
@@ -142,6 +143,8 @@ def _cloud_cache_guard_decision(command: str, context: ToolContext) -> Optional[
 def _cloud_upperdir_guard_decision(command: str, context: ToolContext) -> Optional[str]:
     cloud_mount_cfg = context.get_config("cloud_mount", {})
     if not isinstance(cloud_mount_cfg, dict) or not cloud_mount_cfg.get("active"):
+        return None
+    if not command_may_write_cloud(command):
         return None
     if not command_touches_cloud_mount(command):
         return None
