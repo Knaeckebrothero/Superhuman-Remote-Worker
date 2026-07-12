@@ -1,6 +1,9 @@
 # S3 object store is a near-hard requirement — ship a bundled fallback
 
-**Status**: OPEN (parked 2026-07-12; decision made, work not scheduled)
+**Status**: IN PROGRESS (2026-07-12) — chart-bundled Garage store.
+Spec: `docs/superpowers/specs/2026-07-12-bundled-garage-object-store-design.md`.
+Plan: `docs/superpowers/plans/2026-07-12-bundled-garage-object-store.md`.
+
 **Decision of record**: platform features may **assume an S3-compatible
 object store is present**. Self-host installs without an external store are
 served by a future chart-bundled option, not by per-feature fallback logic.
@@ -47,6 +50,10 @@ suspension — each failing at a different, late point.
    external unset), surface one loud warning at orchestrator startup listing
    the features that will be degraded, instead of today's per-feature late
    failures.
+
+**Current scope:** Item 1 (bundled Garage backing snapshots + virtual tier) is
+under implementation. Item 3 (orchestrator no-store startup warning) remains a
+separate fast-follow.
 
 ## Non-goals
 
