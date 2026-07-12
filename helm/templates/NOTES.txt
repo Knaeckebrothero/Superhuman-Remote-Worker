@@ -61,3 +61,20 @@ Inspect the run:
 
   kubectl -n {{ .Release.Namespace }} logs job/{{ include "srw.fullname" . }}-llm-seed
 {{- end }}
+
+{{- if .Values.garage.enabled }}
+
+Bundled object store (Garage) — NOT FOR PRODUCTION
+==================================================
+A single-node Garage S3 store is enabled. It has NO replication or erasure
+coding and is bound to one PVC ({{ include "srw.fullname" . }}-garage-data).
+It backs workspace snapshots (bucket "{{ .Values.s3.bucket }}") and the virtual
+workspace tier (bucket "{{ .Values.garage.buckets.workspaces }}").
+
+For production, set garage.enabled=false and point at an external S3:
+  - s3.endpoint / s3.bucket                 (snapshots)
+  - virtualWorkspace.s3.endpoint            (virtual tier)
+
+Inspect the one-time bootstrap (layout + buckets + keys):
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "srw.fullname" . }}-garage-bootstrap
+{{- end }}
