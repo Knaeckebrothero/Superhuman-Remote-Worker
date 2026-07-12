@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from orchestrator.services.cloud.base import CanaryFixture, RoReaderGrant
+from orchestrator.services.cloud.errors import CloudBackendError, CloudBackendErrorKind
 from orchestrator.services.cloud.ro_engage import RoEngageRefused, engage_ro_mount
 
 
@@ -60,9 +61,11 @@ def _reader_client(
 class _FakeRoBackend:
     backend_id = "nextcloud"
 
-    def __init__(self):
+    def __init__(self, *, baseline=None, baseline_error=None):
         self.revoked: list[str] = []
         self.canary_removed = False
+        self._baseline = {"a.txt": "e1"} if baseline is None else baseline
+        self._baseline_error = baseline_error
 
     async def ensure_ro_reader(self, *, user_key):
         return f"srw-reader-{user_key}"
@@ -93,6 +96,11 @@ class _FakeRoBackend:
     async def remove_canary_fixture(self, handle, fixture):
         self.canary_removed = True
 
+    async def capture_etag_baseline(self, handle):
+        if self._baseline_error is not None:
+            raise self._baseline_error
+        return self._baseline
+
 
 def _handle():
     return object()  # the gate treats the handle opaquely
@@ -115,7 +123,7 @@ async def test_engage_persists_and_returns_grant_when_probe_ok():
         thread_id="t1",
         user_id="u1",
         postgres_db=db,
-        http_client_factory=lambda creds: probe_client,
+        http_client_factory=lambda creds, reader_id: probe_client,
     )
 
     assert grant.reader_id == "srw-reader-abc"
@@ -166,7 +174,7 @@ async def test_engage_refuses_and_revokes_when_a_write_succeeds():
             thread_id="t1",
             user_id="u1",
             postgres_db=db,
-            http_client_factory=lambda creds: probe_client,
+            http_client_factory=lambda creds, reader_id: probe_client,
         )
 
     db.create_ro_mount.assert_not_awaited()
@@ -190,7 +198,7 @@ async def test_engage_refuses_when_read_control_fails():
             thread_id="t1",
             user_id="u1",
             postgres_db=db,
-            http_client_factory=lambda creds: probe_client,
+            http_client_factory=lambda creds, reader_id: probe_client,
         )
     db.create_ro_mount.assert_not_awaited()
     assert backend.revoked
@@ -212,7 +220,86 @@ async def test_engage_refuses_when_version_below_floor():
             thread_id="t1",
             user_id="u1",
             postgres_db=db,
-            http_client_factory=lambda creds: probe_client,
+            http_client_factory=lambda creds, reader_id: probe_client,
         )
     db.create_ro_mount.assert_not_awaited()
     assert backend.revoked
+
+
+@pytest.mark.asyncio
+async def test_engage_captures_and_persists_etag_baseline():
+    # design §3.4: without a baseline neither the staged-diff manifest nor
+    # the apply conflict gate can classify writes, so a successful engage
+    # must capture + persist one against the row it just created.
+    backend = _FakeRoBackend(baseline={"a.txt": "e1"})
+    probe_client = _reader_client(all_rejected=True, read_control=207)
+    db = AsyncMock()
+    db.create_ro_mount = AsyncMock(return_value="row-1")
+
+    await engage_ro_mount(
+        backend=backend,
+        handle=_handle(),
+        user_key="abc",
+        thread_id="t1",
+        user_id="u1",
+        postgres_db=db,
+        http_client_factory=lambda creds, reader_id: probe_client,
+    )
+
+    db.update_ro_mount_baseline.assert_awaited_once_with("row-1", {"a.txt": "e1"})
+
+
+@pytest.mark.asyncio
+async def test_engage_refuses_when_baseline_capture_fails():
+    backend = _FakeRoBackend(
+        baseline_error=CloudBackendError(
+            CloudBackendErrorKind.UNAVAILABLE, "propfind failed", backend="nextcloud"
+        )
+    )
+    probe_client = _reader_client(all_rejected=True, read_control=207)
+    db = AsyncMock()
+    db.create_ro_mount = AsyncMock(return_value="row-1")
+
+    with pytest.raises(RoEngageRefused):
+        await engage_ro_mount(
+            backend=backend,
+            handle=_handle(),
+            user_key="abc",
+            thread_id="t1",
+            user_id="u1",
+            postgres_db=db,
+            http_client_factory=lambda creds, reader_id: probe_client,
+        )
+
+    # Fail-closed: the row was created but the grant must still be revoked
+    # (no dangling reader access without a baseline to gate writes against),
+    # and the baseline must never be persisted.
+    assert backend.revoked
+    db.update_ro_mount_baseline.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_engage_passes_reader_id_to_client_factory():
+    backend = _FakeRoBackend()
+    probe_client = _reader_client(all_rejected=True, read_control=207)
+    recorder: list[tuple[str | None, str]] = []
+
+    def factory(credentials, reader_id):
+        recorder.append((credentials, reader_id))
+        return probe_client
+
+    db = AsyncMock()
+    db.create_ro_mount = AsyncMock(return_value="row-1")
+
+    grant = await engage_ro_mount(
+        backend=backend,
+        handle=_handle(),
+        user_key="u1",
+        thread_id="t1",
+        user_id="u1",
+        postgres_db=db,
+        http_client_factory=factory,
+    )
+
+    assert grant.reader_id == "srw-reader-u1"
+    assert recorder == [(grant.credentials, "srw-reader-u1")]
