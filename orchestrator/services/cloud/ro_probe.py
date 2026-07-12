@@ -31,12 +31,17 @@ is held to fail-closed standards throughout:
   groupfolders per-branch >= ``GROUPFOLDERS_PATCHED``) into a runtime
   capabilities check instead of a documentation-only assumption.
 * **Side channels are real requests, not decoys.** ``side_channel_probes``
-  builds the actual DAV MOVE/POST requests a real restore/finalize
-  operation would issue (dedicated ``versions``/``trashbin``/``uploads``
-  namespaces), not a second POST to the same generic folder URL every
-  other verb already exercises — the latter can 405 for reasons that
-  have nothing to do with restore-permission enforcement, giving false
-  assurance against the very CVE class this module exists to catch.
+  builds the actual DAV MOVE requests a real restore/finalize operation
+  would issue (dedicated ``versions``/``trashbin``/``uploads`` namespaces),
+  not a second POST to the same generic folder URL every other verb
+  already exercises — the latter can 405 for reasons that have nothing to
+  do with restore-permission enforcement, giving false assurance against
+  the very CVE class this module exists to catch. Each side channel aims
+  at the PROTECTED mount (or verifies its effect there): the
+  uploads-finalize ``Destination`` lands inside the mount, and
+  trash-restore checks the item stayed trashed. A write that only reaches
+  the reader's own home/namespace is a legitimate reader capability, not a
+  bypass, and must not be probed as one (live tuning 2026-07-12).
 
 Gate semantics — ``RoProbeResult.ok`` is the engage gate, strictly. It
 is True only when *every* check was attempted AND verified rejected:
@@ -79,6 +84,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import unquote
 
 # Whole-branch-review Finding 1: 401 was dropped from this set. Without a
 # positive read control, a wrong/expired RO credential 401s on every
@@ -167,7 +173,12 @@ _SYNTHETIC_FILEID = "999999999"
 _SYNTHETIC_VERSIONID = "1"
 _SYNTHETIC_TRASH_ITEM = "srw-ro-probe-item"
 _SYNTHETIC_TRANSFER_ID = "srw-ro-probe"
-_SYNTHETIC_UPLOAD_TARGET = "srw-ro-probe-target"
+# Filename the uploads-finalize probe tries to land INSIDE the protected
+# mount. The whole point of the CVE class is a write reaching the RO folder,
+# so the finalize Destination must be inside the mount — never the reader's
+# own home (a reader can always write its own home, which would false-positive
+# the probe; proven live on NC 31, 2026-07-12).
+_MOUNT_FINALIZE_TARGET = "srw-ro-probe-finalize.txt"
 
 
 def side_channel_probes(
@@ -176,6 +187,7 @@ def side_channel_probes(
     *,
     version_ref: str | None = None,
     trash_ref: str | None = None,
+    mount_url: str | None = None,
 ) -> list[tuple[str, str, dict[str, Any]]]:
     """Build the real restore/finalize requests for the RO-bypass CVE class.
 
@@ -191,29 +203,41 @@ def side_channel_probes(
     ``_SYNTHETIC_TRASH_ITEM`` placeholders in the versions-restore and
     trash-restore requests (``trash_ref`` replaces the placeholder in BOTH
     the URL and the ``Destination`` header) with ids the server actually
-    knows — turning a 404 ``inconclusive`` into a verified ``403``
-    rejection on a correctly-RO reader. ``None`` (the default) keeps the
-    synthetic placeholder, so that side channel stays inconclusive,
-    fail-closed.
+    knows — turning a 404 ``inconclusive`` into a verified rejection on a
+    correctly-RO reader. ``None`` (the default) keeps the synthetic
+    placeholder, so that side channel stays inconclusive, fail-closed.
 
-    Four real operations, not a fourth generic-folder POST:
+    ``mount_url`` is the reader's files-namespace URL for the PROTECTED
+    mount (``{origin}/remote.php/dav/files/{reader}/{mount}``). The CVE
+    class is a write that reaches the read-only folder, so the
+    uploads-finalize ``Destination`` MUST land inside the mount — NOT the
+    reader's own home. A reader is a real Nextcloud user who can always
+    write its own home, so a home-targeted finalize returns 201/204 and
+    false-positives the gate (proven live on NC 31, 2026-07-12: home
+    Destination → 201, mount Destination → 403). When ``mount_url`` is
+    None (the label-only "skipped" path), the finalize falls back to a
+    home Destination — harmless there because the request is never sent.
+
+    Three real operations against the protected mount / dedicated DAV
+    namespaces:
 
     * **versions-restore** (GHSA-5mq8-738w-5942): ``MOVE`` a version into
       the restore target, under the dedicated ``versions`` DAV namespace.
     * **trash-restore** (GHSA-2vrq-fhmf-c49m): ``MOVE`` a trashed item
-      back into ``files``, under the dedicated ``trashbin`` namespace.
-    * **chunked-upload finalize** (the spec's missing
-      "chunked-upload/TUS finalize" verb): ``MOVE`` an in-progress upload
-      chunk collection's ``.file`` marker into ``files`` — this is how a
-      chunked upload is finalized/committed on Nextcloud's ``uploads``
-      DAV namespace.
-    * **TUS-style creation attempt**: a ``POST`` with
-      ``Tus-Resumable``/``Upload-Length`` headers, attempting to start a
-      brand-new upload session. Honest caveat: it targets the NC-shaped
-      ``{root}/uploads/{username}/`` collection here; a real
-      oCIS/OpenCloud TUS creation targets the spaces endpoint instead —
-      the §6.4 live-probe run will correct the request shape per
-      backend.
+      back into the reader's ``trashbin`` restore endpoint — for a
+      groupfolder member this exercises the team-folder trash-restore the
+      CVE covers. Nextcloud signals an RO denial here with a 500, not a
+      clean 403, so ``probe_read_only`` verifies the *effect* (the item
+      stays trashed), not the status code alone.
+    * **chunked-upload finalize** (the spec's "chunked-upload/TUS
+      finalize"): ``MOVE`` an in-progress upload chunk collection's
+      ``.file`` marker — assembled in the reader's own ``uploads``
+      namespace, a legitimate reader capability — with a ``Destination``
+      INSIDE the protected mount. This is the only step of a chunked/TUS
+      upload that touches the mount, so it is THE test for that write
+      path; a standalone "start a TUS session" POST is not (it only ever
+      hits the reader's own namespace and can never demonstrate a mount
+      bypass, so it was removed after the live run — 2026-07-12).
 
     Synthetic ids (see the ``_SYNTHETIC_*`` constants) stand in for real
     file/version/transfer ids so no real cloud state needs to exist for
@@ -226,6 +250,11 @@ def side_channel_probes(
         else f"{_SYNTHETIC_FILEID}/{_SYNTHETIC_VERSIONID}"
     )
     trash_segment = trash_ref if trash_ref is not None else _SYNTHETIC_TRASH_ITEM
+    finalize_dest = (
+        f"{mount_url.rstrip('/')}/{_MOUNT_FINALIZE_TARGET}"
+        if mount_url
+        else f"{root}/files/{username}/{_MOUNT_FINALIZE_TARGET}"
+    )
     return [
         (
             "MOVE",
@@ -254,19 +283,7 @@ def side_channel_probes(
             "uploads-finalize",
             {
                 "url": f"{root}/uploads/{username}/{_SYNTHETIC_TRANSFER_ID}/.file",
-                "headers": {
-                    "Destination": (
-                        f"{root}/files/{username}/{_SYNTHETIC_UPLOAD_TARGET}"
-                    )
-                },
-            },
-        ),
-        (
-            "POST",
-            "tus-create",
-            {
-                "url": f"{root}/uploads/{username}/",
-                "headers": {"Tus-Resumable": "1.0.0", "Upload-Length": "1"},
+                "headers": {"Destination": finalize_dest},
             },
         ),
     ]
@@ -298,6 +315,32 @@ class RoProbeResult:
     @property
     def ok(self) -> bool:
         return not (self.failures or self.skipped or self.inconclusive)
+
+
+async def _trash_item_still_present(
+    client, dav_root: str, username: str, item_name: str
+) -> bool:
+    """Whether ``item_name`` is still in ``username``'s trashbin.
+
+    Used by the trash-restore side channel to verify a restore had NO
+    effect (the item stayed trashed) rather than trusting Nextcloud's
+    status code, which is a 500 — not a clean 403 — when an RO groupfolder
+    member is denied. Fail-closed: any error, a non-207 response, or an
+    unparseable body returns False, so the caller records a failure and the
+    gate refuses rather than reading an unverifiable state as "rejected".
+    """
+    url = f"{dav_root.rstrip('/')}/trashbin/{username}/trash"
+    try:
+        resp = await client.request("PROPFIND", url, headers={"Depth": "1"})
+    except Exception:
+        return False
+    if getattr(resp, "status_code", None) != 207:
+        return False
+    hrefs = re.findall(
+        r"<d:href>([^<]+)</d:href>", getattr(resp, "text", ""), flags=re.IGNORECASE
+    )
+    leaves = {unquote(h.rstrip("/").split("/")[-1]) for h in hrefs}
+    return item_name in leaves
 
 
 async def probe_read_only(
@@ -425,14 +468,22 @@ async def probe_read_only(
             real_upload_session = True
 
         probes = side_channel_probes(
-            dav_root, username, version_ref=version_ref, trash_ref=trash_ref
+            dav_root,
+            username,
+            version_ref=version_ref,
+            trash_ref=trash_ref,
+            mount_url=base_url,
         )
         if real_upload_session:
-            # A real reader-owned session exists — retarget uploads-finalize
-            # at it so a 403/405 is a verified rejection, not a synthetic-id
-            # 404. MKCOL in one's own uploads namespace is a legitimate
-            # reader capability, not a folder write, so this doesn't
-            # contaminate the write-verb probes above.
+            # A real reader-owned session exists — retarget uploads-finalize's
+            # SOURCE at it so a 403/405 is a verified rejection, not a
+            # synthetic-id 404. MKCOL in one's own uploads namespace is a
+            # legitimate reader capability, not a folder write, so this
+            # doesn't contaminate the write-verb probes above. The
+            # Destination stays INSIDE the protected mount (from
+            # side_channel_probes(mount_url=...)) — that is the byte that
+            # must be denied; a reader's own home would accept it (201) and
+            # false-positive the gate.
             probes = [
                 (verb, note, req)
                 if not (verb == "MOVE" and note == "uploads-finalize")
@@ -443,7 +494,7 @@ async def probe_read_only(
                         "url": f"{upload_session_url}/.file",
                         "headers": {
                             "Destination": (
-                                f"{root}/files/{username}/{_SYNTHETIC_UPLOAD_TARGET}"
+                                f"{base_url.rstrip('/')}/{_MOUNT_FINALIZE_TARGET}"
                             )
                         },
                     },
@@ -464,6 +515,29 @@ async def probe_read_only(
                 continue
             status = resp.status_code
             if status in REJECTED_STATUSES:
+                continue
+            if (
+                note == "trash-restore"
+                and trash_ref is not None
+                and status not in _INCONCLUSIVE_STATUSES
+            ):
+                # Nextcloud does NOT return a clean 403 when an RO groupfolder
+                # member is denied a trash restore — it 500s (proven live on
+                # NC 31, 2026-07-12: agent restore -> 201, reader -> 500, and
+                # the file STAYS trashed). Trust the effect, not the status:
+                # if the item is still in the reader's trashbin, the restore
+                # had no effect => RO held. Only a restore that actually moved
+                # the item out of trash (incl. any 2xx) is a real bypass. The
+                # effect check fails closed — an unverifiable trashbin read is
+                # treated as "not still present" => recorded as a failure.
+                if await _trash_item_still_present(
+                    client, root, username, trash_ref
+                ):
+                    continue
+                failures.append(
+                    f"{label} -> {status} (item no longer in trash; restore "
+                    "may have succeeded — write path open)"
+                )
                 continue
             if status in _INCONCLUSIVE_STATUSES:
                 inconclusive.append(

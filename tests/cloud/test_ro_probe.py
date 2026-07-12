@@ -87,7 +87,7 @@ async def test_any_write_success_fails_closed():
 
 def test_side_channel_verbs_are_probed():
     # versions/trash restore + upload-finalize CVE class must be probed via
-    # real DAV MOVE/POST requests (see side_channel_probes), not the old
+    # real DAV MOVE requests (see side_channel_probes), not the old
     # fake-POST-to-the-generic-folder placeholder.
     probes = side_channel_probes("https://cloud/dav", "alice")
     assert any(
@@ -102,7 +102,27 @@ def test_side_channel_verbs_are_probed():
         verb == "MOVE" and "upload" in note and "finalize" in note
         for verb, note, _req in probes
     )
-    assert any(verb == "POST" and "tus" in note.lower() for verb, note, _req in probes)
+    # tus-create (a POST to the reader's OWN uploads root) was removed after
+    # the live run: it can never demonstrate a mount bypass. The only
+    # mount-touching step of a chunked/TUS upload is the finalize MOVE, so
+    # that is THE test — no standalone POST side channel remains.
+    assert not any(verb == "POST" for verb, _note, _req in probes)
+
+
+def test_uploads_finalize_destination_targets_the_mount_not_home():
+    # THE live regression (NC 31, 2026-07-12): a reader can always write its
+    # own home, so the finalize Destination must land INSIDE the protected
+    # mount or the probe false-positives (home dest -> 201; mount dest -> 403).
+    mount = "https://cloud/remote.php/dav/files/alice/Proj"
+    probes = side_channel_probes(
+        "https://cloud/remote.php/dav", "alice", mount_url=mount
+    )
+    finalize = next(
+        req for verb, note, req in probes if note == "uploads-finalize"
+    )
+    assert finalize["headers"]["Destination"].startswith(mount)
+    # never the reader's own files/<user> home root
+    assert "/files/alice/srw-ro-probe" not in finalize["headers"]["Destination"]
 
 
 def test_mutating_verbs_no_longer_contain_fake_post_side_channels():
@@ -335,7 +355,7 @@ async def test_side_channels_skipped_and_recorded_when_username_absent():
     # username — which is why it lands in `skipped`, not `failures`.
     res = await probe_read_only(_FakeClient({}), "https://cloud/dav", "f/")
     assert res.ok is False
-    assert len(res.skipped) == 4
+    assert len(res.skipped) == 3
     assert res.failures == []
     assert res.inconclusive == []
 
@@ -372,7 +392,7 @@ async def test_side_channel_404_is_inconclusive_and_refuses():
     )
     assert res.ok is False
     assert res.failures == []
-    assert len(res.inconclusive) == 4
+    assert len(res.inconclusive) == 3
     assert res.skipped == []
 
 
@@ -401,6 +421,108 @@ async def test_side_channel_201_flips_ok_false():
     )
     assert res.ok is False
     assert any("201" in f for f in res.failures)
+
+
+# ---------------------------------------------------------------------------
+# Live-k3d validation findings (2026-07-12) — trash-restore denial is a 500,
+# not a clean 403, so the probe verifies the EFFECT (item stays trashed).
+# ---------------------------------------------------------------------------
+
+
+_TRASH_ITEM = "srw-ro-trash-canary.txt.d1699999999"
+
+
+def _trash_body(items):
+    rows = "".join(
+        "<d:response><d:href>/remote.php/dav/trashbin/alice/trash/"
+        f"{it}</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status>"
+        "</d:propstat></d:response>"
+        for it in items
+    )
+    return f'<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">{rows}</d:multistatus>'
+
+
+@pytest.mark.asyncio
+async def test_trash_restore_500_but_item_still_trashed_is_rejected():
+    # Live shape (NC 31): the RO reader's trash-restore MOVE returns 500, but
+    # the item STAYS in trash -> the restore had no effect -> RO held. The
+    # probe must treat this as rejected, not "write path open".
+    class _Client:
+        async def request(self, method, url, **kw):
+            if method == "PROPFIND" and "/trashbin/" in url:
+                # effect check: the seeded item is still present
+                return _TextResp(207, _trash_body([_TRASH_ITEM]))
+            if method == "PROPFIND":
+                return _FakeResp(207)  # read control
+            if method == "MKCOL":
+                return _FakeResp(404)  # no real upload session
+            if method == "MOVE" and "/trashbin/" in url:
+                return _FakeResp(500)  # NC's ungraceful RO denial
+            if "/remote.php/" in url:
+                return _FakeResp(403)
+            return _FakeResp(403)
+
+    res = await probe_read_only(
+        _Client(), "https://cloud/dav", "f/",
+        dav_root="https://cloud/remote.php/dav", username="alice",
+        version_ref="12345/1", trash_ref=_TRASH_ITEM,
+    )
+    assert not any("trash-restore" in f for f in res.failures), res.failures
+
+
+@pytest.mark.asyncio
+async def test_trash_restore_item_gone_from_trash_is_failure():
+    # If the item is NO longer in trash after the MOVE, the restore actually
+    # succeeded — a real RO bypass — even if the status wasn't a clean 2xx.
+    class _Client:
+        async def request(self, method, url, **kw):
+            if method == "PROPFIND" and "/trashbin/" in url:
+                return _TextResp(207, _trash_body([]))  # item gone -> restored
+            if method == "PROPFIND":
+                return _FakeResp(207)
+            if method == "MKCOL":
+                return _FakeResp(404)
+            if method == "MOVE" and "/trashbin/" in url:
+                return _FakeResp(500)
+            if "/remote.php/" in url:
+                return _FakeResp(403)
+            return _FakeResp(403)
+
+    res = await probe_read_only(
+        _Client(), "https://cloud/dav", "f/",
+        dav_root="https://cloud/remote.php/dav", username="alice",
+        version_ref="12345/1", trash_ref=_TRASH_ITEM,
+    )
+    assert res.ok is False
+    assert any("trash-restore" in f and "write path open" in f for f in res.failures)
+
+
+@pytest.mark.asyncio
+async def test_trash_restore_unverifiable_trashbin_fails_closed():
+    # If the effect-verification PROPFIND itself fails, the probe cannot
+    # confirm the item stayed trashed -> must fail closed (a failure), never a
+    # silent "rejected".
+    class _Client:
+        async def request(self, method, url, **kw):
+            if method == "PROPFIND" and "/trashbin/" in url:
+                raise ConnectionError("boom")
+            if method == "PROPFIND":
+                return _FakeResp(207)
+            if method == "MKCOL":
+                return _FakeResp(404)
+            if method == "MOVE" and "/trashbin/" in url:
+                return _FakeResp(500)
+            if "/remote.php/" in url:
+                return _FakeResp(403)
+            return _FakeResp(403)
+
+    res = await probe_read_only(
+        _Client(), "https://cloud/dav", "f/",
+        dav_root="https://cloud/remote.php/dav", username="alice",
+        version_ref="12345/1", trash_ref=_TRASH_ITEM,
+    )
+    assert res.ok is False
+    assert any("trash-restore" in f for f in res.failures)
 
 
 # ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ import re
 import secrets
 import time
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 
@@ -1391,7 +1391,7 @@ class NextcloudBackend:
         path = ".srw-ro-canary/probe.txt"
         fileid = await self._put_canary_and_get_fileid(handle, path)
         version_ref = await self._enumerate_version_ref(fileid) if fileid else None
-        trash_ref = await self._enumerate_trash_ref()
+        trash_ref = await self._seed_and_enumerate_trash_ref(handle)
         return CanaryFixture(path=path, version_ref=version_ref, trash_ref=trash_ref)
 
     async def remove_canary_fixture(
@@ -1403,6 +1403,24 @@ class NextcloudBackend:
             )
         except CloudBackendError:
             pass
+        # Permanently purge the trash-restore canary so protected-mode engages
+        # don't accumulate trashed items. Best-effort — a lingering item only
+        # wastes trash space, never affects correctness.
+        if fixture.trash_ref:
+            user = self.webdav_credentials.get("username")
+            if user:
+                purge_url = (
+                    f"/remote.php/dav/trashbin/{user}/trash/"
+                    f"{quote(fixture.trash_ref, safe='')}"
+                )
+                try:
+                    await self._client.request(
+                        "DELETE",
+                        purge_url,
+                        auth=(self._agent_user, self._agent_password),
+                    )
+                except httpx.HTTPError:
+                    pass
 
     async def _put_canary_and_get_fileid(
         self, handle: ProjectFolderHandle, path: str
@@ -1500,11 +1518,38 @@ class NextcloudBackend:
         version_id = self._first_child_leaf(resp.text, self_segment=fileid)
         return f"{fileid}/{version_id}" if version_id else None
 
-    async def _enumerate_trash_ref(self) -> Optional[str]:
-        """Return a real trashed item name from the write identity's trashbin,
-        or None when the trashbin is empty (side channel stays inconclusive)."""
+    # Basename of the throwaway file the trash canary seeds + deletes. The
+    # trash-item name it produces is ``{this}.d{unix_ts}`` and is identical in
+    # every groupfolder member's trash view, so the RO reader can target it.
+    _TRASH_CANARY_NAME = "srw-ro-trash-canary.txt"
+
+    async def _seed_and_enumerate_trash_ref(
+        self, handle: ProjectFolderHandle
+    ) -> Optional[str]:
+        """Seed a real groupfolder-trashed item and return its trash-item name.
+
+        The RO trash-restore CVE (GHSA-2vrq-fhmf-c49m) is a groupfolder member
+        restoring a *team-folder*-trashed file — NOT a personal-files item. So
+        create the precondition deterministically: PUT a throwaway file into
+        the folder (write identity), DELETE it so it lands in the shared trash,
+        then read the write identity's trashbin for the item. Its name
+        (``{basename}.d{ts}``) is what every member — including the RO reader —
+        sees for that deletion, so the reader's restore attempt can target it
+        (live-confirmed on NC 31, 2026-07-12). Returns None if any step fails,
+        leaving the side channel inconclusive → the strict gate refuses
+        (fail-closed).
+        """
         user = self.webdav_credentials.get("username")
         if not user:
+            return None
+        try:
+            await self._put_project_folder_file_bytes_raw(
+                handle, path=self._TRASH_CANARY_NAME, content=b"trash-canary"
+            )
+            await self.delete_project_folder_file(
+                handle, path=self._TRASH_CANARY_NAME, if_exists=True
+            )
+        except CloudBackendError:
             return None
         url = f"/remote.php/dav/trashbin/{user}/trash"
         try:
@@ -1518,7 +1563,15 @@ class NextcloudBackend:
             return None
         if resp.status_code != 207:
             return None
-        return self._first_child_leaf(resp.text, self_segment="trash")
+        hrefs = re.findall(
+            r"<d:href>([^<]+)</d:href>", resp.text, flags=re.IGNORECASE
+        )
+        leaves = [unquote(h.rstrip("/").split("/")[-1]) for h in hrefs]
+        # `{basename}.d{ts}` — newest (max) is the item we just seeded.
+        matches = sorted(
+            leaf for leaf in leaves if leaf.startswith(f"{self._TRASH_CANARY_NAME}.d")
+        )
+        return matches[-1] if matches else None
 
     @staticmethod
     def _first_child_leaf(xml: str, *, self_segment: Optional[str]) -> Optional[str]:
