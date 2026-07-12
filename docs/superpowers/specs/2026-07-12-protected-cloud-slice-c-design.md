@@ -55,7 +55,7 @@ cloud-staging/<thread_id>/manifest.json  # derived diff manifest, overwritten pe
 
 The classification rules are shared with `whiteout.py` (stdlib-pure). The plan pins whether the orchestrator image ships `src/services/cloud_overlay/` (podman-verify imports — the orchestrator-image lesson) or gets a tar-walking sibling module sharing the same constants; either way the constants are defined once.
 
-Manifest shape: `{epoch, staged_at, entries: [{path, status, size, binary}], counts: {added, modified, deleted}}`. `binary` = null-byte sniff of the first 8 KiB of the member.
+Manifest shape: `{epoch, staged_at, entries: [{path, status, size, binary}], counts: {added, modified, deleted}, skipped: [{path, kind}]}` (skipped = non-regular members WebDAV cannot represent — review finding 2026-07-12). `binary` = null-byte sniff of the first 8 KiB of the member.
 
 **Bookkeeping.** Migration `0057`: four columns on `cloud_ro_mounts` — `etag_baseline JSONB` (the path→etag map from `capture_etag_baseline`, captured at engage and re-captured after each apply; **nothing persists this today** — code exploration 2026-07-12 confirmed `capture_etag_baseline` has no orchestrator persistence caller, so Slice C adds both the column and the engage-time capture), `staged_epoch INTEGER NOT NULL DEFAULT 0` (monotonic — bumped on every successful stage push, apply, and reject), `staged_at TIMESTAMPTZ`, `staged_summary JSONB` (manifest `counts` + content signature only — entry lists live in the S3 manifest, not the DB row). `schema_current.sql` regenerated via `scripts/schema-snapshot.sh app`, never hand-edited.
 
