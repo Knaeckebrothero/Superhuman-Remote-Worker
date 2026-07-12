@@ -262,7 +262,7 @@ git commit -m "feat(cloud): persist etag baseline at engage (fail-closed) + pass
 **Interfaces:**
 - Consumes: nothing (pure; stdlib `tarfile` only). Classification rules mirror `src/services/cloud_overlay/whiteout.py` (char(0,0) whiteouts, `.wh.` name markers, 3 opaque xattrs, `.wh..wh..opq` sentinel) — the orchestrator image does NOT ship `src/`, so the constants are **re-declared here with a cross-reference comment**, plus the tar/pax spellings.
 - Produces:
-  - `derive_manifest(tar_path: str, *, baseline: dict[str, str], epoch: int, staged_at: str) -> dict` returning `{"epoch", "staged_at", "counts": {"added","modified","deleted"}, "entries": [{"path","status","size","binary"}, ...]}` with entries sorted by path, `status ∈ added|modified|deleted`.
+  - `derive_manifest(tar_path: str, *, baseline: dict[str, str], epoch: int, staged_at: str) -> dict` returning `{"epoch", "staged_at", "counts": {"added","modified","deleted"}, "entries": [{"path","status","size","binary"}, ...], "skipped": [{"path","kind"}, ...]}` (skipped = non-regular members — symlinks etc. — which WebDAV cannot represent; surfaced, never silent) with entries sorted by path, `status ∈ added|modified|deleted`.
   - `select_protected_mount(mount_rows: list[dict]) -> dict | None` in `cloud_staging/__init__.py` — the single definition of "which mount is protected": first row with `backend_id == "nextcloud"` and a truthy `cloud_handle` (extracted from `main.py:19409-19416`; Task 10 and the engage path both use it).
 
 **Classification rules (spec §5):**
