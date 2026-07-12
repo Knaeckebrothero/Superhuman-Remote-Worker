@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-12-protected-cloud-slice-c-design.md` (owner-approved 2026-07-12). Master design: `docs/design/cloud_access_unification.md`.
 
+**Status: COMPLETE + live k3d gate PASSED 2026-07-12.** All 16 tasks (subagent-driven) + final-review fix wave landed on develop at `dc5f0336`. The manual live gate ran against real minio + real Nextcloud — full staging→review→apply→reject→revoked-row(I3)→resume(I2) chain verified; results + two bugs it surfaced (a migration-ledger wedge and a prod-affecting rclone `-`-leading-credential mount bug, fixed in `d57ee928`) are written up in **spec §14**. Both commits unpushed.
+
 ## Global Constraints
 
 - **CI is the gate** (Python 3.12, no `/dev/fuse`, no live cloud, no live S3): every test is mocked — httpx `MockTransport`/`unittest.mock` fakes, `FakeMainCloudBackend` (`tests/cloud/fake.py`), `FakeRemoteBackend` script-text assertions, MagicMock'd boto3. Run `ruff check` on touched files before each commit.
