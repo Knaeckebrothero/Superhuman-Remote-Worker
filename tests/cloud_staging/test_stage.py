@@ -5,6 +5,7 @@ subprocess seams (_run_ssh_capture / _stream_tar_to_file) are monkeypatched
 per-test so nothing here actually shells out to ssh.
 """
 
+import hashlib
 import io
 import json
 import shutil
@@ -310,6 +311,12 @@ async def test_push_derives_manifest_uploads_and_bumps_epoch(tmp_path, monkeypat
     ]
     assert manifest["skipped"] == []
 
+    # Content binding (multi-replica torn-pair defense): the manifest must
+    # carry the sha256 of the EXACT tar bytes that were uploaded, so readers
+    # can detect a manifest/tar pair interleaved by two concurrent stagings.
+    expected_sha = hashlib.sha256(uploaded[tar_key]).hexdigest()
+    assert manifest["tar_sha256"] == expected_sha
+
     svc.save_blob.assert_not_called()  # manifest goes through upload_blob_file, not save_blob
 
     db.update_ro_mount_staging.assert_awaited_once_with(
@@ -318,9 +325,10 @@ async def test_push_derives_manifest_uploads_and_bumps_epoch(tmp_path, monkeypat
         staged_summary={
             "counts": {"added": 1, "modified": 0, "deleted": 0},
             "signature": signature,
+            "tar_sha256": expected_sha,
         },
     )
-    # staged_summary carries only counts+signature, never the full entries list
+    # staged_summary carries counts+signature+tar_sha256, never entries
     _, kwargs = db.update_ro_mount_staging.await_args
     assert "entries" not in kwargs["staged_summary"]
 
