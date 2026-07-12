@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # blindly a few times: a permanent failure only costs a couple of cheap extra
 # attempts before the caller's F29 hard-fail. Removes the single-shot clone that
 # turned a rollout-window blip into a dead project job.
-# docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+# docs/done/coincident_infra_error_overrides_reported_job_outcome.md
 _CLONE_ATTEMPTS = 3
 _CLONE_BACKOFF_SECONDS = (2.0, 5.0)  # waits before attempts 2 and 3
 
@@ -455,7 +455,7 @@ class WorkspaceManager:
 
         # 1. Clone jobs repo as workspace root (bounded retry+backoff — a momentary
         #    reachability blip during an image rollout must not hard-fail the job on
-        #    the first miss; docs/issues/coincident_infra_error_overrides_reported_job_outcome.md)
+        #    the first miss; docs/done/coincident_infra_error_overrides_reported_job_outcome.md)
         git_mgr = _clone_repo_with_retry(
             jobs_repo["repo_url"], self._workspace_path, backend=self._backend
         )
