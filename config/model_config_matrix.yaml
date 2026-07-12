@@ -310,10 +310,14 @@ gpt-5:
   settings:
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5 supports image inputs
-    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
-    # LangChain's Responses API streaming corrupts parallel tool call args,
-    # and the Codex proxy only supports the Responses API.
-    parallel_tool_calls: false
+    # Enabled 2026-07-12. langchain#34660 is still OPEN but only concerns the
+    # final `response.completed` Responses chunk lacking tool_calls; the
+    # incremental function_call/args-delta stream chunks are emitted correctly
+    # and the graph loop aggregates them via AIMessageChunk (verified against
+    # langchain-openai 1.1.12 and upstream master — code path unchanged). The
+    # Codex proxy only supports the Responses API; validated on gpt-5.6, and
+    # gpt-5/codex/codex-spark share the identical transport.
+    parallel_tool_calls: true
     model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # 32px patches. gpt-5.5 `auto`->original (budget 10000); gpt-5.4 `auto`->high
@@ -346,9 +350,9 @@ gpt-5.6:
     structured_output_method: json_schema
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5.6 supports image inputs
-    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
-    # (Same Responses-API streaming constraint as gpt-5 — codex proxy path.)
-    parallel_tool_calls: false
+    # Enabled 2026-07-12 — empirically validated. Same Responses-API path as
+    # gpt-5; see the gpt-5 block for why langchain#34660 doesn't block this.
+    parallel_tool_calls: true
     model_max_context_tokens: 1000000  # Luna/Terra/Sol: 1M ctx, 128K max output
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # Same 32px-patch vision scheme as the gpt-5 family.
@@ -372,8 +376,9 @@ codex:
   settings:
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
-    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
-    parallel_tool_calls: false
+    # Enabled 2026-07-12. Same Responses-API/codex-proxy path as gpt-5; see the
+    # gpt-5 block for why langchain#34660 doesn't block the graph loop.
+    parallel_tool_calls: true
     model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
     # Same 32px-patch vision scheme as the gpt-5 family.
@@ -393,8 +398,9 @@ codex-spark:
   settings:
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: false  # Codex Spark is code-focused, no vision
-    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
-    parallel_tool_calls: false
+    # Enabled 2026-07-12. Same Responses-API/codex-proxy path as gpt-5; see the
+    # gpt-5 block for why langchain#34660 doesn't block the graph loop.
+    parallel_tool_calls: true
     model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
     max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
 
