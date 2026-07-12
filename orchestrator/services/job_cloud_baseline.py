@@ -531,6 +531,36 @@ async def detect_external_mods(
         # surface that.
         return []
     handle = ProjectFolderHandle.from_db(str(handle_db), backend=backend_id)
+    return await detect_external_mods_against_baseline(
+        baseline_entries=baseline_entries,
+        backend=backend,
+        handle=handle,
+        scope_paths=None,
+    )
+
+
+async def detect_external_mods_against_baseline(
+    *,
+    baseline_entries: dict[str, str],
+    backend: Any,
+    handle: Any,
+    scope_paths: set[str] | None = None,
+) -> list[dict[str, str]]:
+    """Live-compare a path→etag baseline against a fresh cloud folder listing.
+
+    Extracted from :func:`detect_external_mods` (Task 10) so the protected
+    cloud mode apply engine (``services.cloud_staging.apply``) can reuse the
+    same divergence logic scoped to only the paths a staged diff actually
+    touches — spec §7. ``detect_external_mods`` above keeps its original
+    signature/behavior and delegates here with ``scope_paths=None`` (whole
+    project-folder comparison), so Mode A's accept flow is unaffected.
+
+    Returns a list of ``{path, kind}`` dicts, ``kind`` one of
+    ``etag_mismatch`` / ``missing_at_cloud`` / ``unexpected_at_cloud``. Empty
+    list means clean (safe to apply/accept). A ``CloudBackendError`` from the
+    listing call is swallowed the same way the caller-facing wrapper always
+    has — the write path that follows will fail loudly with the real reason.
+    """
     try:
         live_entries: list[ProjectFolderEntry] = await backend.list_project_folder(
             handle
@@ -539,6 +569,9 @@ async def detect_external_mods(
         # Same logic as above — apply will fail with the real reason.
         return []
     live_map = {e.path: e.etag for e in live_entries if not e.is_dir}
+    if scope_paths is not None:
+        live_map = {p: t for p, t in live_map.items() if p in scope_paths}
+        baseline_entries = {p: t for p, t in baseline_entries.items() if p in scope_paths}
     diverged: list[dict[str, str]] = []
     # 1. Every baseline path that's now missing OR mismatched.
     for path, baseline_etag in baseline_entries.items():
