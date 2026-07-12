@@ -327,3 +327,67 @@ class TestDiffFile:
             )
         assert ei.value.status_code == 404
         assert "not in the diff" in ei.value.detail
+
+
+# --------------------------------------------------------------------------- #
+# GiteaDiffSource memoization (services/diff_source.py)
+# --------------------------------------------------------------------------- #
+
+
+class TestGiteaDiffSourceMemoization:
+    """Pin the per-instance summary memo — one Gitea tree walk, not two.
+
+    The per-file endpoint calls ``summary()`` for gating and ``file()``
+    (which calls ``summary()`` again) for content on the SAME instance;
+    without the memo that's 6 Gitea round trips per file view instead
+    of 3 (head-sha lookup + two tree listings, each doubled).
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_summary_call_does_not_refetch(self):
+        from services.diff_source import GiteaDiffSource
+
+        gitea = _make_gitea()
+        source = GiteaDiffSource(job=_make_job(), gitea_client=gitea)
+
+        first = await source.summary()
+        second = await source.summary()
+
+        assert first is second  # same cached object, not a re-build
+        assert gitea.get_branch_head_sha.await_count == 1
+        assert gitea.list_tree.await_count == 2  # one walk = base + head trees
+
+    @pytest.mark.asyncio
+    async def test_none_summary_is_cached_too(self):
+        from services.diff_source import GiteaDiffSource
+
+        gitea = _make_gitea()
+        source = GiteaDiffSource(job=_make_job(), gitea_client=gitea)
+
+        with patch(
+            "services.job_cloud_baseline.get_diff_summary",
+            AsyncMock(return_value=None),
+        ) as gds:
+            assert await source.summary() is None
+            assert await source.summary() is None
+            assert gds.await_count == 1  # None result memoized via sentinel
+
+    @pytest.mark.asyncio
+    async def test_file_reuses_summary_from_same_instance(self):
+        from services.diff_source import GiteaDiffSource
+
+        path = "projects/proj1/mod.py"
+        gitea = _make_gitea(
+            file_contents={(path, BASELINE): "old", (path, BRANCH): "new"}
+        )
+        source = GiteaDiffSource(job=_make_job(), gitea_client=gitea)
+
+        await source.summary()  # endpoint's gating call
+        content = await source.file(path)  # endpoint's content call
+
+        assert content is not None
+        assert content.old_content == "old"
+        assert content.new_content == "new"
+        # Still exactly one tree walk across both calls.
+        assert gitea.get_branch_head_sha.await_count == 1
+        assert gitea.list_tree.await_count == 2
