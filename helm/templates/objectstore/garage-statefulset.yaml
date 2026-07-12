@@ -25,6 +25,8 @@ metadata:
     {{- include "srw.componentLabels" (dict "context" . "component" "garage") | nindent 4 }}
 spec:
   serviceName: {{ include "srw.fullname" . }}-garage
+  # Fixed at 1 — the single-node layout the bootstrap Job assigns supports one
+  # node only. Intentionally not derived from .Values.garage.replicas.
   replicas: 1
   selector:
     matchLabels:

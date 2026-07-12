@@ -1358,14 +1358,19 @@ s3:
 # tier (VIRTUAL_WORKSPACE_*). Single replica, PVC-bound, NO replication/erasure
 # — external S3 (s3.endpoint, virtualWorkspace.s3.endpoint) remains the
 # recommended production path and always overrides this store when set.
+# NOTE: the bundled store's S3 region is fixed at us-east-1 — keep s3.region and
+# virtualWorkspace.s3.region at their us-east-1 defaults when using it; a region
+# override would cause sigv4 signature mismatches against the store.
 garage:
   enabled: false
   image: dxflrs/garage:v1.0.1        # pinned; admin API is "v1" for this tag
-  replicas: 1                         # single-node layout — DO NOT raise
+  replicas: 1                         # informational only — the StatefulSet fixes replicas to 1 (not tunable)
   storageClass: ""
   dataStorageSize: "20Gi"             # one PVC backs meta + data + both buckets
-  # Single-node layout capacity advertised to Garage, in BYTES. Keep <= dataStorageSize.
-  capacityBytes: 21474836480          # 20 GiB
+  # Single-node layout capacity advertised to Garage, in BYTES. Keep strictly
+  # BELOW dataStorageSize — meta + data share the one PVC, so advertising the
+  # full PVC size risks a disk-full store under load.
+  capacityBytes: 17179869184          # 16 GiB (headroom under the 20Gi PVC)
   buckets:
     # Snapshot bucket reuses s3.bucket (single source of truth). Only the
     # virtual-tier workspace bucket is named here.
