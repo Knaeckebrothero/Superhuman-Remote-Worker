@@ -44,18 +44,6 @@
         "maxAge": "1d",
         "timeout": "3s"
       }
-    },
-    {
-      "name": "api-cache",
-      "urls": [
-        "/api/**"
-      ],
-      "cacheConfig": {
-        "strategy": "freshness",
-        "maxSize": 200,
-        "maxAge": "1h",
-        "timeout": "5s"
-      }
     }
   ]
 }
