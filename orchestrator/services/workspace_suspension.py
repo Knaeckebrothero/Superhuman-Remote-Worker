@@ -499,6 +499,31 @@ class WorkspaceSuspensionService:
 
         try:
             source_type = "vm" if vm_ctx and not ws_ctx else "pod"
+
+            # Slice C (design §5): stage the protected session's upperdir
+            # diff to S3 BEFORE the teardown snapshot — this is the last
+            # chance to capture it while the overlay is still mounted.
+            # ``metadata`` here is already the parsed dict (str-JSON handled
+            # above), so reuse it rather than re-reading + re-parsing
+            # ``thread["metadata"]``. Best-effort only: a staging failure
+            # must never block or fail the teardown — the VM snapshot below
+            # is the durable, load-bearing path and always still runs.
+            if metadata.get("protected_cloud"):
+                try:
+                    from services.cloud_staging.stage import stage_thread_cloud_diff
+
+                    await stage_thread_cloud_diff(
+                        thread_id=thread_id,
+                        postgres_db=self._db,
+                        snapshot_service=self._snapshot_service,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "teardown cloud-stage failed (non-fatal) for %s: %s",
+                        thread_id,
+                        e,
+                    )
+
             ok = await self._snapshot_service.capture_vm_snapshot(
                 job_id=thread_id,
                 ssh_host=ssh_host,
