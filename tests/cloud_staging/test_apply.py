@@ -36,7 +36,9 @@ from orchestrator.services.cloud_staging.stage import (
     staging_manifest_key,
     staging_tar_key,
 )
-from orchestrator.services.job_cloud_baseline import detect_external_mods_against_baseline
+from orchestrator.services.job_cloud_baseline import (
+    detect_external_mods_against_baseline,
+)
 
 from tests.cloud.fake import FakeMainCloudBackend
 
@@ -98,7 +100,11 @@ def _mount_row(
 def _thread_mounts_row(*, cloud_handle: str) -> dict:
     # Real thread_mounts rows carry backend_id/cloud_handle (Task 8 note) —
     # select_protected_mount matches on those two keys.
-    return {"backend_id": "nextcloud", "cloud_handle": cloud_handle, "target_path": "/x"}
+    return {
+        "backend_id": "nextcloud",
+        "cloud_handle": cloud_handle,
+        "target_path": "/x",
+    }
 
 
 def _snapshot_service(blobs: dict[str, bytes] | None = None):
@@ -133,7 +139,9 @@ def _cloud_router(backend) -> MagicMock:
 
 
 async def _seeded_backend(
-    files: dict[str, bytes] | None = None, *, backend: FakeMainCloudBackend | None = None
+    files: dict[str, bytes] | None = None,
+    *,
+    backend: FakeMainCloudBackend | None = None,
 ) -> tuple[FakeMainCloudBackend, str]:
     """Ensure a project folder (so list/put work, not just seed_project_file's
     direct-poke path get/put use) and seed it with ``files``. Returns
@@ -166,7 +174,9 @@ class _FaultyPutBackend(FakeMainCloudBackend):
         super().__init__()
         self._fail_path = fail_path
 
-    async def put_project_folder_file_bytes(self, handle, *, path, content, content_type=None):
+    async def put_project_folder_file_bytes(
+        self, handle, *, path, content, content_type=None
+    ):
         if path == self._fail_path:
             raise CloudBackendError(
                 CloudBackendErrorKind.UNAVAILABLE, "boom", backend=self.backend_id
@@ -185,7 +195,9 @@ class TestApplyGates:
     @pytest.mark.asyncio
     async def test_apply_epoch_stale_409(self):
         row = _mount_row(epoch=5)
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle="proj-1")])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle="proj-1")]
+        )
 
         with pytest.raises(StagedApplyError) as ei:
             await apply_staged_diff(
@@ -205,7 +217,9 @@ class TestApplyGates:
     @pytest.mark.asyncio
     async def test_apply_nothing_staged_409(self):
         row = _mount_row(staged_summary=None)
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle="proj-1")])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle="proj-1")]
+        )
 
         with pytest.raises(StagedApplyError) as ei:
             await apply_staged_diff(
@@ -237,7 +251,9 @@ class TestApplyGates:
         manifest = _manifest(entries, tar_bytes=other_bytes, epoch=5)
         row = _mount_row(epoch=5)
         backend, native_id = await _seeded_backend()
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -279,7 +295,9 @@ class TestApplyGates:
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=6)
         row = _mount_row(epoch=5)
         backend, native_id = await _seeded_backend()
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -347,13 +365,17 @@ class TestApplyConflictGate:
     @pytest.mark.asyncio
     async def test_apply_conflict_blocks_hard(self):
         tar_bytes = _build_tar([("upper/mod.txt", b"newv")])
-        entries = [{"path": "mod.txt", "status": "modified", "size": 4, "binary": False}]
+        entries = [
+            {"path": "mod.txt", "status": "modified", "size": 4, "binary": False}
+        ]
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
         backend, native_id = await _seeded_backend({"mod.txt": b"oldv"})
         # Fake backend etags are always "" — any other baseline string
         # deterministically mismatches.
         row = _mount_row(epoch=5, etag_baseline={"mod.txt": "stale-etag"})
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -373,7 +395,9 @@ class TestApplyConflictGate:
 
         assert ei.value.status_code == 409
         assert ei.value.detail["code"] == "external_modifications_detected"
-        assert ei.value.detail["diverged"] == [{"path": "mod.txt", "kind": "etag_mismatch"}]
+        assert ei.value.detail["diverged"] == [
+            {"path": "mod.txt", "kind": "etag_mismatch"}
+        ]
         assert "force" not in ei.value.detail
         assert _write_ops(backend) == []  # no writes happened
         db.update_ro_mount_staging.assert_not_awaited()
@@ -383,7 +407,9 @@ class TestApplyConflictGate:
         """An external change on a path NOT in the staged diff must not
         block the apply — the conflict gate only checks touched paths."""
         tar_bytes = _build_tar([("upper/touched.txt", b"newv")])
-        entries = [{"path": "touched.txt", "status": "modified", "size": 4, "binary": False}]
+        entries = [
+            {"path": "touched.txt", "status": "modified", "size": 4, "binary": False}
+        ]
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
         backend, native_id = await _seeded_backend(
             {"touched.txt": b"oldv", "untouched.txt": b"whatever"}
@@ -395,7 +421,9 @@ class TestApplyConflictGate:
                 "untouched.txt": "stale-etag",  # would mismatch, but out of scope
             },
         )
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -445,7 +473,9 @@ class TestApplyTornTar:
         # cleanly and execution actually reaches the ensure_tar_bound() gate.
         row = _mount_row(epoch=5, etag_baseline={"old.txt": ""})
         backend, native_id = await _seeded_backend({"old.txt": b"still here"})
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -493,7 +523,9 @@ class TestApplyWrites:
         # with an etag matching baseline (fake etags are always "") so the
         # conflict gate sees it as clean, not "unexpected_at_cloud".
         row = _mount_row(epoch=5, etag_baseline={"a.txt": "", "z.txt": ""})
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -515,12 +547,18 @@ class TestApplyWrites:
         assert result["applied"] == 1
 
         ops = [(op, args) for op, args, _kwargs in _write_ops(backend)]
-        delete_positions = [i for i, (op, _a) in enumerate(ops) if op == "delete_project_folder_file"]
-        put_positions = [i for i, (op, _a) in enumerate(ops) if op == "put_project_folder_file_bytes"]
+        delete_positions = [
+            i for i, (op, _a) in enumerate(ops) if op == "delete_project_folder_file"
+        ]
+        put_positions = [
+            i for i, (op, _a) in enumerate(ops) if op == "put_project_folder_file_bytes"
+        ]
         assert delete_positions and put_positions
         assert max(delete_positions) < min(put_positions)
         # Descending path order among the deletes (children before parents).
-        delete_paths = [args[1] for op, args in ops if op == "delete_project_folder_file"]
+        delete_paths = [
+            args[1] for op, args in ops if op == "delete_project_folder_file"
+        ]
         assert delete_paths == sorted(delete_paths, reverse=True)
 
     @pytest.mark.asyncio
@@ -531,9 +569,13 @@ class TestApplyWrites:
             {"path": "bad.txt", "status": "added", "size": 4, "binary": False},
         ]
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
-        backend, native_id = await _seeded_backend(backend=_FaultyPutBackend(fail_path="bad.txt"))
+        backend, native_id = await _seeded_backend(
+            backend=_FaultyPutBackend(fail_path="bad.txt")
+        )
         row = _mount_row(epoch=5, etag_baseline={})
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -570,12 +612,19 @@ class TestApplyWrites:
         new_bytes = b"\x89PNG\x00new-binary-content"  # byte-true, not text
         tar_bytes = _build_tar([("upper/mod.bin", new_bytes)])
         entries = [
-            {"path": "mod.bin", "status": "modified", "size": len(new_bytes), "binary": True}
+            {
+                "path": "mod.bin",
+                "status": "modified",
+                "size": len(new_bytes),
+                "binary": True,
+            }
         ]
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
         backend, native_id = await _seeded_backend({"mod.bin": b"old-content"})
         row = _mount_row(epoch=5, etag_baseline={"mod.bin": ""})
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -596,7 +645,9 @@ class TestApplyWrites:
         assert result["applied"] == 1
         assert result["deleted"] == 0
         # The write went through put_project_folder_file_bytes...
-        put_ops = [c for c in _write_ops(backend) if c[0] == "put_project_folder_file_bytes"]
+        put_ops = [
+            c for c in _write_ops(backend) if c[0] == "put_project_folder_file_bytes"
+        ]
         assert [args[1] for _op, args, _kw in put_ops] == ["mod.bin"]
         # ...and the stored bytes are the exact staged bytes (old overwritten).
         stored = await backend.get_project_folder_file_bytes(
@@ -620,7 +671,9 @@ class TestApplyWrites:
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
         backend, native_id = await _seeded_backend()
         row = _mount_row(epoch=5, etag_baseline={})
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -640,8 +693,12 @@ class TestApplyWrites:
 
         # Walk continued past the missing member: the present file landed.
         assert result["applied"] == 1
-        assert result["errors"] == ["absent.txt: staged content missing from upperdir tar"]
-        put_ops = [c for c in _write_ops(backend) if c[0] == "put_project_folder_file_bytes"]
+        assert result["errors"] == [
+            "absent.txt: staged content missing from upperdir tar"
+        ]
+        put_ops = [
+            c for c in _write_ops(backend) if c[0] == "put_project_folder_file_bytes"
+        ]
         assert [args[1] for _op, args, _kw in put_ops] == ["present.txt"]
         # Partial contract: staging state untouched, no finalization steps ran.
         assert "epoch" not in result
@@ -664,7 +721,9 @@ class TestApplySuccess:
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
         backend, native_id = await _seeded_backend()
         row = _mount_row(epoch=5, etag_baseline={})
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,
@@ -740,7 +799,9 @@ class TestApplySuccess:
         manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
         backend, native_id = await _seeded_backend()
         row = _mount_row(epoch=5, etag_baseline={})
-        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        db = _db(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
         svc = _snapshot_service(
             {
                 staging_tar_key(THREAD_ID): tar_bytes,

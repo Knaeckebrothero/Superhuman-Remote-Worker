@@ -31,10 +31,13 @@ def _build_tar(tmp_path, members):
 
 
 def test_added_vs_modified_by_baseline_membership(tmp_path):
-    tar = _build_tar(tmp_path, [
-        ("upper/new.txt", "file", b"hello", None),
-        ("upper/old.txt", "file", b"world", None),
-    ])
+    tar = _build_tar(
+        tmp_path,
+        [
+            ("upper/new.txt", "file", b"hello", None),
+            ("upper/old.txt", "file", b"world", None),
+        ],
+    )
     m = derive_manifest(tar, baseline={"old.txt": "e1"}, epoch=3, staged_at="t")
     st = {e["path"]: e["status"] for e in m["entries"]}
     assert st == {"new.txt": "added", "old.txt": "modified"}
@@ -46,8 +49,12 @@ def test_added_vs_modified_by_baseline_membership(tmp_path):
 def test_char_whiteout_expands_to_baseline_files(tmp_path):
     # whiteout of a DIRECTORY deletes every baseline file under it
     tar = _build_tar(tmp_path, [("upper/docs", "chr", b"", None)])
-    m = derive_manifest(tar, baseline={"docs/a.txt": "e", "docs/b/c.txt": "e", "keep.txt": "e"},
-                        epoch=1, staged_at="t")
+    m = derive_manifest(
+        tar,
+        baseline={"docs/a.txt": "e", "docs/b/c.txt": "e", "keep.txt": "e"},
+        epoch=1,
+        staged_at="t",
+    )
     assert {e["path"] for e in m["entries"]} == {"docs/a.txt", "docs/b/c.txt"}
     assert all(e["status"] == "deleted" for e in m["entries"])
 
@@ -59,33 +66,55 @@ def test_whiteout_of_never_in_lower_path_is_noop(tmp_path):
 
 
 def test_opaque_dir_deletes_unshadowed_baseline_files_only(tmp_path):
-    tar = _build_tar(tmp_path, [
-        ("upper/proj", "dir", b"", {"SCHILY.xattr.user.fuseoverlayfs.opaque": "y"}),
-        ("upper/proj/kept.txt", "file", b"v2", None),
-    ])
-    m = derive_manifest(tar, baseline={"proj/kept.txt": "e", "proj/gone.txt": "e"},
-                        epoch=1, staged_at="t")
+    tar = _build_tar(
+        tmp_path,
+        [
+            ("upper/proj", "dir", b"", {"SCHILY.xattr.user.fuseoverlayfs.opaque": "y"}),
+            ("upper/proj/kept.txt", "file", b"v2", None),
+        ],
+    )
+    m = derive_manifest(
+        tar,
+        baseline={"proj/kept.txt": "e", "proj/gone.txt": "e"},
+        epoch=1,
+        staged_at="t",
+    )
     st = {e["path"]: e["status"] for e in m["entries"]}
     assert st == {"proj/kept.txt": "modified", "proj/gone.txt": "deleted"}
 
 
 def test_opaque_dir_never_in_lower_is_pure_add(tmp_path):
     # fuse-overlayfs marks every merged-created dir opaque (whiteout.py phase-0 note)
-    tar = _build_tar(tmp_path, [
-        ("upper/newdir", "dir", b"", {"SCHILY.xattr.user.fuseoverlayfs.opaque": "y"}),
-        ("upper/newdir/f.txt", "file", b"x", None),
-    ])
+    tar = _build_tar(
+        tmp_path,
+        [
+            (
+                "upper/newdir",
+                "dir",
+                b"",
+                {"SCHILY.xattr.user.fuseoverlayfs.opaque": "y"},
+            ),
+            ("upper/newdir/f.txt", "file", b"x", None),
+        ],
+    )
     m = derive_manifest(tar, baseline={}, epoch=1, staged_at="t")
-    assert [(e["path"], e["status"]) for e in m["entries"]] == [("newdir/f.txt", "added")]
+    assert [(e["path"], e["status"]) for e in m["entries"]] == [
+        ("newdir/f.txt", "added")
+    ]
 
 
 def test_wh_name_marker_and_sentinel_and_bookkeeping(tmp_path):
-    tar = _build_tar(tmp_path, [
-        ("upper/a/.wh.dead.txt", "file", b"", None),        # xattr-format whiteout
-        ("upper/b/.wh..wh..opq", "file", b"", None),         # opaque sentinel for b/
-        ("upper/.wh..opq", "chr", b"", None),                # engine bookkeeping char dev -> skip
-    ])
-    m = derive_manifest(tar, baseline={"a/dead.txt": "e", "b/old.txt": "e"}, epoch=1, staged_at="t")
+    tar = _build_tar(
+        tmp_path,
+        [
+            ("upper/a/.wh.dead.txt", "file", b"", None),  # xattr-format whiteout
+            ("upper/b/.wh..wh..opq", "file", b"", None),  # opaque sentinel for b/
+            ("upper/.wh..opq", "chr", b"", None),  # engine bookkeeping char dev -> skip
+        ],
+    )
+    m = derive_manifest(
+        tar, baseline={"a/dead.txt": "e", "b/old.txt": "e"}, epoch=1, staged_at="t"
+    )
     st = {e["path"]: e["status"] for e in m["entries"]}
     assert st == {"a/dead.txt": "deleted", "b/old.txt": "deleted"}
 
@@ -97,10 +126,13 @@ def test_bare_wh_prefix_raises(tmp_path):
 
 
 def test_binary_sniff_and_size(tmp_path):
-    tar = _build_tar(tmp_path, [
-        ("upper/img.png", "file", b"\x89PNG\x00\x1a", None),
-        ("upper/note.md", "file", b"plain text", None),
-    ])
+    tar = _build_tar(
+        tmp_path,
+        [
+            ("upper/img.png", "file", b"\x89PNG\x00\x1a", None),
+            ("upper/note.md", "file", b"plain text", None),
+        ],
+    )
     m = derive_manifest(tar, baseline={}, epoch=1, staged_at="t")
     by = {e["path"]: e for e in m["entries"]}
     assert by["img.png"]["binary"] is True and by["img.png"]["size"] == 6
@@ -121,6 +153,7 @@ def test_non_regular_members_surface_as_skipped(tmp_path):
 
 def test_select_protected_mount_picks_first_nextcloud_with_handle():
     from orchestrator.services.cloud_staging import select_protected_mount
+
     rows = [
         {"backend_id": "opencloud", "cloud_handle": "h0"},
         {"backend_id": "nextcloud", "cloud_handle": None},

@@ -3142,9 +3142,7 @@ class TestAttachSessionProtectedCloudSingletonIsolation:
         with (
             patch.object(mod, "_agent", fake_agent),
             patch.object(mod, "_orchestrator_client", fake_orchestrator),
-            patch.object(
-                mod, "PersistentSession", self._fake_session_cls(captured)
-            ),
+            patch.object(mod, "PersistentSession", self._fake_session_cls(captured)),
             patch.object(
                 mod,
                 "_poll_workspace_ready",

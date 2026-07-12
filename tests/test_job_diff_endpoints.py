@@ -269,9 +269,7 @@ class TestDiffFile:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await main.get_job_diff_file(
-                fake_request, JOB_ID, "projects/proj1/mod.py"
-            )
+            await main.get_job_diff_file(fake_request, JOB_ID, "projects/proj1/mod.py")
         assert ei.value.status_code == 404
         assert "baseline" in ei.value.detail.lower()
 
@@ -297,9 +295,7 @@ class TestDiffFile:
         gitea = _make_gitea(initialized=False)
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await main.get_job_diff_file(
-                fake_request, JOB_ID, "projects/proj1/mod.py"
-            )
+            await main.get_job_diff_file(fake_request, JOB_ID, "projects/proj1/mod.py")
         assert ei.value.status_code == 503
 
     @pytest.mark.asyncio
@@ -309,9 +305,7 @@ class TestDiffFile:
         gitea = _make_gitea()
         stack = _patch_endpoint(user=user, job=job, gitea=gitea)
         with stack, pytest.raises(HTTPException) as ei:
-            await main.get_job_diff_file(
-                fake_request, JOB_ID, "projects/proj1/mod.py"
-            )
+            await main.get_job_diff_file(fake_request, JOB_ID, "projects/proj1/mod.py")
         assert ei.value.status_code == 404
         assert "repo" in ei.value.detail.lower()
 

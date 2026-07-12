@@ -571,7 +571,9 @@ async def detect_external_mods_against_baseline(
     live_map = {e.path: e.etag for e in live_entries if not e.is_dir}
     if scope_paths is not None:
         live_map = {p: t for p, t in live_map.items() if p in scope_paths}
-        baseline_entries = {p: t for p, t in baseline_entries.items() if p in scope_paths}
+        baseline_entries = {
+            p: t for p, t in baseline_entries.items() if p in scope_paths
+        }
     diverged: list[dict[str, str]] = []
     # 1. Every baseline path that's now missing OR mismatched.
     for path, baseline_etag in baseline_entries.items():

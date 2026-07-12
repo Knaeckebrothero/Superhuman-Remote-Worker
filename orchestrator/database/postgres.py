@@ -1386,7 +1386,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             result = await conn.execute(
                 query,
-                row_id, staged_epoch,
+                row_id,
+                staged_epoch,
                 json.dumps(staged_summary) if staged_summary is not None else None,
             )
         return result == "UPDATE 1"
@@ -9664,9 +9665,7 @@ class PostgresDB:
             )
             return bool(g.get("public_datasources"))
         except Exception:
-            logger.exception(
-                "public_datasources grant read failed; denying publish"
-            )
+            logger.exception("public_datasources grant read failed; denying publish")
             return False
 
     # Max-level user-scope grants for admins. Admins bypass the PDP at every

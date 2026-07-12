@@ -15288,11 +15288,7 @@ async def update_datasource(
         if body.is_global is not None
         else bool(existing_ds.get("is_global"))
     )
-    if (
-        effective_global
-        and read_only is None
-        and existing_ds.get("read_only") is None
-    ):
+    if effective_global and read_only is None and existing_ds.get("read_only") is None:
         read_only = True  # invariant: public ⇒ read_only set
     # F3: if body.credentials is None or {}, do NOT touch the stored value.
     # The cockpit's edit form sends an empty creds dict when the user
@@ -17426,10 +17422,7 @@ async def agent_get_thread_workspace(
         _cloud_up
         and not cloud_mount_cfg
         and not cloud_sync_cfg
-        and (
-            metadata.get("protected_cloud")
-            or not thread.get("nc_session_folder")
-        )
+        and (metadata.get("protected_cloud") or not thread.get("nc_session_folder"))
     )
     # Re-inject credentials in-flight: the persisted config_override is stripped
     # of secrets (redact_config_override at create/hot-swap). This endpoint is
@@ -19539,7 +19532,9 @@ async def _engage_protected_cloud_for_thread(
 
     row = select_protected_mount(mount_rows)
     if row is None:
-        await _record_protected_error(thread_id, "no Nextcloud project mount to protect")
+        await _record_protected_error(
+            thread_id, "no Nextcloud project mount to protect"
+        )
         return
     backend = main_cloud_router.for_backend("nextcloud")
     try:
@@ -19968,9 +19963,7 @@ async def get_thread_cloud_diff_file(
 
 
 @app.post("/api/agents/threads/{thread_id}/cloud-diff/restage")
-async def restage_thread_cloud_diff(
-    thread_id: str, request: Request
-) -> dict[str, Any]:
+async def restage_thread_cloud_diff(thread_id: str, request: Request) -> dict[str, Any]:
     """Owner-triggered refresh of the staged protected-cloud diff (Task 8).
 
     Schedules the same ``stage_thread_cloud_diff`` background task the
@@ -27109,13 +27102,23 @@ async def my_capabilities(request: Request) -> dict:
 
     features = {"protected_cloud": _is_protected_cloud_mode_enabled()}
     if user.get("is_admin"):
-        return {"is_admin": True, "grants": None, "catalog": CATALOG, "features": features}
+        return {
+            "is_admin": True,
+            "grants": None,
+            "catalog": CATALOG,
+            "features": features,
+        }
     from services.grants_service import resolve_grants_for
 
     grants = await resolve_grants_for(
         postgres_db, user_id=str(user["id"]), project_ids=await _grant_project_ids(user)
     )
-    return {"is_admin": False, "grants": grants, "catalog": CATALOG, "features": features}
+    return {
+        "is_admin": False,
+        "grants": grants,
+        "catalog": CATALOG,
+        "features": features,
+    }
 
 
 # =============================================================================

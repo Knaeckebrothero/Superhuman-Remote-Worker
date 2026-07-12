@@ -641,7 +641,9 @@ class PersistentSession:
         overlay = self.overlay_mount_manager
         if overlay is None or not overlay.active:
             raise CloudOverlayUnavailable("no active cloud overlay")
-        overlay.reset_upper(refresh_lower=lambda: self.cloud_mount_manager.refresh_vfs())
+        overlay.reset_upper(
+            refresh_lower=lambda: self.cloud_mount_manager.refresh_vfs()
+        )
 
     def _deploy_instruction_files(self) -> None:
         """Deploy instruction files from config to workspace.

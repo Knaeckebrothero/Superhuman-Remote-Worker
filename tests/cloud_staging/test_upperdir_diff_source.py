@@ -320,7 +320,9 @@ async def test_content_binding_mismatch_treats_staging_as_missing():
 
     summary = await source.summary()
     assert summary is not None
-    assert summary.files == [DiffEntrySummary(path="new.txt", status="added", binary=False)]
+    assert summary.files == [
+        DiffEntrySummary(path="new.txt", status="added", binary=False)
+    ]
     assert await source.file("new.txt") is None
     assert await source.raw_new_bytes("new.txt") is None
     assert await source.ensure_tar_bound() is False
@@ -337,7 +339,9 @@ async def test_content_binding_absent_key_treats_staging_as_missing():
 
     summary = await source.summary()
     assert summary is not None
-    assert summary.files == [DiffEntrySummary(path="new.txt", status="added", binary=False)]
+    assert summary.files == [
+        DiffEntrySummary(path="new.txt", status="added", binary=False)
+    ]
     assert await source.file("new.txt") is None
     assert await source.raw_new_bytes("new.txt") is None
     assert await source.ensure_tar_bound() is False
@@ -361,7 +365,9 @@ async def test_summary_does_not_download_tar():
     assert summary is not None
     get_blob = source._snapshot_service.get_blob
     keys_fetched = [c.args[0] for c in get_blob.await_args_list]
-    assert keys_fetched == [staging_manifest_key(THREAD_ID)]  # manifest ONLY, never the tar
+    assert keys_fetched == [
+        staging_manifest_key(THREAD_ID)
+    ]  # manifest ONLY, never the tar
 
 
 @pytest.mark.asyncio
@@ -399,7 +405,9 @@ async def test_ensure_tar_bound_true_for_valid_pair():
 @pytest.mark.asyncio
 async def test_ensure_tar_bound_false_when_tar_blob_missing():
     entries = [{"path": "new.txt", "status": "added", "size": 5, "binary": False}]
-    manifest = _manifest(entries, tar_bytes=b"whatever-this-hash-is-never-checked-against")
+    manifest = _manifest(
+        entries, tar_bytes=b"whatever-this-hash-is-never-checked-against"
+    )
     # No tar blob uploaded at all.
     source = _make_source(tar_bytes=None, manifest=manifest)
 

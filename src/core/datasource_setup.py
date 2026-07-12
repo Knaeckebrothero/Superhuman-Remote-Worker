@@ -902,7 +902,9 @@ def inject_datasource_index(
             if is_ro:
                 lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
             else:
-                lines.append(_format_rw_cli_entry(name, ds_type) + _declared_ro_note(ds))
+                lines.append(
+                    _format_rw_cli_entry(name, ds_type) + _declared_ro_note(ds)
+                )
         lines.append("")
 
     if creds:
