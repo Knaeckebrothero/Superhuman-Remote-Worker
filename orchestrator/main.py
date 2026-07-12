@@ -20062,7 +20062,10 @@ async def apply_thread_cloud_diff(
 
     from services.cloud_staging.apply import StagedApplyError, apply_staged_diff
 
-    epoch = int(body.get("epoch", -1))
+    try:
+        epoch = int(body.get("epoch", -1))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail={"code": "invalid_epoch"})
     try:
         result = await apply_staged_diff(
             thread_id=thread_id,
@@ -20095,7 +20098,10 @@ async def reject_thread_cloud_diff(
 
     from services.cloud_staging.apply import StagedApplyError, reject_staged_diff
 
-    epoch = int(body.get("epoch", -1))
+    try:
+        epoch = int(body.get("epoch", -1))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail={"code": "invalid_epoch"})
     try:
         result = await reject_staged_diff(
             thread_id=thread_id,
