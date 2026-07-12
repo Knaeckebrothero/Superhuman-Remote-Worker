@@ -171,3 +171,39 @@ class TestCancelHardKillResets:
         assert dual_app._pod_state == dual_app.PodState.IDLE
         assert dual_app._current_job_id is None
         assert task.cancelled()
+
+
+class TestFinalIdleStatusOnExit:
+    """Finding 5 of
+    docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md:
+    a one-shot worker's final heartbeat must not assert 'ready' — the process
+    exits ~2s later, and a fresh-looking 'ready' row lets the dispatcher
+    claim a job for the dead pod during the ~3-min offline window."""
+
+    @pytest.mark.asyncio
+    async def test_non_loop_reset_asserts_draining(self, monkeypatch):
+        from src.api import dual_app
+
+        client = _reset_module(dual_app)
+        monkeypatch.delenv("AGENT_LOOP", raising=False)
+
+        assert dual_app._final_idle_status() == "draining"
+        await dual_app._reset_to_idle(
+            "test exit", final_status=dual_app._final_idle_status()
+        )
+
+        assert client.heartbeat.await_args.kwargs["status"] == "draining"
+
+    @pytest.mark.asyncio
+    async def test_loop_mode_reset_asserts_ready(self, monkeypatch):
+        from src.api import dual_app
+
+        client = _reset_module(dual_app)
+        monkeypatch.setenv("AGENT_LOOP", "1")
+
+        assert dual_app._final_idle_status() == "ready"
+        await dual_app._reset_to_idle(
+            "test loop", final_status=dual_app._final_idle_status()
+        )
+
+        assert client.heartbeat.await_args.kwargs["status"] == "ready"

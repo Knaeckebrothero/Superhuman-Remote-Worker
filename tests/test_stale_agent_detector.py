@@ -78,3 +78,37 @@ async def test_stale_detector_triggers_dispatch_on_graph_progress_stall():
         await main.stale_agent_detector(shutdown_event)
 
     trigger_dispatch.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_step_failure_does_not_block_downstream_recovery():
+    """One broken sweep must degrade only itself.
+
+    Regression for the 2026-07-11 incident: a bind-type crash in the
+    graph-progress sweep aborted the shared try block and silently disabled
+    recover_orphaned_jobs (and every other downstream step) for ~36h. See
+    docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+    """
+    shutdown_event = asyncio.Event()
+    db = _mock_db(shutdown_event)
+    db.mark_stalled_working_agents_by_graph_progress = AsyncMock(
+        side_effect=TypeError(
+            "invalid input for query argument $1: 10 (expected str, got int)"
+        )
+    )
+
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_trigger_dispatch", MagicMock()),
+        patch.object(main, "_release_thread_resources", AsyncMock()),
+        patch.object(main, "_suspend_thread_resources", AsyncMock()),
+    ):
+        await main.stale_agent_detector(shutdown_event)
+
+    # Everything downstream of the crashing step still ran.
+    db.mark_stuck_session_agents_ready.assert_awaited_once()
+    db.reap_orphaned_session_agents.assert_awaited_once()
+    db.mark_orphaned_threads_ended.assert_awaited_once()
+    db.mark_orphaned_threads_suspended.assert_awaited_once()
+    db.recover_orphaned_jobs.assert_awaited_once()
+    db.gc_offline_agents.assert_awaited_once()
