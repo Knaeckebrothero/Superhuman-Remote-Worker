@@ -7,6 +7,7 @@ accounting still belongs in a later guard implementation.
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -16,6 +17,11 @@ from typing import Iterable
 _CLOUD_ROOTS = ("/cloud", "/workspace/cloud")
 _SHELL_OPERATORS = {"|", "||", "&&", ";", "&"}
 _WORKSPACE_CLOUD_ROOT = "cloud"
+
+_WRITE_INDICATORS = re.compile(
+    r"(?:>>?|\btee\b|\brm\b|\bmv\b|\bcp\b|\btouch\b|\bmkdir\b|\brmdir\b"
+    r"|\brsync\b|\bdd\b|\btruncate\b|\bln\b|\bunzip\b|\btar\b|\bsed\s+(?:-\S*\s+)*-i)"
+)
 
 
 @dataclass(frozen=True)
@@ -130,6 +136,17 @@ def format_cloud_delete_guard_message(
         f"{semantics} Narrow the path, delete specific files, or confirm with "
         "the operator before a bulk delete."
     )
+
+
+def command_may_write_cloud(command: str) -> bool:
+    """Conservative write-indicator check for the at-quota shell guard.
+
+    Reads never copy-up into the overlay upperdir, so a full-quota upperdir
+    must not block them (Slice B deferral: read/write asymmetry). False
+    negatives are tolerable — a missed write fails at the FS layer and the
+    guard catches the next command.
+    """
+    return bool(_WRITE_INDICATORS.search(command))
 
 
 def command_touches_cloud_mount(command: str) -> bool:
