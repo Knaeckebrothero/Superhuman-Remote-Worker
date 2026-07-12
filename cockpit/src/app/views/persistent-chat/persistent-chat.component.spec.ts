@@ -4,6 +4,7 @@ import {
     canComposeDuringSession,
     canSendMessage,
     clearDraft,
+    cloudBadgeVisible,
     draftKey,
     extractClipboardFiles,
     isMicMode,
@@ -345,6 +346,28 @@ describe('textSizeToCss', () => {
 
     it('maps large → 17px', () => {
         expect(textSizeToCss('large')).toBe('17px');
+    });
+});
+
+describe('cloudBadgeVisible', () => {
+    // Protected cloud mode (Slice C, Task 14): the status-bar badge that
+    // opens the staged-diff review drawer.
+    it('shows when the thread is protected and something is staged', () => {
+        expect(cloudBadgeVisible(true, 3)).toBe(true);
+    });
+
+    it('hides when the thread is not protected, even with a nonzero count', () => {
+        // Guards against a stale count signal surviving a thread switch away
+        // from a protected session.
+        expect(cloudBadgeVisible(false, 3)).toBe(false);
+    });
+
+    it('hides when protected but nothing is staged yet', () => {
+        expect(cloudBadgeVisible(true, 0)).toBe(false);
+    });
+
+    it('hides when neither protected nor staged', () => {
+        expect(cloudBadgeVisible(false, 0)).toBe(false);
     });
 });
 

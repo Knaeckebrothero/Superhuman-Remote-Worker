@@ -4,7 +4,7 @@ import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
-import {PersistentChatService, historyToTurns} from './persistent-chat.service';
+import {PersistentChatService, historyToTurns, cloudCountFromSummary} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
@@ -19,6 +19,7 @@ import {
     ToolCallEvent,
     UserTurn,
 } from '../models/turn.model';
+import {ThreadCloudDiffSummary} from '../models/api.model';
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -221,6 +222,31 @@ function createService(opts: {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('cloudCountFromSummary', () => {
+    // Protected cloud mode (Slice C, Task 14): the badge count is the sum of
+    // the staged added/modified/deleted counts.
+    const summary = (counts: {added: number; modified: number; deleted: number}): ThreadCloudDiffSummary => ({
+        thread_id: 't1',
+        epoch: 3,
+        staged_at: '2026-07-12T00:00:00Z',
+        counts,
+        protected_mount: '/mnt/project',
+        files: [],
+    });
+
+    it('returns 0 for a null summary (nothing loaded / not protected)', () => {
+        expect(cloudCountFromSummary(null)).toBe(0);
+    });
+
+    it('sums added + modified + deleted', () => {
+        expect(cloudCountFromSummary(summary({added: 2, modified: 1, deleted: 4}))).toBe(7);
+    });
+
+    it('returns 0 for an all-zero counts summary (empty staging)', () => {
+        expect(cloudCountFromSummary(summary({added: 0, modified: 0, deleted: 0}))).toBe(0);
+    });
+});
 
 describe('PersistentChatService — initial state', () => {
     it('starts disconnected with default signals', () => {
