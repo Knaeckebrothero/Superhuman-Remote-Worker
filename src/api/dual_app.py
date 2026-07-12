@@ -340,7 +340,27 @@ def _should_loop() -> bool:
     return os.environ.get("AGENT_LOOP", "").strip() == "1"
 
 
-async def _reset_to_idle(source: str, *, skip_session_cleanup: bool = False) -> None:
+def _final_idle_status() -> str:
+    """Status asserted by post-task heartbeats: 'ready' iff we actually stay.
+
+    One-shot workers exit ~2s after completion; a final 'ready' heartbeat
+    leaves a dispatchable-looking row for up to the 3-min offline threshold
+    after the process is gone — the dispatcher claiming a job for that dead
+    pod is Finding 5 of
+    docs/issues/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
+    'draining' is agent-assertable (same vocabulary as the drain-intent
+    path), excluded from get_available_agents, and the row falls to
+    'offline' via the normal heartbeat timeout after the exit.
+    """
+    return "ready" if _should_loop() else "draining"
+
+
+async def _reset_to_idle(
+    source: str,
+    *,
+    skip_session_cleanup: bool = False,
+    final_status: str = "ready",
+) -> None:
     """Clean up current task state and return to IDLE for next task.
 
     The state flip to IDLE and the ready-heartbeat are in a try/finally so
@@ -389,7 +409,9 @@ async def _reset_to_idle(source: str, *, skip_session_cleanup: bool = False) -> 
             for attempt in range(3):
                 try:
                     await _orchestrator_client.heartbeat(
-                        status="ready", job_id=None, metrics=_get_agent_metrics()
+                        status=final_status,
+                        job_id=None,
+                        metrics=_get_agent_metrics(),
                     )
                     last_err = None
                     break
@@ -399,10 +421,11 @@ async def _reset_to_idle(source: str, *, skip_session_cleanup: bool = False) -> 
                         await asyncio.sleep(0.5 * (attempt + 1))
             if last_err is not None:
                 logger.warning(
-                    f"Failed to send ready heartbeat after 3 attempts: {last_err}"
+                    f"Failed to send {final_status} heartbeat "
+                    f"after 3 attempts: {last_err}"
                 )
 
-    logger.info("Agent returned to IDLE — ready for next task")
+    logger.info(f"Agent returned to IDLE (reported '{final_status}')")
 
 
 async def _complete_stop(reset_source: str) -> None:
@@ -549,16 +572,19 @@ async def _process_orchestrator_job(
             try:
                 if _orchestrator_client.agent_id:
                     await _orchestrator_client.heartbeat(
-                        status="ready", job_id=None, metrics=_get_agent_metrics()
+                        status=_final_idle_status(),
+                        job_id=None,
+                        metrics=_get_agent_metrics(),
                     )
                 await _orchestrator_client.report_completion(job_id, result)
             except Exception as e:
                 logger.error(f"Failed to report completion for job {job_id}: {e}")
 
-        # Always reset state — _reset_to_idle pushes a final 'ready' heartbeat
-        # so the DB matches reality even in non-loop mode where _schedule_exit
-        # would otherwise os._exit(0) before lifespan cleanup runs.
-        await _reset_to_idle("job completion")
+        # Always reset state — _reset_to_idle pushes a final heartbeat so the
+        # DB matches reality even in non-loop mode where _schedule_exit would
+        # otherwise os._exit(0) before lifespan cleanup runs. Non-loop asserts
+        # 'draining', not 'ready' — see _final_idle_status.
+        await _reset_to_idle("job completion", final_status=_final_idle_status())
         if not _should_loop():
             _schedule_exit(delay=2.0)
 
@@ -574,7 +600,7 @@ async def _process_orchestrator_job(
                 )
             except Exception:
                 logger.error(f"Failed to report error for job {job_id}")
-        await _reset_to_idle("job error")
+        await _reset_to_idle("job error", final_status=_final_idle_status())
         if not _should_loop():
             _schedule_exit(delay=2.0)
     finally:
@@ -938,7 +964,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     try:
                         if _orchestrator_client.agent_id:
                             await _orchestrator_client.heartbeat(
-                                status="ready",
+                                status=_final_idle_status(),
                                 job_id=None,
                                 metrics=_get_agent_metrics(),
                             )
@@ -948,7 +974,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     except Exception as e:
                         logger.error(f"Failed to report completion: {e}")
 
-                await _reset_to_idle("job resume completion")
+                await _reset_to_idle(
+                    "job resume completion", final_status=_final_idle_status()
+                )
                 if not _should_loop():
                     _schedule_exit(delay=2.0)
 
@@ -963,7 +991,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                         )
                     except Exception:
                         pass
-                await _reset_to_idle("job resume error")
+                await _reset_to_idle(
+                    "job resume error", final_status=_final_idle_status()
+                )
                 if not _should_loop():
                     _schedule_exit(delay=2.0)
             finally:

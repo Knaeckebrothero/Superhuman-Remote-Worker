@@ -1437,9 +1437,10 @@ export function clearDraft(threadId: string | null): void {
 
             <!-- Action button: mic while the composer is empty, send once there is
                  something to send, stop/spinner while a turn is in flight.
-                 pointerdown.preventDefault keeps the textarea focused, so tapping
-                 the button doesn't dismiss the on-screen keyboard (and with
-                 resizes-content, doesn't reflow the whole column mid-tap). -->
+                 pointerdown.preventDefault keeps the textarea focused through the
+                 tap, so the on-screen keyboard doesn't reflow the whole column
+                 mid-tap; on mobile send() then blurs deliberately, dismissing the
+                 keyboard so the reply gets the reclaimed height. -->
             @if (micMode()) {
               <button
                 type="button"
@@ -2121,6 +2122,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
         const threadId = this.chat.threadId();
         this.showSlashMenu.set(false);
+        // Mobile: dismiss the on-screen keyboard now the message is on its way,
+        // so the reply renders into the reclaimed height. The keyboard collapse
+        // fires a viewport resize, which re-pins to the bottom (autoScroll is
+        // set below). Desktop keeps focus for rapid follow-up messages.
+        if (this.isMobileDevice()) {
+            this.inputEl?.nativeElement?.blur();
+        }
         // Clear textarea immediately — sendMessage is async because of uploads.
         this.inputText = '';
         // Drop the persisted draft now the message is in flight, so a reload

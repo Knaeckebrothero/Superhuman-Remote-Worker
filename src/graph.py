@@ -430,7 +430,12 @@ def _classify_llm_error(error: Exception) -> str:
                                 return "rate_limit"
                             if code == "tool_use_failed":
                                 return "transient"
-                            if etype == "invalid_request_error":
+                            # 'invalid_request_error' is the OpenAI/Anthropic
+                            # vocabulary; MiniMax says 'bad_request_error'
+                            # (e.g. "invalid function arguments json string" —
+                            # the 2026-07-11 wedge). Both are deterministic
+                            # input rejections: no retry can fix them.
+                            if etype in ("invalid_request_error", "bad_request_error"):
                                 return "permanent"
                     # 400 without a parseable body — be conservative, retry.
                     return "transient"
@@ -477,7 +482,7 @@ def _classify_llm_error(error: Exception) -> str:
                         return "rate_limit"
                     if code == "tool_use_failed":
                         return "transient"
-                    if etype == "invalid_request_error":
+                    if etype in ("invalid_request_error", "bad_request_error"):
                         return "permanent"
 
         nxt = getattr(current, "__cause__", None)
@@ -506,6 +511,14 @@ def _classify_llm_error(error: Exception) -> str:
         or "too many requests" in error_str
     ):
         return "rate_limit"
+    if (
+        "bad_request_error" in error_str or "invalid_request_error" in error_str
+    ) and "tool_use_failed" not in error_str:
+        # Stringified provider 400s that lost their exception class
+        # (observed in production audit logs). Deterministic input
+        # rejections — rate-disguised 400s and Groq tool_use_failed were
+        # already caught above / excluded here.
+        return "permanent"
 
     return "transient"
 
