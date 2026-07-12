@@ -40,6 +40,7 @@ def test_added_vs_modified_by_baseline_membership(tmp_path):
     assert st == {"new.txt": "added", "old.txt": "modified"}
     assert m["counts"] == {"added": 1, "modified": 1, "deleted": 0}
     assert m["epoch"] == 3
+    assert m["skipped"] == []
 
 
 def test_char_whiteout_expands_to_baseline_files(tmp_path):
@@ -104,6 +105,18 @@ def test_binary_sniff_and_size(tmp_path):
     by = {e["path"]: e for e in m["entries"]}
     assert by["img.png"]["binary"] is True and by["img.png"]["size"] == 6
     assert by["note.md"]["binary"] is False
+
+
+def test_non_regular_members_surface_as_skipped(tmp_path):
+    p = tmp_path / "upper.tar"
+    with tarfile.open(p, "w", format=tarfile.PAX_FORMAT) as tf:
+        ti = tarfile.TarInfo(name="upper/link.txt")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = "target.txt"
+        tf.addfile(ti)
+    m = derive_manifest(str(p), baseline={}, epoch=1, staged_at="t")
+    assert m["entries"] == []
+    assert m["skipped"] == [{"path": "link.txt", "kind": "symlink"}]
 
 
 def test_select_protected_mount_picks_first_nextcloud_with_handle():
