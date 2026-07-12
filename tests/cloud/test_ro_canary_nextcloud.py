@@ -75,6 +75,13 @@ class FakeNcCanary:
                 "</d:response></d:multistatus>"
             )
             return httpx.Response(207, text=body)
+        # Trash canary: PUT then DELETE a throwaway file so a real
+        # groupfolder-trashed item exists for the trash-restore side channel.
+        if method == "PUT" and path.endswith("/srw-ro-trash-canary.txt"):
+            return httpx.Response(201)
+        if method == "DELETE" and path.endswith("/srw-ro-trash-canary.txt"):
+            self.deleted = path
+            return httpx.Response(204)
         if method == "DELETE" and path.endswith("/.srw-ro-canary/probe.txt"):
             self.deleted = path
             return httpx.Response(204)
@@ -82,7 +89,7 @@ class FakeNcCanary:
             body = (
                 '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
                 "<d:response><d:href>/remote.php/dav/trashbin/agent-service/"
-                "trash/probe.txt.d1699999999</d:href>"
+                "trash/srw-ro-trash-canary.txt.d1699999999</d:href>"
                 "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
                 "</d:response></d:multistatus>"
             )
@@ -96,7 +103,7 @@ async def test_seed_canary_discovers_real_version_and_trash_refs():
     fixture = await backend.seed_canary_fixture(_handle())
     assert fixture.path == ".srw-ro-canary/probe.txt"
     assert fixture.version_ref == "12345/1699999999"
-    assert fixture.trash_ref == "probe.txt.d1699999999"
+    assert fixture.trash_ref == "srw-ro-trash-canary.txt.d1699999999"
 
 
 @pytest.mark.asyncio
@@ -174,6 +181,10 @@ class FakeNcCanarySelfHrefFirst(FakeNcCanary):
                 "</d:response></d:multistatus>"
             )
             return httpx.Response(207, text=body)
+        if method == "PUT" and path.endswith("/srw-ro-trash-canary.txt"):
+            return httpx.Response(201)
+        if method == "DELETE" and path.endswith("/srw-ro-trash-canary.txt"):
+            return httpx.Response(204)
         if method == "PROPFIND" and "/trashbin/" in path:
             body = (
                 '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
@@ -182,7 +193,7 @@ class FakeNcCanarySelfHrefFirst(FakeNcCanary):
                 "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
                 "</d:response>"
                 "<d:response><d:href>/remote.php/dav/trashbin/agent-service/"
-                "trash/probe.txt.d1699999999</d:href>"
+                "trash/srw-ro-trash-canary.txt.d1699999999</d:href>"
                 "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
                 "</d:response></d:multistatus>"
             )
@@ -197,8 +208,8 @@ async def test_seed_canary_skips_collection_self_href_before_real_item():
     # Versions namespace: self-href's trailing segment equals the fileid
     # ("12345") — must be skipped in favor of the real version id.
     assert fixture.version_ref == "12345/1699999999"
-    # Trashbin namespace: self-href's trailing segment is "trash" (the
-    # collection itself) — must be skipped in favor of the real item, not
-    # returned as the bogus trash_ref="trash" the pre-fix bug would emit.
-    assert fixture.trash_ref == "probe.txt.d1699999999"
+    # Trashbin namespace: the collection self-href (trailing segment "trash")
+    # does not match the trash-canary name prefix, so it is skipped in favor
+    # of the real seeded item — never returned as a bogus trash_ref="trash".
+    assert fixture.trash_ref == "srw-ro-trash-canary.txt.d1699999999"
     assert fixture.trash_ref != "trash"
