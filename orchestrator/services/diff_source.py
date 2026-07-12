@@ -23,6 +23,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+# Sentinel for GiteaDiffSource's summary memo: distinguishes "not computed
+# yet" from a computed-and-cached ``None`` (no diff available).
+_UNSET: Any = object()
+
 
 @dataclass(frozen=True)
 class DiffEntrySummary:
@@ -49,19 +53,28 @@ class DiffFileContent:
 
 
 class GiteaDiffSource:
-    """Mode A diff source: Gitea trees at baseline..branch (text-only)."""
+    """Mode A diff source: Gitea trees at baseline..branch (text-only).
+
+    ``summary()`` is memoized per instance: the endpoints call it once
+    for gating and again (via ``file()``) for content, and an instance
+    is scoped to a single request — one Gitea tree walk each, not two.
+    """
 
     def __init__(self, *, job: dict, gitea_client: Any):
         self._job = job
         self._gitea = gitea_client
+        self._summary_cache: DiffSummary | None = _UNSET
 
     async def summary(self) -> DiffSummary | None:
+        if self._summary_cache is not _UNSET:
+            return self._summary_cache
         from services.job_cloud_baseline import get_diff_summary
 
         s = await get_diff_summary(job=self._job, gitea_client=self._gitea)
         if s is None:
+            self._summary_cache = None
             return None
-        return DiffSummary(
+        self._summary_cache = DiffSummary(
             files=[
                 DiffEntrySummary(path=f["path"], status=f["status"]) for f in s["files"]
             ],
@@ -70,6 +83,7 @@ class GiteaDiffSource:
                 "head_commit": s["head_commit"],
             },
         )
+        return self._summary_cache
 
     async def file(self, path: str) -> DiffFileContent | None:
         s = await self.summary()
