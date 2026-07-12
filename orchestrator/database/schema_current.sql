@@ -412,7 +412,8 @@ CREATE TABLE public.datasources (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     project_id uuid,
-    config jsonb DEFAULT '{}'::jsonb NOT NULL
+    config jsonb DEFAULT '{}'::jsonb NOT NULL,
+    read_only boolean
 );
 
 
@@ -421,6 +422,13 @@ CREATE TABLE public.datasources (
 --
 
 COMMENT ON COLUMN public.datasources.config IS 'Non-secret type-specific datasource configuration. Credentials and tokens must not be stored here.';
+
+
+--
+-- Name: COLUMN datasources.read_only; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.read_only IS 'Declared read-only flag for public (is_global) datasources. NULL = not applicable. Declarative: credentials are the enforcement boundary; kb datasources are read-only by architecture.';
 
 
 --
