@@ -80,6 +80,12 @@ describe('canComposeDuringSession', () => {
         // NOT let a message be queued during a reconnect — it would never send.
         expect(canComposeDuringSession(false, false)).toBe(false);
     });
+
+    it('allows composing in the landing draft, before any thread exists', () => {
+        // Instant landing (docs/features/instant_landing_session.md): the
+        // first send creates the session; typing must be possible at t=0.
+        expect(canComposeDuringSession(false, false, true)).toBe(true);
+    });
 });
 
 describe('canSendMessage', () => {

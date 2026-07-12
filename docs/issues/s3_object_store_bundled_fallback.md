@@ -1,0 +1,56 @@
+# S3 object store is a near-hard requirement — ship a bundled fallback
+
+**Status**: OPEN (parked 2026-07-12; decision made, work not scheduled)
+**Decision of record**: platform features may **assume an S3-compatible
+object store is present**. Self-host installs without an external store are
+served by a future chart-bundled option, not by per-feature fallback logic.
+
+## Problem
+
+An S3-compatible object store started as an optional dependency and has
+quietly become load-bearing. Consumers today:
+
+- **Virtual workspace tier** (`virtualWorkspace.rclone` /
+  `VIRTUAL_WORKSPACE_S3_*`, `helm/values.yaml:1341+`) — the instant/lite
+  session backend stores all workspace files in a per-thread S3 prefix.
+  Empty `rclone.type` disables the tier; a `virtual` job/session then fails
+  at dispatch/attach (`LiteWorkspaceConfigError`). With the instant-landing
+  feature (`docs/features/instant_landing_session.md`) making virtual the
+  *default* session backend, a store-less install has a broken
+  out-of-the-box experience.
+- **Workspace snapshots** (`SNAPSHOT_S3_*`) — workspace suspension/resume,
+  IDE sessions, VM lifecycle (S3→VM extract), container/VM provisioners
+  (`orchestrator/services/workspace_suspension.py`, `snapshot_service.py`,
+  `ide_session.py`, `lifecycle/*`). No store → no suspend/restore paths.
+- **Main-cloud object storage** (`cloud.objectStore` / `OBJECTSTORE_S3_*`,
+  `helm/values.yaml:859+`) — the prod-private OpenCloud layout runs against
+  an external bucket.
+
+The chart itself deploys **no** store (`helm/values.yaml:63` — the MinIO
+host value is a cockpit deep-link only). Prod-private brings its own MinIO
+(`minio.minio.svc`); local k3d has MinIO parity tooling. A fresh self-host
+install with none of these silently loses virtual sessions, snapshots, and
+suspension — each failing at a different, late point.
+
+## Proposal (tackle another day)
+
+1. Add an **opt-in bundled S3 store** to the Helm chart — a small
+   single-node Garage or MinIO deployment + PVC, wired automatically into
+   `virtualWorkspace.rclone`, `SNAPSHOT_S3_*`, and (optionally)
+   `cloud.objectStore` when enabled and no external endpoint is set.
+2. Mark it clearly **not for production** (values comment + NOTES.txt
+   warning on install): single replica, no erasure/replication, PVC-bound;
+   external S3 remains the recommended path. Garage is the leaner candidate
+   (single small binary, low idle RAM); MinIO is the familiar one — decide
+   at implementation time.
+3. Install-time visibility: when no store is configured at all (bundled off,
+   external unset), surface one loud warning at orchestrator startup listing
+   the features that will be degraded, instead of today's per-feature late
+   failures.
+
+## Non-goals
+
+- Per-feature fallback/gating logic in the cockpit or per-endpoint
+  capability flags — explicitly rejected in the instant-landing design
+  discussion (2026-07-11/12). The platform assumes the store exists; making
+  that assumption safe is *this* issue, solved once at the deployment layer.

@@ -1,4 +1,4 @@
-import {Component, inject, OnDestroy, OnInit} from '@angular/core';
+import {Component, effect, inject, OnDestroy, OnInit} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {PersistentChatComponent} from '../../views/persistent-chat/persistent-chat.component';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
@@ -26,7 +26,29 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
 
+    /** Instant-landing draft chat at `/` (route data, not a URL param). */
+    private readonly isDraftRoute = this.route.snapshot.data['draft'] === true;
+
+    constructor() {
+        // Draft flow: when the first send creates the thread
+        // (_createFromDraftSession → createAndConnect sets threadId), move the
+        // URL from / to the session. No replaceUrl — Back returns to a fresh
+        // draft. The destination ChatPage instance skips reconnecting via the
+        // ngOnInit same-thread guard below.
+        effect(() => {
+            const id = this.chat.threadId();
+            if (this.isDraftRoute && id) {
+                void this.router.navigate(['/sessions', id]);
+            }
+        });
+    }
+
     ngOnInit(): void {
+        if (this.isDraftRoute) {
+            this.chat.enterDraftSession();
+            return;
+        }
+
         const threadId = this.route.snapshot.paramMap.get('threadId');
 
         if (threadId === '_creating') {
@@ -44,8 +66,13 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 this.router.navigate(['/sessions']);
             }
         } else if (threadId) {
-            // Already connected to this thread? Don't reconnect.
-            if (this.chat.isConnected() && this.chat.threadId() === threadId) return;
+            // Already connected or mid-start on this thread? Don't reconnect.
+            // The mid-start case is the draft flow landing here right after
+            // createAndConnect — a second connect() would race the first.
+            if (
+                this.chat.threadId() === threadId &&
+                (this.chat.isConnected() || this.chat.isStartingSession())
+            ) return;
 
             this.chat.connect(threadId);
         } else {

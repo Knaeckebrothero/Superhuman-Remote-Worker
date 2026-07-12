@@ -1,6 +1,8 @@
 # Instant Landing Session ("type first, provision on send")
 
-**Status**: PROPOSED v2 (reframed 2026-07-11 after design discussion)
+**Status**: IMPLEMENTED + live-verified on k3d (2026-07-12, uncommitted).
+S3 assumed present platform-wide (`docs/issues/s3_object_store_bundled_fallback.md`);
+platform default = virtual. See "As built" at the bottom.
 **Scope**: orchestrator (default-settings chain) + cockpit (draft mode + settings UI)
 **Related**: `docs/features/no_workspace_agent_mode.md` (virtual/lite tiers),
 `docs/features/builder_to_sessions_consolidation.md` (why `/` currently
@@ -72,14 +74,13 @@ Two things, and the second is the foundation for the first:
 
 ### Part A — workspace backend joins the default-settings chain
 
-**A1. System default (resolved server-side, availability-aware).**
-`_resolve_preference_defaults().persistent_agent` gains
-`workspace_backend`: `"virtual"` when the deployment has an object store
-(`_virtual_workspace_rclone_spec() is not None`), else `"sandbox"`. This is
-the whole "is virtual available" problem solved in one line, at the one
-place that knows the env — no cockpit capability flag, no client-side
-fallback logic. Deployments without an object store simply have a sandbox
-system default.
+**A1. System default.** `_resolve_preference_defaults().persistent_agent`
+gains `workspace_backend: "virtual"`. An S3-compatible object store is an
+assumed platform prerequisite (decision 2026-07-12) — no availability
+probing, no fallback logic; store-less installs are addressed once at the
+deployment layer by `docs/issues/s3_object_store_bundled_fallback.md`. A
+store-less install that ignores that still fails fast with the actionable
+`LiteWorkspaceConfigError` message at attach.
 
 **A2. User override.** `settings.persistent_agent.workspace_backend`
 (values `sandbox|virtual|none`; `vm` invalid, same rule as per-request).
@@ -149,8 +150,7 @@ returns to a fresh draft. Attachments stay disabled until connected
 ## Acceptance criteria
 
 1. Settings shows a "Default workspace" selector under the session-defaults
-   section; unset displays the resolved system default (virtual on
-   deployments with an object store, sandbox otherwise).
+   section; unset displays the resolved system default (virtual).
 2. `POST /api/persistent/threads` with no workspace override provisions the
    owner's default backend; the New Session form's explicit selector still
    wins; `vm` still rejected at create.
@@ -159,8 +159,8 @@ returns to a fresh draft. Attachments stay disabled until connected
 4. Typing and sending creates a session with the user's defaults; on a
    deployment with virtual + warm pool the agent responds within seconds;
    the first message is never lost.
-5. On a deployment without an object store the same flow works (sandbox
-   system default; startup card shows progress; no error).
+5. A user who sets Container as their default workspace gets a sandbox
+   session from the landing flow (slower; startup card shows progress).
 6. `/sessions`, `/sessions/new`, `/sessions/:id`, deep links unchanged;
    entering `/` never kills a connected session server-side.
 7. Works in the mobile layout (responsive CSS only).
@@ -175,25 +175,49 @@ returns to a fresh draft. Attachments stay disabled until connected
 - **S3 cockpit — draft landing** (~1 d + vitest): route, `enterDraft()`,
   draft send → `createAndConnect`, hero, "Advanced options" link,
   sessions-list empty-state CTA → `/`.
-- **Verify** (k3d): settings default resolution both with and without
-  `VIRTUAL_WORKSPACE_RCLONE_TYPE`; `/` → type → send → live session;
-  explicit form selector still wins; `/sessions/*` regression pass; mobile
-  viewport.
+- **Verify** (k3d): settings selector round-trip; `/` → type → send → live
+  virtual session in seconds; user default = sandbox honored; explicit form
+  selector still wins; `/sessions/*` regression pass; mobile viewport.
 
-## Resolved questions (2026-07-11 discussion)
+## Resolved questions
 
-- Backend selection is a **user default, not a cockpit hardcode** — the
-  landing flow sends a minimal body; the server resolves defaults. Users can
-  configure "always container" in Settings.
-- Virtual availability is handled **server-side in the resolved system
-  default** (A1), not via a client capability flag.
+- Backend selection is a **user default, not a cockpit hardcode** (2026-07-11)
+  — the landing flow sends a minimal body; the server resolves defaults.
+  Users can configure "always container" in Settings.
+- **S3 store is an assumed platform prerequisite** (2026-07-12) — no
+  capability flag, no fallback logic; bundled-store fallback parked in
+  `docs/issues/s3_object_store_bundled_fallback.md`.
+- **Platform default = `virtual`** — most sessions don't need shell tools;
+  container is one Settings change or one in-place upgrade away.
+- **Default project** — instant sessions attach the user's default project
+  when one exists (form parity, KB routing).
+- **Draft entry while a session is connected** — always a fresh draft;
+  the connected session stays alive server-side and resumable from the list.
 
-## Open questions
+## As built (2026-07-12)
 
-1. **Platform default** — `virtual` when available (recommended: matches
-   "most sessions don't need shell", and container is one Settings click or
-   one upgrade away), or keep `sandbox` and let users opt into virtual?
-2. **Default project on instant sessions** — attach the user's default
-   project (assumed yes: form parity, KB routing) or leave project-less?
-3. **Draft entry while a session is connected** — always fresh draft
-   (assumed) vs. showing the connected session at `/`.
+All three slices implemented as designed; deltas and findings:
+
+- **Pre-existing bug found & fixed**: `create_thread`'s user-defaults merge
+  read `user.get("settings")`, but no auth path ever selects the `settings`
+  column (`get_user_by_keycloak_sub` returns identity/admission fields only)
+  — so every saved persistent_agent default (model, permission_mode, …) was
+  silently dead at create time. Unit tests never caught it because they mock
+  the user dict *with* settings; the live k3d smoke exposed it. Fix:
+  explicit `postgres_db.get_user_settings()` fetch in `create_thread`.
+- Naming: the service signal is `isDraftSession` / `enterDraftSession()` —
+  "draft" alone already means the composer's persisted text draft.
+- Draft→session URL move is an `effect` in `ChatPageComponent` watching
+  `threadId` (service stays Router-free); the destination instance skips
+  reconnecting via a same-thread guard extended to cover `isStartingSession`.
+- Extra polish: sessions-list empty state gained a "Start chatting" CTA → `/`.
+- Verified: 8794 pytest green (1 unrelated env-dependent failure:
+  `test_database_phase1::test_connect_disconnect` needs a live local
+  Postgres), 892 vitest green, ruff clean, prod build clean. Live k3d:
+  resolved default surfaces `virtual`; create matrix (no setting → virtual ·
+  saved sandbox → sandbox · explicit `none` beats saved sandbox · invalid
+  PATCH → 422); UI flow `/` → type → Enter → thread created with title from
+  message + default project attached, message rode the outbox, agent replied
+  — with a cold agent pod (no warm pool locally) in well under a minute; the
+  425 `/connection` console entries during startup are the normal readiness
+  poll. `/sessions`, `/sessions/new`, `/sessions/:id` regressions clean.

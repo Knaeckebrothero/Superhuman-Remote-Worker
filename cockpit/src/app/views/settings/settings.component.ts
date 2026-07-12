@@ -619,6 +619,19 @@ const EXPIRY_OPTIONS = [
                 </app-select>
               </app-form-field>
             </div>
+            <app-form-field
+              [label]="'settings.persistent.workspaceBackend' | transloco"
+              [hint]="'settings.persistent.workspaceBackendHint' | transloco"
+            >
+              <app-select
+                [value]="paWorkspaceBackend() ?? resolved().persistent_agent?.workspace_backend ?? ''"
+                (changed)="onPrefChange(paWorkspaceBackend, resolved().persistent_agent?.workspace_backend, $event)"
+              >
+                <option value="virtual">{{ 'settings.persistent.workspaceVirtual' | transloco }}{{ !paWorkspaceBackend() && resolved().persistent_agent?.workspace_backend === 'virtual' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                <option value="sandbox">{{ 'settings.persistent.workspaceSandbox' | transloco }}{{ !paWorkspaceBackend() && resolved().persistent_agent?.workspace_backend === 'sandbox' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                <option value="none">{{ 'settings.persistent.workspaceNone' | transloco }}{{ !paWorkspaceBackend() && resolved().persistent_agent?.workspace_backend === 'none' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+              </app-select>
+            </app-form-field>
             <app-form-field [label]="'settings.persistent.greeting' | transloco">
               <app-input
                 [value]="paGreeting()"
@@ -2326,6 +2339,9 @@ export class SettingsComponent implements OnInit {
   // Persistent Agent form state — null = use resolved default
   readonly paModel = signal<string | null>(null);
   readonly paPermissionMode = signal<string | null>(null);
+  // Default session workspace tier (null = track the resolved system default,
+  // which is "virtual" — see docs/features/instant_landing_session.md).
+  readonly paWorkspaceBackend = signal<string | null>(null);
   readonly paConfigName = signal('');
   readonly paGreeting = signal('');
   readonly paIdleTimeout = signal<number | null>(null);
@@ -2434,6 +2450,7 @@ export class SettingsComponent implements OnInit {
         if (pa) {
           this.paModel.set(pa.model ?? null);
           this.paPermissionMode.set(pa.permission_mode ?? null);
+          this.paWorkspaceBackend.set(pa.workspace_backend ?? null);
           this.paConfigName.set(pa.config_name || '');
           this.paGreeting.set(pa.greeting || '');
           this.paIdleTimeout.set(pa.idle_timeout_minutes ?? null);
@@ -2724,6 +2741,7 @@ export class SettingsComponent implements OnInit {
       persistent_agent: {
         model: this.paModel()?.trim() || null,
         permission_mode: this.paPermissionMode() || null,
+        workspace_backend: this.paWorkspaceBackend() || null,
         config_name: this.paConfigName() || null,
         greeting: this.paGreeting().trim() || null,
         idle_timeout_minutes: this.paIdleTimeout() || null,

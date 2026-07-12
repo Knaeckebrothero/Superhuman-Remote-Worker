@@ -209,6 +209,7 @@
     "returnToChat": "Zurück zum Chat",
     "loading": "Sitzungen werden geladen...",
     "empty": "Noch keine Sitzungen. Erstellen Sie eine, um zu beginnen.",
+    "emptyCta": "Einfach loschatten",
     "emptyFilterActive": "Keine aktiven Sitzungen.",
     "emptyFilterEnded": "Keine beendeten Sitzungen.",
     "untitledSession": "Unbenannte Sitzung",
@@ -616,6 +617,11 @@
       "permissionSupervised": "Beaufsichtigt",
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
+      "workspaceBackend": "Standard-Arbeitsbereich",
+      "workspaceBackendHint": "Wo neue Sitzungen ihre Dateien ablegen. Virtuell startet in Sekunden und kann während der Sitzung auf einen Container aufgerüstet werden; Container bietet von Anfang an Shell und Git, braucht aber länger zum Bereitstellen.",
+      "workspaceVirtual": "Virtuell — sofort, Dateien im Cloud-Speicher",
+      "workspaceSandbox": "Container — volle Shell & Git, langsamerer Start",
+      "workspaceNone": "Ohne — nur Chat, keine Dateien",
       "configDefault": "Standard",
       "configDeveloper": "Entwickler",
       "configScholar": "Forscher",
@@ -1083,6 +1089,11 @@
     "empty": {
       "title": "Was wollen wir heute erobern?",
       "subtitle": "Der Agent ist verbunden und bereit. Stelle eine Aufgabe oder wähle unten einen Startpunkt."
+    },
+    "draft": {
+      "title": "Was wollen wir heute erobern?",
+      "subtitle": "Einfach lostippen — die Sitzung startet beim Absenden.",
+      "advanced": "Erweiterte Optionen"
     },
     "ended": {
       "eyebrow": "Wiederaufnehmbar",
