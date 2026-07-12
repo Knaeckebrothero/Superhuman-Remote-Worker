@@ -332,7 +332,11 @@ in either run — synthesis flags Q5 as open; items below are extractions from f
 
 ---
 
-## Part C — Synthesis (recommendations to react to, not decisions)
+## Part C — Synthesis
+
+> **Resolution note (2026-07-12):** the recommendations below were discussed and adopted the
+> same day. The **design authority is now [`../multi_tenancy.md`](../multi_tenancy.md)
+> §Milestone 2 → "Decided shape"** (rewritten in place); this doc remains the evidence base.
 
 1. **Org model:** GitHub/Neon/Vercel-convergent — users are global identities; orgs are the
    only ownership primitive; **auto-create a personal org per user at signup** (real row,
@@ -372,12 +376,14 @@ in either run — synthesis flags Q5 as open; items below are extractions from f
    billing stub's open "reserve strategy" question); quota axes = concurrent jobs +
    spend-rate; hard-stop at zero stays (already locked in the billing stub).
 
-**Open forks needing a human call:**
-- Personal orgs: hidden ("Personal" pseudo-org UX) vs visible first-class org from day one?
-- Which of the ~18 PLATFORM feature kill-switches (TTS library, user-experts, sudo rules)
-  should later gain per-org overrides?
-- Break-glass consent model: org-owner consent required (AWS-style) vs notify-only
-  (audit-bracketed) — affects support SLAs for unresponsive customers.
-- When to actually build: M2 stays demand-gated (Fork B); this doc exists so the first "we
-  want the hosted version for our team" request starts a ~2–3 week build, not a research
-  project.
+**Open forks — RESOLVED 2026-07-12** (outcomes recorded in `multi_tenancy.md` §M2):
+- Personal orgs: **hidden** — real `kind='personal'` row, zero signup ceremony, surfaces only
+  in the org switcher.
+- Platform kill-switch per-org overrides: **deferred**; the `capability_grants` `'org'`
+  scope-enum extension is the mechanism when a customer asks.
+- Break-glass: **consent-gated by default** (org-owner approval in-product, sudo-approval UX
+  pattern) + short pre-declared AVV exceptions (legal, abuse/security) that are
+  notify-plus-audit; all sessions bracketed in `security_events`.
+- Timing: **demand-gated** (first paying team wanting hosted shared-cluster), with one rule
+  in force immediately — **orgs before billing**: M2.A lands before/with the wallet, which
+  keys on `organization_id` from day one.

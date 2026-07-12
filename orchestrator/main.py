@@ -12319,8 +12319,17 @@ async def complete_job(
                 ],
             }
 
-        # 1. Determine and set the new job status
-        new_status, error_message = determine_job_status(job, result)
+        # 1. Determine and set the new job status. For a subjob, pass the parent's
+        # current status so a drain-frozen subjob resolves terminally instead of
+        # pausing into a cascade-guard wedge under a permanently-failed parent.
+        # docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+        _parent_status = None
+        if job.get("parent_job_id"):
+            _parent = await postgres_db.get_job(str(job["parent_job_id"]))
+            _parent_status = _parent.get("status") if _parent else None
+        new_status, error_message = determine_job_status(
+            job, result, parent_status=_parent_status
+        )
 
         # 1·mem. Memory/KB-unavailable bounded retry. determine_job_status has
         # already enforced the cap (paused under MEMORY_RETRY_CAP, failed at it).

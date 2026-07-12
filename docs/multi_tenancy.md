@@ -229,17 +229,30 @@ When all five tick, **M1 is done** and you can open signups to strangers without
 
 **Goal.** Multiple organizations (teams of users) share one deployment, each fully isolated from the others — **including from administrators of other orgs.** *"Mandantenfähigkeit"* in the formal sense. A user can belong to multiple orgs; every resource belongs to exactly one org.
 
-**Trigger.** Real demand. Not yet — individual-subscriber use cases sit comfortably inside M1.
+**Trigger.** Real demand — the first paying team that wants the hosted shared-cluster product. Until then, Fork A single-tenant deploys *are* one org per cluster and need none of this. Individual-subscriber use cases sit comfortably inside M1.
 
-**Why it stays cheap.** M1.A centralized visibility in `orchestrator/security/access.py`. Adding `organizations.id` as an additional constraint is a single change to `user_visible_project_ids` — every consumer (jobs / projects / datasources / threads / etc.) inherits the new restriction without a per-endpoint edit. The org wrapper is *additive*.
+**Status (2026-07-12): design settled.** A research pass (3 codebase surveys + adversarially verified web research) closed the open questions; evidence, per-claim verification status, and industry precedents live in [`features/organizations_research.md`](features/organizations_research.md). The decisions below supersede the earlier sketch. **One rule applies immediately, before M2 even starts: orgs before billing, always** — the wallet/billing work ([`features/saas_billing_and_metering.md`](features/saas_billing_and_metering.md)) must key on `organization_id` from day one, so M2.A lands before or with it. Building wallet-per-user first and migrating later is the exact documented mistake (Neon: "every system had to handle twice the number of edge cases").
+
+### Decided shape (2026-07-12)
+
+1. **Org model — GitHub-style.** Users are global identities; orgs are the *only* ownership primitive; every signup auto-creates a **hidden personal org** (`kind='personal'`, a real row — never `org_id IS NULL` = personal). The org concept surfaces in the UI only when a user creates or joins a team org. No in-place personal→team conversion ever (GitHub deprecated theirs 2026-01); offer "move project into org" instead. Wallet value lives on the org, never the user. Provisioning extends `upsert_user_from_oidc`'s existing atomic CTE (it already creates a personal default project + owner membership — the backfill is mechanical).
+2. **Keycloak — single realm, DB-canonical orgs.** Realm-per-org is rejected (BFF/bootstrap/service-stack blast radius, cross-realm `sub` collisions, realm-count scaling). Keycloak stays tenancy-unaware at first: org membership/roles live in `organization_members`, not in tokens (KC has no per-org RBAC even in 26.6, and the `organization` claim has a maintainer-confirmed gap on global-IdP logins, keycloak#43635). Org context travels **per-request** (`/o/{org-slug}` URL prefix); `srw_sessions` stores only the default org (browser-global active-org cookies are a documented multi-tab trap). **KC Organizations is adopted lazily, per customer, when they want enterprise SSO** — one org + one dedicated IdP object via the admin REST API; that work item includes bumping the chart's Keycloak image from 26.2 to **≥26.6** (org groups landed 26.6.0).
+3. **Admin split — the platform operator loses content access.** The global `is_admin` splits into `platform_operator` (agent/VM fleet, model catalog + provider keys, system settings, org admission, billing ops, security events — **no content reads**) and org roles `owner/admin/member`. The flip is centralized: the 12 visibility helpers in `security/access.py` carry the admin bypass. Content access becomes **break-glass**: consent-gated by default (org owner approves a support-access request in-product — reuse the sudo-approval UX pattern), with a short pre-declared AVV exception list (legal compulsion, abuse/security investigation) that is notify-plus-audit instead; every session bracketed with start/end events in `security_events`, individually attributed. God-mode side doors (raw `/api/tables/{name}`, admin-scope MCP/PAT minting) become operator+break-glass or are removed.
+4. **Compliance posture (German B2B):** target ISO 27001 (BSI C5 later), not SOC 2; the AVV lists LLM providers as sub-processors (14-day-notice model); no analytics/training on tenant content without consent (Art. 28(10) hard line).
+5. **Deferred deliberately:** per-org overrides for platform kill-switches (the `capability_grants` `'org'` scope-enum extension covers future needs), org-shared Gitea/OpenCloud spaces (projects remain the sharing unit in v1 — the org is an isolation/billing/admin boundary only), and Postgres RLS (the access.py funnel + endpoint-inventory CI guard the same failure mode; revisit as additive hardening once org columns exist).
+
+**Why it stays cheap.** M1.A centralized visibility in `orchestrator/security/access.py`. Adding `organizations.id` as an additional constraint is a single change to `user_visible_project_ids` — every consumer (jobs / projects / datasources / threads / etc.) inherits the new restriction without a per-endpoint edit. The org wrapper is *additive*. The three places it is **not** cheap (verified in the research pass): the global `is_admin` bypass semantics in every access helper, the cross-DB metering ledger (`usage_events` needs `organization_id` denormalized at emit time — the audit DB cannot join the app DB), and the audit/vector tiers whose ownership exists only in code (gate convention, not schema).
 
 ### M2.A — Organizations schema (3–5 days)
 
-- New table `organizations(id, name, slug, created_at, …)`.
-- `projects.organization_id` FK, `NOT NULL` after backfill (existing rows → an implicit `default` org).
+- New table `organizations(id, name, slug, kind, created_at, …)` with `kind IN ('personal','team')`.
+- `projects.organization_id` FK, `NOT NULL` after backfill (existing rows → each user's auto-created personal org; `upsert_user_from_oidc` already builds the org-of-one shape).
 - New table `organization_members(org_id, user_id, role)` with `owner/admin/member` roles.
+- `security_events.org_id` (audit boundary from day one) and `usage_events.organization_id` **denormalized at emit** in `usage_ledger.record_events` + `workspace_metering` (cross-DB, cannot be joined at read time).
+- `capability_grants.scope_kind` gains `'org'`.
 - `user_visible_project_ids(user)` augments to include projects in orgs the user is a member of.
-- Cockpit: org switcher (current org sets a per-session cookie), invite flow, org admin pane.
+- Cockpit: org switcher (sets the *default* org; authoritative org context is per-request via `/o/{org-slug}` — never cookie-only, see Decided shape #2), invite flow, org admin pane.
+- Watch item: vector `sources` are content-hash-deduped across jobs → scope dedup per org or accept the cross-org inference channel consciously.
 
 Schema design is straightforward — `project_members` is the template.
 
@@ -251,26 +264,22 @@ Things M1's "single org, many users" model didn't need.
 |---|---|---|
 | 1 | **Per-org quotas** | M1.D quotas are per-user. For paying tiers, per-org caps (concurrent jobs, monthly LLM spend, datasource count, storage GB) become the canonical unit. **Extends** M1.D rather than replacing it. |
 | 2 | **Per-org audit boundary** | An admin of org A must not see org B's audit log. The 403-audit primitive from M1.B needs `org_id` from day one or a retroactive backfill. |
-| 3 | **Per-org branding / settings** | Logo, default expert configs, SSO config (if M2.C goes the per-realm route). Not security-critical, but the natural shape once you have orgs. |
+| 3 | **Per-org branding / settings** | Logo, default expert configs, per-org enterprise SSO (KC Organizations, adopted per customer — see M2.C). Not security-critical, but the natural shape once you have orgs. |
 | 4 | **Cross-org membership UX** | A user in multiple orgs needs a "which org am I working in right now" switcher. URL prefixing (`/o/{org-slug}/…`) is the conventional pattern. |
 
-### M2.C — Realm strategy decision
+### M2.C — Realm strategy: RESOLVED 2026-07-12
 
-| Approach | When to choose | Cost |
-|---|---|---|
-| **One Keycloak realm, org-as-group** | Different orgs share infrastructure (logins, MFA, OAuth providers). Same realm = same identity surface. | Cheap — add a Keycloak group per org. |
-| **Realm-per-tenant** | Hard identity isolation; per-org SSO/SAML; regulatory compliance (financial, healthcare). | Expensive — provisioning, BFF rewrite, per-realm OIDC discovery. |
-
-Default is "one realm" until a tenant requirement forces otherwise.
+**Single realm, DB-canonical orgs; realm-per-tenant rejected on evidence** (BFF/bootstrap/downstream-OIDC blast radius mapped in the research doc §A1, cross-realm `sub` collisions re-keying OpenCloud/Gitea identity, realm-count scaling). Keycloak's native **Organizations** feature (not the old org-as-group idea) is the enterprise-SSO vehicle, adopted lazily per customer org: dedicated IdP object + email-domain routing + unmanaged membership, autocreated via admin REST API. Requires Keycloak **≥26.6** (chart currently pins 26.2). Authorization never depends on KC org state — Postgres is the source of truth; the `organization` token claim is not consumed (global-IdP gap #43635; org-picker login UX). Org-deletion flows must handle KC *managed* members (their realm accounts are destroyed with the org) once KC Orgs is in use.
 
 ### M2 readiness gate
 
 - [ ] **M1 fully done** (M2 builds on M1.A's centralized visibility *and* M1.D's quota plumbing)
-- [ ] Organizations schema + helpers (M2.A)
-- [ ] Per-org quota plumbing (extends M1.D, not parallel)
-- [ ] Per-org audit boundary (extends M1.B #4)
-- [ ] Realm decision made + implemented for chosen path (M2.C)
-- [ ] Cross-org membership UX (cockpit switcher + URL prefixing)
+- [ ] Organizations schema + helpers + personal-org backfill (M2.A)
+- [ ] `is_admin` → `platform_operator` + org-role split; break-glass flow with `security_events` session bracketing (Decided shape #3)
+- [ ] Per-org quota plumbing (extends M1.D, not parallel; axes = concurrent jobs + spend rate)
+- [ ] Per-org audit boundary (`security_events.org_id` + `usage_events.organization_id`)
+- [ ] Cross-org membership UX (cockpit switcher + `/o/{org-slug}` URL prefixing)
+- [ ] Billing lands **after** M2.A, wallet keyed on org (see Status note above)
 
 ---
 
