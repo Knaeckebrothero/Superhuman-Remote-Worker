@@ -216,7 +216,8 @@ the orchestrator log for the same `request_id`.
 ## Status
 
 Diagnosed and measured 2026-07-09 (k3d, telemetry-confirmed).
-**Implemented + live-verified same day** (uncommitted). As built:
+**Implemented + live-verified same day**; shipped in `5f8b6047`
+(deployed to dev 2026-07-10). As built:
 
 - Migration `0051_users_cloud_identity.sql` + `schema_current.sql` regen.
 - `Database.get_user_cloud_identity` / `merge_user_cloud_identity`
