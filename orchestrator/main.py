@@ -4513,7 +4513,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         # keeps the golden budget anchor + counters and does
                         # NOT consume a provision attempt — the attempt budget
                         # bounds VM boots, and no boot is happening. See
-                        # docs/issues/
+                        # docs/done/
                         # golden_image_cold_import_fails_inflight_vm_jobs.md.
                         if not vm_ctx.get("golden_wait_started_at"):
                             await postgres_db.merge_vm_context(

@@ -546,7 +546,7 @@ class TestAttemptsExhausted:
     vm_ssh_readiness_probe_unroutable_from_orchestrator.md), so waiting out
     max_attempts × tick (~5 min observed) only delays the force-delete while
     a dead VM holds shared cluster capacity. See
-    docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md §C.
+    docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md §C.
     """
 
     @pytest.mark.asyncio

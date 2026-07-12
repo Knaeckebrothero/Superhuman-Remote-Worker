@@ -54,7 +54,7 @@ VM_PARK_GOLDEN = "park_golden"  # golden import never finished → fail + park
 # Observed cold import on the shared VM cluster: ~30 min — deliberately above
 # both VM_PROVISION_TIMEOUT_S (600) and the controller's VM_GOLDEN_POLL_TIMEOUT
 # (900), which is the misalignment that burned a loop iteration (see
-# docs/issues/golden_image_cold_import_fails_inflight_vm_jobs.md).
+# docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
 DEFAULT_GOLDEN_WAIT_TIMEOUT_S = 2700.0
 
 
