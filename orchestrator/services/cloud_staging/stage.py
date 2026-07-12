@@ -269,7 +269,21 @@ async def _stage_thread_cloud_diff(
 
     staged_summary = row.get("staged_summary")
     if staged_summary and staged_summary.get("signature") == signature:
-        return {"skipped": "unchanged"}
+        # The signature says nothing changed since the last successful
+        # stage, but that's only trustworthy if the manifest blob this
+        # staging depends on is actually still there — it can go missing
+        # (e.g. an out-of-band deletion, or a partial earlier failure that
+        # still recorded staged_summary) without the signature ever
+        # changing. Skipping in that case would leave the review/apply path
+        # reading "staged" against nothing. Fall through to a full re-stage
+        # instead of trusting the skip.
+        if await snapshot_service.get_blob(staging_manifest_key(thread_id)) is not None:
+            return {"skipped": "unchanged"}
+        logger.warning(
+            "stage: thread %s signature unchanged but manifest blob missing — "
+            "re-staging instead of skipping",
+            thread_id,
+        )
 
     tar_path: str | None = None
     manifest_path: str | None = None

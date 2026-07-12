@@ -304,6 +304,12 @@ async def test_raw_new_bytes_returns_exact_member_bytes():
 
 @pytest.mark.asyncio
 async def test_content_binding_mismatch_treats_staging_as_missing():
+    """Post-review hardening (2026-07-12): binding is no longer checked by
+    summary() — a valid manifest always yields a summary now, even when the
+    tar behind it is torn. The protection moves to the tar layer: any read
+    that actually needs new-side bytes (``file()`` on an added/modified
+    entry) still returns ``None`` on a binding mismatch.
+    """
     tar_bytes = _build_tar([("upper/new.txt", b"abc")])
     other_bytes = _build_tar([("upper/new.txt", b"different-content-entirely")])
     entries = [{"path": "new.txt", "status": "added", "size": 3, "binary": False}]
@@ -312,17 +318,89 @@ async def test_content_binding_mismatch_treats_staging_as_missing():
     manifest = _manifest(entries, tar_bytes=other_bytes)
     source = _make_source(tar_bytes=tar_bytes, manifest=manifest)
 
-    assert await source.summary() is None
+    summary = await source.summary()
+    assert summary is not None
+    assert summary.files == [DiffEntrySummary(path="new.txt", status="added", binary=False)]
     assert await source.file("new.txt") is None
+    assert await source.raw_new_bytes("new.txt") is None
+    assert await source.ensure_tar_bound() is False
 
 
 @pytest.mark.asyncio
 async def test_content_binding_absent_key_treats_staging_as_missing():
+    """Same contract shift as above, absent-hash variant."""
     tar_bytes = _build_tar([("upper/new.txt", b"abc")])
     entries = [{"path": "new.txt", "status": "added", "size": 3, "binary": False}]
     manifest = _manifest(entries, tar_bytes=tar_bytes)
     del manifest["tar_sha256"]
     source = _make_source(tar_bytes=tar_bytes, manifest=manifest)
 
-    assert await source.summary() is None
+    summary = await source.summary()
+    assert summary is not None
+    assert summary.files == [DiffEntrySummary(path="new.txt", status="added", binary=False)]
     assert await source.file("new.txt") is None
+    assert await source.raw_new_bytes("new.txt") is None
+    assert await source.ensure_tar_bound() is False
+
+
+# --------------------------------------------------------------------------- #
+# Manifest-only summaries (post-review hardening, 2026-07-12) — summary()
+# must never download/hash the tar; only actual tar touches do.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_summary_does_not_download_tar():
+    tar_bytes = _build_tar([("upper/new.txt", b"hello")])
+    entries = [{"path": "new.txt", "status": "added", "size": 5, "binary": False}]
+    manifest = _manifest(entries, tar_bytes=tar_bytes)
+    source = _make_source(tar_bytes=tar_bytes, manifest=manifest)
+
+    summary = await source.summary()
+
+    assert summary is not None
+    get_blob = source._snapshot_service.get_blob
+    keys_fetched = [c.args[0] for c in get_blob.await_args_list]
+    assert keys_fetched == [staging_manifest_key(THREAD_ID)]  # manifest ONLY, never the tar
+
+
+@pytest.mark.asyncio
+async def test_summary_does_not_download_tar_even_when_called_repeatedly():
+    """summary() is memoized, but even the first call alone must not reach
+    the tar blob — repeated calls must not either (cache, not a fluke)."""
+    tar_bytes = _build_tar([("upper/new.txt", b"hello")])
+    entries = [{"path": "new.txt", "status": "added", "size": 5, "binary": False}]
+    manifest = _manifest(entries, tar_bytes=tar_bytes)
+    source = _make_source(tar_bytes=tar_bytes, manifest=manifest)
+
+    await source.summary()
+    await source.summary()
+    await source.summary()
+
+    get_blob = source._snapshot_service.get_blob
+    assert get_blob.await_count == 1  # manifest fetched once, tar never
+
+
+@pytest.mark.asyncio
+async def test_ensure_tar_bound_true_for_valid_pair():
+    tar_bytes = _build_tar([("upper/new.txt", b"hello")])
+    entries = [{"path": "new.txt", "status": "added", "size": 5, "binary": False}]
+    manifest = _manifest(entries, tar_bytes=tar_bytes)
+    source = _make_source(tar_bytes=tar_bytes, manifest=manifest)
+
+    assert await source.ensure_tar_bound() is True
+    # Cached: a subsequent tar-touching read doesn't re-fetch either blob.
+    get_blob = source._snapshot_service.get_blob
+    call_count_after_bind = get_blob.await_count
+    assert await source.raw_new_bytes("new.txt") == b"hello"
+    assert get_blob.await_count == call_count_after_bind
+
+
+@pytest.mark.asyncio
+async def test_ensure_tar_bound_false_when_tar_blob_missing():
+    entries = [{"path": "new.txt", "status": "added", "size": 5, "binary": False}]
+    manifest = _manifest(entries, tar_bytes=b"whatever-this-hash-is-never-checked-against")
+    # No tar blob uploaded at all.
+    source = _make_source(tar_bytes=None, manifest=manifest)
+
+    assert await source.ensure_tar_bound() is False

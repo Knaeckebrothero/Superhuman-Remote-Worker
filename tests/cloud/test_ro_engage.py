@@ -117,6 +117,9 @@ async def test_engage_persists_and_returns_grant_when_probe_ok():
     )
     db = AsyncMock()
     db.create_ro_mount = AsyncMock(return_value="row-1")
+    db.get_ro_mount_by_thread = AsyncMock(
+        return_value={"id": "row-1", "staged_summary": None}
+    )
 
     grant = await engage_ro_mount(
         backend=backend,
@@ -240,6 +243,9 @@ async def test_engage_captures_and_persists_etag_baseline():
     probe_client = _reader_client(all_rejected=True, read_control=207)
     db = AsyncMock()
     db.create_ro_mount = AsyncMock(return_value="row-1")
+    db.get_ro_mount_by_thread = AsyncMock(
+        return_value={"id": "row-1", "staged_summary": None}
+    )
 
     await engage_ro_mount(
         backend=backend,
@@ -264,6 +270,9 @@ async def test_engage_refuses_when_baseline_capture_fails():
     probe_client = _reader_client(all_rejected=True, read_control=207)
     db = AsyncMock()
     db.create_ro_mount = AsyncMock(return_value="row-1")
+    db.get_ro_mount_by_thread = AsyncMock(
+        return_value={"id": "row-1", "staged_summary": None}
+    )
 
     with pytest.raises(RoEngageRefused):
         await engage_ro_mount(
@@ -297,6 +306,9 @@ async def test_engage_refuses_when_baseline_persist_reports_inactive_row():
     db = AsyncMock()
     db.create_ro_mount = AsyncMock(return_value="row-1")
     db.update_ro_mount_baseline = AsyncMock(return_value=False)
+    db.get_ro_mount_by_thread = AsyncMock(
+        return_value={"id": "row-1", "staged_summary": None}
+    )
 
     with pytest.raises(RoEngageRefused):
         await engage_ro_mount(
@@ -314,6 +326,69 @@ async def test_engage_refuses_when_baseline_persist_reports_inactive_row():
 
 
 @pytest.mark.asyncio
+async def test_reengage_preserves_baseline_under_live_staging():
+    # Post-review hardening: a resume re-engage on a thread whose row
+    # already carries a live staging (staged_summary not None) must NOT
+    # recapture the baseline — the staged diff classifies its entries
+    # against the EXISTING baseline, and a fresh capture here would
+    # silently absorb whatever changed on the cloud since staging into
+    # "the baseline", bypassing the apply conflict gate for those changes.
+    backend = _FakeRoBackend(baseline={"a.txt": "fresh-etag-should-not-be-used"})
+    probe_client = _reader_client(all_rejected=True, read_control=207)
+    db = AsyncMock()
+    db.create_ro_mount = AsyncMock(return_value="row-1")
+    db.get_ro_mount_by_thread = AsyncMock(
+        return_value={
+            "id": "row-1",
+            "staged_summary": {"counts": {"added": 1}, "signature": "sig"},
+        }
+    )
+
+    grant = await engage_ro_mount(
+        backend=backend,
+        handle=_handle(),
+        user_key="abc",
+        thread_id="t1",
+        user_id="u1",
+        postgres_db=db,
+        http_client_factory=lambda creds, reader_id: probe_client,
+    )
+
+    # Engage still succeeds and returns the grant...
+    assert grant.reader_id == "srw-reader-abc"
+    db.create_ro_mount.assert_awaited_once()
+    # ...but the baseline is neither captured nor persisted.
+    db.update_ro_mount_baseline.assert_not_awaited()
+    assert backend.revoked == []  # not a refusal — a normal, successful skip
+
+
+@pytest.mark.asyncio
+async def test_engage_recaptures_baseline_when_no_live_staging():
+    # Sanity counterpart: a row with staged_summary=None (first-time engage,
+    # or after a restage-clear/apply/reject) must still recapture normally —
+    # the skip guard must not become an unconditional skip.
+    backend = _FakeRoBackend(baseline={"a.txt": "e1"})
+    probe_client = _reader_client(all_rejected=True, read_control=207)
+    db = AsyncMock()
+    db.create_ro_mount = AsyncMock(return_value="row-1")
+    db.get_ro_mount_by_thread = AsyncMock(
+        return_value={"id": "row-1", "staged_summary": None}
+    )
+
+    await engage_ro_mount(
+        backend=backend,
+        handle=_handle(),
+        user_key="abc",
+        thread_id="t1",
+        user_id="u1",
+        postgres_db=db,
+        http_client_factory=lambda creds, reader_id: probe_client,
+    )
+
+    db.update_ro_mount_baseline.assert_awaited_once_with("row-1", {"a.txt": "e1"})
+
+
+@pytest.mark.asyncio
 async def test_engage_passes_reader_id_to_client_factory():
     # The fake mints a reader name that CANNOT be re-derived from
     # user_key/user_id ("srw-reader-u1" would collapse the two) — only
@@ -328,6 +403,9 @@ async def test_engage_passes_reader_id_to_client_factory():
 
     db = AsyncMock()
     db.create_ro_mount = AsyncMock(return_value="row-1")
+    db.get_ro_mount_by_thread = AsyncMock(
+        return_value={"id": "row-1", "staged_summary": None}
+    )
 
     grant = await engage_ro_mount(
         backend=backend,

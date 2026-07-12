@@ -74,9 +74,12 @@ async def engage_ro_mount(
     client authenticated AS THE READER (so the probe exercises the reader's
     real rights) — ``reader_id`` is ``grant.reader_id`` itself, never
     re-derived by the caller. On success the ``cloud_ro_mounts`` row is
-    persisted, the etag baseline (design §3.4) is captured and persisted
-    against it, and the grant is returned; on any failure (including a
-    baseline capture/persist failure — without one neither the staged-diff
+    persisted, and — UNLESS this is a resume re-engage on a thread whose row
+    already carries a live staging (``staged_summary`` not ``None``), in
+    which case the prior baseline is preserved as-is (see the capture block
+    below) — the etag baseline (design §3.4) is captured and persisted
+    against it. The grant is returned either way; on any failure (including
+    a baseline capture/persist failure — without one neither the staged-diff
     manifest nor the apply conflict gate can classify writes) the grant is
     revoked — along with the ``cloud_ro_mounts`` row, if it already
     persisted — and ``RoEngageRefused`` is raised.
@@ -141,6 +144,28 @@ async def engage_ro_mount(
         # except below revokes the grant AND (row-aware, since the row has
         # already persisted at this point) marks the row revoked, just like
         # every other refusal in this function (no second cleanup path).
+        #
+        # BUT: this may be a resume re-engage on a thread whose row already
+        # carries a live staging — ``create_ro_mount``'s upsert just replaced
+        # credentials/status in place and left ``etag_baseline``/
+        # ``staged_summary`` untouched. The staged diff classifies its
+        # entries against THAT (prior) baseline; capturing a fresh one here
+        # would silently absorb whatever changed on the cloud folder since
+        # staging into "the baseline", making those changes invisible to the
+        # apply conflict gate instead of surfacing as
+        # ``external_modifications_detected``. So: skip capture+persist
+        # whenever a staging is still live. Only restage (clears staging) or
+        # apply/reject (clears staging too) should ever move the baseline
+        # forward — re-engage must not.
+        existing_row = await postgres_db.get_ro_mount_by_thread(thread_id)
+        if existing_row is not None and existing_row.get("staged_summary") is not None:
+            logger.info(
+                "RO mount re-engage for thread %s: existing staging binds to "
+                "prior baseline — preserving",
+                thread_id,
+            )
+            return grant
+
         try:
             baseline = await backend.capture_etag_baseline(handle)
         except Exception as e:

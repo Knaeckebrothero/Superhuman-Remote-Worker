@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import tarfile
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -222,9 +223,11 @@ class TestApplyGates:
 
     @pytest.mark.asyncio
     async def test_apply_staging_missing_410(self):
-        """Manifest content-binding mismatch (torn multi-replica pair) reads
-        the same as "staging missing" — DB says staged, S3 says otherwise.
-        Apply must write NOTHING to the cloud in this case.
+        """Manifest content-binding mismatch (torn multi-replica pair) is
+        caught by ``ensure_tar_bound()`` (post-review hardening: summary()
+        is manifest-only now, so it no longer fails this way — see
+        ``TestApplyTornTar`` below for the ordering-sensitive version of
+        this). Apply must write NOTHING to the cloud in this case.
         """
         tar_bytes = _build_tar([("upper/new.txt", b"hello")])
         other_bytes = _build_tar([("upper/new.txt", b"different-content-entirely")])
@@ -254,6 +257,48 @@ class TestApplyGates:
 
         assert ei.value.status_code == 410
         assert ei.value.detail == {"code": "staging_missing"}
+        assert _write_ops(backend) == []
+        db.update_ro_mount_staging.assert_not_awaited()
+        db.update_ro_mount_baseline.assert_not_awaited()
+        svc.delete_blob.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_manifest_epoch_mismatch_409(self):
+        """The manifest's own recorded ``epoch`` must match the DB row's
+        ``staged_epoch`` even after the DB-row epoch pin already passed —
+        this is the TOCTOU close: a concurrent turn-end stage can overwrite
+        the S3 manifest/tar pair (and bump the row) in the gap between the
+        DB read and the S3 read. Manifest epoch N+1 vs row epoch N -> 409,
+        NOTHING written.
+        """
+        tar_bytes = _build_tar([("upper/new.txt", b"hello")])
+        entries = [{"path": "new.txt", "status": "added", "size": 5, "binary": False}]
+        # Manifest claims epoch 6, but the row (as apply read it) is still
+        # pinned at 5 — as if a concurrent restage landed between apply's DB
+        # read and its S3 read.
+        manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=6)
+        row = _mount_row(epoch=5)
+        backend, native_id = await _seeded_backend()
+        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        svc = _snapshot_service(
+            {
+                staging_tar_key(THREAD_ID): tar_bytes,
+                staging_manifest_key(THREAD_ID): json.dumps(manifest).encode(),
+            }
+        )
+
+        with pytest.raises(StagedApplyError) as ei:
+            await apply_staged_diff(
+                thread_id=THREAD_ID,
+                epoch=5,
+                postgres_db=db,
+                main_cloud_router=_cloud_router(backend),
+                snapshot_service=svc,
+                reset_agent_overlay=AsyncMock(return_value=True),
+            )
+
+        assert ei.value.status_code == 409
+        assert ei.value.detail == {"code": "epoch_stale", "staged_epoch": 5}
         assert _write_ops(backend) == []
         db.update_ro_mount_staging.assert_not_awaited()
         db.update_ro_mount_baseline.assert_not_awaited()
@@ -369,6 +414,62 @@ class TestApplyConflictGate:
 
         assert result["errors"] == []
         assert result["applied"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Torn tar (content-binding failure) — must be caught BEFORE any write
+# --------------------------------------------------------------------------- #
+
+
+class TestApplyTornTar:
+    @pytest.mark.asyncio
+    async def test_torn_tar_apply_writes_nothing(self):
+        """A torn multi-replica manifest/tar pair must be caught by
+        ``ensure_tar_bound()`` before the delete loop even starts — deletes
+        run first (whiteout-before-create), so if the torn-tar probe ran
+        late (e.g. only inside the create loop, discovered per-file via
+        ``raw_new_bytes``), a torn staging could still delete real cloud
+        files before failing. This manifest mixes a delete AND a create so
+        BOTH loops are proven to never have started: zero backend ops.
+        """
+        tar_bytes = _build_tar([("upper/new.txt", b"hello")])
+        other_bytes = _build_tar([("upper/new.txt", b"different-content-entirely")])
+        entries = [
+            {"path": "old.txt", "status": "deleted", "size": 0, "binary": False},
+            {"path": "new.txt", "status": "added", "size": 5, "binary": False},
+        ]
+        # Manifest describes `other_bytes`, but the tar blob at the
+        # deterministic key is `tar_bytes` — a torn pair.
+        manifest = _manifest(entries, tar_bytes=other_bytes, epoch=5)
+        # A live file matching the baseline so the conflict gate passes
+        # cleanly and execution actually reaches the ensure_tar_bound() gate.
+        row = _mount_row(epoch=5, etag_baseline={"old.txt": ""})
+        backend, native_id = await _seeded_backend({"old.txt": b"still here"})
+        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        svc = _snapshot_service(
+            {
+                staging_tar_key(THREAD_ID): tar_bytes,
+                staging_manifest_key(THREAD_ID): json.dumps(manifest).encode(),
+            }
+        )
+
+        with pytest.raises(StagedApplyError) as ei:
+            await apply_staged_diff(
+                thread_id=THREAD_ID,
+                epoch=5,
+                postgres_db=db,
+                main_cloud_router=_cloud_router(backend),
+                snapshot_service=svc,
+                reset_agent_overlay=AsyncMock(return_value=True),
+            )
+
+        assert ei.value.status_code == 410
+        assert ei.value.detail == {"code": "staging_missing"}
+        # Zero backend ops: neither the delete nor the create ran.
+        assert _write_ops(backend) == []
+        db.update_ro_mount_staging.assert_not_awaited()
+        db.update_ro_mount_baseline.assert_not_awaited()
+        svc.delete_blob.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------- #
@@ -585,8 +686,9 @@ class TestApplySuccess:
 
         backend.capture_etag_baseline = _capture
 
-        async def _update_baseline(row_id, baseline):
+        async def _update_baseline(row_id, baseline, *, require_active=True):
             call_order.append("update_baseline")
+            assert require_active is False  # bookkeeping must tolerate a revoked row
             return True
 
         db.update_ro_mount_baseline = AsyncMock(side_effect=_update_baseline)
@@ -597,8 +699,11 @@ class TestApplySuccess:
 
         svc.delete_blob = AsyncMock(side_effect=_delete_blob)
 
-        async def _update_staging(row_id, *, staged_epoch, staged_summary):
+        async def _update_staging(
+            row_id, *, staged_epoch, staged_summary, require_active=True
+        ):
             call_order.append("update_staging")
+            assert require_active is False
             return True
 
         db.update_ro_mount_staging = AsyncMock(side_effect=_update_staging)
@@ -658,7 +763,7 @@ class TestApplySuccess:
         assert result["overlay_reset"] is False
         # Staging still clears even though the overlay reset failed.
         db.update_ro_mount_staging.assert_awaited_once_with(
-            row["id"], staged_epoch=6, staged_summary=None
+            row["id"], staged_epoch=6, staged_summary=None, require_active=False
         )
 
 
@@ -691,7 +796,7 @@ class TestReject:
         svc.delete_blob.assert_any_await(staging_tar_key(THREAD_ID))
         svc.delete_blob.assert_any_await(staging_manifest_key(THREAD_ID))
         db.update_ro_mount_staging.assert_awaited_once_with(
-            row["id"], staged_epoch=6, staged_summary=None
+            row["id"], staged_epoch=6, staged_summary=None, require_active=False
         )
         db.update_ro_mount_baseline.assert_not_awaited()
         # Reject never resolves a mount/backend at all.
@@ -733,6 +838,126 @@ class TestReject:
 
         assert ei.value.status_code == 409
         assert ei.value.detail == {"code": "nothing_staged"}
+
+
+# --------------------------------------------------------------------------- #
+# Bookkeeping on a revoked row (idle-drain reconciler can revoke a
+# cloud_ro_mounts row within ~15min regardless of a pending review; reads
+# already tolerate a revoked row — Task 8 — writes must too)
+# --------------------------------------------------------------------------- #
+
+
+class _RevokedAwareDB:
+    """Minimal fake modeling the real SQL's ``WHERE id=$1 [AND
+    status='active']`` gate — a plain ``AsyncMock(return_value=True)``
+    couldn't distinguish "require_active reached the query and mattered"
+    from "require_active was silently ignored". Mutates an in-memory row so
+    the test can assert the UPDATE actually took effect.
+    """
+
+    def __init__(self, *, mount_row: dict, thread_mounts: list[dict]):
+        self._row = dict(mount_row)
+        self._thread_mounts = thread_mounts
+        self.baseline_calls: list[tuple[str, dict, bool]] = []
+        self.staging_calls: list[dict[str, Any]] = []
+
+    async def get_ro_mount_by_thread(self, thread_id):
+        return dict(self._row)
+
+    async def list_thread_mounts(self, thread_id):
+        return self._thread_mounts
+
+    async def update_ro_mount_baseline(self, row_id, baseline, *, require_active=True):
+        self.baseline_calls.append((row_id, baseline, require_active))
+        if require_active and self._row.get("status") != "active":
+            return False
+        self._row["etag_baseline"] = baseline
+        return True
+
+    async def update_ro_mount_staging(
+        self, row_id, *, staged_epoch, staged_summary, require_active=True
+    ):
+        self.staging_calls.append(
+            {
+                "staged_epoch": staged_epoch,
+                "staged_summary": staged_summary,
+                "require_active": require_active,
+            }
+        )
+        if require_active and self._row.get("status") != "active":
+            return False
+        self._row["staged_epoch"] = staged_epoch
+        self._row["staged_summary"] = staged_summary
+        return True
+
+
+class TestRevokedRowBookkeeping:
+    @pytest.mark.asyncio
+    async def test_apply_and_reject_bookkeeping_on_revoked_row(self):
+        # --- apply on a revoked row ---
+        tar_bytes = _build_tar([("upper/new.txt", b"hello")])
+        entries = [{"path": "new.txt", "status": "added", "size": 5, "binary": False}]
+        manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
+        backend, native_id = await _seeded_backend()
+        row = _mount_row(epoch=5, etag_baseline={})
+        row["status"] = "revoked"
+        db = _RevokedAwareDB(
+            mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)]
+        )
+        svc = _snapshot_service(
+            {
+                staging_tar_key(THREAD_ID): tar_bytes,
+                staging_manifest_key(THREAD_ID): json.dumps(manifest).encode(),
+            }
+        )
+
+        result = await apply_staged_diff(
+            thread_id=THREAD_ID,
+            epoch=5,
+            postgres_db=db,
+            main_cloud_router=_cloud_router(backend),
+            snapshot_service=svc,
+            reset_agent_overlay=AsyncMock(return_value=True),
+        )
+
+        assert result["errors"] == []
+        assert result["epoch"] == 6
+        # The write itself succeeded (revoked row never blocked reads/writes
+        # to the cloud folder — only the bookkeeping gate is at issue here).
+        assert result["applied"] == 1
+        # Bookkeeping calls were made with require_active=False...
+        assert db.baseline_calls[-1][2] is False
+        assert db.staging_calls[-1]["require_active"] is False
+        # ...and actually took effect on the revoked row (the fake's
+        # require_active=True branch would have returned False and left
+        # these untouched).
+        assert db._row["etag_baseline"] == {"new.txt": ""}
+        assert db._row["staged_summary"] is None
+        assert db._row["staged_epoch"] == 6
+
+        # --- reject on a (separate) revoked row ---
+        row2 = _mount_row(epoch=9)
+        row2["status"] = "revoked"
+        db2 = _RevokedAwareDB(mount_row=row2, thread_mounts=[])
+        svc2 = _snapshot_service(
+            {
+                staging_tar_key(THREAD_ID): b"tar-bytes",
+                staging_manifest_key(THREAD_ID): b"{}",
+            }
+        )
+
+        reject_result = await reject_staged_diff(
+            thread_id=THREAD_ID,
+            epoch=9,
+            postgres_db=db2,
+            snapshot_service=svc2,
+            reset_agent_overlay=AsyncMock(return_value=True),
+        )
+
+        assert reject_result == {"rejected": True, "epoch": 10, "overlay_reset": True}
+        assert db2.staging_calls[-1]["require_active"] is False
+        assert db2._row["staged_summary"] is None
+        assert db2._row["staged_epoch"] == 10
 
 
 # --------------------------------------------------------------------------- #
