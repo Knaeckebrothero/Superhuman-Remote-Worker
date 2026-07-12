@@ -76,13 +76,15 @@ async def engage_ro_mount(
     re-derived by the caller. On success the ``cloud_ro_mounts`` row is
     persisted, the etag baseline (design §3.4) is captured and persisted
     against it, and the grant is returned; on any failure (including a
-    baseline capture failure — without one neither the staged-diff manifest
-    nor the apply conflict gate can classify writes) the grant is revoked and
-    ``RoEngageRefused`` is raised.
+    baseline capture/persist failure — without one neither the staged-diff
+    manifest nor the apply conflict gate can classify writes) the grant is
+    revoked — along with the ``cloud_ro_mounts`` row, if it already
+    persisted — and ``RoEngageRefused`` is raised.
     """
     await backend.ensure_ro_reader(user_key=user_key)
     grant = await backend.mint_ro_grant(handle, user_key=user_key, grant_key=thread_id)
     canary = None
+    row_id: str | None = None  # set once persisted, so the rollback is row-aware
     try:
         canary = await backend.seed_canary_fixture(handle)
         # Probe AS THE READER using its freshly minted credential.
@@ -136,21 +138,38 @@ async def engage_ro_mount(
         # Etag baseline (design §3.4): without it neither the staged-diff
         # manifest nor the apply conflict gate can classify writes, so a
         # capture failure here is itself an engage refusal — the outer
-        # except below revokes the grant just like every other refusal in
-        # this function (no second cleanup path).
+        # except below revokes the grant AND (row-aware, since the row has
+        # already persisted at this point) marks the row revoked, just like
+        # every other refusal in this function (no second cleanup path).
         try:
             baseline = await backend.capture_etag_baseline(handle)
         except Exception as e:
             raise RoEngageRefused(f"etag baseline capture failed: {e}") from e
-        await postgres_db.update_ro_mount_baseline(row_id, baseline)
+        if not await postgres_db.update_ro_mount_baseline(row_id, baseline):
+            # False = the row is no longer active (e.g. the reconciler
+            # revoked it mid-engage) — the baseline did NOT persist, so
+            # engage must not report success.
+            raise RoEngageRefused(
+                "etag baseline persist failed: cloud_ro_mounts row no longer active"
+            )
 
         return grant
     except Exception:
-        # Fail closed: roll the grant back so no partial RO access lingers.
+        # Fail closed: roll the grant back so no partial RO access lingers —
+        # and if the row already persisted (baseline-stage refusals fire
+        # after create_ro_mount), mark it revoked too, so no status='active'
+        # row with dead credentials and a NULL baseline survives.
         try:
             await backend.revoke_ro_grant(grant.grant_handle, user_key=user_key)
         except Exception:  # pragma: no cover - best effort
             logger.exception("failed to revoke RO grant during engage rollback")
+        if row_id is not None:
+            try:
+                await postgres_db.mark_ro_mount_revoked(row_id)
+            except Exception:  # pragma: no cover - best effort
+                logger.exception(
+                    "failed to mark RO mount row revoked during engage rollback"
+                )
         raise
     finally:
         if canary is not None:
