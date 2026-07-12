@@ -259,6 +259,39 @@ class TestApplyGates:
         db.update_ro_mount_baseline.assert_not_awaited()
         svc.delete_blob.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_apply_no_protected_mount_409(self):
+        """Mount rows exist but none is the protected one (no
+        nextcloud+cloud_handle row) — 409 before any backend/S3 touch."""
+        row = _mount_row(epoch=5)
+        # Neither row satisfies select_protected_mount: wrong backend_id, or
+        # a nextcloud row with no cloud_handle.
+        db = _db(
+            mount_row=row,
+            thread_mounts=[
+                {"backend_id": "gitea", "cloud_handle": "x", "target_path": "/a"},
+                {"backend_id": "nextcloud", "cloud_handle": None, "target_path": "/b"},
+            ],
+        )
+        svc = _snapshot_service()
+        router = _cloud_router(FakeMainCloudBackend())
+
+        with pytest.raises(StagedApplyError) as ei:
+            await apply_staged_diff(
+                thread_id=THREAD_ID,
+                epoch=5,
+                postgres_db=db,
+                main_cloud_router=router,
+                snapshot_service=svc,
+                reset_agent_overlay=AsyncMock(return_value=True),
+            )
+
+        assert ei.value.status_code == 409
+        assert ei.value.detail == {"code": "no_protected_mount"}
+        router.for_backend.assert_not_called()
+        svc.get_blob.assert_not_awaited()
+        db.update_ro_mount_staging.assert_not_awaited()
+
 
 # --------------------------------------------------------------------------- #
 # Conflict gate — hard 409, no force flag, scoped to touched paths
@@ -424,6 +457,93 @@ class TestApplyWrites:
         assert "epoch" not in result
         assert "overlay_reset" not in result
         # Staging state must be completely untouched — retry is safe.
+        db.update_ro_mount_staging.assert_not_awaited()
+        db.update_ro_mount_baseline.assert_not_awaited()
+        svc.delete_blob.assert_not_awaited()
+        reset_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_modified_entry_overwrites_cloud_bytes(self):
+        """A ``modified`` entry PUTs the staged tar bytes over the existing
+        cloud file — WebDAV overwrite semantics, byte-true."""
+        new_bytes = b"\x89PNG\x00new-binary-content"  # byte-true, not text
+        tar_bytes = _build_tar([("upper/mod.bin", new_bytes)])
+        entries = [
+            {"path": "mod.bin", "status": "modified", "size": len(new_bytes), "binary": True}
+        ]
+        manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
+        backend, native_id = await _seeded_backend({"mod.bin": b"old-content"})
+        row = _mount_row(epoch=5, etag_baseline={"mod.bin": ""})
+        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        svc = _snapshot_service(
+            {
+                staging_tar_key(THREAD_ID): tar_bytes,
+                staging_manifest_key(THREAD_ID): json.dumps(manifest).encode(),
+            }
+        )
+
+        result = await apply_staged_diff(
+            thread_id=THREAD_ID,
+            epoch=5,
+            postgres_db=db,
+            main_cloud_router=_cloud_router(backend),
+            snapshot_service=svc,
+            reset_agent_overlay=AsyncMock(return_value=True),
+        )
+
+        assert result["errors"] == []
+        assert result["applied"] == 1
+        assert result["deleted"] == 0
+        # The write went through put_project_folder_file_bytes...
+        put_ops = [c for c in _write_ops(backend) if c[0] == "put_project_folder_file_bytes"]
+        assert [args[1] for _op, args, _kw in put_ops] == ["mod.bin"]
+        # ...and the stored bytes are the exact staged bytes (old overwritten).
+        stored = await backend.get_project_folder_file_bytes(
+            ProjectFolderHandle(backend=backend.backend_id, native_id=native_id),
+            path="mod.bin",
+        )
+        assert stored == new_bytes
+
+    @pytest.mark.asyncio
+    async def test_apply_missing_tar_member_collected_walk_continues(self):
+        """A manifest entry whose path has NO tar member (binding still valid:
+        the hash covers the actual tar) -> per-file error collected, the walk
+        continues to other entries, and the partial-failure contract holds
+        (staging untouched)."""
+        tar_bytes = _build_tar([("upper/present.txt", b"here")])
+        entries = [
+            # Not in the tar — raw_new_bytes() returns None for it.
+            {"path": "absent.txt", "status": "added", "size": 4, "binary": False},
+            {"path": "present.txt", "status": "added", "size": 4, "binary": False},
+        ]
+        manifest = _manifest(entries, tar_bytes=tar_bytes, epoch=5)
+        backend, native_id = await _seeded_backend()
+        row = _mount_row(epoch=5, etag_baseline={})
+        db = _db(mount_row=row, thread_mounts=[_thread_mounts_row(cloud_handle=native_id)])
+        svc = _snapshot_service(
+            {
+                staging_tar_key(THREAD_ID): tar_bytes,
+                staging_manifest_key(THREAD_ID): json.dumps(manifest).encode(),
+            }
+        )
+        reset_mock = AsyncMock(return_value=True)
+
+        result = await apply_staged_diff(
+            thread_id=THREAD_ID,
+            epoch=5,
+            postgres_db=db,
+            main_cloud_router=_cloud_router(backend),
+            snapshot_service=svc,
+            reset_agent_overlay=reset_mock,
+        )
+
+        # Walk continued past the missing member: the present file landed.
+        assert result["applied"] == 1
+        assert result["errors"] == ["absent.txt: staged content missing from upperdir tar"]
+        put_ops = [c for c in _write_ops(backend) if c[0] == "put_project_folder_file_bytes"]
+        assert [args[1] for _op, args, _kw in put_ops] == ["present.txt"]
+        # Partial contract: staging state untouched, no finalization steps ran.
+        assert "epoch" not in result
         db.update_ro_mount_staging.assert_not_awaited()
         db.update_ro_mount_baseline.assert_not_awaited()
         svc.delete_blob.assert_not_awaited()

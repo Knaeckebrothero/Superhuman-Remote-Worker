@@ -156,6 +156,39 @@ class TestApplyEndpoint:
             assert kwargs["epoch"] == -1
 
     @pytest.mark.asyncio
+    async def test_apply_malformed_epoch_422(self, fake_request):
+        """Non-coercible epoch in the body -> 422 invalid_epoch, engine never
+        called (was an unhandled ValueError -> 500 before the polish pass)."""
+        user = _make_user()
+        thread = _make_thread()
+        engine_mock = AsyncMock()
+        stack, db = _patch_endpoint(user=user, thread=thread)
+        with stack, patch(
+            "services.cloud_staging.apply.apply_staged_diff", engine_mock
+        ):
+            with pytest.raises(HTTPException) as ei:
+                await main.apply_thread_cloud_diff(
+                    fake_request, THREAD_ID, {"epoch": "not-a-number"}
+                )
+            engine_mock.assert_not_awaited()
+        assert ei.value.status_code == 422
+        assert ei.value.detail == {"code": "invalid_epoch"}
+
+        # reject mirrors the same guard (None -> TypeError branch).
+        reject_mock = AsyncMock()
+        stack2, _db2 = _patch_endpoint(user=user, thread=thread)
+        with stack2, patch(
+            "services.cloud_staging.apply.reject_staged_diff", reject_mock
+        ):
+            with pytest.raises(HTTPException) as ei2:
+                await main.reject_thread_cloud_diff(
+                    fake_request, THREAD_ID, {"epoch": None}
+                )
+            reject_mock.assert_not_awaited()
+        assert ei2.value.status_code == 422
+        assert ei2.value.detail == {"code": "invalid_epoch"}
+
+    @pytest.mark.asyncio
     async def test_apply_staged_error_maps_to_http(self, fake_request):
         user = _make_user()
         thread = _make_thread()
