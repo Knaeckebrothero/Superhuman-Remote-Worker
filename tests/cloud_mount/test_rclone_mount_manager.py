@@ -101,6 +101,40 @@ def test_starts_rclone_mount_and_installs_workspace_symlink():
     assert "${workspace}/cloud" in link_scripts[0]
 
 
+def test_config_create_shields_credential_that_looks_like_a_flag():
+    """Regression: a reader credential that begins with ``-`` must not be
+    parsed by rclone (cobra) as a flag. ``config create`` puts its flags
+    before a POSIX ``--`` end-of-options marker, after which every token is a
+    positional ``key value`` pair — so a ``-``-leading ``pass`` is safe.
+
+    Without the marker rclone aborts with "unknown shorthand flag" and the
+    whole mount fails (observed live: reader credential ``-Yi9OE…``)."""
+    dash_pass = "-Yi9OE14rYnaHKdUk7EkBtnjT1-LPw8A"
+    cfg = _cloud_mount_cfg()
+    cfg["mounts"][0]["auth"]["password"] = dash_pass
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+
+    manager._start_all_sync()
+
+    script = next(
+        body
+        for path, body in backend.files.items()
+        if path.endswith("mount_srw-thread-1-home.sh")
+    )
+    create_line = next(ln for ln in script.splitlines() if "config create" in ln)
+    # Flags precede the end-of-options marker; the credential follows it.
+    i_obscure = create_line.index("--obscure")
+    i_sep = create_line.index(" -- ")
+    i_pass = create_line.index(dash_pass)
+    assert i_obscure < i_sep < i_pass, create_line
+
+
 def test_cache_flags_are_gated_by_rclone_mount_help():
     cfg = _cloud_mount_cfg()
     cfg["mounts"][0]["cache"]["vfs_cache_min_free_space"] = "5G"
