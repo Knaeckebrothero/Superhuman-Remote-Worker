@@ -5230,6 +5230,14 @@ class DatasourceCreate(BaseModel):
     is_global: bool = Field(
         False, description="Whether this datasource is visible to all users"
     )
+    read_only: bool | None = Field(
+        None,
+        description=(
+            "Declared read-only flag for public datasources (defaults to true "
+            "on publish; kb is always read-only). Declarative — credentials "
+            "are the enforcement boundary."
+        ),
+    )
 
 
 class DatasourceUpdate(BaseModel):
@@ -15164,6 +15172,28 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
     user = await require_approved_user(request, postgres_db)
     user_id = str(user["id"])
 
+    # Publish gate — is_global hands the publisher's stored credentials to
+    # every user's agents (docs/features/public_datasources.md).
+    if body.is_global and not await postgres_db.user_can_publish_datasource(user):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Publishing public datasources requires the "
+                "'public_datasources' capability"
+            ),
+        )
+    read_only = body.read_only
+    if body.type == "kb":
+        if read_only is False:
+            raise HTTPException(
+                status_code=400,
+                detail="Knowledge-base datasources are always read-only",
+            )
+        if body.is_global:
+            read_only = True
+    elif body.is_global and read_only is None:
+        read_only = True  # invariant: public ⇒ read_only set (RO default)
+
     connection_url = body.connection_url
     if body.type == "kb":
         connection_url = _validate_kb_repository_url(connection_url)
@@ -15197,6 +15227,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
             config=datasource_config,
             created_by=user_id,
             is_global=body.is_global,
+            read_only=read_only,
         )
     except HTTPException:
         raise
