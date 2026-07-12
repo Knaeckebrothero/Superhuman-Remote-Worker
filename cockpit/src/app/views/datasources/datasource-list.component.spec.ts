@@ -5,6 +5,7 @@ import {describe, expect, it, vi} from 'vitest';
 
 import {Datasource, DatasourceIndexStatus} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {DatasourceListComponent} from './datasource-list.component';
@@ -54,6 +55,10 @@ function createComponent() {
       },
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
       {provide: UserService, useValue: {currentUser}},
+      {
+        provide: CapabilitiesService,
+        useValue: {canPublishDatasources: () => true},
+      },
     ],
   });
   const component = runInInjectionContext(
@@ -75,6 +80,8 @@ describe('DatasourceListComponent OKF Knowledge Base support', () => {
       cli_hint: '',
       default_branch: 'main',
       root_path: 'vault',
+      is_global: false,
+      read_only: true,
     };
     component.gitAuthMethod = 'token';
     component.formCredentials.password = 'secret-token';
@@ -159,5 +166,122 @@ describe('DatasourceListComponent OKF Knowledge Base support', () => {
     expect(component.canManage(ds)).toBe(false);
     currentUser.set({id: 'admin', is_admin: true});
     expect(component.canManage(ds)).toBe(true);
+  });
+});
+
+describe('DatasourceListComponent publish confirmation tiers', () => {
+  it('needs no confirmation for a private save', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Mine';
+    expect(component.publishConfirmTier()).toBeNull();
+  });
+
+  it('warns on a read-only publish (create)', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Org Wiki';
+    component.formData.is_global = true;
+    expect(component.publishConfirmTier()).toBe('warn');
+  });
+
+  it('requires the typed name on a read-write publish (create)', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Org Wiki';
+    component.formData.is_global = true;
+    component.formData.read_only = false;
+    expect(component.publishConfirmTier()).toBe('name');
+  });
+
+  it('requires the typed name on a public RO→RW flip (edit)', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({...ds, is_global: true, read_only: true});
+    component.formData.read_only = false;
+    // kb locks to read-only; use a repository-shaped edit for the flip.
+    component.formData.type = 'repository';
+    expect(component.publishConfirmTier()).toBe('name');
+  });
+
+  it('needs no confirmation for unpublish or RW→RO', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      is_global: true,
+      read_only: false,
+    });
+    component.formData.is_global = false;
+    expect(component.publishConfirmTier()).toBeNull();
+
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      is_global: true,
+      read_only: false,
+    });
+    component.formData.read_only = true;
+    expect(component.publishConfirmTier()).toBeNull();
+  });
+
+  it('stays silent when an already-public RW datasource is edited unchanged', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      is_global: true,
+      read_only: false,
+    });
+    expect(component.publishConfirmTier()).toBeNull();
+  });
+
+  it('sends is_global and read_only in the create payload', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Org Wiki';
+    component.formData.type = 'repository';
+    component.formData.is_global = true;
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'tok';
+    component.doSave();
+    const payload = api.createDatasource.mock.calls[0][0];
+    expect(payload.is_global).toBe(true);
+    expect(payload.read_only).toBe(true);
+  });
+
+  it('forces read_only=true for kb in the payload', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Org KB';
+    component.formData.type = 'kb';
+    component.formData.is_global = true;
+    component.formData.read_only = false; // UI forbids this; belt-and-braces
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].read_only).toBe(true);
+  });
+
+  it('openEditForm seeds visibility from the datasource', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({...ds, is_global: true, read_only: false});
+    expect(component.formData.is_global).toBe(true);
+    expect(component.formData.read_only).toBe(false);
+  });
+
+  it('saveForm defers to the dialog when confirmation is needed', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Org Wiki';
+    component.formData.type = 'repository';
+    component.formData.is_global = true;
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'tok';
+
+    component.saveForm();
+    expect(api.createDatasource).not.toHaveBeenCalled();
+    expect(component.showPublishConfirm()).toBe(true);
+    expect(component.publishConfirmName()).toBeNull(); // warn tier
+
+    component.onPublishConfirmed();
+    expect(api.createDatasource).toHaveBeenCalledOnce();
   });
 });
