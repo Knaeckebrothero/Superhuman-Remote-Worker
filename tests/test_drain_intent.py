@@ -585,6 +585,229 @@ class TestVersionUpgradeFreeze:
         assert status == "failed"
 
 
+class TestCoincidentInfraErrorOverride:
+    """A coincident infra/teardown error must not override a reported outcome.
+
+    docs/issues/coincident_infra_error_overrides_reported_job_outcome.md
+    Slice C (top-level completion masked by a post-completion teardown blip) and
+    Slice B (drained subjob mis-routed to pending_review instead of re-dispatch).
+    """
+
+    # Verification disabled + non-loop → the completion branch resolves cleanly
+    # without touching the disk-config fallback.
+    _NO_VERIFY = {"agent": {"verification": {"enabled": False}}}
+
+    # Verbatim error strings from the 2026-07-12 incidents.
+    _SSH_TIMEOUT = (
+        "Failed to connect to workspace 100.64.24.193:22 after 2 attempt(s) "
+        "[timeout]: timed out"
+    )
+    _WS_IO_TIMEOUT = "Workspace I/O timed out stat /home/agent-host/workspace/plan.md"
+
+    # --- Phase 1: the teardown-error classifier ---
+
+    def test_classifier_matches_incident_strings(self):
+        from orchestrator.services.completion import is_teardown_infra_error
+
+        assert is_teardown_infra_error(self._SSH_TIMEOUT)
+        assert is_teardown_infra_error(self._WS_IO_TIMEOUT)
+        assert is_teardown_infra_error(
+            "SSH command failed on 100.64.23.198: Key-exchange timed out "
+            "waiting for key negotiation"
+        )
+        assert is_teardown_infra_error(
+            "Failed to connect to workspace x:30022 after 1 attempt(s) [gone]: "
+            "[Errno -2] Name or service not known"
+        )
+
+    def test_classifier_rejects_genuine_errors_and_empty(self):
+        from orchestrator.services.completion import is_teardown_infra_error
+
+        assert not is_teardown_infra_error("AssertionError: expected 3 got 4")
+        assert not is_teardown_infra_error("KeyError: 'sh,py,md'")
+        assert not is_teardown_infra_error(None)
+        assert not is_teardown_infra_error("")
+
+    # --- Slice C: completion + teardown error → completed, not failed ---
+
+    def test_completion_with_teardown_error_completes(self):
+        # e15fab1f: 1445 audits, job_completed, then an SSH timeout to the reaped
+        # VM during teardown. The completion must win over the teardown blip.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {
+            "id": "e15fab1f",
+            "parent_job_id": None,
+            "resolved_config": self._NO_VERIFY,
+        }
+        result = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": {"message": self._SSH_TIMEOUT},
+            "freeze_data": {"status": "job_completed"},
+        }
+        status, err = determine_job_status(job, result)
+        assert status == "completed"
+        assert err is None
+
+    def test_job_completed_freeze_with_ws_io_timeout_not_failed(self):
+        # 57be4c22 shape: freeze status=job_completed (no goal_achieved flag) + a
+        # workspace I/O timeout. The completion branch owns it — never failed.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {
+            "id": "57be4c22",
+            "parent_job_id": None,
+            "resolved_config": self._NO_VERIFY,
+        }
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"message": self._WS_IO_TIMEOUT},
+            "freeze_data": {"status": "job_completed"},
+        }
+        status, err = determine_job_status(job, result)
+        assert status != "failed"
+        assert err is None
+
+    def test_loop_completion_with_teardown_error_completes(self):
+        # The real e15fab1f/57be4c22 case is a loop job → completed so the loop
+        # advances instead of counting a phantom failure.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {
+            "id": "loopjob",
+            "parent_job_id": None,
+            "resolved_config": self._NO_VERIFY,
+            "context": {"loop_id": "loop-1"},
+        }
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"message": self._WS_IO_TIMEOUT},
+            "freeze_data": {"status": "job_completed"},
+        }
+        status, err = determine_job_status(job, result)
+        assert status == "completed"
+        assert err is None
+
+    def test_completion_with_non_teardown_error_still_fails(self):
+        # A genuine mid-run crash riding a completion report is NOT masked — only
+        # teardown-class errors are spared.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "j", "parent_job_id": None, "resolved_config": self._NO_VERIFY}
+        result = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "error": {"message": "AssertionError: bad final state"},
+            "freeze_data": {"status": "job_completed"},
+        }
+        status, msg = determine_job_status(job, result)
+        assert status == "failed"
+        assert msg == "AssertionError: bad final state"
+
+    def test_teardown_error_without_completion_still_fails(self):
+        # A workspace timeout MID-RUN (no completion declared) still fails — the
+        # carve-out requires the agent to have reported a completion.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "j", "parent_job_id": None}
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"message": self._SSH_TIMEOUT},
+        }
+        status, msg = determine_job_status(job, result)
+        assert status == "failed"
+        assert msg == self._SSH_TIMEOUT
+
+    # --- Slice B: drained subjob → re-dispatch, not pending_review ---
+
+    def test_drained_subjob_pauses_for_redispatch(self):
+        # da9d5917 with a live parent: version_upgrade drain freeze, no fd.status,
+        # not goal_achieved → paused for re-dispatch (was pending_review).
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "da9d5917", "parent_job_id": "73e68890"}
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "freeze_data": {
+                "freeze_type": "version_upgrade",
+                "reason": "orchestrator drain intent at phase boundary",
+            },
+        }
+        status, err = determine_job_status(job, result, parent_status="processing")
+        assert status == "paused"
+        assert err is None
+
+    def test_drained_subjob_under_failed_parent_resolves_terminal(self):
+        # The exact da9d5917 case: parent 73e68890 FAILED. Pausing would wedge
+        # (the cascade guard never re-dispatches under a failed parent) → cancel.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "da9d5917", "parent_job_id": "73e68890"}
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "freeze_data": {"freeze_type": "version_upgrade"},
+        }
+        status, _ = determine_job_status(job, result, parent_status="failed")
+        assert status == "cancelled"
+
+    def test_drained_subjob_under_paused_parent_still_pauses(self):
+        # A paused parent is TEMPORARY — it resumes and the subjob re-dispatches.
+        # Only permanent terminals (failed/cancelled) wedge, so pause here.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "s", "parent_job_id": "p"}
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "freeze_data": {"freeze_type": "version_upgrade"},
+        }
+        status, _ = determine_job_status(job, result, parent_status="paused")
+        assert status == "paused"
+
+    def test_drained_subjob_goal_achieved_under_dead_parent_completes(self):
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "s", "parent_job_id": "p"}
+        result = {
+            "should_stop": True,
+            "goal_achieved": True,
+            "freeze_data": {"freeze_type": "version_upgrade"},
+        }
+        status, _ = determine_job_status(job, result, parent_status="cancelled")
+        assert status == "completed"
+
+    def test_subjob_non_drain_stop_unchanged(self):
+        # A subjob that stops with no fd.status and NO drain freeze keeps the old
+        # visible pending_review fallback (outage freezes deferred, etc.).
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "s", "parent_job_id": "p"}
+        result = {"should_stop": True, "goal_achieved": False, "freeze_data": {}}
+        status, _ = determine_job_status(job, result, parent_status="processing")
+        assert status == "pending_review"
+
+    def test_critic_status_routing_unchanged(self):
+        # Regression guard: a critic that sets fd.status still routes by it,
+        # regardless of parent_status.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "c", "parent_job_id": "p"}
+        for fd_status, expected in [
+            ("completed", "completed"),
+            ("waiting", "waiting"),
+            ("job_completed", "completed"),
+        ]:
+            result = {"should_stop": True, "freeze_data": {"status": fd_status}}
+            status, _ = determine_job_status(job, result, parent_status="processing")
+            assert status == expected, f"{fd_status} -> {status}"
+
+
 # =============================================================================
 # Auto-continue resume-clear — the version_upgrade drain livelock + its fix
 # (docs/issues/version_upgrade_drain_livelock.md)
