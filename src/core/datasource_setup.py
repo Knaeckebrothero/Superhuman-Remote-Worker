@@ -823,6 +823,17 @@ def clone_repository_datasources(
 # ---------------------------------------------------------------------------
 
 
+def _declared_ro_note(ds: Dict[str, Any]) -> str:
+    """Advisory suffix for publisher-declared read-only datasources.
+
+    Declarative only (docs/features/public_datasources.md): credentials are
+    the enforcement boundary; this just tells the agent the intent. Distinct
+    from ``project_read_only`` (per-link connector mode), which switches the
+    tool surface.
+    """
+    return " (declared read-only — treat as no-write)" if ds.get("read_only") else ""
+
+
 def inject_datasource_index(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
@@ -865,7 +876,7 @@ def inject_datasource_index(
         for ds, clone_name in zip(repos, resolve_repo_clone_names(repos)):
             lines.append(
                 f"- **{ds.get('name')}** — cloned at `./repos/{clone_name}/`, "
-                f"git pre-authenticated"
+                f"git pre-authenticated{_declared_ro_note(ds)}"
             )
         lines.append("")
 
@@ -891,7 +902,7 @@ def inject_datasource_index(
             if is_ro:
                 lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
             else:
-                lines.append(_format_rw_cli_entry(name, ds_type))
+                lines.append(_format_rw_cli_entry(name, ds_type) + _declared_ro_note(ds))
         lines.append("")
 
     if creds:
@@ -928,12 +939,12 @@ def inject_datasource_index(
 
             if ds_type == "generic":
                 cli = ds.get("cli_hint", "CLI via env vars")
-                lines.append(f"- **{name}** (generic) — {cli}")
+                lines.append(f"- **{name}** (generic) — {cli}{_declared_ro_note(ds)}")
             elif ds_type == "webdav":
                 access = "read-only tools" if is_ro else "read-write tools"
-                lines.append(f"- **{name}** (webdav, {access})")
+                lines.append(f"- **{name}** (webdav, {access}){_declared_ro_note(ds)}")
             else:
-                lines.append(f"- **{name}** ({ds_type})")
+                lines.append(f"- **{name}** ({ds_type}){_declared_ro_note(ds)}")
         lines.append("")
 
     try:
