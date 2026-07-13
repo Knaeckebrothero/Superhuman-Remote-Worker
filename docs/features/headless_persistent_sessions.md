@@ -164,7 +164,7 @@ CREATE INDEX idx_thread_events_thread_created
     ON thread_events(thread_id, created_at);
 ```
 
-**Why `epoch`.** Mirrors Discord's gateway protocol: a session-id bump tells the client "your cursor is from a previous server-side incarnation, do a full re-sync." Without it, clients with stale cursors silently get partial replays after a pod restart — the [Discord-net `#938`](https://github.com/discord-net/Discord.Net/issues/938) infinite-loop class of bug. Bumped by: agent pod restart with cold checkpoint, explicit admin reset, schema migrations that touch event meaning.
+**Why `epoch`.** Mirrors Discord's gateway protocol: a session-id bump tells the client "your cursor is from a previous server-side incarnation, do a full re-sync." Without it, clients with stale cursors silently get partial replays after a pod restart — the [Discord-net `#938`](https://github.com/discord-net/Discord.Net/issues/938) infinite-loop class of bug. The agent atomically allocates a fresh epoch on every successful DB-backed runtime attach, including when retention left the previous generation empty; explicit administrative resets and schema migrations that change event meaning may also advance it.
 
 **Retention.** Tiered:
 

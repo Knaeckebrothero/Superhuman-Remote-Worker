@@ -12,6 +12,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
 
@@ -184,11 +185,29 @@ _draft_title_value: Optional[str] = None
 # _loop_on_tool_result.
 _tool_inflight: bool = False
 
-# Phase 2 event-log cursor. Allocated synchronously by _broadcast; the DB
-# write is scheduled via asyncio.create_task (fire-and-forget). Initialized
-# in _attach_session with epoch bump on cold restart; cleared on terminate.
+# Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
+# through one ordered writer so a later sequence can never become visible in
+# Postgres before an earlier queued sequence. Each DB-backed runtime attach
+# atomically allocates a fresh epoch; teardown clears the process-local cursor.
 _events_epoch: int = 0
 _next_seq: int = 0
+_event_writer: Optional["_OrderedPersistentEventWriter"] = None
+
+_EVENT_WRITER_QUEUE_MAXSIZE: int = int(
+    os.environ.get("THREAD_EVENT_WRITER_QUEUE_MAXSIZE", "10000")
+)
+_EVENT_WRITER_BATCH_SIZE: int = int(
+    os.environ.get("THREAD_EVENT_WRITER_BATCH_SIZE", "100")
+)
+_EVENT_WRITER_STATE_MAX_ATTEMPTS: int = int(
+    os.environ.get("THREAD_EVENT_WRITER_STATE_MAX_ATTEMPTS", "3")
+)
+_EVENT_WRITER_RETRY_BASE_S: float = float(
+    os.environ.get("THREAD_EVENT_WRITER_RETRY_BASE_S", "0.1")
+)
+_EVENT_WRITER_CLOSE_TIMEOUT_S: float = float(
+    os.environ.get("THREAD_EVENT_WRITER_CLOSE_TIMEOUT_S", "10")
+)
 
 # ---------------------------------------------------------------------------
 # NATS notification publishing (Direct Session WebSockets, Task 9)
@@ -225,6 +244,10 @@ class WorkspaceNotReady(RuntimeError):
     the pool-mode /session/attach path) keep catching it, while the lifespan
     startup can catch it specifically to exit cleanly instead of crash-looping.
     """
+
+
+class EventJournalUnavailable(RuntimeError):
+    """The persistent event generation could not be resolved authoritatively."""
 
 
 async def _ensure_nats_client():
@@ -1189,6 +1212,91 @@ def _apply_session_tool_group_markers(
             merged_config.pop(marker, None)
 
 
+async def _resolve_event_journal_epoch(postgres_conn: Any, thread_id: str) -> int:
+    """Atomically allocate a new event generation for this runtime attach.
+
+    Allocation is unconditional: an empty current epoch may be genuinely new,
+    fully pruned, or left by a failed runtime. Reusing it can strand a cached
+    SSE cursor ahead of every newly allocated sequence. The existing SSE
+    mid-stream epoch-change path safely re-anchors provisioning clients that
+    opened against the pre-attach generation.
+    """
+
+    sql = """
+        UPDATE threads
+        SET events_epoch = events_epoch + 1
+        WHERE id = $1
+        RETURNING events_epoch
+    """
+    try:
+        async with postgres_conn.acquire() as conn:
+            row = await conn.fetchrow(sql, thread_id)
+    except Exception as exc:
+        raise EventJournalUnavailable(
+            "Persistent event journal initialization failed"
+        ) from exc
+
+    if row is None:
+        raise EventJournalUnavailable("Persistent event journal thread does not exist")
+    try:
+        epoch = int(row["events_epoch"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise EventJournalUnavailable(
+            "Persistent event journal returned an invalid generation"
+        ) from exc
+
+    logger.info("Allocated events_epoch %d for thread %s", epoch, thread_id)
+    return epoch
+
+
+async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
+    """Release a partially built session after journal initialization fails."""
+
+    global _session, _thread_id, _event_writer
+    global _events_epoch, _next_seq, _tool_inflight
+    global _loop_user_queue, _loop_interrupt_flag, _hard_interrupt_event
+    global _loop_last_user_content
+
+    writer = _event_writer
+    if writer is not None:
+        try:
+            await writer.close()
+        except Exception as exc:
+            logger.warning(
+                "Failed to close event writer after attach failure (thread=%s): %s",
+                thread_id,
+                exc,
+            )
+        finally:
+            _event_writer = None
+
+    failed_session = _session
+    if failed_session is not None:
+        tool_context = getattr(failed_session, "tool_context", None)
+        if tool_context is not None:
+            tool_context.citation_verdict_callback = None
+        try:
+            await failed_session.cleanup()
+        except Exception as exc:
+            logger.warning(
+                "Failed to clean partial session after event-journal error "
+                "(thread=%s): %s",
+                thread_id,
+                exc,
+            )
+
+    _session = None
+    _thread_id = None
+    _events_epoch = 0
+    _next_seq = 0
+    _tool_inflight = False
+    _loop_user_queue = None
+    _loop_interrupt_flag = None
+    _hard_interrupt_event = None
+    _loop_last_user_content = [""]
+    _subscribers.clear()
+
+
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
@@ -1207,11 +1315,23 @@ async def _attach_session(
     base instead of the pod's boot config when provided.
     """
     global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
+    global _event_writer
 
     if _session is not None:
         raise RuntimeError(
             f"Cannot attach thread {thread_id}: already attached to {_thread_id}"
         )
+
+    # A normal detach always closes and clears the prior writer. Recover from a
+    # stale writer defensively before a pool-mode reattach so no event can land
+    # under the previous thread/pool identity.
+    if _event_writer is not None:
+        logger.warning(
+            "Closing stale thread_events writer before attaching thread %s",
+            thread_id,
+        )
+        await _event_writer.close()
+        _event_writer = None
 
     _thread_id = thread_id
 
@@ -1631,63 +1751,40 @@ async def _attach_session(
     if _session is not None and _session.tool_context is not None:
         _session.tool_context.citation_verdict_callback = _emit_citation_verdict
 
-    # Phase 2 event-log cursor init. The current epoch lives on the threads
-    # row; we bump it iff the previous epoch has events (i.e. this is a
-    # cold-checkpoint restart that lost the in-memory seq counter). A fresh
-    # epoch with no rows is reused as-is. _next_seq always starts at 0
-    # locally — _broadcast pre-increments before writing the first event.
-    #
-    # MUST run before the first _broadcast below. Otherwise an early frame
-    # (cloud_mount.ready, etc.) is written under the provisional epoch, the
-    # bump-check then sees that non-empty epoch and supersedes it, and any
-    # client that opened the SSE stream during provisioning is left holding a
-    # cursor for a now-dead epoch — which surfaces as a doubled turn plus a
-    # spurious "SESSION RESUMED" divider after the forced gone_beyond_horizon
-    # resync. See memory project_session_epoch_duplicate_render.
+    # Allocate one authoritative generation per runtime attach before the first
+    # broadcast. This is unconditional even when the previous generation has no
+    # rows: retention may have pruned it while clients still cache a high
+    # cursor. A provisioning SSE opened against the pre-attach generation uses
+    # the existing mid-stream epoch-change reconciliation path.
     _tool_inflight = False
     _events_epoch = 0
     _next_seq = 0
     if _session is not None and _session.postgres_conn is not None:
         try:
-            async with _session.postgres_conn.acquire() as conn:
-                current_epoch = await conn.fetchval(
-                    "SELECT events_epoch FROM threads WHERE id = $1",
-                    _thread_id,
-                )
-                if current_epoch is None:
-                    current_epoch = 0
-                max_seq = await conn.fetchval(
-                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
-                    "WHERE thread_id = $1 AND epoch = $2",
-                    _thread_id,
-                    current_epoch,
-                )
-                if max_seq and max_seq > 0:
-                    # Cold-checkpoint restart: previous epoch has events
-                    # but we lost the in-memory counter. Bump to a fresh
-                    # epoch so cursors from the previous run trigger
-                    # GONE_BEYOND_HORIZON on reconnect.
-                    new_epoch = await conn.fetchval(
-                        "UPDATE threads SET events_epoch = events_epoch + 1 "
-                        "WHERE id = $1 RETURNING events_epoch",
-                        _thread_id,
-                    )
-                    _events_epoch = int(new_epoch)
-                    logger.info(
-                        "Bumped events_epoch to %d for thread %s "
-                        "(previous epoch had %d events)",
-                        _events_epoch,
-                        _thread_id,
-                        max_seq,
-                    )
-                else:
-                    _events_epoch = int(current_epoch)
-        except Exception as e:
-            logger.warning(
-                "events_epoch init failed for thread %s (non-fatal): %s",
-                _thread_id,
-                e,
+            _events_epoch = await _resolve_event_journal_epoch(
+                _session.postgres_conn, _thread_id
             )
+            writer = _OrderedPersistentEventWriter(
+                postgres_conn=_session.postgres_conn,
+                thread_id=_thread_id,
+                on_terminal_failure=_event_persistence_failed,
+            )
+            writer.start()
+            _event_writer = writer
+        except Exception as exc:
+            logger.error(
+                "Event journal initialization failed; aborting session attach "
+                "(thread=%s): %s",
+                _thread_id,
+                exc,
+                exc_info=True,
+            )
+            await _cleanup_failed_event_journal_attach(thread_id)
+            if isinstance(exc, EventJournalUnavailable):
+                raise
+            raise EventJournalUnavailable(
+                "Persistent event journal initialization failed"
+            ) from exc
 
     cloud_mount_active = bool(
         _session.cloud_mount_manager and _session.cloud_mount_manager.active
@@ -1917,6 +2014,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
     global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight
+    global _event_writer
 
     if not _session:
         return
@@ -1997,6 +2095,23 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
             except Exception as e:
                 logger.warning(f"Final git push failed (non-fatal): {e}")
 
+    # The journal owns a captured pool + thread identity. Drain it while both
+    # the session and live subscribers still exist: terminal Canvas failures
+    # can then emit their direct reconciliation control before teardown clears
+    # either registry, and a pool-mode reattach cannot inherit queued events.
+    event_writer = _event_writer
+    if event_writer is not None:
+        try:
+            await event_writer.close()
+        except Exception as e:
+            logger.warning(
+                "thread_events writer close failed (thread=%s): %s",
+                thread_id,
+                e,
+            )
+        finally:
+            _event_writer = None
+
     # Clean up session resources
     await _session.cleanup()
 
@@ -2015,7 +2130,8 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     _subscribers.clear()
 
     # Phase 2 event-log cursor reset. The next session attach reads the
-    # epoch fresh from the threads table.
+    # epoch fresh from the threads table. The ordered writer was already
+    # drained and cleared above, before either captured identity disappeared.
     _events_epoch = 0
     _next_seq = 0
     _tool_inflight = False
@@ -2745,6 +2861,330 @@ async def _safe_set_thread_status(status: str) -> None:
         logger.warning("Failed to set thread status to %s: %s", status, e)
 
 
+@dataclass(frozen=True)
+class _QueuedPersistentEvent:
+    """One immutable event-log write owned by the ordered writer."""
+
+    epoch: int
+    seq: int
+    kind: str
+    payload: Any
+
+
+def _requires_bounded_event_retry(kind: str) -> bool:
+    """Return whether losing ``kind`` requires explicit client reconciliation.
+
+    Canvas events are state invalidations rather than replaceable token pacing.
+    Keep this predicate at the transport boundary so future Canvas adapters do
+    not need their own event sequencer or persistence path.
+    """
+
+    return kind.startswith("canvas.") and kind != "canvas.reconcile_required"
+
+
+class _OrderedPersistentEventWriter:
+    """Persist one runtime's thread events in FIFO, atomic batches.
+
+    ``_broadcast`` remains synchronous/non-blocking for the agent loop. It puts
+    immutable events onto this bounded queue; one task is the sole database
+    writer for the attached runtime. A single INSERT persists each batch in
+    queue order, eliminating the old one-task-per-frame visibility race.
+
+    Ordinary streaming frames get one best-effort write. State invalidations
+    receive bounded retries. Queue overflow and terminal write failure are
+    reported through ``on_terminal_failure`` so callers can force an
+    authoritative-state reconciliation without recursively journaling it.
+    """
+
+    _INSERT_BATCH_SQL = """
+        INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
+        SELECT
+            $1,
+            (queued.value->>'epoch')::integer,
+            (queued.value->>'seq')::bigint,
+            queued.value->>'kind',
+            queued.value->'payload'
+        FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY
+            AS queued(value, ordinal)
+        ORDER BY queued.ordinal
+    """
+
+    def __init__(
+        self,
+        *,
+        postgres_conn: Any,
+        thread_id: str,
+        on_terminal_failure: Callable[[list[_QueuedPersistentEvent], str], None],
+        queue_maxsize: int = _EVENT_WRITER_QUEUE_MAXSIZE,
+        batch_size: int = _EVENT_WRITER_BATCH_SIZE,
+        state_max_attempts: int = _EVENT_WRITER_STATE_MAX_ATTEMPTS,
+        retry_base_s: float = _EVENT_WRITER_RETRY_BASE_S,
+    ) -> None:
+        if queue_maxsize < 1:
+            raise ValueError("event writer queue_maxsize must be positive")
+        if batch_size < 1:
+            raise ValueError("event writer batch_size must be positive")
+        if state_max_attempts < 1:
+            raise ValueError("event writer state_max_attempts must be positive")
+
+        self.postgres_conn = postgres_conn
+        self.thread_id = thread_id
+        self._on_terminal_failure = on_terminal_failure
+        self._queue: asyncio.Queue[_QueuedPersistentEvent] = asyncio.Queue(
+            maxsize=queue_maxsize
+        )
+        self._batch_size = batch_size
+        self._state_max_attempts = state_max_attempts
+        self._retry_base_s = max(0.0, retry_base_s)
+        self._task: Optional[asyncio.Task] = None
+        self._closing = False
+        self._last_enqueued_cursor: Optional[tuple[int, int]] = None
+        self._active_batch: tuple[_QueuedPersistentEvent, ...] = ()
+
+    def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("event writer already started")
+        self._task = asyncio.create_task(
+            self._run(),
+            name=f"thread-event-writer-{self.thread_id}",
+        )
+
+    def enqueue(self, event: _QueuedPersistentEvent) -> bool:
+        """Queue an event without blocking the agent's output loop."""
+
+        if self._task is None or self._closing or self._task.done():
+            self._notify_terminal_failure([event], "writer_unavailable")
+            return False
+
+        cursor = (event.epoch, event.seq)
+        if (
+            self._last_enqueued_cursor is not None
+            and cursor <= self._last_enqueued_cursor
+        ):
+            logger.error(
+                "thread_events rejected non-monotonic cursor "
+                "(thread=%s previous=%s next=%s kind=%s)",
+                self.thread_id,
+                self._last_enqueued_cursor,
+                cursor,
+                event.kind,
+            )
+            self._notify_terminal_failure([event], "non_monotonic_cursor")
+            return False
+        self._last_enqueued_cursor = cursor
+
+        try:
+            self._queue.put_nowait(event)
+            return True
+        except asyncio.QueueFull:
+            # The live WS frame was already delivered. Journal overflow is
+            # therefore a replay/reconciliation failure, not a reason to block
+            # the model loop. Canvas invalidations are never lost silently:
+            # their callback emits a direct, non-journaled reconcile control.
+            logger.warning(
+                "thread_events queue full — dropping journal frame "
+                "(thread=%s epoch=%d seq=%d kind=%s)",
+                self.thread_id,
+                event.epoch,
+                event.seq,
+                event.kind,
+            )
+            self._notify_terminal_failure([event], "queue_overflow")
+            return False
+
+    async def close(self, timeout_s: float = _EVENT_WRITER_CLOSE_TIMEOUT_S) -> None:
+        """Stop accepting events, drain queued writes, and stop the worker."""
+
+        task = self._task
+        if task is None:
+            self._closing = True
+            return
+
+        self._closing = True
+        timed_out = False
+        try:
+            await asyncio.wait_for(self._queue.join(), timeout=max(0.0, timeout_s))
+        except asyncio.TimeoutError:
+            timed_out = True
+
+        failed_on_shutdown: list[_QueuedPersistentEvent] = []
+        if timed_out:
+            # Snapshot the in-flight batch before cancellation clears it, then
+            # drain the still-queued tail. The callback is intentionally live
+            # only; attempting another journal write here could hang teardown.
+            failed_on_shutdown.extend(self._active_batch)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            while True:
+                try:
+                    failed_on_shutdown.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+                else:
+                    self._queue.task_done()
+            if failed_on_shutdown:
+                logger.warning(
+                    "thread_events writer drain timed out (thread=%s pending=%d)",
+                    self.thread_id,
+                    len(failed_on_shutdown),
+                )
+                self._notify_terminal_failure(
+                    failed_on_shutdown, "writer_shutdown_timeout"
+                )
+        else:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        self._task = None
+
+    async def _run(self) -> None:
+        while True:
+            first = await self._queue.get()
+            batch = [first]
+            while len(batch) < self._batch_size:
+                try:
+                    batch.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            self._active_batch = tuple(batch)
+            try:
+                await self._write_with_retry(batch)
+            finally:
+                self._active_batch = ()
+                for _event in batch:
+                    self._queue.task_done()
+
+    async def _write_with_retry(self, batch: list[_QueuedPersistentEvent]) -> None:
+        attempts = (
+            self._state_max_attempts
+            if any(_requires_bounded_event_retry(event.kind) for event in batch)
+            else 1
+        )
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._write_batch(batch)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt < attempts:
+                    logger.warning(
+                        "thread_events batch write failed; retrying "
+                        "(thread=%s first_seq=%d last_seq=%d attempt=%d/%d): %s",
+                        self.thread_id,
+                        batch[0].seq,
+                        batch[-1].seq,
+                        attempt,
+                        attempts,
+                        exc,
+                    )
+                    if self._retry_base_s:
+                        await asyncio.sleep(self._retry_base_s * (2 ** (attempt - 1)))
+                    continue
+
+                logger.warning(
+                    "thread_events batch write failed terminally "
+                    "(thread=%s first_seq=%d last_seq=%d attempts=%d): %s",
+                    self.thread_id,
+                    batch[0].seq,
+                    batch[-1].seq,
+                    attempts,
+                    exc,
+                )
+                self._notify_terminal_failure(batch, "write_failed")
+
+    async def _write_batch(self, batch: list[_QueuedPersistentEvent]) -> None:
+        rows = [
+            {
+                "epoch": event.epoch,
+                "seq": event.seq,
+                "kind": event.kind,
+                "payload": event.payload,
+            }
+            for event in batch
+        ]
+        async with self.postgres_conn.acquire() as conn:
+            await conn.execute(
+                self._INSERT_BATCH_SQL,
+                self.thread_id,
+                json.dumps(rows),
+            )
+
+    def _notify_terminal_failure(
+        self, events: list[_QueuedPersistentEvent], reason: str
+    ) -> None:
+        try:
+            self._on_terminal_failure(events, reason)
+        except Exception as exc:
+            logger.warning(
+                "thread_events terminal-failure callback failed "
+                "(thread=%s reason=%s): %s",
+                self.thread_id,
+                reason,
+                exc,
+            )
+
+
+def _fan_out_live_frame(frame: Dict[str, Any]) -> None:
+    """Enqueue one already-built frame for every live control subscriber."""
+
+    method = str(frame.get("method") or "unknown")
+    for client_id, queue in list(_subscribers.items()):
+        try:
+            queue.put_nowait(frame)
+        except asyncio.QueueFull:
+            # Drop oldest, retry. If the retry still fails (shouldn't -- we just
+            # made room), drop the new frame and move on.
+            try:
+                queue.get_nowait()
+                queue.put_nowait(frame)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                logger.warning(
+                    "Subscriber %s queue overflow -- dropping frame %s",
+                    client_id,
+                    method,
+                )
+
+
+def _event_persistence_failed(
+    events: list[_QueuedPersistentEvent], reason: str
+) -> None:
+    """Force live Canvas clients back to authoritative REST state.
+
+    This control frame deliberately has no ``_seq`` and never re-enters the
+    journal. Ordinary event failures remain best-effort and are covered by the
+    existing history/reconnect behavior; Canvas state invalidations require an
+    explicit reconciliation signal when a live control subscriber exists.
+    """
+
+    canvas_events = [
+        event for event in events if _requires_bounded_event_retry(event.kind)
+    ]
+    if not canvas_events:
+        return
+
+    canvas_id = "main"
+    payload = canvas_events[-1].payload
+    if isinstance(payload, dict) and isinstance(payload.get("canvas_id"), str):
+        canvas_id = payload["canvas_id"]
+    _fan_out_live_frame(
+        {
+            "method": "canvas.reconcile_required",
+            "params": {
+                "canvas_id": canvas_id,
+                "reason": reason,
+            },
+        }
+    )
+
+
 def _broadcast(method: str, params: Dict[str, Any]) -> None:
     """Enqueue a frame onto every subscriber queue, persist to event log.
 
@@ -2753,11 +3193,9 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
     old chunk than block the loop on a stuck consumer.
 
     Phase 2 (event log): allocates the next seq synchronously and stamps
-    `(_events_epoch, seq)` into the frame's params under `_seq`. The actual
-    DB write is scheduled via asyncio.create_task and is best-effort — a
-    failed DB write doesn't block the loop or cancel the in-pod broadcast.
-    Reconnecting SSE clients replay from this log; failed writes produce a
-    cursor gap that GONE_BEYOND_HORIZON catches on the next mismatch.
+    `(_events_epoch, seq)` into the frame's params under `_seq`. One
+    per-runtime writer persists FIFO batches, so the SSE poller cannot advance
+    past an earlier event whose independent write is still in flight.
     """
     global _next_seq
     _next_seq += 1
@@ -2768,22 +3206,7 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
     # consistent under reconnect.
     params_with_cursor = {**params, "_seq": [epoch, seq]}
     frame = {"method": method, "params": params_with_cursor}
-
-    for client_id, queue in list(_subscribers.items()):
-        try:
-            queue.put_nowait(frame)
-        except asyncio.QueueFull:
-            # Drop oldest, retry. If the retry still fails (shouldn't — we just
-            # made room), drop the new frame and move on.
-            try:
-                queue.get_nowait()
-                queue.put_nowait(frame)
-            except (asyncio.QueueEmpty, asyncio.QueueFull):
-                logger.warning(
-                    "Subscriber %s queue overflow — dropping frame %s",
-                    client_id,
-                    method,
-                )
+    _fan_out_live_frame(frame)
 
     # Mirror notification-worthy events to NATS so the orchestrator's
     # bridge can fan them out to the SSE notification feed. Non-blocking,
@@ -2791,14 +3214,27 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
     if method in _NOTIFICATION_METHODS:
         asyncio.create_task(emit_session_event(method, params))
 
-    # Fire-and-forget DB write. Doesn't block the broadcast — if persistence
-    # fails the live subscribers still received the frame; only the SSE
-    # replay path loses a row.
+    # Queue one immutable journal snapshot. The loop stays non-blocking, while
+    # the sole writer serializes database visibility for every sequence.
     if _session is not None and _session.postgres_conn is not None:
-        asyncio.create_task(
-            _persist_event(epoch, seq, method, params),
-            name=f"persist-event-{seq}",
+        event = _QueuedPersistentEvent(
+            epoch=epoch,
+            seq=seq,
+            kind=method,
+            payload=json.loads(json.dumps(_safe_serialize(params))),
         )
+        writer = _event_writer
+        if writer is None or writer.thread_id != _thread_id:
+            logger.error(
+                "thread_events writer unavailable (thread=%s epoch=%d seq=%d kind=%s)",
+                _thread_id,
+                epoch,
+                seq,
+                method,
+            )
+            _event_persistence_failed([event], "writer_unavailable")
+        else:
+            writer.enqueue(event)
 
 
 def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
@@ -2825,47 +3261,6 @@ def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
         )
     except Exception as e:
         logger.debug("citation.verdict broadcast failed (non-fatal): %s", e)
-
-
-async def _persist_event(
-    epoch: int, seq: int, kind: str, payload: Dict[str, Any]
-) -> None:
-    """Insert one row into thread_events. Best-effort; failures are logged.
-
-    Called fire-and-forget from _broadcast. Captures the postgres_conn at
-    task start so a concurrent _terminate_session can null _session
-    without blowing up this in-flight write.
-    """
-    if _session is None or _thread_id is None:
-        return
-    postgres_conn = _session.postgres_conn
-    if postgres_conn is None:
-        return
-    try:
-        # Serialize payload defensively — frames carry tool args, etc.
-        safe_payload = _safe_serialize(payload)
-        async with postgres_conn.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO thread_events "
-                "(thread_id, epoch, seq, kind, payload) "
-                "VALUES ($1, $2, $3, $4, $5::jsonb)",
-                _thread_id,
-                epoch,
-                seq,
-                kind,
-                json.dumps(safe_payload),
-            )
-    except Exception as e:
-        # Best-effort: log and drop. The frame already reached live
-        # subscribers; only SSE replay for this seq is lost.
-        logger.warning(
-            "thread_events write failed (thread=%s epoch=%d seq=%d kind=%s): %s",
-            _thread_id,
-            epoch,
-            seq,
-            kind,
-            e,
-        )
 
 
 async def _run_subscriber_pump(

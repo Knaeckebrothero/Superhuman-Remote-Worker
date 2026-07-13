@@ -20,6 +20,10 @@ import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {reduce, ReducerAction} from './turn-reducer';
 import {AppToastService} from '../../ui/toast';
+import {
+    CanvasControl,
+    PersistentThreadTransportBridge,
+} from './persistent-thread-transport-bridge.service';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -287,8 +291,18 @@ export class PersistentChatService {
     private readonly notifications = inject(NotificationService);
     private readonly transloco = inject(TranslocoService);
     private readonly destroyRef = inject(DestroyRef);
+    private readonly threadTransport = inject(PersistentThreadTransportBridge);
 
     constructor() {
+        // PersistentChatService remains the sole SSE/WebSocket lifecycle owner.
+        // Canvas receives decoded invalidations through this narrow bridge and
+        // may send only its typed control vocabulary back through the current
+        // thread's existing control socket.
+        const detachCanvasControl = this.threadTransport.attachControlSender(
+            (threadId, control) => this._sendCanvasControl(threadId, control),
+        );
+        this.destroyRef.onDestroy(detachCanvasControl);
+
         // Refresh the thread's engine citations whenever a turn finishes (the
         // agent may have created new ones via cite_web/cite_document), so inline
         // [N] markers resolve live without a reload. See CitationRefDirective.
@@ -640,6 +654,11 @@ export class PersistentChatService {
     // fetch bails instead of installing a resurrected EventSource on a
     // closed/superseded session.
     private sseGeneration = 0;
+    // Whole-connect generation. Route reuse can start connect(B) while an
+    // earlier connect(A) is still awaiting cache/REST. Every async state apply
+    // in the cold-connect path is tied to this generation so A can never paint
+    // history/metadata or reclaim B's transports after it has been superseded.
+    private connectGeneration = 0;
     // Wall-clock time the tab was last hidden (visibilitychange). A hide longer
     // than the watchdog window forces an unconditional revalidate on return — a
     // socket that died while the tab was frozen still reports readyState===OPEN.
@@ -666,6 +685,7 @@ export class PersistentChatService {
      * window — _ensureControlWs() must not race past).
      */
     private controlWsOpening = false;
+    private controlWsOpeningGeneration = 0;
 
     /**
      * Connect to a persistent agent session.
@@ -693,6 +713,7 @@ export class PersistentChatService {
     ): Promise<void> {
         const sameThread = this.threadId() === threadId && this.historyLoaded();
         this.disconnect();
+        const generation = this.connectGeneration;
         this.isDraftSession.set(false);
         this.connectionState.set('connecting');
         this.error.set(null);
@@ -726,7 +747,8 @@ export class PersistentChatService {
             this.cloudDiffPanelOpen.set(false);
 
             this.threadId.set(threadId);
-            await this.loadHistory(threadId);
+            await this.loadHistory(threadId, generation);
+            if (!this._isCurrentConnect(threadId, generation)) return;
             // loadHistory wholesale-replaced turns, killing the optimistic
             // bubbles for any carried outbox items. Re-dispatch them now —
             // BEFORE _openSse and _openControlWs, either of which can trigger
@@ -735,7 +757,8 @@ export class PersistentChatService {
             // before any readiness path runs.
             if (opts.carryOutbox) this._redispatchOutboxBubbles();
         }
-        await this.loadThreadMeta(threadId);
+        await this.loadThreadMeta(threadId, generation);
+        if (!this._isCurrentConnect(threadId, generation)) return;
         void this.loadCitations(threadId);
 
         // Don't auto-connect to ended sessions — render the read-only resume
@@ -747,7 +770,12 @@ export class PersistentChatService {
 
         this.intentionalClose = false;
         await this._openSse(threadId);
+        if (!this._isCurrentConnect(threadId, generation)) return;
         await this._openControlWs(threadId);
+    }
+
+    private _isCurrentConnect(threadId: string, generation: number): boolean {
+        return this.threadId() === threadId && this.connectGeneration === generation;
     }
 
     /**
@@ -802,7 +830,7 @@ export class PersistentChatService {
             // createAndConnect surfaced the error state and re-showed the
             // queued bubbles; re-enter draft so the next send retries the
             // create with the same outbox.
-            this.isDraftSession.set(true);
+            if (this.threadId() === null) this.isDraftSession.set(true);
         } finally {
             this.creatingFromDraft = false;
         }
@@ -814,6 +842,8 @@ export class PersistentChatService {
      */
     async createAndConnect(body: Record<string, any>): Promise<string> {
         this.disconnect();
+        const creationGeneration = this.connectGeneration;
+        let createdThreadId: string | null = null;
         // Clear the conversation + threadId synchronously so the "Creating
         // thread …" startup card isn't rendered on top of turns from the
         // session the user just navigated away from. disconnect() intentionally
@@ -830,19 +860,34 @@ export class PersistentChatService {
                 this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body)
             );
             const threadId = resp.thread_id;
+            createdThreadId = threadId;
+            if (
+                this.connectGeneration !== creationGeneration ||
+                this.threadId() !== null
+            ) {
+                // The thread was created, but the user navigated elsewhere
+                // while the POST was in flight. Return its id to the caller
+                // without stealing the newer route's state or transports.
+                return threadId;
+            }
             this.isCreating.set(false);
             // Carry the outbox: messages typed on the "Creating thread" card
             // belong to this new thread and must survive the connect() reset.
             await this.connect(threadId, {carryOutbox: true});
             return threadId;
         } catch (e) {
-            this.isCreating.set(false);
-            this.connectionState.set('error');
-            this.startupPhase.set(null);
-            // The reset at the top of createAndConnect wiped the optimistic
-            // bubbles; re-show any queued sends on the error screen so the user
-            // doesn't have a silently-retained outbox with no visible messages.
-            this._redispatchOutboxBubbles();
+            const ownsCurrentView = createdThreadId
+                ? this.threadId() === createdThreadId
+                : this.connectGeneration === creationGeneration && this.threadId() === null;
+            if (ownsCurrentView) {
+                this.isCreating.set(false);
+                this.connectionState.set('error');
+                this.startupPhase.set(null);
+                // The reset at the top of createAndConnect wiped the optimistic
+                // bubbles; re-show any queued sends on the error screen so the user
+                // doesn't have a silently-retained outbox with no visible messages.
+                this._redispatchOutboxBubbles();
+            }
             throw e;
         }
     }
@@ -938,11 +983,12 @@ export class PersistentChatService {
         }
     }
 
-    private async loadHistory(threadId: string): Promise<void> {
+    private async loadHistory(threadId: string, generation?: number): Promise<void> {
         try {
             // 1. Cache-first: paint the cached conversation immediately (zero
             //    latency on reopen). Empty when this thread isn't cached yet.
             const cached = await this.cache.getThreadMessages(threadId);
+            if (!this._isCurrentThreadRequest(threadId, generation)) return;
             if (cached.length) {
                 this.dispatch({type: 'load_history', threadId, turns: historyToTurns(cached)});
                 this.resetWindow();
@@ -959,6 +1005,7 @@ export class PersistentChatService {
             const resp = await firstValueFrom(
                 this.http.get<{messages: HistoryMessage[]; total: number}>(url),
             );
+            if (!this._isCurrentThreadRequest(threadId, generation)) return;
             const fetched = resp.messages ?? [];
 
             // 3. Append to the cache by id (never full-replace — that loses
@@ -982,16 +1029,19 @@ export class PersistentChatService {
         } catch {
             // Network failure is non-fatal — any cached transcript was already
             // painted above; just mark history loaded.
-            this.historyLoaded.set(true);
+            if (this._isCurrentThreadRequest(threadId, generation)) {
+                this.historyLoaded.set(true);
+            }
         }
     }
 
     /** Load thread metadata (title, model, turn count) from REST. */
-    private async loadThreadMeta(threadId: string): Promise<void> {
+    private async loadThreadMeta(threadId: string, generation?: number): Promise<void> {
         try {
             const thread = await firstValueFrom(
                 this.http.get<any>(`${environment.apiUrl}/persistent/threads/${threadId}`)
             );
+            if (!this._isCurrentThreadRequest(threadId, generation)) return;
             this.sessionTitle.set(thread.title || null);
             const model = thread.metadata?.config_override?.llm?.model;
             this.modelName.set(model || thread.config_name || null);
@@ -1011,6 +1061,13 @@ export class PersistentChatService {
         } catch {
             // Non-fatal — UI will show fallback values
         }
+    }
+
+    private _isCurrentThreadRequest(threadId: string, generation?: number): boolean {
+        return (
+            this.threadId() === threadId &&
+            (generation === undefined || this.connectGeneration === generation)
+        );
     }
 
     /**
@@ -1072,7 +1129,11 @@ export class PersistentChatService {
         const generation = ++this.sseGeneration;
 
         const cursor = await this.cache.getThreadCursor(threadId);
-        if (generation !== this.sseGeneration) return;
+        if (
+            generation !== this.sseGeneration ||
+            this.intentionalClose ||
+            this.threadId() !== threadId
+        ) return;
 
         // ngsw-bypass keeps the Angular service worker out of the SSE path. Its
         // /api/** dataGroup otherwise buffers the stream body (which never ends),
@@ -1286,6 +1347,7 @@ export class PersistentChatService {
     private async _handleGoneBeyondHorizon(event: MessageEvent): Promise<void> {
         const tid = this.threadId();
         if (!tid) return;
+        const generation = this.connectGeneration;
         // The frame carries the live epoch + its tail seq:
         // {"params":{"epoch":N,"server_seq":M,...}}.
         let epoch: number | null = null;
@@ -1302,7 +1364,8 @@ export class PersistentChatService {
             this.sse = null;
         }
         // Reload transcript so visible history doesn't have a silent gap.
-        await this.loadHistory(tid);
+        await this.loadHistory(tid, generation);
+        if (!this._isCurrentConnect(tid, generation)) return;
         // loadHistory replaced turns → re-dispatch bubbles for still-queued
         // sends. Skip the item whose POST is in flight: accept-time persistence
         // may already have put its row in the reloaded history, so re-adding it
@@ -1316,6 +1379,7 @@ export class PersistentChatService {
         } else {
             await this.cache.deleteThreadCursor(tid);
         }
+        if (!this._isCurrentConnect(tid, generation)) return;
         await this._openSse(tid);
     }
 
@@ -1364,10 +1428,15 @@ export class PersistentChatService {
      */
     private async _openControlWs(threadId: string): Promise<void> {
         if (this.controlWsOpening) return;
+        const openingGeneration = ++this.controlWsOpeningGeneration;
         this.controlWsOpening = true;
         try {
             const connection = await this._resolveConnection(threadId);
-            if (this.intentionalClose || this.threadId() !== threadId) return;
+            if (
+                openingGeneration !== this.controlWsOpeningGeneration ||
+                this.intentionalClose ||
+                this.threadId() !== threadId
+            ) return;
             // GET /connection only returns 200 after the orchestrator has a
             // bound agent and the agent's /ready probe passes. That REST
             // readiness is enough to unblock the composer; the control WS
@@ -1380,11 +1449,17 @@ export class PersistentChatService {
         } catch {
             // Resolution failed — leave controlWs null; _ensureControlWs
             // (driven by user clicks) or the reconnect loop will retry.
-            if (!this.intentionalClose && this.threadId() === threadId) {
+            if (
+                openingGeneration === this.controlWsOpeningGeneration &&
+                !this.intentionalClose &&
+                this.threadId() === threadId
+            ) {
                 this._scheduleControlWsReconnect(threadId);
             }
         } finally {
-            this.controlWsOpening = false;
+            if (openingGeneration === this.controlWsOpeningGeneration) {
+                this.controlWsOpening = false;
+            }
         }
     }
 
@@ -1452,10 +1527,12 @@ export class PersistentChatService {
     }
 
     private _installControlWs(threadId: string, wsUrl: string): void {
-        this.controlWs = new WebSocket(wsUrl);
+        const ws = new WebSocket(wsUrl);
+        this.controlWs = ws;
         this.controlWsLastMessageAt = Date.now();
         this._startControlWsWatchdog(threadId);
-        this.controlWs.onclose = (event: CloseEvent) => {
+        ws.onclose = (event: CloseEvent) => {
+            if (this.controlWs !== ws) return;
             this.controlWs = null;
             this._stopControlWsWatchdog();
             if (this.intentionalClose) return;
@@ -1471,7 +1548,7 @@ export class PersistentChatService {
             // so we don't need the WS aggressively reconnecting.
             this._scheduleControlWsReconnect(threadId);
         };
-        this.controlWs.onerror = () => {
+        ws.onerror = () => {
             // The close handler will fire; nothing to do here.
         };
         // SSE is the canonical receive path for agent-emitted events. The
@@ -1490,7 +1567,12 @@ export class PersistentChatService {
         // them — and session.state is what flips sessionReady on a
         // reconnect to an already-idle loop where the cached SSE cursor
         // sits past the most recent `ready` event.
-        this.controlWs.onmessage = (event: MessageEvent) => {
+        ws.onmessage = (event: MessageEvent) => {
+            if (
+                this.controlWs !== ws ||
+                this.intentionalClose ||
+                this.threadId() !== threadId
+            ) return;
             // Any frame proves liveness — including ws.ping, whose only job
             // is feeding this watchdog.
             this.controlWsLastMessageAt = Date.now();
@@ -1517,17 +1599,28 @@ export class PersistentChatService {
      */
     private async _reopenWithFreshToken(threadId: string): Promise<void> {
         if (this.controlWsOpening) return;
+        const openingGeneration = ++this.controlWsOpeningGeneration;
         this.controlWsOpening = true;
         try {
             const connection = await this._fetchConnection(threadId);
-            if (this.intentionalClose || this.threadId() !== threadId) return;
+            if (
+                openingGeneration !== this.controlWsOpeningGeneration ||
+                this.intentionalClose ||
+                this.threadId() !== threadId
+            ) return;
             this._installControlWs(threadId, connection.ws_url);
         } catch {
-            if (!this.intentionalClose && this.threadId() === threadId) {
+            if (
+                openingGeneration === this.controlWsOpeningGeneration &&
+                !this.intentionalClose &&
+                this.threadId() === threadId
+            ) {
                 this._scheduleControlWsReconnect(threadId);
             }
         } finally {
-            this.controlWsOpening = false;
+            if (openingGeneration === this.controlWsOpeningGeneration) {
+                this.controlWsOpening = false;
+            }
         }
     }
 
@@ -1599,13 +1692,44 @@ export class PersistentChatService {
         this._ensureControlWs();
         const ws = this.controlWs;
         if (!ws) return;
+        const threadId = this.threadId();
         const sendWhenOpen = () => {
             ws.removeEventListener('open', sendWhenOpen);
-            if (ws.readyState === WebSocket.OPEN) {
+            if (
+                this.controlWs === ws &&
+                !this.intentionalClose &&
+                this.threadId() === threadId &&
+                ws.readyState === WebSocket.OPEN
+            ) {
                 ws.send(JSON.stringify(data));
             }
         };
         ws.addEventListener('open', sendWhenOpen);
+    }
+
+    /**
+     * Canvas controls report acceptance to their caller. Unlike the legacy
+     * best-effort control verbs, `true` therefore means the frame was written
+     * to the currently-open socket, not merely that an async connection attempt
+     * was started. A failed attempt still kick-starts the control transport so
+     * a deliberate caller retry can succeed.
+     */
+    private _sendCanvasControl(
+        threadId: string,
+        data: CanvasControl,
+    ): boolean {
+        if (this.intentionalClose || this.threadId() !== threadId) return false;
+        const ws = this.controlWs;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            this._ensureControlWs();
+            return false;
+        }
+        try {
+            ws.send(JSON.stringify(data));
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     /** Cancel the current backoff wait and immediately reopen the SSE.
@@ -1627,7 +1751,15 @@ export class PersistentChatService {
 
     /** Disconnect from the session. */
     disconnect(): void {
+        // Invalidates cache/REST continuations from any in-flight connect even
+        // when no transport has been installed yet.
+        this.connectGeneration++;
+        // Let a newer thread claim control-WS opening immediately; the stale
+        // async resolver observes its invalidated generation before install.
+        this.controlWsOpeningGeneration++;
+        this.controlWsOpening = false;
         this.intentionalClose = true;
+        this.isCreating.set(false);
         if (this.controlWsReconnectTimer) {
             clearTimeout(this.controlWsReconnectTimer);
             this.controlWsReconnectTimer = null;
@@ -1647,14 +1779,20 @@ export class PersistentChatService {
             this.sse.close();
             this.sse = null;
         }
-        if (this.controlWs) {
-            this.controlWs.onclose = null;
+        const controlWs = this.controlWs;
+        this.controlWs = null;
+        if (controlWs) {
+            // Assignment does not cancel a browser callback already queued for
+            // dispatch, so installed handlers also verify socket ownership.
+            controlWs.onopen = null;
+            controlWs.onmessage = null;
+            controlWs.onerror = null;
+            controlWs.onclose = null;
             try {
-                this.controlWs.close(1000);
+                controlWs.close(1000);
             } catch {
                 // ignore
             }
-            this.controlWs = null;
         }
         this.reconnectAttempt.set(0);
         this.reconnectGaveUp.set(false);
@@ -1708,6 +1846,7 @@ export class PersistentChatService {
     async resumeSession(): Promise<void> {
         const threadId = this.threadId();
         if (!threadId) return;
+        const generation = this.connectGeneration;
         this.isSessionPaused.set(false);
         try {
             await firstValueFrom(
@@ -1718,6 +1857,7 @@ export class PersistentChatService {
             // double-click). Fall through to connect() either way — its
             // cold-start path is self-healing.
         }
+        if (!this._isCurrentConnect(threadId, generation)) return;
         await this.connect(threadId);
     }
 
@@ -2256,6 +2396,12 @@ export class PersistentChatService {
     private _handleEvent(data: { method: string; params?: Record<string, unknown> }): void {
         const params = data.params ?? {};
         const now = Date.now();
+
+        // Forward the decoded envelope, never transport ownership or full
+        // state. CanvasService treats these frames as invalidations and reloads
+        // the authoritative REST representation.
+        const threadId = this.threadId();
+        if (threadId) this.threadTransport.forwardEvent(threadId, data);
 
         // Fold any buffered streamed deltas before handling a non-delta frame.
         // Several handlers below read conversation() and may skip dispatching

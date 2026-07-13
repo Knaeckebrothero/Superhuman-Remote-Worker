@@ -2823,13 +2823,25 @@ class TestTerminateSession:
         fake_session.cleanup = AsyncMock(side_effect=lambda: order.append("cleanup"))
         mod._session = fake_session
 
+        async def close_writer():
+            # The writer must drain while both captured identities are still
+            # authoritative; pool-mode reuse clears them immediately after.
+            assert mod._session is fake_session
+            assert mod._thread_id == "t1"
+            order.append("writer_closed")
+
+        fake_writer = MagicMock()
+        fake_writer.close = AsyncMock(side_effect=close_writer)
+        mod._event_writer = fake_writer
+
         with patch.object(mod, "_update_thread_status", new=AsyncMock()):
             await mod._terminate_session("test")
 
-        # Cancel happens before cleanup which happens before nulling.
-        assert order == ["loop_cancelled", "cleanup"]
+        # Cancel happens first; journal drain precedes cleanup + identity clear.
+        assert order == ["loop_cancelled", "writer_closed", "cleanup"]
         assert mod._session is None
         assert mod._loop_task is None
+        assert mod._event_writer is None
 
     @pytest.mark.asyncio
     async def test_clears_headless_input_primitives(self):
@@ -2848,6 +2860,7 @@ class TestTerminateSession:
         mod._tool_inflight = True
         mod._events_epoch = 7
         mod._next_seq = 42
+        mod._event_writer = None
 
         fake_session = MagicMock()
         fake_session.workspace_sync = None
@@ -2871,6 +2884,81 @@ class TestTerminateSession:
 # ---------------------------------------------------------------------------
 # 3.17.2b Attach-time cloud mount/sync selection
 # ---------------------------------------------------------------------------
+
+
+class TestAttachSessionEventJournalFailure:
+    @pytest.mark.asyncio
+    async def test_aborts_and_cleans_partial_session_before_any_broadcast(self):
+        import src.api.persistent_app as mod
+
+        fake_db = MagicMock()
+        instances = []
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                self.postgres_conn = fake_db
+                self.tool_context = SimpleNamespace(
+                    citation_verdict_callback=None,
+                )
+                self.cleanup = AsyncMock()
+                instances.append(self)
+
+            async def setup(self, **kwargs):
+                return None
+
+        workspace_override = {"remote": {"host": "10.42.0.10"}}
+        fake_agent = SimpleNamespace(
+            config=object(),
+            _tactical_llm=None,
+            _llm=object(),
+            _auxiliary_llm=object(),
+            postgres_conn=fake_db,
+            vector_conn=None,
+        )
+        fake_orchestrator = SimpleNamespace(
+            get_thread_workspace=AsyncMock(return_value=workspace_override)
+        )
+
+        mod._session = None
+        mod._thread_id = None
+        mod._event_writer = None
+        mod._events_epoch = 0
+        mod._next_seq = 0
+        mod._subscribers.clear()
+        with (
+            patch.object(mod, "_agent", fake_agent),
+            patch.object(mod, "_orchestrator_client", fake_orchestrator),
+            patch.object(mod, "PersistentSession", FakeSession),
+            patch.object(
+                mod,
+                "_poll_workspace_ready",
+                new=AsyncMock(return_value=workspace_override),
+            ),
+            patch.object(
+                mod,
+                "_resolve_event_journal_epoch",
+                new=AsyncMock(
+                    side_effect=mod.EventJournalUnavailable(
+                        "Persistent event journal initialization failed"
+                    )
+                ),
+            ),
+            patch.object(mod, "_OrderedPersistentEventWriter") as writer_cls,
+            patch.object(mod, "_broadcast") as broadcast,
+        ):
+            with pytest.raises(mod.EventJournalUnavailable):
+                await mod._attach_session("thread-journal-failure")
+
+        assert len(instances) == 1
+        instances[0].cleanup.assert_awaited_once()
+        assert instances[0].tool_context.citation_verdict_callback is None
+        writer_cls.assert_not_called()
+        broadcast.assert_not_called()
+        assert mod._session is None
+        assert mod._thread_id is None
+        assert mod._event_writer is None
+        assert mod._events_epoch == 0
+        assert mod._next_seq == 0
 
 
 class TestAttachSessionCloudMount:
