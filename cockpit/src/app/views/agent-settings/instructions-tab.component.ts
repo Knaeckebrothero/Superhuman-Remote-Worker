@@ -89,7 +89,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       cursor: not-allowed;
     }
     .instructions-editor::placeholder {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
     .instructions-actions {
       display: flex;

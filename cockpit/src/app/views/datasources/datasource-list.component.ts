@@ -989,7 +989,7 @@ import {UserService} from '../../core/services/user.service';
         align-items: center;
         gap: 12px;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
         flex-wrap: wrap;
@@ -1088,7 +1088,7 @@ import {UserService} from '../../core/services/user.service';
 
       .hint-inline {
         font-weight: 400;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
       }
 
@@ -1106,7 +1106,7 @@ import {UserService} from '../../core/services/user.service';
       .credential-retain-hint {
         margin-top: 4px;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Env var editor */
@@ -1131,7 +1131,7 @@ import {UserService} from '../../core/services/user.service';
       }
 
       .env-eq {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
       }
@@ -1260,7 +1260,7 @@ import {UserService} from '../../core/services/user.service';
       .public-key-hint {
         margin-top: 10px;
         margin-bottom: 0;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .public-key-wrap {
@@ -1315,7 +1315,7 @@ import {UserService} from '../../core/services/user.service';
         gap: 10px;
         padding: 40px;
         flex: 1;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 13px;
       }
 
@@ -1346,7 +1346,7 @@ import {UserService} from '../../core/services/user.service';
         text-align: left;
         padding: 8px 10px;
         background: var(--surface-0, var(--surface-0));
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-weight: 500;
         text-transform: uppercase;
         font-size: 10px;
@@ -1382,7 +1382,7 @@ import {UserService} from '../../core/services/user.service';
       .ds-desc {
         display: block;
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -1407,7 +1407,7 @@ import {UserService} from '../../core/services/user.service';
       }
 
       .index-status-detail {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .index-status-error {

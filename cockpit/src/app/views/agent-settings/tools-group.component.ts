@@ -115,7 +115,7 @@ export function allToolCategoriesSelected(
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
     .select-all-btn {
       flex-shrink: 0;
@@ -167,7 +167,7 @@ export function allToolCategoriesSelected(
       flex-shrink: 0;
     }
     .tool-toggle-icon {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       flex-shrink: 0;
     }
     .tool-toggle-info {
@@ -184,7 +184,7 @@ export function allToolCategoriesSelected(
     }
     .tool-toggle-desc {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
     .reset-btn {
       display: inline-flex;
@@ -195,7 +195,7 @@ export function allToolCategoriesSelected(
       border: none;
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
     }
@@ -220,7 +220,7 @@ export function allToolCategoriesSelected(
     }
     .inline-label {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       white-space: nowrap;
     }
     .inline-input {

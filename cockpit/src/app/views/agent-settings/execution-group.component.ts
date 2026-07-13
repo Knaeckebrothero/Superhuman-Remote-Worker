@@ -178,7 +178,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-bottom: 12px;
       padding-bottom: 6px;
       border-bottom: 1px solid var(--border-color, var(--surface-0));
@@ -255,7 +255,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
       border: none;
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
     }
@@ -266,7 +266,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
     .field-hint {
       display: block;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-top: 2px;
     }
   `],

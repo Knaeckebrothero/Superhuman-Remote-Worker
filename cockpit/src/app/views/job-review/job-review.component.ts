@@ -334,7 +334,7 @@ interface FrozenJobData {
         align-items: center;
         gap: 8px;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -359,7 +359,7 @@ interface FrozenJobData {
         gap: 12px;
         padding: 40px 20px;
         flex: 1;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         text-align: center;
       }
 
@@ -399,7 +399,7 @@ interface FrozenJobData {
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .job-description {
@@ -413,7 +413,7 @@ interface FrozenJobData {
         gap: 12px;
         font-size: 10px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .summary-text {
@@ -424,7 +424,7 @@ interface FrozenJobData {
       }
 
       .summary-text.muted {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-style: italic;
       }
 
@@ -528,7 +528,7 @@ interface FrozenJobData {
         padding: 0 12px;
         background: var(--panel-bg, var(--panel-bg));
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.5px;
       }

@@ -238,7 +238,7 @@ function secondsLeft(req: SudoRequest): number {
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--app-bg, #1e1e2e);
+        background: var(--app-bg);
       }
 
       .page-header {
@@ -267,7 +267,7 @@ function secondsLeft(req: SudoRequest): number {
         width: 8px;
         height: 8px;
         border-radius: 50%;
-        background: var(--text-muted, #6c7086);
+        background: var(--text-muted);
       }
       .status-dot.connected {
         background: var(--success);
@@ -307,7 +307,7 @@ function secondsLeft(req: SudoRequest): number {
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -316,7 +316,7 @@ function secondsLeft(req: SudoRequest): number {
       .empty {
         padding: 24px;
         text-align: center;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 13px;
       }
 
@@ -356,7 +356,7 @@ function secondsLeft(req: SudoRequest): number {
       .countdown {
         margin-left: auto;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-variant-numeric: tabular-nums;
       }
 
@@ -374,7 +374,7 @@ function secondsLeft(req: SudoRequest): number {
         display: flex;
         gap: 12px;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         margin-bottom: 8px;
       }
 
@@ -390,7 +390,7 @@ function secondsLeft(req: SudoRequest): number {
       .card-reason {
         margin-top: 6px;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-style: italic;
       }
 
@@ -423,7 +423,7 @@ function secondsLeft(req: SudoRequest): number {
       }
 
       .rule-desc {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
       }
 
