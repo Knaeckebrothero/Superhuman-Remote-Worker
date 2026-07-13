@@ -195,7 +195,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
                   <div class="memory-header" (click)="toggleExpanded(mem.id)">
                     <span
                       class="type-badge"
-                      [style.background]="typeColors[mem.memory_type] + '33'"
+                      [style.background]="tint(typeColors[mem.memory_type])"
                       [style.color]="typeColors[mem.memory_type]"
                     >
                       {{ formatType(mem.memory_type) }}
@@ -289,7 +289,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg);
         position: relative;
       }
 
@@ -299,8 +299,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         align-items: center;
         gap: 8px;
         padding: 6px 8px;
-        background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--panel-header-bg);
+        border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
       }
 
@@ -311,10 +311,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .tab-btn {
         padding: 4px 12px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -322,31 +322,31 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .tab-btn:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .tab-btn.active {
-        background: var(--accent-color, #cba6f7);
-        color: var(--on-accent, var(--timeline-bg, #11111b));
-        border-color: var(--accent-color, #cba6f7);
+        background: var(--accent-color);
+        color: var(--on-accent, var(--timeline-bg));
+        border-color: var(--accent-color);
       }
 
       .refresh-btn {
         margin-left: auto;
         padding: 4px 8px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         cursor: pointer;
         display: flex;
         align-items: center;
       }
 
       .refresh-btn:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       /* States */
@@ -370,21 +370,21 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: #f38ba8;
+        color: var(--danger);
         flex: 1;
       }
 
       .error-state button {
         padding: 8px 16px;
-        border: 1px solid #f38ba8;
+        border: 1px solid var(--danger);
         border-radius: var(--radius-control);
         background: transparent;
-        color: #f38ba8;
+        color: var(--danger);
         cursor: pointer;
       }
 
       .error-state button:hover {
-        background: rgba(243, 139, 168, 0.1);
+        background: color-mix(in srgb, var(--danger) 10%, transparent);
       }
 
       .empty-state {
@@ -394,7 +394,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex: 1;
       }
 
@@ -426,7 +426,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 1px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         margin-bottom: 8px;
         padding-left: 4px;
       }
@@ -438,7 +438,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .metric-card {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
         border-radius: var(--radius-control);
         padding: 12px 10px;
         text-align: center;
@@ -448,7 +448,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         font-family: 'JetBrains Mono', monospace;
         font-size: 20px;
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         line-height: 1.2;
       }
 
@@ -456,7 +456,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         font-size: 10px;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         margin-top: 4px;
       }
 
@@ -465,8 +465,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: flex;
         gap: 4px;
         padding: 8px;
-        background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--panel-header-bg);
+        border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
         align-items: center;
         flex-wrap: wrap;
@@ -474,10 +474,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .filter-btn {
         padding: 4px 10px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -485,21 +485,21 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .filter-btn:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .filter-btn.active {
-        color: var(--timeline-bg, #11111b);
+        color: var(--timeline-bg);
         border-color: transparent;
       }
 
       .inline-select {
         padding: 4px 8px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
-        background: var(--panel-bg, #181825);
-        color: var(--text-secondary, #a6adc8);
+        background: var(--panel-bg);
+        color: var(--text-secondary);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -507,14 +507,14 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .inline-select:focus {
         outline: none;
-        border-color: var(--accent-color, #cba6f7);
+        border-color: var(--accent-color);
       }
 
       .entry-count {
         margin-left: auto;
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Memory List */
@@ -525,15 +525,15 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .memory-item {
-        border-left: 3px solid var(--border-color, #45475a);
+        border-left: 3px solid var(--border-color);
         margin-bottom: 4px;
         border-radius: var(--radius-tag);
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
         transition: all 0.15s ease;
       }
 
       .memory-item:hover {
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
       }
 
       .memory-header {
@@ -560,7 +560,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .source-tag {
         font-size: 10px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         white-space: nowrap;
         flex-shrink: 0;
       }
@@ -568,7 +568,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .memory-summary {
         flex: 1;
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -584,13 +584,13 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .memory-time {
         font-family: 'JetBrains Mono', monospace;
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex-shrink: 0;
       }
 
       .expand-icon {
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex-shrink: 0;
         width: 12px;
         text-align: center;
@@ -599,7 +599,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       /* Expanded Details */
       .memory-details {
         padding: 8px 10px 12px 52px;
-        border-top: 1px solid var(--border-color, #313244);
+        border-top: 1px solid var(--border-color);
         background: rgba(17, 17, 27, 0.3);
       }
 
@@ -612,17 +612,17 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         margin-bottom: 4px;
       }
 
       .detail-content {
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         white-space: pre-wrap;
         word-break: break-word;
         font-family: 'JetBrains Mono', monospace;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg);
         padding: 8px;
         border-radius: var(--radius-tag);
         max-height: 200px;
@@ -639,8 +639,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .keyword-chip {
         padding: 2px 8px;
         border-radius: var(--radius-pill);
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
+        background: var(--surface-0);
+        color: var(--text-secondary);
         font-size: 10px;
         font-family: 'JetBrains Mono', monospace;
       }
@@ -655,7 +655,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .detail-item {
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Pagination */
@@ -664,15 +664,15 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         align-items: center;
         justify-content: space-between;
         padding: 8px 12px;
-        border-top: 1px solid var(--border-color, #313244);
-        background: var(--panel-header-bg, #1e1e2e);
+        border-top: 1px solid var(--border-color);
+        background: var(--panel-header-bg);
         flex-shrink: 0;
       }
 
       .page-info {
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .page-controls {
@@ -682,10 +682,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .page-btn {
         padding: 4px 10px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -693,8 +693,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .page-btn:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .page-btn:disabled {
@@ -730,19 +730,19 @@ export class MemoryPanelComponent {
 
   // Color mappings
   readonly typeColors: Record<MemoryType, string> = {
-    factual: '#89b4fa',
-    procedural: '#a6e3a1',
-    error_solution: '#f38ba8',
-    vocabulary: '#f9e2af',
-    relational: '#cba6f7',
+    factual: 'var(--cat-6)',          // lapis
+    procedural: 'var(--cat-4)',       // olive
+    error_solution: 'var(--danger)',  // semantic
+    vocabulary: 'var(--cat-3)',       // gold
+    relational: 'var(--cat-7)',       // violet
   };
 
   readonly sourceColorMap: Record<MemorySource, string> = {
-    observer: '#94e2d5',
-    todo: '#89b4fa',
-    compaction: '#fab387',
-    phase_archive: '#f5c2e7',
-    tool_error: '#f38ba8',
+    observer: 'var(--cat-5)',       // slate-teal
+    todo: 'var(--cat-6)',           // lapis
+    compaction: 'var(--cat-2)',     // copper
+    phase_archive: 'var(--cat-8)',  // mauve
+    tool_error: 'var(--danger)',    // semantic
   };
 
   // Static data for template iteration
@@ -873,9 +873,14 @@ export class MemoryPanelComponent {
   }
 
   importanceColor(value: number): string {
-    if (value >= 0.8) return '#a6e3a1';
-    if (value >= 0.5) return '#f9e2af';
-    return '#f38ba8';
+    if (value >= 0.8) return 'var(--success)';
+    if (value >= 0.5) return 'var(--warning)';
+    return 'var(--danger)';
+  }
+
+  /** Translucent background from a token — replaces the old `color + '33'` hex-alpha concat. */
+  tint(color: string): string {
+    return `color-mix(in srgb, ${color} 20%, transparent)`;
   }
 
   // ===== Data Loading =====
