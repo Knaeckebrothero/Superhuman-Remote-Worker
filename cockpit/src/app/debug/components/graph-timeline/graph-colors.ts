@@ -33,7 +33,7 @@ export interface GraphColors {
 }
 
 const defaultReader = (name: string): string =>
-  getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  getComputedStyle(document.body).getPropertyValue(name).trim();
 
 /**
  * Resolve the theme tokens the graph needs into concrete color strings.
