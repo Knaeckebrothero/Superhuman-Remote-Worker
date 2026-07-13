@@ -11,6 +11,7 @@ import {
   renderCanvasMarkdown,
   renderCanvasStaticHtml,
   resolveCanvasContentUrl,
+  resolveCanvasViewerBootstrapUrl,
   selectCanvasChromeState,
   selectCanvasRenderer,
   shouldResetCanvasImageZoom,
@@ -47,6 +48,21 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     expect(selectCanvasRenderer(state('auto'))).toBe('unsupported');
   });
 
+  it('selects a live app only with the positive viewer-session capability', () => {
+    const unavailable = state('auto', 'workspace_app');
+    const available: CanvasState = {
+      ...unavailable,
+      capabilities: {
+        ...unavailable.capabilities,
+        can_create_viewer_session: true,
+      },
+    };
+
+    expect(selectCanvasRenderer(unavailable)).toBe('unsupported');
+    expect(selectCanvasRenderer(available)).toBe('app');
+    expect(selectCanvasRenderer({...available, renderer: 'html'})).toBe('unsupported');
+  });
+
   it('preserves image zoom for a same-source refresh and resets on replacement', () => {
     expect(shouldResetCanvasImageZoom(null, 'workspace_file:chart.png')).toBe(false);
     expect(shouldResetCanvasImageZoom('workspace_file:chart.png', 'workspace_file:chart.png'))
@@ -79,6 +95,45 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     expect(resolveCanvasContentUrl('//evil.test/file', 'https://api.example.test/api')).toBeNull();
     expect(resolveCanvasContentUrl('/api/%255c%255cevil.test/file?presentation_revision=1&source_fingerprint=x&source_version=y&ngsw-bypass=true', 'https://api.example.test/api')).toBeNull();
     expect(resolveCanvasContentUrl('/api/file?ngsw-bypass=true', 'https://api.example.test/api')).toBeNull();
+  });
+
+  it('accepts only an exact isolated Canvas bootstrap origin and path', () => {
+    const origin = 'https://7f2640cb-8584-4ab1-a68e-95b2c9274419.canvas.userland.test';
+    const bootstrap = `${origin}/_canvas/bootstrap?token=${'t'.repeat(43)}`;
+    expect(resolveCanvasViewerBootstrapUrl(
+      bootstrap,
+      origin,
+      '.canvas.userland.test',
+      'https://cockpit.platform.test/sessions/t-1',
+    )).toBe(bootstrap);
+
+    const rejected = [
+      ['http://7f2640cb.canvas.userland.test/_canvas/bootstrap?token=x',
+        'http://7f2640cb.canvas.userland.test'],
+      [`${origin}/app?token=x`, origin],
+      [`${origin}/_canvas/bootstrap?token=x#leak`, origin],
+      [`${origin}/_canvas/bootstrap?token=${'t'.repeat(43)}&extra=1`, origin],
+      ['https://user@7f2640cb.canvas.userland.test/_canvas/bootstrap?token=x', origin],
+      ['https://7f2640cb.canvas.userland.test.evil.test/_canvas/bootstrap?token=x',
+        'https://7f2640cb.canvas.userland.test.evil.test'],
+      ['https://nested.label.canvas.userland.test/_canvas/bootstrap?token=x',
+        'https://nested.label.canvas.userland.test'],
+      [`https://7f2640cb-8584-4ab1-a68e-95b2c9274419.canvas.userland.test:444/_canvas/bootstrap?token=${'t'.repeat(43)}`,
+        'https://7f2640cb-8584-4ab1-a68e-95b2c9274419.canvas.userland.test:444'],
+      [`${origin}/_canvas/bootstrap?token=x`, 'https://other.canvas.userland.test'],
+      ['https://cockpit.platform.test/_canvas/bootstrap?token=x',
+        'https://cockpit.platform.test'],
+    ] as const;
+    for (const [url, expectedOrigin] of rejected) {
+      expect(resolveCanvasViewerBootstrapUrl(
+        url,
+        expectedOrigin,
+        '.canvas.userland.test',
+        'https://cockpit.platform.test/',
+      )).toBeNull();
+    }
+    expect(resolveCanvasViewerBootstrapUrl(bootstrap, origin, null)).toBeNull();
+    expect(resolveCanvasViewerBootstrapUrl(bootstrap, origin, 'canvas.userland.test')).toBeNull();
   });
 
   it('uses isolated Markdown semantics with bounded math and inert untrusted resources', () => {

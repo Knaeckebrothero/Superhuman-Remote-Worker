@@ -59,6 +59,12 @@ class _Writer:
         self.waited = True
 
 
+class _StallingWriter(_Writer):
+    async def wait_closed(self) -> None:
+        self.waited = True
+        await asyncio.Event().wait()
+
+
 class _Connection:
     def __init__(self) -> None:
         self.closed = False
@@ -96,6 +102,48 @@ def _target(generation: UUID = GENERATION) -> RemoteWorkspaceTarget:
         port=30022,
         fingerprint="SHA256:test",
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_channel_teardown_is_bounded(monkeypatch) -> None:
+    writer = _StallingWriter()
+    connection = _Connection()
+
+    async def open_connection(host: str, port: int):
+        connection.open_calls.append((host, port))
+        return object(), writer
+
+    connection.open_connection = open_connection  # type: ignore[method-assign]
+    pool = PinnedSSHTransportPool(idle_timeout=60)
+    entry = canvas_ssh._PooledSSHTransport(  # noqa: SLF001
+        target=_target(),
+        connection=connection,
+        last_used=0,
+        leases=1,
+    )
+
+    async def checkout(**kwargs):
+        del kwargs
+        yield connection
+
+    from contextlib import asynccontextmanager
+
+    monkeypatch.setattr(pool, "checkout", asynccontextmanager(checkout))
+    monkeypatch.setattr(canvas_ssh, "DEFAULT_SSH_CLOSE_TIMEOUT_SECONDS", 0.01)
+    async with asyncio.timeout(0.5):
+        async with pool.open_loopback_connection(
+            target=entry.target,
+            destination_port=8501,
+            key_path="/tmp/key",
+            generation_resolver=lambda: _resolved_thread(),
+        ):
+            pass
+    assert writer.closed
+    assert writer.waited
+
+
+async def _resolved_thread() -> dict[str, Any]:
+    return _thread()
 
 
 @pytest.mark.asyncio

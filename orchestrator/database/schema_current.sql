@@ -64,6 +64,30 @@ CREATE TYPE public.sudo_request_status AS ENUM (
 
 
 --
+-- Name: notify_canvas_origin_session_change(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.notify_canvas_origin_session_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL THEN
+        PERFORM pg_notify(
+            'canvas_session_changes',
+            json_build_object('kind', 'session', 'id', NEW.id)::text
+        );
+    ELSIF OLD.expires_at IS DISTINCT FROM NEW.expires_at THEN
+        PERFORM pg_notify(
+            'canvas_session_changes',
+            json_build_object('kind', 'session_renewed', 'id', NEW.id)::text
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: notify_thread_permission_update(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -80,6 +104,70 @@ BEGIN
                 'status', NEW.status
             )::text
         );
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: revoke_canvas_sessions_for_bff_session(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.revoke_canvas_sessions_for_bff_session() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    UPDATE canvas_origin_sessions
+    SET revoked_at = COALESCE(revoked_at, now()),
+        revocation_reason = COALESCE(revocation_reason, 'parent_session_ended'),
+        parent_srw_session_id = NULL,
+        updated_at = now()
+    WHERE parent_srw_session_id = OLD.id
+      AND revoked_at IS NULL;
+    RETURN OLD;
+END;
+$$;
+
+
+--
+-- Name: revoke_canvas_sessions_for_retired_origin(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.revoke_canvas_sessions_for_retired_origin() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.origin_generation IS NOT NULL
+       AND OLD.origin_generation IS DISTINCT FROM NEW.origin_generation THEN
+        UPDATE canvas_origin_sessions
+        SET revoked_at = COALESCE(revoked_at, now()),
+            revocation_reason = COALESCE(revocation_reason, 'origin_retired'),
+            updated_at = now()
+        WHERE thread_id = OLD.thread_id
+          AND canvas_id = OLD.canvas_id
+          AND origin_generation = OLD.origin_generation
+          AND revoked_at IS NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: revoke_canvas_sessions_for_user_admission(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.revoke_canvas_sessions_for_user_admission() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF OLD.is_approved IS TRUE AND NEW.is_approved IS NOT TRUE THEN
+        UPDATE canvas_origin_sessions
+        SET revoked_at = COALESCE(revoked_at, now()),
+            revocation_reason = COALESCE(revocation_reason, 'user_not_approved'),
+            updated_at = now()
+        WHERE user_id = NEW.id AND revoked_at IS NULL;
     END IF;
     RETURN NEW;
 END;
@@ -296,6 +384,101 @@ COMMENT ON COLUMN public.automations.last_scheduled_at IS 'Cron-canonical time o
 --
 
 COMMENT ON COLUMN public.automations.last_dispatched_at IS 'Wall-clock time the dispatcher actually fired the last run. Usually within seconds of last_scheduled_at; large drift = orchestrator was down or the dispatcher was lagging.';
+
+
+--
+-- Name: canvas_origin_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.canvas_origin_sessions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    session_secret_hash character varying(64) NOT NULL,
+    user_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    canvas_id character varying(64) DEFAULT 'main'::character varying NOT NULL,
+    parent_srw_session_id uuid,
+    issued_presentation_revision bigint NOT NULL,
+    source_fingerprint text NOT NULL,
+    workspace_generation uuid NOT NULL,
+    origin_generation uuid NOT NULL,
+    embedding_origin text NOT NULL,
+    cookie_mode character varying(32) NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    last_renewed_at timestamp with time zone DEFAULT now() NOT NULL,
+    revoked_at timestamp with time zone,
+    revocation_reason character varying(64),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_canvas_origin_session_cookie_mode CHECK (((cookie_mode)::text = ANY ((ARRAY['development-cookie-free'::character varying, 'psl-isolated'::character varying])::text[]))),
+    CONSTRAINT ck_canvas_origin_session_hash CHECK (((session_secret_hash)::text ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT ck_canvas_origin_session_revision CHECK ((issued_presentation_revision > 0)),
+    CONSTRAINT ck_canvas_origin_session_revocation CHECK (((revoked_at IS NULL) = (revocation_reason IS NULL)))
+);
+
+
+--
+-- Name: TABLE canvas_origin_sessions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.canvas_origin_sessions IS 'Short-lived isolated Canvas gateway credentials; only SHA-256 secret hashes are persisted.';
+
+
+--
+-- Name: canvas_view_attachments; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.canvas_view_attachments (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    canvas_id character varying(64) DEFAULT 'main'::character varying NOT NULL,
+    parent_srw_session_id uuid,
+    origin_session_id uuid,
+    bridge_nonce_hash character varying(64) NOT NULL,
+    embedding_origin text NOT NULL,
+    cookie_mode character varying(32) NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    closed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_canvas_attachment_cookie_mode CHECK (((cookie_mode)::text = ANY ((ARRAY['development-cookie-free'::character varying, 'psl-isolated'::character varying])::text[]))),
+    CONSTRAINT ck_canvas_attachment_nonce_hash CHECK (((bridge_nonce_hash)::text ~ '^[0-9a-f]{64}$'::text))
+);
+
+
+--
+-- Name: TABLE canvas_view_attachments; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.canvas_view_attachments IS 'Non-credential frame/window presence records linked to a shared origin session after bootstrap.';
+
+
+--
+-- Name: canvas_view_bootstraps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.canvas_view_bootstraps (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    token_hash character varying(64) NOT NULL,
+    attachment_id uuid NOT NULL,
+    expected_presentation_revision bigint NOT NULL,
+    source_fingerprint text NOT NULL,
+    workspace_generation uuid NOT NULL,
+    origin_generation uuid NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    consumed_origin_session_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_canvas_bootstrap_hash CHECK (((token_hash)::text ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT ck_canvas_bootstrap_revision CHECK ((expected_presentation_revision > 0))
+);
+
+
+--
+-- Name: TABLE canvas_view_bootstraps; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.canvas_view_bootstraps IS 'Single-use, short-lived iframe bootstrap credentials stored only as SHA-256 hashes.';
 
 
 --
@@ -1937,6 +2120,46 @@ ALTER TABLE ONLY public.automations
 
 
 --
+-- Name: canvas_origin_sessions canvas_origin_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_origin_sessions
+    ADD CONSTRAINT canvas_origin_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: canvas_origin_sessions canvas_origin_sessions_session_secret_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_origin_sessions
+    ADD CONSTRAINT canvas_origin_sessions_session_secret_hash_key UNIQUE (session_secret_hash);
+
+
+--
+-- Name: canvas_view_attachments canvas_view_attachments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_attachments
+    ADD CONSTRAINT canvas_view_attachments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: canvas_view_bootstraps canvas_view_bootstraps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_bootstraps
+    ADD CONSTRAINT canvas_view_bootstraps_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: canvas_view_bootstraps canvas_view_bootstraps_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_bootstraps
+    ADD CONSTRAINT canvas_view_bootstraps_token_hash_key UNIQUE (token_hash);
+
+
+--
 -- Name: canvases canvases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2456,6 +2679,69 @@ CREATE INDEX idx_automations_owner ON public.automations USING btree (owner_id);
 --
 
 CREATE INDEX idx_automations_project ON public.automations USING btree (project_id) WHERE (project_id IS NOT NULL);
+
+
+--
+-- Name: idx_canvas_origin_sessions_active_identity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_origin_sessions_active_identity ON public.canvas_origin_sessions USING btree (origin_generation, thread_id, canvas_id) WHERE (revoked_at IS NULL);
+
+
+--
+-- Name: idx_canvas_origin_sessions_expires; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_origin_sessions_expires ON public.canvas_origin_sessions USING btree (expires_at);
+
+
+--
+-- Name: idx_canvas_origin_sessions_parent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_origin_sessions_parent ON public.canvas_origin_sessions USING btree (parent_srw_session_id) WHERE ((revoked_at IS NULL) AND (parent_srw_session_id IS NOT NULL));
+
+
+--
+-- Name: idx_canvas_origin_sessions_user_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_origin_sessions_user_active ON public.canvas_origin_sessions USING btree (user_id) WHERE (revoked_at IS NULL);
+
+
+--
+-- Name: idx_canvas_view_attachments_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_view_attachments_active ON public.canvas_view_attachments USING btree (thread_id, canvas_id, user_id) WHERE (closed_at IS NULL);
+
+
+--
+-- Name: idx_canvas_view_attachments_expires; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_view_attachments_expires ON public.canvas_view_attachments USING btree (expires_at);
+
+
+--
+-- Name: idx_canvas_view_attachments_origin_session; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_view_attachments_origin_session ON public.canvas_view_attachments USING btree (origin_session_id) WHERE ((closed_at IS NULL) AND (origin_session_id IS NOT NULL));
+
+
+--
+-- Name: idx_canvas_view_bootstraps_expires; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_view_bootstraps_expires ON public.canvas_view_bootstraps USING btree (expires_at);
+
+
+--
+-- Name: idx_canvas_view_bootstraps_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_canvas_view_bootstraps_pending ON public.canvas_view_bootstraps USING btree (token_hash) WHERE (consumed_at IS NULL);
 
 
 --
@@ -3152,6 +3438,34 @@ CREATE TRIGGER thread_permission_notify_trigger AFTER UPDATE ON public.thread_pe
 
 
 --
+-- Name: canvas_origin_sessions trg_canvas_origin_session_change; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_canvas_origin_session_change AFTER UPDATE OF revoked_at, expires_at ON public.canvas_origin_sessions FOR EACH ROW EXECUTE FUNCTION public.notify_canvas_origin_session_change();
+
+
+--
+-- Name: srw_sessions trg_canvas_revoke_bff_session; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_canvas_revoke_bff_session BEFORE DELETE ON public.srw_sessions FOR EACH ROW EXECUTE FUNCTION public.revoke_canvas_sessions_for_bff_session();
+
+
+--
+-- Name: canvases trg_canvas_revoke_retired_origin; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_canvas_revoke_retired_origin AFTER UPDATE OF origin_generation ON public.canvases FOR EACH ROW EXECUTE FUNCTION public.revoke_canvas_sessions_for_retired_origin();
+
+
+--
+-- Name: users trg_canvas_revoke_user_admission; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_canvas_revoke_user_admission AFTER UPDATE OF is_approved ON public.users FOR EACH ROW EXECUTE FUNCTION public.revoke_canvas_sessions_for_user_admission();
+
+
+--
 -- Name: datasources update_datasources_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -3231,6 +3545,78 @@ ALTER TABLE ONLY public.automations
 
 ALTER TABLE ONLY public.automations
     ADD CONSTRAINT automations_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_origin_sessions canvas_origin_sessions_parent_srw_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_origin_sessions
+    ADD CONSTRAINT canvas_origin_sessions_parent_srw_session_id_fkey FOREIGN KEY (parent_srw_session_id) REFERENCES public.srw_sessions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: canvas_origin_sessions canvas_origin_sessions_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_origin_sessions
+    ADD CONSTRAINT canvas_origin_sessions_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_origin_sessions canvas_origin_sessions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_origin_sessions
+    ADD CONSTRAINT canvas_origin_sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_view_attachments canvas_view_attachments_origin_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_attachments
+    ADD CONSTRAINT canvas_view_attachments_origin_session_id_fkey FOREIGN KEY (origin_session_id) REFERENCES public.canvas_origin_sessions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: canvas_view_attachments canvas_view_attachments_parent_srw_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_attachments
+    ADD CONSTRAINT canvas_view_attachments_parent_srw_session_id_fkey FOREIGN KEY (parent_srw_session_id) REFERENCES public.srw_sessions(id) ON DELETE SET NULL;
+
+
+--
+-- Name: canvas_view_attachments canvas_view_attachments_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_attachments
+    ADD CONSTRAINT canvas_view_attachments_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_view_attachments canvas_view_attachments_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_attachments
+    ADD CONSTRAINT canvas_view_attachments_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_view_bootstraps canvas_view_bootstraps_attachment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_bootstraps
+    ADD CONSTRAINT canvas_view_bootstraps_attachment_id_fkey FOREIGN KEY (attachment_id) REFERENCES public.canvas_view_attachments(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_view_bootstraps canvas_view_bootstraps_consumed_origin_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_bootstraps
+    ADD CONSTRAINT canvas_view_bootstraps_consumed_origin_session_id_fkey FOREIGN KEY (consumed_origin_session_id) REFERENCES public.canvas_origin_sessions(id) ON DELETE SET NULL;
 
 
 --

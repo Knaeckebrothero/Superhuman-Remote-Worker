@@ -59,6 +59,25 @@ export interface CanvasCapabilities {
   readonly can_edit: boolean;
   readonly can_pop_out: boolean;
   readonly can_take_control: boolean;
+  /**
+   * Positive server capability for creating an isolated live-app attachment.
+   * Optional while older/default-off orchestrators still return the Slice 3A
+   * capability shape; absence always means unsupported.
+   */
+  readonly can_create_viewer_session?: boolean;
+}
+
+export interface CanvasViewAttachment {
+  readonly attachment_id: string;
+  readonly origin: string;
+  readonly bootstrap_url: string;
+  readonly expires_at: string;
+  readonly renew_after: string;
+}
+
+export interface CanvasViewAttachmentRenewal {
+  readonly expires_at: string;
+  readonly renew_after: string;
 }
 
 export interface CanvasState {

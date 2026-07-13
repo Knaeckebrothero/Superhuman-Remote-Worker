@@ -10,8 +10,10 @@ import secrets
 from tempfile import SpooledTemporaryFile
 from typing import Any, Literal
 from urllib.parse import quote, urlencode
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from security.access import require_internal, require_thread_owner
@@ -42,6 +44,15 @@ from services.canvas_files import (
     ValidatedCanvasFile,
     acquire_canvas_response_lease,
     current_workspace_generation,
+)
+from services.canvas_viewer_config import (
+    CanvasViewerConfigurationError,
+    canvas_viewer_config,
+)
+from services.canvas_viewer_sessions import (
+    CanvasViewerError,
+    CanvasViewerSessionService,
+    canvas_viewer_error_detail,
 )
 
 router = APIRouter(
@@ -140,6 +151,10 @@ def _get_app_gateway(db: Any | None = None) -> ThreadWorkspaceAppGateway:
     )
 
 
+def _get_viewer_service(db: Any) -> CanvasViewerSessionService:
+    return CanvasViewerSessionService(db)
+
+
 def _state_response(
     payload: bytes,
     etag: str,
@@ -194,6 +209,62 @@ def _raise_app_error(error: CanvasAppError) -> None:
         status_code=error.status_code,
         detail={"code": error.code, "message": error.message},
     ) from error
+
+
+def _raise_viewer_error(error: CanvasViewerError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail=canvas_viewer_error_detail(error),
+    ) from error
+
+
+def _required_parent_session_id(request: Request) -> UUID:
+    """Require exactly one canonical BFF cookie, never Bearer/MCP fallback."""
+
+    if request.headers.get("Authorization") or any(
+        request.headers.get(name)
+        for name in ("X-Internal-Key", "X-MCP-User-Id", "X-MCP-Token")
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "canvas_parent_session_required",
+                "message": "A current Cockpit session is required",
+            },
+        )
+    values: list[str] = []
+    for header in request.headers.getlist("cookie"):
+        for item in header.split(";"):
+            name, separator, value = item.strip().partition("=")
+            if separator and name == "srw_session":
+                values.append(value.strip())
+    if len(values) != 1:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "canvas_parent_session_required",
+                "message": "A current Cockpit session is required",
+            },
+        )
+    try:
+        session_id = UUID(values[0])
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "canvas_parent_session_required",
+                "message": "A current Cockpit session is required",
+            },
+        ) from exc
+    if str(session_id) != values[0].lower():
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "canvas_parent_session_required",
+                "message": "A current Cockpit session is required",
+            },
+        )
+    return session_id
 
 
 def _required_edit_preconditions(request: Request) -> tuple[str, int]:
@@ -368,6 +439,13 @@ async def _represent(
         # a same-origin fallback while that boundary is absent or disabled.
         if canvas_live_preview_enabled():
             status = await _get_app_gateway(db).status_for_record(thread, record)
+            if status == "ready":
+                try:
+                    viewer = canvas_viewer_config()
+                except CanvasViewerConfigurationError:
+                    viewer = None
+                if viewer is not None and viewer.enabled:
+                    capabilities = CanvasCapabilities(can_create_viewer_session=True)
     return build_public_canvas_representation(
         record,
         status=status,
@@ -482,6 +560,130 @@ async def clear_main_canvas(thread_id: str, request: Request) -> Response:
     assert mutation.record is not None
     representation = build_public_canvas_representation(mutation.record)
     return _state_response(representation.payload, representation.etag)
+
+
+@router.post(
+    "/main/view-attachments",
+    responses={401: {}, 403: {}, 409: {}, 412: {}, 428: {}, 503: {}},
+)
+async def create_main_canvas_view_attachment(
+    thread_id: str, request: Request
+) -> Response:
+    """Create one iframe-only bootstrap from exact authorized Canvas state."""
+
+    parent_session_id = _required_parent_session_id(request)
+    try:
+        await _require_empty_refresh_body(request)
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    db = _get_db()
+    user, thread = await require_thread_owner(request, db, thread_id)
+    record = await _get_canvas_service(db).get(thread_id)
+    if record is None or not isinstance(record.source, WorkspaceAppSource):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "canvas_not_live_app",
+                "message": "The current Canvas is not a live workspace application",
+            },
+        )
+    visible = await _represent(
+        thread_id, thread, record, browser_content_url=True, db=db
+    )
+    expected = request.headers.get("If-Match")
+    if expected is None:
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "code": "canvas_precondition_required",
+                "message": "If-Match is required to attach a Canvas viewer",
+            },
+        )
+    if not secrets.compare_digest(expected.strip(), visible.etag):
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "code": "canvas_precondition_failed",
+                "message": "Canvas state ETag is stale",
+            },
+        )
+    if not visible.state.capabilities.can_create_viewer_session:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "canvas_viewer_unavailable",
+                "message": "Canvas live viewer is unavailable",
+            },
+        )
+    await require_thread_owner(request, db, thread_id)
+    try:
+        grant = await _get_viewer_service(db).create_attachment(
+            user_id=str(user["id"]),
+            thread_id=thread_id,
+            parent_session_id=parent_session_id,
+            embedding_origin=request.headers.get("Origin"),
+            expected_record=record,
+        )
+    except CanvasViewerError as exc:
+        _raise_viewer_error(exc)
+    return JSONResponse(
+        grant.public_dict(), headers={"Cache-Control": "private, no-store"}
+    )
+
+
+@router.post(
+    "/main/view-attachments/{attachment_id}/renew",
+    responses={401: {}, 403: {}, 409: {}, 503: {}},
+)
+async def renew_main_canvas_view_attachment(
+    thread_id: str, attachment_id: UUID, request: Request
+) -> Response:
+    parent_session_id = _required_parent_session_id(request)
+    try:
+        await _require_empty_refresh_body(request)
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    db = _get_db()
+    user, _ = await require_thread_owner(request, db, thread_id)
+    try:
+        renewal = await _get_viewer_service(db).renew_attachment(
+            attachment_id=attachment_id,
+            user_id=str(user["id"]),
+            thread_id=thread_id,
+            parent_session_id=parent_session_id,
+        )
+    except CanvasViewerError as exc:
+        _raise_viewer_error(exc)
+    return JSONResponse(
+        renewal.public_dict(), headers={"Cache-Control": "private, no-store"}
+    )
+
+
+@router.delete(
+    "/main/view-attachments/{attachment_id}",
+    status_code=204,
+    responses={401: {}, 403: {}, 503: {}},
+)
+async def close_main_canvas_view_attachment(
+    thread_id: str, attachment_id: UUID, request: Request
+) -> Response:
+    parent_session_id = _required_parent_session_id(request)
+    try:
+        await _require_empty_refresh_body(request)
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    db = _get_db()
+    user, _ = await require_thread_owner(request, db, thread_id)
+    try:
+        await _get_viewer_service(db).close_attachment(
+            attachment_id=attachment_id,
+            user_id=str(user["id"]),
+            thread_id=thread_id,
+            parent_session_id=parent_session_id,
+        )
+    except CanvasViewerError as exc:
+        _raise_viewer_error(exc)
+    return Response(status_code=204, headers={"Cache-Control": "private, no-store"})
 
 
 def _verify_content_identity(

@@ -161,6 +161,7 @@ class CanvasCapabilities(_StrictFrozenModel):
     can_edit: bool = False
     can_pop_out: bool = False
     can_take_control: bool = False
+    can_create_viewer_session: bool = False
 
 
 class PublicWorkspaceFileSource(_StrictFrozenModel):

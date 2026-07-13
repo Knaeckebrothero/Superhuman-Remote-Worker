@@ -131,6 +131,124 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CANVAS_LIVE_PREVIEW_DENIED_PORTS
+            # Browser viewer control plane. The positive capability requires
+            # both Canvas gates plus the validated deployment attestations;
+            # default values remain false/empty.
+            - name: CANVAS_VIEWER_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_ENABLED
+            - name: CANVAS_VIEWER_DEPLOYMENT_PROFILE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_DEPLOYMENT_PROFILE
+            - name: CANVAS_VIEWER_COOKIE_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_COOKIE_MODE
+            - name: CANVAS_VIEWER_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_DOMAIN
+            - name: CANVAS_VIEWER_HOST_SUFFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_HOST_SUFFIX
+            - name: CANVAS_VIEWER_COCKPIT_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_COCKPIT_ORIGINS
+            - name: CANVAS_VIEWER_RAW_PATH_VERIFIED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_RAW_PATH_VERIFIED
+            - name: CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED
+            - name: CANVAS_VIEWER_SESSION_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_SESSION_TTL_SECONDS
+            - name: CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS
+            - name: CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS
+            - name: CANVAS_VIEWER_REVALIDATE_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_REVALIDATE_SECONDS
+            - name: CANVAS_VIEWER_MAX_CONNECTIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_CONNECTIONS
+            - name: CANVAS_VIEWER_MAX_HTTP_PER_SESSION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_HTTP_PER_SESSION
+            - name: CANVAS_VIEWER_MAX_HEADER_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_HEADER_BYTES
+            - name: CANVAS_VIEWER_MAX_HEADER_FIELDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_HEADER_FIELDS
+            - name: CANVAS_VIEWER_MAX_QUERY_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_QUERY_BYTES
+            - name: CANVAS_VIEWER_MAX_QUERY_FIELDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_QUERY_FIELDS
+            - name: CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES
+            - name: CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES
+            - name: CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS
+            - name: CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS
+            - name: CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS
             - name: VECTOR_POSTGRES_USER
               valueFrom:
                 secretKeyRef:

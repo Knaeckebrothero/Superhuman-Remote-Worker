@@ -186,12 +186,29 @@ ingress:
     enabled: true
     issuerName: mkcert-issuer
 
-# Dynamic Canvas live workspace applications remain gated until the separate
-# wildcard viewer origin and proxy land. File viewing/editing is unaffected.
+# Dynamic Canvas live workspace applications remain gated. The chart now knows
+# how to render an internal-only gateway, but deliberately provides no wildcard
+# viewer ingress/TLS; file viewing/editing is unaffected. The shared development
+# DB/config credentials are not a production deployment contract.
 canvas:
   livePreview:
     enabled: false
     deniedPorts: []
+    viewer:
+      enabled: false
+      deploymentProfile: development
+      cookieMode: ""
+      domain: ""
+      hostSuffix: ""
+      cockpitOrigins: []
+      rawPathVerified: false
+      pslBoundaryVerified: false
+      # Keep these empty while disabled. Enabling requires both selectors to
+      # identify an already-provisioned local wildcard edge.
+      networkPolicy:
+        edgeNamespaceSelector: {}
+        edgePodSelector: {}
+        extraEgress: []
 
 # -----------------------------------------------------------------------------
 # Agent pool — no warm/buffer slots; agents spin up on demand only

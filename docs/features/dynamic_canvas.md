@@ -16,6 +16,8 @@ related:
   - "[[agent_skills]]"
   - "[[dynamic_canvas_slice1_verification]]"
   - "[[dynamic_canvas_slice2_verification]]"
+  - "[[dynamic_canvas_slice3a_verification]]"
+  - "[[dynamic_canvas_slice3b_verification]]"
   - "[[shared_application_action_layer]]"
   - "[[builder_to_sessions_consolidation]]"
   - "[[persistent_chat_ui_redesign]]"
@@ -36,15 +38,20 @@ on local k3d, including a two-replica save race and final browser-visible CORS
 validator exposure. The orchestrator and Cockpit rollouts were ready after the
 final verification. The Slice-1 bodyless-`304` framing defect found during the
 first acceptance pass is fixed and reverified.
-The default-off Slice-3A callable/SSH foundation is also implemented and
-verified, but it deliberately exposes no viewer URL, proxy, or Cockpit live-app
-renderer and does not count as a user-facing Slice-3 release. User-facing
-Slices 3–6 remain planned. Original brainstorm filed 2026-05-13. Pointer model
-agreed and repository, security, accessibility, and comparable-product audits
-completed 2026-07-13. See the
+The default-off Slice-3A callable/SSH foundation and Slice-3B isolated
+ordinary-HTTP viewer checkpoint are also implemented and repository-verified.
+Slice 3B includes the viewer-session control plane, dedicated gateway, strict
+one-port proxy, Cockpit iframe lifecycle, and dark deployment plumbing, but the
+chart intentionally publishes no wildcard ingress and all viewer gates remain
+off by default. It therefore does not count as a production or user-facing
+Slice-3 release. Multi-port/streaming apps and Slices 4–6 remain planned.
+Original brainstorm filed 2026-05-13. Pointer model agreed and repository,
+security, accessibility, and comparable-product audits completed 2026-07-13.
+See the
 [[dynamic_canvas_slice1_verification|Slice-1 verification record]] and
 [[dynamic_canvas_slice2_verification|Slice-2 verification record]], plus the
-[[dynamic_canvas_slice3a_verification|Slice-3A foundation record]].
+[[dynamic_canvas_slice3a_verification|Slice-3A foundation record]] and
+[[dynamic_canvas_slice3b_verification|Slice-3B ordinary-HTTP record]].
 
 ## Decision Summary
 
@@ -836,8 +843,8 @@ editable-file re-read/preservation, static-HTML limits, and stage safety. It
 intentionally refuses to guess app, port, browser, or routing fields which are
 not advertised by the current tool schema. Extend it with app/browser guidance
 only as those corresponding end-to-end presentation surfaces land. The
-default-off Slice-3A callable foundation alone is not such a user-facing
-surface.
+default-off Slice-3A/3B implementation is not yet a deployed user-facing
+surface, so the bundled skill remains file-focused for this checkpoint.
 
 The current and planned guidance contract covers:
 
@@ -1591,25 +1598,37 @@ selected flow is:
    top-level bootstrap as compatibility behavior.
 4. The Canvas gateway consumes it. If the request already carries a valid origin
    session cookie for the same user/source/workspace/origin/embedding identity,
-   it attaches the new view to that session without changing the cookie. If not,
-   it creates a short-lived **origin session**, links the attachment, and
-   responds with a `303` to the canonical clean entry URL plus a host-only
-   cookie. The redirect contains no token or reserved bootstrap query:
+   it attaches the new view to that session and may reissue the same validated
+   value to refresh browser retention up to the immutable parent-session bound.
+   If not, it creates a short-lived **origin session** and links the attachment.
+   The gateway returns a minimal server-owned transition document plus a
+   host-only cookie:
 
    ```text
    __Host-canvas_session=...; Secure; HttpOnly; SameSite=None;
    Partitioned; Path=/
    ```
 
+   Its nonce-bound inline script calls `location.replace()` with the canonical
+   entry path. The next navigation is therefore initiated by a document on the
+   allocated Canvas origin, removes the bootstrap token from the live URL, and
+   carries `Sec-Fetch-Site: same-origin`.
+
    Record the presentation revision at issuance for audit, but authorize
    requests by the still-current origin/source/workspace identity: an unchanged
    same-app health refresh may advance presentation revision without killing
    mounted frames.
-5. The fixed cookie identifies the shared origin session, not one tab. Main
+5. Every ordinary app request requires `Sec-Fetch-Site: same-origin` before
+   cookie authentication. A browser which ignores the unknown `Partitioned`
+   attribute might store the viewer cookie unpartitioned, but an attacker-site
+   image/fetch/iframe request is still rejected before it can reach an app with
+   a state-changing GET. Only the one-time cross-site iframe bootstrap is
+   admitted; browsers without enforceable Fetch Metadata are unsupported.
+6. The fixed cookie identifies the shared origin session, not one tab. Main
    pane, second Cockpit tab, and wrapper pop-out in the same cookie partition
    reuse it; their attachment IDs/nonces drive UI presence only. Closing one
    attachment never revokes or overwrites the session for the others.
-6. A normal Cockpit-wrapper pop-out stays embedded and uses the same flow. If a
+7. A normal Cockpit-wrapper pop-out stays embedded and uses the same flow. If a
    target browser does not support the embedded partitioned-cookie flow, live
    Canvas preview is unsupported in v1. Do not open the app top-level, relax the
    sandbox, or leave a bearer token in asset URLs as a compatibility fallback.
@@ -1656,7 +1675,7 @@ Session enforcement is cluster-wide rather than a process-local cleanup hint:
   registered to and cancellable through its origin session.
 
 This flow requires a real-browser spike across Chrome, Firefox, Safari/iOS, PWA,
-embedded, and pop-out modes before the live-app slice starts. Multi-tenant
+embedded, and pop-out modes before the live-app viewer is enabled. Multi-tenant
 production also requires the Canvas tenant label to be an effective cookie
 boundary (normally a propagated private Public Suffix List entry). Proxy
 rewriting of upstream `Set-Cookie` cannot stop hostile JavaScript from setting a
@@ -1978,11 +1997,13 @@ revocation, thread switch, workspace generation change, or clear.
 - `CanvasPaneComponent`, renderer registry, file renderer adapters, and service.
 - Best-effort conditional file writes, refresh, conflict UX, and editing
   awareness in Slice 2.
-- Separate user-content domain, wildcard ingress/TLS, partitioned viewer-session
-  bootstrap, and per-app origin generations.
+- Per-app origin generations plus a partitioned viewer-session bootstrap and
+  dedicated isolated gateway in Slice 3B. The separately registrable
+  user-content domain and wildcard DNS/TLS edge remain operator-owned launch
+  prerequisites and are intentionally not created by the chart.
 - Shared pinned AsyncSSH transport and bounded one-port readiness in Slice 3A;
-  long-lived proxy channel registration, the manifest route table, and the safe
-  streaming HTTP/WebSocket multiplexer remain.
+  request-scoped, revocation-aware, strict ordinary-HTTP forwarding in Slice
+  3B. The manifest route table and streaming SSE/WebSocket multiplexer remain.
 - Canvas skill and capability-aware scope.
 - Browser renderer adapter once shared-browser streaming exists.
 
@@ -2188,28 +2209,80 @@ gate makes disablement fail closed during that rollout. The companion skill
 stays file-focused until presenting an app produces a usable user-facing stage.
 See [[dynamic_canvas_slice3a_verification]].
 
-The remaining Slice-3 work is:
+**Ordinary-HTTP viewer checkpoint (Slice 3B):** Implemented and default-off as
+of 2026-07-13. It adds:
 
-- Provision a separate registrable wildcard Canvas domain, DNS/TLS/ingress, and
-  per-source origin generations. Production app-cookie mode waits for an
-  effective PSL tenant boundary; PSL-less cookie-free mode is explicitly
-  insecure local development and cannot enable production live preview.
-- Complete the partitioned-cookie/bootstrap/wrapper-pop-out browser matrix;
-  browsers without the embedded authentication flow report live preview as
-  unsupported rather than opening untrusted content top-level.
-- Extend the short-lived 3A direct-channel health path into request-scoped proxy
-  channels with active in-flight registration/cancellation on revocation; keep
-  the fixed loopback destination and never create a local TCP listener.
-- Ship `workspace_port` for bounded ordinary HTTP first, with fixed iframe
-  sandbox/Permissions Policy, bounded decoded/reframed request bodies, streamed
-  response bodies, cancellation,
-  methods/limits, cookies, redirects, Range/HEAD, proxy CSP/header policy,
-  origin-session teardown, and origin-rotation attack tests. SSE and WebSocket are not
-  advertised yet.
+- migration `0061` with hashed origin-session and one-time bootstrap secrets,
+  non-credential view attachments, parent-BFF-session bounds, cleanup indexes,
+  and transaction-delivered revocation notifications;
+- owner-authorized create/renew/close attachment routes which require one exact
+  BFF cookie, reject Bearer/internal-auth hybrids, bind creation to the current
+  Canvas state ETag, and never return a reusable gateway credential to Cockpit;
+- one exact UUID host per `origin_generation`, iframe-only one-time bootstrap,
+  a reserved host-only `Secure; HttpOnly; SameSite=None; Partitioned` viewer
+  cookie, policy-rollover revocation, and PostgreSQL revalidation on every
+  request and at most every configured 15 seconds while an exchange is active;
+- a dedicated ASGI gateway with no API fallback, exact raw-path/host parsing,
+  bounded authentication admission and active-connection registration,
+  fail-closed notification/listener behavior, client-disconnect propagation,
+  and bounded SSH/HTTP teardown;
+- complete-body validation/spooling before upstream bytes, a strict `h11`
+  request/response adapter over a request-scoped pinned SSH direct channel to
+  the single selected loopback port, common HTTP methods, HEAD/Range, safe
+  same-origin/entry-loopback redirects, streamed bounded responses, and
+  gateway-owned no-store/CSP/header policy;
+- a Cockpit attachment controller, exact default-port HTTPS UUID-origin and
+  bootstrap-URL validation before the resource-URL trust boundary, fixed
+  sandbox/referrer/Permissions Policy, teardown on presentation/thread/pane
+  lifecycle changes, and a persistent **do not enter passwords or secrets**
+  warning; and
+- conditional Helm and Compose gateway plumbing, an internal-only service,
+  fail-closed gateway/workspace NetworkPolicies, runtime Cockpit host-suffix
+  injection, and no published development port or chart-owned Ingress.
+
+The browser may retain the opaque viewer cookie only until the immutable parent
+BFF session's absolute expiry. That retention is not authorization: the shorter
+renewable PostgreSQL origin-session expiry remains authoritative on every
+gateway request. A newly authorized bootstrap may reissue the already-validated
+same-host cookie to refresh its browser retention bound; the parent renewal API
+extends only the server lease and cannot silently resurrect an expired session.
+
+Application traffic is deliberately **cookie-free in both deployment modes in
+this checkpoint**. The gateway consumes the reserved viewer cookie, forwards no
+`Cookie`, and drops every upstream `Set-Cookie`. Therefore selecting
+`psl-isolated` satisfies a production configuration precondition but does not
+claim full app-cookie support. SSE, multipart live streams, upgrades, and
+WebSockets fail closed and remain Slice 4 work. The proxy supports only the one
+`entry_port`; it does not interpret a multi-port route manifest yet.
+
+Repository verification covers policy rollover, expiry, renewal, shared-session
+reuse, revocation/cancellation, framing ambiguity, body/response limits,
+redirects, header/cookie stripping, SSH-close stalls, exact frontend URL
+validation, renderer lifecycle, default-off manifests, and conditional network
+policy. See [[dynamic_canvas_slice3b_verification]].
+
+The remaining Slice-3 launch work is:
+
+- provision an operator-owned, separately registrable wildcard Canvas domain,
+  DNS/TLS/raw-path-preserving edge, effective private PSL boundary, and edge
+  rate limits before the gateway; the chart intentionally does not infer or
+  create those resources;
+- replace the gateway's shared application database credential and broad
+  ConfigMap projection with a least-privilege viewer-specific database role and
+  explicit gateway-only configuration/secret contract; and
+- pass the production-build Chromium, Firefox, WebKit, real Safari/iOS, and PWA
+  iframe-authentication, partitioned-cookie, CSP/sandbox, navigation, leakage,
+  logout, expiry, and cross-replica revocation matrix. Unsupported browsers
+  must report live preview unavailable rather than open untrusted content
+  top-level.
+
+These external launch gates do not justify expanding the shared-secret
+architecture inside this checkpoint.
 
 Do not enable or claim the user-facing slice complete until real browsers prove
-no BFF/Keycloak cookie or authorization-header leakage. The default-off 3A
-foundation does not satisfy or bypass that launch gate.
+no BFF/Keycloak cookie or authorization-header leakage. The default-off 3A/3B
+implementation does not satisfy or bypass that launch gate, and it was not
+enabled in local k3d during this checkpoint.
 
 ### Slice 4 — Multi-port and streaming apps
 
@@ -2384,9 +2457,10 @@ claimed as Safari coverage. Cover:
 - When multiple humans can edit one thread, is awareness per canvas sufficient,
   or does it need per-user cursors/locks?
 
-None of these blocked Slices 0–2. The browser authentication matrix is a blocking
-acceptance gate for Slice 3, not an unanswered architecture choice hidden in
-the file-stage scope.
+None of these blocked Slices 0–2 or the default-off 3A/3B implementation
+checkpoints. The browser authentication matrix is a blocking production
+acceptance gate for a user-facing Slice 3 release, not an unanswered
+architecture choice hidden in the file-stage scope.
 
 ## Relationship to Adjacent Features
 

@@ -1,0 +1,19 @@
+{{- if .Values.canvas.livePreview.viewer.enabled }}
+# Internal target only. A separate, operator-owned wildcard TLS/host edge is a
+# launch prerequisite; this chart intentionally creates no Canvas Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8086
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+{{- end }}

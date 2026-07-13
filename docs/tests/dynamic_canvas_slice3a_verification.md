@@ -107,10 +107,13 @@ checkpoint deliberately adds no frontend live-app code.
 
 ## Next implementation gate
 
-Continue Slice 3 only after the deployment has a separately registrable
-user-content domain, wildcard DNS/TLS, an effective private PSL boundary,
-raw-path-preserving outer host dispatch, and the specified real-browser
-authentication/leakage fixtures. The next code then adds viewer sessions and a
-bounded ordinary-HTTP proxy before Cockpit receives its fixed sandboxed iframe
-renderer. Untrusted applications must never fall back to a top-level trusted
-Cockpit or API origin.
+Slice 3B subsequently delivered the default-off viewer-session, isolated
+gateway, ordinary-HTTP proxy, Cockpit iframe, and dark deployment plumbing; see
+`docs/tests/dynamic_canvas_slice3b_verification.md`. The external launch gate
+below remains intentionally unresolved.
+
+Enable user-facing Slice 3 only after the deployment has a separately
+registrable user-content domain, wildcard DNS/TLS, an effective private PSL
+boundary, raw-path-preserving outer host dispatch, and the specified
+real-browser authentication/leakage fixtures. Untrusted applications must never
+fall back to a top-level trusted Cockpit or API origin.

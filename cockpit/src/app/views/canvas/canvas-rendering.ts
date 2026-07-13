@@ -4,7 +4,13 @@ import {Marked, MarkedExtension, Renderer} from 'marked';
 import {CanvasState} from '../../core/models/canvas.model';
 import {environment} from '../../core/environment';
 
-export type CanvasTrustedRenderer = 'markdown' | 'text' | 'html' | 'image' | 'unsupported';
+export type CanvasTrustedRenderer =
+  | 'markdown'
+  | 'text'
+  | 'html'
+  | 'image'
+  | 'app'
+  | 'unsupported';
 
 const MARKDOWN_TAGS = [
   'a', 'annotation', 'blockquote', 'br', 'code', 'del', 'div', 'em', 'h1', 'h2',
@@ -155,6 +161,13 @@ export function resolveCanvasContentUrl(
 
 /** The backend normally resolves `auto`; an unknown/new source fails closed. */
 export function selectCanvasRenderer(state: CanvasState | null): CanvasTrustedRenderer {
+  if (
+    state?.source?.type === 'workspace_app' &&
+    state.renderer === 'auto' &&
+    state.capabilities.can_create_viewer_session === true
+  ) {
+    return 'app';
+  }
   if (!state?.source || state.source.type !== 'workspace_file') return 'unsupported';
   switch (state.renderer) {
     case 'markdown':
@@ -164,6 +177,78 @@ export function selectCanvasRenderer(state: CanvasState | null): CanvasTrustedRe
       return state.renderer;
     default:
       return 'unsupported';
+  }
+}
+
+/**
+ * Validate the server-minted, cross-origin viewer bootstrap before it reaches
+ * Angular's resource-URL trust boundary. Cockpit never derives this URL from a
+ * port, entry path, or origin-generation label.
+ */
+export function resolveCanvasViewerBootstrapUrl(
+  bootstrapUrl: string,
+  origin: string,
+  hostSuffix = environment.canvasViewerHostSuffix,
+  documentBase = typeof document === 'undefined' ? 'https://cockpit.invalid/' : document.baseURI,
+): string | null {
+  if (
+    !hostSuffix ||
+    !/^\.[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(hostSuffix) ||
+    hostSuffix.includes('..') ||
+    hostSuffix !== hostSuffix.toLowerCase()
+  ) {
+    return null;
+  }
+
+  try {
+    const expected = new URL(origin);
+    const bootstrap = new URL(bootstrapUrl);
+    const parent = new URL(documentBase);
+    if (
+      expected.protocol !== 'https:' ||
+      expected.port !== '' ||
+      expected.origin !== origin ||
+      expected.pathname !== '/' ||
+      expected.search ||
+      expected.hash ||
+      expected.username ||
+      expected.password ||
+      expected.origin === parent.origin
+    ) {
+      return null;
+    }
+
+    const hostname = expected.hostname;
+    if (!hostname.endsWith(hostSuffix)) return null;
+    const originLabel = hostname.slice(0, -hostSuffix.length);
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(originLabel)
+    ) {
+      return null;
+    }
+
+    if (
+      bootstrap.protocol !== 'https:' ||
+      bootstrap.origin !== expected.origin ||
+      bootstrap.username ||
+      bootstrap.password ||
+      bootstrap.hash ||
+      bootstrap.pathname !== '/_canvas/bootstrap'
+    ) {
+      return null;
+    }
+    const tokens = bootstrap.searchParams.getAll('token');
+    if (
+      tokens.length !== 1 ||
+      !/^[A-Za-z0-9_-]{32,128}$/.test(tokens[0]) ||
+      bootstrap.search !== `?token=${tokens[0]}` ||
+      Array.from(bootstrap.searchParams.keys()).some(key => key !== 'token')
+    ) {
+      return null;
+    }
+    return bootstrap.href;
+  } catch {
+    return null;
   }
 }
 

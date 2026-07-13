@@ -334,6 +334,69 @@ canvas:
     # -- Additional workspace loopback ports which live preview must reject.
     # The built-in control-port denylist remains enforced independently.
     deniedPorts: []
+    # Browser-facing live-app delivery is a separate, stricter gate. The
+    # conditional gateway below is internal-only: this chart intentionally
+    # renders no wildcard ingress or TLS route for it. Before production launch,
+    # provision a least-privilege Canvas database credential and replace the
+    # broad shared ConfigMap projection with an explicit gateway-only contract.
+    viewer:
+      # -- Create the internal Canvas gateway and let the orchestrator advertise
+      # viewer-session capability. Also requires livePreview.enabled=true and
+      # every deployment attestation below.
+      enabled: false
+      # -- `production` requires a verified effective-PSL boundary and
+      # psl-isolated cookies. `development` may use cookie-free proxy mode but
+      # is not a production security claim.
+      deploymentProfile: production
+      # -- Empty while disabled. Enabled values are `psl-isolated` or, only for
+      # the development profile, `development-cookie-free`.
+      cookieMode: ""
+      # -- Independently registrable user-content domain, without scheme or
+      # wildcard (for example `example-userland.com`). No DNS/ingress is created.
+      domain: ""
+      # -- Exact dotted suffix for random origins (for example
+      # `.canvas.example-userland.com`). Must fall beneath domain.
+      hostSuffix: ""
+      # -- Exact trusted HTTPS Cockpit origins allowed to embed the gateway.
+      cockpitOrigins: []
+      # -- Explicit operator attestations. Enabling a viewer without the raw
+      # path guarantee fails chart validation. Production also requires PSL.
+      rawPathVerified: false
+      pslBoundaryVerified: false
+      sessionTtlSeconds: 900
+      bootstrapTtlSeconds: 60
+      attachmentTtlSeconds: 1200
+      revalidateSeconds: 15
+      replicas: 1
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "50m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      limits:
+        maxConnections: 256
+        maxHttpPerSession: 16
+        maxHeaderBytes: 65536
+        maxHeaderFields: 100
+        maxQueryBytes: 16384
+        maxQueryFields: 256
+        maxRequestBodyBytes: 10485760
+        maxResponseBodyBytes: 104857600
+        connectTimeoutSeconds: 5
+        idleTimeoutSeconds: 60
+        exchangeTimeoutSeconds: 300
+      networkPolicy:
+        # -- Both selectors must contain matchLabels and/or matchExpressions
+        # before viewer.enabled can be set. They identify the operator-owned
+        # edge allowed to reach the otherwise internal Service on TCP/8086.
+        edgeNamespaceSelector: {}
+        edgePodSelector: {}
+        # -- Raw egress rules for an external app Postgres endpoint or
+        # non-pod workspace SSH target. Built-in rules cover cluster DNS,
+        # chart Postgres, and labelled in-cluster workspaces on SSH 22/30022.
+        extraEgress: []
 
 # =============================================================================
 # Auth — cockpit cookie BFF + (future) PAT system

@@ -33,6 +33,13 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+        {{- if .Values.canvas.livePreview.viewer.enabled }}
+        # Canvas origin/session authorization and revocation state is stored in
+        # the application database; the internal gateway needs no other DB.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 14 }}
+        {{- end }}
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
