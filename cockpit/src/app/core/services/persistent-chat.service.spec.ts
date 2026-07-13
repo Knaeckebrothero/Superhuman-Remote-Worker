@@ -2,7 +2,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {NgZone, signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
-import {of, throwError} from 'rxjs';
+import {of, Subject, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService, historyToTurns, cloudCountFromSummary} from './persistent-chat.service';
 import {ApiService} from './api.service';
@@ -20,6 +20,7 @@ import {
     UserTurn,
 } from '../models/turn.model';
 import {ThreadCloudDiffSummary} from '../models/api.model';
+import {PersistentThreadTransportBridge} from './persistent-thread-transport-bridge.service';
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -208,8 +209,10 @@ function createService(opts: {
         ],
     });
     const service = TestBed.inject(PersistentChatService);
+    const threadTransport = TestBed.inject(PersistentThreadTransportBridge);
     return {
         service,
+        threadTransport,
         mockHttp,
         mockApi,
         mockCache,
@@ -680,6 +683,274 @@ describe('PersistentChatService — connect()', () => {
         expect(service.isConnected()).toBe(true);
         expect(service.error()).toBeNull();
     });
+
+    it('does not let a slow stale connect reclaim a newer thread route', async () => {
+        const {service, mockHttp, sseInstances, wsInstances} = createService();
+        const slowAMeta = new Subject<Record<string, unknown>>();
+        let markAMetaRequested: () => void = () => {};
+        const aMetaRequested = new Promise<void>((resolve) => {
+            markAMetaRequested = resolve;
+        });
+
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/persistent/threads/thread-A/messages')) {
+                return of({
+                    messages: [{
+                        id: 'a-user',
+                        role: 'human',
+                        content: 'history A',
+                        tool_calls: null,
+                        turn_number: 1,
+                        created_at: '2026-07-13T08:00:00Z',
+                    }],
+                    total: 1,
+                });
+            }
+            if (url.endsWith('/persistent/threads/thread-A')) {
+                markAMetaRequested();
+                return slowAMeta.asObservable();
+            }
+            if (url.endsWith('/persistent/threads/thread-B/messages')) {
+                return of({
+                    messages: [{
+                        id: 'b-user',
+                        role: 'human',
+                        content: 'history B',
+                        tool_calls: null,
+                        turn_number: 1,
+                        created_at: '2026-07-13T08:01:00Z',
+                    }],
+                    total: 1,
+                });
+            }
+            if (url.endsWith('/persistent/threads/thread-B')) {
+                return of({status: 'active', title: 'Thread B', total_turns: 1});
+            }
+            if (url.endsWith('/sessions/thread-B/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-B'});
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active'});
+        });
+
+        const connectA = service.connect('thread-A');
+        await aMetaRequested;
+        await service.connect('thread-B');
+
+        // Resolve A only after B owns the state and both transports.
+        slowAMeta.next({status: 'active', title: 'Thread A', total_turns: 1});
+        slowAMeta.complete();
+        await connectA;
+
+        expect(service.threadId()).toBe('thread-B');
+        expect(service.sessionTitle()).toBe('Thread B');
+        expect(service.turns().map((turn) => turn.id)).toEqual(['b-user']);
+        expect(sseInstances).toHaveLength(1);
+        expect(sseInstances[0].url).toContain('/persistent/threads/thread-B/stream');
+        expect(wsInstances).toHaveLength(1);
+        expect(wsInstances[0].url).toBe('ws://thread-B');
+    });
+
+    it('lets the newer thread replace a stale control-WebSocket open', async () => {
+        const {service, mockHttp, sseInstances, wsInstances} = createService();
+        const slowAConnection = new Subject<Record<string, unknown>>();
+        let markAConnectionRequested: () => void = () => {};
+        const aConnectionRequested = new Promise<void>((resolve) => {
+            markAConnectionRequested = resolve;
+        });
+
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/persistent/threads/thread-A')) {
+                return of({status: 'active', title: 'Thread A', total_turns: 0});
+            }
+            if (url.endsWith('/persistent/threads/thread-B')) {
+                return of({status: 'active', title: 'Thread B', total_turns: 0});
+            }
+            if (url.endsWith('/sessions/thread-A/connection')) {
+                markAConnectionRequested();
+                return slowAConnection.asObservable();
+            }
+            if (url.endsWith('/sessions/thread-B/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-B'});
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active'});
+        });
+
+        const connectA = service.connect('thread-A');
+        await aConnectionRequested;
+        await service.connect('thread-B');
+        slowAConnection.next({state: 'ready', ws_url: 'ws://thread-A'});
+        slowAConnection.complete();
+        await connectA;
+
+        expect(service.threadId()).toBe('thread-B');
+        expect(sseInstances).toHaveLength(2);
+        expect(sseInstances[0].close).toHaveBeenCalled();
+        expect(sseInstances[1].url).toContain('/persistent/threads/thread-B/stream');
+        expect(wsInstances).toHaveLength(1);
+        expect(wsInstances[0].url).toBe('ws://thread-B');
+    });
+
+    it('ignores a queued direct frame from the previous thread WebSocket', async () => {
+        const {service, mockHttp, wsInstances, threadTransport} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/persistent/threads/thread-A')) {
+                return of({status: 'active', title: 'Thread A', total_turns: 0});
+            }
+            if (url.endsWith('/persistent/threads/thread-B')) {
+                return of({status: 'active', title: 'Thread B', total_turns: 0});
+            }
+            if (url.endsWith('/sessions/thread-A/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-A'});
+            }
+            if (url.endsWith('/sessions/thread-B/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-B'});
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active'});
+        });
+
+        await service.connect('thread-A');
+        const staleOnMessage = wsInstances[0].onmessage;
+        const staleOnClose = wsInstances[0].onclose;
+        await service.connect('thread-B');
+        expect(wsInstances[0].onmessage).toBeNull();
+
+        const invalidations: unknown[] = [];
+        const subscription = threadTransport.canvasInvalidations$.subscribe((event) =>
+            invalidations.push(event),
+        );
+        staleOnClose({code: 1006, reason: 'late A close'} as CloseEvent);
+        staleOnMessage({
+            data: JSON.stringify({
+                method: 'canvas.reconcile_required',
+                params: {canvas_id: 'main', reason: 'stale-A-frame'},
+            }),
+        } as MessageEvent);
+
+        expect(service.threadId()).toBe('thread-B');
+        expect((service as any).controlWs).toBe(wsInstances[1]);
+        expect(invalidations).toEqual([]);
+        subscription.unsubscribe();
+    });
+
+    it('forwards Canvas SSE invalidations through the typed bridge without resetting chat', async () => {
+        const {service, mockHttp, sseInstances, threadTransport} = createService();
+        mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        const invalidations: unknown[] = [];
+        const subscription = threadTransport.canvasInvalidations$.subscribe((event) =>
+            invalidations.push(event),
+        );
+
+        await service.connect('thread-canvas');
+        fireSseMessage(sseInstances[0], {
+            method: 'canvas.updated',
+            params: {
+                canvas_id: 'main',
+                presentation_revision: 3,
+                source_type: 'workspace_file',
+                _seq: [1, 4],
+            },
+        });
+
+        expect(invalidations).toEqual([
+            expect.objectContaining({
+                threadId: 'thread-canvas',
+                method: 'canvas.updated',
+                presentationRevision: 3,
+            }),
+        ]);
+        expect(service.turns()).toEqual([]);
+        subscription.unsubscribe();
+    });
+
+    it('keeps Canvas control sending on the existing thread WebSocket owner', async () => {
+        const {service, mockHttp, wsInstances, threadTransport} = createService();
+        mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await service.connect('thread-canvas');
+
+        const accepted = threadTransport.sendCanvasControl('thread-canvas', {
+            method: 'canvas.source_updated',
+            canvas_id: 'main',
+            path: 'output/report.md',
+            presentation_revision: 4,
+            source_version: 'sha256:abc',
+        });
+
+        expect(accepted).toBe(true);
+        expect(wsInstances).toHaveLength(1);
+        expect(wsInstances[0].send).toHaveBeenCalledWith(
+            JSON.stringify({
+                method: 'canvas.source_updated',
+                canvas_id: 'main',
+                path: 'output/report.md',
+                presentation_revision: 4,
+                source_version: 'sha256:abc',
+            }),
+        );
+
+        expect(
+            threadTransport.sendCanvasControl('another-thread', {
+                method: 'canvas.source_updated',
+                canvas_id: 'main',
+                path: 'output/report.md',
+                presentation_revision: 4,
+                source_version: 'sha256:abc',
+            }),
+        ).toBe(false);
+        expect(wsInstances[0].send).toHaveBeenCalledTimes(1);
+    });
+
+    it('truthfully rejects a Canvas control while the WebSocket is still connecting', () => {
+        const {service, threadTransport} = createService();
+        const connectingWs = createMockWs();
+        connectingWs.readyState = WebSocket.CONNECTING;
+        service.threadId.set('thread-canvas');
+        (service as any).controlWs = connectingWs;
+
+        const accepted = threadTransport.sendCanvasControl('thread-canvas', {
+            method: 'canvas.source_updated',
+            canvas_id: 'main',
+            path: 'output/report.md',
+            presentation_revision: 4,
+            source_version: 'sha256:abc',
+        });
+
+        expect(accepted).toBe(false);
+        expect(connectingWs.send).not.toHaveBeenCalled();
+    });
+
+    it('forwards a direct reconcile-required control frame without an SSE sequence', async () => {
+        const {service, mockHttp, wsInstances, threadTransport} = createService();
+        mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        const invalidations: unknown[] = [];
+        threadTransport.canvasInvalidations$.subscribe((event) => invalidations.push(event));
+        await service.connect('thread-canvas');
+
+        wsInstances[0].onmessage({
+            data: JSON.stringify({
+                method: 'canvas.reconcile_required',
+                params: {canvas_id: 'main', reason: 'write_failed'},
+            }),
+        } as MessageEvent);
+
+        expect(invalidations).toEqual([
+            expect.objectContaining({
+                threadId: 'thread-canvas',
+                method: 'canvas.reconcile_required',
+                presentationRevision: null,
+            }),
+        ]);
+    });
 });
 
 describe('PersistentChatService — createAndConnect()', () => {
@@ -756,6 +1027,71 @@ describe('PersistentChatService — createAndConnect()', () => {
         resolvePost({thread_id: 'thread-new'});
         await promise;
         expect(service.threadId()).toBe('thread-new');
+    });
+
+    it('does not connect a newly-created thread after the user navigates elsewhere', async () => {
+        const {service, mockHttp, sseInstances} = createService();
+        const createResponse = new Subject<{thread_id: string}>();
+        mockHttp.post.mockImplementation((url: string) =>
+            url.endsWith('/persistent/threads') ? createResponse.asObservable() : of({}),
+        );
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/persistent/threads/thread-B')) {
+                return of({status: 'active', title: 'Thread B', total_turns: 0});
+            }
+            if (url.endsWith('/sessions/thread-B/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-B'});
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active'});
+        });
+
+        const create = service.createAndConnect({config_name: 'scholar'});
+        await service.connect('thread-B');
+        createResponse.next({thread_id: 'thread-created'});
+        createResponse.complete();
+
+        await expect(create).resolves.toBe('thread-created');
+        expect(service.threadId()).toBe('thread-B');
+        expect(service.sessionTitle()).toBe('Thread B');
+        expect(sseInstances).toHaveLength(1);
+        expect(sseInstances[0].url).toContain('/persistent/threads/thread-B/stream');
+    });
+});
+
+describe('PersistentChatService — resume navigation safety', () => {
+    it('does not reconnect the resumed thread after navigation to another thread', async () => {
+        const {service, mockHttp, sseInstances} = createService();
+        const resumeResponse = new Subject<Record<string, never>>();
+        service.threadId.set('thread-A');
+        mockHttp.post.mockImplementation((url: string) =>
+            url.endsWith('/persistent/threads/thread-A/resume')
+                ? resumeResponse.asObservable()
+                : of({}),
+        );
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/persistent/threads/thread-B')) {
+                return of({status: 'active', title: 'Thread B', total_turns: 0});
+            }
+            if (url.endsWith('/sessions/thread-B/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-B'});
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active'});
+        });
+
+        const resume = service.resumeSession();
+        await service.connect('thread-B');
+        resumeResponse.next({});
+        resumeResponse.complete();
+        await resume;
+
+        expect(service.threadId()).toBe('thread-B');
+        expect(service.sessionTitle()).toBe('Thread B');
+        expect(sseInstances).toHaveLength(1);
+        expect(sseInstances[0].url).toContain('/persistent/threads/thread-B/stream');
     });
 });
 

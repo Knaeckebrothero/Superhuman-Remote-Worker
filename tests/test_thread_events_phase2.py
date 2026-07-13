@@ -3,7 +3,7 @@ semantics, per-turn lock. DB-integration tests (migration apply, full SSE
 replay, prune sweep) live separately and are gated on a running Postgres.
 
 Covers:
-  - _broadcast stamps (epoch, seq) cursors and schedules _persist_event.
+  - _broadcast stamps (epoch, seq) cursors and queues the ordered writer.
   - _loop_check_interrupt tri-state mode (also exercised in test_persistent_app).
   - WS interrupt handler picks hard vs graceful based on _tool_inflight.
   - Interrupt mid-stream in persistent_graph: "hard" drops partial AIMessage,
@@ -15,19 +15,73 @@ Covers:
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# Section 1 — _broadcast cursor + _persist_event scheduling
+# Section 1 — _broadcast cursor + ordered journal writer
 # ---------------------------------------------------------------------------
+
+
+class TestEventJournalEpochAllocation:
+    @staticmethod
+    def _pool(conn):
+        class _Acquire:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        pool = MagicMock()
+        pool.acquire = lambda: _Acquire()
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_unconditionally_allocates_a_new_runtime_generation(self):
+        """An empty/pruned prior epoch must never be reused on reattach."""
+        import src.api.persistent_app as mod
+
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value={"events_epoch": 8})
+
+        epoch = await mod._resolve_event_journal_epoch(
+            self._pool(conn), "thread-pruned"
+        )
+
+        assert epoch == 8
+        sql, thread_id = conn.fetchrow.await_args.args
+        assert "events_epoch = events_epoch + 1" in " ".join(sql.split())
+        assert "MAX(seq)" not in sql
+        assert thread_id == "thread-pruned"
+
+    @pytest.mark.asyncio
+    async def test_missing_thread_fails_closed(self):
+        import src.api.persistent_app as mod
+
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value=None)
+
+        with pytest.raises(mod.EventJournalUnavailable, match="does not exist"):
+            await mod._resolve_event_journal_epoch(self._pool(conn), "thread-missing")
+
+    @pytest.mark.asyncio
+    async def test_database_error_is_wrapped_as_journal_unavailable(self):
+        import src.api.persistent_app as mod
+
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(side_effect=RuntimeError("database offline"))
+
+        with pytest.raises(mod.EventJournalUnavailable, match="initialization failed"):
+            await mod._resolve_event_journal_epoch(self._pool(conn), "thread-db")
 
 
 class TestBroadcastCursor:
     """Phase 2 changes: _broadcast pre-increments seq, stamps (epoch, seq)
-    into the frame's params, and schedules a fire-and-forget DB write."""
+    into the frame's params, and queues one ordered DB writer."""
 
     def setup_method(self):
         import src.api.persistent_app as mod
@@ -35,6 +89,7 @@ class TestBroadcastCursor:
         mod._subscribers.clear()
         mod._events_epoch = 0
         mod._next_seq = 0
+        mod._event_writer = None
         mod._session = None  # disables the DB write scheduling
 
     def teardown_method(self):
@@ -43,6 +98,7 @@ class TestBroadcastCursor:
         mod._subscribers.clear()
         mod._events_epoch = 0
         mod._next_seq = 0
+        mod._event_writer = None
         mod._session = None
 
     def test_broadcast_increments_seq_monotonically(self):
@@ -85,11 +141,10 @@ class TestBroadcastCursor:
         assert "_seq" in frame["params"]
 
     @pytest.mark.asyncio
-    async def test_broadcast_schedules_persist_task_when_session_present(
+    async def test_broadcast_queues_ordered_writer_when_session_present(
         self,
     ):
-        """When _session is set with a postgres_conn, _broadcast spawns a
-        _persist_event task. Without _session it's a pure broadcast."""
+        """A DB-backed session routes broadcast persistence through its writer."""
         import src.api.persistent_app as mod
 
         # Fake session with a no-op acquire that records the call.
@@ -114,15 +169,199 @@ class TestBroadcastCursor:
         mod._session = fake_session
         mod._thread_id = "thread-xyz"
         mod._subscribe("c1")
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=fake_conn,
+            thread_id="thread-xyz",
+            on_terminal_failure=mod._event_persistence_failed,
+        )
+        writer.start()
+        mod._event_writer = writer
 
         mod._broadcast("token", {"content": "hi"})
-        # The DB write is scheduled — let the event loop drain.
-        await asyncio.sleep(0.05)
+        await writer.close()
+        mod._event_writer = None
 
-        assert recorded, "expected _persist_event to call execute()"
+        assert recorded, "expected the ordered writer to call execute()"
         # First arg is the INSERT SQL; subsequent args bind values.
         sql = recorded[0][0]
         assert "INSERT INTO thread_events" in sql
+        assert "ON CONFLICT" not in sql
+        rows = json.loads(recorded[0][2])
+        assert [(row["seq"], row["kind"]) for row in rows] == [(1, "token")]
+
+
+class TestOrderedPersistentEventWriter:
+    @staticmethod
+    def _pool(conn):
+        class _Acquire:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        pool = MagicMock()
+        pool.acquire = lambda: _Acquire()
+        return pool
+
+    @pytest.mark.asyncio
+    async def test_never_starts_later_write_while_earlier_batch_is_blocked(self):
+        """The regression: seq 2 cannot race past a slow seq 1 insert."""
+        import src.api.persistent_app as mod
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        started: list[list[int]] = []
+        completed: list[list[int]] = []
+        active = 0
+        max_active = 0
+
+        class _Conn:
+            async def execute(self, _sql, _thread_id, rows_json):
+                nonlocal active, max_active
+                seqs = [row["seq"] for row in json.loads(rows_json)]
+                started.append(seqs)
+                active += 1
+                max_active = max(max_active, active)
+                if seqs == [1]:
+                    first_started.set()
+                    await release_first.wait()
+                completed.append(seqs)
+                active -= 1
+
+        failures = []
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=self._pool(_Conn()),
+            thread_id="thread-ordered",
+            on_terminal_failure=lambda events, reason: failures.append(
+                (events, reason)
+            ),
+            batch_size=1,
+        )
+        writer.start()
+        assert writer.enqueue(
+            mod._QueuedPersistentEvent(0, 1, "token", {"content": "one"})
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        assert writer.enqueue(
+            mod._QueuedPersistentEvent(0, 2, "token", {"content": "two"})
+        )
+        assert writer.enqueue(
+            mod._QueuedPersistentEvent(0, 3, "token", {"content": "three"})
+        )
+        await asyncio.sleep(0)
+        assert started == [[1]]
+
+        release_first.set()
+        await writer.close()
+
+        assert started == [[1], [2], [3]]
+        assert completed == [[1], [2], [3]]
+        assert max_active == 1
+        assert failures == []
+
+    @pytest.mark.asyncio
+    async def test_persists_a_fifo_burst_in_one_batch(self):
+        import src.api.persistent_app as mod
+
+        calls = []
+
+        class _Conn:
+            async def execute(self, _sql, _thread_id, rows_json):
+                calls.append(json.loads(rows_json))
+
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=self._pool(_Conn()),
+            thread_id="thread-batch",
+            on_terminal_failure=lambda _events, _reason: None,
+            batch_size=10,
+        )
+        writer.start()
+        for seq in range(1, 4):
+            assert writer.enqueue(
+                mod._QueuedPersistentEvent(4, seq, "token", {"content": str(seq)})
+            )
+        await writer.close()
+
+        assert len(calls) == 1
+        assert [row["seq"] for row in calls[0]] == [1, 2, 3]
+        assert all(row["epoch"] == 4 for row in calls[0])
+
+    @pytest.mark.asyncio
+    async def test_canvas_failure_retries_then_sends_unjournaled_reconcile(self):
+        import src.api.persistent_app as mod
+
+        attempts = 0
+
+        class _Conn:
+            async def execute(self, _sql, _thread_id, _rows_json):
+                nonlocal attempts
+                attempts += 1
+                raise RuntimeError("database unavailable")
+
+        mod._subscribers.clear()
+        with patch.object(mod, "_orchestrator_client", None):
+            queue = mod._subscribe("canvas-client")
+            writer = mod._OrderedPersistentEventWriter(
+                postgres_conn=self._pool(_Conn()),
+                thread_id="thread-canvas",
+                on_terminal_failure=mod._event_persistence_failed,
+                state_max_attempts=3,
+                retry_base_s=0,
+            )
+            writer.start()
+            assert writer.enqueue(
+                mod._QueuedPersistentEvent(
+                    2,
+                    9,
+                    "canvas.updated",
+                    {"canvas_id": "main", "presentation_revision": 7},
+                )
+            )
+            await writer.close()
+
+        assert attempts == 3
+        assert queue.get_nowait() == {
+            "method": "canvas.reconcile_required",
+            "params": {"canvas_id": "main", "reason": "write_failed"},
+        }
+        assert queue.empty()
+        mod._subscribers.clear()
+
+    @pytest.mark.asyncio
+    async def test_full_queue_does_not_silently_drop_canvas_invalidation(self):
+        import src.api.persistent_app as mod
+
+        class _Conn:
+            async def execute(self, _sql, _thread_id, _rows_json):
+                return None
+
+        mod._subscribers.clear()
+        with patch.object(mod, "_orchestrator_client", None):
+            queue = mod._subscribe("canvas-client")
+            writer = mod._OrderedPersistentEventWriter(
+                postgres_conn=self._pool(_Conn()),
+                thread_id="thread-overflow",
+                on_terminal_failure=mod._event_persistence_failed,
+                queue_maxsize=1,
+            )
+            writer.start()
+            assert writer.enqueue(
+                mod._QueuedPersistentEvent(1, 1, "token", {"content": "full"})
+            )
+            assert not writer.enqueue(
+                mod._QueuedPersistentEvent(
+                    1, 2, "canvas.updated", {"canvas_id": "main"}
+                )
+            )
+            await writer.close()
+
+        assert queue.get_nowait() == {
+            "method": "canvas.reconcile_required",
+            "params": {"canvas_id": "main", "reason": "queue_overflow"},
+        }
+        mod._subscribers.clear()
 
 
 # ---------------------------------------------------------------------------

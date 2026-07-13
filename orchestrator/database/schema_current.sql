@@ -299,6 +299,81 @@ COMMENT ON COLUMN public.automations.last_dispatched_at IS 'Wall-clock time the 
 
 
 --
+-- Name: canvases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.canvases (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    thread_id uuid NOT NULL,
+    canvas_id character varying(64) DEFAULT 'main'::character varying NOT NULL,
+    source jsonb,
+    title text,
+    renderer character varying(32) DEFAULT 'auto'::character varying NOT NULL,
+    editable boolean DEFAULT false NOT NULL,
+    alt_text text,
+    presentation_revision bigint DEFAULT 0 NOT NULL,
+    source_fingerprint text,
+    source_version text,
+    origin_generation uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_canvases_alt_text_length CHECK (((alt_text IS NULL) OR (char_length(alt_text) <= 1000))),
+    CONSTRAINT ck_canvases_revision_nonnegative CHECK ((presentation_revision >= 0)),
+    CONSTRAINT ck_canvases_source_shape CHECK ((((source IS NULL) AND (source_fingerprint IS NULL) AND (source_version IS NULL) AND (origin_generation IS NULL) AND (title IS NULL) AND (alt_text IS NULL) AND (editable = false) AND ((renderer)::text = 'auto'::text)) OR ((source IS NOT NULL) AND (source_fingerprint IS NOT NULL) AND (title IS NOT NULL)))),
+    CONSTRAINT ck_canvases_title_length CHECK (((title IS NULL) OR (char_length(title) <= 200)))
+);
+
+
+--
+-- Name: TABLE canvases; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.canvases IS 'Thread-scoped Dynamic Canvas presentation pointers; source content is not copied here.';
+
+
+--
+-- Name: COLUMN canvases.canvas_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvases.canvas_id IS 'Presentation slot. V1 application services accept only main.';
+
+
+--
+-- Name: COLUMN canvases.source; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvases.source IS 'Server-normalized logical source; never contains credentials, proxy URLs, or workspace addresses.';
+
+
+--
+-- Name: COLUMN canvases.presentation_revision; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvases.presentation_revision IS 'Monotonic presentation-domain revision, advanced once per successful state transition.';
+
+
+--
+-- Name: COLUMN canvases.source_fingerprint; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvases.source_fingerprint IS 'sha256 fingerprint of the canonical security-relevant logical source identity.';
+
+
+--
+-- Name: COLUMN canvases.source_version; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvases.source_version IS 'Strong sha256 content version for file-backed sources; distinct from presentation_revision.';
+
+
+--
+-- Name: COLUMN canvases.origin_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvases.origin_generation IS 'Random revocable browser-origin generation for a live application trust unit.';
+
+
+--
 -- Name: capability_grants; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1593,7 +1668,7 @@ CREATE TABLE public.threads (
 -- Name: COLUMN threads.events_epoch; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log epoch for this thread. Agent bumps on attach when a cold checkpoint restart loses its in-memory seq counter; client cursors from older epochs trigger a full re-sync.';
+COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log runtime generation. The agent allocates a new epoch on every DB-backed runtime attach; older client cursors trigger authoritative re-sync.';
 
 
 --
@@ -1796,6 +1871,14 @@ ALTER TABLE ONLY public.agents
 
 ALTER TABLE ONLY public.automations
     ADD CONSTRAINT automations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: canvases canvases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvases
+    ADD CONSTRAINT canvases_pkey PRIMARY KEY (id);
 
 
 --
@@ -2132,6 +2215,14 @@ ALTER TABLE ONLY public.thread_permission_requests
 
 ALTER TABLE ONLY public.threads
     ADD CONSTRAINT threads_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: canvases uq_canvases_thread_canvas; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvases
+    ADD CONSTRAINT uq_canvases_thread_canvas UNIQUE (thread_id, canvas_id);
 
 
 --
@@ -2822,6 +2913,13 @@ CREATE INDEX schema_migrations_dirty_idx ON public.schema_migrations USING btree
 
 
 --
+-- Name: uq_canvases_origin_generation; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_canvases_origin_generation ON public.canvases USING btree (origin_generation) WHERE (origin_generation IS NOT NULL);
+
+
+--
 -- Name: uq_config_override; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3048,6 +3146,14 @@ ALTER TABLE ONLY public.automations
 
 ALTER TABLE ONLY public.automations
     ADD CONSTRAINT automations_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvases canvases_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvases
+    ADD CONSTRAINT canvases_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --
