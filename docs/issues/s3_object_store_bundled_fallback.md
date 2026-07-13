@@ -51,9 +51,14 @@ suspension — each failing at a different, late point.
    the features that will be degraded, instead of today's per-feature late
    failures.
 
-**Current scope:** Item 1 (bundled Garage backing snapshots + virtual tier) is
-under implementation. Item 3 (orchestrator no-store startup warning) remains a
-separate fast-follow.
+**Current scope:** Item 1 (bundled Garage backing snapshots + virtual tier)
+IMPLEMENTED + live-verified on k3d (chart-only). Item 2 guardrails shipped with
+it. Item 3 (orchestrator no-store startup warning) IMPLEMENTED —
+`_object_store_startup_warning` in `orchestrator/main.py` emits one loud
+`logger.warning` from the lifespan when `S3_ENDPOINT` is empty and the virtual
+tier has no durable `s3` store (unit-tested in
+`tests/test_lite_workspace_dispatch.py`). All three proposal items now
+addressed; unpushed on develop.
 
 ## Non-goals
 
