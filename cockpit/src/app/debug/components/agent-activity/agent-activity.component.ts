@@ -316,7 +316,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg);
         position: relative;
       }
 
@@ -325,18 +325,18 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: flex;
         gap: 4px;
         padding: 8px;
-        background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--panel-header-bg);
+        border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
         align-items: center;
       }
 
       .filter-btn {
         padding: 5px 12px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -344,22 +344,22 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .filter-btn:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .filter-btn.active {
-        background: var(--accent-color, #cba6f7);
-        color: var(--on-accent, var(--timeline-bg, #11111b));
-        border-color: var(--accent-color, #cba6f7);
+        background: var(--accent-color);
+        color: var(--on-accent, var(--timeline-bg));
+        border-color: var(--accent-color);
       }
 
       .sort-btn {
         padding: 5px 10px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -368,15 +368,15 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .sort-btn:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .entry-count {
         margin-left: auto;
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Loading Overlay */
@@ -403,21 +403,21 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: #f38ba8;
+        color: var(--danger);
         flex: 1;
       }
 
       .error-state button {
         padding: 8px 16px;
-        border: 1px solid #f38ba8;
+        border: 1px solid var(--danger);
         border-radius: var(--radius-control);
         background: transparent;
-        color: #f38ba8;
+        color: var(--danger);
         cursor: pointer;
       }
 
       .error-state button:hover {
-        background: rgba(243, 139, 168, 0.1);
+        background: color-mix(in srgb, var(--danger) 10%, transparent);
       }
 
       /* Empty State */
@@ -428,7 +428,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex: 1;
       }
 
@@ -452,32 +452,32 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .entry-item {
-        border-left: 3px solid var(--border-color, #45475a);
+        border-left: 3px solid var(--border-color);
         margin-bottom: 4px;
         border-radius: var(--radius-surface);
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
         transition: all 0.15s ease;
       }
 
       .entry-item:hover {
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
       }
 
       /* Phase-based background tinting */
       .entry-item.phase-strategic {
-        background: rgba(203, 166, 247, 0.06);
+        background: color-mix(in srgb, var(--accent-color) 6%, transparent);
       }
 
       .entry-item.phase-strategic:hover {
-        background: rgba(203, 166, 247, 0.10);
+        background: color-mix(in srgb, var(--accent-color) 10%, transparent);
       }
 
       .entry-item.phase-tactical {
-        background: rgba(166, 227, 161, 0.06);
+        background: color-mix(in srgb, var(--success) 6%, transparent);
       }
 
       .entry-item.phase-tactical:hover {
-        background: rgba(166, 227, 161, 0.10);
+        background: color-mix(in srgb, var(--success) 10%, transparent);
       }
 
       .entry-header {
@@ -492,7 +492,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .step-number {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         min-width: 36px;
       }
 
@@ -501,31 +501,31 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         border-radius: var(--radius-tag);
         font-size: 10px;
         font-weight: 600;
-        color: var(--timeline-bg, #11111b);
+        color: var(--timeline-bg);
         text-transform: uppercase;
       }
 
       .node-name {
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         flex: 1;
       }
 
       .latency {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .timestamp {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .expand-icon {
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         width: 16px;
         text-align: center;
       }
@@ -533,7 +533,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       /* Entry Details */
       .entry-details {
         padding: 8px 10px 12px 52px;
-        border-top: 1px solid var(--border-color, #45475a);
+        border-top: 1px solid var(--border-color);
         background: rgba(0, 0, 0, 0.15);
       }
 
@@ -549,13 +549,13 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .detail-label {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         min-width: 70px;
         flex-shrink: 0;
       }
 
       .detail-value {
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         word-break: break-word;
       }
 
@@ -564,12 +564,12 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .detail-value.success {
-        color: #a6e3a1;
+        color: var(--success);
       }
 
       .detail-value.failure,
       .detail-value.error {
-        color: #f38ba8;
+        color: var(--danger);
       }
 
       .detail-value.response-preview,
@@ -593,7 +593,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         border-radius: var(--radius-tag);
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: #a6e3a1;
+        color: var(--success);
         overflow-x: auto;
         max-height: 150px;
         white-space: pre-wrap;
@@ -609,8 +609,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .tool-chip {
         padding: 2px 8px;
         border-radius: var(--radius-tag);
-        background: var(--accent-color, #cba6f7);
-        color: var(--on-accent, var(--timeline-bg, #11111b));
+        background: var(--accent-color);
+        color: var(--on-accent, var(--timeline-bg));
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
       }
@@ -623,7 +623,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         gap: 8px;
         padding: 12px;
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .load-more-btn {
@@ -631,10 +631,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         width: 100%;
         padding: 8px;
         margin-top: 4px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -642,12 +642,12 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .load-more-btn:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .request-link {
-        color: #89b4fa;
+        color: var(--cat-6);
         cursor: pointer;
         text-decoration: underline;
         text-decoration-style: dotted;
@@ -655,13 +655,13 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .request-link:hover {
-        color: #b4befe;
+        color: color-mix(in srgb, var(--cat-6) 78%, var(--text-primary));
         text-decoration-style: solid;
       }
 
       .pending-indicator {
         font-size: 10px;
-        color: #f9e2af;
+        color: var(--warning);
         font-style: italic;
         animation: pulse 1.5s ease-in-out infinite;
       }
@@ -672,7 +672,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .detail-value.pending {
-        color: #f9e2af;
+        color: var(--warning);
         font-style: italic;
       }
     `,
@@ -714,24 +714,24 @@ export class AgentActivityComponent {
 
   // Step type color mapping (fallback for non-tool steps)
   private readonly stepColors: Record<AuditStepType, string> = {
-    initialize: '#89b4fa',    // Blue
-    llm: '#a6e3a1',           // Green (combined LLM call+response)
-    tool: '#cba6f7',          // Purple (default for unknown tools)
-    check: '#fab387',         // Peach
-    routing: '#94e2d5',       // Teal
-    phase_complete: '#74c7ec',// Sapphire
-    error: '#f38ba8',         // Red
+    initialize: 'var(--cat-6)',      // lapis  (was blue)
+    llm: 'var(--cat-4)',             // olive  (was green)
+    tool: 'var(--cat-7)',            // violet (was purple)
+    check: 'var(--cat-2)',           // copper (was peach)
+    routing: 'var(--cat-5)',         // slate-teal (was teal)
+    phase_complete: 'var(--cat-3)',  // gold   (was sapphire)
+    error: 'var(--danger)',          // semantic
   };
 
-  // Tool category color mapping (Catppuccin Mocha palette)
+  // Tool category color mapping (Imperial ramp)
   private readonly toolCategoryColors: Record<string, string> = {
-    workspace: '#89b4fa',     // Blue - file operations
-    core: '#cba6f7',          // Purple - todo/job management
-    research: '#94e2d5',      // Teal - web search
-    citation: '#f9e2af',      // Yellow - citations
-    graph: '#f5c2e7',         // Pink - Neo4j graph
-    communication: '#a6e3a1', // Green - messaging
-    delegation: '#fab387',    // Peach - child jobs
+    workspace: 'var(--cat-6)',      // lapis  (was blue)
+    core: 'var(--cat-7)',           // violet (was purple)
+    research: 'var(--cat-5)',       // slate-teal (was teal)
+    citation: 'var(--cat-3)',       // gold   (was yellow)
+    graph: 'var(--cat-8)',          // mauve  (was pink)
+    communication: 'var(--cat-4)',  // olive  (was green)
+    delegation: 'var(--cat-2)',     // copper (was peach)
   };
 
   // Map tool names to their categories
@@ -829,7 +829,7 @@ export class AgentActivityComponent {
         return this.toolCategoryColors[category];
       }
     }
-    return this.stepColors[stepType] || '#6c7086';
+    return this.stepColors[stepType] || 'var(--text-muted)';
   }
 
   getToolCategory(toolName: string): string | undefined {
