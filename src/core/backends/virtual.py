@@ -32,7 +32,7 @@ import logging
 import posixpath
 
 from ..workspace_backend import WorkspaceBackend
-from .object_store import ObjectStore
+from .object_store import InMemoryObjectStore, ObjectStore
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +173,18 @@ class VirtualWorkspaceBackend(WorkspaceBackend):
         # Explicit: the virtual tier has no shell. ShellManager refuses to
         # construct without a shell-capable backend, so shell tools are absent.
         return False
+
+    @property
+    def supports_canvas_presentation(self) -> bool:
+        """Whether another orchestrator process can materialize these files.
+
+        The dev ``memory`` transport lives only inside this agent process. A
+        Canvas gateway in the orchestrator cannot read it, so advertising
+        ``set_canvas`` would create a guaranteed-dead presentation. Durable
+        rclone-backed virtual stores remain eligible.
+        """
+
+        return not isinstance(self._store, InMemoryObjectStore)
 
     # =========================================================================
     # File operations

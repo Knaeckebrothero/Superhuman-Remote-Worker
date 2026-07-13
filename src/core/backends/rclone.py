@@ -19,10 +19,13 @@ prefix-inclusive key the backend hands us. Requires rclone ≥ 1.59 for
 
 import json
 import logging
+import os
 import re
+import selectors
 import shutil
 import subprocess
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from .object_store import ObjectInfo, ObjectStore, ObjectStoreError
 
@@ -39,6 +42,15 @@ _NOT_FOUND_RE = re.compile(
 )
 
 _DEFAULT_REMOTE_NAME = "srw"
+
+
+class RcloneSizeLimitExceeded(ObjectStoreError):
+    """A bounded rclone read observed more bytes than its caller permits."""
+
+    def __init__(self, limit: int, observed: int):
+        super().__init__(f"rclone object exceeded the {limit}-byte read limit")
+        self.limit = limit
+        self.observed = observed
 
 
 def _env_key(remote_name: str, option: str) -> str:
@@ -151,6 +163,95 @@ class RcloneObjectStore(ObjectStore):
         if self._is_not_found(proc):
             raise FileNotFoundError(key)
         raise ObjectStoreError(f"rclone cat failed for {key}: {self._stderr(proc)}")
+
+    def get_bounded(
+        self,
+        key: str,
+        max_bytes: int,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> bytes:
+        """Incrementally read at most ``max_bytes + 1`` bytes from ``rclone``.
+
+        This deliberately avoids ``subprocess.run(capture_output=True)`` so a
+        stale metadata size cannot make a caller retain an unbounded object.
+        The subprocess is terminated and reaped on overflow, timeout, or
+        caller failure.
+        """
+
+        if max_bytes < 0:
+            raise ValueError("max_bytes must not be negative")
+        env = dict(os.environ)
+        env.update(self._env_overlay)
+        try:
+            proc = subprocess.Popen(
+                [self._rclone_bin, "cat", self._remote_path(key)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                bufsize=0,
+            )
+        except FileNotFoundError as exc:
+            raise ObjectStoreError(
+                f"rclone binary '{self._rclone_bin}' not found on PATH"
+            ) from exc
+
+        selector: selectors.BaseSelector | None = None
+        try:
+            assert proc.stdout is not None
+            selector = selectors.DefaultSelector()
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + self._transfer_timeout
+            data = bytearray()
+            while True:
+                if cancelled is not None and cancelled():
+                    raise ObjectStoreError("rclone cat cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ObjectStoreError("rclone cat timed out")
+                events = selector.select(min(remaining, 0.25))
+                if cancelled is not None and cancelled():
+                    raise ObjectStoreError("rclone cat cancelled")
+                if not events:
+                    if proc.poll() is None:
+                        continue
+                    chunk = os.read(
+                        proc.stdout.fileno(), max(1, max_bytes + 1 - len(data))
+                    )
+                    if not chunk:
+                        break
+                else:
+                    chunk = os.read(
+                        proc.stdout.fileno(), max(1, max_bytes + 1 - len(data))
+                    )
+                    if not chunk:
+                        break
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    raise RcloneSizeLimitExceeded(max_bytes, len(data))
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ObjectStoreError("rclone cat timed out")
+            try:
+                return_code = proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired as exc:
+                raise ObjectStoreError("rclone cat timed out") from exc
+            if return_code != 0:
+                raise ObjectStoreError(f"rclone cat failed for {key}")
+            return bytes(data)
+        finally:
+            if selector is not None:
+                selector.close()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            if proc.stdout is not None:
+                proc.stdout.close()
 
     def put(self, key: str, data: bytes) -> None:
         if not isinstance(data, (bytes, bytearray)):

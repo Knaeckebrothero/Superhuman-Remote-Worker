@@ -17,6 +17,7 @@ from services.workspace_lifecycle import (
     WorkspaceOwner,
     ensure_workspace,
 )
+from services.workspace_binding import ensure_virtual_thread_workspace_binding
 from src.core.backends.factory import LITE_BACKENDS
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,8 @@ async def ensure_session_workspace(
     thread = await db.get_thread(thread_id)
     if not thread or thread.get("status") == "ended":
         return None
-    if _thread_backend(thread) in LITE_BACKENDS:
+    backend = _thread_backend(thread)
+    if backend in LITE_BACKENDS:
         # virtual/none sessions run with no workspace pod (no_workspace_agent_mode.md
         # §4) — nothing to provision or reconcile. Centralized here so both the
         # resume path and the periodic reconcile sweep skip lite threads.
@@ -62,6 +64,8 @@ async def ensure_session_workspace(
             "session %s uses a lite workspace backend — no workspace to provision",
             thread_id,
         )
+        if backend == "virtual":
+            await ensure_virtual_thread_workspace_binding(db, thread_id)
         return None
     return await ensure_workspace(
         WorkspaceOwner.session(thread_id),

@@ -22,6 +22,7 @@ import {reduce, ReducerAction} from './turn-reducer';
 import {AppToastService} from '../../ui/toast';
 import {
     CanvasControl,
+    CanvasSourceUpdatedControl,
     PersistentThreadTransportBridge,
 } from './persistent-thread-transport-bridge.service';
 
@@ -677,6 +678,11 @@ export class PersistentChatService {
     private controlWsReconnectAttempt = 0;
     private controlWsLastMessageAt = 0;
     private controlWsWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+    /** Latest committed user edit waiting for a reconnecting control socket. */
+    private pendingCanvasSourceUpdate: {
+        threadId: string;
+        control: CanvasSourceUpdatedControl;
+    } | null = null;
     private intentionalClose = false;
     /**
      * Guard against double-opening the control WS while an async
@@ -1531,6 +1537,25 @@ export class PersistentChatService {
         this.controlWs = ws;
         this.controlWsLastMessageAt = Date.now();
         this._startControlWsWatchdog(threadId);
+        ws.onopen = () => {
+            if (
+                this.controlWs !== ws ||
+                this.intentionalClose ||
+                this.threadId() !== threadId
+            ) return;
+            this.controlWsReconnectAttempt = 0;
+            this.controlWsLastMessageAt = Date.now();
+            const pending = this.pendingCanvasSourceUpdate;
+            if (!pending || pending.threadId !== threadId) return;
+            try {
+                ws.send(JSON.stringify(pending.control));
+                if (this.pendingCanvasSourceUpdate === pending) {
+                    this.pendingCanvasSourceUpdate = null;
+                }
+            } catch {
+                // Keep the latest committed revision for the next reconnect.
+            }
+        };
         ws.onclose = (event: CloseEvent) => {
             if (this.controlWs !== ws) return;
             this.controlWs = null;
@@ -1721,15 +1746,49 @@ export class PersistentChatService {
         if (this.intentionalClose || this.threadId() !== threadId) return false;
         const ws = this.controlWs;
         if (!ws || ws.readyState !== WebSocket.OPEN) {
+            if (data.method === 'canvas.source_updated') {
+                this._queueCanvasSourceUpdate(threadId, data);
+            }
             this._ensureControlWs();
             return false;
         }
+        let outgoing = data;
+        if (
+            data.method === 'canvas.source_updated' &&
+            this.pendingCanvasSourceUpdate?.threadId === threadId &&
+            this.pendingCanvasSourceUpdate.control.presentation_revision >
+                data.presentation_revision
+        ) {
+            outgoing = this.pendingCanvasSourceUpdate.control;
+        }
         try {
-            ws.send(JSON.stringify(data));
+            ws.send(JSON.stringify(outgoing));
+            if (outgoing.method === 'canvas.source_updated') {
+                const pendingRevision =
+                    this.pendingCanvasSourceUpdate?.control.presentation_revision ?? -1;
+                if (pendingRevision <= outgoing.presentation_revision) {
+                    this.pendingCanvasSourceUpdate = null;
+                }
+            }
             return true;
         } catch {
+            if (data.method === 'canvas.source_updated') {
+                this._queueCanvasSourceUpdate(threadId, data);
+            }
             return false;
         }
+    }
+
+    private _queueCanvasSourceUpdate(
+        threadId: string,
+        control: CanvasSourceUpdatedControl,
+    ): void {
+        const pending = this.pendingCanvasSourceUpdate;
+        if (
+            pending?.threadId === threadId &&
+            pending.control.presentation_revision > control.presentation_revision
+        ) return;
+        this.pendingCanvasSourceUpdate = {threadId, control};
     }
 
     /** Cancel the current backoff wait and immediately reopen the SSE.
@@ -1765,6 +1824,7 @@ export class PersistentChatService {
             this.controlWsReconnectTimer = null;
         }
         this.controlWsReconnectAttempt = 0;
+        this.pendingCanvasSourceUpdate = null;
         this._stopSseWatchdog();
         this._stopControlWsWatchdog();
         this._clearSendKickstart();

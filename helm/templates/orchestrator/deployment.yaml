@@ -121,6 +121,16 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: PROTECTED_CLOUD_MODE_ENABLED
+            - name: CANVAS_LIVE_PREVIEW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_LIVE_PREVIEW_ENABLED
+            - name: CANVAS_LIVE_PREVIEW_DENIED_PORTS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_LIVE_PREVIEW_DENIED_PORTS
             - name: VECTOR_POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -386,13 +396,16 @@ spec:
               value: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) | quote }}
             - name: SESSION_JWT_SECRET_KEY
               value: {{ .Values.sessionRouter.jwtSecretKey | default "jwt-secret" | quote }}
-            # MCP auth (only when mcp pod is deployed)
-            {{- if .Values.mcp.enabled }}
+            # Shared internal auth for MCP and dynamically-provisioned agents.
+            # Optional preserves graceful degradation when an externally
+            # managed Secret has not enabled delegated internal calls yet.
             - name: MCP_INTERNAL_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_INTERNAL_KEY
+                  optional: true
+            {{- if .Values.mcp.enabled }}
             # MCP_DEV_TOKEN — dev-only fixed admin MCP token. When set, the
             # orchestrator seeds this exact token for the admin user at startup
             # and on first admin login (init._seed_admin_mcp_token) so a

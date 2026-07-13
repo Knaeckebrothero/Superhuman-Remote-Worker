@@ -816,7 +816,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             # Handle empty files: record as read and return informative message
             if total_lines == 0:
-                context.record_file_read(path)
+                context.record_file_read(path, content)
                 return f"File '{path}' is empty (0 lines)."
 
             # Validate offset
@@ -863,7 +863,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 result += f"Use offset={end_line + 1} to continue.]"
 
             # Record successful read for read-before-write tracking
-            context.record_file_read(path)
+            context.record_file_read(path, content)
             return result
 
         except FileNotFoundError:
@@ -957,10 +957,16 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             )
 
         try:
-            # Enforce read-before-write for existing non-empty files
-            if workspace.exists(path) and not context.was_recently_read(path):
+            # Enforce read-before-write for existing non-empty files. A
+            # versioned read must still match the current complete text; this
+            # catches Canvas/user edits even when a best-effort invalidation was
+            # missed while the agent was detached.
+            existed = workspace.exists(path)
+            had_recent_read = context.was_recently_read(path)
+            if existed:
                 existing = workspace.read_file(path)
-                if existing.strip():
+                if existing.strip() and not context.recent_read_matches(path, existing):
+                    context.invalidate_recent_read(path)
                     from src.services.guardrails import format_nudge
 
                     model = (
@@ -980,6 +986,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 context._snapshot_callback(path)
 
             workspace.write_file(path, content)
+            if existed and had_recent_read:
+                context.record_file_read(path, content)
 
             return f"Written: {path}"
 
@@ -1039,23 +1047,25 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if full_path.is_dir():
                 return f"Error: '{path}' is a directory, not a file."
 
-            # Enforce read-before-write discipline (skip for empty files)
-            if not context.was_recently_read(path):
-                existing = workspace.read_file(path)
-                if existing.strip():
-                    from src.services.guardrails import format_nudge
+            # Enforce read-before-write discipline (skip for empty files), and
+            # reject a stale versioned read after an out-of-band edit.
+            content = workspace.read_file(path)
+            had_recent_read = context.was_recently_read(path)
+            if content.strip() and not context.recent_read_matches(path, content):
+                context.invalidate_recent_read(path)
+                from src.services.guardrails import format_nudge
 
-                    model = (
-                        context._llm_config.model
-                        if context._llm_config is not None
-                        else None
-                    )
-                    return format_nudge(
-                        "read_file_required_error",
-                        model=model,
-                        file_path=path,
-                        tool_name="edit_file",
-                    )
+                model = (
+                    context._llm_config.model
+                    if context._llm_config is not None
+                    else None
+                )
+                return format_nudge(
+                    "read_file_required_error",
+                    model=model,
+                    file_path=path,
+                    tool_name="edit_file",
+                )
 
             # Validate position parameter
             if position is not None and position not in ("start", "end"):
@@ -1063,8 +1073,6 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"Error: Invalid position '{position}'. "
                     f"Use 'start' to prepend, 'end' to append, or omit for replace mode."
                 )
-
-            content = workspace.read_file(path)
 
             # Snapshot for undo before editing
             if context._snapshot_callback:
@@ -1074,11 +1082,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if position == "end":
                 new_content = content + new_string
                 workspace.write_file(path, new_content)
+                if had_recent_read:
+                    context.record_file_read(path, new_content)
                 return f"Appended to: {path}"
 
             if position == "start":
                 new_content = new_string + content
                 workspace.write_file(path, new_content)
+                if had_recent_read:
+                    context.record_file_read(path, new_content)
                 return f"Prepended to: {path}"
 
             # Replace mode (default) - requires old_string
@@ -1107,6 +1119,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             new_content = content.replace(old_string, new_string, 1)
             workspace.write_file(path, new_content)
+            if had_recent_read:
+                context.record_file_read(path, new_content)
 
             return f"Edited: {path}"
 

@@ -28,6 +28,14 @@ import { AppBadgeComponent, type BadgeTone } from '../../ui/badge';
 import { AppSpinnerComponent } from '../../ui/spinner';
 import { AppDialogComponent } from '../../ui/dialog';
 import { AppToastService } from '../../ui/toast';
+import {
+  disposeMonacoEditor,
+  MonacoDiffEditor,
+  MonacoEditorLoaderService,
+  MonacoTextModel,
+  monacoLanguageFromPath,
+  preferredMonacoTheme,
+} from '../../core/services/monaco-editor-loader.service';
 
 /** A file-tree entry from either diff summary shape (job or thread mode). */
 type DiffFileEntry = JobDiffFileEntry | ThreadCloudDiffSummary['files'][number];
@@ -111,6 +119,7 @@ export class JobDiffReviewComponent {
   private destroy = inject(DestroyRef);
   private toast = inject(AppToastService);
   private translocoService = inject(TranslocoService);
+  private monaco = inject(MonacoEditorLoaderService);
 
   /** Bind exactly one of jobId/threadId — see `diffApiFor`. */
   jobId = input<string | null>(null);
@@ -151,14 +160,8 @@ export class JobDiffReviewComponent {
     ),
   );
 
-  // Monaco diff editor instance; lazily attached when a file is selected.
-  // We type Monaco as `any` here because we load it via the AMD-based
-  // ``@monaco-editor/loader`` (rather than the ESM module) — that path
-  // avoids esbuild trying to bundle Monaco's .ttf-importing CSS.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private diffEditor: any = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private monacoModule: any = null;
+  private diffEditor: MonacoDiffEditor | null = null;
+  private diffModels: MonacoTextModel[] = [];
 
   constructor() {
     // Host wiring guard: exactly one of jobId/threadId must be bound. Runs
@@ -250,14 +253,14 @@ export class JobDiffReviewComponent {
    */
   private async renderDiff(file: DiffFile, container: HTMLDivElement): Promise<void> {
     try {
-      const monaco = await this.loadMonaco();
+      const monaco = await this.monaco.load();
       this.disposeEditor();
       container.innerHTML = '';
       const original = file.old_content ?? '';
       const modified = file.new_content ?? '';
       // Best-effort language inference from extension; Monaco falls
       // back to plain text when it doesn't recognize one.
-      const language = languageFromPath(file.path);
+      const language = monacoLanguageFromPath(file.path);
       const originalModel = monaco.editor.createModel(original, language);
       const modifiedModel = monaco.editor.createModel(modified, language);
       const editor = monaco.editor.createDiffEditor(container, {
@@ -267,40 +270,21 @@ export class JobDiffReviewComponent {
         ignoreTrimWhitespace: false,
         scrollBeyondLastLine: false,
         minimap: { enabled: false },
-        theme: prefersDarkTheme() ? 'vs-dark' : 'vs',
+        theme: preferredMonacoTheme(),
       });
       editor.setModel({ original: originalModel, modified: modifiedModel });
       this.diffEditor = editor;
+      this.diffModels = [originalModel, modifiedModel];
     } catch (err) {
       console.error('Monaco diff editor failed to render:', err);
       this.monacoFailed.set(true);
     }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async loadMonaco(): Promise<any> {
-    if (this.monacoModule) return this.monacoModule;
-    // ``@monaco-editor/loader`` injects Monaco's AMD loader, then asks
-    // it to require the editor module from our static asset path.
-    // angular.json copies node_modules/monaco-editor/min/vs into
-    // assets/monaco/vs, so the path below is served by the same host
-    // as the cockpit (no CDN dependency).
-    const loaderModule = await import('@monaco-editor/loader');
-    const loader = loaderModule.default;
-    // ``monaco/vs`` is copied verbatim into ``public/`` by
-    // scripts/copy-monaco.mjs at prebuild time; Angular's static asset
-    // pipeline leaves the AMD bundle untouched (no output hashing
-    // rewriting Monaco's ``define()`` IDs).
-    loader.config({ paths: { vs: 'monaco/vs' } });
-    this.monacoModule = await loader.init();
-    return this.monacoModule;
-  }
-
   private disposeEditor(): void {
-    if (this.diffEditor && typeof (this.diffEditor as { dispose?: () => void }).dispose === 'function') {
-      (this.diffEditor as { dispose: () => void }).dispose();
-    }
+    disposeMonacoEditor(this.diffEditor, this.diffModels);
     this.diffEditor = null;
+    this.diffModels = [];
   }
 
   // ---------- actions ----------
@@ -420,36 +404,4 @@ export class JobDiffReviewComponent {
         return this.translocoService.translate('jobDiffReview.conflict.unexpectedAtCloud');
     }
   }
-}
-
-function languageFromPath(path: string): string {
-  const ext = path.split('.').pop()?.toLowerCase() ?? '';
-  const map: Record<string, string> = {
-    md: 'markdown',
-    markdown: 'markdown',
-    json: 'json',
-    yaml: 'yaml',
-    yml: 'yaml',
-    ts: 'typescript',
-    tsx: 'typescript',
-    js: 'javascript',
-    jsx: 'javascript',
-    py: 'python',
-    sh: 'shell',
-    bash: 'shell',
-    sql: 'sql',
-    html: 'html',
-    css: 'css',
-    scss: 'scss',
-    xml: 'xml',
-    txt: 'plaintext',
-  };
-  return map[ext] ?? 'plaintext';
-}
-
-function prefersDarkTheme(): boolean {
-  if (typeof document === 'undefined') return false;
-  // Cockpit applies `theme-senate` (dark) or `theme-travertine` (light)
-  // to <body>; see src/index.html pre-paint script.
-  return document.body.classList.contains('theme-senate');
 }

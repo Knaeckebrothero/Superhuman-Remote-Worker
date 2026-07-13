@@ -8,6 +8,7 @@ Tests cover:
 """
 
 import sys
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -226,6 +227,46 @@ class TestSuspendWorkspace:
         result = await svc.suspend_workspace("some-id")
 
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_stale_docker_suspend_cannot_touch_reassigned_static_host(self):
+        """A sweep queued on an old lease must remain a no-op after reassignment."""
+
+        svc = make_service()
+        read_started = asyncio.Event()
+        host_reassigned = asyncio.Event()
+        stale_lease = {
+            "status": "ready",
+            "host": "workspace-1",
+            "port": 30022,
+            "provisioner": "docker",
+            "_docker_workspace_lease_id": "old-lease",
+        }
+
+        async def delayed_stale_job(job_id):
+            read_started.set()
+            await host_reassigned.wait()
+            return {
+                "id": job_id,
+                "context": {"workspace_container": stale_lease},
+            }
+
+        svc._db.get_job.side_effect = delayed_stale_job
+        docker = MagicMock()
+        docker._reset_workspace_via_ssh = AsyncMock(return_value=True)
+        svc._docker_provisioner = docker
+
+        pending = asyncio.create_task(svc.suspend_workspace("old-job"))
+        await read_started.wait()
+        # The authoritative lease can now belong to a different owner; the
+        # delayed read represents the stale snapshot already held by a sweep.
+        host_reassigned.set()
+
+        assert await pending is False
+        svc._snapshot_service.capture_vm_snapshot.assert_not_awaited()
+        svc._container_provisioner.delete_workspace.assert_not_awaited()
+        svc._db.merge_workspace_container_context.assert_not_awaited()
+        docker._reset_workspace_via_ssh.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_suspend_exception_reverts(self):

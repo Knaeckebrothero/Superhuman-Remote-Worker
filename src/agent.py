@@ -2783,6 +2783,24 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         context._resolved_tool_names = loaded_tool_names
         context._limits = self.config.limits
 
+        # Capability-scoped bundled skills are resolved only after the final
+        # backend gate. In particular, worker jobs must never advertise or
+        # materialize present-with-canvas because Canvas is session-only.
+        from .core.skill_resolution import scope_skills_for_tools
+
+        skill_catalog = self.config.extra.get(
+            "_unscoped_resolved_skills",
+            self.config.extra.get("_resolved_skills", {}),
+        )
+        self.config.extra = {
+            **self.config.extra,
+            "_unscoped_resolved_skills": skill_catalog,
+            "_resolved_skills": scope_skills_for_tools(
+                skill_catalog, loaded_tool_names
+            ),
+        }
+        context.config["_resolved_skills"] = self.config.extra["_resolved_skills"]
+
         # Deploy instruction files with Jinja2 rendering (after tools loaded)
         self._deploy_instruction_files(loaded_tool_names)
 

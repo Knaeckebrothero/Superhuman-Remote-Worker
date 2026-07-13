@@ -47,6 +47,7 @@ except ImportError:
 
 from .notification_feed import notification_feed
 from .ssh_helpers import is_tailnet_addr, orchestrator_can_reach
+from .workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +498,7 @@ class NatsBridge:
                 data.get("status"),
             )
             if job_id in self._thread_vm_ids:
+                updates[CANVAS_WORKSPACE_GENERATION_KEY] = None
                 await self._set_thread_vm_context(job_id, updates)
             else:
                 await self._set_vm_context(job_id, updates)
@@ -582,7 +584,16 @@ class NatsBridge:
                 "ssh_probe_error": not_ready_reason,
             }
             if is_thread:
+                # The VM guest's NATS payload is not a provisioner-attested host
+                # identity. Slice 1 deliberately fails Canvas closed for VMs.
+                vm_updates[CANVAS_WORKSPACE_GENERATION_KEY] = None
                 await self._set_thread_vm_context(job_id, vm_updates)
+                if status == "ready":
+                    logger.warning(
+                        "VM thread %s is ready, but Canvas file serving remains "
+                        "disabled until host identity is provisioner-attested",
+                        job_id,
+                    )
             else:
                 await self._set_vm_context(job_id, vm_updates)
 

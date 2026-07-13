@@ -88,6 +88,15 @@ X11Forwarding no
 PrintMotd no
 AcceptEnv LANG LC_*
 Subsystem sftp /usr/lib/openssh/sftp-server
+# Canvas reaches declared guest HTTP ports only through request-scoped
+# direct-tcpip channels on this authenticated SSH transport. Keep forwarding
+# local to the SSH client, restrict its destination to guest loopback, and
+# disable the unrelated forwarding/tunnel surfaces explicitly.
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:*
+GatewayPorts no
+AllowAgentForwarding no
+PermitTunnel no
 # Keep connections alive (agent may have idle periods between tool calls)
 ClientAliveInterval 60
 ClientAliveCountMax 720

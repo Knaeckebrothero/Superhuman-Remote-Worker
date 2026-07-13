@@ -27,7 +27,8 @@ tiktoken>=0.5.0
 streamlit>=1.30.0
 pdfplumber>=0.10.0
 pdf2image>=1.16.0  # PDF page rendering (requires poppler system package)
-Pillow>=10.0.0  # Image handling for document rendering
+Pillow>=10.4.0  # Image handling and Dynamic Canvas image validation
+python-magic>=0.4.27  # Dynamic Canvas MIME validation (host also needs libmagic)
 python-docx>=1.1.0
 docx2txt>=0.8  # Required by langchain Docx2txtLoader
 python-pptx>=0.6.21
@@ -66,6 +67,8 @@ claude-agent-sdk>=0.1.35
 Jinja2>=3.1
 # Remote workspace backend (SSH/SFTP to VM)
 paramiko>=3.4.0
+# Host-key-pinned, bounded SFTP reads for Dynamic Canvas workspace files.
+asyncssh>=2.21.0
 # AES-GCM encryption at rest for stored credentials (user/system API keys,
 # custom LLM endpoint keys). Already a transitive dep via paramiko; listed
 # explicitly so crypto.py keeps working if that changes.

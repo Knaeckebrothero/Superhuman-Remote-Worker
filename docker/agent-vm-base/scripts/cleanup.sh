@@ -46,6 +46,10 @@ rm -rf /tmp/* /var/tmp/*
 truncate -s 0 /etc/machine-id
 rm -f /var/lib/dbus/machine-id
 
+# Never publish a VM image with reusable SSH host private keys. cloud-init and
+# the per-instance runcmd both regenerate these on the clone's first boot.
+rm -f /etc/ssh/ssh_host_*
+
 # Clear shell history
 rm -f /root/.bash_history /home/*/.bash_history
 

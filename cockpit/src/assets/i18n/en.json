@@ -21,6 +21,13 @@
     "showMore": "Show {{count}} more lines",
     "showLess": "Show less",
     "previewNote": "preview · {{size}} total",
+    "canvas": {
+      "open": "Open Canvas",
+      "current": "current",
+      "currentStage": "opens current stage",
+      "replaced": "presentation replaced",
+      "unavailable": "Canvas unavailable"
+    },
     "titles": {
       "read_file": "Read file",
       "write_file": "Write file",
@@ -51,7 +58,101 @@
       "send_message": "Send message",
       "delegate_work": "Delegate work",
       "job_complete": "Complete job",
-      "mark_complete": "Mark complete"
+      "mark_complete": "Mark complete",
+      "set_canvas": "Present in Canvas",
+      "get_canvas": "Inspect Canvas",
+      "clear_canvas": "Clear Canvas"
+    }
+  },
+  "canvas": {
+    "paneLabel": "Dynamic Canvas",
+    "defaultTitle": "Canvas",
+    "noSource": "No source selected",
+    "untrusted": "Agent-provided content",
+    "refresh": "Refresh Canvas status",
+    "close": "Close Canvas",
+    "open": "Open Canvas",
+    "hide": "Hide Canvas",
+    "skipToCanvas": "Skip to Canvas",
+    "returnToChat": "Return to chat",
+    "resize": "Resize chat and Canvas",
+    "empty": "The agent has not presented anything yet.",
+    "unsupported": "This Canvas source is not supported by this version of Cockpit.",
+    "contentTooComplex": "This artifact is too complex to render safely. Ask the agent to simplify it.",
+    "renderer": {
+      "markdown": "Markdown",
+      "text": "Text",
+      "html": "Static HTML",
+      "image": "Image",
+      "unsupported": "Unsupported source"
+    },
+    "status": {
+      "ready": "Canvas ready",
+      "readyRevision": "Canvas ready, presentation {{revision}}",
+      "loading": "Loading Canvas content…",
+      "updating": "The agent is updating the Canvas…",
+      "sourceChanged": "The source changed in the workspace. Ask the agent to present it again.",
+      "contentError": "Canvas content could not be loaded.",
+      "starting": "Canvas is starting…",
+      "unavailable": "Canvas source is currently unavailable.",
+      "ended": "This Canvas source has ended.",
+      "error": "Canvas encountered an error.",
+      "cleared": "Canvas was cleared."
+    },
+    "image": {
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
+      "missingAlt": "Image with no description provided"
+    },
+    "html": {
+      "frameTitle": "Static Canvas preview: {{title}}"
+    },
+    "editor": {
+      "label": "Canvas source editor",
+      "loading": "Loading editor…",
+      "unavailable": "The source editor could not be loaded.",
+      "edit": "Edit source",
+      "preview": "Preview source",
+      "save": "Save",
+      "saving": "Saving…",
+      "saved": "Canvas source saved",
+      "unsaved": "You have unsaved Canvas changes",
+      "keepEditing": "Keep editing",
+      "loadCurrent": "Discard and load current",
+      "discardCleared": "Discard local changes",
+      "remoteEditing": "Another view is editing this Canvas source.",
+      "sourceRefresh": "The workspace file changed outside the Canvas editor.",
+      "loadWorkspace": "Load workspace version",
+      "conflict": {
+        "content_changed": {
+          "title": "The workspace file changed",
+          "body": "Your edits are preserved. Compare them before loading the current workspace version."
+        },
+        "presentation_changed": {
+          "title": "The Canvas was republished",
+          "body": "Your edits are preserved. Load the current presentation before saving over it."
+        },
+        "replaced": {
+          "title": "The Canvas source was replaced",
+          "body": "Your edits still belong to the previous source and have not been saved."
+        },
+        "cleared": {
+          "title": "The Canvas was cleared",
+          "body": "Your local edits are preserved until you discard them or copy them elsewhere."
+        },
+        "busy": {
+          "title": "The Canvas source is busy",
+          "body": "Another save is in progress. Your edits are safe; try saving again shortly."
+        },
+        "precondition_required": {
+          "title": "The editor lost its save precondition",
+          "body": "Your edits are safe. Load the current version before trying again."
+        },
+        "save_failed": {
+          "title": "The Canvas source could not be saved",
+          "body": "Your edits remain in this browser. Check the connection and try again."
+        }
+      }
     }
   },
   "common": {
@@ -2066,6 +2167,10 @@
       "delegation": {
         "label": "Delegation",
         "description": "Ability to spawn subagents that work in parallel"
+      },
+      "canvas": {
+        "label": "Canvas",
+        "description": "Ability to present workspace files in the shared session Canvas"
       },
       "orchestrator": {
         "label": "Fleet Management",

@@ -21,17 +21,20 @@ import os
 from typing import Any, Optional
 
 from services import workspace_metering
+from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
 
 try:
     from kubernetes import client as k8s_client, config as k8s_config
+    from kubernetes.stream import stream as k8s_stream
 
     K8S_AVAILABLE = True
 except ImportError:
     k8s_client = None
     k8s_config = None
+    k8s_stream = None
     K8S_AVAILABLE = False
 
 
@@ -319,6 +322,11 @@ class ContainerProvisioner:
                     "status": "created",
                     "pod_name": pod_name,
                     "namespace": self._namespace,
+                    **(
+                        {CANVAS_WORKSPACE_GENERATION_KEY: None}
+                        if owner.kind == "session"
+                        else {}
+                    ),
                 },
             )
 
@@ -335,7 +343,33 @@ class ContainerProvisioner:
             ready_timeout = self._reattach_ready_timeout if pvc_reattach else 120
             pod_ip = await self._wait_for_ready(pod_name, timeout=ready_timeout)
             if pod_ip:
+                canvas_generation = None
+                if owner.kind == "session" and self._db:
+                    try:
+                        backing_id, fingerprint = await self._trusted_pod_ssh_identity(
+                            pod_name, pvc_name=pvc_name
+                        )
+                        binding = await self._db.bind_thread_workspace_backing(
+                            owner.id,
+                            backing_kind="remote",
+                            backing_id=backing_id,
+                            ssh_host_key_fingerprint=fingerprint,
+                        )
+                        if binding:
+                            canvas_generation = binding.get("workspace_generation")
+                    except Exception:
+                        # The workspace remains usable by its agent, but Canvas
+                        # file serving fails closed until a trusted binding is
+                        # available. Never substitute SSH TOFU here.
+                        logger.exception(
+                            "Failed to bind trusted Canvas SSH identity for session %s",
+                            owner.id,
+                        )
                 ready_ctx = {"status": "ready", "pod_ip": pod_ip, "port": 30022}
+                if owner.kind == "session":
+                    # Pair this endpoint with the exact binding minted above.
+                    # A failed/missing bind publishes null and Canvas fails closed.
+                    ready_ctx[CANVAS_WORKSPACE_GENERATION_KEY] = canvas_generation
                 # Hand the agent the STABLE Service DNS (not the ephemeral IP) so
                 # a reattached/recovered pod is reachable at the same address.
                 # The dispatch + resume paths prefer this `host` over `pod_ip`.
@@ -1353,6 +1387,10 @@ class ContainerProvisioner:
                                 "mountPath": "/tmp/ssh-pubkey",
                                 "readOnly": True,
                             },
+                            {
+                                "name": "workspace-identity",
+                                "mountPath": "/var/lib/srw-system",
+                            },
                         ],
                         "readinessProbe": {
                             "tcpSocket": {"port": 30022},
@@ -1389,6 +1427,10 @@ class ContainerProvisioner:
                             ],
                             "defaultMode": 0o600,
                         },
+                    },
+                    {
+                        "name": "workspace-identity",
+                        "emptyDir": {},
                     },
                 ],
             },
@@ -1562,6 +1604,56 @@ class ContainerProvisioner:
             await asyncio.sleep(2)
 
         return None
+
+    async def _trusted_pod_ssh_identity(
+        self, pod_name: str, *, pvc_name: str | None = None
+    ) -> tuple[str, str]:
+        """Read pod UID + host-key fingerprint through the K8s control plane."""
+
+        if self._core_api is None or k8s_stream is None:
+            raise RuntimeError("Kubernetes exec transport is unavailable")
+        pod = await asyncio.to_thread(
+            self._core_api.read_namespaced_pod,
+            name=pod_name,
+            namespace=self._namespace,
+        )
+        backing_kind = "pod"
+        backing_uid = str(getattr(pod.metadata, "uid", "") or "")
+        if pvc_name:
+            claim = await asyncio.to_thread(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=self._namespace,
+            )
+            backing_kind = "pvc"
+            backing_uid = str(getattr(claim.metadata, "uid", "") or "")
+        if not backing_uid:
+            raise RuntimeError("workspace pod has no Kubernetes UID")
+        output = await asyncio.to_thread(
+            k8s_stream,
+            self._core_api.connect_get_namespaced_pod_exec,
+            pod_name,
+            self._namespace,
+            command=[
+                "ssh-keygen",
+                "-lf",
+                "/var/lib/srw-system/ssh/ssh_host_ed25519_key.pub",
+                "-E",
+                "sha256",
+            ],
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+            _request_timeout=10,
+        )
+        fields = str(output).strip().split()
+        fingerprint = next(
+            (field for field in fields if field.startswith("SHA256:")), None
+        )
+        if not fingerprint:
+            raise RuntimeError("workspace host-key fingerprint was not reported")
+        return f"k8s-{backing_kind}:{self._namespace}:{backing_uid}", fingerprint
 
     async def _set_context(self, owner: WorkspaceOwner, updates: dict) -> None:
         """Atomically merge updates into the workspace context for a job or session."""

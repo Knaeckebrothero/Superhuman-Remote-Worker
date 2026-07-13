@@ -1057,6 +1057,27 @@ def test_pod_manifest_injects_pod_uid_via_downward_api():
     assert pod_uid_entry["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.uid"
 
 
+def test_pod_manifest_injects_internal_key_for_canvas_tools():
+    p = _bare_provisioner_for_manifest()
+    manifest = p._build_pod_manifest(
+        pod_name="srw-agent-s-canvas",
+        purpose="session",
+        thread_id="11111111-2222-3333-4444-555555555555",
+        config_name="persistent_defaults",
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+    env = manifest["spec"]["containers"][0]["env"]
+    internal = next(e for e in env if e["name"] == "MCP_INTERNAL_KEY")
+    assert internal["valueFrom"]["secretKeyRef"] == {
+        "name": "srw-secret",
+        "key": "MCP_INTERNAL_KEY",
+        "optional": True,
+    }
+
+
 def test_pod_manifest_injects_session_bound_thread_id_env():
     """Session pods carry SESSION_BOUND_THREAD_ID env so the pod's JWT
     validator can check the `tid` claim matches its own thread."""

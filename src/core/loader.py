@@ -1463,6 +1463,7 @@ class ToolsConfig:
     communication: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
+    canvas: List[str] = field(default_factory=list)
     agent_catalog: List[str] = field(default_factory=list)
     workflows: List[str] = field(default_factory=list)
     # Loop campaign tools (loop_plan). Never listed in bundled configs — the
@@ -2227,6 +2228,7 @@ def load_agent_config(
         communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
+        canvas=tools_data.get("canvas", []),
         agent_catalog=tools_data.get("agent_catalog", []),
         workflows=tools_data.get("workflows", []),
         loop=tools_data.get("loop", []),
@@ -2459,6 +2461,7 @@ def load_agent_config_from_dict(
         communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
+        canvas=tools_data.get("canvas", []),
         agent_catalog=tools_data.get("agent_catalog", []),
         workflows=tools_data.get("workflows", []),
         loop=tools_data.get("loop", []),
@@ -4231,6 +4234,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         "communication",
         "delegation",
         "orchestrator",
+        "canvas",
         "agent_catalog",
         "workflows",
         "loop",

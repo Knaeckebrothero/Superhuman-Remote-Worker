@@ -182,6 +182,23 @@ export const TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = {
     // Job lifecycle
     job_complete: {title: 'Complete job', icon: 'check_circle', category: 'core', params: []},
     mark_complete: {title: 'Mark complete', icon: 'check_circle', category: 'core', params: []},
+
+    // Dynamic Canvas. The result is state metadata, not content to echo into
+    // chat; its trusted action always opens the current stage.
+    set_canvas: {
+        title: 'Present in Canvas',
+        icon: 'dashboard_customize',
+        category: 'workspace',
+        params: [
+            {key: 'path', label: 'Path', kind: 'path'},
+            {key: 'title', label: 'Title', kind: 'text'},
+            {key: 'renderer', label: 'Renderer', kind: 'text'},
+        ],
+        result: {kind: 'none'},
+        subtitle: (a) => basename(pickArg(a, ['path', 'title'])),
+    },
+    get_canvas: {title: 'Inspect Canvas', icon: 'preview', category: 'workspace', params: [], result: {kind: 'json'}},
+    clear_canvas: {title: 'Clear Canvas', icon: 'hide_image', category: 'workspace', params: [], result: {kind: 'none'}},
 };
 
 /** Heuristic icon for an unregistered tool (mirrors the old `toolIcon`). */
@@ -254,6 +271,7 @@ function buildResult(
     n: NormalizedToolCall,
     args: Record<string, unknown>,
 ): ToolResult | undefined {
+    if (d.result?.kind === 'none') return undefined;
     // Diff tools render from args even before any result row arrives — but a
     // failed call shows its error output instead of a diff that never applied.
     if (d.result?.kind === 'diff' && n.status !== 'error') {
@@ -273,6 +291,23 @@ function buildResult(
         language,
         bytesTotal: n.resultBytesTotal ?? undefined,
     };
+}
+
+function canvasAction(n: NormalizedToolCall): ToolCardView['action'] {
+    if (n.tool !== 'set_canvas' || n.status !== 'ok') return undefined;
+    const result = n.result ?? '';
+    let revision: number | undefined;
+    try {
+        const parsed = JSON.parse(result) as Record<string, unknown>;
+        const value = parsed['presentation_revision'];
+        if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) revision = value;
+    } catch {
+        const match = result.match(/["']?presentation_revision["']?\s*[:=]\s*(\d+)/);
+        if (match) revision = Number(match[1]);
+    }
+    return revision === undefined
+        ? {kind: 'open_canvas'}
+        : {kind: 'open_canvas', presentationRevision: revision};
 }
 
 function buildDetails(n: NormalizedToolCall): ToolDetail[] {
@@ -307,6 +342,7 @@ export function buildToolCardView(n: NormalizedToolCall): ToolCardView {
         params: buildParams(d, args),
         result,
         details: buildDetails(n),
+        action: canvasAction(n),
         error: n.error ? String(n.error) : undefined,
     };
 }

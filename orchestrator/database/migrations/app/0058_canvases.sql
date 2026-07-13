@@ -8,7 +8,7 @@
 -- transactional: yes
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS canvases (
+CREATE TABLE canvases (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     thread_id             UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
     canvas_id             VARCHAR(64) NOT NULL DEFAULT 'main',
@@ -47,10 +47,7 @@ CREATE TABLE IF NOT EXISTS canvases (
     )
 );
 
--- This index is built on the brand-new empty canvases table. CONCURRENTLY is
--- unavailable inside the transactional migration and has no benefit here.
--- squawk-ignore require-concurrent-index-creation
-CREATE UNIQUE INDEX IF NOT EXISTS uq_canvases_origin_generation
+CREATE UNIQUE INDEX uq_canvases_origin_generation
     ON canvases (origin_generation)
     WHERE origin_generation IS NOT NULL;
 
@@ -68,9 +65,3 @@ COMMENT ON COLUMN canvases.source_version IS
     'Strong sha256 content version for file-backed sources; distinct from presentation_revision.';
 COMMENT ON COLUMN canvases.origin_generation IS
     'Random revocable browser-origin generation for a live application trust unit.';
-
--- Slice 0 also makes the existing persistent-event journal generation
--- fail-closed. A generation is allocated for every DB-backed runtime attach,
--- including when retention has emptied the preceding generation.
-COMMENT ON COLUMN threads.events_epoch IS
-    'Current event-log runtime generation. The agent allocates a new epoch on every DB-backed runtime attach; older client cursors trigger authoritative re-sync.';

@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Any, List, Dict, Tuple
-from uuid import UUID
+from uuid import UUID, uuid4
 
 try:
     import asyncpg
@@ -37,6 +37,26 @@ from security.crypto import (
 from utils.db_url import build_postgres_url
 
 logger = logging.getLogger(__name__)
+
+# Non-lifecycle workspace metadata which may be written independently while a
+# static Docker lease is allocated. Allocation replaces every authority-bearing
+# endpoint/lifecycle field, but must not erase repository attachment or the
+# documented snapshot reference/work marker used to restore durable state.
+_DOCKER_WORKSPACE_PRESERVED_FIELDS = frozenset(
+    {"git_remote_url", "repo_name", "last_snapshot", "last_snapshot_turns"}
+)
+_DOCKER_WORKSPACE_TRANSITION_PRESERVED_FIELDS = _DOCKER_WORKSPACE_PRESERVED_FIELDS | {
+    "ide_host",
+    "ide_port",
+}
+_DOCKER_WORKSPACE_GENERATION_KEY = "_canvas_workspace_generation"
+_DOCKER_WORKSPACE_LEASE_KEY = "_docker_workspace_lease_id"
+_DOCKER_WORKSPACE_TRUST_KEY = "_docker_workspace_trust_mode"
+_DOCKER_WORKSPACE_ATTESTED_KEY = "_docker_workspace_attested"
+_DOCKER_INVENTORY_COLUMNS = (
+    "host, port, status, lease_id, owner_kind, owner_id, trust_mode, "
+    "host_key_fingerprint, quarantine_reason"
+)
 
 
 def _encrypt_optional(value: str | None) -> str | None:
@@ -963,10 +983,29 @@ class PostgresDB:
             return False
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM jobs WHERE id = $1",
-                uuid_val,
-            )
+            async with conn.transaction():
+                # Static Docker inventory deliberately has no owner FK. Keep an
+                # in-flight endpoint occupied even if a cleanup caller deletes
+                # the owner after a failed/partial release.
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                await conn.execute(
+                    """
+                    UPDATE docker_workspace_leases
+                    SET status = 'quarantined',
+                        quarantine_reason = 'owner_deleted_before_recreation',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE owner_kind = 'job' AND owner_id = $1
+                      AND status IN ('ready', 'releasing')
+                    """,
+                    uuid_val,
+                )
+                result = await conn.execute(
+                    "DELETE FROM jobs WHERE id = $1",
+                    uuid_val,
+                )
 
         return result == "DELETE 1"
 
@@ -2098,6 +2137,918 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def acquire_docker_workspace_lease(
+        self,
+        *,
+        owner_kind: str,
+        owner_id: str,
+        candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Any] | None:
+        """Atomically lease one static Docker workspace across jobs and threads.
+
+        ``docker_workspace_leases`` is the durable occupancy authority. The
+        owner JSONB object is only a context mirror and is written in the same
+        transaction as an inventory claim. This distinction is essential:
+        quarantined inventory must survive permanent deletion of its last job
+        or thread owner.
+
+        A previously unseen endpoint is unavailable by default. It is seeded
+        ``released`` only by either an explicit, fingerprinted bootstrap
+        attestation or the same-trust ``trusted_dev`` mode. ``ON CONFLICT DO
+        NOTHING`` makes those flags first-discovery-only; configuration can
+        never promote an existing durable quarantine.
+        """
+
+        try:
+            owner_uuid = UUID(owner_id)
+        except (TypeError, ValueError):
+            return None
+        if owner_kind not in {"job", "thread"}:
+            raise ValueError("Docker workspace owner kind must be job or thread")
+
+        normalized: list[dict[str, Any]] = []
+        by_endpoint: dict[tuple[str, int], dict[str, Any]] = {}
+        for candidate in candidates:
+            host = str(candidate.get("host") or "").strip()
+            try:
+                port = int(candidate.get("port", 22))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Docker workspace candidate port is invalid") from exc
+            if (
+                not host
+                or len(host) > 255
+                or any(ord(char) < 32 or ord(char) == 127 for char in host)
+                or not 1 <= port <= 65535
+            ):
+                raise ValueError("Docker workspace candidate is invalid")
+
+            bootstrap_attested = candidate.get("bootstrap_attested", False)
+            trusted_dev_reuse = candidate.get("trusted_dev_reuse", False)
+            if not isinstance(bootstrap_attested, bool) or not isinstance(
+                trusted_dev_reuse, bool
+            ):
+                raise ValueError("Docker workspace trust flags must be boolean")
+            fingerprint_value = candidate.get("host_key_fingerprint")
+            fingerprint = None
+            if fingerprint_value is not None:
+                fingerprint = str(fingerprint_value).strip()
+                if (
+                    not fingerprint.startswith("SHA256:")
+                    or len(fingerprint) > 128
+                    or any(char.isspace() for char in fingerprint)
+                ):
+                    raise ValueError("Docker workspace host fingerprint is invalid")
+            if bootstrap_attested and fingerprint is None:
+                raise ValueError(
+                    "Docker workspace bootstrap attestation requires a fingerprint"
+                )
+
+            item: dict[str, Any] = {
+                "host": host,
+                "port": port,
+                "host_key_fingerprint": fingerprint,
+                "bootstrap_attested": bootstrap_attested,
+                "trusted_dev_reuse": trusted_dev_reuse,
+            }
+            if candidate.get("ide_host"):
+                ide_host = str(candidate["ide_host"]).strip()
+                if not ide_host or len(ide_host) > 255:
+                    raise ValueError("Docker workspace IDE host is invalid")
+                item["ide_host"] = ide_host
+            if candidate.get("ide_port") is not None:
+                try:
+                    ide_port = int(candidate["ide_port"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Docker workspace IDE port is invalid") from exc
+                if not 1 <= ide_port <= 65535:
+                    raise ValueError("Docker workspace IDE port is invalid")
+                item["ide_port"] = ide_port
+
+            endpoint = (host, port)
+            prior = by_endpoint.get(endpoint)
+            if prior is not None:
+                security_fields = (
+                    "host_key_fingerprint",
+                    "bootstrap_attested",
+                    "trusted_dev_reuse",
+                )
+                if any(
+                    prior.get(field) != item.get(field) for field in security_fields
+                ):
+                    raise ValueError(
+                        "Duplicate Docker workspace candidates disagree on trust"
+                    )
+                continue
+            by_endpoint[endpoint] = item
+            normalized.append(item)
+        if not normalized:
+            return None
+
+        select_owner = (
+            "SELECT context->'workspace_container' AS workspace "
+            "FROM jobs WHERE id = $1 FOR UPDATE"
+            if owner_kind == "job"
+            else "SELECT metadata->'workspace_container' AS workspace "
+            "FROM threads WHERE id = $1 FOR UPDATE"
+        )
+        update_owner = (
+            "UPDATE jobs "
+            "SET context = jsonb_set(COALESCE(context, '{}'::jsonb), "
+            "'{workspace_container}', $2::jsonb), "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = $1"
+            if owner_kind == "job"
+            else "UPDATE threads "
+            "SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), "
+            "'{workspace_container}', $2::jsonb), "
+            "last_activity = CURRENT_TIMESTAMP WHERE id = $1"
+        )
+
+        def parse_workspace(raw: Any) -> dict[str, Any]:
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (TypeError, ValueError):
+                    return {}
+            return dict(raw) if isinstance(raw, dict) else {}
+
+        def inventory_dict(row: Any) -> dict[str, Any] | None:
+            return dict(row) if row is not None else None
+
+        def mirror_inventory(
+            current: dict[str, Any],
+            inventory: dict[str, Any],
+            *,
+            preserve_generation: bool,
+        ) -> dict[str, Any]:
+            lease_id = inventory.get("lease_id")
+            trust_mode = str(inventory.get("trust_mode") or "unattested")
+            mirrored = {
+                **{
+                    key: current[key]
+                    for key in _DOCKER_WORKSPACE_PRESERVED_FIELDS
+                    if key in current
+                },
+                "host": str(inventory["host"]),
+                "port": int(inventory["port"]),
+                "status": str(inventory["status"]),
+                "provisioner": "docker",
+                _DOCKER_WORKSPACE_LEASE_KEY: str(lease_id) if lease_id else None,
+                _DOCKER_WORKSPACE_TRUST_KEY: trust_mode,
+                _DOCKER_WORKSPACE_ATTESTED_KEY: trust_mode == "attested",
+                "quarantine_reason": inventory.get("quarantine_reason"),
+            }
+            candidate = by_endpoint.get(
+                (str(inventory["host"]), int(inventory["port"]))
+            )
+            if candidate:
+                for field in ("ide_host", "ide_port"):
+                    if field in candidate:
+                        mirrored[field] = candidate[field]
+            if owner_kind == "thread":
+                mirrored[_DOCKER_WORKSPACE_GENERATION_KEY] = (
+                    current.get(_DOCKER_WORKSPACE_GENERATION_KEY)
+                    if preserve_generation
+                    else None
+                )
+            return mirrored
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                owner_row = await conn.fetchrow(select_owner, owner_uuid)
+                if owner_row is None:
+                    return None
+                current = parse_workspace(owner_row["workspace"])
+
+                # First discovery is the only point at which configuration may
+                # seed availability. Existing inventory always wins unchanged.
+                for candidate in normalized:
+                    if candidate["bootstrap_attested"]:
+                        seed_status = "released"
+                        seed_trust = "attested"
+                        seed_fingerprint = candidate["host_key_fingerprint"]
+                        seed_reason = None
+                    elif candidate["trusted_dev_reuse"]:
+                        seed_status = "released"
+                        seed_trust = "trusted_dev"
+                        seed_fingerprint = candidate["host_key_fingerprint"]
+                        seed_reason = None
+                    else:
+                        seed_status = "quarantined"
+                        seed_trust = "unattested"
+                        seed_fingerprint = None
+                        seed_reason = "bootstrap_attestation_required"
+                    await conn.execute(
+                        """
+                        INSERT INTO docker_workspace_leases (
+                            host, port, status, trust_mode,
+                            host_key_fingerprint, quarantine_reason
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        ON CONFLICT (host, port) DO NOTHING
+                        """,
+                        candidate["host"],
+                        candidate["port"],
+                        seed_status,
+                        seed_trust,
+                        seed_fingerprint,
+                        seed_reason,
+                    )
+
+                # If inventory already has a live lease for this owner, it is
+                # authoritative even when the JSONB mirror is absent or stale.
+                inventory = inventory_dict(
+                    await conn.fetchrow(
+                        f"""
+                        SELECT {_DOCKER_INVENTORY_COLUMNS}
+                        FROM docker_workspace_leases
+                        WHERE owner_kind = $1 AND owner_id = $2
+                          AND status IN ('ready', 'releasing')
+                        FOR UPDATE
+                        """,
+                        owner_kind,
+                        owner_uuid,
+                    )
+                )
+                if inventory is not None:
+                    endpoint = (str(inventory["host"]), int(inventory["port"]))
+                    candidate = by_endpoint.get(endpoint)
+                    trust_mode = str(inventory.get("trust_mode") or "unattested")
+                    fingerprint_matches = bool(
+                        candidate
+                        and candidate.get("host_key_fingerprint")
+                        == inventory.get("host_key_fingerprint")
+                    )
+                    try:
+                        current_port = int(current.get("port", 22))
+                    except (TypeError, ValueError):
+                        current_port = -1
+                    mirror_same_lease = (
+                        current.get("provisioner") == "docker"
+                        and str(current.get("host") or "") == endpoint[0]
+                        and current_port == endpoint[1]
+                        and current.get("status") == inventory.get("status")
+                        and str(current.get(_DOCKER_WORKSPACE_LEASE_KEY) or "")
+                        == str(inventory.get("lease_id") or "")
+                    )
+                    current_claims_docker_lease = current.get(
+                        "provisioner"
+                    ) == "docker" and current.get("status") in {
+                        "ready",
+                        "releasing",
+                        "released",
+                        "quarantined",
+                    }
+                    if current_claims_docker_lease and not mirror_same_lease:
+                        # A missing mirror can be repaired from inventory, but
+                        # two different live claims must never be reconciled by
+                        # silently overwriting one side. Keep the durable host
+                        # unavailable and withdraw all capability-bearing
+                        # identity from the owner mirror.
+                        await conn.execute(
+                            """
+                            UPDATE docker_workspace_leases
+                            SET status = 'quarantined',
+                                quarantine_reason = 'owner_mirror_mismatch',
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE host = $1 AND port = $2
+                              AND lease_id IS NOT DISTINCT FROM $3
+                            """,
+                            *endpoint,
+                            inventory.get("lease_id"),
+                        )
+                        quarantined = {
+                            **{
+                                key: current[key]
+                                for key in _DOCKER_WORKSPACE_PRESERVED_FIELDS
+                                if key in current
+                            },
+                            "host": endpoint[0],
+                            "port": endpoint[1],
+                            "status": "quarantined",
+                            "provisioner": "docker",
+                            _DOCKER_WORKSPACE_LEASE_KEY: None,
+                            _DOCKER_WORKSPACE_TRUST_KEY: "unattested",
+                            _DOCKER_WORKSPACE_ATTESTED_KEY: False,
+                            "quarantine_reason": "owner_mirror_mismatch",
+                        }
+                        if owner_kind == "thread":
+                            quarantined[_DOCKER_WORKSPACE_GENERATION_KEY] = None
+                        result = await conn.execute(
+                            update_owner, owner_uuid, json.dumps(quarantined)
+                        )
+                        if result != "UPDATE 1":
+                            raise RuntimeError(
+                                "Docker workspace owner mirror disappeared during quarantine"
+                            )
+                        return quarantined
+                    if trust_mode == "attested" and not fingerprint_matches:
+                        await conn.execute(
+                            """
+                            UPDATE docker_workspace_leases
+                            SET status = 'quarantined',
+                                quarantine_reason = 'host_fingerprint_inventory_mismatch',
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE host = $1 AND port = $2
+                            """,
+                            *endpoint,
+                        )
+                        inventory["status"] = "quarantined"
+                        inventory["quarantine_reason"] = (
+                            "host_fingerprint_inventory_mismatch"
+                        )
+                        mirror_same_lease = False
+                    elif trust_mode == "trusted_dev" and (
+                        not candidate or not candidate["trusted_dev_reuse"]
+                    ):
+                        await conn.execute(
+                            """
+                            UPDATE docker_workspace_leases
+                            SET status = 'quarantined',
+                                quarantine_reason = 'trusted_dev_inventory_not_enabled',
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE host = $1 AND port = $2
+                            """,
+                            *endpoint,
+                        )
+                        inventory["status"] = "quarantined"
+                        inventory["quarantine_reason"] = (
+                            "trusted_dev_inventory_not_enabled"
+                        )
+                        mirror_same_lease = False
+                    elif trust_mode not in {"attested", "trusted_dev"}:
+                        await conn.execute(
+                            """
+                            UPDATE docker_workspace_leases
+                            SET status = 'quarantined',
+                                quarantine_reason = 'inventory_trust_invalid',
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE host = $1 AND port = $2
+                            """,
+                            *endpoint,
+                        )
+                        inventory["status"] = "quarantined"
+                        inventory["quarantine_reason"] = "inventory_trust_invalid"
+                        mirror_same_lease = False
+
+                    authoritative = mirror_inventory(
+                        current,
+                        inventory,
+                        preserve_generation=(
+                            mirror_same_lease
+                            and inventory["status"] == "ready"
+                            and trust_mode == "attested"
+                        ),
+                    )
+                    result = await conn.execute(
+                        update_owner, owner_uuid, json.dumps(authoritative)
+                    )
+                    if result != "UPDATE 1":
+                        raise RuntimeError(
+                            "Docker workspace owner mirror disappeared during lease claim"
+                        )
+                    return authoritative
+
+                # A non-released mirror without a matching live inventory row
+                # is not authority. Mirror a durable quarantine for its endpoint
+                # and do not silently hand the owner a different host.
+                if (
+                    current.get("provisioner") == "docker"
+                    and current.get("status") != "released"
+                ):
+                    try:
+                        current_endpoint = (
+                            str(current.get("host") or "").strip(),
+                            int(current.get("port", 22)),
+                        )
+                    except (TypeError, ValueError):
+                        return None
+                    if current_endpoint[0] and 1 <= current_endpoint[1] <= 65535:
+                        existing = inventory_dict(
+                            await conn.fetchrow(
+                                f"""
+                                SELECT {_DOCKER_INVENTORY_COLUMNS}
+                                FROM docker_workspace_leases
+                                WHERE host = $1 AND port = $2
+                                FOR UPDATE
+                                """,
+                                *current_endpoint,
+                            )
+                        )
+                        if existing is None:
+                            await conn.execute(
+                                """
+                                INSERT INTO docker_workspace_leases (
+                                    host, port, status, trust_mode,
+                                    quarantine_reason
+                                )
+                                VALUES ($1, $2, 'quarantined', 'unattested',
+                                        'owner_inventory_missing')
+                                ON CONFLICT (host, port) DO NOTHING
+                                """,
+                                *current_endpoint,
+                            )
+                            existing = inventory_dict(
+                                await conn.fetchrow(
+                                    f"""
+                                    SELECT {_DOCKER_INVENTORY_COLUMNS}
+                                    FROM docker_workspace_leases
+                                    WHERE host = $1 AND port = $2
+                                    FOR UPDATE
+                                    """,
+                                    *current_endpoint,
+                                )
+                            )
+                        if existing is not None and existing["status"] != "released":
+                            authoritative = mirror_inventory(
+                                current, existing, preserve_generation=False
+                            )
+                            # The endpoint may be quarantined for a different or
+                            # ambiguous legacy owner. Never overwrite that row.
+                            if existing.get("owner_id") is not None and (
+                                str(existing.get("owner_id")) != str(owner_uuid)
+                                or existing.get("owner_kind") != owner_kind
+                            ):
+                                authoritative = {
+                                    **{
+                                        key: current[key]
+                                        for key in _DOCKER_WORKSPACE_PRESERVED_FIELDS
+                                        if key in current
+                                    },
+                                    "host": current_endpoint[0],
+                                    "port": current_endpoint[1],
+                                    "status": "quarantined",
+                                    "provisioner": "docker",
+                                    _DOCKER_WORKSPACE_LEASE_KEY: None,
+                                    _DOCKER_WORKSPACE_TRUST_KEY: "unattested",
+                                    _DOCKER_WORKSPACE_ATTESTED_KEY: False,
+                                    "quarantine_reason": (
+                                        "inventory_owned_by_another_lease"
+                                    ),
+                                }
+                                if owner_kind == "thread":
+                                    authoritative[_DOCKER_WORKSPACE_GENERATION_KEY] = (
+                                        None
+                                    )
+                            result = await conn.execute(
+                                update_owner, owner_uuid, json.dumps(authoritative)
+                            )
+                            if result != "UPDATE 1":
+                                raise RuntimeError(
+                                    "Docker workspace owner mirror disappeared during quarantine"
+                                )
+                            return authoritative
+
+                selected: dict[str, Any] | None = None
+                selected_inventory: dict[str, Any] | None = None
+                for candidate in normalized:
+                    row = inventory_dict(
+                        await conn.fetchrow(
+                            f"""
+                            SELECT {_DOCKER_INVENTORY_COLUMNS}
+                            FROM docker_workspace_leases
+                            WHERE host = $1 AND port = $2
+                            FOR UPDATE
+                            """,
+                            candidate["host"],
+                            candidate["port"],
+                        )
+                    )
+                    if row is None or row["status"] != "released":
+                        continue
+                    trust_mode = str(row.get("trust_mode") or "unattested")
+                    if trust_mode == "attested":
+                        if not candidate.get("host_key_fingerprint") or candidate[
+                            "host_key_fingerprint"
+                        ] != row.get("host_key_fingerprint"):
+                            await conn.execute(
+                                """
+                                UPDATE docker_workspace_leases
+                                SET status = 'quarantined',
+                                    quarantine_reason =
+                                        'host_fingerprint_inventory_mismatch',
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE host = $1 AND port = $2
+                                """,
+                                candidate["host"],
+                                candidate["port"],
+                            )
+                            continue
+                    elif trust_mode == "trusted_dev":
+                        if not candidate["trusted_dev_reuse"]:
+                            continue
+                    else:
+                        await conn.execute(
+                            """
+                            UPDATE docker_workspace_leases
+                            SET status = 'quarantined',
+                                quarantine_reason = 'inventory_trust_invalid',
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE host = $1 AND port = $2
+                            """,
+                            candidate["host"],
+                            candidate["port"],
+                        )
+                        continue
+                    selected = candidate
+                    selected_inventory = row
+                    break
+
+                if selected is None or selected_inventory is None:
+                    return None
+
+                lease_id = uuid4()
+                result = await conn.execute(
+                    """
+                    UPDATE docker_workspace_leases
+                    SET status = 'ready',
+                        lease_id = $3,
+                        owner_kind = $4,
+                        owner_id = $5,
+                        quarantine_reason = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE host = $1 AND port = $2 AND status = 'released'
+                    """,
+                    selected["host"],
+                    selected["port"],
+                    lease_id,
+                    owner_kind,
+                    owner_uuid,
+                )
+                if result != "UPDATE 1":
+                    raise RuntimeError("Docker workspace inventory claim was lost")
+
+                preserved = {
+                    key: current[key]
+                    for key in _DOCKER_WORKSPACE_PRESERVED_FIELDS
+                    if key in current
+                }
+                trust_mode = str(selected_inventory["trust_mode"])
+                lease = {
+                    **preserved,
+                    **{
+                        key: selected[key]
+                        for key in ("host", "port", "ide_host", "ide_port")
+                        if key in selected
+                    },
+                    "status": "ready",
+                    "provisioner": "docker",
+                    _DOCKER_WORKSPACE_LEASE_KEY: str(lease_id),
+                    _DOCKER_WORKSPACE_TRUST_KEY: trust_mode,
+                    _DOCKER_WORKSPACE_ATTESTED_KEY: trust_mode == "attested",
+                    "quarantine_reason": None,
+                }
+                if owner_kind == "thread":
+                    # Pairing is a second exact-lease CAS. Until that succeeds,
+                    # Canvas remains unavailable even for attested inventory.
+                    lease[_DOCKER_WORKSPACE_GENERATION_KEY] = None
+                owner_result = await conn.execute(
+                    update_owner, owner_uuid, json.dumps(lease)
+                )
+                if owner_result != "UPDATE 1":
+                    # Raising (rather than returning None) rolls the inventory
+                    # claim back with the owner-mirror write.
+                    raise RuntimeError(
+                        "Docker workspace owner mirror disappeared during lease claim"
+                    )
+                return lease
+
+    async def transition_docker_workspace_lease(
+        self,
+        *,
+        owner_kind: str,
+        owner_id: str,
+        expected_lease_id: str | None,
+        expected_statuses: set[str],
+        updates: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        """Compare-and-merge one exact durable Docker inventory lease.
+
+        The inventory endpoint, owner, lease ID, and status must all agree.
+        This serializes Canvas pairing, release, finalization, and allocation
+        across replicas. A stale owner mirror can never mutate a newly assigned
+        inventory row. Owner and inventory updates commit together; the narrow
+        owner-missing finalization case keeps an already-claimed endpoint
+        occupied or safely finalizes an exact post-cleanup lease.
+        """
+
+        try:
+            owner_uuid = UUID(owner_id)
+        except (TypeError, ValueError):
+            return None
+        if owner_kind not in {"job", "thread"}:
+            raise ValueError("Docker workspace owner kind must be job or thread")
+        valid_statuses = {"ready", "releasing", "released", "quarantined"}
+        if not expected_statuses or not expected_statuses <= valid_statuses:
+            raise ValueError("Docker workspace expected status is invalid")
+        status = updates.get("status")
+        if status not in valid_statuses:
+            raise ValueError("Docker workspace target status is invalid")
+        allowed_updates = {
+            "status",
+            "quarantine_reason",
+            _DOCKER_WORKSPACE_GENERATION_KEY,
+            _DOCKER_WORKSPACE_TRUST_KEY,
+            _DOCKER_WORKSPACE_ATTESTED_KEY,
+        }
+        if not set(updates) <= allowed_updates:
+            raise ValueError("Docker workspace transition contains unsupported fields")
+
+        expected_uuid: UUID | None = None
+        if expected_lease_id is not None:
+            try:
+                expected_uuid = UUID(str(expected_lease_id))
+            except (TypeError, ValueError):
+                return None
+
+        requested_trust = updates.get(_DOCKER_WORKSPACE_TRUST_KEY)
+        requested_attested = updates.get(_DOCKER_WORKSPACE_ATTESTED_KEY)
+        if requested_trust is not None and requested_trust not in {
+            "unattested",
+            "trusted_dev",
+            "attested",
+        }:
+            raise ValueError("Docker workspace target trust mode is invalid")
+        if requested_attested is not None and not isinstance(requested_attested, bool):
+            raise ValueError("Docker workspace attested marker must be boolean")
+        if (
+            requested_trust is not None
+            and requested_attested is not None
+            and requested_attested != (requested_trust == "attested")
+        ):
+            raise ValueError("Docker workspace trust markers disagree")
+
+        select_owner = (
+            "SELECT context->'workspace_container' AS workspace "
+            "FROM jobs WHERE id = $1 FOR UPDATE"
+            if owner_kind == "job"
+            else "SELECT metadata->'workspace_container' AS workspace "
+            "FROM threads WHERE id = $1 FOR UPDATE"
+        )
+        update_owner = (
+            "UPDATE jobs "
+            "SET context = jsonb_set(COALESCE(context, '{}'::jsonb), "
+            "'{workspace_container}', $2::jsonb), "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = $1"
+            if owner_kind == "job"
+            else "UPDATE threads "
+            "SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), "
+            "'{workspace_container}', $2::jsonb), "
+            "last_activity = CURRENT_TIMESTAMP WHERE id = $1"
+        )
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                owner_row = await conn.fetchrow(select_owner, owner_uuid)
+                current: dict[str, Any] | None = None
+                if owner_row is not None:
+                    raw_current = owner_row["workspace"] or {}
+                    if isinstance(raw_current, str):
+                        try:
+                            raw_current = json.loads(raw_current)
+                        except (TypeError, ValueError):
+                            raw_current = {}
+                    if isinstance(raw_current, dict):
+                        current = dict(raw_current)
+
+                inventory = None
+                if expected_uuid is not None:
+                    inventory_row = await conn.fetchrow(
+                        f"""
+                        SELECT {_DOCKER_INVENTORY_COLUMNS}
+                        FROM docker_workspace_leases
+                        WHERE owner_kind = $1 AND owner_id = $2 AND lease_id = $3
+                        FOR UPDATE
+                        """,
+                        owner_kind,
+                        owner_uuid,
+                        expected_uuid,
+                    )
+                    inventory = dict(inventory_row) if inventory_row else None
+                elif (
+                    current is not None
+                    and current.get(_DOCKER_WORKSPACE_LEASE_KEY) is None
+                ):
+                    # Legacy NULL is a real CAS value, never a wildcard. Durable
+                    # migration inventory is quarantined, so this path can only
+                    # match an explicitly owner-associated NULL lease.
+                    try:
+                        current_host = str(current.get("host") or "").strip()
+                        current_port = int(current.get("port", 22))
+                    except (TypeError, ValueError):
+                        return None
+                    inventory_row = await conn.fetchrow(
+                        f"""
+                        SELECT {_DOCKER_INVENTORY_COLUMNS}
+                        FROM docker_workspace_leases
+                        WHERE host = $1 AND port = $2
+                          AND owner_kind = $3 AND owner_id = $4
+                          AND lease_id IS NULL
+                        FOR UPDATE
+                        """,
+                        current_host,
+                        current_port,
+                        owner_kind,
+                        owner_uuid,
+                    )
+                    inventory = dict(inventory_row) if inventory_row else None
+
+                if (
+                    inventory is None
+                    or inventory.get("status") not in expected_statuses
+                ):
+                    return None
+
+                allowed_targets = {
+                    "ready": {"ready", "releasing", "quarantined"},
+                    "releasing": {"released", "quarantined"},
+                    "released": set(),
+                    "quarantined": {"quarantined"},
+                }
+                inventory_status = str(inventory["status"])
+                if status not in allowed_targets[inventory_status]:
+                    raise ValueError("Docker workspace lifecycle transition is invalid")
+
+                owner_matches = False
+                if current is not None:
+                    try:
+                        owner_matches = (
+                            current.get("provisioner") == "docker"
+                            and current.get("status") == inventory_status
+                            and str(current.get("host") or "") == str(inventory["host"])
+                            and int(current.get("port", 22)) == int(inventory["port"])
+                            and (
+                                (
+                                    expected_lease_id is None
+                                    and current.get(_DOCKER_WORKSPACE_LEASE_KEY) is None
+                                )
+                                or str(current.get(_DOCKER_WORKSPACE_LEASE_KEY) or "")
+                                == str(expected_uuid)
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        owner_matches = False
+
+                if current is not None and not owner_matches:
+                    # Inventory is authoritative, but a live disagreement means
+                    # neither side is safe to use. Quarantine the exact lease;
+                    # never redirect the stale mirror to another endpoint.
+                    await conn.execute(
+                        """
+                        UPDATE docker_workspace_leases
+                        SET status = 'quarantined',
+                            quarantine_reason = 'owner_mirror_mismatch',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE host = $1 AND port = $2 AND lease_id IS NOT DISTINCT FROM $3
+                        """,
+                        inventory["host"],
+                        inventory["port"],
+                        inventory.get("lease_id"),
+                    )
+                    quarantined = {
+                        **{
+                            key: current[key]
+                            for key in _DOCKER_WORKSPACE_TRANSITION_PRESERVED_FIELDS
+                            if key in current
+                        },
+                        "host": str(inventory["host"]),
+                        "port": int(inventory["port"]),
+                        "status": "quarantined",
+                        "provisioner": "docker",
+                        "quarantine_reason": "owner_mirror_mismatch",
+                        _DOCKER_WORKSPACE_LEASE_KEY: None,
+                        _DOCKER_WORKSPACE_TRUST_KEY: "unattested",
+                        _DOCKER_WORKSPACE_GENERATION_KEY: None,
+                        _DOCKER_WORKSPACE_ATTESTED_KEY: False,
+                    }
+                    result = await conn.execute(
+                        update_owner, owner_uuid, json.dumps(quarantined)
+                    )
+                    if result != "UPDATE 1":
+                        raise RuntimeError(
+                            "Docker workspace owner mirror disappeared during quarantine"
+                        )
+                    return None
+
+                if current is None and status not in {"released", "quarantined"}:
+                    # Pairing/releasing without an owner is nonsensical. Preserve
+                    # the endpoint as an owner-independent quarantine.
+                    await conn.execute(
+                        """
+                        UPDATE docker_workspace_leases
+                        SET status = 'quarantined',
+                            quarantine_reason = 'owner_deleted_during_transition',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE host = $1 AND port = $2 AND lease_id = $3
+                        """,
+                        inventory["host"],
+                        inventory["port"],
+                        inventory["lease_id"],
+                    )
+                    return None
+
+                current_trust = str(inventory.get("trust_mode") or "unattested")
+                target_trust = str(requested_trust or current_trust)
+                if status == "released" and requested_trust is None:
+                    # Releasing an endpoint is a trust-boundary operation. A
+                    # controller must explicitly preserve attested provenance;
+                    # dev cleanup must explicitly downgrade to trusted_dev.
+                    raise ValueError(
+                        "Docker workspace release requires an explicit trust mode"
+                    )
+                if target_trust == "attested" and current_trust != "attested":
+                    raise ValueError(
+                        "Docker workspace trust cannot be promoted by a lease transition"
+                    )
+                if target_trust != current_trust and not (
+                    inventory["status"] == "releasing"
+                    and status in {"released", "quarantined"}
+                    and target_trust == "trusted_dev"
+                ):
+                    raise ValueError("Docker workspace trust transition is invalid")
+                target_fingerprint = inventory.get("host_key_fingerprint")
+                if target_trust == "trusted_dev":
+                    target_fingerprint = None
+                if target_trust == "attested" and not target_fingerprint:
+                    raise ValueError("Attested Docker inventory has no fingerprint")
+
+                if status == "quarantined":
+                    quarantine_reason = str(
+                        updates.get("quarantine_reason") or "lease_quarantined"
+                    )
+                else:
+                    quarantine_reason = None
+
+                inventory_result = await conn.execute(
+                    """
+                    UPDATE docker_workspace_leases
+                    SET status = $4,
+                        trust_mode = $5,
+                        host_key_fingerprint = $6,
+                        quarantine_reason = $7,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE host = $1 AND port = $2
+                      AND lease_id IS NOT DISTINCT FROM $3
+                    """,
+                    inventory["host"],
+                    inventory["port"],
+                    inventory.get("lease_id"),
+                    status,
+                    target_trust,
+                    target_fingerprint,
+                    quarantine_reason,
+                )
+                if inventory_result != "UPDATE 1":
+                    raise RuntimeError("Docker workspace inventory transition was lost")
+
+                replacement_base = {
+                    key: current[key]
+                    for key in _DOCKER_WORKSPACE_TRANSITION_PRESERVED_FIELDS
+                    if current is not None and key in current
+                }
+                replacement = {
+                    **replacement_base,
+                    "host": str(inventory["host"]),
+                    "port": int(inventory["port"]),
+                    "status": status,
+                    "provisioner": "docker",
+                    _DOCKER_WORKSPACE_LEASE_KEY: (
+                        str(inventory["lease_id"])
+                        if inventory.get("lease_id") is not None
+                        else None
+                    ),
+                    _DOCKER_WORKSPACE_TRUST_KEY: target_trust,
+                    _DOCKER_WORKSPACE_ATTESTED_KEY: target_trust == "attested",
+                    "quarantine_reason": quarantine_reason,
+                }
+                if owner_kind == "thread":
+                    if status != "ready":
+                        replacement[_DOCKER_WORKSPACE_GENERATION_KEY] = None
+                    elif _DOCKER_WORKSPACE_GENERATION_KEY in updates:
+                        replacement[_DOCKER_WORKSPACE_GENERATION_KEY] = updates[
+                            _DOCKER_WORKSPACE_GENERATION_KEY
+                        ]
+                    elif current is not None:
+                        replacement[_DOCKER_WORKSPACE_GENERATION_KEY] = current.get(
+                            _DOCKER_WORKSPACE_GENERATION_KEY
+                        )
+                if current is not None:
+                    owner_result = await conn.execute(
+                        update_owner, owner_uuid, json.dumps(replacement)
+                    )
+                    if owner_result != "UPDATE 1":
+                        raise RuntimeError(
+                            "Docker workspace owner mirror disappeared during transition"
+                        )
+                return replacement
+
     async def merge_thread_workspace_context(
         self, thread_id: str, container_updates: Dict[str, Any]
     ) -> bool:
@@ -2136,6 +3087,103 @@ class PostgresDB:
             )
 
         return result == "UPDATE 1"
+
+    async def bind_thread_workspace_backing(
+        self,
+        thread_id: str,
+        *,
+        backing_kind: str,
+        backing_id: str,
+        ssh_host_key_fingerprint: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically bind a thread to one concrete workspace generation.
+
+        Ordinary status/endpoint merges deliberately do not touch this
+        identity. Repeating the same binding is a no-op; a different backing
+        identifier, kind, or pinned SSH host key mints a new opaque generation.
+        This keeps generation and fingerprint paired under one row lock.
+        """
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return None
+        if backing_kind not in {"remote", "virtual"}:
+            raise ValueError("workspace backing kind must be remote or virtual")
+        backing_id = str(backing_id).strip()
+        if not backing_id or len(backing_id) > 512 or "\x00" in backing_id:
+            raise ValueError("workspace backing id is invalid")
+        if backing_kind == "remote" and not ssh_host_key_fingerprint:
+            raise ValueError("remote workspace binding requires a host fingerprint")
+        if ssh_host_key_fingerprint is not None:
+            ssh_host_key_fingerprint = ssh_host_key_fingerprint.strip()
+            if (
+                not ssh_host_key_fingerprint.startswith("SHA256:")
+                or len(ssh_host_key_fingerprint) > 128
+                or any(ch.isspace() for ch in ssh_host_key_fingerprint)
+            ):
+                raise ValueError("SSH host-key fingerprint is invalid")
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT metadata FROM threads WHERE id = $1 FOR UPDATE",
+                    uuid_val,
+                )
+                if row is None:
+                    return None
+                metadata = row.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+
+                binding = metadata.get("_workspace_binding") or {}
+                if not isinstance(binding, dict):
+                    binding = {}
+                generation = binding.get("generation")
+                valid_generation = False
+                try:
+                    UUID(str(generation))
+                    valid_generation = True
+                except (TypeError, ValueError):
+                    pass
+                unchanged = (
+                    valid_generation
+                    and binding.get("kind") == backing_kind
+                    and binding.get("backing_id") == backing_id
+                    and binding.get("ssh_host_key_fingerprint")
+                    == ssh_host_key_fingerprint
+                )
+                if unchanged:
+                    return {
+                        "workspace_generation": str(generation),
+                        "changed": False,
+                    }
+
+                generation = str(uuid4())
+                patch = {
+                    "_workspace_binding": {
+                        "generation": generation,
+                        "kind": backing_kind,
+                        "backing_id": backing_id,
+                        "ssh_host_key_fingerprint": ssh_host_key_fingerprint,
+                    }
+                }
+                await conn.execute(
+                    """
+                    UPDATE threads
+                    SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+                        last_activity = CURRENT_TIMESTAMP
+                    WHERE id = $1
+                    """,
+                    uuid_val,
+                    json.dumps(patch),
+                )
+                return {"workspace_generation": generation, "changed": True}
 
     async def merge_thread_vm_context(
         self, thread_id: str, vm_updates: Dict[str, Any]
@@ -3628,15 +4676,35 @@ class PostgresDB:
 
     async def delete_thread(self, thread_id: str) -> None:
         """Permanently delete a thread and its messages."""
+        try:
+            thread_uuid = UUID(str(thread_id))
+        except (TypeError, ValueError):
+            return
         async with self.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM thread_messages WHERE thread_id = $1",
-                thread_id,
-            )
-            await conn.execute(
-                "DELETE FROM threads WHERE id = $1",
-                thread_id,
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    "srw-docker-workspace-pool",
+                )
+                await conn.execute(
+                    """
+                    UPDATE docker_workspace_leases
+                    SET status = 'quarantined',
+                        quarantine_reason = 'owner_deleted_before_recreation',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE owner_kind = 'thread' AND owner_id = $1
+                      AND status IN ('ready', 'releasing')
+                    """,
+                    thread_uuid,
+                )
+                await conn.execute(
+                    "DELETE FROM thread_messages WHERE thread_id = $1",
+                    thread_uuid,
+                )
+                await conn.execute(
+                    "DELETE FROM threads WHERE id = $1",
+                    thread_uuid,
+                )
 
     async def update_thread_status(self, thread_id: str, status: str) -> None:
         """Update thread status."""

@@ -1,0 +1,95 @@
+/*
+ * Canvas Markdown is assigned through a sanitizer-backed innerHTML sink, so
+ * Angular's emulated component attributes are not present on its descendants.
+ * Keep this one narrowly namespaced global recipe instead of disabling view
+ * encapsulation on the renderer component.
+ */
+.canvas-markdown {
+  overflow-wrap: anywhere;
+
+  > :first-child { margin-top: 0; }
+  > :last-child { margin-bottom: 0; }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    margin: 1.4em 0 0.55em;
+    color: var(--text-primary);
+    line-height: 1.25;
+  }
+
+  h1 { font-size: 1.8rem; }
+  h2 { font-size: 1.45rem; }
+  h3 { font-size: 1.2rem; }
+
+  p,
+  ul,
+  ol,
+  blockquote,
+  pre,
+  table {
+    margin: 0.9em 0;
+  }
+
+  a,
+  a[data-canvas-external] {
+    color: var(--accent-color);
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
+    cursor: pointer;
+  }
+
+  .canvas-inert-link {
+    color: var(--text-secondary);
+    text-decoration: underline dotted;
+  }
+
+  .canvas-image-alt {
+    display: inline-block;
+    padding: 2px 6px;
+    color: var(--text-muted);
+    font-style: italic;
+    border: 1px dashed var(--border-color);
+    border-radius: var(--radius-tag);
+  }
+
+  blockquote {
+    padding-left: 1em;
+    color: var(--text-secondary);
+    border-left: 3px solid var(--accent-color);
+  }
+
+  code {
+    padding: 0.1em 0.3em;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.9em;
+    background: var(--code-bg, var(--surface-0));
+    border-radius: var(--radius-tag);
+  }
+
+  pre {
+    padding: 14px;
+    overflow: auto;
+    background: var(--code-bg, var(--surface-0));
+    border-radius: var(--radius-surface);
+
+    code { padding: 0; background: transparent; }
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  th,
+  td {
+    padding: 7px 9px;
+    text-align: left;
+    border: 1px solid var(--border-color);
+  }
+
+  th { background: var(--surface-0); }
+}

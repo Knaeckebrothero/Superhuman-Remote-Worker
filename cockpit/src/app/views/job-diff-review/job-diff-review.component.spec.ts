@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { diffApiFor, isBinaryEntry, rejectBodyKeyFor } from './job-diff-review.component';
+import {monacoLanguageFromPath} from '../../core/services/monaco-editor-loader.service';
 
 /**
  * Unit tests for the pure helpers used by JobDiffReviewComponent.
@@ -14,31 +15,6 @@ import { diffApiFor, isBinaryEntry, rejectBodyKeyFor } from './job-diff-review.c
  * the real implementation the component uses.
  */
 
-function languageFromPath(path: string): string {
-  const ext = path.split('.').pop()?.toLowerCase() ?? '';
-  const map: Record<string, string> = {
-    md: 'markdown',
-    markdown: 'markdown',
-    json: 'json',
-    yaml: 'yaml',
-    yml: 'yaml',
-    ts: 'typescript',
-    tsx: 'typescript',
-    js: 'javascript',
-    jsx: 'javascript',
-    py: 'python',
-    sh: 'shell',
-    bash: 'shell',
-    sql: 'sql',
-    html: 'html',
-    css: 'css',
-    scss: 'scss',
-    xml: 'xml',
-    txt: 'plaintext',
-  };
-  return map[ext] ?? 'plaintext';
-}
-
 function statusGlyph(status: 'added' | 'modified' | 'deleted'): string {
   return status === 'added' ? '+' : status === 'deleted' ? '−' : 'M';
 }
@@ -46,34 +22,38 @@ function statusGlyph(status: 'added' | 'modified' | 'deleted'): string {
 describe('JobDiffReviewComponent helpers', () => {
   describe('languageFromPath', () => {
     it('infers markdown from .md', () => {
-      expect(languageFromPath('projects/foo/README.md')).toBe('markdown');
+      expect(monacoLanguageFromPath('projects/foo/README.md')).toBe('markdown');
     });
 
     it('infers yaml from .yml and .yaml', () => {
-      expect(languageFromPath('projects/foo/config.yaml')).toBe('yaml');
-      expect(languageFromPath('projects/foo/.gitlab-ci.yml')).toBe('yaml');
+      expect(monacoLanguageFromPath('projects/foo/config.yaml')).toBe('yaml');
+      expect(monacoLanguageFromPath('projects/foo/.gitlab-ci.yml')).toBe('yaml');
     });
 
     it('infers typescript from .ts and .tsx', () => {
-      expect(languageFromPath('projects/foo/index.ts')).toBe('typescript');
-      expect(languageFromPath('projects/foo/component.tsx')).toBe('typescript');
+      expect(monacoLanguageFromPath('projects/foo/index.ts')).toBe('typescript');
+      expect(monacoLanguageFromPath('projects/foo/component.tsx')).toBe('typescript');
     });
 
     it('infers python from .py', () => {
-      expect(languageFromPath('projects/foo/script.py')).toBe('python');
+      expect(monacoLanguageFromPath('projects/foo/script.py')).toBe('python');
     });
 
     it('falls back to plaintext for unknown extensions', () => {
-      expect(languageFromPath('projects/foo/notes.xyz')).toBe('plaintext');
+      expect(monacoLanguageFromPath('projects/foo/notes.xyz')).toBe('plaintext');
     });
 
     it('handles paths without an extension', () => {
-      expect(languageFromPath('projects/foo/Dockerfile')).toBe('plaintext');
+      expect(monacoLanguageFromPath('projects/foo/Dockerfile')).toBe('plaintext');
     });
 
     it('is case-insensitive', () => {
-      expect(languageFromPath('projects/foo/README.MD')).toBe('markdown');
-      expect(languageFromPath('projects/foo/Config.JSON')).toBe('json');
+      expect(monacoLanguageFromPath('projects/foo/README.MD')).toBe('markdown');
+      expect(monacoLanguageFromPath('projects/foo/Config.JSON')).toBe('json');
+    });
+
+    it('maps LaTeX sources for Canvas editing', () => {
+      expect(monacoLanguageFromPath('paper/main.tex')).toBe('latex');
     });
   });
 

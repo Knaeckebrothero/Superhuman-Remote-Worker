@@ -55,6 +55,12 @@ export interface ToolResult {
     bytesTotal?: number;
 }
 
+export interface ToolCardAction {
+    readonly kind: 'open_canvas';
+    /** Revision presented by this historical tool result when recoverable. */
+    readonly presentationRevision?: number;
+}
+
 /**
  * The complete, render-ready description of one tool call. Produced by
  * `buildToolCardView()` from a `NormalizedToolCall`; consumed by
@@ -73,6 +79,8 @@ export interface ToolCardView {
     params: ToolParam[];
     result?: ToolResult;
     details: ToolDetail[];
+    /** Optional trusted Cockpit action; never an agent-supplied URL. */
+    action?: ToolCardAction;
     /** Explicit error message (audit) or the errored output (live). */
     error?: string;
 }

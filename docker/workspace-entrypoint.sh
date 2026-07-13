@@ -12,10 +12,10 @@ set -e
 #    Dockerfile. The skeleton restores dotfiles (.bashrc, .gitconfig, etc.)
 #    on first boot without overwriting files that already exist (-n).
 # ---------------------------------------------------------------------------
+chown agent-host:agent-host /home/agent-host
 if [ ! -f /home/agent-host/.workspace-initialized ]; then
-    cp -rn /etc/skel.agent-host/. /home/agent-host/
-    chown -R agent-host:agent-host /home/agent-host
-    touch /home/agent-host/.workspace-initialized
+    su -s /bin/sh agent-host -c \
+        'cp -rn /etc/skel.agent-host/. /home/agent-host/ && touch /home/agent-host/.workspace-initialized'
 fi
 
 # ---------------------------------------------------------------------------
@@ -35,6 +35,34 @@ if [ -f /tmp/ssh-pubkey/ssh-publickey ]; then
     cp /tmp/ssh-pubkey/ssh-publickey /etc/ssh/authorized_keys/agent-host
     chmod 644 /etc/ssh/authorized_keys/agent-host
 fi
+
+# ---------------------------------------------------------------------------
+# 2a. Install a per-workspace SSH host identity.
+#
+# Host identity must not live below the agent-owned home directory. Kubernetes
+# mounts a pod-private emptyDir here so keys survive a container restart; a new
+# pod/container receives a new key and the provisioner rotates the paired
+# Canvas generation. Never fall back to image-baked host keys.
+# ---------------------------------------------------------------------------
+HOST_KEY_DIR=/var/lib/srw-system/ssh
+install -d -o root -g root -m 0700 /var/lib/srw-system
+install -d -o root -g root -m 0700 "$HOST_KEY_DIR"
+if [ ! -s "$HOST_KEY_DIR/ssh_host_ed25519_key" ]; then
+    ssh-keygen -q -t ed25519 -N '' -f "$HOST_KEY_DIR/ssh_host_ed25519_key"
+fi
+if [ ! -s "$HOST_KEY_DIR/ssh_host_rsa_key" ]; then
+    ssh-keygen -q -t rsa -b 3072 -N '' -f "$HOST_KEY_DIR/ssh_host_rsa_key"
+fi
+# Reassert the trust boundary on every start, including a restart after the
+# agent deletes its home marker and the skeleton is seeded again. Nothing in
+# the home-seeding path recursively changes ownership, and persisted host keys
+# remain root-owned with exact OpenSSH modes.
+chown root:root "$HOST_KEY_DIR"/ssh_host_*_key "$HOST_KEY_DIR"/ssh_host_*_key.pub
+chmod 0600 "$HOST_KEY_DIR"/ssh_host_*_key
+chmod 0644 "$HOST_KEY_DIR"/ssh_host_*_key.pub
+for key in "$HOST_KEY_DIR"/ssh_host_*_key "$HOST_KEY_DIR"/ssh_host_*_key.pub; do
+    ln -sfn "$key" "/etc/ssh/$(basename "$key")"
+done
 
 # ---------------------------------------------------------------------------
 # 2b. Seed per-user code-server config (theme / keybindings / snippets)

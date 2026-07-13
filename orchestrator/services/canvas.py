@@ -13,11 +13,15 @@ bytes represented by the strong state ETag.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
 import logging
+import os
+import re
 import secrets
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Any, Awaitable, Callable, Literal
@@ -37,6 +41,12 @@ logger = logging.getLogger(__name__)
 MAIN_CANVAS_ID = "main"
 SOURCE_FINGERPRINT_SCHEMA_VERSION = 1
 _SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
+_EDIT_COORDINATOR_SEMAPHORE = asyncio.Semaphore(
+    max(1, int(os.getenv("CANVAS_MAX_EDIT_COORDINATORS", "4")))
+)
+_EDIT_COORDINATOR_QUEUE_TIMEOUT = float(
+    os.getenv("CANVAS_EDIT_COORDINATOR_QUEUE_TIMEOUT", "5")
+)
 
 CanvasRenderer = Literal["auto", "markdown", "text", "html", "image"]
 CanvasStatus = Literal[
@@ -138,6 +148,12 @@ class CanvasSetInput(_StrictFrozenModel):
             raise ValueError("source_version is supported only for workspace_file")
         if self.new_app and not is_app:
             raise ValueError("new_app is supported only for workspace_app")
+        if self.editable and (
+            not is_file or self.renderer not in {"markdown", "text", "html"}
+        ):
+            raise ValueError(
+                "editable Canvas sources require a validated text or HTML renderer"
+            )
         return self
 
 
@@ -180,6 +196,7 @@ class CanvasPublicState(_StrictFrozenModel):
     status: CanvasStatus
     capabilities: CanvasCapabilities
     updated_at: str
+    content_url: str | None = None
 
 
 class CanvasInvalidationParams(_StrictFrozenModel):
@@ -265,6 +282,50 @@ class CanvasPreconditionRequired(CanvasError):
 
 class CanvasPreconditionFailed(CanvasError):
     pass
+
+
+class CanvasEditError(CanvasError):
+    """Typed conditional-edit failure shared by the HTTP adapter and tests."""
+
+    def __init__(self, status_code: int, code: str, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
+def canvas_file_lock_key(thread_id: str, canonical_path: str) -> int:
+    """Return a stable signed PostgreSQL advisory-lock key for one file."""
+
+    material = (
+        b"srw-canvas-file-edit-v1\x00"
+        + thread_id.encode("utf-8")
+        + b"\x00"
+        + canonical_path.encode("utf-8")
+    )
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big", signed=True)
+
+
+@asynccontextmanager
+async def _canvas_mutation_admission():
+    admitted = False
+    try:
+        try:
+            await asyncio.wait_for(
+                _EDIT_COORDINATOR_SEMAPHORE.acquire(),
+                timeout=max(0.05, _EDIT_COORDINATOR_QUEUE_TIMEOUT),
+            )
+            admitted = True
+        except TimeoutError as exc:
+            raise CanvasEditError(
+                503,
+                "canvas_edit_capacity_exhausted",
+                "Canvas edit capacity is currently exhausted",
+            ) from exc
+        yield
+    finally:
+        if admitted:
+            _EDIT_COORDINATOR_SEMAPHORE.release()
 
 
 def _coerce_datetime(value: Any) -> datetime:
@@ -392,6 +453,7 @@ def build_public_canvas_representation(
     *,
     status: CanvasStatus | None = None,
     capabilities: CanvasCapabilities | None = None,
+    content_url: str | None = None,
 ) -> CanvasRepresentation:
     """Serialize one exact caller-visible state and derive its strong ETag."""
 
@@ -410,6 +472,7 @@ def build_public_canvas_representation(
         status=derived_status,
         capabilities=capabilities or CanvasCapabilities(),
         updated_at=_utc_iso(record.updated_at),
+        content_url=content_url,
     )
     payload = json.dumps(
         state.model_dump(mode="json"),
@@ -439,6 +502,7 @@ def canvas_invalidation(
 
 CanvasEventCallback = Callable[[CanvasInvalidation], Awaitable[None] | None]
 CanvasRepresentationBuilder = Callable[[CanvasRecord], CanvasRepresentation]
+CanvasFileWriter = Callable[[CanvasRecord, dict[str, Any]], Awaitable[str]]
 
 
 class CanvasService:
@@ -549,6 +613,321 @@ class CanvasService:
         await self._emit(record, method="canvas.updated")
         return CanvasMutation(changed=True, record=record)
 
+    async def edit_file(
+        self,
+        thread_id: str,
+        *,
+        expected_presentation_revision: int,
+        expected_source_fingerprint: str,
+        expected_source_version: str,
+        expected_thread_user_id: str,
+        writer: CanvasFileWriter,
+        canvas_id: str = MAIN_CANVAS_ID,
+        lock_timeout: float | None = None,
+    ) -> CanvasMutation:
+        """Conditionally write an editable file and advance Canvas state once.
+
+        The PostgreSQL session-level advisory lock serializes cooperating
+        writers across replicas. The Canvas row lock is taken only after that
+        coordinator and is held across the bounded workspace write/readback,
+        preventing a concurrent clear or replacement from redirecting a save.
+        """
+
+        self._require_main(canvas_id)
+        initial = await self.get(thread_id, canvas_id=canvas_id)
+        initial_source = self._validate_edit_record(
+            initial,
+            expected_presentation_revision=expected_presentation_revision,
+            expected_source_fingerprint=expected_source_fingerprint,
+            expected_source_version=expected_source_version,
+        )
+        lock_key = canvas_file_lock_key(thread_id, initial_source.path)
+        timeout = (
+            float(os.getenv("CANVAS_EDIT_LOCK_TIMEOUT", "5"))
+            if lock_timeout is None
+            else lock_timeout
+        )
+        deadline = asyncio.get_running_loop().time() + max(0.05, timeout)
+        updated_record: CanvasRecord | None = None
+
+        coordinator_admitted = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    _EDIT_COORDINATOR_SEMAPHORE.acquire(),
+                    timeout=max(0.05, _EDIT_COORDINATOR_QUEUE_TIMEOUT),
+                )
+                coordinator_admitted = True
+            except TimeoutError as exc:
+                raise CanvasEditError(
+                    503,
+                    "canvas_edit_capacity_exhausted",
+                    "Canvas edit capacity is currently exhausted",
+                ) from exc
+
+            async with self._db.acquire() as conn:
+                acquired = False
+                try:
+                    while True:
+                        acquired = bool(
+                            await conn.fetchval(
+                                "SELECT pg_try_advisory_lock($1)", lock_key
+                            )
+                        )
+                        if acquired:
+                            break
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise CanvasEditError(
+                                423,
+                                "canvas_edit_busy",
+                                "Another Canvas save is currently in progress",
+                            )
+                        await asyncio.sleep(0.05)
+
+                    async with conn.transaction():
+                        thread_row = await conn.fetchrow(
+                            """
+                            SELECT id, user_id, metadata
+                            FROM threads
+                            WHERE id = $1
+                            FOR SHARE
+                            """,
+                            thread_id,
+                        )
+                        if thread_row is None or str(
+                            thread_row.get("user_id") or ""
+                        ) != str(expected_thread_user_id):
+                            raise CanvasEditError(
+                                403,
+                                "canvas_not_authorized",
+                                "Canvas thread authorization changed",
+                            )
+                        row = await conn.fetchrow(
+                            """
+                            SELECT thread_id, canvas_id, source, title, renderer,
+                                   editable, alt_text, presentation_revision,
+                                   source_fingerprint, source_version,
+                                   origin_generation, created_at, updated_at
+                            FROM canvases
+                            WHERE thread_id = $1 AND canvas_id = $2
+                            FOR UPDATE
+                            """,
+                            thread_id,
+                            canvas_id,
+                        )
+                        current = (
+                            CanvasRecord.from_row(row) if row is not None else None
+                        )
+                        self._validate_edit_record(
+                            current,
+                            expected_presentation_revision=(
+                                expected_presentation_revision
+                            ),
+                            expected_source_fingerprint=expected_source_fingerprint,
+                            expected_source_version=expected_source_version,
+                        )
+                        assert current is not None
+
+                        resulting_version = await writer(current, dict(thread_row))
+                        if not isinstance(resulting_version, str) or not re.fullmatch(
+                            _SHA256_PATTERN, resulting_version
+                        ):
+                            raise CanvasEditError(
+                                500,
+                                "canvas_write_failed",
+                                "Canvas workspace write returned an invalid "
+                                "content version",
+                            )
+
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE canvases
+                            SET source_version = $3,
+                                presentation_revision = presentation_revision + 1,
+                                updated_at = now()
+                            WHERE thread_id = $1 AND canvas_id = $2
+                            RETURNING thread_id, canvas_id, source, title, renderer,
+                                      editable, alt_text, presentation_revision,
+                                      source_fingerprint, source_version,
+                                      origin_generation, created_at, updated_at
+                            """,
+                            thread_id,
+                            canvas_id,
+                            resulting_version,
+                        )
+                        updated_record = CanvasRecord.from_row(updated)
+                finally:
+                    if acquired:
+                        try:
+                            released = await conn.fetchval(
+                                "SELECT pg_advisory_unlock($1)", lock_key
+                            )
+                            if released is not True:
+                                logger.error(
+                                    "Canvas advisory lock was not held at release "
+                                    "for thread=%s",
+                                    thread_id,
+                                )
+                        except Exception:
+                            # Returning a connection with a session lock would
+                            # poison the pool. Terminate it if explicit unlock
+                            # fails.
+                            logger.exception(
+                                "Canvas advisory lock release failed for thread=%s",
+                                thread_id,
+                            )
+                            terminate = getattr(conn, "terminate", None)
+                            if callable(terminate):
+                                terminate()
+        finally:
+            if coordinator_admitted:
+                _EDIT_COORDINATOR_SEMAPHORE.release()
+
+        assert updated_record is not None
+        await self._emit(updated_record, method="canvas.updated")
+        return CanvasMutation(changed=True, record=updated_record)
+
+    @staticmethod
+    def _validate_edit_record(
+        record: CanvasRecord | None,
+        *,
+        expected_presentation_revision: int,
+        expected_source_fingerprint: str,
+        expected_source_version: str,
+    ) -> WorkspaceFileSource:
+        """Apply conflict precedence before any ordinary hash mismatch."""
+
+        if record is None or record.source is None:
+            raise CanvasEditError(409, "canvas_cleared", "Canvas is cleared")
+        if not isinstance(record.source, WorkspaceFileSource):
+            raise CanvasEditError(409, "canvas_replaced", "Canvas source was replaced")
+        if record.source_fingerprint != expected_source_fingerprint:
+            raise CanvasEditError(409, "canvas_replaced", "Canvas source was replaced")
+        if record.presentation_revision != expected_presentation_revision:
+            raise CanvasEditError(
+                409,
+                "canvas_presentation_changed",
+                "Canvas presentation changed; reload its current state",
+            )
+        if not record.editable:
+            raise CanvasEditError(
+                409,
+                "canvas_not_editable",
+                "The current Canvas presentation is not editable",
+            )
+        if record.renderer not in {"markdown", "text", "html"}:
+            raise CanvasEditError(
+                409,
+                "canvas_not_editable",
+                "The current Canvas renderer does not support editing",
+            )
+        if record.source_version != expected_source_version:
+            raise CanvasEditError(
+                412,
+                "canvas_content_precondition_failed",
+                "Canvas content changed; reload before saving",
+            )
+        return record.source
+
+    async def refresh_file(
+        self,
+        thread_id: str,
+        *,
+        expected_etag: str | None,
+        expected_thread_user_id: str,
+        refresher: CanvasFileWriter,
+        canvas_id: str = MAIN_CANVAS_ID,
+        representation_builder: CanvasRepresentationBuilder = (
+            build_public_canvas_representation
+        ),
+    ) -> CanvasMutation:
+        """Adopt the current validated workspace bytes for a file Canvas."""
+
+        self._require_main(canvas_id)
+        refreshed_record: CanvasRecord | None = None
+        async with _canvas_mutation_admission():
+            async with self._db.acquire() as conn:
+                async with conn.transaction():
+                    thread_row = await conn.fetchrow(
+                        """
+                        SELECT id, user_id, metadata
+                        FROM threads
+                        WHERE id = $1
+                        FOR SHARE
+                        """,
+                        thread_id,
+                    )
+                    if thread_row is None or str(
+                        thread_row.get("user_id") or ""
+                    ) != str(expected_thread_user_id):
+                        raise CanvasEditError(
+                            403,
+                            "canvas_not_authorized",
+                            "Canvas thread authorization changed",
+                        )
+                    row = await conn.fetchrow(
+                        """
+                        SELECT thread_id, canvas_id, source, title, renderer,
+                               editable, alt_text, presentation_revision,
+                               source_fingerprint, source_version,
+                               origin_generation, created_at, updated_at
+                        FROM canvases
+                        WHERE thread_id = $1 AND canvas_id = $2
+                        FOR UPDATE
+                        """,
+                        thread_id,
+                        canvas_id,
+                    )
+                    if row is None or row.get("source") is None:
+                        raise CanvasEditError(
+                            409, "canvas_cleared", "Canvas is cleared"
+                        )
+                    current = CanvasRecord.from_row(row)
+                    if not isinstance(current.source, WorkspaceFileSource):
+                        raise CanvasEditError(
+                            409,
+                            "canvas_not_file",
+                            "The current Canvas is not file-backed",
+                        )
+                    if expected_etag is None:
+                        raise CanvasPreconditionRequired(
+                            "If-Match is required to refresh a Canvas"
+                        )
+                    current_etag = representation_builder(current).etag
+                    if not secrets.compare_digest(expected_etag.strip(), current_etag):
+                        raise CanvasPreconditionFailed("Canvas state ETag is stale")
+
+                    resulting_version = await refresher(current, dict(thread_row))
+                    if not isinstance(resulting_version, str) or not re.fullmatch(
+                        _SHA256_PATTERN, resulting_version
+                    ):
+                        raise CanvasEditError(
+                            500,
+                            "canvas_refresh_failed",
+                            "Canvas refresh returned an invalid content version",
+                        )
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE canvases
+                        SET source_version = $3,
+                            presentation_revision = presentation_revision + 1,
+                            updated_at = now()
+                        WHERE thread_id = $1 AND canvas_id = $2
+                        RETURNING thread_id, canvas_id, source, title, renderer,
+                                  editable, alt_text, presentation_revision,
+                                  source_fingerprint, source_version,
+                                  origin_generation, created_at, updated_at
+                        """,
+                        thread_id,
+                        canvas_id,
+                        resulting_version,
+                    )
+                    refreshed_record = CanvasRecord.from_row(updated)
+
+        assert refreshed_record is not None
+        await self._emit(refreshed_record, method="canvas.updated")
+        return CanvasMutation(changed=True, record=refreshed_record)
+
     async def clear(
         self,
         thread_id: str,
@@ -558,6 +937,7 @@ class CanvasService:
         representation_builder: CanvasRepresentationBuilder = (
             build_public_canvas_representation
         ),
+        require_precondition: bool = True,
     ) -> CanvasMutation:
         """Conditionally clear a populated presentation.
 
@@ -590,13 +970,15 @@ class CanvasService:
                 if current.source is None:
                     return CanvasMutation(changed=False, record=current)
 
-                if expected_etag is None:
+                if expected_etag is None and require_precondition:
                     raise CanvasPreconditionRequired(
                         "If-Match is required to clear a populated Canvas"
                     )
-                current_etag = representation_builder(current).etag
-                if not secrets.compare_digest(expected_etag.strip(), current_etag):
-                    raise CanvasPreconditionFailed("Canvas state ETag is stale")
+                if require_precondition:
+                    assert expected_etag is not None
+                    current_etag = representation_builder(current).etag
+                    if not secrets.compare_digest(expected_etag.strip(), current_etag):
+                        raise CanvasPreconditionFailed("Canvas state ETag is stale")
 
                 cleared_row = await conn.fetchrow(
                     """
@@ -654,6 +1036,7 @@ class CanvasService:
 __all__ = [
     "BrowserSource",
     "CanvasCapabilities",
+    "CanvasEditError",
     "CanvasError",
     "CanvasInvalidation",
     "CanvasMutation",
@@ -669,6 +1052,7 @@ __all__ = [
     "WorkspaceAppSource",
     "WorkspaceFileSource",
     "build_public_canvas_representation",
+    "canvas_file_lock_key",
     "canonical_source_fingerprint",
     "canvas_invalidation",
 ]
