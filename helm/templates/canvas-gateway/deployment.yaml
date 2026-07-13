@@ -1,0 +1,116 @@
+{{- if .Values.canvas.livePreview.viewer.enabled }}
+{{- $viewer := .Values.canvas.livePreview.viewer -}}
+{{- if not .Values.canvas.livePreview.enabled -}}
+{{- fail "canvas.livePreview.viewer.enabled requires canvas.livePreview.enabled=true" -}}
+{{- end -}}
+{{- if not (hasSuffix (printf ".%s" $viewer.domain) $viewer.hostSuffix) -}}
+{{- fail "canvas.livePreview.viewer.hostSuffix must be at or below canvas.livePreview.viewer.domain" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-canvas-gateway
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "canvas-gateway") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  replicas: {{ $viewer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "canvas-gateway") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-postgres 5432; do sleep 2; done"]
+      {{- end }}
+      containers:
+        - name: canvas-gateway
+          image: "{{ .Values.image.orchestrator.repository }}:{{ .Values.image.orchestrator.tag }}"
+          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
+          command:
+            - uvicorn
+            - canvas_gateway:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8086"
+            - --http
+            - h11
+            # Bootstrap URLs contain one-time credentials. The gateway owns
+            # query-redacted request logs; Uvicorn access logging stays off.
+            - --no-access-log
+          ports:
+            - name: http
+              containerPort: 8086
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "srw.configMapName" . }}
+          env:
+            - name: PORT
+              value: "8086"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: SSH_KEY_PATH
+              value: /run/secrets/vm-ssh-key
+          volumeMounts:
+            - name: vm-ssh-key
+              mountPath: /run/secrets/vm-ssh-key
+              subPath: ssh-privatekey
+              readOnly: true
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml $viewer.resources | nindent 12 }}
+      volumes:
+        - name: vm-ssh-key
+          secret:
+            secretName: {{ include "srw.vmSshKeySecretName" . }}
+            # Matches the orchestrator mount: the production image runs as the
+            # non-root `srw` user while the projected key is root-owned.
+            defaultMode: 0444
+{{- end }}

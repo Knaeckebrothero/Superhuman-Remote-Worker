@@ -158,11 +158,29 @@ ingress:
     issuerName: letsencrypt-prod
 
 # Workspace-port Canvas previews remain unavailable until the deployment has
-# the separate viewer domain/edge and has passed the browser security gates.
+# a separate viewer domain/edge and has passed the browser security gates. The
+# chart can render an internal gateway, but intentionally creates no wildcard
+# ingress or TLS route for it. Dedicated least-privilege database credentials
+# and a gateway-only config projection are also production launch blockers.
 canvas:
   livePreview:
     enabled: false
     deniedPorts: []
+    viewer:
+      enabled: false
+      deploymentProfile: production
+      cookieMode: ""
+      domain: ""
+      hostSuffix: ""
+      cockpitOrigins: []
+      rawPathVerified: false
+      pslBoundaryVerified: false
+      # Keep both selectors empty while disabled. Enabling requires non-empty
+      # selectors for the operator-owned edge and opens only TCP/8086 from it.
+      networkPolicy:
+        edgeNamespaceSelector: {}
+        edgePodSelector: {}
+        extraEgress: []
 
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets

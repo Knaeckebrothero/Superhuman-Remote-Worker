@@ -47,9 +47,7 @@ spec:
           port: 30022
         - protocol: TCP
           port: 9222
-    # SFTP from orchestrator: thread workspace uploads (camera capture, voice
-    # messages, attachments) land in <workspace>/uploads/ via paramiko SFTP.
-    # See orchestrator/services/thread_uploads.py.
+    # SSH from orchestrator: thread uploads plus IDE/snapshot control paths.
     - from:
         - podSelector:
             matchLabels:
@@ -57,6 +55,20 @@ spec:
       ports:
         - protocol: TCP
           port: 30022
+    {{- if $.Values.canvas.livePreview.viewer.enabled }}
+    # The Canvas gateway opens request-scoped direct channels to workspace
+    # loopback. Container workspaces use 30022; VM/KubeVirt inventory may use
+    # the conventional port 22. No application port is opened on the pod net.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "canvas-gateway") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 30022
+        - protocol: TCP
+          port: 22
+    {{- end }}
     # code-server from orchestrator (IDE session proxying)
     - from:
         - podSelector:

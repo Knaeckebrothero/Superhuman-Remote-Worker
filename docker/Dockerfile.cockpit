@@ -44,6 +44,12 @@ LABEL description="Cockpit Angular Frontend"
 # Copy built static assets from builder
 COPY --from=builder /app/dist/cockpit/browser /usr/share/nginx/html
 
+# Compose can inject the non-secret Canvas viewer suffix at container start.
+# The stock nginx entrypoint runs executable scripts in /docker-entrypoint.d;
+# Helm instead mounts a complete chart-rendered env.js and leaves this unset.
+COPY docker/cockpit-canvas-env.sh /docker-entrypoint.d/40-srw-canvas-env.sh
+RUN chmod 0755 /docker-entrypoint.d/40-srw-canvas-env.sh
+
 # Nginx config: SPA fallback + port 4000. Stock mime.types has no
 # .webmanifest mapping, so without the explicit location the manifest is
 # served as application/octet-stream and Android installs degrade to a

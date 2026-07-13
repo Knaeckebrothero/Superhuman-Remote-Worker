@@ -255,6 +255,7 @@ def test_workspace_port_set_normalizes_and_returns_status_without_viewer_data(
         "can_edit": False,
         "can_pop_out": False,
         "can_take_control": False,
+        "can_create_viewer_session": False,
     }
     assert gateway.validation_calls == [(db.thread, 8501, "/demo")]
     assert len(gateway.revalidation_calls) == 1

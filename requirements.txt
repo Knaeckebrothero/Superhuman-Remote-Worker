@@ -47,6 +47,9 @@ langdetect>=1.0.9
 # picked up automatically. Tighten to `<0.136` if upstream confirms a real compromise.
 fastapi>=0.109.0,!=0.136.3
 uvicorn>=0.27.0
+# Direct, security-patched HTTP/1.1 parser/encoder for the Dynamic Canvas
+# request-scoped SSH proxy transport (also used transitively by Uvicorn).
+h11>=0.16.0
 httpx>=0.26.0
 # Retry primitives for the main-cloud backend layer (transitive via
 # langchain-core today; listed explicitly so cloud/retry.py keeps working

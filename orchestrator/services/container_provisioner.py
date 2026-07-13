@@ -604,6 +604,64 @@ class ContainerProvisioner:
             )
             return None
 
+    async def get_last_termination(self, owner: WorkspaceOwner) -> Optional[dict]:
+        """Read the workspace pod's terminated-container cause, for legibility.
+
+        Called on workspace loss BEFORE ``delete_workspace`` (while the Failed
+        pod tombstone still exists) so a resource kill surfaces its true cause
+        (``OOMKilled`` / ``Evicted``) instead of the opaque downstream SSH error
+        the agent happened to hit. Mirrors the agent-pod reap classifier in
+        ``agent_provisioner`` — the kill reason lives in ``state.terminated`` or,
+        if the container restarted, ``last_state.terminated``.
+
+        Returns ``{phase, pod_reason, container_reason, exit_code, signal}`` or
+        ``None`` when the pod is already gone (404) or K8s is unavailable.
+        """
+        if not self._k8s_available:
+            return None
+        pod_name = owner.pod_name
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+        except Exception as e:
+            if getattr(e, "status", None) == 404:
+                return None
+            logger.debug(
+                "Termination read failed for %s %s: %s", owner.kind, owner.id, e
+            )
+            return None
+
+        status = pod.status
+        exit_code: Any = None
+        container_reason: Any = None
+        signal: Any = None
+        for cs in getattr(status, "container_statuses", None) or []:
+            if cs.name != "workspace":
+                continue
+            terminated = getattr(getattr(cs, "state", None), "terminated", None)
+            if terminated is None:
+                # Container restarted (e.g. OOMKilled then restarted): the kill
+                # reason lives in last_state.terminated, not state.
+                terminated = getattr(
+                    getattr(cs, "last_state", None), "terminated", None
+                )
+            if terminated is not None:
+                exit_code = getattr(terminated, "exit_code", None)
+                container_reason = getattr(terminated, "reason", None)
+                signal = getattr(terminated, "signal", None)
+            break
+        return {
+            "phase": getattr(status, "phase", None),
+            # pod-level status.reason is "Evicted" on node-pressure eviction
+            "pod_reason": getattr(status, "reason", None),
+            "container_reason": container_reason,
+            "exit_code": exit_code,
+            "signal": signal,
+        }
+
     async def workspace_pod_live(self, owner: "WorkspaceOwner") -> Optional[bool]:
         """Drift probe: is the owner's workspace pod actually alive?
 

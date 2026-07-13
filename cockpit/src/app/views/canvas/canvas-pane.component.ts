@@ -26,12 +26,14 @@ import {selectCanvasChromeState, selectCanvasRenderer} from './canvas-rendering'
 import {CanvasContentController} from './canvas-content.controller';
 import {CanvasEditController} from './canvas-edit.controller';
 import {CanvasEditorComponent} from './canvas-editor.component';
+import {CanvasViewerController} from './canvas-viewer.controller';
+import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.component';
 
 @Component({
   selector: 'app-canvas-pane',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  providers: [CanvasContentController, CanvasEditController],
+  providers: [CanvasContentController, CanvasEditController, CanvasViewerController],
   imports: [
     TranslocoPipe,
     AppBadgeComponent,
@@ -41,6 +43,7 @@ import {CanvasEditorComponent} from './canvas-editor.component';
     AppSpinnerComponent,
     CanvasHtmlRendererComponent,
     CanvasImageRendererComponent,
+    CanvasLiveAppRendererComponent,
     CanvasMarkdownRendererComponent,
     CanvasTextRendererComponent,
     CanvasEditorComponent,
@@ -165,10 +168,16 @@ import {CanvasEditorComponent} from './canvas-editor.component';
                 <app-canvas-image-renderer [src]="imageUrl()!" [alt]="imageAlt()"
                                            [sourceKey]="displaySourceKey()!" />
               }
+              @case ('app') {
+                <app-canvas-live-app-renderer [src]="viewer.frameUrl()!"
+                                              [title]="liveAppFrameTitle()"
+                                              [warning]="'canvas.app.untrustedWarning' | transloco" />
+              }
             }
             @if (showOverlay()) {
               <div class="canvas-overlay" role="status">
-                @if (contentStatus() === 'loading' || canvas.loadStatus() === 'loading') {
+                @if (contentStatus() === 'loading' || canvas.loadStatus() === 'loading' ||
+                     viewer.viewerStatus() === 'loading' || viewer.viewerStatus() === 'renewing') {
                   <app-spinner size="sm" tone="accent" />
                 } @else {
                   <app-icon size="sm">info</app-icon>
@@ -178,7 +187,8 @@ import {CanvasEditorComponent} from './canvas-editor.component';
             }
           } @else {
             <div class="canvas-placeholder">
-              @if (contentStatus() === 'loading' || canvas.loadStatus() === 'loading') {
+              @if (contentStatus() === 'loading' || canvas.loadStatus() === 'loading' ||
+                   viewer.viewerStatus() === 'loading' || viewer.viewerStatus() === 'renewing') {
                 <app-spinner size="md" tone="accent" />
               } @else {
                 <app-icon size="xl">preview</app-icon>
@@ -202,6 +212,7 @@ export class CanvasPaneComponent {
   readonly canvas = inject(CanvasService);
   private readonly content = inject(CanvasContentController);
   readonly editor = inject(CanvasEditController);
+  readonly viewer = inject(CanvasViewerController);
   private readonly transloco = inject(TranslocoService);
   private readonly contentViewport = viewChild<ElementRef<HTMLElement>>('contentViewport');
   private readonly canvasEditor = viewChild<CanvasEditorComponent>('canvasEditor');
@@ -227,7 +238,8 @@ export class CanvasPaneComponent {
     if (this.editor.hasSession() && (this.editor.dirty() || this.editor.conflict())) {
       return this.editor.sessionRenderer();
     }
-    return this.displayRenderer();
+    const selected = selectCanvasRenderer(this.state());
+    return selected === 'app' ? selected : this.displayRenderer();
   });
   readonly previewContent = computed(() =>
     this.editor.hasSession() && this.editor.dirty()
@@ -236,6 +248,7 @@ export class CanvasPaneComponent {
   );
   readonly hasVisual = computed(() => {
     if (this.editor.editMode() && this.editor.hasSession()) return true;
+    if (this.effectiveRenderer() === 'app') return this.viewer.frameUrl() !== null;
     if (this.effectiveRenderer() === 'image') return this.imageUrl() !== null;
     return this.effectiveRenderer() !== 'unsupported' &&
       (this.contentStatus() !== 'idle' || this.editor.hasSession());
@@ -246,6 +259,11 @@ export class CanvasPaneComponent {
   readonly sourceSummary = computed(() => {
     const source = this.chromeState()?.source;
     if (source?.type === 'workspace_file' && typeof source.path === 'string') return source.path;
+    if (source?.type === 'workspace_app') {
+      return typeof source.entry_path === 'string' && source.entry_path
+        ? source.entry_path
+        : this.transloco.translate('canvas.app.source');
+    }
     return this.transloco.translate('canvas.noSource');
   });
   readonly rendererLabel = computed(() =>
@@ -257,6 +275,9 @@ export class CanvasPaneComponent {
   readonly frameTitle = computed(() =>
     this.transloco.translate('canvas.html.frameTitle', {title: this.title()}),
   );
+  readonly liveAppFrameTitle = computed(() =>
+    this.transloco.translate('canvas.app.frameTitle', {title: this.title()}),
+  );
   readonly sourceNeedsRefresh = computed(() =>
     this.state()?.status === 'source_changed' || this.contentStatus() === 'source_changed',
   );
@@ -267,6 +288,9 @@ export class CanvasPaneComponent {
       !this.editor.editMode() &&
       (this.contentStatus() === 'loading' ||
         this.contentStatus() === 'source_changed' ||
+        this.viewer.viewerStatus() === 'loading' ||
+        this.viewer.viewerStatus() === 'renewing' ||
+        this.viewer.viewerStatus() === 'error' ||
         this.canvas.loadStatus() === 'loading' ||
         state?.status === 'source_changed' ||
         state?.status === 'unavailable' ||
@@ -284,6 +308,15 @@ export class CanvasPaneComponent {
     }
     if (this.editor.dirty()) return this.transloco.translate('canvas.editor.unsaved');
     if (this.contentStatus() === 'loading') return this.transloco.translate('canvas.status.loading');
+    if (this.viewer.viewerStatus() === 'loading') {
+      return this.transloco.translate('canvas.app.connecting');
+    }
+    if (this.viewer.viewerStatus() === 'renewing') {
+      return this.transloco.translate('canvas.app.renewing');
+    }
+    if (this.viewer.viewerStatus() === 'error') {
+      return this.transloco.translate('canvas.app.unavailable');
+    }
     if (this.canvas.loadStatus() === 'loading') {
       return this.transloco.translate(this.hasVisual() ? 'canvas.status.updating' : 'canvas.status.loading');
     }
@@ -325,6 +358,12 @@ export class CanvasPaneComponent {
       this.contentEtag(),
       this.contentStatus() === 'ready',
       this.contentStatus() === 'source_changed',
+    ));
+    effect(() => this.viewer.syncPresentation(
+      this.active() && this.effectiveRenderer() === 'app',
+      this.canvas.threadId(),
+      this.state(),
+      this.canvas.stateEtag(),
     ));
     effect(() => this.dirtyChange.emit(this.editor.dirty()));
   }

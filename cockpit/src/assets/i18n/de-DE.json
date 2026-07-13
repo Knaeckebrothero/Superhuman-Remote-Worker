@@ -84,6 +84,7 @@
       "text": "Text",
       "html": "Statisches HTML",
       "image": "Bild",
+      "app": "Live-App",
       "unsupported": "Nicht unterstützte Quelle"
     },
     "status": {
@@ -106,6 +107,14 @@
     },
     "html": {
       "frameTitle": "Statische Canvas-Vorschau: {{title}}"
+    },
+    "app": {
+      "source": "Workspace-Anwendung",
+      "frameTitle": "Live-Canvas-Anwendung: {{title}}",
+      "untrustedWarning": "Nicht vertrauenswürdige App — keine Passwörter oder Geheimnisse eingeben.",
+      "connecting": "Verbindung zur isolierten Canvas-Anwendung wird hergestellt…",
+      "renewing": "Die sichere Canvas-Verbindung wird aktualisiert…",
+      "unavailable": "Die isolierte Canvas-Anwendung konnte nicht geöffnet werden."
     },
     "editor": {
       "label": "Editor für die Canvas-Quelle",
