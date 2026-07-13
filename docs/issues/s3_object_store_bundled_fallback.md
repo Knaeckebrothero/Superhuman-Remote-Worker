@@ -55,10 +55,14 @@ suspension — each failing at a different, late point.
 IMPLEMENTED + live-verified on k3d (chart-only). Item 2 guardrails shipped with
 it. Item 3 (orchestrator no-store startup warning) IMPLEMENTED —
 `_object_store_startup_warning` in `orchestrator/main.py` emits one loud
-`logger.warning` from the lifespan when `S3_ENDPOINT` is empty and the virtual
-tier has no durable `s3` store (unit-tested in
-`tests/test_lite_workspace_dispatch.py`). All three proposal items now
-addressed; unpushed on develop.
+`logger.warning` from the lifespan when EITHER seam is unconfigured —
+`S3_ENDPOINT` empty (snapshots/suspend/IDE/VM-extract) or the virtual tier
+lacking a durable `s3` store (`memory` warns but flags non-durable). The two
+almost always point at the same store, so a half-config is usually a mistake,
+and virtual being the default session backend means a snapshots-only config
+silently breaks the default UX; silent only when both seams have a durable
+store (unit-tested in `tests/test_lite_workspace_dispatch.py`). All three
+proposal items now addressed; unpushed on develop.
 
 ## Non-goals
 

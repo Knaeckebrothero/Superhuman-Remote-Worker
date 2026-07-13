@@ -3146,37 +3146,50 @@ def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
 def _object_store_startup_warning(
     env: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
-    """One consolidated warning when the deployment has NO object store at all.
+    """One consolidated warning when EITHER object-store seam is unconfigured.
 
     Reads the same env the features read, so it reflects the real resolved
     config whether the store is external or the chart-bundled Garage:
     ``S3_ENDPOINT`` (snapshots / suspend-resume / IDE persistence / VM S3
     extract) and ``VIRTUAL_WORKSPACE_RCLONE_TYPE`` (the virtual/default session
-    tier). Returns None when at least one durable store is configured, so the
-    lifespan logs this only for the genuinely store-less case — replacing the
-    scattered, late per-feature failures (``LiteWorkspaceConfigError`` at
-    dispatch, silent snapshot no-ops) with one loud signal at startup. See
+    tier). Emits one loud line naming whichever seam is degraded: the two
+    almost always point at the SAME store, so a half-configured deployment is
+    usually a mistake, and — with instant-landing making ``virtual`` the
+    default session backend — a snapshots-only config silently breaks the
+    default UX. Returns None only when BOTH seams have a durable store. Replaces
+    the scattered, late per-feature failures (``LiteWorkspaceConfigError`` at
+    dispatch, silent snapshot no-ops) with one signal at startup. See
     docs/issues/s3_object_store_bundled_fallback.md item 3.
     """
     env = os.environ if env is None else env
     s3_endpoint = (env.get("S3_ENDPOINT") or "").strip()
     rclone_type = (env.get("VIRTUAL_WORKSPACE_RCLONE_TYPE") or "").strip()
 
-    # A durable store on either seam means the deployment is not store-less.
-    if s3_endpoint or rclone_type == "s3":
+    bullets: list[str] = []
+    if not s3_endpoint:
+        bullets.append(
+            "workspace snapshots + suspend/resume, IDE session persistence, and "
+            "VM-lifecycle S3 extract are disabled (S3_ENDPOINT unset)"
+        )
+    if rclone_type != "s3":
+        if rclone_type == "memory":
+            bullets.append(
+                "virtual/instant sessions run but are NON-DURABLE (in-process "
+                "'memory' store — files vanish on pod restart)"
+            )
+        else:
+            bullets.append(
+                "virtual/instant sessions FAIL at dispatch "
+                "(LiteWorkspaceConfigError) — if your deployment uses them"
+            )
+
+    if not bullets:
         return None
 
-    virtual_state = (
-        "virtual/default sessions run but are NON-DURABLE (in-process 'memory' "
-        "store — files vanish on pod restart)"
-        if rclone_type == "memory"
-        else "default/virtual sessions FAIL at dispatch (LiteWorkspaceConfigError)"
-    )
     return (
-        "No object store configured — degraded features: "
-        f"{virtual_state}; workspace snapshots + suspend/resume disabled; "
-        "IDE session persistence and VM-lifecycle S3 extract unavailable. "
-        "Fix: configure an external S3 (S3_ENDPOINT / VIRTUAL_WORKSPACE_S3_*) "
+        "Object store not fully configured — "
+        + "; ".join(bullets)
+        + ". Fix: point at an external S3 (S3_ENDPOINT / VIRTUAL_WORKSPACE_S3_*) "
         "or enable the chart-bundled store (garage.enabled=true). "
         "See docs/issues/s3_object_store_bundled_fallback.md."
     )
