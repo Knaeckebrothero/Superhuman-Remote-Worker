@@ -21,9 +21,9 @@ related:
 
 # Builder Removal (→ Canvas later)
 
-> Remove the builder now (it's unused and ships as the default chat surface right before the OSS release + pilots). **Park** its artifact-authoring machinery rather than delete it — the dynamic canvas will reuse it. Do **not** build an `instruction-author` session bridge; the capability comes back inside the [[dynamic_canvas]], not as a constrained session expert.
+> Remove the builder now (it's unused and ships as the default chat surface right before the OSS release + pilots). **Park** its artifact-authoring machinery rather than delete it — later structured draft actions on the [[dynamic_canvas]] may use it as reference. The pointer-based Canvas control plane does not depend on it. Do **not** build an `instruction-author` session bridge.
 
-**Status:** ✅ **SHIPPED on `develop`** — decided 2026-06-13, executed 2026-06-19 as 5 PRs. The builder is fully removed; its artifact-authoring machinery is parked for the [[dynamic_canvas]] (the separate follow-on). The plan below is preserved as written; the per-PR ✅ markers + the deviations note record what actually landed.
+**Status:** ✅ **SHIPPED on `develop`** — decided 2026-06-13, executed 2026-06-19 as 5 PRs. The builder is fully removed; its artifact-authoring machinery is parked as reference for later structured draft actions on the [[dynamic_canvas]]. The plan below is preserved as written; the per-PR ✅ markers + the deviations note record what actually landed.
 
 | PR | Commit | Outcome |
 |---|---|---|
@@ -37,14 +37,14 @@ related:
 
 **Deviation 2 (PR 3): no dispatch handlers to park.** The 5 artifact tools are applied **client-side** (cockpit `applyToolCall`, parked in PR 2); the orchestrator only emitted them as `tool_call` SSE events. So only the 5 **schemas** were parked. `builder_dispatch.py` held the ~85 operator/inspection tools (MCP-redundant) and was deleted whole.
 
-**Supersedes:** the earlier plan in this doc (build an `instruction-author` expert + `promote-to-job` verb *before* deleting the builder). Dropped — nobody uses the builder, so there is no live workflow to preserve through a bridge; the real replacement is canvas-hosted collaborative job/expert creation.
+**Supersedes:** the earlier plan in this doc (build an `instruction-author` expert + `promote-to-job` verb *before* deleting the builder). Dropped — nobody uses the builder, so there is no live workflow to preserve through a bridge. The pointer-based Canvas core and any later structured job/expert drafting adapter are separate follow-ons; only that later drafting work may use the parked machinery as reference.
 
 ## Why now, why this shape
 
 - **Urgent / visible.** The builder is the shell's default view (`cockpit/.../shell.component.ts:93` renders `<app-instruction-builder/>`; root routes to the shell) — the "first chat tab." It's undocumented, the internal test students were already told it's deprecated, and it's barely used. It should not be the first thing OSS users and pilots see in the coming weeks.
 - **Its only real delta over sessions is the artifact tools** (mutate `instructions`/`config_override`/`description` and stream them into a form). Those tools are under-tested and some don't work — we don't want to wire them into sessions as-is.
-- **Canvas is the right home.** The builder's UX was always weak: it mutated cockpit form state in the background, with no clear signal of *which* field/window it changed. A Claude-Artifacts-style canvas tile makes job/expert creation a **visible, collaborative surface** — agent and user fill it together. [[dynamic_canvas]]'s v1 plan already lists "copy `JobArtifactService.applyToolCall()` + `BuilderStreamService` **verbatim** for `CanvasService`" — so parking that machinery feeds the canvas directly.
-- **Decoupled timelines.** Removal ships on its own; canvas + job-builder-in-canvas is the ~2-week later track. Removal is **not** blocked on canvas.
+- **Canvas may host the later drafting adapter.** The builder's UX was always weak: it mutated cockpit form state in the background, with no clear signal of *which* field/window it changed. A visible collaborative surface would fix that. The refined [[dynamic_canvas]] core is a separate typed presentation pointer to a workspace file/app/browser; the parked `JobArtifactService.applyToolCall()` machinery is reference material only for a later structured job/expert drafting adapter which might render there. It is not copied into the core Canvas state service.
+- **Decoupled timelines.** Removal, the pointer-based Canvas core, and a possible job-builder-on-Canvas adapter are independent tracks. Removal is **not** blocked on either follow-on.
 
 ## Current surface (verified 2026-06-13)
 
@@ -69,7 +69,7 @@ instruction-builder.component (chat UI)
 | Shell default render + sessions sidebar | `views/shell/shell.component.ts:93,406,463` | **Swap** default → sessions |
 | ComponentRegistry registration | `app.ts:28,344`; `debug/layout.model.ts:32` | **Unregister** |
 | Sidebar nav item | `shell/sidebar/sidebar.component.ts:46` (`nav.builder`) | **Remove** |
-| `builder-stream.service.ts` | `core/services/` | **Park** (canvas seed) |
+| `builder-stream.service.ts` | `core/services/` | **Park** (future structured-drafting reference) |
 | `JobArtifactService.applyToolCall()` + `WorkspaceProposal` + `streaming`/`builderModel` | `core/services/job-artifact.service.ts` | **Park** the AI-sync half; **keep** form-state half |
 | `job-create` + `agent-settings/instructions-tab` | `views/` | **Keep** as manual forms (drop AI-fill bindings) |
 | `builderModels` signal / `builder_models` field | `core/services/model.service.ts:30,50,75` | **Rename → `chatModels`/`chat_models`** (NOT delete) |
@@ -101,7 +101,7 @@ Risk-ordered so the urgent visible win lands first and reversibly, and the caref
 
 ### PR 2 — Remove the builder frontend + split `JobArtifactService` ✅ `6d2ecef6`
 - Delete `views/instruction-builder/`.
-- **Split `JobArtifactService`**: keep the form-state container (instructions/description/config signals job-create writes directly); **park** the AI-sync half (`applyToolCall`, `WorkspaceProposal`, `streaming`, `builderModel`) into `core/services/_parked/` (canvas seed).
+- **Split `JobArtifactService`**: keep the form-state container (instructions/description/config signals job-create writes directly); **park** the AI-sync half (`applyToolCall`, `WorkspaceProposal`, `streaming`, `builderModel`) into `core/services/_parked/` (future structured-drafting reference).
 - Park `builder-stream.service.ts` alongside it.
 - Update `job-create` + `agent-settings/instructions-tab` to drop the streaming/AI-fill bindings — they remain working **manual** forms.
 
@@ -121,8 +121,8 @@ Risk-ordered so the urgent visible win lands first and reversibly, and the caref
 ## Park strategy & canvas hand-off
 
 Parked, unwired, with a `README.md` pointing here + to [[dynamic_canvas]]:
-- `cockpit/src/app/core/services/_parked/` — `builder-stream.service.ts` + the extracted `applyToolCall`/`WorkspaceProposal` sync logic. The canvas plan copies this shape into `CanvasService`.
-- `orchestrator/services/_parked/builder_artifact_tools.py` — the 5 artifact-tool schemas + dispatch handlers, the seed for the canvas's job/expert authoring operations.
+- `cockpit/src/app/core/services/_parked/` — `builder-stream.service.ts` + the extracted `applyToolCall`/`WorkspaceProposal` sync logic. These remain a seed for later structured draft actions or a `job-builder` renderer. The pointer-based core Canvas service does not reuse the deleted Builder session/SSE loop.
+- `orchestrator/services/_parked/builder_artifact_tools.py` — the 5 artifact-tool schemas, reference material for a later structured job/expert drafting adapter rather than Canvas core.
 
 These are reference/reuse, not live code. Alternative (rely on git history) was rejected — the owner asked for an explicit parked folder so the canvas work has a visible starting point.
 
@@ -132,7 +132,8 @@ How the builder's capability returns inside [[dynamic_canvas]] is a **separate d
 - **(a) a structured `form` canvas kind** — schema-driven form the agent populates + user edits + a submit action dispatches the job/expert; generalizes beyond job creation.
 - **(b) a bespoke `job-builder` tile** in the canvas grid — reuses grid/lock/awareness plumbing, keeps a hand-built form component (closest to today's UI, minus the invisible-mutation problem since it's a visible tile).
 
-Decide when canvas v1 (steps 1–4 in `dynamic_canvas.md`) is stable.
+Decide only after the Canvas file stage and editing semantics in
+`dynamic_canvas.md` are stable; this work is not part of the core Canvas slices.
 
 ## Acceptance criteria
 
@@ -143,7 +144,7 @@ Decide when canvas v1 (steps 1–4 in `dynamic_canvas.md`) is stable.
 3. `job-create` and `agent-settings/instructions-tab` still create/edit manually (no AI-fill, no console errors from a missing builder backend).
 4. `builder_models` **dropped** (not renamed — Deviation 1); session/admin model selection unaffected (pickers read `groups`).
 5. `builder_sessions`/`builder_messages` dropped via migration; no orphaned postgres methods.
-6. README smoke-test + this doc reflect the new landing; the canvas seed is parked and pointed at from [[dynamic_canvas]].
+6. README smoke-test + this doc reflect the new landing; the structured-drafting reference is parked and pointed at from [[dynamic_canvas]].
 
 ## Risks / open checks
 
@@ -159,7 +160,7 @@ Decide when canvas v1 (steps 1–4 in `dynamic_canvas.md`) is stable.
 
 Two threads remain open to "finish what we started":
 
-1. **Canvas** — the real replacement for the builder's authoring UX, seeded by the parked machinery. See *Park strategy & canvas hand-off* + *Deferred to canvas* above. Not started.
+1. **Canvas-hosted structured drafting** — a separate possible replacement for the builder's authoring UX after the pointer-based shared stage is stable. The parked machinery seeds only that later drafting adapter; Canvas core does not depend on it. See *Park strategy & canvas hand-off* + *Deferred to canvas* above. Not started.
 
 2. **Job tooling in sessions** — verified 2026-06-24. Persistent sessions already cover *"check on jobs / create them"*: `src/api/persistent_session.py` `_setup_tools()` **unconditionally** injects 8 orchestrator tools (defined in `src/tools/orchestrator/jobs.py`, which call the orchestrator REST API) — `create_worker_job`, `list_worker_jobs`, `get_worker_job`, `get_job_workspace_file`, and `approve_`/`resume_`/`cancel_`/`pause_worker_job`. These are **orthogonal to the builder** (never part of it; the builder had its own server-side set in the deleted `builder_dispatch.py`), so the removal lost nothing here.
    - **Open (optional, additive — not a regression):** sessions get the *lifecycle* set, not the builder's deeper *read-only inspection* (job todos, diffs, commits, audit trail, source/citation lookups — the ~85 operator tools from `builder_dispatch.py`, redundant with the Cockpit Jobs / Job Review / Debug pages). To give a session agent inline inspection, expose more `get_*` tools from `jobs.py` and append them to `_ORCHESTRATOR_TOOLS` in `_setup_tools()`. Decision point: do that vs. "that's the Cockpit's job."
