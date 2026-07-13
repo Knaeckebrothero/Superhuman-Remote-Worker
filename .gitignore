@@ -215,3 +215,6 @@ target/
 # Memory eval harness — datasets are large downloads, runs are local artifacts
 eval/memory/data/
 eval/memory/runs/
+
+# Superpowers brainstorm companion (local mockups)
+.superpowers/
