@@ -1348,6 +1348,12 @@ s3:
   region: "us-east-1"
   snapshotMaxSizeGb: "10"
   snapshotRetentionDays: "90"
+  # Fail-closed policy (opt-in). Default false = the orchestrator logs one loud
+  # startup warning if either object-store seam is unconfigured, then runs
+  # degraded. Set true and the orchestrator REFUSES to start (pod crash-loops)
+  # unless BOTH seams have a durable store: snapshots (s3.endpoint) AND the
+  # virtual tier (virtualWorkspace.rclone.type=s3, or the bundled garage.enabled).
+  required: false
 
 # =============================================================================
 # Bundled object store (Garage) — NOT FOR PRODUCTION
