@@ -128,12 +128,20 @@ These are reference/reuse, not live code. Alternative (rely on git history) was 
 
 ## Deferred to canvas (out of scope here)
 
-How the builder's capability returns inside [[dynamic_canvas]] is a **separate design**, not part of this removal. The open fork (record only):
-- **(a) a structured `form` canvas kind** — schema-driven form the agent populates + user edits + a submit action dispatches the job/expert; generalizes beyond job creation.
-- **(b) a bespoke `job-builder` tile** in the canvas grid — reuses grid/lock/awareness plumbing, keeps a hand-built form component (closest to today's UI, minus the invisible-mutation problem since it's a visible tile).
+How the builder's capability returns inside [[dynamic_canvas]] is a **separate
+design**, not part of this removal. The open fork (record only):
 
-Decide only after the Canvas file stage and editing semantics in
-`dynamic_canvas.md` are stable; this work is not part of the core Canvas slices.
+- **(a) a structured `form` Canvas source/renderer** — schema-driven form the
+  agent populates + user edits + a submit action dispatches the job/expert;
+  generalizes beyond job creation.
+- **(b) a bespoke `job-builder` renderer on the shared stage** — keeps a
+  hand-built form component (closest to today's UI, minus the invisible-mutation
+  problem because the shared state is visible). A future grid remains a
+  separate post-v1 option.
+
+Dynamic Canvas Slices 0–2 now provide the stable file stage and editing
+semantics that this decision depended on. The structured drafting adapter is
+still a separate, unstarted feature and is not part of the core Canvas slices.
 
 ## Acceptance criteria
 
