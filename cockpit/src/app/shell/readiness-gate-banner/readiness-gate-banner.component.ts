@@ -76,9 +76,9 @@ import {UserService} from '../../core/services/user.service';
   styles: [`
     .readiness-banner {
       padding: 12px 16px;
-      background: rgba(243, 139, 168, 0.12);
-      border-bottom: 1px solid rgba(243, 139, 168, 0.4);
-      color: var(--red, #f38ba8);
+      background: color-mix(in srgb, var(--danger) 12%, transparent);
+      border-bottom: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+      color: var(--danger);
       font-size: 13px;
       line-height: 1.5;
     }

@@ -731,7 +731,7 @@ import {ModelService} from '../../core/services/model.service';
       background: rgba(255, 255, 255, 0.05);
     }
     .accordion-icon {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
     .modified-badge {
       margin-left: auto;
@@ -761,7 +761,7 @@ import {ModelService} from '../../core/services/model.service';
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-bottom: 8px;
     }
     .shared-params {
@@ -792,11 +792,11 @@ import {ModelService} from '../../core/services/model.service';
     .field-hint {
       display: block;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-top: 2px;
     }
     .info-icon {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       cursor: help;
       margin-left: 2px;
     }
@@ -839,7 +839,7 @@ import {ModelService} from '../../core/services/model.service';
     }
     .slider-label {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       min-width: 12px;
       text-align: center;
     }
@@ -872,7 +872,7 @@ import {ModelService} from '../../core/services/model.service';
       border: none;
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
     }

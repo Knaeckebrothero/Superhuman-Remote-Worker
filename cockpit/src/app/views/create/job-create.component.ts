@@ -332,7 +332,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         display: flex;
         align-items: center;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -406,7 +406,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         border: none;
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
         cursor: pointer;
         transition: all 0.15s ease;
@@ -472,7 +472,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .slider-label {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         min-width: 14px;
         text-align: center;
       }
@@ -654,14 +654,14 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .tool-toggle-desc {
         display: block;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .field-hint {
         display: block;
         margin-top: 4px;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .field-error {
@@ -684,7 +684,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         align-items: center;
         gap: 8px;
         padding: 16px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 13px;
       }
 
@@ -757,7 +757,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .expert-desc {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         line-height: 1.4;
         display: -webkit-box;
         -webkit-line-clamp: 2;
@@ -822,7 +822,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .dropzone-icon {
         font-size: 48px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .dropzone-text {
@@ -832,7 +832,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .dropzone-hint {
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* File List */
@@ -869,7 +869,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .file-icon {
         font-size: 28px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         width: 36px;
         text-align: center;
       }
@@ -892,7 +892,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .file-size {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .file-error {
@@ -927,7 +927,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       }
 
       .status-icon.pending {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       app-button.add-more-btn {
@@ -947,7 +947,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         border: 1px dashed var(--border-color, var(--surface-1));
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
         cursor: pointer;
         transition: all 0.15s ease;
@@ -978,7 +978,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         align-items: center;
         gap: 8px;
         padding: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
       }
 
@@ -1031,7 +1031,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .ds-desc {
         display: block;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;

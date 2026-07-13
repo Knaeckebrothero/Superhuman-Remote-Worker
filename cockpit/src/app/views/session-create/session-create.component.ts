@@ -198,7 +198,7 @@ interface ExpertDetail extends Expert {
       align-items: center;
       justify-content: space-between;
       padding: 12px 16px;
-      background: var(--panel-header-bg, #1e1e2e);
+      background: var(--panel-header-bg);
       border-bottom: 1px solid var(--border-color, var(--surface-0));
       flex-shrink: 0;
     }
@@ -229,7 +229,7 @@ interface ExpertDetail extends Expert {
       display: block;
       margin-top: 4px;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
     .project-chips {
       display: flex;
@@ -246,7 +246,7 @@ interface ExpertDetail extends Expert {
     }
     .loading-hint {
       font-size: 12px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       padding: 8px 0;
     }
     .expert-grid {
@@ -298,7 +298,7 @@ interface ExpertDetail extends Expert {
     }
     .expert-desc {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       line-height: 1.4;
       display: -webkit-box;
       -webkit-line-clamp: 2;

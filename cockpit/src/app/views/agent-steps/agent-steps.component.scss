@@ -12,7 +12,7 @@
   width: 16px;
   height: 16px;
   border: 2px solid color-mix(in srgb, var(--accent-color) 20%, transparent);
-  border-top-color: var(--accent-color, #cba6f7);
+  border-top-color: var(--accent-color);
 
   @include shape.circle;
 
@@ -33,11 +33,11 @@
   overflow: hidden;
 
   &.is-processing {
-    border-color: var(--accent-color, #cba6f7);
+    border-color: var(--accent-color);
   }
 
   &.is-error {
-    border-color: #f38ba8;
+    border-color: var(--danger);
   }
 
   &[open] > summary .chevron-icon {
@@ -74,8 +74,8 @@
       width: 16px;
       height: 16px;
 
-      &.complete { color: #a6e3a1; }
-      &.error { color: #f38ba8; }
+      &.complete { color: var(--success); }
+      &.error { color: var(--danger); }
     }
 
     .header-text {
@@ -131,7 +131,7 @@
     &.step-approval_request .step-icon-wrapper { background: linear-gradient(135deg, #f97316, #fb923c); }
     &.step-file_change .step-icon-wrapper { background: linear-gradient(135deg, #14b8a6, #2dd4bf); }
     &.step-inspection_result .step-icon-wrapper { background: linear-gradient(135deg, #06b6d4, #22d3ee); }
-    &.step-workspace_proposal .step-icon-wrapper { background: linear-gradient(135deg, #f97316, #fab387); }
+    &.step-workspace_proposal .step-icon-wrapper { background: linear-gradient(135deg, var(--alert), var(--warning)); }
 
     .step-item-header {
       display: flex;
@@ -144,7 +144,7 @@
 
       @include shape.control;
 
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary);
       font-size: 11px;
 
       &::-webkit-details-marker {
@@ -185,7 +185,7 @@
 
       .step-duration {
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-family: 'JetBrains Mono', 'Fira Code', monospace;
         flex-shrink: 0;
       }
@@ -195,14 +195,14 @@
       padding: 6px 8px 8px 36px;
       font-size: 11px;
       line-height: 1.4;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       white-space: pre-wrap;
       overflow-wrap: break-word;
       max-height: 200px;
       overflow-y: auto;
 
       .step-code {
-        background: var(--timeline-bg, #11111b);
+        background: var(--timeline-bg);
         padding: 8px;
 
         @include shape.tag;
@@ -213,7 +213,7 @@
         margin: 0;
         white-space: pre-wrap;
         overflow-wrap: break-word;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color);
         max-height: 200px;
       }
 

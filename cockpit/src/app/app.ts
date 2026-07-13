@@ -109,7 +109,7 @@ import {AppIconComponent} from './ui/icon';
         justify-content: center;
         height: 100%;
         padding: 2rem;
-        background: var(--bg-primary, #1e1e2e);
+        background: var(--app-bg);
       }
 
       .pending-approval-card {
@@ -117,20 +117,20 @@ import {AppIconComponent} from './ui/icon';
         max-width: 480px;
         padding: 3rem 2.5rem;
         border-radius: var(--radius-surface);
-        background: var(--bg-secondary, #313244);
-        border: 1px solid var(--border-color, #45475a);
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
       }
 
       .pending-icon {
         font-size: 3rem;
-        color: var(--text-tertiary, #a6adc8);
+        color: var(--text-muted);
         display: block;
         margin-bottom: 1rem;
       }
 
       .pending-approval-card h2 {
         margin: 0 0 1rem;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         font-size: 1.5rem;
         font-weight: 600;
       }
@@ -143,13 +143,13 @@ import {AppIconComponent} from './ui/icon';
 
       .pending-detail {
         font-size: 0.875rem;
-        color: var(--text-tertiary, #a6adc8);
+        color: var(--text-muted);
       }
 
       .pending-logout {
         margin-top: 1.5rem;
         padding: 0.625rem 2rem;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #bac2de);
@@ -159,8 +159,8 @@ import {AppIconComponent} from './ui/icon';
       }
 
       .pending-logout:hover {
-        background: var(--bg-tertiary, #45475a);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-1);
+        color: var(--text-primary);
       }
 
       .sidebar-backdrop {

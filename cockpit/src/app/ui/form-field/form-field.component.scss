@@ -31,7 +31,7 @@
 
 .app-form-field__required {
   margin-left: 2px;
-  color: var(--danger, #f38ba8);
+  color: var(--danger);
 }
 
 .app-form-field__hint-inline {
@@ -55,6 +55,6 @@
 .app-form-field__error {
   margin-top: 6px;
   font-size: v.$font-size-xs;
-  color: var(--danger, #f38ba8);
+  color: var(--danger);
   line-height: v.$line-height-base;
 }

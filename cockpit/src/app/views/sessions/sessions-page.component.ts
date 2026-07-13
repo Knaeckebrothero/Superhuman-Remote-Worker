@@ -254,7 +254,7 @@ interface Project {
       display: block;
       height: 100%;
       overflow-y: auto;
-      background: var(--app-bg, #1e1e2e);
+      background: var(--app-bg);
     }
 
     .page-toggle {
@@ -327,7 +327,7 @@ interface Project {
 
     .dialog-hint {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       line-height: 1.5;
       margin-bottom: 8px;
     }
@@ -360,7 +360,7 @@ interface Project {
 
     .chip-hint {
       font-size: 10px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .dialog-actions {
@@ -431,7 +431,7 @@ interface Project {
       padding: 1px 6px;
       border-radius: var(--radius-tag);
       background: var(--surface-0, var(--surface-0));
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       /* Shrink + ellipsis so a long config (e.g. a project UUID) truncates
          instead of pushing the title to 0 width or overlapping the actions. */
       flex-shrink: 1;
@@ -444,7 +444,7 @@ interface Project {
     .session-id {
       font-family: var(--font-mono, monospace);
       font-size: 10px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       flex-shrink: 0;
     }
 
@@ -460,7 +460,7 @@ interface Project {
 
     .meta-item {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .session-actions {
@@ -474,7 +474,7 @@ interface Project {
     .loading, .empty-state {
       text-align: center;
       padding: 40px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       font-size: 13px;
     }
 
@@ -493,7 +493,7 @@ interface Project {
     .filter-empty {
       text-align: center;
       padding: 32px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       font-size: 13px;
     }
 

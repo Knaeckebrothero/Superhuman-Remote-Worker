@@ -389,7 +389,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
     .loading {
       text-align: center;
       padding: 24px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       font-size: 13px;
     }
 
@@ -405,7 +405,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
       margin-left: auto;
       padding: 4px 10px;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .override-count.has-overrides {
@@ -438,7 +438,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
     .toggle-icon {
       margin-left: auto;
       font-size: 18px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .toggle-icon.sub { font-size: 16px; }
@@ -446,7 +446,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
     .section-desc {
       padding: 4px 12px 0;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .section-body {
@@ -507,7 +507,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
 
     .field-desc {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-top: 3px;
       line-height: 1.4;
     }
@@ -543,7 +543,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
 
     .field-hint {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-top: 2px;
     }
 

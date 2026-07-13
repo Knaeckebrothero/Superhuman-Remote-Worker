@@ -263,7 +263,7 @@ interface ShellPane {
         align-items: center;
         gap: 8px;
         padding: 8px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -649,7 +649,7 @@ interface ShellPane {
       .shell-tab.active {
         color: var(--info);
         border-bottom-color: var(--info);
-        background: rgba(148, 226, 213, 0.05);
+        background: color-mix(in srgb, var(--cat-5) 5%, transparent);
       }
 
       .tab-name {

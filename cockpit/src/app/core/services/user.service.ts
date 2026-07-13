@@ -77,7 +77,7 @@ export class UserService {
   }
 
   /** Create a new user via the API and refresh the list. */
-  createUser(displayName: string, avatarColor: string = '#89b4fa', email?: string): void {
+  createUser(displayName: string, avatarColor: string = 'var(--cat-6)', email?: string): void {
     const body: Record<string, string> = {
       display_name: displayName,
       avatar_color: avatarColor,

@@ -27,9 +27,9 @@ import { AppIconComponent } from '../../ui/icon';
         width: 32px;
         height: 32px;
         background: transparent;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         cursor: pointer;
         padding: 0;
         flex-shrink: 0;
@@ -39,8 +39,8 @@ import { AppIconComponent } from '../../ui/icon';
       }
 
       .sidebar-toggle:hover {
-        color: var(--accent-color, #cba6f7);
-        border-color: var(--accent-color, #cba6f7);
+        color: var(--accent-color);
+        border-color: var(--accent-color);
       }
 
     `,
