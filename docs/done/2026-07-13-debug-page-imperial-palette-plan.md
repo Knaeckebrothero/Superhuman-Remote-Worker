@@ -1,5 +1,31 @@
 # Debug Page → Imperial Palette Implementation Plan
 
+> ## ✅ STATUS: COMPLETE — subagent-driven on `develop`, 2026-07-13
+>
+> All 8 tasks executed (fresh implementer + task-reviewer each), then a whole-branch
+> opus review. **10 commits `764e0997..b33e2396`** (this plan doc committed at `e24713d5`).
+> **966 cockpit specs green**; `tsc -p tsconfig.app.json --noEmit` clean; both Catppuccin
+> gates — signature hex **and** full-palette rgba — zero across `cockpit/src` (excluding
+> `*.spec.ts` fixtures and `assets/schema.json` data). The per-task `- [x]` checkboxes below
+> are the historical plan of record; this banner is the as-built record.
+>
+> **As-built notes / deviations:**
+> 1. **Graph change-states stay Okabe-Ito** (the ⚠️ box below), not `--success`/`--danger`.
+>    Spec Rule 1 amended with the carve-out note.
+> 2. **Critical bug caught in final review:** the graph resolver read tokens from
+>    `document.documentElement` (`<html>`), but Cockpit's theme color tokens live on the
+>    `.theme-*` **body** class — so it returned `""` and rendered the graph colorless. Fixed
+>    to `document.body` (`80628b0a`) and **verified in real Chromium** (Playwright); jsdom
+>    passed vacuously because it does not compute custom properties. A spy-based guard test
+>    now asserts the reader targets `document.body`.
+> 3. **Two `--accent-color` overloads** (Tasks 2 & 7 `.request-link` / `.bubble-tool`)
+>    collided with active/selected semantics → remapped to `--cat-6` / `--cat-7`.
+> 4. **Six fallback-drops on nonexistent tokens** (`--bg-primary`, `--red`, …) would have
+>    rendered elements colorless → remapped to real tokens (`--app-bg`, `--danger`, …), not
+>    restored hex. Graph retheme also moved into `ngZone.runOutsideAngular` (`b33e2396`).
+> 5. **Owed:** live theme-flip eyeball of the graph/memory/layout panels on both themes;
+>    Travertine light-theme check of the deliberately-kept `rgba(17,17,27,…)` neutral scrims.
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the Debug page's hardcoded Catppuccin colors with a theme-aware Imperial categorical ramp (`--cat-1..8`) and sweep the app's dead Catppuccin fallbacks, so the theme config is the single source of color truth.
@@ -47,7 +73,7 @@ The spec's Rule 1 says graph `created → --success`, `deleted → --danger`. **
 **Interfaces:**
 - Produces: CSS custom properties `--cat-1 … --cat-8`, emitted per active theme via `apply-app-theme`. Consumed by every later task as `var(--cat-N)` (DOM/SVG) or read by name (graph resolver).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `cockpit/src/styles/themes/theme-config.spec.ts`:
 ```typescript
@@ -69,12 +95,12 @@ describe('_theme-config.scss ramp tokens', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cockpit && npx vitest run src/styles/themes/theme-config.spec.ts`
 Expected: FAIL — each `cat-N` appears 0 times, `expected 0 to be 2`.
 
-- [ ] **Step 3: Add the tokens**
+- [x] **Step 3: Add the tokens**
 
 In `_theme-config.scss`, inside the `$travertine-theme` map, after the `// Track / gutter` block (before `// Interactive overlays`), add:
 ```scss
@@ -102,12 +128,12 @@ And inside `$senate-theme`, in the matching spot:
   'cat-8': #c98aa3, // mauve
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd cockpit && npx vitest run src/styles/themes/theme-config.spec.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add cockpit/src/styles/themes/_theme-config.scss cockpit/src/styles/themes/theme-config.spec.ts
 git commit -m "feat(debug): add Imperial categorical ramp tokens (--cat-1..8)"
@@ -125,7 +151,7 @@ git commit -m "feat(debug): add Imperial categorical ramp tokens (--cat-1..8)"
 - Consumes: `--cat-N` tokens (Task 1).
 - Produces: public `getStepColor(stepType, entry?)` and `getToolColor(name)` return `var(--…)` strings; `stepColors` / `toolCategoryColors` maps hold token strings.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `agent-activity.component.spec.ts`:
 ```typescript
@@ -160,12 +186,12 @@ describe('AgentActivityComponent colors', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/agent-activity/agent-activity.component.spec.ts`
 Expected: FAIL — returns `#a6e3a1` etc., not `var(--cat-4)`.
 
-- [ ] **Step 3: Rewrite the color maps + fallback**
+- [x] **Step 3: Rewrite the color maps + fallback**
 
 Replace `stepColors` (line ~716) with:
 ```typescript
@@ -193,7 +219,7 @@ Replace `toolCategoryColors` (line ~727) with:
 ```
 In `getStepColor` (line ~832) change the default `|| '#6c7086'` to `|| 'var(--text-muted)'`.
 
-- [ ] **Step 4: Sweep the component's static styles**
+- [x] **Step 4: Sweep the component's static styles**
 
 In the same file's `styles` template string, apply the mechanical rules:
 - Drop every Catppuccin fallback: `var(--token, #hexOrRgba)` → `var(--token)` (delete `, #…` / `, rgba(…)` inside the `var()`).
@@ -201,14 +227,14 @@ In the same file's `styles` template string, apply the mechanical rules:
 - Accent/success rgba tints → `color-mix`: `rgba(203, 166, 247, 0.06)` → `color-mix(in srgb, var(--accent-color) 6%, transparent)` (repeat for `0.10`→`10%`); `rgba(166, 227, 161, 0.06)` → `color-mix(in srgb, var(--success) 6%, transparent)` (and `0.10`→`10%`); `rgba(243, 139, 168, 0.1)` → `color-mix(in srgb, var(--danger) 10%, transparent)`.
 - Leave neutral `rgba(0,0,0,…)` / `rgba(17,17,27,…)` overlays as-is (not Catppuccin signatures).
 
-- [ ] **Step 5: Run tests + grep gate**
+- [x] **Step 5: Run tests + grep gate**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/agent-activity/agent-activity.component.spec.ts`
 Expected: PASS.
 Run: `rg -n '#cba6f7|#f38ba8|#a6e3a1|#89b4fa|#f9e2af|#fab387|#94e2d5|#f5c2e7|#89dceb|#74c7ec|#b4befe|#cdd6f4|#a6adc8|#6c7086|#7f849c|#313244|#1e1e2e|#181825|#11111b|#45475a' cockpit/src/app/debug/components/agent-activity/agent-activity.component.ts`
 Expected: no matches (exit 1).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 ```bash
 git add cockpit/src/app/debug/components/agent-activity/
 git commit -m "feat(debug): Imperial ramp for agent-activity badges"
@@ -226,7 +252,7 @@ git commit -m "feat(debug): Imperial ramp for agent-activity badges"
 - Consumes: `--cat-N`, `--danger`, `--success`, `--warning` (Tasks 1).
 - Produces: public `typeColors`, `sourceColorMap` (token strings), `importanceColor(value)` (semantic token), and a new public helper `tint(color: string): string` returning a `color-mix` string.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `memory-panel.component.spec.ts`:
 ```typescript
@@ -263,12 +289,12 @@ describe('MemoryPanelComponent colors', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/memory-panel/memory-panel.component.spec.ts`
 Expected: FAIL — hex values returned; `tint` undefined.
 
-- [ ] **Step 3: Rewrite maps + importanceColor + add tint helper**
+- [x] **Step 3: Rewrite maps + importanceColor + add tint helper**
 
 Replace `typeColors` (line ~733):
 ```typescript
@@ -306,7 +332,7 @@ Add a `tint` helper next to `importanceColor`:
   }
 ```
 
-- [ ] **Step 4: Fix the alpha-concat template binding + sweep static styles**
+- [x] **Step 4: Fix the alpha-concat template binding + sweep static styles**
 
 In the template, change line ~198 from:
 ```html
@@ -318,14 +344,14 @@ to:
 ```
 Then sweep the `styles` block with the same rules as Task 2 Step 4 (drop `var(--x, #cat)` fallbacks; `#f38ba8`→`var(--danger)`; `rgba(243,139,168,0.1)`→`color-mix(in srgb, var(--danger) 10%, transparent)`; leave `rgba(17,17,27,…)` / `rgba(0,0,0,…)` overlays).
 
-- [ ] **Step 5: Run tests + grep gate**
+- [x] **Step 5: Run tests + grep gate**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/memory-panel/memory-panel.component.spec.ts`
 Expected: PASS.
 Run: `rg -n '#cba6f7|#f38ba8|#a6e3a1|#89b4fa|#f9e2af|#fab387|#94e2d5|#f5c2e7|#89dceb|#74c7ec|#b4befe|#cdd6f4|#a6adc8|#6c7086|#7f849c|#313244|#1e1e2e|#181825|#11111b|#45475a' cockpit/src/app/debug/components/memory-panel/memory-panel.component.ts`
 Expected: no matches.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 ```bash
 git add cockpit/src/app/debug/components/memory-panel/
 git commit -m "feat(debug): Imperial ramp for memory-panel + color-mix tints"
@@ -345,7 +371,7 @@ git commit -m "feat(debug): Imperial ramp for memory-panel + color-mix tints"
 
 Note: SVG presentation attribute `fill=` does NOT resolve `var()`; the CSS `fill` property (via `[style.fill]`) does — hence the binding switch.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```typescript
 import {describe, expect, it, beforeEach} from 'vitest';
 import {TestBed} from '@angular/core/testing';
@@ -370,12 +396,12 @@ describe('LayoutPreviewComponent palette', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/layout-picker/layout-preview.component.spec.ts`
 Expected: FAIL — hex arrays returned.
 
-- [ ] **Step 3: Swap palette + template bindings**
+- [x] **Step 3: Swap palette + template bindings**
 
 Replace the `colors` array (line ~45):
 ```typescript
@@ -396,14 +422,14 @@ In the template, change the `<rect>` bindings (lines ~23-24) from attributes to 
 ```
 (Delete the old `[attr.fill]` / `[attr.stroke]` lines.)
 
-- [ ] **Step 4: Run test + grep gate**
+- [x] **Step 4: Run test + grep gate**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/layout-picker/layout-preview.component.spec.ts`
 Expected: PASS.
 Run: `rg -n '#cba6f7|#f38ba8|#a6e3a1|#89b4fa|#f9e2af|#fab387|#94e2d5|#f5c2e7|#89dceb|#74c7ec|#b4befe|#cdd6f4|#a6adc8|#6c7086|#7f849c|#313244|#1e1e2e|#181825|#11111b|#45475a' cockpit/src/app/debug/components/layout-picker/layout-preview.component.ts`
 Expected: no matches.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add cockpit/src/app/debug/components/layout-picker/layout-preview.component.ts cockpit/src/app/debug/components/layout-picker/layout-preview.component.spec.ts
 git commit -m "feat(debug): Imperial ramp for layout preview (SVG style.fill)"
@@ -426,7 +452,7 @@ git commit -m "feat(debug): Imperial ramp for layout preview (SVG style.fill)"
   - `interface GraphColors { nodeType: Record<string,string>; nodeDefault; nodeLabelText; nodeOutline; nodeBorder; selected; edgeLine; edgeLabelText; edgeLabelBg; changeCreated; changeModified; changeDeleted: string }`
   - The `read` param is injectable so tests avoid jsdom's missing custom-property computation.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `graph-colors.spec.ts`:
 ```typescript
@@ -467,12 +493,12 @@ describe('buildCytoscapeStyles', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/graph-timeline/graph-colors.spec.ts`
 Expected: FAIL — module `./graph-colors` not found.
 
-- [ ] **Step 3: Create `graph-colors.ts`**
+- [x] **Step 3: Create `graph-colors.ts`**
 ```typescript
 import type {CyStyle} from './graph-styles';
 
@@ -629,7 +655,7 @@ export function buildCytoscapeStyles(c: GraphColors): CyStyle[] {
 }
 ```
 
-- [ ] **Step 4: Strip the old color exports from `graph-styles.ts`**
+- [x] **Step 4: Strip the old color exports from `graph-styles.ts`**
 
 Delete `CHANGE_COLORS` (lines ~15-20), `LABEL_COLORS` (~26-36), `getLabelColor` (~41-43), and the entire `cytoscapeStyles` const (~48-209). **Keep** the `CyStyle` interface (~7-10) and all `*LayoutOptions` exports (~215-281). Verify nothing else imports the removed symbols:
 Run: `rg -n 'cytoscapeStyles|CHANGE_COLORS|LABEL_COLORS|getLabelColor' cockpit/src/app`
@@ -637,14 +663,14 @@ Expected: only `graph-timeline.component.ts:15` still imports the now-removed `c
 
 > **Cross-task compile note:** removing `cytoscapeStyles` leaves `graph-timeline.component.ts:15` importing a symbol that no longer exists, so the app does **not** typecheck between Task 5 and Task 6. This is expected — Task 6 fixes that import. Do NOT run a full `tsc`/build at the end of Task 5 (the per-file grep + the `graph-colors.spec.ts` unit test are its gates); commit Tasks 5 and 6 back-to-back (or squash them) so no broken build is left standing for review.
 
-- [ ] **Step 5: Run test + grep gate**
+- [x] **Step 5: Run test + grep gate**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/graph-timeline/graph-colors.spec.ts`
 Expected: PASS.
 Run: `rg -n '#cba6f7|#f38ba8|#a6e3a1|#89b4fa|#f9e2af|#fab387|#94e2d5|#f5c2e7|#89dceb|#74c7ec|#b4befe|#cdd6f4|#a6adc8|#6c7086|#7f849c|#313244|#1e1e2e|#181825|#11111b|#45475a' cockpit/src/app/debug/components/graph-timeline/graph-styles.ts cockpit/src/app/debug/components/graph-timeline/graph-colors.ts`
 Expected: no matches. (Okabe-Ito hex `#0072B2/#E69F00/#D55E00` are not in the signature list — intended.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 ```bash
 git add cockpit/src/app/debug/components/graph-timeline/graph-colors.ts cockpit/src/app/debug/components/graph-timeline/graph-colors.spec.ts cockpit/src/app/debug/components/graph-timeline/graph-styles.ts
 git commit -m "feat(debug): theme-aware graph color resolver (keeps Okabe-Ito change states)"
@@ -664,7 +690,7 @@ git commit -m "feat(debug): theme-aware graph color resolver (keeps Okabe-Ito ch
 
 Rationale: Cytoscape can't read `var()`, so it holds concrete colors that must be rebuilt when the theme changes. `ThemeService.resolved` is a signal, so an `effect()` reacts to flips. Full component instantiation needs a real canvas (not available in jsdom), so the automated test targets the extracted `rethemeGraph()` method with a fake `cy`; the effect wiring is verified visually.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 ```typescript
 import {describe, expect, it, vi} from 'vitest';
 import {GraphTimelineComponent} from './graph-timeline.component';
@@ -690,12 +716,12 @@ describe('GraphTimelineComponent.rethemeGraph', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/graph-timeline/graph-timeline.retheme.spec.ts`
 Expected: FAIL — `rethemeGraph` is not a function.
 
-- [ ] **Step 3: Wire the resolver + effect into the component**
+- [x] **Step 3: Wire the resolver + effect into the component**
 
 - Update the import (line ~15):
 ```typescript
@@ -727,14 +753,14 @@ import {buildCytoscapeStyles, resolveGraphColors} from './graph-colors';
     });
 ```
 
-- [ ] **Step 4: Run test + grep gate + typecheck**
+- [x] **Step 4: Run test + grep gate + typecheck**
 
 Run: `cd cockpit && npx vitest run src/app/debug/components/graph-timeline/graph-timeline.retheme.spec.ts`
 Expected: PASS.
 Run: `rg -n '#cba6f7|#f38ba8|#a6e3a1|#89b4fa|#f9e2af|#fab387|#94e2d5|#f5c2e7|#89dceb|#74c7ec|#b4befe|#cdd6f4|#a6adc8|#6c7086|#7f849c|#313244|#1e1e2e|#181825|#11111b|#45475a' cockpit/src/app/debug/components/graph-timeline/graph-timeline.component.ts`
 Expected: no matches.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add cockpit/src/app/debug/components/graph-timeline/graph-timeline.component.ts cockpit/src/app/debug/components/graph-timeline/graph-timeline.retheme.spec.ts
 git commit -m "feat(debug): recolor graph on theme flip via effect()"
@@ -755,7 +781,7 @@ git commit -m "feat(debug): recolor graph on theme flip via effect()"
 
 No new tests — the deliverable is verified by the whole-directory grep gate (behavior is unchanged; these are fallback/semantic swaps only).
 
-- [ ] **Step 1: Apply the mechanical sweep to each file**
+- [x] **Step 1: Apply the mechanical sweep to each file**
 
 Per file, apply the Global-Constants rules:
 - `var(--token, #hexOrRgba)` → `var(--token)` (drop the fallback).
@@ -763,19 +789,19 @@ Per file, apply the Global-Constants rules:
 - Catppuccin rgba tints → `color-mix` against the matching token (accent `#cba6f7`/`203,166,247`→`--accent-color`; success `166,227,161`→`--success`; danger `243,139,168`→`--danger`), preserving the percentage.
 - Leave neutral black/near-black rgba overlays as-is.
 
-- [ ] **Step 2: Whole-debug-directory grep gate**
+- [x] **Step 2: Whole-debug-directory grep gate**
 
 Run: `rg -n '#cba6f7|#f38ba8|#a6e3a1|#89b4fa|#f9e2af|#fab387|#94e2d5|#f5c2e7|#89dceb|#74c7ec|#b4befe|#cdd6f4|#a6adc8|#6c7086|#7f849c|#313244|#1e1e2e|#181825|#11111b|#45475a' cockpit/src/app/debug`
 Expected: **no matches** (the entire debug page is now Catppuccin-free).
 
-- [ ] **Step 3: Full debug suite + build sanity**
+- [x] **Step 3: Full debug suite + build sanity**
 
 Run: `cd cockpit && npm run test`
 Expected: all specs pass (including the four new ones).
 Run: `cd cockpit && npx tsc -p tsconfig.app.json --noEmit`
 Expected: no type errors.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 ```bash
 git add cockpit/src/app/debug
 git commit -m "chore(debug): drop dead Catppuccin fallbacks across remaining panels"
@@ -791,7 +817,7 @@ git commit -m "chore(debug): drop dead Catppuccin fallbacks across remaining pan
 
 No new tests — verified by the app-wide grep gate + existing suite.
 
-- [ ] **Step 1: Enumerate the target files**
+- [x] **Step 1: Enumerate the target files**
 
 Run:
 ```bash
@@ -799,11 +825,11 @@ rg -l '#cba6f7|#f38ba8|#a6e3a1|#89b4fa|#f9e2af|#fab387|#94e2d5|#f5c2e7|#89dceb|#
 ```
 Expected: ~25 files (sidebar, inbox, job-review, job-create, agents, workspace-browser, sudo, sessions, jobs, datasources, config-editor, agent-settings/*, notification-bell, toast, form-field, statistics, todos, projects, chat-history, view-mode-banner, readiness-gate-banner, empty-catalog-banner, user.service, app.ts, …).
 
-- [ ] **Step 2: Sweep each file**
+- [x] **Step 2: Sweep each file**
 
 Apply the same rules as Task 7 Step 1 across every enumerated file, plus the two named strays above. The overwhelming majority are Bucket-A fallbacks: `var(--token, #cat)` → `var(--token)`.
 
-- [ ] **Step 3: App-wide grep gate**
+- [x] **Step 3: App-wide grep gate**
 
 Run:
 ```bash
@@ -811,14 +837,14 @@ rg -n '#cba6f7|#f38ba8|#a6e3a1|#89b4fa|#f9e2af|#fab387|#94e2d5|#f5c2e7|#89dceb|#
 ```
 Expected: **no matches** anywhere under `app/` or `styles/`.
 
-- [ ] **Step 4: Full suite + build + typecheck**
+- [x] **Step 4: Full suite + build + typecheck**
 
 Run: `cd cockpit && npm run test`
 Expected: green.
 Run: `cd cockpit && npx tsc -p tsconfig.app.json --noEmit`
 Expected: no errors.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add cockpit/src/app cockpit/src/styles
 git commit -m "chore(cockpit): remove dead Catppuccin fallbacks app-wide + retint strays"
