@@ -77,11 +77,11 @@ import { ComponentMetadata, ComponentType } from '../../layout.model';
         gap: 8px;
         height: 32px;
         padding: 0 12px;
-        background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--panel-header-bg);
+        border-bottom: 1px solid var(--border-color);
         font-size: 12px;
         font-weight: 500;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         user-select: none;
         position: relative;
       }
@@ -131,8 +131,8 @@ import { ComponentMetadata, ComponentType } from '../../layout.model';
         min-width: 180px;
         max-height: 300px;
         overflow-y: auto;
-        background: var(--surface-0, #313244);
-        border: 1px solid var(--border-color, #45475a);
+        background: var(--surface-0);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-surface);
         box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
         z-index: 100;
@@ -147,7 +147,7 @@ import { ComponentMetadata, ComponentType } from '../../layout.model';
         background: none;
         border: none;
         text-align: left;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         font-size: 12px;
         cursor: pointer;
         transition: background-color 0.1s ease;
@@ -158,8 +158,8 @@ import { ComponentMetadata, ComponentType } from '../../layout.model';
       }
 
       .dropdown-item.active {
-        background: rgba(203, 166, 247, 0.2);
-        color: var(--accent-color, #cba6f7);
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+        color: var(--accent-color);
       }
 
       .panel-actions {
@@ -178,7 +178,7 @@ import { ComponentMetadata, ComponentType } from '../../layout.model';
         background: none;
         border: none;
         border-radius: var(--radius-control);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         cursor: pointer;
         transition: all 0.15s ease;
       }
@@ -190,12 +190,12 @@ import { ComponentMetadata, ComponentType } from '../../layout.model';
 
       .action-btn:hover {
         background: rgba(255, 255, 255, 0.1);
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
       }
 
       .action-btn.close-btn:hover {
-        background: rgba(243, 139, 168, 0.2);
-        color: #f38ba8;
+        background: color-mix(in srgb, var(--danger) 20%, transparent);
+        color: var(--danger);
       }
     `,
   ],

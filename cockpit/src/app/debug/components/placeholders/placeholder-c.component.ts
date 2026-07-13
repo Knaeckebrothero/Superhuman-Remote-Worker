@@ -17,7 +17,7 @@ import { Component } from '@angular/core';
         justify-content: center;
         height: 100%;
         gap: 8px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .placeholder-label {
