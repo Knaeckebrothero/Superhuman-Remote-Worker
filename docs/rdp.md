@@ -26,9 +26,10 @@ scope is still undecided, so there's no design doc or implementation plan yet. C
 The idea: add a browser-based remote desktop ("RDP") so a less-technical user can "visit"
 the machine the agent runs on.
 
-The finding: the concrete use cases that motivated it are largely **already covered** by two
-features we've designed — [[shared_browser]] (CDP screencast of the agent's browser) and the
-`url` kind of [[dynamic_canvas]]. The only thing a true remote desktop adds beyond those is
+The finding: the concrete use cases that motivated it are largely **already
+covered** by two features we've designed — [[shared_browser]] (CDP screencast of
+the agent's browser) and the planned `workspace_port` / `workspace_app` sources
+of [[dynamic_canvas]]. The only thing a true remote desktop adds beyond those is
 **non-web GUI** (file manager, native apps, OS dialogs).
 
 **Decision:** defer the remote-desktop / RDP capability. Build the dynamic canvas
@@ -74,10 +75,11 @@ Two consequences for any "visit the machine" feature:
 
 ## Relationship to the two existing designs
 
-- **[[dynamic_canvas]]** is the artifacts-style surface — a multi-kind tile grid the agent
-  writes into. It already lists `shared_browser` and `url` as **kinds**, and has a "delivery
-  mode B" (signed short-lived URL → real browser tab on an isolated domain). Any "desktop"
-  capability should be **one more canvas kind**, not a separate UI tab.
+- **[[dynamic_canvas]]** is the artifacts-style shared stage. V1 has one typed
+  `main` presentation pointer per thread; file presentation is implemented,
+  while `workspace_port` / `workspace_app` and `browser` sources are later
+  slices. Any future desktop capability should be another trusted Canvas
+  source/renderer, not a separate top-level UI.
 - **[[shared_browser]]** is watch / take-control of the agent's browser. It deliberately chose
   **CDP screencast and rejected noVNC/VNC desktop**, because noVNC needs Xvfb + a *headed*
   browser + three extra processes, while screencast reuses the existing headless Chromium and
@@ -89,22 +91,24 @@ Two consequences for any "visit the machine" feature:
 | Motivating need | Covered by |
 |---|---|
 | See **and take over** the browser the agent opened (tax form) | [[shared_browser]] — view (Phase 1) + take-control (Phase 2) |
-| Test an app without port-forwarding / CORS | Partly — a [[dynamic_canvas]] `url` tile proxies the workspace port, but inserts the orchestrator origin (the rewriting we wanted to avoid). A browser *truly on the machine* is cleaner — and that means a **headful** browser. |
+| Test an app without port-forwarding / CORS | Planned — [[dynamic_canvas]] Slice 3 adds isolated `workspace_port` / `workspace_app` proxying; a browser *truly on the machine* remains a separate headful-browser option. |
 | General "visit the machine" / RDP | **Not covered** — the only genuinely net-new piece |
 
-**The genuine gap:** the only thing a true desktop adds beyond screencast + the `url` kind is
-**non-web GUI** — file manager, native apps, the OS file-picker / print / PDF-viewer dialogs
-([[shared_browser]] lists these as screencast's blind spots), and arbitrary windows.
+**The genuine gap:** the only thing a true desktop adds beyond screencast +
+Canvas app sources is **non-web GUI** — file manager, native apps, the OS
+file-picker / print / PDF-viewer dialogs ([[shared_browser]] lists these as
+screencast's blind spots), and arbitrary windows.
 
 ## Options considered (for when we revisit)
 
-All three live *inside* the canvas-with-modes vision (each is a kind), and all reuse the
-existing authenticated proxy. Ordered by increasing capability:
+All three live *inside* the Canvas host vision (each is a trusted
+source/renderer), and all reuse the existing authenticated proxy. Ordered by
+increasing capability:
 
-**A — Build what's specced (no desktop).** Ship [[shared_browser]] (view + take-control) and
-the `url` kind. Covers the tax-form case and most app-testing. Lightest; reuses headless
-Chromium and the existing proxy. Trade-off: app-testing goes through the proxy (origin
-rewriting); no native GUI.
+**A — Build what's specced (no desktop).** Ship [[shared_browser]] (view +
+take-control) and the Canvas workspace-app sources. Covers the tax-form case and
+most app-testing. Lightest; reuses headless Chromium and the existing proxy.
+Trade-off: app-testing goes through the proxy (origin rewriting); no native GUI.
 
 **B — On-machine browser (the screencast "escape hatch").** Flip the agent's Chromium to
 **headful under Xvfb** and give the user a drivable browser (real omnibox), still streamed via
@@ -112,11 +116,11 @@ rewriting); no native GUI.
 OAuth testing on a browser genuinely on the machine, plus seeing the agent's browser. **One**
 extra process (Xvfb), not three. No file manager / native apps.
 
-**C — Full Linux desktop.** A new `desktop` canvas kind via **noVNC** (Xvfb + x11vnc +
-websockify in the workspace image, proxied like the IDE). File manager, native apps, OS
-dialogs, arbitrary windows, a real on-machine browser — closest to the original "RDP" picture.
-Heaviest; consciously reverses [[shared_browser]]'s no-VNC decision, justified only by needing
-non-web GUI.
+**C — Full Linux desktop.** A new `desktop` Canvas source/renderer via **noVNC**
+(Xvfb + x11vnc + websockify in the workspace image, proxied like the IDE). File
+manager, native apps, OS dialogs, arbitrary windows, a real on-machine browser —
+closest to the original "RDP" picture. Heaviest; consciously reverses
+[[shared_browser]]'s no-VNC decision, justified only by needing non-web GUI.
 
 > **Substrate note** (the question that prompted this): a desktop does **not** require a
 > dedicated VM. Xvfb is a userspace framebuffer — no GPU, no privileged pod — so it runs fine
@@ -128,7 +132,8 @@ non-web GUI.
   territory) — so the desktop is not on the critical path for them.
 - The desktop's only unique value (non-web GUI) is speculative until we see real demand —
   classic YAGNI.
-- A desktop would be a **canvas kind**, so [[dynamic_canvas]] is a prerequisite regardless.
+- A desktop would be a **Canvas source/renderer**, so [[dynamic_canvas]] is a
+  prerequisite regardless.
   Building the canvas first is strictly higher-leverage and loses nothing.
 
 ## Triggers to revisit
@@ -139,13 +144,14 @@ Pick this back up if we see:
   suite, etc.);
 - real pain from screencast's blind spots in [[shared_browser]] (native file-picker, print,
   PDF viewer, WebAuthn);
-- users struggling with **proxy-origin / CORS** issues when testing apps through the `url` kind
-  (→ argues for option B, the on-machine headful browser);
+- users struggling with **proxy-origin / CORS** issues when testing apps through
+  Canvas workspace-app sources (→ argues for option B, the on-machine headful
+  browser);
 - product demand for a "feels like a real computer" experience for non-technical users.
 
 ## References
 
-- [[dynamic_canvas]] — the artifacts-style multi-kind surface (the container).
+- [[dynamic_canvas]] — the typed shared presentation stage (the host surface).
 - [[shared_browser]] — watch/control the agent's browser via CDP screencast; the no-noVNC
   decision and its named Xvfb escape hatch.
 - [[vm_snapshots_and_ide]] — the IDE-in-browser feature whose proxy + auth rails any desktop
