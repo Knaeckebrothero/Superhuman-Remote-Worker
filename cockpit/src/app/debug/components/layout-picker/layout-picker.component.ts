@@ -78,8 +78,8 @@ import { LayoutPreviewComponent } from './layout-preview.component';
         width: 320px;
         max-height: 400px;
         overflow-y: auto;
-        background: var(--panel-bg, #181825);
-        border: 1px solid var(--border-color, #313244);
+        background: var(--panel-bg);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-surface);
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
         z-index: 1001;
@@ -87,7 +87,7 @@ import { LayoutPreviewComponent } from './layout-preview.component';
 
       .picker-section {
         padding: 12px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color);
       }
 
       .picker-section:last-child {
@@ -99,7 +99,7 @@ import { LayoutPreviewComponent } from './layout-preview.component';
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 1px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         margin: 0 0 10px 0;
       }
 
@@ -115,7 +115,7 @@ import { LayoutPreviewComponent } from './layout-preview.component';
         align-items: center;
         gap: 6px;
         padding: 8px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
         border: 1px solid transparent;
         border-radius: var(--radius-control);
         cursor: pointer;
@@ -123,13 +123,13 @@ import { LayoutPreviewComponent } from './layout-preview.component';
       }
 
       .layout-card:hover {
-        background: var(--surface-1, #45475a);
-        border-color: var(--accent, #89b4fa);
+        background: var(--surface-1);
+        border-color: var(--cat-6);
       }
 
       .card-name {
         font-size: 10px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         text-align: center;
         white-space: nowrap;
         overflow: hidden;
@@ -139,7 +139,7 @@ import { LayoutPreviewComponent } from './layout-preview.component';
 
       .loading {
         text-align: center;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
         padding: 20px;
       }
