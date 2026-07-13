@@ -1,10 +1,21 @@
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it, vi} from 'vitest';
 import {resolveGraphColors, buildCytoscapeStyles} from './graph-colors';
 
 // Fake reader: returns the token name back so we can assert mapping without a real DOM.
 const echo = (name: string) => `RESOLVED${name}`;
 
 describe('resolveGraphColors', () => {
+  // jsdom does not compute CSS custom properties, so this can't assert on the resolved
+  // VALUE — it asserts on the reader's TARGET instead. ThemeService puts the theme class
+  // (and therefore the --cat-*/--panel-bg/etc tokens) on document.body, not <html>.
+  it('default reader reads theme tokens from document.body, not <html>', () => {
+    const spy = vi.spyOn(window, 'getComputedStyle');
+    resolveGraphColors(); // no injected reader → exercises the default reader
+    expect(spy).toHaveBeenCalledWith(document.body);
+    expect(spy).not.toHaveBeenCalledWith(document.documentElement);
+    spy.mockRestore();
+  });
+
   it('maps node types to ramp tokens', () => {
     const c = resolveGraphColors(echo);
     expect(c.nodeType['Rule']).toBe('RESOLVED--cat-1');       // terracotta (was red)
