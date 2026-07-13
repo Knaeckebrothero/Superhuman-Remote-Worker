@@ -81,6 +81,11 @@ class ToolContext:
         # WS/SSE broadcast (live citations-panel update); worker jobs leave it
         # None. Threaded to CitationEngine(on_verdict=...).
     )
+    canvas_event_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = (
+        None  # (method, params) post-commit Canvas invalidation hook. Persistent
+        # sessions wire this to their ordered _broadcast path; worker jobs leave
+        # it unset. REST state remains authoritative if the callback fails.
+    )
     datasources: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
     _job_id: Optional[str] = None  # Direct job_id override
@@ -100,6 +105,9 @@ class ToolContext:
     _recent_reads: Deque[str] = field(
         default_factory=lambda: deque(maxlen=10)
     )  # Recently read file paths
+    _recent_read_versions: Dict[str, str] = field(
+        default_factory=dict
+    )  # Optional sha256 of the full text bytes observed for a recent path
     _current_phase: Optional[str] = None
     _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
     _instruction_files: List[Any] = field(
@@ -681,20 +689,46 @@ class ToolContext:
             self.citation_engine = None
             self._source_registry.clear()
 
-    def record_file_read(self, path: str) -> None:
-        """Record that a file was read. Uses normalized path.
+    def record_file_read(self, path: str, content: str | bytes | None = None) -> None:
+        """Record that a file was read, optionally with its full-text version.
 
         This is called by read_file to track which files have been recently
         accessed. The tracking window is limited to the last N reads (default 10).
+        Callers that only need path-based instruction enforcement may omit
+        ``content``; text ``read_file`` calls pass the complete bytes so later
+        writes can detect an out-of-band change even if an invalidation event
+        was missed.
 
         Args:
             path: Path to the file that was read
+            content: Complete text content observed by the reader, when available
         """
         normalized = path.lstrip("/").strip()
+        evicted = None
         # Remove if already present (we'll re-add at the end)
         if normalized in self._recent_reads:
             self._recent_reads.remove(normalized)
+        elif (
+            self._recent_reads.maxlen is not None
+            and self._recent_reads.maxlen > 0
+            and len(self._recent_reads) >= self._recent_reads.maxlen
+        ):
+            evicted = self._recent_reads[0]
         self._recent_reads.append(normalized)
+        if evicted is not None:
+            self._recent_read_versions.pop(evicted, None)
+        if normalized not in self._recent_reads:
+            # A deque configured with maxlen=0 cannot retain path or version.
+            self._recent_read_versions.pop(normalized, None)
+        elif content is None:
+            # Preserve the legacy path-only contract for instruction files and
+            # other callers that do not have authoritative full text.
+            self._recent_read_versions.pop(normalized, None)
+        else:
+            raw = content.encode("utf-8") if isinstance(content, str) else content
+            self._recent_read_versions[normalized] = (
+                "sha256:" + hashlib.sha256(raw).hexdigest()
+            )
 
     def was_recently_read(self, path: str) -> bool:
         """Check if file was read within the tracking window.
@@ -709,6 +743,41 @@ class ToolContext:
         """
         normalized = path.lstrip("/").strip()
         return normalized in self._recent_reads
+
+    def recent_read_matches(self, path: str, content: str | bytes) -> bool:
+        """Check path recency and any recorded full-text content version.
+
+        Path-only records deliberately remain visible to
+        :meth:`was_recently_read` for instruction-file enforcement, but cannot
+        authorize a text write. ``read_file`` must have recorded a version and
+        the current full text must still match it.
+        """
+
+        normalized = path.lstrip("/").strip()
+        if normalized not in self._recent_reads:
+            return False
+        expected = self._recent_read_versions.get(normalized)
+        if expected is None:
+            return False
+        raw = content.encode("utf-8") if isinstance(content, str) else content
+        current = "sha256:" + hashlib.sha256(raw).hexdigest()
+        return current == expected
+
+    def invalidate_recent_read(self, path: str) -> bool:
+        """Forget a file read after an out-of-band user edit.
+
+        Returns whether the normalized path was present. Keeping this as a
+        public ToolContext operation prevents transports from mutating the
+        private deque and makes read-before-write enforcement immediately
+        require a fresh agent read.
+        """
+
+        normalized = path.lstrip("/").strip()
+        present = normalized in self._recent_reads
+        if present:
+            self._recent_reads.remove(normalized)
+        self._recent_read_versions.pop(normalized, None)
+        return present
 
     def get_read_tracking_limit(self) -> int:
         """Get the tracking window size from config or default.

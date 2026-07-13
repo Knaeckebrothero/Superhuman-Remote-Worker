@@ -6,6 +6,7 @@
 @use 'styles/themes/shape-overrides';
 @use 'styles/code-highlight';     // Global PrismJS token theme for <markdown> code blocks
 @use 'styles/katex';              // Global presentation tweaks for KaTeX math in <markdown>
+@use 'styles/canvas-content';     // Sanitized Dynamic Canvas markdown typography
 
 // --- Theme classes (body-class swap) ---
 // Default look = senate (dark). <body class="theme-senate"> applies these tokens.
@@ -27,6 +28,7 @@ body {
   height: 100%;
   width: 100%;
   overflow: hidden;
+
   // App shell, not a document: kill double-tap-to-zoom (and the legacy 300ms
   // tap delay) everywhere, including Safari tabs that ignore the viewport
   // meta's zoom lock. Pinch-zoom prevention itself comes from the meta in

@@ -40,6 +40,9 @@ excluded_rules = [
 #        - app/0004 / app/0006: BIGSERIAL primary keys (fixed forward by 0007).
 #        - app/0008: ADD CHECK without NOT VALID and CREATE INDEX without
 #                CONCURRENTLY on threads. Already applied 2026-05-13.
+#        - app/0058: CREATE INDEX without CONCURRENTLY on the brand-new Canvas
+#                table. The applied bytes predate its lint annotation and are
+#                pinned by the migration checksum guard.
 #        - vector/0008: six CREATE INDEX without CONCURRENTLY. Four are on
 #                brand-new empty tables (knowledge_chunks) — instant build, no
 #                meaningful lock; the two on knowledge_index are sub-second on a
@@ -54,5 +57,6 @@ excluded_paths = [
     "orchestrator/database/migrations/app/0004_thread_events.sql",
     "orchestrator/database/migrations/app/0006_headless_notifications.sql",
     "orchestrator/database/migrations/app/0008_thread_awaiting_user.sql",
+    "orchestrator/database/migrations/app/0058_canvases.sql",
     "orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

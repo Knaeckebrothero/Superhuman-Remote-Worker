@@ -18,6 +18,7 @@ import functools
 import logging
 from typing import Any, Dict, List
 
+from .canvas import create_canvas_tools, get_canvas_metadata
 from .citation import create_citation_tools, get_citation_metadata
 from .webdav import create_webdav_tools, get_webdav_metadata
 from .communication import create_communication_tools, get_communication_metadata
@@ -70,6 +71,7 @@ TOOL_REGISTRY.update(get_core_metadata())
 TOOL_REGISTRY.update(get_research_metadata())
 TOOL_REGISTRY.update(get_browser_direct_metadata())
 TOOL_REGISTRY.update(get_citation_metadata())
+TOOL_REGISTRY.update(get_canvas_metadata())
 TOOL_REGISTRY.update(get_graph_metadata())
 TOOL_REGISTRY.update(get_sql_metadata())
 TOOL_REGISTRY.update(get_mongodb_metadata())
@@ -164,8 +166,12 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
       ``git`` (all need a workspace-backed execution environment). This is what
       ``WorkspaceBackend.supports_shell`` already promises: it "gates
       ShellManager construction *and* shell tool registration".
-    - ``not backend.supports_file_tools`` → drop ``workspace`` (file) tools —
-      the ``none`` tier, whose ScratchBackend is internal-only (§6).
+    - ``not backend.supports_file_tools`` → drop ``workspace`` (file) tools and
+      the Slice-1 file-only ``canvas`` category — the ``none`` tier, whose
+      ScratchBackend is internal-only (§6).
+    - ``not backend.supports_canvas_presentation`` → drop only ``canvas``. The
+      process-local virtual-memory transport has file tools, but a separate
+      orchestrator process cannot materialize those bytes for the viewer.
 
     Everything else (web research, datasource SQL/graph/Mongo/WebDAV, knowledge,
     core, communication, delegation, citation) passes through. ``backend=None``
@@ -178,6 +184,12 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
         drop_categories.update(_EXECUTION_CATEGORIES)
     if not getattr(backend, "supports_file_tools", True):
         drop_categories.add("workspace")
+        drop_categories.add("canvas")
+    # Canvas is a positive, externally materializable capability. Unknown and
+    # custom backends must opt in explicitly; file-tool support alone says
+    # nothing about whether the orchestrator can read the same bytes.
+    if not getattr(backend, "supports_canvas_presentation", False):
+        drop_categories.add("canvas")
     if not drop_categories:
         return tool_names
     kept: List[str] = []
@@ -188,11 +200,12 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
     if dropped:
         logger.info(
             "Backend capability gate dropped %d tool(s) %s "
-            "(supports_shell=%s, supports_file_tools=%s)",
+            "(supports_shell=%s, supports_file_tools=%s, supports_canvas=%s)",
             len(dropped),
             sorted(dropped),
             getattr(backend, "supports_shell", False),
             getattr(backend, "supports_file_tools", True),
+            getattr(backend, "supports_canvas_presentation", False),
         )
     return kept
 
@@ -584,6 +597,25 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded orchestrator tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load orchestrator tools: {e}")
+
+    # Dynamic Canvas tools are persistent-session-only. The category is still
+    # registered globally so config/catalog surfaces can describe it, but a
+    # worker context cannot accidentally acquire a nonfunctional adapter.
+    if "canvas" in tools_by_category:
+        if not context.thread_id or not context.user_id:
+            logger.warning(
+                "Canvas tools require an authenticated persistent ToolContext"
+            )
+        else:
+            try:
+                canvas_tools = create_canvas_tools(context)
+                requested = set(tools_by_category["canvas"])
+                for tool in canvas_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded Canvas tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load Canvas tools: {e}")
 
     # Agent catalog tools (experts + skills)
     if "agent_catalog" in tools_by_category:

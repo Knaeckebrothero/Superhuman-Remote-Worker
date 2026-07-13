@@ -113,6 +113,34 @@ $mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   color: var(--danger);
 }
 
+.tc__canvas-context {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.tc__action {
+  min-height: 26px;
+  padding: 2px 8px;
+  flex-shrink: 0;
+  color: var(--accent-color);
+  font: 600 11px/1 var(--font-primary, inherit);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--accent-color) 45%, var(--border-color));
+  border-radius: var(--radius-control);
+  cursor: pointer;
+}
+
+.tc__action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-color) 10%, transparent);
+}
+
+.tc__action:disabled {
+  color: var(--text-muted);
+  border-color: var(--border-color);
+  cursor: not-allowed;
+}
+
 /* Error/denied accents, visible even while collapsed. */
 .tc--error {
   border-left: 3px solid var(--danger);

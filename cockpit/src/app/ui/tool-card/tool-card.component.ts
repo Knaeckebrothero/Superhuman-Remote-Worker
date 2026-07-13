@@ -1,4 +1,4 @@
-import {ChangeDetectionStrategy, Component, OnDestroy, computed, inject, input, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, OnDestroy, computed, inject, input, output, signal} from '@angular/core';
 import {toSignal} from '@angular/core/rxjs-interop';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
@@ -6,11 +6,25 @@ import {AppIconComponent} from '../icon';
 import {AppIconButtonComponent} from '../icon-button';
 import {copyText} from '../copy-field';
 import {DiffLine} from '../../core/util/line-diff';
-import {ToolCardStatus, ToolCardView, ToolResult} from '../../core/models/tool-card.model';
+import {ToolCardAction, ToolCardStatus, ToolCardView, ToolResult} from '../../core/models/tool-card.model';
+import {CanvasService} from '../../core/services/canvas.service';
+import {CanvasState} from '../../core/models/canvas.model';
 
 /** Lines of a text/code/terminal result shown before "show N more". */
 const RESULT_LINE_CAP = 200;
 const COPIED_RESET_MS = 2000;
+
+export type CanvasToolCardContext = 'current' | 'currentStage' | 'replaced' | 'unavailable';
+
+/** Historical set_canvas cards can open only the current logical stage. */
+export function canvasToolCardContext(
+    action: ToolCardAction | undefined,
+    current: CanvasState | null,
+): CanvasToolCardContext {
+    if (!current?.source || current.status === 'cleared') return 'unavailable';
+    if (action?.presentationRevision === undefined) return 'currentStage';
+    return action.presentationRevision === current.presentation_revision ? 'current' : 'replaced';
+}
 
 /**
  * Source-agnostic presentational card for one agent tool call. Renders a
@@ -37,6 +51,13 @@ const COPIED_RESET_MS = 2000;
           <app-icon size="xs" class="tc__status-icon">{{ statusIcon() }}</app-icon>
           {{ statusLabel() }}
         </span>
+        @if (view().action; as action) {
+          <span class="tc__canvas-context">{{ canvasContextLabel() }}</span>
+          <button type="button" class="tc__action" [disabled]="!canvasActionAvailable()"
+                  (click)="requestAction($event, action)">
+            {{ 'toolCard.canvas.open' | transloco }}
+          </button>
+        }
       </summary>
 
       <div class="tc__body">
@@ -123,8 +144,10 @@ export class AppToolCardComponent implements OnDestroy {
     readonly view = input.required<ToolCardView>();
     /** Force the card open regardless of status (e.g. the debug surface). */
     readonly defaultOpen = input<boolean>(false);
+    readonly actionRequested = output<ToolCardAction>();
 
     private readonly transloco = inject(TranslocoService);
+    private readonly canvas = inject(CanvasService);
     private readonly lang = toSignal(this.transloco.langChanges$, {
         initialValue: this.transloco.getActiveLang(),
     });
@@ -134,6 +157,14 @@ export class AppToolCardComponent implements OnDestroy {
     private copiedTimer?: ReturnType<typeof setTimeout>;
 
     protected readonly status = computed<ToolCardStatus>(() => this.view().status);
+    protected readonly canvasActionAvailable = computed(() => {
+        const state = this.canvas.state();
+        return !!state?.source && state.status !== 'cleared';
+    });
+    protected readonly canvasContextLabel = computed(() => {
+        const context = canvasToolCardContext(this.view().action, this.canvas.state());
+        return this.transloco.translate(`toolCard.canvas.${context}`);
+    });
 
     /** Auto-open on a problem; otherwise honour `defaultOpen`. */
     protected readonly open = computed(
@@ -216,6 +247,12 @@ export class AppToolCardComponent implements OnDestroy {
         this.copied.set(true);
         clearTimeout(this.copiedTimer);
         this.copiedTimer = setTimeout(() => this.copied.set(false), COPIED_RESET_MS);
+    }
+
+    requestAction(event: MouseEvent, action: ToolCardAction): void {
+        event.preventDefault();
+        event.stopPropagation();
+        if (this.canvasActionAvailable()) this.actionRequested.emit(action);
     }
 
     ngOnDestroy(): void {

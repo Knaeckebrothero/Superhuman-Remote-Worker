@@ -147,7 +147,7 @@ from security.credential_files import (  # noqa: E402
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
-from routers import canvases_router  # noqa: E402
+from routers import canvases_router, internal_canvases_router  # noqa: E402
 from routers import project_loops_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
@@ -178,6 +178,13 @@ from services.usage_ledger import (  # noqa: E402
     cache_hit_ratio_from_rows,
 )
 from services.usage_rollup import UsageRollup, usage_rollup_loop  # noqa: E402
+from services.virtual_workspace import (  # noqa: E402
+    virtual_workspace_rclone_spec as _build_virtual_workspace_rclone_spec,
+)
+from services.workspace_binding import (  # noqa: E402
+    ensure_virtual_thread_workspace_binding,
+    remote_canvas_presentation_available,
+)
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -221,6 +228,11 @@ from src.core.model_registry import (  # noqa: E402
 # (no_workspace_agent_mode.md §4) — importing the frozenset is cheap; the heavy
 # backend modules are lazy-imported inside the factory's functions.
 from src.core.backends.factory import LITE_BACKENDS  # noqa: E402
+from src.core.session_tool_overrides import (  # noqa: E402
+    SESSION_TOOL_OVERRIDE_NAMES,
+    SessionToolOverrideError,
+    validate_session_tool_overrides,
+)
 from src.utils.ssh_key import (  # noqa: E402
     InvalidSSHKeyError,
     generate_ed25519_keypair as _generate_ed25519_keypair,
@@ -3025,13 +3037,13 @@ def _validated_session_workspace_override(
     return ws
 
 
-_SESSION_CREATE_TOOL_OVERRIDE_KEYS = frozenset(
-    {"orchestrator", "agent_catalog", "workflows"}
-)
+_SESSION_CREATE_TOOL_OVERRIDE_KEYS = frozenset(SESSION_TOOL_OVERRIDE_NAMES)
+_SESSION_CREATE_TOOL_OVERRIDE_NAMES = SESSION_TOOL_OVERRIDE_NAMES
 _SESSION_TOOL_DISABLED_MARKERS = {
     "orchestrator": "_fleet_management_disabled",
     "agent_catalog": "_agent_catalog_disabled",
     "workflows": "_workflows_disabled",
+    "canvas": "_canvas_disabled",
 }
 
 
@@ -3043,21 +3055,10 @@ def _validated_session_tool_overrides(
     At session creation we intentionally honor only the SRW session-facing
     control groups, not arbitrary tool grants from the request.
     """
-    tools = config_override.get("tools") if isinstance(config_override, dict) else None
-    if not isinstance(tools, dict):
-        return {}
-    accepted: dict[str, list[str]] = {}
-    for key in _SESSION_CREATE_TOOL_OVERRIDE_KEYS:
-        if key not in tools:
-            continue
-        value = tools.get(key)
-        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid tools.{key} override; expected a string list.",
-            )
-        accepted[key] = value
-    return accepted
+    try:
+        return validate_session_tool_overrides(config_override)
+    except SessionToolOverrideError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _validated_session_fleet_tools_override(
@@ -3119,29 +3120,7 @@ def _virtual_workspace_rclone_spec() -> Optional[dict[str, Any]]:
     ``object_store_from_spec`` consumes as ``rclone_spec`` (§4/§5). ``config``
     holds rclone backend key/values; for ``memory`` it is empty.
     """
-    rtype = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_TYPE", "").strip()
-    if not rtype:
-        return None
-    root = os.environ.get("VIRTUAL_WORKSPACE_RCLONE_ROOT", "").strip()
-    config: dict[str, Any] = {}
-    if rtype == "s3":
-        config = {
-            "provider": os.environ.get("VIRTUAL_WORKSPACE_S3_PROVIDER", "").strip()
-            or "Minio",
-            "access_key_id": os.environ.get("VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID", ""),
-            "secret_access_key": os.environ.get(
-                "VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY", ""
-            ),
-            "endpoint": os.environ.get("VIRTUAL_WORKSPACE_S3_ENDPOINT", "").strip(),
-            "region": os.environ.get("VIRTUAL_WORKSPACE_S3_REGION", "").strip()
-            or "us-east-1",
-            # The agent's scoped key can't create buckets and the bucket is
-            # pre-provisioned, so tell rclone not to probe/create it. String
-            # (not bool) — config values reach rclone as RCLONE_CONFIG_* env.
-            "no_check_bucket": "true",
-        }
-    # "memory" (dev) carries no credentials — empty config.
-    return {"type": rtype, "config": config, "root": root}
+    return _build_virtual_workspace_rclone_spec()
 
 
 def _object_store_startup_warning(
@@ -6794,11 +6773,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    # Canvas uses a strong representation ETag as its mutation precondition.
-    # The local Cockpit dev server (4200) calls the orchestrator (8085)
-    # cross-origin, so this one non-secret response header must be readable by
+    # Canvas uses strong state/content ETags as mutation preconditions. The
+    # local Cockpit dev server (4200) calls the orchestrator (8085)
+    # cross-origin, so both non-secret response headers must be readable by
     # HttpClient there. Production remains same-origin behind the BFF.
-    expose_headers=["ETag"],
+    expose_headers=["ETag", "X-Canvas-Content-ETag"],
 )
 
 
@@ -6897,6 +6876,7 @@ app.include_router(graph_router)
 app.include_router(uploads_router)
 app.include_router(automations_router)
 app.include_router(canvases_router)
+app.include_router(internal_canvases_router)
 app.include_router(project_loops_router)
 app.include_router(sessions_router)
 
@@ -7052,11 +7032,9 @@ async def list_jobs(
 
 
 def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
-    """Strip credential fields from a job's ``config_override`` before it leaves
-    over REST. asyncpg returns the JSONB column as a JSON string; we redact and
-    re-serialize to the original representation so the response shape is
-    unchanged. See ``security.access.redact_config_override``.
-    """
+    """Strip credentials and private workspace lease identity from a job."""
+
+    job = _redact_nested_workspace_state(job, field="context")
     co = job.get("config_override")
     if co is None:
         return job
@@ -7073,6 +7051,55 @@ def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
     cleaned = redact_config_override(co)
     job["config_override"] = json.dumps(cleaned) if was_str else cleaned
     return job
+
+
+def _redact_nested_workspace_state(
+    record: dict[str, Any], *, field: str
+) -> dict[str, Any]:
+    """Remove provisioner-only lease fields while preserving JSONB shape."""
+
+    value = record.get(field)
+    was_str = isinstance(value, str)
+    if was_str:
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return record
+    if not isinstance(value, dict):
+        return record
+
+    cleaned = value
+    changed = False
+    for context_key in ("workspace_container", "vm"):
+        context = cleaned.get(context_key)
+        if not isinstance(context, dict) or not any(
+            key in context
+            for key in (
+                "_canvas_workspace_generation",
+                "_docker_workspace_lease_id",
+                "_docker_workspace_trust_mode",
+                "_docker_workspace_attested",
+                "_docker_workspace_host_key_fingerprint",
+                "quarantine_reason",
+            )
+        ):
+            continue
+        if not changed:
+            cleaned = dict(cleaned)
+            changed = True
+        context = dict(context)
+        context.pop("_canvas_workspace_generation", None)
+        context.pop("_docker_workspace_lease_id", None)
+        context.pop("_docker_workspace_trust_mode", None)
+        context.pop("_docker_workspace_attested", None)
+        context.pop("_docker_workspace_host_key_fingerprint", None)
+        context.pop("quarantine_reason", None)
+        cleaned[context_key] = context
+    if not changed:
+        return record
+    result = dict(record)
+    result[field] = json.dumps(cleaned) if was_str else cleaned
+    return result
 
 
 def _with_cloud_review_mode(job: dict[str, Any]) -> dict[str, Any]:
@@ -7245,6 +7272,7 @@ def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     before it leaves over REST. ``metadata`` is a JSONB column returned as a
     JSON string; redact and re-serialize to the original representation.
     """
+    thread = _redact_nested_workspace_state(thread, field="metadata")
     md = thread.get("metadata")
     was_str = isinstance(md, str)
     if was_str:
@@ -7252,10 +7280,15 @@ def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
             md = json.loads(md)
         except (json.JSONDecodeError, TypeError):
             return thread  # unparseable — cannot contain our config_override
-    if isinstance(md, dict) and "config_override" in md:
+    if isinstance(md, dict):
+        should_copy = "config_override" in md or "_workspace_binding" in md
+        if not should_copy:
+            return thread
         thread = dict(thread)
         md = dict(md)
-        md["config_override"] = redact_config_override(md["config_override"])
+        if "config_override" in md:
+            md["config_override"] = redact_config_override(md["config_override"])
+        md.pop("_workspace_binding", None)
         thread["metadata"] = json.dumps(md) if was_str else md
     return thread
 
@@ -17448,6 +17481,34 @@ async def _resolve_thread_repositories(
     return payload or None
 
 
+def _agent_canvas_workspace_capabilities(
+    metadata: dict[str, Any],
+    workspace_context: dict[str, Any],
+    vm_context: dict[str, Any],
+) -> tuple[bool, bool]:
+    """Return file/live capability bits for the internal agent attach payload."""
+
+    vm_is_active = bool(
+        isinstance(vm_context, dict)
+        and vm_context.get("status") == "ready"
+        and vm_context.get("ssh_host")
+    )
+    canvas_presentation_available = bool(
+        not vm_is_active
+        and remote_canvas_presentation_available(metadata, workspace_context)
+    )
+    # Port presentation is deliberately narrower than file presentation. The
+    # positive bit is computed by the orchestrator from its default-off
+    # deployment gate and the same attested workspace binding; the agent never
+    # infers it from a backend label or endpoint reachability.
+    from services.canvas_apps import canvas_live_preview_enabled
+
+    canvas_live_apps_available = bool(
+        canvas_presentation_available and canvas_live_preview_enabled()
+    )
+    return canvas_presentation_available, canvas_live_apps_available
+
+
 @app.get("/api/agents/threads/{thread_id}/workspace")
 async def agent_get_thread_workspace(
     request: Request, thread_id: str
@@ -17470,6 +17531,9 @@ async def agent_get_thread_workspace(
             metadata = {}
     ws = metadata.get("workspace_container") or {}
     vm = metadata.get("vm") or {}
+    canvas_presentation_available, canvas_live_apps_available = (
+        _agent_canvas_workspace_capabilities(metadata, ws, vm)
+    )
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
     project_ids = await _revalidate_thread_project_ids(
         thread, await _thread_project_ids(thread_id)
@@ -17584,6 +17648,11 @@ async def agent_get_thread_workspace(
         "pod_port": ws.get("pod_port") or ws.get("port"),
         "namespace": ws.get("namespace"),
         "git_remote_url": ws.get("git_remote_url"),
+        # Public capability only: private generation/fingerprint material stays
+        # in metadata. A ready endpoint without a paired trusted binding must
+        # not cause the agent to advertise Canvas tools which can never work.
+        "canvas_presentation_available": canvas_presentation_available,
+        "canvas_live_apps_available": canvas_live_apps_available,
         # SSH key path (set by Docker provisioner in dev mode)
         "ssh_key_path": os.environ.get("SSH_KEY_PATH"),
         # VM fields (take precedence when present)
@@ -17888,6 +17957,16 @@ async def agent_update_thread_config(
     await require_internal(request)
     try:
         config_override = dict(body.config_override or {})
+        if "tools" in config_override:
+            # Runtime updates use the same closed group/name boundary as
+            # session creation.  Persist only the accepted session-facing
+            # subset; otherwise a globally registered tool could be smuggled
+            # through an unrelated category and instantiated by name later.
+            accepted_tools = _validated_session_tool_overrides(config_override)
+            if accepted_tools:
+                config_override["tools"] = accepted_tools
+            else:
+                config_override.pop("tools", None)
         thread_row = await postgres_db.get_thread(thread_id)
 
         # Layer 2 (fail loud): a runtime config change must also fit the owner's
@@ -18902,6 +18981,14 @@ async def create_thread(
                     thread_id,
                     json.dumps(metadata_patch),
                 )
+
+        # A durable virtual object-store namespace is itself the workspace
+        # backing. Bind it once at thread creation and preserve that generation
+        # across agent-pod restarts. Process-local memory is deliberately not
+        # bound/advertised to Canvas because another orchestrator replica cannot
+        # read it.
+        if _backend_from_override(config_override) == "virtual":
+            await ensure_virtual_thread_workspace_binding(postgres_db, thread_id)
 
         # Seed thread_mounts for the attached projects.
         if effective_project_ids:

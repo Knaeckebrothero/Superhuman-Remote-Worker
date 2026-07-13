@@ -32,6 +32,8 @@ import time
 from typing import Any, Optional
 
 import httpx
+
+from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 import yaml
 
 from .nats_bridge import nats_bridge
@@ -863,6 +865,9 @@ class VMProvisioner:
             "ssh_probe_attempts": 0,
             "ssh_probe_error": None,
             "ssh_probe_failed_at": None,
+            # Slice 1 does not trust a guest self-reported VM host key. Keep
+            # Canvas closed until the VM provisioner can attest the key.
+            CANVAS_WORKSPACE_GENERATION_KEY: None,
             # Golden-wait anchor from a previous incarnation must not cap this
             # provision's patience for a cold golden import (dispatcher stamps
             # it again on the first waiting_golden it sees).

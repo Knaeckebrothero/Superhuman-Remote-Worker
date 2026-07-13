@@ -539,6 +539,69 @@ COMMENT ON COLUMN public.datasources.read_only IS 'Declared read-only flag for p
 
 
 --
+-- Name: docker_workspace_leases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.docker_workspace_leases (
+    host text NOT NULL,
+    port integer NOT NULL,
+    status text NOT NULL,
+    lease_id uuid,
+    owner_kind text,
+    owner_id uuid,
+    trust_mode text DEFAULT 'unattested'::text NOT NULL,
+    host_key_fingerprint text,
+    quarantine_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_docker_workspace_attested_fingerprint CHECK (((trust_mode <> 'attested'::text) OR (host_key_fingerprint IS NOT NULL))),
+    CONSTRAINT ck_docker_workspace_lease_fingerprint CHECK (((host_key_fingerprint IS NULL) OR ((host_key_fingerprint ~~ 'SHA256:%'::text) AND (char_length(host_key_fingerprint) <= 128) AND (host_key_fingerprint !~ '[[:space:]]'::text)))),
+    CONSTRAINT ck_docker_workspace_lease_host CHECK (((host = btrim(host)) AND (host <> ''::text) AND (char_length(host) <= 255) AND (host !~ '[[:cntrl:]]'::text))),
+    CONSTRAINT ck_docker_workspace_lease_owner_kind CHECK (((owner_kind IS NULL) OR (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])))),
+    CONSTRAINT ck_docker_workspace_lease_owner_pair CHECK (((owner_kind IS NULL) = (owner_id IS NULL))),
+    CONSTRAINT ck_docker_workspace_lease_port CHECK (((port >= 1) AND (port <= 65535))),
+    CONSTRAINT ck_docker_workspace_lease_status CHECK ((status = ANY (ARRAY['ready'::text, 'releasing'::text, 'released'::text, 'quarantined'::text]))),
+    CONSTRAINT ck_docker_workspace_lease_trust_mode CHECK ((trust_mode = ANY (ARRAY['unattested'::text, 'trusted_dev'::text, 'attested'::text]))),
+    CONSTRAINT ck_docker_workspace_live_lease_shape CHECK (((status <> ALL (ARRAY['ready'::text, 'releasing'::text])) OR ((owner_kind IS NOT NULL) AND (owner_id IS NOT NULL) AND (lease_id IS NOT NULL))))
+);
+
+
+--
+-- Name: TABLE docker_workspace_leases; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.docker_workspace_leases IS 'Durable endpoint authority for pre-provisioned Docker workspaces. No owner FK by design: quarantine survives deleted jobs/threads.';
+
+
+--
+-- Name: COLUMN docker_workspace_leases.status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.docker_workspace_leases.status IS 'Only released inventory may be allocated; ready/releasing/quarantined remains occupied even after owner deletion.';
+
+
+--
+-- Name: COLUMN docker_workspace_leases.trust_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.docker_workspace_leases.trust_mode IS 'unattested, explicit same-trust trusted_dev, or controller/bootstrap attested. Existing rows are never promoted by configuration alone.';
+
+
+--
+-- Name: COLUMN docker_workspace_leases.host_key_fingerprint; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.docker_workspace_leases.host_key_fingerprint IS 'Exact provisioner-attested Ed25519 SHA-256 identity for attested inventory; public-key metadata, never a private key.';
+
+
+--
+-- Name: COLUMN docker_workspace_leases.quarantine_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.docker_workspace_leases.quarantine_reason IS 'Operator-visible recovery reason. First discovery without explicit bootstrap attestation is permanent quarantine until a controller/manual recreation attests the endpoint.';
+
+
+--
 -- Name: experts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1906,6 +1969,14 @@ ALTER TABLE ONLY public.datasources
 
 
 --
+-- Name: docker_workspace_leases docker_workspace_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.docker_workspace_leases
+    ADD CONSTRAINT docker_workspace_leases_pkey PRIMARY KEY (host, port);
+
+
+--
 -- Name: experts experts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2931,6 +3002,20 @@ CREATE UNIQUE INDEX uq_config_override ON public.config_overrides USING btree (C
 --
 
 CREATE UNIQUE INDEX uq_datasource_name_type_owner ON public.datasources USING btree (name, type, COALESCE(created_by, '00000000-0000-0000-0000-000000000000'::uuid));
+
+
+--
+-- Name: uq_docker_workspace_active_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_docker_workspace_active_owner ON public.docker_workspace_leases USING btree (owner_kind, owner_id) WHERE ((owner_id IS NOT NULL) AND (status = ANY (ARRAY['ready'::text, 'releasing'::text])));
+
+
+--
+-- Name: uq_docker_workspace_lease_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_docker_workspace_lease_id ON public.docker_workspace_leases USING btree (lease_id) WHERE (lease_id IS NOT NULL);
 
 
 --

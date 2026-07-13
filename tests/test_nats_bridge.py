@@ -86,6 +86,7 @@ def mock_db():
     db.merge_vm_context_if_current = AsyncMock(return_value=True)
     db.merge_thread_vm_context_if_current = AsyncMock(return_value=True)
     db.merge_ide_session_context = AsyncMock()
+    db.bind_thread_workspace_backing = AsyncMock()
     return db
 
 
@@ -884,6 +885,33 @@ class TestOnDaemonRegister:
     to the tailnet, so a probe gate can never pass (see docs/issues/
     vm_ssh_readiness_probe_unroutable_from_orchestrator.md).
     """
+
+    @pytest.mark.asyncio
+    async def test_thread_vm_guest_identity_does_not_enable_canvas(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """Guest NATS self-report is not provisioner-attested; fail closed."""
+        thread_id = "thread-reg-canvas-closed"
+        bridge_with_db._thread_vm_ids.add(thread_id)
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+        await bridge_with_db._on_daemon_register(
+            make_msg(
+                {
+                    "job_id": thread_id,
+                    "hostname": "vm-thread",
+                    "ip": "100.64.1.55",
+                    "pid": 44,
+                    "ssh_ready": True,
+                    "ssh_host_key_fingerprint": "SHA256:self-reported",
+                    "workspace_backing_id": "self-reported-boot",
+                }
+            )
+        )
+
+        updates = mock_db.merge_thread_vm_context.call_args.args[1]
+        assert updates["status"] == "ready"
+        assert updates["_canvas_workspace_generation"] is None
+        mock_db.bind_thread_workspace_backing.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_ssh_ready_true_promotes_to_ready(

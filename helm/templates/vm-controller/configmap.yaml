@@ -102,6 +102,9 @@ data:
                   runcmd:
                     - mkdir -p /run/agent
                     - chmod 755 /run/agent
+                    - rm -f /etc/ssh/ssh_host_*
+                    - ssh-keygen -A
+                    - systemctl restart ssh
                     - systemctl daemon-reload
                     - systemctl enable management-daemon.service
                     - systemctl start management-daemon.service

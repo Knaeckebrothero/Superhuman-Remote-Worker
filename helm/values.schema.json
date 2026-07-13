@@ -48,6 +48,26 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "canvas": {
+      "type": "object",
+      "properties": {
+        "livePreview": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "deniedPorts": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
     "ingress": {
       "type": "object",
       "properties": {

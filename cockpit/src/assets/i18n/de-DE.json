@@ -21,6 +21,13 @@
     "showMore": "{{count}} weitere Zeilen anzeigen",
     "showLess": "Weniger anzeigen",
     "previewNote": "Vorschau · {{size}} gesamt",
+    "canvas": {
+      "open": "Canvas öffnen",
+      "current": "aktuell",
+      "currentStage": "öffnet aktuelle Bühne",
+      "replaced": "Präsentation ersetzt",
+      "unavailable": "Canvas nicht verfügbar"
+    },
     "titles": {
       "read_file": "Datei lesen",
       "write_file": "Datei schreiben",
@@ -51,7 +58,101 @@
       "send_message": "Nachricht senden",
       "delegate_work": "Arbeit delegieren",
       "job_complete": "Job abschließen",
-      "mark_complete": "Als erledigt markieren"
+      "mark_complete": "Als erledigt markieren",
+      "set_canvas": "In Canvas präsentieren",
+      "get_canvas": "Canvas prüfen",
+      "clear_canvas": "Canvas leeren"
+    }
+  },
+  "canvas": {
+    "paneLabel": "Dynamischer Canvas",
+    "defaultTitle": "Canvas",
+    "noSource": "Keine Quelle ausgewählt",
+    "untrusted": "Vom Agenten bereitgestellter Inhalt",
+    "refresh": "Canvas-Status aktualisieren",
+    "close": "Canvas schließen",
+    "open": "Canvas öffnen",
+    "hide": "Canvas ausblenden",
+    "skipToCanvas": "Zum Canvas springen",
+    "returnToChat": "Zurück zum Chat",
+    "resize": "Chat und Canvas in der Größe ändern",
+    "empty": "Der Agent hat noch nichts präsentiert.",
+    "unsupported": "Diese Canvas-Quelle wird von dieser Cockpit-Version nicht unterstützt.",
+    "contentTooComplex": "Dieses Artefakt ist zu komplex, um es sicher darzustellen. Bitten Sie den Agenten, es zu vereinfachen.",
+    "renderer": {
+      "markdown": "Markdown",
+      "text": "Text",
+      "html": "Statisches HTML",
+      "image": "Bild",
+      "unsupported": "Nicht unterstützte Quelle"
+    },
+    "status": {
+      "ready": "Canvas ist bereit",
+      "readyRevision": "Canvas ist bereit, Präsentation {{revision}}",
+      "loading": "Canvas-Inhalt wird geladen…",
+      "updating": "Der Agent aktualisiert den Canvas…",
+      "sourceChanged": "Die Quelle im Workspace wurde geändert. Bitten Sie den Agenten, sie erneut zu präsentieren.",
+      "contentError": "Der Canvas-Inhalt konnte nicht geladen werden.",
+      "starting": "Canvas wird gestartet…",
+      "unavailable": "Die Canvas-Quelle ist derzeit nicht verfügbar.",
+      "ended": "Diese Canvas-Quelle wurde beendet.",
+      "error": "Im Canvas ist ein Fehler aufgetreten.",
+      "cleared": "Canvas wurde geleert."
+    },
+    "image": {
+      "zoomIn": "Vergrößern",
+      "zoomOut": "Verkleinern",
+      "missingAlt": "Bild ohne bereitgestellte Beschreibung"
+    },
+    "html": {
+      "frameTitle": "Statische Canvas-Vorschau: {{title}}"
+    },
+    "editor": {
+      "label": "Editor für die Canvas-Quelle",
+      "loading": "Editor wird geladen…",
+      "unavailable": "Der Quelltexteditor konnte nicht geladen werden.",
+      "edit": "Quelle bearbeiten",
+      "preview": "Vorschau anzeigen",
+      "save": "Speichern",
+      "saving": "Wird gespeichert…",
+      "saved": "Canvas-Quelle gespeichert",
+      "unsaved": "Sie haben ungespeicherte Canvas-Änderungen",
+      "keepEditing": "Weiter bearbeiten",
+      "loadCurrent": "Verwerfen und aktuelle Version laden",
+      "discardCleared": "Lokale Änderungen verwerfen",
+      "remoteEditing": "Eine andere Ansicht bearbeitet diese Canvas-Quelle.",
+      "sourceRefresh": "Die Workspace-Datei wurde außerhalb des Canvas-Editors geändert.",
+      "loadWorkspace": "Workspace-Version laden",
+      "conflict": {
+        "content_changed": {
+          "title": "Die Workspace-Datei wurde geändert",
+          "body": "Ihre Änderungen bleiben erhalten. Vergleichen Sie sie, bevor Sie die aktuelle Workspace-Version laden."
+        },
+        "presentation_changed": {
+          "title": "Der Canvas wurde erneut präsentiert",
+          "body": "Ihre Änderungen bleiben erhalten. Laden Sie die aktuelle Präsentation, bevor Sie sie überschreiben."
+        },
+        "replaced": {
+          "title": "Die Canvas-Quelle wurde ersetzt",
+          "body": "Ihre Änderungen gehören weiterhin zur vorherigen Quelle und wurden nicht gespeichert."
+        },
+        "cleared": {
+          "title": "Der Canvas wurde geleert",
+          "body": "Ihre lokalen Änderungen bleiben erhalten, bis Sie sie verwerfen oder anderweitig kopieren."
+        },
+        "busy": {
+          "title": "Die Canvas-Quelle ist belegt",
+          "body": "Ein anderer Speichervorgang läuft. Ihre Änderungen sind sicher; versuchen Sie es gleich erneut."
+        },
+        "precondition_required": {
+          "title": "Die Speichervoraussetzung des Editors fehlt",
+          "body": "Ihre Änderungen sind sicher. Laden Sie die aktuelle Version und versuchen Sie es erneut."
+        },
+        "save_failed": {
+          "title": "Die Canvas-Quelle konnte nicht gespeichert werden",
+          "body": "Ihre Änderungen bleiben in diesem Browser erhalten. Prüfen Sie die Verbindung und versuchen Sie es erneut."
+        }
+      }
     }
   },
   "common": {
@@ -2066,6 +2167,10 @@
       "delegation": {
         "label": "Delegation",
         "description": "Kann Subagenten starten, die parallel arbeiten"
+      },
+      "canvas": {
+        "label": "Canvas",
+        "description": "Kann Workspace-Dateien im gemeinsamen Sitzungs-Canvas präsentieren"
       },
       "orchestrator": {
         "label": "Flottenverwaltung",

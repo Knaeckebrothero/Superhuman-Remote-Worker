@@ -1,12 +1,35 @@
 # Docker Compose Deployment Mode
 
-**Status:** Implementing (Phase 1-4 complete)
-**Last updated:** 2026-04-11
+**Status:** Historical implementation record; static-workspace lifecycle superseded
+**Last updated:** 2026-07-13
 **Historical note:** An earlier plan (`docs/local_development.md`, now removed)
 introduced a `--dev` flag that let the agent use its own filesystem as the
 workspace. That escape hatch and the `LocalBackend` class it depended on have
 both been deleted — production and dev now both go through SSH to a workspace
 container. See "Production safety guard" below for the current design.
+
+> **Current static-workspace safety contract (supersedes recycle/reset passages
+> below):** Docker workspace endpoints are allocated from durable, host-keyed
+> inventory, independently of job and thread rows. A newly created production
+> endpoint may enter the released pool only through the one-time
+> `DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS` import and an exact matching
+> `WORKSPACE_HOST_KEY_FINGERPRINTS` entry. Before that import, recreate the
+> container **and** replace or independently sanitize its persistent
+> `/home/agent-host` workspace data; rotating only the SSH host key is not a
+> tenant boundary. Remove the bootstrap variable immediately after the import so
+> a later database rollback cannot replay it.
+>
+> Production/default allocation is one-use: release snapshots the workspace and
+> then quarantines the endpoint. Returning it to production inventory requires
+> explicit container and persistent-data recreation followed by fresh
+> attestation; there is no automatic recreation controller yet. SSH deletion and
+> container restart are not security resets. `DOCKER_WORKSPACE_TRUSTED_DEV_REUSE`
+> permits pinned-SSH cleanup only for disposable, single-user/same-trust
+> development. An unpinned trusted-dev endpoint can receive its initial lease,
+> but cleanup fails closed and quarantines it; configure exact fingerprints for
+> repeated development reuse. Workspace SSH uses port `30022` inside the Compose
+> network (the dev stack publishes it as `localhost:2201`-`2203`); VM SSH remains
+> on port `22` unless explicitly configured otherwise.
 
 ## Context
 
@@ -65,14 +88,14 @@ a clear error rather than silently falling back to Docker Compose mode mid-opera
 | Concern | Kubernetes | Docker Compose |
 |---------|-----------|----------------|
 | **Detection** | k8s API reachable + verified | k8s API unreachable |
-| **Workspace containers** | Dynamic via `ContainerProvisioner` | Fixed services in compose, recycled between jobs |
+| **Workspace containers** | Dynamic via `ContainerProvisioner` | Fixed services, leased from durable host inventory |
 | **VMs** | KubeVirt CRDs (NATS or direct API) | QEMU-in-Docker containers |
 | **Worker agents** | Dynamic pods, auto-scaled | Fixed `deploy.replicas` in compose |
 | **Persistent agents** | Pod-per-thread, on-demand | Fixed pool, reassigned between sessions |
 | **Scheduling** | Dynamic provisioning + dispatch | Static 1:1 assignment (agent <-> workspace) |
-| **Workspace lifecycle** | Create pod -> use -> snapshot to S3 -> delete pod | Use -> snapshot to S3 -> restart container -> reuse |
+| **Workspace lifecycle** | Create pod -> use -> snapshot to S3 -> delete pod | Attest once -> lease -> snapshot -> quarantine -> explicit recreate/data reset/reattest |
 | **IDE sessions** | On-demand pod from S3 snapshot | Workspace already on the network; direct code-server access |
-| **Service discovery** | k8s DNS + Services | Docker network DNS (`workspace-1:22`) |
+| **Service discovery** | k8s DNS + Services | Docker network DNS (`workspace-1:30022`) |
 
 
 ## What Already Exists
@@ -92,9 +115,10 @@ The full workspace persistence pipeline is built and tested:
 | Job resume integration | `orchestrator/main.py` lines ~3965, ~5352 | Wired into job lifecycle |
 
 Key insight: the snapshot service works over SSH. It doesn't care whether the target
-is a k8s pod or a Docker container -- it just needs a hostname and SSH access. This
-means **workspace recycling in Docker Compose mode works out of the box** once the
-orchestrator knows the container's hostname.
+is a k8s pod or a Docker container -- it just needs a hostname and SSH access.
+Snapshotting therefore works for Compose endpoints, but **safe cross-tenant reuse
+does not follow from snapshot support**. The inventory, quarantine, recreation, and
+attestation contract above is still required.
 
 ### Docker Compose Files (complete)
 
@@ -169,6 +193,10 @@ UIDs, or use an init step that copies and `chown`s the keys. On SELinux systems
 
 ### 2. Workspace Container Services in Compose
 
+> **Historical compose sketch:** The service shape remains useful context, but the
+> lifecycle and key-management assumptions in this sketch predate the current
+> durable-inventory and attestation contract above.
+
 Add fixed workspace containers to `docker-compose.yaml`. Use explicitly named services
 (not `docker compose up --scale`) because `--scale` creates anonymous replicas that
 cannot have per-instance volumes or configuration.
@@ -182,7 +210,7 @@ workspace-1:
   volumes:
     - ssh_keys:/home/agent-host/.ssh:ro
   healthcheck:
-    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
     interval: 10s
     timeout: 5s
     retries: 5
@@ -199,7 +227,8 @@ workspace-2:
 The number of workspace containers matches the number of agents. For the default
 setup (2 workers + 1 persistent), 3 workspace containers.
 
-**Service discovery:** Set `WORKSPACE_HOSTS=workspace-1,workspace-2,workspace-3` in
+**Service discovery:** Set
+`WORKSPACE_HOSTS=workspace-1:30022,workspace-2:30022,workspace-3:30022` in
 the orchestrator environment. This is simpler and more reliable than DNS probing
 (which fails if a workspace container is temporarily down during startup). Docker
 Compose's embedded DNS resolves these service names to container IPs automatically.
@@ -209,7 +238,7 @@ orchestrator doesn't attempt workspace assignment before containers are ready:
 ```yaml
 orchestrator:
   environment:
-    WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1,workspace-2,workspace-3}
+    WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1:30022,workspace-2:30022,workspace-3:30022}
     VM_HOSTS: ${VM_HOSTS:-}
   depends_on:
     workspace-1:
@@ -240,7 +269,11 @@ agent-persistent:
       condition: service_completed_successfully
 ```
 
-### 3. Orchestrator: Docker Compose Provisioner
+### 3. Orchestrator: Docker Compose Provisioner (historical allocator sketch)
+
+> **Superseded:** The pseudocode below recorded the original owner-row allocator.
+> The current contract uses a durable host-keyed inventory, lease-ID compare-and-
+> swap transitions, production quarantine, and explicit bootstrap attestation.
 
 When k8s is unavailable, the orchestrator needs a different code path for workspace
 assignment. The static pool model is recommended -- no Docker API needed.
@@ -253,8 +286,7 @@ class DockerProvisioner:
 
     Unlike ContainerProvisioner (which creates/deletes k8s pods on demand),
     this provisioner works with pre-existing containers defined in the
-    compose file. It assigns available workspaces to jobs and recycles
-    them after job completion.
+    compose file. It assigns available workspaces to jobs.
 
     Follows the same interface as ContainerProvisioner where possible
     so the orchestrator dispatch logic can use either interchangeably.
@@ -278,7 +310,7 @@ class DockerProvisioner:
         Checks jobs.context.workspace_container in DB to find which
         workspaces are currently in use. Returns the first free one.
 
-        Returns: {"host": "workspace-1", "port": 22, "status": "ready"}
+        Returns: {"host": "workspace-1", "port": 30022, "status": "ready"}
         Returns None if all workspaces are in use.
         """
         ...
@@ -287,8 +319,8 @@ class DockerProvisioner:
         """Release workspace back to the pool after job completion.
 
         1. Snapshot workspace to S3 (via existing SnapshotService)
-        2. Reset workspace (see Workspace Lifecycle section)
-        3. Clear workspace_container from job context in DB
+        2. Quarantine the production endpoint
+        3. Record the lease transition in durable host inventory
         """
         ...
 ```
@@ -297,8 +329,9 @@ class DockerProvisioner:
 containers on demand would mimic k8s behavior more closely. But it adds complexity
 (socket mounting, permission management) and isn't necessary -- the fixed-count model
 is simpler and sufficient for Docker Compose deployments. The orchestrator tracks
-assignment state in PostgreSQL (same `jobs.context.workspace_container` JSONB field
-used by `ContainerProvisioner`), not in Docker.
+assignment state in PostgreSQL. The original sketch stored availability only in
+`jobs.context.workspace_container`; that approach is superseded by durable,
+host-keyed inventory, while owner JSON retains the concrete lease reference.
 
 ### 4. Orchestrator: Mode-Aware Dispatch
 
@@ -427,52 +460,44 @@ When a thread ends:
 3. Clear `threads.agent_id`
 
 
-### 6. Workspace Lifecycle: Recycle Between Jobs
+### 6. Workspace Lifecycle: Quarantine After Use
 
-After a job completes in Docker Compose mode:
+The earlier design proposed restarting a static container and immediately recycling
+it. That design is **superseded**. Docker restart preserves the container writable
+layer, and persistent `/home/agent-host` data survives both restart and ordinary
+container recreation when its volume is retained. `kill 1`, `docker compose restart`,
+and an SSH `rm -rf` therefore cannot establish a cross-tenant security boundary.
+
+The production/default flow is:
 
 ```
-Job completes
-  |
-  +-- Snapshot workspace to S3 (existing: snapshot_service.capture_vm_snapshot)
-  |     +-- SSH into workspace container, tar /home/agent-host/, upload to S3
-  |
-  +-- Reset workspace for next job
-  |     +-- Container restart (recommended)
-  |           docker compose restart workspace-1
-  |           Entrypoint re-initializes sshd + code-server
-  |           ~5-10 seconds downtime
-  |
-  +-- Mark workspace as available in DB
+One-time pool bootstrap
+  +-- Recreate container and replace/independently sanitize persistent workspace data
+  +-- Verify exact Ed25519 fingerprint through the trusted Docker control plane
+  +-- Import endpoint once as attested, then remove the bootstrap environment value
+
+Job/session completes
+  +-- Snapshot workspace to S3 (best effort)
+  +-- Transition the concrete lease from ready -> releasing -> quarantined
+  +-- Keep the host unavailable even if owner rows are later removed
+
+Future reuse
+  +-- Explicitly recreate container and persistent data
+  +-- Re-attest through a recreation controller (not implemented yet)
+  +-- Only then return the host to released inventory
 ```
 
-**Why container restart over SSH cleanup:** Docker's OverlayFS destroys the
-container's writable layer on restart, returning the filesystem to the image's clean
-state. Named volumes (like SSH keys) survive. This catches everything an SSH cleanup
-script would miss: dotfiles, installed packages, modified system configs, shell
-history, tmux sessions, /tmp contents. The 5-10 second restart cost is worth the
-guarantee of a clean slate.
+`DOCKER_WORKSPACE_TRUSTED_DEV_REUSE=true` is a separate convenience mode for a
+single-user or otherwise same-trust disposable environment. It may delete workspace
+files over SSH and return the lease as `trusted_dev`, but this is not production
+attestation. Cleanup requires a configured exact host-key fingerprint. The automatic
+dev seed without a fingerprint can be allocated once, but its release quarantines
+because the orchestrator will not make an unpinned cleanup connection. Configure
+`WORKSPACE_HOST_KEY_FINGERPRINTS` when repeated development reuse is required.
 
-**How to restart from the orchestrator:** The orchestrator doesn't need Docker API
-access. SSH into the workspace, run `kill 1` (sends SIGTERM to the entrypoint/PID 1),
-and Docker's `restart: unless-stopped` policy automatically restarts the container.
-Or use the Docker API via socket mount if cleaner lifecycle control is needed.
-
-For persistent sessions (save/restore):
-```
-Session ends
-  |
-  +-- Snapshot to S3 (full workspace state)
-  +-- Restart workspace container (clean slate)
-  +-- Agent returns to idle pool
-
-Session resumes (or new session needs existing state)
-  |
-  +-- Assign idle agent + workspace
-  +-- Download snapshot from S3
-  +-- Extract to workspace via SSH (existing: ide_session._extract_snapshot_to_vm)
-  +-- Agent connects, resumes
-```
+Snapshots remain the persistence mechanism for resume. A resumed workload must be
+restored only into a fresh/attested production endpoint or an explicitly same-trust
+development endpoint; the existence of a snapshot never makes a used endpoint safe.
 
 
 ## VMs in Docker Compose Mode
@@ -617,8 +642,19 @@ No new secrets infrastructure is needed for Docker Compose mode. New variables g
 Added to `.env.example` under "Docker Compose Mode -- Workspace & VM Pool":
 
 ```bash
-# Workspace container hostnames (comma-separated, must match compose services)
-# WORKSPACE_HOSTS=workspace-1,workspace-2,workspace-3
+# Workspace SSH endpoints (comma-separated, must match compose services)
+# WORKSPACE_HOSTS=workspace-1:30022,workspace-2:30022,workspace-3:30022
+
+# Exact public host-key fingerprints for every reusable endpoint
+# WORKSPACE_HOST_KEY_FINGERPRINTS=workspace-1:30022=SHA256:replace_me,workspace-2:30022=SHA256:replace_me
+
+# ONE-TIME import only, after container + persistent-data recreation/sanitization.
+# Remove immediately after the successful inventory import.
+# DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS=workspace-1:30022,workspace-2:30022
+
+# Same-trust, single-user dev convenience only; never a production reset.
+# Repeated reuse also requires the exact fingerprint inventory above.
+# DOCKER_WORKSPACE_TRUSTED_DEV_REUSE=false
 
 # Agent replica counts
 # WORKER_REPLICAS=2
@@ -638,7 +674,7 @@ Added to `.env.example` under "Docker Compose Mode -- Workspace & VM Pool":
 # Orchestrator reads workspace pool from env
 orchestrator:
   environment:
-    WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1,workspace-2,workspace-3}
+    WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1:30022,workspace-2:30022,workspace-3:30022}
     VM_HOSTS: ${VM_HOSTS:-}
 
 # Agent replicas from env
@@ -713,6 +749,11 @@ This meant:
 
 All core phases are implemented. Remaining work is integration testing and polish.
 
+The original Phase 1 release/recycle behavior was subsequently hardened: static
+production endpoints now use durable host-keyed inventory and quarantine after use.
+The one-time bootstrap and trusted-development exception are described in the safety
+contract at the top of this document.
+
 ### Phase 1: Workspace containers in compose + orchestrator auto-detect — DONE
 
 | What | Where |
@@ -776,13 +817,15 @@ All core phases are implemented. Remaining work is integration testing and polis
 
 Collected from Coder, DevPod, OpenHands, Docker Sandboxes, and Spacelift:
 
-1. **Separate persistent storage from ephemeral compute.** SSH keys and config in
-   named volumes (survive restart). Workspace files in the container's writable layer
-   (destroyed on restart). This is the universal pattern across all workspace platforms.
+1. **Treat persistent storage and compute as one reset boundary.** A Docker restart
+   preserves the writable layer, and named workspace volumes survive recreation.
+   Production reuse requires both container recreation and replacement or independent
+   sanitization of persistent workspace data, followed by attestation.
 
-2. **Track assignments by immutable job ID, not hostname.** Store `job_id -> hostname`
-   in the database, not `hostname -> current state`. This prevents races if a workspace
-   is released and reassigned simultaneously.
+2. **Make the host inventory authoritative.** Track host state independently of job
+   and thread lifetimes, and pair each owner with an immutable lease ID. Lease-ID
+   compare-and-swap transitions prevent stale releasers from changing a reassigned
+   endpoint.
 
 3. **Use hostnames, not IPs.** Docker Compose DNS resolves service names to container
    IPs. After a container restart, the IP may change. If paramiko or any SSH client
@@ -796,9 +839,10 @@ Collected from Coder, DevPod, OpenHands, Docker Sandboxes, and Spacelift:
    ServiceAccount can't create pods, throw at startup -- don't discover this when the
    first job arrives.
 
-6. **Signal handling matters.** When restarting workspace containers, the entrypoint
-   receives SIGTERM. Ensure sshd and code-server handle it gracefully. The standard
-   `sshd` binary does; custom wrapper scripts must propagate signals.
+6. **Fail closed on reset and trust failures.** Snapshot failure does not prove a
+   workspace is clean, SSH cleanup is not production attestation, and an unpinned SSH
+   cleanup must not run. Quarantine the endpoint until explicit recreation and
+   attestation.
 
 
 ## Open Questions
@@ -819,10 +863,12 @@ Collected from Coder, DevPod, OpenHands, Docker Sandboxes, and Spacelift:
    developers can't use VM workspaces in compose. Fallback: use workspace containers
    only (no VMs), or run compose on a remote Linux machine via Docker context.
 
-5. **Workspace container restart vs Docker API:** The current design avoids needing
-   the Docker socket mounted into the orchestrator. If cleaner lifecycle control is
-   needed later (e.g., real `docker restart` instead of `kill 1`), mounting
-   `/var/run/docker.sock` is an option but adds a security surface.
+5. **Workspace container restart vs Docker API — resolved/superseded:** Restart is not
+   a reset and must not return a production endpoint to the pool. A future recreation
+   controller needs an authenticated control-plane path, must replace or independently
+   sanitize persistent workspace data, and must attest the resulting endpoint before
+   inventory release. Mounting `/var/run/docker.sock` directly remains an avoidable
+   security surface rather than a shortcut around that protocol.
 
 
 ## Related Documents

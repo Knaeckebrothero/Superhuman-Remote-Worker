@@ -70,8 +70,6 @@ class WorkspaceSuspensionService:
             backends = []
             if self._container_provisioner and self._container_provisioner.is_available:
                 backends.append("k8s")
-            if self._docker_provisioner and self._docker_provisioner.is_available:
-                backends.append("docker")
             if self._vm_provisioner and self._vm_provisioner.is_available:
                 backends.append("vm")
             logger.info(
@@ -88,16 +86,9 @@ class WorkspaceSuspensionService:
         if not self._snapshot_service or not self._snapshot_service.is_available:
             return False
         return (
-            (
-                self._container_provisioner is not None
-                and self._container_provisioner.is_available
-            )
-            or (
-                self._docker_provisioner is not None
-                and self._docker_provisioner.is_available
-            )
-            or (self._vm_provisioner is not None and self._vm_provisioner.is_available)
-        )
+            self._container_provisioner is not None
+            and self._container_provisioner.is_available
+        ) or (self._vm_provisioner is not None and self._vm_provisioner.is_available)
 
     @property
     def idle_timeout_minutes(self) -> int:
@@ -112,7 +103,6 @@ class WorkspaceSuspensionService:
 
         Dispatches to the correct provisioner based on workspace metadata:
         - K8s container: snapshot → delete pod
-        - Docker Compose: snapshot → SSH reset (container stays alive)
         - VM: snapshot → delete VM
 
         Returns True if snapshot + teardown succeeded.
@@ -135,6 +125,13 @@ class WorkspaceSuspensionService:
         ws_ctx = ctx.get("workspace_container", {})
         vm_ctx = ctx.get("vm", {})
         provisioner_type = ws_ctx.get("provisioner")
+        if provisioner_type == "docker":
+            logger.warning(
+                "Static Docker workspace suspension is disabled; safe reuse "
+                "requires controller-attested container recreation (job %s)",
+                job_id,
+            )
+            return False
 
         # Determine SSH host for snapshot
         ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
@@ -212,13 +209,7 @@ class WorkspaceSuspensionService:
                 "suspended_at": datetime.now(timezone.utc).isoformat(),
             }
 
-            if provisioner_type == "docker" and self._docker_provisioner:
-                await self._docker_provisioner._reset_workspace_via_ssh(
-                    ws_ctx.get("host", ""), int(ws_ctx.get("port", 22))
-                )
-                suspended_ctx.update({"pod_ip": None, "pod_name": None})
-                await self._db.merge_workspace_container_context(job_id, suspended_ctx)
-            elif vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
                 await self._vm_provisioner.delete_vm(job_id)
                 await self._db.merge_vm_context(job_id, suspended_ctx)
             else:
@@ -254,7 +245,6 @@ class WorkspaceSuspensionService:
 
         Dispatches to the correct provisioner based on workspace metadata:
         - K8s container: create pod → SSH extract
-        - Docker Compose: container already running → SSH extract
         - VM: create VM → SSH extract
 
         Returns True if provisioning + snapshot extraction succeeded.
@@ -276,6 +266,13 @@ class WorkspaceSuspensionService:
         ws_ctx = ctx.get("workspace_container", {})
         vm_ctx = ctx.get("vm", {})
         provisioner_type = ws_ctx.get("provisioner")
+        if provisioner_type == "docker":
+            logger.warning(
+                "Static Docker workspace restore is disabled; safe reuse "
+                "requires controller-attested container recreation (job %s)",
+                job_id,
+            )
+            return False
 
         if ws_ctx:
             await self._db.merge_workspace_container_context(
@@ -287,24 +284,7 @@ class WorkspaceSuspensionService:
         try:
             ssh_host = None
 
-            if provisioner_type == "docker" and self._docker_provisioner:
-                # Docker Compose: container is already running, just get its host
-                ssh_host = ws_ctx.get("host")
-                if not ssh_host:
-                    # Need to re-assign a workspace slot
-                    result = await self._docker_provisioner.assign_workspace(job_id)
-                    if not result:
-                        await self._db.merge_workspace_container_context(
-                            job_id,
-                            {
-                                "status": "failed",
-                                "error": "no workspace available for restore",
-                            },
-                        )
-                        return False
-                    ssh_host = result["host"]
-
-            elif vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
                 # VM: create a fresh VM
                 ok = await self._vm_provisioner.create_vm(job_id)
                 if not ok:
@@ -467,6 +447,13 @@ class WorkspaceSuspensionService:
         ws_ctx = metadata.get("workspace_container", {})
         vm_ctx = metadata.get("vm", {})
         provisioner_type = ws_ctx.get("provisioner")
+        if provisioner_type == "docker":
+            logger.warning(
+                "Static Docker workspace suspension is disabled; safe reuse "
+                "requires controller-attested container recreation (thread %s)",
+                thread_id,
+            )
+            return False
 
         ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
         ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
@@ -552,13 +539,7 @@ class WorkspaceSuspensionService:
                 "suspended_at": datetime.now(timezone.utc).isoformat(),
             }
 
-            if provisioner_type == "docker" and self._docker_provisioner:
-                await self._docker_provisioner._reset_workspace_via_ssh(
-                    ws_ctx.get("host", ""), int(ws_ctx.get("port", 22))
-                )
-                suspended_ctx.update({"pod_ip": None, "pod_name": None})
-                await self._db.merge_thread_workspace_context(thread_id, suspended_ctx)
-            elif vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
                 await self._vm_provisioner.delete_thread_vm(thread_id)
                 await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
             else:
@@ -614,6 +595,13 @@ class WorkspaceSuspensionService:
         ws_ctx = metadata.get("workspace_container", {})
         vm_ctx = metadata.get("vm", {})
         provisioner_type = ws_ctx.get("provisioner")
+        if provisioner_type == "docker":
+            logger.warning(
+                "Static Docker workspace restore is disabled; safe reuse "
+                "requires controller-attested container recreation (thread %s)",
+                thread_id,
+            )
+            return False
 
         if ws_ctx:
             await self._db.merge_thread_workspace_context(
@@ -625,25 +613,7 @@ class WorkspaceSuspensionService:
         try:
             ssh_host = None
 
-            if provisioner_type == "docker" and self._docker_provisioner:
-                # Docker: container already running, get its host
-                ssh_host = ws_ctx.get("host")
-                if not ssh_host:
-                    result = await self._docker_provisioner.assign_thread_workspace(
-                        thread_id
-                    )
-                    if not result:
-                        await self._db.merge_thread_workspace_context(
-                            thread_id,
-                            {
-                                "status": "failed",
-                                "error": "no workspace available for restore",
-                            },
-                        )
-                        return False
-                    ssh_host = result["host"]
-
-            elif vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
                 ok = await self._vm_provisioner.create_thread_vm(thread_id)
                 if not ok:
                     logger.error(

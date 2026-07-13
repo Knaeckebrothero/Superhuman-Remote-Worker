@@ -112,6 +112,145 @@ class TestDeployBoundSkillWithoutDeploymentDir:
         assert "CITE BODY" in session.workspace_manager.read_file(path)
 
 
+class TestCapabilityScopedCanvasSkillDeployment:
+    def test_managed_canvas_skill_upgrades_only_unchanged_owned_bytes(self):
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {
+                    "menu": [{"name": "present-with-canvas"}],
+                    "files": {"present-with-canvas": {"SKILL.md": "canvas-v1"}},
+                }
+            }
+        )
+        session = _make_session(config=cfg)
+        written: dict[str, str] = {}
+        workspace = MagicMock()
+        workspace.exists.side_effect = lambda path: path in written
+        workspace.read_file.side_effect = lambda path: written[path]
+        workspace.delete_file.side_effect = (
+            lambda path: written.pop(path, None) is not None
+        )
+        workspace.write_file.side_effect = lambda path, content: written.__setitem__(
+            path, content
+        )
+        session.workspace_manager = workspace
+
+        session._scope_skills_for_tool_names(["use_skill", "set_canvas"])
+        session._deploy_catalog_skill_files({"present-with-canvas"})
+        path = "skills/present-with-canvas/SKILL.md"
+        assert written[path] == "canvas-v1"
+
+        unscoped = session.config.extra["_unscoped_resolved_skills"]
+        unscoped["files"]["present-with-canvas"]["SKILL.md"] = "canvas-v2"
+        session._scope_skills_for_tool_names(["use_skill", "set_canvas"])
+        session._deploy_catalog_skill_files({"present-with-canvas"})
+
+        assert written[path] == "canvas-v2"
+        assert session._managed_canvas_skill_files[path] == session._skill_file_digest(
+            "canvas-v2"
+        )
+
+        # A user edit breaks the recorded ownership digest, so even a later
+        # bundled v3 must not overwrite or re-claim it.
+        written[path] = "user-customized"
+        unscoped = session.config.extra["_unscoped_resolved_skills"]
+        unscoped["files"]["present-with-canvas"]["SKILL.md"] = "canvas-v3"
+        session._scope_skills_for_tool_names(["use_skill", "set_canvas"])
+        session._deploy_catalog_skill_files({"present-with-canvas"})
+        assert written[path] == "user-customized"
+        assert path not in session._managed_canvas_skill_files
+
+    def test_canvas_skill_waits_for_actual_tools_and_reconciles_runtime_toggle(self):
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {
+                    "menu": [
+                        {"name": "ordinary-skill"},
+                        {"name": "present-with-canvas"},
+                    ],
+                    "files": {
+                        "ordinary-skill": {"SKILL.md": "ordinary"},
+                        "present-with-canvas": {"SKILL.md": "canvas"},
+                    },
+                }
+            }
+        )
+        session = _make_session(config=cfg)
+        written: dict[str, str] = {}
+        workspace = MagicMock()
+        workspace.exists.side_effect = lambda path: path in written
+        workspace.read_file.side_effect = lambda path: written[path]
+        workspace.delete_file.side_effect = (
+            lambda path: written.pop(path, None) is not None
+        )
+        workspace.write_file.side_effect = lambda path, content: written.__setitem__(
+            path, content
+        )
+        session.workspace_manager = workspace
+        session.tool_context = SimpleNamespace(config={})
+
+        # Workspace setup can deploy ordinary skills, but Canvas has not yet
+        # instantiated and must be absent from both the menu and workspace.
+        session._deploy_instruction_files()
+        assert [
+            item["name"] for item in session.config.extra["_resolved_skills"]["menu"]
+        ] == ["ordinary-skill"]
+        assert written == {"skills/ordinary-skill/SKILL.md": "ordinary"}
+
+        # Missing identity, an explicit disable, and backend=none all result in
+        # an actual loaded set without set_canvas; none may add the skill.
+        session._scope_skills_for_tool_names(["use_skill"])
+        session._deploy_catalog_skill_files({"present-with-canvas"})
+        assert "skills/present-with-canvas/SKILL.md" not in written
+
+        # A later none→workspace rebind can admit both tools and add the skill.
+        session._scope_skills_for_tool_names(["use_skill", "set_canvas"])
+        session._deploy_catalog_skill_files({"present-with-canvas"})
+        assert [
+            item["name"] for item in session.config.extra["_resolved_skills"]["menu"]
+        ] == ["ordinary-skill", "present-with-canvas"]
+        assert written["skills/present-with-canvas/SKILL.md"] == "canvas"
+        assert (
+            session.tool_context.config["_resolved_skills"]
+            == session.config.extra["_resolved_skills"]
+        )
+
+        # A runtime Canvas toggle removes the menu entry and only the unchanged
+        # managed file. An unrelated/user file under the same directory survives.
+        written["skills/present-with-canvas/user-notes.md"] = "keep me"
+        session._scope_skills_for_tool_names(["use_skill"])
+        session._deploy_catalog_skill_files({"present-with-canvas"})
+        assert [
+            item["name"] for item in session.config.extra["_resolved_skills"]["menu"]
+        ] == ["ordinary-skill"]
+        assert "skills/present-with-canvas/SKILL.md" not in written
+        assert written["skills/present-with-canvas/user-notes.md"] == "keep me"
+        assert "skills/present-with-canvas/.srw-managed.json" not in written
+
+        # Re-admission works, and a subsequently user-modified managed file is
+        # released rather than deleted when capability is removed again.
+        session._scope_skills_for_tool_names(["use_skill", "set_canvas"])
+        session._deploy_catalog_skill_files({"present-with-canvas"})
+        written["skills/present-with-canvas/SKILL.md"] = "user-modified"
+        session._scope_skills_for_tool_names(["use_skill"])
+        session._deploy_catalog_skill_files({"present-with-canvas"})
+        assert written["skills/present-with-canvas/SKILL.md"] == "user-modified"
+
+    def test_empty_db_catalog_gets_only_default_canvas_skill_after_actual_load(self):
+        cfg = _make_config(extra={"_resolved_skills": {}})
+        session = _make_session(config=cfg)
+
+        session._scope_skills_for_tool_names(["use_skill"])
+        assert session.config.extra["_resolved_skills"]["menu"] == []
+
+        session._scope_skills_for_tool_names(["use_skill", "set_canvas"])
+        menu = session.config.extra["_resolved_skills"]["menu"]
+        assert [item["name"] for item in menu] == ["present-with-canvas"]
+        assert set(session.config.extra["_resolved_skills"]["files"]) == {
+            "present-with-canvas"
+        }
+
+
 # ---------------------------------------------------------------------------
 # 2.1 _EXCLUDED_TOOLS constant
 # ---------------------------------------------------------------------------
@@ -455,7 +594,75 @@ class TestSetupWorkspace:
             await session._setup_workspace()
 
         mock_remote.connect.assert_called_once()
+        # A direct/configured remote endpoint has no orchestrator-attested
+        # generation + host identity pairing, even when labelled sandbox.
+        assert mock_remote.supports_canvas_presentation is False
+        assert mock_remote.supports_canvas_live_apps is False
         assert session.workspace_manager is not None
+
+    @pytest.mark.asyncio
+    async def test_attested_sandbox_override_enables_canvas_presentation(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "configured.test", "port": 22},
+        )
+        session = _make_session(config=cfg)
+        mock_remote = MagicMock()
+        mock_remote.connect = MagicMock()
+        workspace_override = {
+            "backend": "sandbox",
+            "remote": {"host": "paired.test", "port": 30022},
+            "canvas_presentation_available": True,
+            "canvas_live_apps_available": True,
+        }
+
+        with (
+            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
+            ),
+        ):
+            MockWM.return_value.path = "/tmp/test"
+            MockWM.return_value.initialize = MagicMock()
+            await session._setup_workspace(workspace_override=workspace_override)
+
+        assert mock_remote.supports_canvas_presentation is True
+        assert mock_remote.supports_canvas_live_apps is True
+
+    @pytest.mark.asyncio
+    async def test_vm_remote_backend_disables_canvas_presentation(self):
+        cfg = _make_config(
+            ws_backend="vm",
+            ws_remote={"host": "vm.test", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        mock_remote = MagicMock()
+        mock_remote.connect = MagicMock()
+
+        with (
+            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
+            ),
+        ):
+            MockWM.return_value.path = "/tmp/test"
+            MockWM.return_value.initialize = MagicMock()
+            await session._setup_workspace()
+
+        assert mock_remote.supports_canvas_presentation is False
+        assert mock_remote.supports_canvas_live_apps is False
 
     @pytest.mark.asyncio
     async def test_remote_retry_succeeds_after_failures(self):
@@ -968,6 +1175,46 @@ class TestSetupTools:
         assert "list_skills" in loaded_names
         assert "list_automations" not in loaded_names
         assert "set_automation_bundle" not in loaded_names
+
+    def test_canvas_can_be_disabled_independently(self):
+        cfg = _make_config(extra={"_canvas_disabled": True})
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend.supports_shell = True
+        session.workspace_manager.backend.supports_file_tools = True
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=[
+                    "read_file",
+                    "use_skill",
+                    "get_canvas",
+                    "set_canvas",
+                    "clear_canvas",
+                ],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext"),
+        ):
+            session._setup_tools(None)
+
+        loaded_names = mock_load.call_args[0][0]
+        assert "read_file" in loaded_names
+        assert "use_skill" in loaded_names
+        assert "get_canvas" not in loaded_names
+        assert "set_canvas" not in loaded_names
+        assert "clear_canvas" not in loaded_names
 
     def test_no_duplicate_orchestrator_tools(self):
         """Orchestrator tools not duplicated if already in config."""
@@ -1868,6 +2115,7 @@ class _SwappableWM:
 
     def __init__(self, backend):
         self._backend = backend
+        self._files = {}
 
     @property
     def backend(self):
@@ -1877,7 +2125,16 @@ class _SwappableWM:
         return f"/tmp/ws/{rel}"
 
     def write_file(self, rel, content):
-        pass
+        self._files[rel] = content
+
+    def exists(self, rel):
+        return rel in self._files
+
+    def read_file(self, rel):
+        return self._files[rel]
+
+    def delete_file(self, rel):
+        return self._files.pop(rel, None) is not None
 
 
 def _named_tool(name):
@@ -1909,6 +2166,7 @@ class TestResetupToolsForBackend:
         session.workspace_manager = _SwappableWM(virtual)
         session._llm = MagicMock()
         session._llm.bind_tools.return_value = MagicMock()
+        session.system_prompt = "pre-upgrade prompt"
 
         new_sm = MagicMock()
 
@@ -1934,6 +2192,10 @@ class TestResetupToolsForBackend:
             patch(
                 "src.api.persistent_session.supports_parallel_tool_calls",
                 return_value=False,
+            ),
+            patch(
+                "src.api.persistent_session.get_phase_system_prompt",
+                return_value="post-upgrade prompt",
             ),
             patch(
                 "src.services.guardrails.apply_guardrails_to_tools",
@@ -1971,6 +2233,7 @@ class TestResetupToolsForBackend:
         rebind_names = {t.name for t in session._llm.bind_tools.call_args[0][0]}
         assert shell in rebind_names and git in rebind_names
         assert session.llm_with_tools is session._llm.bind_tools.return_value
+        assert session.system_prompt == "post-upgrade prompt"
 
     def test_resetup_before_setup_is_noop(self):
         """Guard: called before _setup_tools (no tool_context) → safe no-op."""

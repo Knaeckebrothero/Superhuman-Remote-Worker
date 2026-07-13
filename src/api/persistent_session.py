@@ -8,11 +8,15 @@ and config without subclassing or modifying it.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import time
 from dataclasses import asdict as _dc_asdict
 from dataclasses import dataclass, field
+from dataclasses import is_dataclass as _dc_is_dataclass
+from dataclasses import replace as _dc_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -129,7 +133,11 @@ _EXCLUDED_TOOLS = frozenset(
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
+_CANVAS_DISABLED_KEY = "_canvas_disabled"
 _FLEET_MANAGEMENT_CONTROL_TOOLS = {"request_workspace_upgrade"}
+_CANVAS_SKILL_NAME = "present-with-canvas"
+_CANVAS_SKILL_MANIFEST = f"skills/{_CANVAS_SKILL_NAME}/.srw-managed.json"
+_CANVAS_SKILL_MANIFEST_OWNER = "srw-present-with-canvas-v1"
 
 # ENOTCONN watchdog probe interval for the protected-mode capture overlay
 # (design §11.6 #3). Module-level so tests can monkeypatch it down to a tiny
@@ -160,6 +168,12 @@ def _workflows_enabled(config: Any) -> bool:
     """Return whether automation/project-loop workflow tools should be exposed."""
     extra = getattr(config, "extra", {}) or {}
     return extra.get(_WORKFLOWS_DISABLED_KEY) is not True
+
+
+def _canvas_enabled(config: Any) -> bool:
+    """Return whether the session's independent Canvas tool group is enabled."""
+    extra = getattr(config, "extra", {}) or {}
+    return extra.get(_CANVAS_DISABLED_KEY) is not True
 
 
 @dataclass
@@ -230,6 +244,10 @@ class PersistentSession:
 
     # File checkpoints for undo (turn_id -> list of snapshots)
     file_checkpoints: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict)
+    # Exact hashes of companion-skill files this runtime created. The persisted
+    # manifest carries the same ownership proof across session-agent restarts.
+    _managed_canvas_skill_files: Dict[str, str] = field(default_factory=dict)
+    _canvas_skill_manifest_owned: bool = False
 
     # Nextcloud workspace sync (initialized if session has nc_session_folder)
     workspace_sync: Optional[Any] = None
@@ -463,6 +481,16 @@ class PersistentSession:
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
                 )
+                # Only the internal attach API can attest that this exact SSH
+                # endpoint is paired to a Canvas generation and pinned host
+                # identity. Direct remote config, VMs, and legacy overrides all
+                # remain fail-closed even when the connection itself is usable.
+                workspace_backend.supports_canvas_presentation = (
+                    workspace_override or {}
+                ).get("canvas_presentation_available") is True
+                workspace_backend.supports_canvas_live_apps = (
+                    workspace_override or {}
+                ).get("canvas_live_apps_available") is True
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, workspace_backend.connect)
                 logger.info(
@@ -645,6 +673,258 @@ class PersistentSession:
             refresh_lower=lambda: self.cloud_mount_manager.refresh_vfs()
         )
 
+    def _scope_skills_for_tool_names(self, tool_names: List[str]) -> None:
+        """Apply capability-aware optional-skill scope without mutating a base config."""
+        from src.core.skill_resolution import (
+            add_default_canvas_skill,
+            scope_skills_for_tools,
+        )
+
+        skill_catalog = self.config.extra.get(
+            "_unscoped_resolved_skills",
+            self.config.extra.get("_resolved_skills", {}),
+        )
+        # Canvas is available independently of the optional DB skill catalog.
+        # Add exactly its bundled companion as a floor; the scope call below
+        # still withholds it until both tools actually instantiated.
+        skill_catalog = add_default_canvas_skill(skill_catalog)
+        scoped = scope_skills_for_tools(skill_catalog, tool_names)
+        next_extra = {
+            **self.config.extra,
+            "_unscoped_resolved_skills": skill_catalog,
+            "_resolved_skills": scoped,
+        }
+        if _dc_is_dataclass(self.config):
+            self.config = _dc_replace(self.config, extra=next_extra)
+        else:  # Lightweight test/config adapters may not be real dataclasses.
+            self.config.extra = next_extra
+        if self.tool_context is not None:
+            # use_skill authorizes by the CURRENT scoped menu, not by stale
+            # workspace bytes. Keep its long-lived ToolContext synchronized on
+            # every backend/config rebind.
+            self.tool_context.config["_resolved_skills"] = scoped
+
+    def _deploy_catalog_skill_files(
+        self, only_names: Optional[set[str]] = None
+    ) -> None:
+        """Materialize currently scoped model-invoked skill files.
+
+        Ordinary catalog skills retain their historical add-only behavior.
+        The capability-scoped Canvas companion is reconciled in both
+        directions: files created by SRW are withdrawn when either required
+        tool disappears, while modified files and unrelated files in the same
+        directory are treated as user content and preserved.
+        """
+        from src.core.skill_resolution import skill_files_to_workspace
+
+        skills_files = self.config.extra.get("_resolved_skills", {}).get("files", {})
+        if only_names is not None:
+            skills_files = {
+                name: files
+                for name, files in skills_files.items()
+                if name in only_names
+            }
+        ordinary_files = {
+            name: files
+            for name, files in skills_files.items()
+            if name != _CANVAS_SKILL_NAME
+        }
+        for ws_path, content in skill_files_to_workspace(ordinary_files).items():
+            if self.workspace_manager.exists(ws_path):
+                continue  # don't overwrite on session resume
+            parent_dir = str(Path(ws_path).parent)
+            if parent_dir and parent_dir != ".":
+                self.workspace_manager.backend.mkdir(parent_dir)
+            self.workspace_manager.write_file(ws_path, content)
+            logger.debug(f"Deployed skill file to workspace: {ws_path}")
+
+        if only_names is None or _CANVAS_SKILL_NAME in only_names:
+            desired = skills_files.get(_CANVAS_SKILL_NAME)
+            self._reconcile_canvas_skill_files(
+                desired if isinstance(desired, dict) else {}
+            )
+
+    @staticmethod
+    def _skill_file_digest(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def _load_canvas_skill_manifest(self, allowed_paths: set[str]) -> Dict[str, str]:
+        """Load only a manifest carrying SRW's exact ownership marker."""
+
+        self._canvas_skill_manifest_owned = False
+        try:
+            if not self.workspace_manager.exists(_CANVAS_SKILL_MANIFEST):
+                return {}
+            payload = json.loads(
+                self.workspace_manager.read_file(_CANVAS_SKILL_MANIFEST)
+            )
+            if payload.get("managed_by") != _CANVAS_SKILL_MANIFEST_OWNER:
+                return {}
+            raw_files = payload.get("files")
+            if not isinstance(raw_files, dict):
+                return {}
+            from src.core.skill_format import validate_skill_path
+
+            loaded: Dict[str, str] = {}
+            for rel_path, digest in raw_files.items():
+                validate_skill_path(rel_path)
+                if not isinstance(digest, str) or len(digest) != 64:
+                    return {}
+                int(digest, 16)
+                workspace_path = f"skills/{_CANVAS_SKILL_NAME}/{rel_path}"
+                # The manifest is an ownership record, not authority to delete
+                # arbitrary sibling files. Only currently resolved bundle paths
+                # may ever be managed.
+                if workspace_path in allowed_paths:
+                    loaded[workspace_path] = digest
+            self._canvas_skill_manifest_owned = True
+            return loaded
+        except Exception:
+            # An unrecognized file at the reserved path may be user content.
+            # Never overwrite or delete it without our ownership marker.
+            logger.warning("Could not load the managed Canvas skill manifest")
+            return {}
+
+    def _store_canvas_skill_manifest(self, managed: Dict[str, str]) -> None:
+        prefix = f"skills/{_CANVAS_SKILL_NAME}/"
+        if not managed:
+            if self._canvas_skill_manifest_owned and self.workspace_manager.exists(
+                _CANVAS_SKILL_MANIFEST
+            ):
+                self.workspace_manager.delete_file(_CANVAS_SKILL_MANIFEST)
+            self._canvas_skill_manifest_owned = False
+            return
+
+        if (
+            self.workspace_manager.exists(_CANVAS_SKILL_MANIFEST)
+            and not self._canvas_skill_manifest_owned
+        ):
+            # Preserve a pre-existing unowned marker-shaped path. In-memory
+            # ownership still makes withdrawal safe for this runtime.
+            return
+        payload = {
+            "managed_by": _CANVAS_SKILL_MANIFEST_OWNER,
+            "files": {
+                path.removeprefix(prefix): digest
+                for path, digest in sorted(managed.items())
+                if path.startswith(prefix)
+            },
+        }
+        self.workspace_manager.backend.mkdir(prefix.rstrip("/"))
+        self.workspace_manager.write_file(
+            _CANVAS_SKILL_MANIFEST,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+        self._canvas_skill_manifest_owned = True
+
+    def _reconcile_canvas_skill_files(self, desired_files: Dict[str, str]) -> None:
+        """Converge the one capability-scoped skill without deleting user work."""
+
+        from src.core.skill_format import validate_skill_path
+
+        prefix = f"skills/{_CANVAS_SKILL_NAME}/"
+        unscoped_files = (
+            self.config.extra.get("_unscoped_resolved_skills", {})
+            .get("files", {})
+            .get(_CANVAS_SKILL_NAME, {})
+        )
+        allowed_paths: set[str] = set()
+        if isinstance(unscoped_files, dict):
+            for rel_path in unscoped_files:
+                if not isinstance(rel_path, str):
+                    continue
+                try:
+                    allowed_paths.add(f"{prefix}{validate_skill_path(rel_path)}")
+                except ValueError:
+                    logger.warning(
+                        "Ignoring unsafe Canvas skill path in resolved catalog: %r",
+                        rel_path,
+                    )
+
+        desired: Dict[str, str] = {}
+        for rel_path, content in desired_files.items():
+            if not isinstance(rel_path, str) or not isinstance(content, str):
+                logger.warning("Ignoring malformed Canvas skill file entry")
+                continue
+            try:
+                path = f"{prefix}{validate_skill_path(rel_path)}"
+            except ValueError:
+                logger.warning(
+                    "Ignoring unsafe Canvas skill path in scoped catalog: %r",
+                    rel_path,
+                )
+                continue
+            desired[path] = content
+            allowed_paths.add(path)
+
+        managed = self._load_canvas_skill_manifest(allowed_paths)
+        managed.update(
+            {
+                path: digest
+                for path, digest in self._managed_canvas_skill_files.items()
+                if path in allowed_paths
+            }
+        )
+
+        # Withdraw obsolete/disabled files only when their current bytes still
+        # match the hash SRW recorded when it wrote them. A modified file has
+        # become user content and is deliberately released from management.
+        for path, digest in list(managed.items()):
+            if path in desired:
+                continue
+            try:
+                if not self.workspace_manager.exists(path):
+                    managed.pop(path, None)
+                    continue
+                unchanged = (
+                    self._skill_file_digest(self.workspace_manager.read_file(path))
+                    == digest
+                )
+                if not unchanged:
+                    # Modified managed bytes have become user content.
+                    managed.pop(path, None)
+                    continue
+                if self.workspace_manager.delete_file(path) is False:
+                    logger.warning(
+                        "Could not withdraw managed Canvas skill file: %s", path
+                    )
+                    continue
+            except Exception:
+                logger.warning("Could not withdraw managed Canvas skill file: %s", path)
+                # Retain ownership after a transient workspace failure so a
+                # later reconciliation can retry the safe digest-checked delete.
+                continue
+            managed.pop(path, None)
+
+        # Never overwrite a pre-existing or user-modified file. An unchanged
+        # SRW-owned file may be upgraded when bundled desired bytes change.
+        for path, content in desired.items():
+            expected = self._skill_file_digest(content)
+            if self.workspace_manager.exists(path):
+                try:
+                    current = self._skill_file_digest(
+                        self.workspace_manager.read_file(path)
+                    )
+                except Exception:
+                    continue
+                recorded = managed.get(path)
+                if recorded != current:
+                    managed.pop(path, None)
+                    continue
+                if current != expected:
+                    self.workspace_manager.write_file(path, content)
+                    managed[path] = expected
+                    logger.debug("Upgraded managed Canvas skill file: %s", path)
+                continue
+            parent_dir = str(Path(path).parent)
+            self.workspace_manager.backend.mkdir(parent_dir)
+            self.workspace_manager.write_file(path, content)
+            managed[path] = expected
+            logger.debug("Deployed managed Canvas skill file: %s", path)
+
+        self._managed_canvas_skill_files = managed
+        self._store_canvas_skill_manifest(managed)
+
     def _deploy_instruction_files(self) -> None:
         """Deploy instruction files from config to workspace.
 
@@ -652,21 +932,16 @@ class PersistentSession:
         Copies files like design_guide.md from the expert config directory into
         the workspace so the agent can read them via workspace tools.
         """
+        # Workspace creation precedes ToolContext identity resolution and tool
+        # instantiation. Fail closed here: deploy ordinary catalog skills now,
+        # but admit present-with-canvas only after the actual loaded tool list is
+        # known in _load_tools_for_backend().
+        self._scope_skills_for_tool_names([])
+
         # Skill directories (Slice 2) — mirror of the agent.py worker path. Runs
         # before the instruction-files guard since skills come from the frozen
         # blob (_resolved_skills), not the expert config dir.
-        from src.core.skill_resolution import skill_files_to_workspace
-
-        skills_files = self.config.extra.get("_resolved_skills", {}).get("files", {})
-        for ws_path, content in skill_files_to_workspace(skills_files).items():
-            target = self.workspace_manager.get_path(ws_path)
-            if target.exists():
-                continue  # don't overwrite on session resume
-            parent_dir = str(Path(ws_path).parent)
-            if parent_dir and parent_dir != ".":
-                self.workspace_manager.backend.mkdir(parent_dir)
-            self.workspace_manager.write_file(ws_path, content)
-            logger.debug(f"Deployed skill file to workspace: {ws_path}")
+        self._deploy_catalog_skill_files()
 
         if not self.config.instruction_files:
             return
@@ -896,6 +1171,7 @@ class PersistentSession:
         fleet_management_tools.update(_FLEET_MANAGEMENT_CONTROL_TOOLS)
         agent_catalog_tools = set(get_tools_by_category("agent_catalog"))
         workflow_tools = set(get_tools_by_category("workflows"))
+        canvas_tools = set(get_tools_by_category("canvas"))
 
         if not fleet_management_enabled:
             tool_names = [
@@ -953,6 +1229,9 @@ class PersistentSession:
                 if name not in tool_names:
                     tool_names.append(name)
 
+        if not _canvas_enabled(self.config):
+            tool_names = [name for name in tool_names if name not in canvas_tools]
+
         if self.cloud_mount_manager and self.cloud_mount_manager.active:
             if "srw_cloud_status" not in tool_names:
                 tool_names.append("srw_cloud_status")
@@ -1000,6 +1279,16 @@ class PersistentSession:
                     self.tools.extend(load_tools([name], self.tool_context))
                 except ValueError:
                     logger.debug(f"Tool not implemented: {name}")
+
+        # The model-facing skill menu follows tools that actually instantiated,
+        # not merely configured candidates. This fails closed if a Canvas
+        # adapter or persistent identity was unavailable during registration.
+        loaded_tool_names = [tool.name for tool in self.tools]
+        self._scope_skills_for_tool_names(loaded_tool_names)
+        # This is the first point at which present-with-canvas may touch the
+        # workspace. Re-running after a none→workspace upgrade is idempotent and
+        # admits it only when both use_skill and set_canvas actually loaded.
+        self._deploy_catalog_skill_files({"present-with-canvas"})
 
         # Generate tool documentation in workspace (before overrides so full
         # docstrings are captured — mirrors agent.py._setup_job_tools)
@@ -1055,6 +1344,17 @@ class PersistentSession:
         # ._backend flips), so tool_context.workspace_manager stays valid.
         self._load_tools_for_backend()
         self._bind_tools()
+        if self.system_prompt:
+            # Capability-scoped skill menus are embedded in the system prompt.
+            # Rebuild it so a none→workspace upgrade that admits Canvas also
+            # makes present-with-canvas discoverable on the next turn.
+            self.system_prompt = get_phase_system_prompt(
+                self.config,
+                is_strategic=False,
+                model=self.config.llm.model or "",
+                tool_names=[tool.name for tool in self.tools],
+                prompt_type="interactive",
+            )
         backend_name = type(getattr(self.workspace_manager, "backend", None)).__name__
         logger.info(
             f"Re-derived {len(self.tools)} tools after backend swap ({backend_name})"
@@ -1449,6 +1749,10 @@ class PersistentSession:
 
     async def cleanup(self) -> None:
         """Clean up session resources."""
+        if self.tool_context is not None:
+            self.tool_context.citation_verdict_callback = None
+            self.tool_context.canvas_event_callback = None
+
         if self._cloud_overlay_monitor_task is not None:
             self._cloud_overlay_monitor_task.cancel()
             try:

@@ -280,9 +280,15 @@ class TestPodManifest:
     def test_env_overrides(self):
         m = self._build(config_name="scholar")
         env = m["spec"]["containers"][0]["env"]
-        env_dict = {e["name"]: e["value"] for e in env}
+        env_dict = {e["name"]: e.get("value") for e in env}
         assert env_dict["AGENT_CONFIG"] == "scholar"
         assert env_dict["AGENT_PORT"] == "8001"
+        internal = next(e for e in env if e["name"] == "MCP_INTERNAL_KEY")
+        assert internal["valueFrom"]["secretKeyRef"] == {
+            "name": "srw",
+            "key": "MCP_INTERNAL_KEY",
+            "optional": True,
+        }
 
     def test_security_context_non_root(self):
         m = self._build()

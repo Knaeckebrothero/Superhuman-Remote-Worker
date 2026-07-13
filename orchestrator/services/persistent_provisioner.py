@@ -540,6 +540,16 @@ class PersistentProvisioner:
                         "env": [
                             {"name": "AGENT_CONFIG", "value": config_name},
                             {"name": "AGENT_PORT", "value": "8001"},
+                            {
+                                "name": "MCP_INTERNAL_KEY",
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "name": self._secret_name,
+                                        "key": "MCP_INTERNAL_KEY",
+                                        "optional": True,
+                                    }
+                                },
+                            },
                         ]
                         + (
                             [{"name": "AGENT_EXPERT_ID", "value": expert_id}]

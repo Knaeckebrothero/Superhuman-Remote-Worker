@@ -51,7 +51,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
     git \
+    libmagic1 \
     openssh-client \
+    rclone \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder (system-owned, read-only is fine)

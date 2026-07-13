@@ -287,4 +287,140 @@ describe('CanvasService', () => {
     window.dispatchEvent(new Event('focus'));
     http.expectOne((req) => req.url.includes('/thread-1/canvases/main')).flush(canvasState(1));
   });
+
+  it('saves source bytes with both preconditions and applies the response immediately', () => {
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      canvasState(2, {status: 'ready', editable: true}),
+      {headers: {ETag: '"canvas:2:state"'}},
+    );
+    const sender = vi.fn().mockReturnValue(true);
+    transport.attachControlSender(sender);
+    let result: unknown;
+
+    service.saveContent({
+      contentUrl: '/api/persistent/threads/thread-1/canvases/main/content' +
+        '?presentation_revision=2&source_fingerprint=sha256%3Afp' +
+        '&source_version=sha256%3Aabc&ngsw-bypass=true',
+      contentEtag: '"sha256:abc"',
+      presentationRevision: 2,
+      content: '# Edited report',
+    }).subscribe(value => result = value);
+
+    const save = http.expectOne(req => req.method === 'PUT');
+    expect(save.request.headers.get('If-Match')).toBe('"sha256:abc"');
+    expect(save.request.headers.get('X-Canvas-Presentation-Revision')).toBe('2');
+    expect(save.request.headers.get('Content-Type')).toBe('text/plain; charset=utf-8');
+    expect(save.request.body).toBe('# Edited report');
+    save.flush(canvasState(3, {
+      status: 'ready',
+      editable: true,
+      source_version: 'sha256:def',
+    }), {
+      headers: {
+        ETag: '"canvas:3:state"',
+        'X-Canvas-Content-ETag': '"sha256:def"',
+      },
+    });
+
+    expect(result).toEqual(expect.objectContaining({
+      stateEtag: '"canvas:3:state"',
+      contentEtag: '"sha256:def"',
+    }));
+    expect(service.state()?.presentation_revision).toBe(3);
+    expect(service.stateEtag()).toBe('"canvas:3:state"');
+    expect(sender).toHaveBeenCalledWith('thread-1', {
+      method: 'canvas.source_updated',
+      canvas_id: 'main',
+      path: 'output/report.md',
+      presentation_revision: 3,
+      source_version: 'sha256:def',
+    });
+  });
+
+  it('conditionally adopts current workspace bytes and invalidates the runtime cache', () => {
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      canvasState(4, {status: 'source_changed'}),
+      {headers: {ETag: '"canvas:4:state"'}},
+    );
+    const sender = vi.fn().mockReturnValue(true);
+    transport.attachControlSender(sender);
+
+    service.refreshSource().subscribe();
+    const refresh = http.expectOne(req => req.url.endsWith('/canvases/main/refresh'));
+    expect(refresh.request.method).toBe('POST');
+    expect(refresh.request.headers.get('If-Match')).toBe('"canvas:4:state"');
+    refresh.flush(canvasState(5, {
+      status: 'ready',
+      source_version: 'sha256:fresh',
+    }), {
+      headers: {
+        ETag: '"canvas:5:state"',
+        'X-Canvas-Content-ETag': '"sha256:fresh"',
+      },
+    });
+
+    expect(service.state()?.source_version).toBe('sha256:fresh');
+    expect(sender).toHaveBeenCalledWith('thread-1', expect.objectContaining({
+      method: 'canvas.source_updated',
+      presentation_revision: 5,
+      source_version: 'sha256:fresh',
+    }));
+  });
+
+  it('does not notify the runtime from a mutation response older than current state', () => {
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      canvasState(3, {status: 'ready', editable: true}),
+      {headers: {ETag: '"canvas:3:state"'}},
+    );
+    const sender = vi.fn().mockReturnValue(true);
+    transport.attachControlSender(sender);
+    const contentUrl = '/api/persistent/threads/thread-1/canvases/main/content' +
+      '?presentation_revision=3&source_fingerprint=sha256%3Afp' +
+      '&source_version=sha256%3Aabc&ngsw-bypass=true';
+
+    service.saveContent({
+      contentUrl,
+      contentEtag: '"sha256:abc"',
+      presentationRevision: 3,
+      content: '# Older completion',
+    }).subscribe();
+    service.saveContent({
+      contentUrl,
+      contentEtag: '"sha256:abc"',
+      presentationRevision: 3,
+      content: '# Newer completion',
+    }).subscribe();
+
+    const [older, newer] = http.match(req => req.method === 'PUT');
+    newer.flush(canvasState(5, {
+      status: 'ready',
+      editable: true,
+      source_version: 'sha256:newer',
+    }), {
+      headers: {
+        ETag: '"canvas:5:state"',
+        'X-Canvas-Content-ETag': '"sha256:newer"',
+      },
+    });
+    older.flush(canvasState(4, {
+      status: 'ready',
+      editable: true,
+      source_version: 'sha256:older',
+    }), {
+      headers: {
+        ETag: '"canvas:4:state"',
+        'X-Canvas-Content-ETag': '"sha256:older"',
+      },
+    });
+
+    expect(service.state()?.presentation_revision).toBe(5);
+    expect(sender).toHaveBeenCalledTimes(1);
+    expect(sender).toHaveBeenCalledWith('thread-1', expect.objectContaining({
+      presentation_revision: 5,
+      source_version: 'sha256:newer',
+    }));
+  });
 });

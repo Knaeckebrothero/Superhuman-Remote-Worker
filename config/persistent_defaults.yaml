@@ -115,6 +115,11 @@ tools:
     - kb_export
   # Orchestrator tools auto-injected by PersistentSession._setup_tools()
   orchestrator: [ ]
+  # File-backed Dynamic Canvas presentation (persistent sessions only)
+  canvas:
+    - get_canvas
+    - set_canvas
+    - clear_canvas
   # Expert/skill catalog tools auto-injected by PersistentSession._setup_tools()
   agent_catalog: [ ]
   # Automation and project-loop workflow tools auto-injected by PersistentSession._setup_tools()

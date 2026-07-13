@@ -10,6 +10,7 @@ import {
     Injector,
     OnDestroy,
     OnInit,
+    output,
     QueryList,
     signal,
     ViewChild,
@@ -512,6 +513,7 @@ export function clearDraft(threadId: string | null): void {
           <span class="status-label">{{ connectionLabel() }}</span>
         </div>
         <div class="header-right">
+          <ng-content select="[chatHeaderAction]" />
           @if (chat.isConnected()) {
             @if (viewport.isMobile()) {
               <!-- Mobile: fold the secondary controls into one overflow menu so
@@ -787,7 +789,7 @@ export function clearDraft(threadId: string | null): void {
       <ng-template #toolDetails let-tools>
         <div class="tool-detail-list">
           @for (tc of tools; track tc.id) {
-            <app-tool-card [view]="toolView(tc)" />
+            <app-tool-card [view]="toolView(tc)" (actionRequested)="canvasRequested.emit()" />
           }
         </div>
       </ng-template>
@@ -1583,6 +1585,7 @@ export function clearDraft(threadId: string | null): void {
     styleUrls: ['./persistent-chat.component.scss'],
 })
 export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDestroy {
+    readonly canvasRequested = output<void>();
     readonly chat = inject(PersistentChatService);
     readonly viewport = inject(ViewportService);
     private readonly api = inject(ApiService);

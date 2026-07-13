@@ -167,6 +167,26 @@ class TestEditFileReadRequirement:
         content = workspace_manager.read_file("test.md")
         assert "Goodbye, world!" in content
 
+    def test_edit_file_requires_fresh_read_after_out_of_band_change(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        workspace_manager.write_file("test.md", "Agent observed this")
+        workspace_tools["read_file"].invoke({"path": "test.md"})
+
+        # Simulate a Canvas/user save while the WS invalidation is unavailable.
+        workspace_manager.write_file("test.md", "User changed this")
+        result = workspace_tools["edit_file"].invoke(
+            {
+                "path": "test.md",
+                "old_string": "User",
+                "new_string": "Agent",
+            }
+        )
+
+        assert "read_file" in result.lower()
+        assert workspace_manager.read_file("test.md") == "User changed this"
+        assert not tool_context.was_recently_read("test.md")
+
 
 class TestEditFilePositionModes:
     """Tests for edit_file position parameter (append/prepend)."""
@@ -315,6 +335,27 @@ class TestWriteFileReadRequirement:
         # Verify the change
         content = workspace_manager.read_file("test.md")
         assert content == "New content"
+
+    def test_write_file_requires_fresh_read_after_out_of_band_change(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        workspace_manager.write_file("test.md", "Visible line\nAgent observed this")
+        workspace_tools["read_file"].invoke(
+            {"path": "test.md", "offset": 1, "limit": 1}
+        )
+
+        # The content hash is the integrity guard when no live invalidation was
+        # delivered. It covers the full text, not only the displayed line range.
+        workspace_manager.write_file("test.md", "Visible line\nUser changed this")
+        result = workspace_tools["write_file"].invoke(
+            {"path": "test.md", "content": "Agent overwrite"}
+        )
+
+        assert "read_file" in result.lower()
+        assert workspace_manager.read_file("test.md") == (
+            "Visible line\nUser changed this"
+        )
+        assert not tool_context.was_recently_read("test.md")
 
 
 class TestAppendFileRemoved:

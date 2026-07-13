@@ -332,7 +332,11 @@ services:
       ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-Admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # MCP token verification
-      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
+      MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
+      # Dark-shipped Canvas live-app capability; keep disabled until the
+      # isolated viewer-domain launch gates are satisfied.
+      CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
+      CANVAS_LIVE_PREVIEW_DENIED_PORTS: "${CANVAS_LIVE_PREVIEW_DENIED_PORTS:-}"
       # AES-GCM encryption at rest for stored credentials
       # (user_api_keys / project_api_keys / system_api_keys / llm_endpoints)
       APP_ENCRYPTION_KEY: "${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY required — generate with: python -c 'import secrets,base64; print(base64.b64encode(secrets.token_bytes(32)).decode())'}"
@@ -394,7 +398,11 @@ services:
       # VM lifecycle (optional)
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       # Docker Compose mode — workspace/VM pool (ignored when k8s is available)
-      WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1,workspace-2,workspace-3,workspace-4,workspace-5}
+      WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1:30022,workspace-2:30022,workspace-3:30022,workspace-4:30022,workspace-5:30022}
+      WORKSPACE_HOST_KEY_FINGERPRINTS: ${WORKSPACE_HOST_KEY_FINGERPRINTS:-}
+      DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS: ${DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS:-}
+      SSH_KEY_PATH: /run/secrets/ssh/id_ed25519
+      DOCKER_WORKSPACE_TRUSTED_DEV_REUSE: ${DOCKER_WORKSPACE_TRUSTED_DEV_REUSE:-false}
       VM_HOSTS: ${VM_HOSTS:-}
       # Orchestrator settings
       AUTO_ASSIGN_ENABLED: ${AUTO_ASSIGN_ENABLED:-true}
@@ -402,6 +410,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - workspace_data:/workspace:z
+      - ssh_keys:/run/secrets/ssh:ro
     ports:
       - "${ORCHESTRATOR_PORT:-8085}:8085"
     depends_on:
@@ -411,6 +420,8 @@ services:
         condition: service_healthy
       gitea:
         condition: service_healthy
+      ssh-keygen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8085/api/health"]
       interval: 10s
@@ -430,6 +441,9 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
       VECTOR_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
       ORCHESTRATOR_URL: http://orchestrator:8085
+      # Shared only with trusted agent/MCP callers of internal routes.
+      MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
+      CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
       WORKSPACE_PATH: /workspace
       # LLM routing
       LLM_BASE_URL: ${LLM_BASE_URL:-}
@@ -535,7 +549,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -553,7 +567,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -571,7 +585,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -589,7 +603,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -607,7 +621,7 @@ services:
     volumes:
       - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/30022"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -627,7 +641,7 @@ services:
       COCKPIT_API_URL: http://orchestrator:8085
       MCP_TRANSPORT: http
       MCP_PORT: 8055
-      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
+      MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
     ports:
       - "${MCP_PORT:-8055}:8055"
     depends_on:

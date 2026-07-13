@@ -27,6 +27,7 @@ export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 /** Session creation also shows SRW, knowledge, and git categories. */
 export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
+  { key: 'canvas', label: 'Canvas', icon: 'dashboard_customize', description: 'Ability to present workspace files in the shared session Canvas' },
   { key: 'orchestrator', label: 'Fleet Management', icon: 'hub', description: 'Ability to inspect and steer SRW jobs, projects, repositories, and session workspace upgrades' },
   { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to manage experts and skills' },
   { key: 'workflows', label: 'Automations & Loops', icon: 'auto_mode', description: 'Ability to inspect automations and project loops, and draft disabled automations' },
