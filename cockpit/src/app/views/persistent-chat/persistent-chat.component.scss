@@ -115,7 +115,7 @@
 
       .status-dot.connected { background: var(--success); }
       .status-dot.connecting { background: var(--warning); animation: pulse 1s infinite; }
-      .status-dot.disconnected { background: var(--surface-2, #585b70); }
+      .status-dot.disconnected { background: var(--surface-2); }
       .status-dot.error { background: var(--danger); }
 
       @keyframes pulse {
