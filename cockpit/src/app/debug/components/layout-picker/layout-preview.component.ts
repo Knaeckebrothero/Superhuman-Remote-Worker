@@ -20,8 +20,8 @@ import { LayoutConfig } from '../../layout.model';
           [attr.y]="rect.y"
           [attr.width]="rect.width"
           [attr.height]="rect.height"
-          [attr.fill]="rect.fill"
-          [attr.stroke]="strokeColor"
+          [style.fill]="rect.fill"
+          [style.stroke]="strokeColor"
           stroke-width="1"
           rx="2"
         />
@@ -41,20 +41,14 @@ export class LayoutPreviewComponent {
   @Input() width = 80;
   @Input() height = 50;
 
-  // Catppuccin Mocha colors for visual distinction
+  // Theme tokens for color ramp
   private readonly colors = [
-    '#89b4fa', // Blue
-    '#a6e3a1', // Green
-    '#f9e2af', // Yellow
-    '#fab387', // Peach
-    '#cba6f7', // Mauve
-    '#f38ba8', // Red
-    '#94e2d5', // Teal
-    '#f5c2e7', // Pink
+    'var(--cat-1)', 'var(--cat-2)', 'var(--cat-3)', 'var(--cat-4)',
+    'var(--cat-5)', 'var(--cat-6)', 'var(--cat-7)', 'var(--cat-8)',
   ];
 
-  readonly strokeColor = '#313244'; // Surface 0
-  readonly bgColor = '#1e1e2e'; // Base
+  readonly strokeColor = 'var(--surface-1)';
+  readonly bgColor = 'var(--panel-bg)';
 
   /**
    * Computed array of rectangles to render.
