@@ -413,7 +413,7 @@ interface Project {
     }
 
     .session-status-dot.active, .session-status-dot.created { background: var(--success); }
-    .session-status-dot.ended { background: var(--surface-2, #585b70); }
+    .session-status-dot.ended { background: var(--surface-2); }
 
     .session-title {
       font-size: 13px;

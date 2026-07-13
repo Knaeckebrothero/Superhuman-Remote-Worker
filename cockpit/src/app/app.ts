@@ -137,7 +137,7 @@ import {AppIconComponent} from './ui/icon';
 
       .pending-approval-card p {
         margin: 0 0 0.75rem;
-        color: var(--text-secondary, #bac2de);
+        color: var(--text-secondary);
         line-height: 1.6;
       }
 
@@ -152,7 +152,7 @@ import {AppIconComponent} from './ui/icon';
         border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #bac2de);
+        color: var(--text-secondary);
         font-size: 0.875rem;
         cursor: pointer;
         transition: all 0.15s ease;
