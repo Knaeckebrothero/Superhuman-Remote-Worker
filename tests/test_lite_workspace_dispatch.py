@@ -396,3 +396,47 @@ class TestObjectStoreStartupWarning:
             )
             is not None
         )
+
+
+class TestObjectStoreRequiredEnforcement:
+    """Opt-in fail-closed: OBJECT_STORE_REQUIRED makes an incomplete object-store
+    config a startup error (crash-loop until fixed) instead of a warning. Default
+    (unset/falsey) stays warn-only. Truthy per the repo convention: true/1/yes."""
+
+    def test_warns_not_raises_when_flag_unset(self):
+        msg = main._check_object_store_config({})
+        assert msg is not None
+        assert "Object store not fully configured" in msg
+
+    def test_raises_when_required_and_store_missing(self):
+        with pytest.raises(RuntimeError, match="refuses to start"):
+            main._check_object_store_config({"OBJECT_STORE_REQUIRED": "true"})
+
+    def test_raises_on_partial_config_when_required(self):
+        # snapshots set but virtual tier missing + required -> still fail-closed
+        with pytest.raises(RuntimeError):
+            main._check_object_store_config(
+                {"S3_ENDPOINT": "http://minio:9000", "OBJECT_STORE_REQUIRED": "1"}
+            )
+
+    def test_no_raise_when_required_and_both_configured(self):
+        assert (
+            main._check_object_store_config(
+                {
+                    "S3_ENDPOINT": "http://minio:9000",
+                    "VIRTUAL_WORKSPACE_RCLONE_TYPE": "s3",
+                    "OBJECT_STORE_REQUIRED": "true",
+                }
+            )
+            is None
+        )
+
+    def test_falsey_flag_values_warn_not_raise(self):
+        for val in ("false", "0", "no", "", "  "):
+            msg = main._check_object_store_config({"OBJECT_STORE_REQUIRED": val})
+            assert msg is not None, f"{val!r} should warn, not raise"
+
+    def test_truthy_flag_variants_raise(self):
+        for val in ("true", "TRUE", "1", "yes", " Yes "):
+            with pytest.raises(RuntimeError):
+                main._check_object_store_config({"OBJECT_STORE_REQUIRED": val})

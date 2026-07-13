@@ -176,6 +176,9 @@ data:
   S3_REGION: {{ .Values.s3.region | quote }}
   SNAPSHOT_MAX_SIZE_GB: {{ .Values.s3.snapshotMaxSizeGb | quote }}
   SNAPSHOT_RETENTION_DAYS: {{ .Values.s3.snapshotRetentionDays | quote }}
+  # Opt-in fail-closed: when "true" the orchestrator refuses to start unless
+  # both object-store seams are configured (default warn-only).
+  OBJECT_STORE_REQUIRED: {{ .Values.s3.required | default false | quote }}
 
   # IDE sessions
   IDE_SESSION_IDLE_TIMEOUT: {{ .Values.ide.sessionIdleTimeout | quote }}
