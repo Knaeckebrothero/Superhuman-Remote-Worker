@@ -94,6 +94,32 @@ data:
   # foundation slice.
   CANVAS_LIVE_PREVIEW_ENABLED: {{ ternary "true" "false" .Values.canvas.livePreview.enabled | quote }}
   CANVAS_LIVE_PREVIEW_DENIED_PORTS: {{ join "," .Values.canvas.livePreview.deniedPorts | quote }}
+  # Browser-facing viewer gate and isolation attestations. These stay present
+  # but disabled/empty in ordinary installs so both the API capability and the
+  # separate gateway fail closed.
+  CANVAS_VIEWER_ENABLED: {{ ternary "true" "false" .Values.canvas.livePreview.viewer.enabled | quote }}
+  CANVAS_VIEWER_DEPLOYMENT_PROFILE: {{ .Values.canvas.livePreview.viewer.deploymentProfile | quote }}
+  CANVAS_VIEWER_COOKIE_MODE: {{ .Values.canvas.livePreview.viewer.cookieMode | quote }}
+  CANVAS_VIEWER_DOMAIN: {{ .Values.canvas.livePreview.viewer.domain | quote }}
+  CANVAS_VIEWER_HOST_SUFFIX: {{ .Values.canvas.livePreview.viewer.hostSuffix | quote }}
+  CANVAS_VIEWER_COCKPIT_ORIGINS: {{ join "," .Values.canvas.livePreview.viewer.cockpitOrigins | quote }}
+  CANVAS_VIEWER_RAW_PATH_VERIFIED: {{ ternary "true" "false" .Values.canvas.livePreview.viewer.rawPathVerified | quote }}
+  CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED: {{ ternary "true" "false" .Values.canvas.livePreview.viewer.pslBoundaryVerified | quote }}
+  CANVAS_VIEWER_SESSION_TTL_SECONDS: {{ .Values.canvas.livePreview.viewer.sessionTtlSeconds | int | quote }}
+  CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS: {{ .Values.canvas.livePreview.viewer.bootstrapTtlSeconds | int | quote }}
+  CANVAS_VIEWER_ATTACHMENT_TTL_SECONDS: {{ .Values.canvas.livePreview.viewer.attachmentTtlSeconds | int | quote }}
+  CANVAS_VIEWER_REVALIDATE_SECONDS: {{ .Values.canvas.livePreview.viewer.revalidateSeconds | int | quote }}
+  CANVAS_VIEWER_MAX_CONNECTIONS: {{ .Values.canvas.livePreview.viewer.limits.maxConnections | int | quote }}
+  CANVAS_VIEWER_MAX_HTTP_PER_SESSION: {{ .Values.canvas.livePreview.viewer.limits.maxHttpPerSession | int | quote }}
+  CANVAS_VIEWER_MAX_HEADER_BYTES: {{ .Values.canvas.livePreview.viewer.limits.maxHeaderBytes | int | quote }}
+  CANVAS_VIEWER_MAX_HEADER_FIELDS: {{ .Values.canvas.livePreview.viewer.limits.maxHeaderFields | int | quote }}
+  CANVAS_VIEWER_MAX_QUERY_BYTES: {{ .Values.canvas.livePreview.viewer.limits.maxQueryBytes | int | quote }}
+  CANVAS_VIEWER_MAX_QUERY_FIELDS: {{ .Values.canvas.livePreview.viewer.limits.maxQueryFields | int | quote }}
+  CANVAS_VIEWER_MAX_REQUEST_BODY_BYTES: {{ .Values.canvas.livePreview.viewer.limits.maxRequestBodyBytes | int | quote }}
+  CANVAS_VIEWER_MAX_RESPONSE_BODY_BYTES: {{ .Values.canvas.livePreview.viewer.limits.maxResponseBodyBytes | int | quote }}
+  CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS: {{ .Values.canvas.livePreview.viewer.limits.connectTimeoutSeconds | int | quote }}
+  CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS: {{ .Values.canvas.livePreview.viewer.limits.idleTimeoutSeconds | int | quote }}
+  CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS: {{ .Values.canvas.livePreview.viewer.limits.exchangeTimeoutSeconds | int | quote }}
   # Effective context ceiling for models routed via the system codex proxy
   # (CLIProxyAPI / ChatGPT-OAuth backend), which caps context far below the
   # models' true API windows and rejects larger inputs with `context_too_large`.

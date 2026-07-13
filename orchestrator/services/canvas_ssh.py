@@ -27,12 +27,26 @@ logger = logging.getLogger(__name__)
 
 CANVAS_LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_SSH_IDLE_TIMEOUT_SECONDS = 60.0
+DEFAULT_SSH_CLOSE_TIMEOUT_SECONDS = 5.0
 # A truthy, explicitly empty KnownHostsResult. Falsy values can make AsyncSSH
 # consult the process user's default known_hosts file, which is not Canvas
 # authority for a workspace generation.
 EMPTY_KNOWN_HOSTS = ((), (), (), (), (), (), ())
 
 GenerationResolver = Callable[[], Awaitable[dict[str, Any]]]
+
+
+async def _bounded_wait_closed(resource: Any) -> None:
+    wait_closed = getattr(resource, "wait_closed", None)
+    if not callable(wait_closed):
+        return
+    try:
+        async with asyncio.timeout(DEFAULT_SSH_CLOSE_TIMEOUT_SECONDS):
+            await wait_closed()
+    except TimeoutError:
+        logger.warning("Canvas SSH resource close timed out")
+    except Exception:
+        logger.debug("Canvas SSH resource close failed", exc_info=True)
 
 
 class CanvasSSHError(Exception):
@@ -258,8 +272,7 @@ class PinnedSSHTransportPool:
             entry.idle_handle.cancel()
             entry.idle_handle = None
         entry.connection.close()
-        with suppress(Exception):
-            await entry.connection.wait_closed()
+        await _bounded_wait_closed(entry.connection)
 
     def _cancel_idle(self, entry: _PooledSSHTransport) -> None:
         if entry.idle_handle is not None:
@@ -321,14 +334,12 @@ class PinnedSSHTransportPool:
         except asyncio.CancelledError:
             if connection is not None:
                 connection.close()
-                with suppress(Exception):
-                    await connection.wait_closed()
+                await _bounded_wait_closed(connection)
             raise
         except Exception as exc:
             if connection is not None:
                 connection.close()
-                with suppress(Exception):
-                    await connection.wait_closed()
+                await _bounded_wait_closed(connection)
             raise CanvasSSHError(
                 503,
                 "workspace_unavailable",
@@ -515,10 +526,7 @@ class PinnedSSHTransportPool:
                 yield reader, writer
             finally:
                 writer.close()
-                wait_closed = getattr(writer, "wait_closed", None)
-                if callable(wait_closed):
-                    with suppress(Exception):
-                        await wait_closed()
+                await _bounded_wait_closed(writer)
 
     async def evict_thread(self, thread_id: str) -> None:
         """Close every pooled transport/channel belonging to one thread."""
@@ -608,7 +616,7 @@ class PinnedSFTPPool:
             finally:
                 with suppress(Exception):
                     sftp.exit()
-                    await sftp.wait_closed()
+                await _bounded_wait_closed(sftp)
 
     async def evict_thread(self, thread_id: str) -> None:
         await self._transport_pool.evict_thread(thread_id)

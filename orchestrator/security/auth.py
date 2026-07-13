@@ -679,7 +679,7 @@ async def cleanup_expired_tokens(db, shutdown_event: asyncio.Event) -> None:
 
 
 async def cleanup_expired_sessions(db, shutdown_event: asyncio.Event) -> None:
-    """Background task: prune dead BFF session rows and consumed pre-auth state.
+    """Prune dead BFF, pre-auth, and dependent Canvas viewer state.
 
     Hourly cadence matches cleanup_expired_tokens. Idle-timeout enforcement
     is handled by the per-request validator; this loop only removes rows
@@ -690,7 +690,15 @@ async def cleanup_expired_sessions(db, shutdown_event: asyncio.Event) -> None:
         try:
             await db.cleanup_expired_srw_sessions()
             await db.cleanup_expired_srw_pre_auth()
-            logger.debug("Expired BFF sessions / pre-auth state cleanup completed")
+            # Lazy import keeps the core authentication dependency direction
+            # unchanged. Viewer cleanup is safe while the feature is disabled:
+            # it removes only already-expired hashed credentials/presence rows.
+            from services.canvas_viewer_sessions import CanvasViewerSessionService
+
+            await CanvasViewerSessionService(db).cleanup()
+            logger.debug(
+                "Expired BFF sessions / pre-auth / Canvas viewer cleanup completed"
+            )
         except Exception as e:
             logger.error("Error cleaning up BFF sessions: %s", e)
 

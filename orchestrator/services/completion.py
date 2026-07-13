@@ -330,6 +330,47 @@ def is_teardown_infra_error(message: str | None) -> bool:
     return any(pattern in low for pattern in _TEARDOWN_ERROR_PATTERNS)
 
 
+def classify_workspace_death(
+    termination: dict[str, Any] | None,
+) -> tuple[str, bool]:
+    """Human cause + is-resource-kill flag from a workspace pod's terminated
+    state (the dict from ``ContainerProvisioner.get_last_termination``).
+
+    The bool is the escalation signal: a resource kill (OOM / node-pressure
+    eviction) means "retry bigger", not "re-dispatch into the same grave". We
+    only assert a resource kill on positive evidence — a pod already gone before
+    we could read it stays ``False`` (no evidence), so we never fabricate an OOM.
+    See docs/features/workspace_resource_pressure_resilience.md.
+    """
+    if not termination:
+        return (
+            "workspace pod gone before its termination cause could be read",
+            False,
+        )
+    container_reason = termination.get("container_reason") or ""
+    pod_reason = termination.get("pod_reason") or ""
+    exit_code = termination.get("exit_code")
+    if container_reason == "OOMKilled":
+        return ("workspace ran out of memory (OOMKilled)", True)
+    if pod_reason == "Evicted":
+        return ("workspace evicted under node resource pressure", True)
+    if exit_code == 137:
+        # 137 = 128 + SIGKILL. A workspace pod has no liveness probe to SIGKILL
+        # it, so a bare 137 without an OOMKilled reason is still almost always
+        # memory pressure (the kernel can drop the reason when the node is under
+        # duress). Flag as a likely resource kill — hedged wording, not a claim.
+        return (
+            "workspace process killed (SIGKILL/137) — likely memory pressure",
+            True,
+        )
+    if container_reason:
+        detail = f"workspace container terminated: {container_reason}"
+        if exit_code is not None:
+            detail += f" (exit {exit_code})"
+        return (detail, False)
+    return ("workspace became unavailable (no terminated-container record)", False)
+
+
 def auto_continue_drain_update(
     context: dict[str, Any], freeze_data: dict[str, Any], *, cap: int
 ) -> tuple[int, Any, bool]:

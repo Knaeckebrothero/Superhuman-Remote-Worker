@@ -71,7 +71,9 @@ export class CanvasContentController {
       return;
     }
 
-    if (renderer === 'unsupported' || !sourceKey || !visualKey) {
+    // Live apps own an attachment/session lifecycle, not file bytes. Keep this
+    // controller file-only so it never treats a viewer bootstrap as content.
+    if (renderer === 'app' || renderer === 'unsupported' || !sourceKey || !visualKey) {
       this.clearVisual();
       return;
     }

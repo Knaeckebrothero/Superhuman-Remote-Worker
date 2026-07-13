@@ -10,10 +10,11 @@ name: db-migrations
 #                    applied history: those files can't be edited (the runner's
 #                    checksum guard rejects drift), so their findings are
 #                    unactionable and would keep the job permanently red.
-#   2. dry-run     — apply every migration from zero to a fresh
-#                    pgvector/pgvector:pg15 service container (transactional
-#                    pass rolls back; non-tx migrations are skipped under
-#                    --dry-run)
+#   2. dry-run     — dry-run every migration, then really apply the app chain
+#                    and exercise the Canvas viewer credential lifecycle on a
+#                    fresh pgvector/pgvector:pg15 service container (transactional
+#                    dry-run pass rolls back; non-tx migrations are skipped
+#                    under --dry-run and included in the real apply)
 #   3. artifact    — regenerate the *_current.sql schema artifacts (real apply,
 #                    all three families) and fail if they drift from committed
 #   4. uniqueness  — refuse duplicate NNNN_ prefixes within each migrations
@@ -28,6 +29,8 @@ on:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
       - 'orchestrator/database/*_current.sql'
+      - 'orchestrator/services/canvas*.py'
+      - 'tests/test_canvas_viewer_postgres_integration.py'
       - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
       - '.squawk.toml'
@@ -36,6 +39,8 @@ on:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
       - 'orchestrator/database/*_current.sql'
+      - 'orchestrator/services/canvas*.py'
+      - 'tests/test_canvas_viewer_postgres_integration.py'
       - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
       - '.squawk.toml'
@@ -139,7 +144,7 @@ jobs:
           python-version: '3.12'
       # asyncpg drives the runner; cryptography is pulled in transitively
       # via security.crypto (AESGCM) when database/__init__.py loads postgres.py.
-      - run: pip install --quiet asyncpg cryptography
+      - run: pip install --quiet asyncpg cryptography 'pydantic>=2.10' pytest pytest-asyncio
       - name: Create the vector database
         env:
           PGPASSWORD: ci
@@ -168,6 +173,16 @@ jobs:
           python -m database.migrate \
             --dir database/migrations/vector \
             --dry-run
+      - name: Apply app migrations for Canvas viewer lifecycle test
+        working-directory: orchestrator
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
+        run: python -m database.migrate --dir database/migrations/app
+      - name: Exercise Canvas viewer lifecycle against PostgreSQL
+        env:
+          CANVAS_TEST_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
+          PYTHONPATH: orchestrator:.
+        run: pytest -q tests/test_canvas_viewer_postgres_integration.py
 
   artifact:
     # The keystone drift gate (HF-1): regenerate the canonical *_current.sql

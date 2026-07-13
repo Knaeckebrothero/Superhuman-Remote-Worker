@@ -84,6 +84,7 @@
       "text": "Text",
       "html": "Static HTML",
       "image": "Image",
+      "app": "Live app",
       "unsupported": "Unsupported source"
     },
     "status": {
@@ -106,6 +107,14 @@
     },
     "html": {
       "frameTitle": "Static Canvas preview: {{title}}"
+    },
+    "app": {
+      "source": "Workspace application",
+      "frameTitle": "Live Canvas application: {{title}}",
+      "untrustedWarning": "Untrusted app — do not enter passwords or secrets.",
+      "connecting": "Connecting to the isolated Canvas application…",
+      "renewing": "Refreshing the secure Canvas connection…",
+      "unavailable": "The isolated Canvas application could not be opened."
     },
     "editor": {
       "label": "Canvas source editor",

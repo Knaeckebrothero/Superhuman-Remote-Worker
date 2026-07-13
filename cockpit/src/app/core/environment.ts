@@ -15,6 +15,9 @@ const getEnvOrNull = (key: string): string | null => {
 export const environment = {
   // Core
   apiUrl: getEnv('apiUrl', 'http://localhost:8085/api'),
+  // Isolated Dynamic Canvas viewer suffix (for example
+  // `.canvas.example-userland.com`). Null keeps live apps dark-shipped.
+  canvasViewerHostSuffix: getEnvOrNull('canvasViewerHostSuffix'),
 
   // External tools
   giteaUrl: getEnv('giteaUrl', 'http://localhost:3000/srw'),

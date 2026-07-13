@@ -5,6 +5,7 @@
 # stays reproducible and off the advisory. See top-level requirements.txt for detail.
 fastapi>=0.115.0,!=0.136.3
 uvicorn[standard]>=0.34.0
+h11>=0.16.0
 asyncpg>=0.30.0
 # pgvector registers the asyncpg vector codec (postgres.py connection init).
 # Without it the registration silently no-ops and every orchestrator-side
