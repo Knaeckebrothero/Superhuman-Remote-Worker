@@ -3195,6 +3195,33 @@ def _object_store_startup_warning(
     )
 
 
+def _check_object_store_config(
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """Warn (return the message) or fail-closed (raise) on an incomplete
+    object-store config.
+
+    Default (``OBJECT_STORE_REQUIRED`` unset/falsey) is warn-only, matching the
+    platform's degrade-open convention. When ``OBJECT_STORE_REQUIRED`` is set
+    (``true``/``1``/``yes``) and either seam lacks a durable store, raises
+    ``RuntimeError`` so the orchestrator refuses to start — crash-looping until
+    the operator fixes it — for deployments that prefer fail-closed over silent
+    degradation. Returns None when both seams have a durable store.
+    """
+    env = os.environ if env is None else env
+    msg = _object_store_startup_warning(env)
+    if msg and (env.get("OBJECT_STORE_REQUIRED") or "").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    ):
+        raise RuntimeError(
+            msg + " OBJECT_STORE_REQUIRED is set, so the orchestrator refuses "
+            "to start with an incomplete object-store config."
+        )
+    return msg
+
+
 def _inject_lite_workspace_config(
     config_override: Optional[dict[str, Any]], *, prefix: str
 ) -> Optional[dict[str, Any]]:
@@ -6356,10 +6383,11 @@ async def lifespan(app: FastAPI):
     # Initialize S3 snapshot service (graceful if S3 not configured)
     await snapshot_service.connect(db=postgres_db)
 
-    # One loud, early signal when the deployment has NO object store at all,
-    # replacing the scattered late failures (virtual-session dispatch,
-    # snapshot no-ops). docs/issues/s3_object_store_bundled_fallback.md item 3.
-    _store_warning = _object_store_startup_warning()
+    # One loud, early signal when either object-store seam is unconfigured,
+    # replacing the scattered late failures (virtual-session dispatch, snapshot
+    # no-ops). Fail-closed (raise, crash-loop) when OBJECT_STORE_REQUIRED is
+    # set; warn-only otherwise. docs/issues/s3_object_store_bundled_fallback.md.
+    _store_warning = _check_object_store_config()
     if _store_warning:
         logger.warning(_store_warning)
 

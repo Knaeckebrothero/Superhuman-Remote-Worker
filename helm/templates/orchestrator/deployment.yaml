@@ -731,6 +731,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SNAPSHOT_RETENTION_DAYS
+            # Opt-in fail-closed object-store policy (read at lifespan startup).
+            - name: OBJECT_STORE_REQUIRED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OBJECT_STORE_REQUIRED
             # IDE sessions
             - name: IDE_SESSION_IDLE_TIMEOUT
               valueFrom:
