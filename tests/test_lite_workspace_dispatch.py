@@ -326,38 +326,73 @@ class TestLiteSubjobGating:
 # so it is testable without a live lifespan.
 # ---------------------------------------------------------------------------
 class TestObjectStoreStartupWarning:
-    def test_warns_when_no_store_at_all(self):
-        msg = main._object_store_startup_warning({})
-        assert msg is not None
-        assert "No object store configured" in msg
-        # names the sharp default-session breakage + the fixes
-        assert "LiteWorkspaceConfigError" in msg
-        assert "snapshots" in msg
-        assert "garage.enabled=true" in msg
-        assert "docs/issues/s3_object_store_bundled_fallback.md" in msg
+    """Warn if EITHER seam is unconfigured; the two almost always point at the
+    same store, so a half-config is usually a mistake and (virtual being the
+    default session backend) a snapshots-only config silently breaks the
+    default UX. Silent only when BOTH have a durable store."""
 
-    def test_silent_when_snapshot_s3_endpoint_set(self):
+    def test_silent_only_when_both_seams_configured(self):
         assert (
             main._object_store_startup_warning(
-                {"S3_ENDPOINT": "http://minio.minio.svc:9000"}
+                {
+                    "S3_ENDPOINT": "http://minio.minio.svc:9000",
+                    "VIRTUAL_WORKSPACE_RCLONE_TYPE": "s3",
+                }
             )
             is None
         )
 
-    def test_silent_when_virtual_tier_is_durable_s3(self):
-        assert (
-            main._object_store_startup_warning({"VIRTUAL_WORKSPACE_RCLONE_TYPE": "s3"})
-            is None
-        )
+    def test_warns_when_no_store_at_all(self):
+        msg = main._object_store_startup_warning({})
+        assert msg is not None
+        assert "LiteWorkspaceConfigError" in msg  # virtual bullet
+        assert "snapshots" in msg.lower()  # snapshot bullet
+        assert "garage.enabled=true" in msg
+        assert "docs/issues/s3_object_store_bundled_fallback.md" in msg
 
-    def test_memory_store_warns_but_flags_non_durable(self):
-        # "memory" makes virtual sessions work but ephemerally, and snapshots
-        # are still off — so it still warns, and says the sessions are not durable.
+    def test_warns_about_virtual_when_only_snapshots_configured(self):
+        # S3_ENDPOINT set (snapshots OK) but the virtual tier is unconfigured —
+        # warn about the virtual tier ONLY, don't claim snapshots are disabled.
+        msg = main._object_store_startup_warning({"S3_ENDPOINT": "http://minio:9000"})
+        assert msg is not None
+        assert "LiteWorkspaceConfigError" in msg
+        assert "snapshots" not in msg.lower()
+
+    def test_warns_about_snapshots_when_only_virtual_configured(self):
+        # Durable virtual store but no S3_ENDPOINT — warn about snapshots ONLY,
+        # don't claim virtual sessions fail.
+        msg = main._object_store_startup_warning(
+            {"VIRTUAL_WORKSPACE_RCLONE_TYPE": "s3"}
+        )
+        assert msg is not None
+        assert "snapshots" in msg.lower()
+        assert "LiteWorkspaceConfigError" not in msg
+
+    def test_memory_store_flagged_non_durable(self):
         msg = main._object_store_startup_warning(
             {"VIRTUAL_WORKSPACE_RCLONE_TYPE": "memory"}
         )
         assert msg is not None
         assert "non-durable" in msg.lower()
+        assert "snapshots" in msg.lower()  # snapshots still unconfigured here
 
-    def test_whitespace_s3_endpoint_is_treated_as_empty(self):
-        assert main._object_store_startup_warning({"S3_ENDPOINT": "   "}) is not None
+    def test_memory_with_snapshots_flags_only_non_durable(self):
+        # Snapshots configured + memory virtual — warn only about the non-durable
+        # virtual store, not about snapshots.
+        msg = main._object_store_startup_warning(
+            {
+                "S3_ENDPOINT": "http://minio:9000",
+                "VIRTUAL_WORKSPACE_RCLONE_TYPE": "memory",
+            }
+        )
+        assert msg is not None
+        assert "non-durable" in msg.lower()
+        assert "snapshots" not in msg.lower()
+
+    def test_whitespace_values_treated_as_empty(self):
+        assert (
+            main._object_store_startup_warning(
+                {"S3_ENDPOINT": "   ", "VIRTUAL_WORKSPACE_RCLONE_TYPE": "  "}
+            )
+            is not None
+        )
