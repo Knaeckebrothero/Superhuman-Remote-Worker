@@ -174,7 +174,7 @@ import {ViewportService} from '../../core/services/viewport.service';
 
     .btn-primary {
       background: var(--accent-color, var(--accent-color));
-      color: var(--on-accent, var(--timeline-bg, #11111b));
+      color: var(--on-accent, var(--timeline-bg));
       border-color: var(--accent-color, var(--accent-color));
       font-weight: 600;
     }

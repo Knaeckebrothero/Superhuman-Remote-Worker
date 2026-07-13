@@ -50,9 +50,9 @@ import {ViewModeService} from '../../core/services/view-mode.service';
         align-items: center;
         gap: 10px;
         padding: 8px 16px;
-        /* Use the theme warning tokens. The previous hardcoded #f9e2af is a
-           dark-theme amber and rendered near-invisible (~1.1:1) on light
-           themes, where --warn-color is undefined. */
+        /* Use the theme warning tokens. The previous hardcoded Catppuccin
+           amber fallback rendered near-invisible (~1.1:1) on light themes,
+           where --warn-color is undefined. */
         background: var(--warning-tint);
         border-bottom: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
         /* Mix toward the theme text color so the amber clears WCAG AA (4.5:1)

@@ -171,7 +171,7 @@ const STORAGE_KEYS = {
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       margin-bottom: 12px;
       padding-bottom: 6px;
       border-bottom: 1px solid var(--border-color, var(--surface-0));
@@ -224,7 +224,7 @@ const STORAGE_KEYS = {
       border: none;
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
     }
@@ -241,7 +241,7 @@ const STORAGE_KEYS = {
       border-radius: var(--radius-control);
       background: var(--surface-1, rgba(255, 255, 255, 0.04));
       border-left: 2px solid var(--warning, #f5a623);
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary);
       font-size: 12px;
       line-height: 1.4;
     }

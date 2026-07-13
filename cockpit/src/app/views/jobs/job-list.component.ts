@@ -513,7 +513,7 @@ interface JobRow {
         align-items: center;
         gap: 12px;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
         flex-wrap: wrap;
@@ -569,7 +569,7 @@ interface JobRow {
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex: 1;
       }
 
@@ -600,7 +600,7 @@ interface JobRow {
         text-align: left;
         padding: 10px 12px;
         background: var(--surface-0, var(--surface-0));
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-weight: 500;
         text-transform: uppercase;
         font-size: 10px;
@@ -645,10 +645,10 @@ interface JobRow {
       }
 
       .expand-btn {
-        background: rgba(127, 132, 156, 0.1);
-        border: 1px solid rgba(127, 132, 156, 0.25);
+        background: color-mix(in srgb, var(--text-muted) 10%, transparent);
+        border: 1px solid color-mix(in srgb, var(--text-muted) 25%, transparent);
         border-radius: var(--radius-control);
-        color: var(--text-muted, #7f849c);
+        color: var(--text-muted);
         cursor: pointer;
         padding: 2px;
         width: 22px;
@@ -662,8 +662,8 @@ interface JobRow {
 
       .expand-btn:hover {
         color: var(--text-primary, var(--text-primary));
-        background: rgba(127, 132, 156, 0.2);
-        border-color: rgba(127, 132, 156, 0.4);
+        background: color-mix(in srgb, var(--text-muted) 20%, transparent);
+        border-color: color-mix(in srgb, var(--text-muted) 40%, transparent);
       }
 
       .expand-chevron {
@@ -679,7 +679,7 @@ interface JobRow {
       }
 
       .child-connector {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
         opacity: 0.5;
         flex-shrink: 0;
@@ -769,7 +769,7 @@ interface JobRow {
       .job-id {
         font-family: 'JetBrains Mono', monospace;
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -778,7 +778,7 @@ interface JobRow {
       .job-error {
         margin-top: 3px;
         font-size: 10px;
-        color: var(--danger, #f38ba8);
+        color: var(--danger);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -799,14 +799,14 @@ interface JobRow {
       }
 
       .project-name.empty {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Created Cell */
       .created-cell {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Actions */
@@ -835,7 +835,7 @@ interface JobRow {
 
       .job-count {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .promote-row td {

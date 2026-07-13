@@ -233,8 +233,8 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         flex-direction: column;
         width: 200px;
         height: 100%;
-        background: var(--panel-bg, #181825);
-        border-right: 1px solid var(--border-color, #313244);
+        background: var(--panel-bg);
+        border-right: 1px solid var(--border-color);
       }
 
       .sidebar-header {
@@ -242,7 +242,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         align-items: center;
         gap: 8px;
         padding: 16px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
       }
 
@@ -250,7 +250,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         display: flex;
         align-items: center;
         gap: 10px;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color);
       }
 
       .sidebar-brand-stack {
@@ -264,7 +264,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         font-family: var(--font-display, inherit);
         font-size: 18px;
         font-weight: 700;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color);
         letter-spacing: 1px;
       }
 
@@ -273,7 +273,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         font-size: 11px;
         letter-spacing: 0.18em;
         text-transform: uppercase;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .collapse-btn {
@@ -286,7 +286,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         background: transparent;
         border: none;
         border-radius: var(--radius-control);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         cursor: pointer;
         padding: 0;
         transition:
@@ -295,8 +295,8 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
       }
 
       .collapse-btn:hover {
-        color: var(--text-primary, #cdd6f4);
-        background: var(--surface-0, #313244);
+        color: var(--text-primary);
+        background: var(--surface-0);
       }
 
 
@@ -304,7 +304,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         flex: 1;
         overflow-y: auto;
         scrollbar-width: thin;
-        scrollbar-color: var(--border-color, #313244) transparent;
+        scrollbar-color: var(--border-color) transparent;
       }
 
       .sidebar-nav {
@@ -320,7 +320,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         gap: 10px;
         padding: 8px 12px;
         border-radius: var(--radius-control);
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         text-decoration: none;
         font-size: 13px;
         transition:
@@ -329,13 +329,13 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
       }
 
       .nav-link:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .nav-link.active {
-        background: var(--surface-0, #313244);
-        color: var(--accent-color, #cba6f7);
+        background: var(--surface-0);
+        color: var(--accent-color);
       }
 
       /* Mobile drawer sizing: the 200px/13px desktop rail reads cramped as an
@@ -397,7 +397,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
 
       .section {
         padding: 8px;
-        border-top: 1px solid var(--border-color, #313244);
+        border-top: 1px solid var(--border-color);
       }
 
       .section-title {
@@ -405,7 +405,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 1px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         padding: 4px 8px 6px;
         margin: 0;
       }
@@ -416,7 +416,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         gap: 8px;
         padding: 6px 12px;
         border-radius: var(--radius-control);
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         text-decoration: none;
         font-size: 12px;
         cursor: pointer;
@@ -431,8 +431,8 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
       }
 
       .section-link:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .link-icon {
@@ -446,7 +446,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
 
       .sidebar-footer {
         padding: 12px;
-        border-top: 1px solid var(--border-color, #313244);
+        border-top: 1px solid var(--border-color);
         display: flex;
         flex-direction: column;
         gap: 8px;
@@ -468,13 +468,13 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         justify-content: center;
         font-size: 11px;
         font-weight: 600;
-        color: var(--timeline-bg, #11111b);
+        color: var(--timeline-bg);
         flex-shrink: 0;
       }
 
       .user-name {
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -493,15 +493,15 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         width: 30px;
         height: 30px;
         border-radius: var(--radius-control);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         text-decoration: none;
         transition: color 0.15s ease, background 0.15s ease;
       }
 
       .footer-link:hover,
       .footer-link.active {
-        color: var(--accent-color, #cba6f7);
-        background: var(--surface-0, #313244);
+        color: var(--accent-color);
+        background: var(--surface-0);
       }
 
       .footer-link .nav-icon {
@@ -512,9 +512,9 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         flex: 1;
         padding: 6px 12px;
         background: transparent;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
         font-family: inherit;
         cursor: pointer;
@@ -524,8 +524,8 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
       }
 
       .logout-button:hover {
-        color: var(--accent-color, #cba6f7);
-        border-color: var(--accent-color, #cba6f7);
+        color: var(--accent-color);
+        border-color: var(--accent-color);
       }
     `,
   ],

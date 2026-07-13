@@ -166,7 +166,7 @@ import {
         align-items: center;
         justify-content: space-between;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -219,7 +219,7 @@ import {
         padding: 2px 8px;
         border-radius: var(--radius-pill);
         background: var(--danger);
-        color: var(--on-danger, var(--timeline-bg, #11111b));
+        color: var(--on-danger, var(--timeline-bg));
         font-size: 11px;
         font-weight: 600;
       }

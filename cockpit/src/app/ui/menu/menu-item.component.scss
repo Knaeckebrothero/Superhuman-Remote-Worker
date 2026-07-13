@@ -23,11 +23,11 @@
   }
 
   &[data-tone='danger'] {
-    color: var(--danger, #f38ba8);
+    color: var(--danger);
 
     &:hover:not([data-disabled]),
     &:focus-visible:not([data-disabled]) {
-      background: var(--danger-tint, rgb(243, 139, 168, 0.12));
+      background: var(--danger-tint);
     }
   }
 

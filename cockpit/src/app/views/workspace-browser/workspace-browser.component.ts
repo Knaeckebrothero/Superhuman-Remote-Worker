@@ -149,7 +149,7 @@ interface RepoEntry {
         align-items: center;
         gap: 8px;
         padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
+        background: var(--panel-header-bg);
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
@@ -168,7 +168,7 @@ interface RepoEntry {
         align-items: center;
         justify-content: center;
         flex: 1;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
       }
 
@@ -206,7 +206,7 @@ interface RepoEntry {
         border: none;
         border-radius: var(--radius-tag);
         background: transparent;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -222,7 +222,7 @@ interface RepoEntry {
       }
 
       .crumb-sep {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         opacity: 0.5;
       }
 
@@ -274,13 +274,13 @@ interface RepoEntry {
         flex-shrink: 0;
         font-size: 10px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .empty-dir {
         padding: 20px 12px;
         text-align: center;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
       }
 
@@ -297,7 +297,7 @@ interface RepoEntry {
         align-items: center;
         justify-content: center;
         flex: 1;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 12px;
       }
 
@@ -323,7 +323,7 @@ interface RepoEntry {
       .file-size {
         font-family: 'JetBrains Mono', monospace;
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex-shrink: 0;
         margin-left: 12px;
       }
@@ -356,7 +356,7 @@ interface RepoEntry {
         align-items: center;
         gap: 8px;
         padding: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
       }
 
