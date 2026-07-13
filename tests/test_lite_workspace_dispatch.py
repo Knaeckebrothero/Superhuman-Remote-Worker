@@ -317,3 +317,47 @@ class TestLiteSubjobGating:
     def test_json_string_override(self):
         assert main._is_lite_config_override('{"workspace": {"backend": "none"}}')
         assert not main._is_lite_config_override("not json at all")
+
+
+# ---------------------------------------------------------------------------
+# _object_store_startup_warning — one loud, early signal when the deployment
+# has NO object store at all (docs/issues/s3_object_store_bundled_fallback.md
+# item 3). Reads the same env the features read; returns the message (or None)
+# so it is testable without a live lifespan.
+# ---------------------------------------------------------------------------
+class TestObjectStoreStartupWarning:
+    def test_warns_when_no_store_at_all(self):
+        msg = main._object_store_startup_warning({})
+        assert msg is not None
+        assert "No object store configured" in msg
+        # names the sharp default-session breakage + the fixes
+        assert "LiteWorkspaceConfigError" in msg
+        assert "snapshots" in msg
+        assert "garage.enabled=true" in msg
+        assert "docs/issues/s3_object_store_bundled_fallback.md" in msg
+
+    def test_silent_when_snapshot_s3_endpoint_set(self):
+        assert (
+            main._object_store_startup_warning(
+                {"S3_ENDPOINT": "http://minio.minio.svc:9000"}
+            )
+            is None
+        )
+
+    def test_silent_when_virtual_tier_is_durable_s3(self):
+        assert (
+            main._object_store_startup_warning({"VIRTUAL_WORKSPACE_RCLONE_TYPE": "s3"})
+            is None
+        )
+
+    def test_memory_store_warns_but_flags_non_durable(self):
+        # "memory" makes virtual sessions work but ephemerally, and snapshots
+        # are still off — so it still warns, and says the sessions are not durable.
+        msg = main._object_store_startup_warning(
+            {"VIRTUAL_WORKSPACE_RCLONE_TYPE": "memory"}
+        )
+        assert msg is not None
+        assert "non-durable" in msg.lower()
+
+    def test_whitespace_s3_endpoint_is_treated_as_empty(self):
+        assert main._object_store_startup_warning({"S3_ENDPOINT": "   "}) is not None
