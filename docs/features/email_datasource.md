@@ -12,7 +12,11 @@ Design document for adding `email` as a datasource type so users can attach a ma
 to projects and jobs with tiered access: read-only, read/write, draft-only composition,
 and (gated) send.
 
-> **Status (2026-07-11): PROPOSED.** No implementation yet.
+> **Status (2026-07-12): PROPOSED.** No implementation yet. Reconciled against the
+> datasource changes on develop @ `f50a1039`: the `config jsonb` column (migration `0055`,
+> shipped for OKF `kb`) means **no email migration is needed**; the new `read_only` publish
+> flag (`0056`) and grant-gated publishing (`public_datasources.md`) drive the
+> email-is-never-published rule below.
 
 ## Motivation
 
@@ -108,11 +112,13 @@ snippet, and file pointers. Attachments are never inlined into context.
 
 ### Data model
 
-No new table. One datasource row = one mailbox account.
+No new table **and no new migration** — one datasource row = one mailbox account, on
+columns that already exist.
 
 - `datasources.type = 'email'` (type is `text`; whitelist lives in the API layer,
-  `orchestrator/main.py:4940`).
-- **Secrets** stay in `credentials` (encrypted):
+  `orchestrator/main.py:5209` — currently `generic, repository, kb, postgresql, neo4j,
+  mongodb, webdav, kubeconfig, ssh_key, generic_file`).
+- **Secrets** stay in `credentials` (encrypted at rest, per [[credential_file_datasources]]):
 
 ```json
 {
@@ -124,11 +130,9 @@ No new table. One datasource row = one mailbox account.
 }
 ```
 
-- **Non-secret scoping config** must be readable/editable in the UI without round-tripping
-  secrets, so it does not belong in `credentials`. New migration
-  `orchestrator/database/migrations/app/00XX_datasource_config.sql` adds
-  `config jsonb NOT NULL DEFAULT '{}'` to `datasources` (generic — future connector types
-  get non-secret settings for free):
+- **Non-secret scoping** goes in the **existing `config jsonb` column** (migration
+  `0055_datasource_config.sql`, landed 2026-07-11 for OKF `kb` datasources, which store
+  `config.root_path`). No email-specific migration is required:
 
 ```json
 {
@@ -141,6 +145,28 @@ No new table. One datasource row = one mailbox account.
 
 Folder matching: exact name or subtree (`AI` also allows `AI/…`). SMTP block optional —
 omitted unless tier is `send`.
+
+#### Three "read-only" axes — do not conflate
+
+The datasource system now carries three independent read-only-ish concepts. The email
+tier is the *first* one; the doc names all three so implementation doesn't cross wires:
+
+| Concept | Where | Meaning for email |
+|---------|-------|-------------------|
+| `config.access` (this feature) | `config` jsonb | The tier: `read`/`read_write`/`draft`/`send`. **Tool-layer enforced.** |
+| `datasources.read_only` | column, migration `0056` | Declarative **publish** flag for `is_global` org-wide rows; NULL for private. Surfaces in the agent index via `_declared_ro_note()` as "(declared read-only — treat as no-write)". Email is **never published** (see below), so this stays NULL. |
+| `project_read_only` | per-project link | Connector-mode switch on a project↔datasource link. For email it **clamps the tier down to `read`** (it must not empty credentials — see the managed-connector caveat in Touchpoints). |
+
+#### Publishing email is rejected
+
+`docs/features/public_datasources.md` (implemented 2026-07-12) establishes that a public
+(`is_global`) datasource hands the **publisher's stored credentials** to every other user's
+agent that attaches it. For a mailbox that means a third party's agent operating your inbox
+with your identity — categorically worse than a shared read-only database. Therefore
+`type='email'` **rejects `is_global=true`** at create/update (a typed guard mirroring the
+existing `kb`-specific guards at `main.py:15175`/`15198`/`15281`, inverted: `kb` is
+publish-friendly, `email` is publish-hostile). Email mailboxes are private, project- or
+job-scoped only.
 
 ### Tool surface
 
@@ -165,17 +191,26 @@ API, avoids hand-rolled `imaplib` state machines) + stdlib `smtplib`/`email.mess
 
 ### Touchpoints
 
+Line numbers are as of develop @ `f50a1039` and drift; anchor on the symbol. The OKF
+`kb` commit (`e27a9313`) is the most recent end-to-end datasource-type addition and is the
+better template than webdav for the *plumbing* touchpoints below (whitelist, `config`
+usage, cockpit per-type fields, i18n); webdav remains the template for the *tool module*.
+
 | Component | Change |
 |-----------|--------|
-| `orchestrator/database/migrations/app/` | `00XX_datasource_config.sql` (+ regen `schema_current.sql` via `scripts/schema-snapshot.sh` — CI gate) |
-| `orchestrator/main.py:4940` | Add `email` to the type whitelist; accept/validate `config` on create/update |
-| `orchestrator/main.py:14254` | Add `email` entry to the per-category read/write tool map (read = 4 read tools; write = all 8, clamped by tier) |
-| `orchestrator/main.py:14698` (`POST /api/datasources/{id}/test`) | IMAP login + verify each allowlisted folder exists (+ SMTP `EHLO`/auth if tier `send`) |
-| `src/core/datasource_setup.py` | `email` branch in the connection factory (~line 602 pattern); KB summary line (~line 905) listing allowed folders + tier so the agent knows its scope without probing |
-| `src/tools/email/` | New module per above |
-| `src/tools/registry.py` | Registry gate + metadata import (webdav precedent at `:462`) |
-| `cockpit` | `datasource-list.component.ts` form (host/port/security fields with provider presets for Gmail/Fastmail, folder allowlist chips, tier radio incl. app-password hint text); `api.model.ts` type |
-| `requirements.txt` (both) | `imap-tools` |
+| migrations | **None.** `config` (0055) and `read_only` (0056) already exist; latest pushed is `0057_cloud_ro_mounts_staging.sql`. No schema-snapshot regen needed. |
+| `orchestrator/main.py:5209` | Add `email` to the type whitelist; accept/validate `config` (`access`, `folders`, `drafts_folder`, `from_address`) on create/update |
+| `main.py` create/update (`~15175`–`15281`) | Add the `is_global`-rejection guard for `type='email'` (see "Publishing email is rejected") |
+| `main.py:14843` `managed_types` set | Add `email` **with a caveat**: the `if ds_type in managed_types and is_read_only: creds = {}` branch (`:14859`) empties creds for read-only managed connectors. Email needs a live IMAP connection even at `read` tier, so it must be exempt — its tier is driven by `config.access`, not by withholding creds. Simplest: don't empty creds for `email`; instead pass `config.access` (clamped by `project_read_only`) through to the tool factory. |
+| `main.py` per-category read/write tool map (`~14254`, webdav entry) | Add `email` entry (read = 4 read tools; write = all 8, then clamped by tier + `project_read_only`) |
+| `POST /api/datasources/{id}/test` (`~14698`) | IMAP login + verify each allowlisted folder exists (+ SMTP `EHLO`/auth if tier `send`). Same `managed_types` gate the endpoint already uses. |
+| `src/core/datasource_setup.py` | `email` branch in the connection factory (webdav pattern ~`:602`); datasource-index entry (`inject_datasource_index`, ~`:902`) listing tier + allowed folders, honoring `_declared_ro_note()` for consistency |
+| `src/tools/email/` | New tool module (webdav module shape) |
+| `src/tools/registry.py` | Registry gate + metadata import (webdav precedent `:462`) |
+| `cockpit/src/app/views/datasources/datasource-list.component.ts` | Add an `@if (formData.type === 'email')` field block — the per-type pattern the `kb`/`kubeconfig`/`ssh_key` blocks already established (this resolves the old open question). Fields: host/port/security with Gmail/Fastmail presets, folder-allowlist chips, tier radio, app-password hint |
+| `cockpit .../api.model.ts` | `email` type + config shape |
+| `cockpit/src/assets/i18n/en.json` + `de-DE.json` | Form labels/hints (OKF added ~20 lines each; email is the same shape) |
+| `requirements.txt` (both — see [[two_requirements_files]]) | `imap-tools` |
 
 ### Testing
 
@@ -190,10 +225,11 @@ API, avoids hand-rolled `imaplib` state machines) + stdlib `smtplib`/`email.mess
 
 ## Implementation roadmap
 
-1. **P0 — plumbing**: migration + schema snapshot, type whitelist, `config` handling,
-   test endpoint, cockpit form.
-2. **P1 — read tier**: connection factory, the four read tools, registry, KB summary,
-   unit tests, greenmail integration test.
+1. **P0 — plumbing** (no migration — `config` already exists): type whitelist, `config`
+   validation, `is_global` rejection, `managed_types` add + read-only-creds carve-out,
+   test endpoint, cockpit form + i18n.
+2. **P1 — read tier**: connection factory, the four read tools, registry, datasource-index
+   entry, unit tests, greenmail integration test.
 3. **P2 — write + draft tiers**: move/flag/draft tools. This is the end of the default
    product experience (`draft` = default tier).
 4. **P3 — send tier**: SMTP path + approval-gate wiring + the send/allowlist dispatch
@@ -204,8 +240,10 @@ API, avoids hand-rolled `imaplib` state machines) + stdlib `smtplib`/`email.mess
 
 ## Open questions
 
-- Does the cockpit datasource form currently support per-type dynamic fields cleanly, or
-  does the email form force the same refactor the credential-file types needed?
+- ~~Does the cockpit datasource form support per-type dynamic fields cleanly?~~
+  **Resolved (2026-07-12)**: the OKF `kb` commit (`e27a9313`) added `@if (formData.type
+  === '…')` field blocks for `kb`/`kubeconfig`/`ssh_key`/`generic_file`; email adds one
+  more of the same shape.
 - `email_read` output for HTML-only mail: ship text extraction v1 (html→text), or also
   save raw HTML alongside? (Proposal: save both, snippet from text.)
 - Should `email_list` surface `List-Unsubscribe`/bulk-mail heuristics to help agents skip

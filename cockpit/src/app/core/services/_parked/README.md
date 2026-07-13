@@ -7,8 +7,10 @@ via the `_parked/` glob, so they are never compiled, type-checked, or tested.
 They are the cockpit half of the now-removed **instruction builder** — the
 AI-driven artifact authoring that streamed `instructions` / `config` /
 `description` mutations into the job-create form. The builder was removed in the
-builder → sessions consolidation; this machinery is preserved verbatim because
-the **Dynamic Canvas** will reuse it.
+builder → sessions consolidation; this machinery is preserved verbatim as a
+reference for future structured job/expert draft actions that may be presented
+on the **Dynamic Canvas**. The pointer-based Canvas control plane itself does
+not reuse this deleted Builder session loop.
 
 ## Contents
 
@@ -24,9 +26,13 @@ the **Dynamic Canvas** will reuse it.
 
 ## Reuse
 
-The dynamic canvas plan copies `JobArtifactService.applyToolCall()` +
-`BuilderStreamService` into `CanvasService`. Import paths here were shifted one
-directory level (`../`) when parked — fix them on reuse.
+If a later structured `form` or `job-builder` canvas renderer revives these
+mutation patterns, treat them as design reference and port only the applicable
+state transitions into the shared application-action layer. Do not reconnect
+the deleted `/api/builder/...` SSE flow or copy it into the core Canvas service.
+Import paths here were shifted one directory level (`../`) when parked and the
+snapshot is intentionally outside compilation, so any reused code must be
+adapted and tested as new production code.
 
 See:
 
