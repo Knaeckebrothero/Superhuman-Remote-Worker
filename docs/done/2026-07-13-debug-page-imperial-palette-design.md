@@ -1,7 +1,7 @@
 # Debug page → Imperial palette (categorical ramp + full Catppuccin sweep)
 
 - **Date:** 2026-07-13
-- **Status:** Approved design, ready for implementation plan
+- **Status:** **Implemented** · 2026-07-13 · develop `764e0997..b33e2396` (10 commits; plan `e24713d5`). 966 cockpit specs green, `tsc -p tsconfig.app.json --noEmit` clean, both Catppuccin gates (hex + full-palette rgba) zero across `cockpit/src`. Live theme-flip eyeball of the Cytoscape graph on both themes still owed.
 - **Scope owner:** Cockpit frontend (`cockpit/src`)
 
 ## Problem
@@ -89,6 +89,16 @@ error/success/warning/deleted uses the existing semantic tokens, never the ramp:
 | heatmap `≥ 0.8`, graph `created`, `agent-steps.complete`              | `--success`    |
 | heatmap `0.5–0.8`                                                     | `--warning`    |
 | graph `unchanged`, graph `Default` node                              | `--text-muted` |
+
+> **As-built carve-out (Okabe-Ito) — amends the graph rows above.** The graph
+> change-state borders (`created` / `modified` / `deleted`) are **not** mapped to
+> `--success` / `--danger` as the table originally proposed. They keep the
+> intentional Okabe-Ito colorblind-safe palette (`#0072B2` blue / `#E69F00` amber
+> / `#D55E00` vermillion) already in the code; recoloring them to theme red/green
+> would regress colorblind accessibility and let a *status* border read as a
+> *nominal* hue. Only graph `unchanged` → `--text-muted` from Rule 1 applies to
+> the graph. This carve-out was flagged during planning (plan §"Deviation from
+> spec") and confirmed at implementation.
 
 **Rule 2 — nominal categories cycle the ramp by stable index.** Event step types, tool
 categories, memory types/sources, graph node types, layout thumbnails map to `--cat-N`
