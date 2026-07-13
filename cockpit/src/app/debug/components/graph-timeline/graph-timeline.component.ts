@@ -12,7 +12,8 @@ import {
 } from '@angular/core';
 import {GraphService} from '../../services/graph.service';
 import {DataService} from '../../../core/services/data.service';
-import {cytoscapeStyles} from './graph-styles';
+import {ThemeService} from '../../../core/services/theme.service';
+import {buildCytoscapeStyles, resolveGraphColors} from './graph-colors';
 import {TimelineRenderer} from './timeline-renderer';
 import type {Core} from 'cytoscape';
 import {AppSpinnerComponent} from '../../../ui/spinner';
@@ -206,7 +207,7 @@ let cytoscape: any;
       display: flex;
       flex-direction: column;
       height: 100%;
-      background: var(--panel-bg, #181825);
+      background: var(--panel-bg);
       position: relative;
     }
 
@@ -217,8 +218,8 @@ let cytoscape: any;
       align-items: center;
       gap: 8px;
       padding: 8px;
-      background: var(--surface-0, #313244);
-      border-bottom: 1px solid var(--border-color, #313244);
+      background: var(--surface-0);
+      border-bottom: 1px solid var(--border-color);
       flex-shrink: 0;
     }
 
@@ -231,19 +232,19 @@ let cytoscape: any;
 
     .btn {
       padding: 6px 12px;
-      border: 1px solid var(--border-color, #45475a);
+      border: 1px solid var(--border-color);
       border-radius: var(--radius-control);
-      background: var(--panel-header-bg, #1e1e2e);
-      color: var(--text-secondary, #a6adc8);
+      background: var(--panel-header-bg);
+      color: var(--text-secondary);
       font-size: 12px;
       cursor: pointer;
       transition: all 0.15s ease;
     }
 
     .btn:hover:not(:disabled) {
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
-      border-color: var(--text-muted, #6c7086);
+      background: var(--surface-0);
+      color: var(--text-primary);
+      border-color: var(--text-muted);
     }
 
     .btn:disabled {
@@ -261,8 +262,8 @@ let cytoscape: any;
       display: flex;
       gap: 16px;
       padding: 6px 12px;
-      background: var(--panel-header-bg, #1e1e2e);
-      border-bottom: 1px solid var(--border-color, #313244);
+      background: var(--panel-header-bg);
+      border-bottom: 1px solid var(--border-color);
       font-size: 11px;
       flex-shrink: 0;
     }
@@ -271,16 +272,16 @@ let cytoscape: any;
       display: flex;
       align-items: center;
       gap: 4px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .summary-label {
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary);
     }
 
     .summary-value {
       font-family: 'JetBrains Mono', monospace;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary);
     }
 
     .summary-item .dot {
@@ -307,8 +308,8 @@ let cytoscape: any;
       align-items: center;
       gap: 8px;
       padding: 8px 12px;
-      background: var(--surface-0, #313244);
-      border-bottom: 1px solid var(--border-color, #313244);
+      background: var(--surface-0);
+      border-bottom: 1px solid var(--border-color);
       flex-shrink: 0;
     }
 
@@ -317,7 +318,7 @@ let cytoscape: any;
       height: 6px;
       -webkit-appearance: none;
       appearance: none;
-      background: var(--panel-bg, #181825);
+      background: var(--panel-bg);
       border-radius: var(--radius-pill);
       outline: none;
     }
@@ -327,25 +328,25 @@ let cytoscape: any;
       appearance: none;
       width: 14px;
       height: 14px;
-      background: var(--accent-color, #cba6f7);
+      background: var(--accent-color);
       border-radius: 50%;
       cursor: pointer;
-      border: 2px solid var(--panel-bg, #181825);
+      border: 2px solid var(--panel-bg);
     }
 
     .timeline-slider::-moz-range-thumb {
       width: 14px;
       height: 14px;
-      background: var(--accent-color, #cba6f7);
+      background: var(--accent-color);
       border-radius: 50%;
       cursor: pointer;
-      border: 2px solid var(--panel-bg, #181825);
+      border: 2px solid var(--panel-bg);
     }
 
     .timeline-position {
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       min-width: 80px;
       text-align: right;
     }
@@ -356,21 +357,21 @@ let cytoscape: any;
       align-items: center;
       gap: 8px;
       padding: 6px 12px;
-      background: var(--panel-header-bg, #1e1e2e);
-      border-bottom: 1px solid var(--border-color, #313244);
+      background: var(--panel-header-bg);
+      border-bottom: 1px solid var(--border-color);
       font-size: 11px;
       flex-shrink: 0;
       overflow: hidden;
     }
 
     .query-label {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       flex-shrink: 0;
     }
 
     .query-text {
       font-family: 'JetBrains Mono', monospace;
-      color: #a6e3a1;
+      color: var(--success);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -380,7 +381,7 @@ let cytoscape: any;
     .graph-container {
       flex: 1;
       min-height: 200px;
-      background: var(--timeline-bg, #11111b);
+      background: var(--timeline-bg);
     }
 
     .graph-container.hidden {
@@ -392,8 +393,8 @@ let cytoscape: any;
       display: flex;
       gap: 16px;
       padding: 6px 12px;
-      background: var(--surface-0, #313244);
-      border-top: 1px solid var(--border-color, #313244);
+      background: var(--surface-0);
+      border-top: 1px solid var(--border-color);
       font-size: 11px;
       flex-shrink: 0;
     }
@@ -402,7 +403,7 @@ let cytoscape: any;
       display: flex;
       align-items: center;
       gap: 4px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
     }
 
     .legend-dot {
@@ -442,7 +443,7 @@ let cytoscape: any;
       justify-content: center;
       gap: 16px;
       z-index: 10;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary);
     }
 
     /* Error state */
@@ -453,7 +454,7 @@ let cytoscape: any;
       justify-content: center;
       gap: 12px;
       padding: 40px;
-      color: #f38ba8;
+      color: var(--danger);
       flex: 1;
     }
 
@@ -469,7 +470,7 @@ let cytoscape: any;
       justify-content: center;
       gap: 12px;
       padding: 40px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted);
       flex: 1;
     }
 
@@ -490,6 +491,7 @@ export class GraphTimelineComponent implements OnDestroy {
   private readonly destroyRef = inject(DestroyRef);
   readonly graph = inject(GraphService);
   readonly data = inject(DataService);
+  private readonly theme = inject(ThemeService);
 
   private readonly graphContainer = viewChild<ElementRef<HTMLDivElement>>('graphContainer');
 
@@ -547,6 +549,12 @@ export class GraphTimelineComponent implements OnDestroy {
         this.graph.clear();
       }
     });
+
+    // Recolor the graph when the user flips light/dark (Cytoscape holds concrete colors).
+    effect(() => {
+      this.theme.resolved();      // establish the dependency
+      this.rethemeGraph();
+    });
   }
 
   ngOnDestroy(): void {
@@ -595,7 +603,7 @@ export class GraphTimelineComponent implements OnDestroy {
     this.ngZone.runOutsideAngular(() => {
       this.cy = cytoscape({
         container,
-        style: cytoscapeStyles,
+        style: buildCytoscapeStyles(resolveGraphColors()),
         layout: { name: 'preset' },
         minZoom: 0.1,
         maxZoom: 3,
@@ -616,6 +624,12 @@ export class GraphTimelineComponent implements OnDestroy {
       // Set up event listeners
       this.setupCytoscapeListeners();
     });
+  }
+
+  /** Rebuild the Cytoscape stylesheet from the current theme's tokens. */
+  rethemeGraph(): void {
+    if (!this.cy) return;
+    this.cy.style(buildCytoscapeStyles(resolveGraphColors())).update();
   }
 
   /**
