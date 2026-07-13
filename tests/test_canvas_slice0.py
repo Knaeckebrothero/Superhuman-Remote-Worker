@@ -1,0 +1,484 @@
+"""Dynamic Canvas Slice 0: durable state actions and owner-facing routes."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+
+from services.canvas import (
+    BrowserSource,
+    CanvasCapabilities,
+    CanvasPreconditionFailed,
+    CanvasPreconditionRequired,
+    CanvasService,
+    CanvasSetInput,
+    WorkspaceAppRoute,
+    WorkspaceAppSource,
+    WorkspaceFileSource,
+    build_public_canvas_representation,
+    canonical_source_fingerprint,
+)
+
+_THREAD_ID = "a3333333-3333-3333-3333-333333333333"
+_WORKSPACE_GENERATION = UUID("11111111-aaaa-4aaa-8aaa-111111111111")
+_OTHER_WORKSPACE_GENERATION = UUID("22222222-bbbb-4bbb-8bbb-222222222222")
+_SOURCE_VERSION = "sha256:" + "a" * 64
+
+
+class _FakeCanvasDB:
+    """Small asyncpg-shaped store that exercises the service SQL branches."""
+
+    def __init__(self) -> None:
+        self.rows: dict[tuple[str, str], dict[str, Any]] = {}
+        self.now = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
+        self.in_transaction = False
+        self.acquire_count = 0
+
+    @asynccontextmanager
+    async def acquire(self):
+        self.acquire_count += 1
+        yield self
+
+    @asynccontextmanager
+    async def transaction(self):
+        assert not self.in_transaction
+        self.in_transaction = True
+        try:
+            yield
+        finally:
+            self.in_transaction = False
+
+    def _tick(self) -> datetime:
+        self.now += timedelta(microseconds=1)
+        return self.now
+
+    async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
+        sql = " ".join(query.split())
+
+        if sql.startswith("SELECT thread_id"):
+            key = (str(args[0]), str(args[1]))
+            row = self.rows.get(key)
+            return dict(row) if row is not None else None
+
+        if sql.startswith("INSERT INTO canvases"):
+            (
+                thread_id,
+                canvas_id,
+                source_json,
+                title,
+                renderer,
+                editable,
+                alt_text,
+                source_fingerprint,
+                source_version,
+                origin_candidate,
+                new_app,
+            ) = args
+            key = (str(thread_id), str(canvas_id))
+            existing = self.rows.get(key)
+            now = self._tick()
+            origin_generation = origin_candidate
+            if (
+                existing is not None
+                and origin_candidate is not None
+                and existing["origin_generation"] is not None
+                and existing["source_fingerprint"] == source_fingerprint
+                and not new_app
+            ):
+                origin_generation = existing["origin_generation"]
+            row = {
+                "thread_id": str(thread_id),
+                "canvas_id": str(canvas_id),
+                "source": source_json,
+                "title": title,
+                "renderer": renderer,
+                "editable": editable,
+                "alt_text": alt_text,
+                "presentation_revision": (
+                    existing["presentation_revision"] + 1 if existing else 1
+                ),
+                "source_fingerprint": source_fingerprint,
+                "source_version": source_version,
+                "origin_generation": origin_generation,
+                "created_at": existing["created_at"] if existing else now,
+                "updated_at": now,
+            }
+            self.rows[key] = row
+            return dict(row)
+
+        if sql.startswith("UPDATE canvases SET source = NULL"):
+            key = (str(args[0]), str(args[1]))
+            existing = self.rows[key]
+            row = {
+                **existing,
+                "source": None,
+                "title": None,
+                "renderer": "auto",
+                "editable": False,
+                "alt_text": None,
+                "presentation_revision": existing["presentation_revision"] + 1,
+                "source_fingerprint": None,
+                "source_version": None,
+                "origin_generation": None,
+                "updated_at": self._tick(),
+            }
+            self.rows[key] = row
+            return dict(row)
+
+        raise AssertionError(f"unexpected Canvas SQL: {sql}")
+
+
+def _file_set(
+    *,
+    path: str = "output/report.md",
+    workspace_generation: UUID = _WORKSPACE_GENERATION,
+    title: str = "Research report",
+) -> CanvasSetInput:
+    return CanvasSetInput(
+        source=WorkspaceFileSource(
+            path=path,
+            workspace_generation=workspace_generation,
+        ),
+        title=title,
+        renderer="markdown",
+        source_version=_SOURCE_VERSION,
+    )
+
+
+def _seed_presented(db: _FakeCanvasDB) -> None:
+    asyncio.run(CanvasService(db).set(_THREAD_ID, _file_set()))
+
+
+def test_source_fingerprint_is_canonical_and_security_relevant() -> None:
+    forward = WorkspaceAppSource(
+        entry_port=5173,
+        entry_path="/",
+        routes=(
+            WorkspaceAppRoute(path_prefix="/ws", port=8000),
+            WorkspaceAppRoute(path_prefix="/api", port=8000),
+        ),
+        manifest_path=".srw/canvas.yaml",
+        manifest_version="sha256:" + "b" * 64,
+        workspace_generation=_WORKSPACE_GENERATION,
+    )
+    reverse = WorkspaceAppSource(
+        entry_port=5173,
+        entry_path="/",
+        routes=tuple(reversed(forward.routes)),
+        manifest_path="some/other/name.yaml",  # path is presentation metadata
+        manifest_version=forward.manifest_version,
+        workspace_generation=_WORKSPACE_GENERATION,
+    )
+
+    assert canonical_source_fingerprint(forward) == canonical_source_fingerprint(
+        reverse
+    )
+    changed_generation = forward.model_copy(
+        update={"workspace_generation": _OTHER_WORKSPACE_GENERATION}
+    )
+    changed_entry = forward.model_copy(update={"entry_port": 4173})
+    assert canonical_source_fingerprint(forward) != canonical_source_fingerprint(
+        changed_generation
+    )
+    assert canonical_source_fingerprint(forward) != canonical_source_fingerprint(
+        changed_entry
+    )
+
+
+def test_public_representation_hashes_exact_visible_bytes_and_redacts_identity() -> (
+    None
+):
+    db = _FakeCanvasDB()
+    _seed_presented(db)
+    record = asyncio.run(CanvasService(db).get(_THREAD_ID))
+    assert record is not None
+
+    unavailable = build_public_canvas_representation(record)
+    ready = build_public_canvas_representation(record, status="ready")
+    editable = build_public_canvas_representation(
+        record,
+        capabilities=CanvasCapabilities(can_edit=True),
+    )
+    body = json.loads(unavailable.payload)
+
+    assert body["source"] == {
+        "type": "workspace_file",
+        "path": "output/report.md",
+    }
+    assert "workspace_generation" not in unavailable.payload.decode()
+    assert "source_fingerprint" not in unavailable.payload.decode()
+    assert unavailable.etag.startswith('"canvas:1:')
+    assert unavailable.etag != ready.etag
+    assert unavailable.etag != editable.etag
+
+
+@pytest.mark.asyncio
+async def test_set_refresh_replace_and_origin_rotation_are_atomic() -> None:
+    db = _FakeCanvasDB()
+    callbacks: list[dict[str, Any]] = []
+
+    async def callback(event) -> None:
+        assert not db.in_transaction
+        callbacks.append(event.model_dump(mode="json"))
+
+    service = CanvasService(db, event_callback=callback)
+    first = await service.set(_THREAD_ID, _file_set())
+    refresh = await service.set(_THREAD_ID, _file_set(title="Updated label"))
+    replacement = await service.set(_THREAD_ID, _file_set(path="output/other.md"))
+
+    assert first.record is not None and first.record.presentation_revision == 1
+    assert refresh.record is not None and refresh.record.presentation_revision == 2
+    assert replacement.record is not None
+    assert replacement.record.presentation_revision == 3
+    assert first.record.source_fingerprint == refresh.record.source_fingerprint
+    assert replacement.record.source_fingerprint != first.record.source_fingerprint
+    assert [event["method"] for event in callbacks] == [
+        "canvas.updated",
+        "canvas.updated",
+        "canvas.updated",
+    ]
+
+    app_source = WorkspaceAppSource(
+        entry_port=5173,
+        workspace_generation=_WORKSPACE_GENERATION,
+    )
+    app_first = await service.set(
+        _THREAD_ID,
+        CanvasSetInput(source=app_source, title="Prototype"),
+    )
+    app_refresh = await service.set(
+        _THREAD_ID,
+        CanvasSetInput(source=app_source, title="Prototype refreshed"),
+    )
+    app_reset = await service.set(
+        _THREAD_ID,
+        CanvasSetInput(source=app_source, title="Prototype", new_app=True),
+    )
+    assert app_first.record is not None and app_first.record.origin_generation
+    assert app_refresh.record is not None
+    assert app_refresh.record.origin_generation == app_first.record.origin_generation
+    assert app_reset.record is not None
+    assert app_reset.record.origin_generation != app_first.record.origin_generation
+
+
+@pytest.mark.asyncio
+async def test_conditional_clear_and_repeated_clear_semantics() -> None:
+    db = _FakeCanvasDB()
+    callbacks: list[str] = []
+
+    async def callback(event) -> None:
+        assert not db.in_transaction
+        callbacks.append(event.method)
+
+    service = CanvasService(db, event_callback=callback)
+    absent = await service.clear(_THREAD_ID, expected_etag=None)
+    assert not absent.changed and absent.record is None
+
+    presented = await service.set(_THREAD_ID, _file_set())
+    assert presented.record is not None
+    before = build_public_canvas_representation(presented.record)
+
+    with pytest.raises(CanvasPreconditionRequired):
+        await service.clear(_THREAD_ID, expected_etag=None)
+    with pytest.raises(CanvasPreconditionFailed):
+        await service.clear(_THREAD_ID, expected_etag='"canvas:stale"')
+    unchanged = await service.get(_THREAD_ID)
+    assert unchanged is not None and unchanged.presentation_revision == 1
+
+    cleared = await service.clear(_THREAD_ID, expected_etag=before.etag)
+    assert cleared.changed and cleared.record is not None
+    assert cleared.record.presentation_revision == 2
+    assert cleared.record.source is None
+    assert cleared.record.title is None
+    assert cleared.record.renderer == "auto"
+    assert cleared.record.editable is False
+    assert cleared.record.source_fingerprint is None
+    assert cleared.record.source_version is None
+    assert cleared.record.origin_generation is None
+    assert build_public_canvas_representation(cleared.record).state.status == "cleared"
+
+    repeated = await service.clear(_THREAD_ID, expected_etag=None)
+    assert not repeated.changed
+    assert repeated.record is not None
+    assert repeated.record.presentation_revision == 2
+    assert callbacks == ["canvas.updated", "canvas.cleared"]
+
+    represented = await service.set(_THREAD_ID, _file_set())
+    assert represented.record is not None
+    assert represented.record.presentation_revision == 3
+
+
+@pytest.mark.asyncio
+async def test_only_main_canvas_is_accepted() -> None:
+    service = CanvasService(_FakeCanvasDB())
+    with pytest.raises(ValueError, match="only canvas_id='main'"):
+        await service.get(_THREAD_ID, canvas_id="secondary")
+    with pytest.raises(ValueError, match="only canvas_id='main'"):
+        await service.set(_THREAD_ID, _file_set(), canvas_id="secondary")
+
+
+def _route_app(monkeypatch, db: _FakeCanvasDB):
+    from routers import canvases as canvases_router_module
+
+    owner_calls: list[tuple[Any, str]] = []
+
+    async def owner(request, received_db, thread_id):
+        owner_calls.append((received_db, thread_id))
+        return {"id": "user-1"}, {"id": thread_id, "user_id": "user-1"}
+
+    monkeypatch.setattr(canvases_router_module, "_get_db", lambda: db)
+    monkeypatch.setattr(canvases_router_module, "require_thread_owner", owner)
+    app = FastAPI()
+    app.include_router(canvases_router_module.router)
+    return app, owner_calls
+
+
+def test_get_route_returns_204_for_absent_and_revalidates_present_state(
+    monkeypatch,
+) -> None:
+    db = _FakeCanvasDB()
+    app, owner_calls = _route_app(monkeypatch, db)
+    client = TestClient(app)
+
+    absent = client.get(f"/api/persistent/threads/{_THREAD_ID}/canvases/main")
+    assert absent.status_code == 204
+    assert absent.headers["cache-control"] == "private, no-cache"
+
+    _seed_presented(db)
+    current = client.get(f"/api/persistent/threads/{_THREAD_ID}/canvases/main")
+    assert current.status_code == 200
+    assert current.headers["etag"].startswith('"canvas:1:')
+    assert current.headers["cache-control"] == "private, no-cache"
+    assert current.json()["status"] == "unavailable"
+    assert current.json()["capabilities"] == {
+        "can_edit": False,
+        "can_pop_out": False,
+        "can_take_control": False,
+    }
+
+    not_modified = client.get(
+        f"/api/persistent/threads/{_THREAD_ID}/canvases/main",
+        headers={"If-None-Match": f"W/{current.headers['etag']}"},
+    )
+    assert not_modified.status_code == 304
+    assert not not_modified.content
+    assert len(owner_calls) == 3
+    assert all(call == (db, _THREAD_ID) for call in owner_calls)
+
+
+def test_delete_route_requires_exact_etag_then_becomes_idempotent(monkeypatch) -> None:
+    db = _FakeCanvasDB()
+    _seed_presented(db)
+    app, _ = _route_app(monkeypatch, db)
+    client = TestClient(app)
+    url = f"/api/persistent/threads/{_THREAD_ID}/canvases/main"
+
+    missing = client.delete(url)
+    assert missing.status_code == 428
+    assert missing.json()["detail"]["code"] == "canvas_precondition_required"
+
+    stale = client.delete(url, headers={"If-Match": '"canvas:0:stale"'})
+    assert stale.status_code == 412
+    assert stale.json()["detail"]["code"] == "canvas_precondition_failed"
+
+    current = client.get(url)
+    cleared = client.delete(url, headers={"If-Match": current.headers["etag"]})
+    assert cleared.status_code == 200
+    assert cleared.json()["source"] is None
+    assert cleared.json()["status"] == "cleared"
+    assert cleared.json()["presentation_revision"] == 2
+    assert cleared.headers["etag"].startswith('"canvas:2:')
+
+    repeated = client.delete(url)
+    assert repeated.status_code == 204
+    persisted = client.get(url)
+    assert persisted.status_code == 200
+    assert persisted.json()["presentation_revision"] == 2
+
+
+def test_routes_fail_at_owner_gate_before_canvas_access(monkeypatch) -> None:
+    from routers import canvases as canvases_router_module
+
+    db = _FakeCanvasDB()
+
+    async def denied(request, received_db, thread_id):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    monkeypatch.setattr(canvases_router_module, "_get_db", lambda: db)
+    monkeypatch.setattr(canvases_router_module, "require_thread_owner", denied)
+    app = FastAPI()
+    app.include_router(canvases_router_module.router)
+    response = TestClient(app).get(
+        f"/api/persistent/threads/{_THREAD_ID}/canvases/main"
+    )
+    assert response.status_code == 403
+    assert db.acquire_count == 0
+
+
+def test_main_app_mounts_only_slice_zero_public_canvas_routes() -> None:
+    from main import app
+
+    routes = {
+        (method, route.path)
+        for route in app.routes
+        for method in getattr(route, "methods", ())
+    }
+    path = "/api/persistent/threads/{thread_id}/canvases/main"
+    assert ("GET", path) in routes
+    assert ("DELETE", path) in routes
+    assert not any(
+        route_path.startswith("/api/internal/") and "canvas" in route_path
+        for _, route_path in routes
+    )
+
+
+def test_main_cors_exposes_canvas_etag_to_local_cockpit(monkeypatch) -> None:
+    from main import app
+    from routers import canvases as canvases_router_module
+
+    db = _FakeCanvasDB()
+    _seed_presented(db)
+
+    async def owner(request, received_db, thread_id):
+        return {"id": "user-1"}, {"id": thread_id, "user_id": "user-1"}
+
+    monkeypatch.setattr(canvases_router_module, "_get_db", lambda: db)
+    monkeypatch.setattr(canvases_router_module, "require_thread_owner", owner)
+    response = TestClient(app).get(
+        f"/api/persistent/threads/{_THREAD_ID}/canvases/main",
+        headers={"Origin": "http://localhost:4200"},
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-expose-headers"] == "ETag"
+    assert response.headers["access-control-allow-origin"] == "http://localhost:4200"
+
+
+def test_canvas_migration_has_thread_cascade_and_single_slot_key() -> None:
+    migration = Path(
+        "orchestrator/database/migrations/app/0058_canvases.sql"
+    ).read_text()
+    assert (
+        "thread_id             UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE"
+        in migration
+    )
+    assert "UNIQUE (thread_id, canvas_id)" in migration
+    assert "presentation_revision BIGINT NOT NULL DEFAULT 0" in migration
+    assert "uq_canvases_origin_generation" in migration
+    assert "squawk-ignore require-concurrent-index-creation" in migration
+
+
+def test_browser_source_public_shape_does_not_expose_generation() -> None:
+    source = BrowserSource(
+        browser_generation=UUID("33333333-cccc-4ccc-8ccc-333333333333")
+    )
+    fingerprint = canonical_source_fingerprint(source)
+    assert fingerprint.startswith("sha256:") and len(fingerprint) == 71

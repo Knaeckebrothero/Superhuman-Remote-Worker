@@ -28,9 +28,10 @@ related:
 > file, open the IDE, forward a port, copy a proxy URL, or reconstruct an image
 > from chat output just to see and collaborate on the result.
 
-**Status:** Research-backed implementation design; no implementation yet.
-Original brainstorm filed 2026-05-13. Pointer model agreed and repository,
-security, accessibility, and comparable-product audits completed 2026-07-13.
+**Status:** Slice 0 state/event foundation implemented 2026-07-13; Slices 1–6
+remain planned. Original brainstorm filed 2026-05-13. Pointer model agreed and
+repository, security, accessibility, and comparable-product audits completed
+2026-07-13.
 
 ## Decision Summary
 
@@ -1917,7 +1918,15 @@ revocation, thread switch, workspace generation change, or clear.
 
 ### Slice 0 — State and event foundation
 
-- next available application migration (currently `0058`) and `CanvasService`
+**Implementation status:** Complete as of 2026-07-13. This includes migration
+`0058`, the generated current-schema artifact, atomic Canvas state actions,
+owner-protected public state/conditional-clear routes, ordered persistent-event
+writing with fail-closed per-runtime epochs and direct reconciliation on
+terminal Canvas failures, and the typed Cockpit transport/state bridge.
+Source-setting HTTP adapters, model tools, and the companion skill intentionally
+remain in Slice 1.
+
+- application migration `0058` and `CanvasService`
   with `require_thread_owner`-protected `main` routes and atomic revision
   semantics;
 - fix `_broadcast` persistence with one ordered event writer;

@@ -147,6 +147,7 @@ from security.credential_files import (  # noqa: E402
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
+from routers import canvases_router  # noqa: E402
 from routers import project_loops_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
@@ -6793,9 +6794,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    # Expose nothing extra — the BFF only returns JSON + Set-Cookie, and
-    # browsers already see Set-Cookie. Keeping this explicit makes the
-    # CSP-style header surface visible.
+    # Canvas uses a strong representation ETag as its mutation precondition.
+    # The local Cockpit dev server (4200) calls the orchestrator (8085)
+    # cross-origin, so this one non-secret response header must be readable by
+    # HttpClient there. Production remains same-origin behind the BFF.
+    expose_headers=["ETag"],
 )
 
 
@@ -6893,6 +6896,7 @@ app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
 app.include_router(automations_router)
+app.include_router(canvases_router)
 app.include_router(project_loops_router)
 app.include_router(sessions_router)
 
