@@ -1,9 +1,11 @@
 import {HttpClient, HttpErrorResponse, HttpResponse} from '@angular/common/http';
 import {DestroyRef, inject, Injectable, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
-import {Subscription} from 'rxjs';
+import {map, Observable, Subscription, tap, throwError} from 'rxjs';
 import {
+  CanvasContentSaveRequest,
   CanvasLoadStatus,
+  CanvasMutationResponse,
   CanvasRequestError,
   CanvasState,
   MAIN_CANVAS_ID,
@@ -102,6 +104,50 @@ export class CanvasService {
       return;
     }
     this.startReconcile(null);
+  }
+
+  /**
+   * Save UTF-8 source bytes through the server-issued content pointer.
+   *
+   * The caller must supply the ETag captured with those exact bytes and the
+   * presentation revision they were loaded under. The backend revalidates both
+   * before reading the body and returns the new authoritative state.
+   */
+  saveContent(request: CanvasContentSaveRequest): Observable<CanvasMutationResponse> {
+    const threadId = this.threadId();
+    if (!threadId) {
+      return throwError(() => new Error('Cannot save Canvas content without a thread'));
+    }
+    return this.http.put<CanvasState>(request.contentUrl, request.content, {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'If-Match': request.contentEtag,
+        'X-Canvas-Presentation-Revision': String(request.presentationRevision),
+      },
+      observe: 'response',
+    }).pipe(
+      map(response => this.parseMutationResponse(response)),
+      tap(response => this.applyMutationResponse(threadId, response, true)),
+    );
+  }
+
+  /** Adopt the current workspace bytes after an out-of-band source change. */
+  refreshSource(): Observable<CanvasMutationResponse> {
+    const threadId = this.threadId();
+    const stateEtag = this.stateEtag();
+    if (!threadId || !stateEtag) {
+      return throwError(() => new Error('Cannot refresh Canvas without current state'));
+    }
+    const url =
+      `${environment.apiUrl}/persistent/threads/${encodeURIComponent(threadId)}` +
+      `/canvases/${MAIN_CANVAS_ID}/refresh`;
+    return this.http.post<CanvasState>(url, null, {
+      headers: {'If-Match': stateEtag},
+      observe: 'response',
+    }).pipe(
+      map(response => this.parseMutationResponse(response)),
+      tap(response => this.applyMutationResponse(threadId, response, true)),
+    );
   }
 
   private handleInvalidation(event: CanvasInvalidation): void {
@@ -293,6 +339,53 @@ export class CanvasService {
       this.pendingRevisionFollowUpAllowed ||= allowTargetFollowUp;
     }
   }
+
+  private parseMutationResponse(response: HttpResponse<CanvasState>): CanvasMutationResponse {
+    if (!isCanvasState(response.body)) {
+      throw new Error('Canvas mutation returned invalid state');
+    }
+    const stateEtag = response.headers.get('ETag');
+    const contentEtag = response.headers.get('X-Canvas-Content-ETag');
+    const expectedContentEtag = response.body.source_version
+      ? `"${response.body.source_version}"`
+      : null;
+    if (!stateEtag || !contentEtag || contentEtag !== expectedContentEtag) {
+      throw new Error('Canvas mutation returned invalid precondition metadata');
+    }
+    return {state: response.body, stateEtag, contentEtag};
+  }
+
+  private applyMutationResponse(
+    threadId: string,
+    response: CanvasMutationResponse,
+    notifyRuntime: boolean,
+  ): void {
+    if (this.threadId() !== threadId) return;
+    const currentRevision = this.state()?.presentation_revision ?? 0;
+    if (response.state.presentation_revision < currentRevision) return;
+    this.state.set(response.state);
+    this.stateEtag.set(response.stateEtag);
+    this.loadStatus.set('ready');
+    this.requestError.set(null);
+    this.lastSuccessfulReconcileAt = Date.now();
+
+    const source = response.state.source;
+    if (
+      !notifyRuntime ||
+      source?.type !== 'workspace_file' ||
+      typeof source.path !== 'string' ||
+      !response.state.source_version
+    ) {
+      return;
+    }
+    this.transport.sendCanvasControl(threadId, {
+      method: 'canvas.source_updated',
+      canvas_id: MAIN_CANVAS_ID,
+      path: source.path,
+      presentation_revision: response.state.presentation_revision,
+      source_version: response.state.source_version,
+    });
+  }
 }
 
 const CANVAS_RENDERERS = new Set(['auto', 'markdown', 'text', 'html', 'image']);
@@ -326,6 +419,9 @@ function isCanvasState(value: unknown): value is CanvasState {
     Number.isSafeInteger(value['presentation_revision']) &&
     value['presentation_revision'] >= 0 &&
     (value['source_version'] === null || typeof value['source_version'] === 'string') &&
+    (value['content_url'] === undefined ||
+      value['content_url'] === null ||
+      typeof value['content_url'] === 'string') &&
     typeof value['status'] === 'string' &&
     CANVAS_STATUSES.has(value['status']) &&
     isRecord(capabilities) &&

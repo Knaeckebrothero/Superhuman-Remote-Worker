@@ -70,6 +70,12 @@ export interface CanvasState {
   readonly alt_text: string | null;
   readonly presentation_revision: number;
   readonly source_version: string | null;
+  /**
+   * Server-minted, authorized file-content pointer. The Cockpit may resolve
+   * this relative URL against the configured API origin, but must never derive
+   * a content path or its presentation/source identity query itself.
+   */
+  readonly content_url?: string | null;
   readonly status: CanvasStatus;
   readonly capabilities: CanvasCapabilities;
   readonly updated_at: string;
@@ -80,4 +86,17 @@ export type CanvasLoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 export interface CanvasRequestError {
   readonly status: number | null;
   readonly code: string | null;
+}
+
+export interface CanvasContentSaveRequest {
+  readonly contentUrl: string;
+  readonly contentEtag: string;
+  readonly presentationRevision: number;
+  readonly content: string;
+}
+
+export interface CanvasMutationResponse {
+  readonly state: CanvasState;
+  readonly stateEtag: string;
+  readonly contentEtag: string;
 }

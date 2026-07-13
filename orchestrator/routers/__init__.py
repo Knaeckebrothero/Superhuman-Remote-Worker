@@ -8,7 +8,13 @@ as their own router file; ``main.py`` includes them via
 """
 
 from routers.automations import router as automations_router
+from routers.canvases import internal_router as internal_canvases_router
 from routers.canvases import router as canvases_router
 from routers.project_loops import router as project_loops_router
 
-__all__ = ["automations_router", "canvases_router", "project_loops_router"]
+__all__ = [
+    "automations_router",
+    "canvases_router",
+    "internal_canvases_router",
+    "project_loops_router",
+]

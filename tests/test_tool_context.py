@@ -293,6 +293,30 @@ class TestReadTracking:
         ctx.record_file_read("  foo.md  ")
         assert ctx.was_recently_read("foo.md") is True
 
+    def test_user_edit_invalidation_requires_a_fresh_read(self):
+        ctx = ToolContext()
+        ctx.record_file_read("/output/report.md", "# Before\n")
+
+        assert ctx.recent_read_matches("output/report.md", "# Before\n") is True
+        assert ctx.invalidate_recent_read("output/report.md") is True
+        assert ctx.was_recently_read("output/report.md") is False
+        assert ctx.recent_read_matches("output/report.md", "# Before\n") is False
+        assert ctx.invalidate_recent_read("output/report.md") is False
+
+    def test_versioned_read_detects_changed_full_text(self):
+        ctx = ToolContext()
+        ctx.record_file_read("output/report.md", "# Before\n")
+
+        assert ctx.recent_read_matches("output/report.md", "# Before\n") is True
+        assert ctx.recent_read_matches("output/report.md", "# User edit\n") is False
+
+    def test_path_only_read_preserves_instruction_enforcement_semantics(self):
+        ctx = ToolContext()
+        ctx.record_file_read("AGENTS.md")
+
+        assert ctx.was_recently_read("AGENTS.md") is True
+        assert ctx.recent_read_matches("AGENTS.md", "content not tracked") is False
+
     def test_deque_eviction(self):
         """Recording 11th file should evict the oldest (maxlen=10)."""
         ctx = ToolContext()

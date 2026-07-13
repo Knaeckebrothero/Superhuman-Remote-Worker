@@ -23,6 +23,10 @@ from fastapi import HTTPException
 
 import orchestrator.main as orch_main
 from src.api.persistent_app import _load_expert_config
+from src.core.session_tool_overrides import (
+    SessionToolOverrideError,
+    validate_session_tool_overrides,
+)
 
 
 class _FakeResponse:
@@ -239,6 +243,53 @@ class TestSessionWorkspaceBackendDefaultChain:
             )
         assert exc.value.status_code == 400
         assert "workflows" in exc.value.detail
+
+    @pytest.mark.parametrize(
+        ("group", "injected"),
+        [
+            ("orchestrator", "run_command"),
+            ("agent_catalog", "create_worker_job"),
+            ("workflows", "get_skill"),
+            ("canvas", "run_command"),
+        ],
+    )
+    def test_cross_category_session_tool_override_rejected(self, group, injected):
+        with pytest.raises(orch_main.HTTPException) as exc:
+            orch_main._validated_session_tool_overrides({"tools": {group: [injected]}})
+        assert exc.value.status_code == 400
+        assert group in exc.value.detail
+        assert injected in exc.value.detail
+
+    def test_known_session_tool_override_names_are_accepted(self):
+        assert orch_main._validated_session_tool_overrides(
+            {
+                "tools": {
+                    "orchestrator": ["get_session_context"],
+                    "agent_catalog": ["list_skills"],
+                    "workflows": ["list_automations"],
+                    "canvas": ["get_canvas", "set_canvas", "clear_canvas"],
+                }
+            }
+        ) == {
+            "orchestrator": ["get_session_context"],
+            "agent_catalog": ["list_skills"],
+            "workflows": ["list_automations"],
+            "canvas": ["get_canvas", "set_canvas", "clear_canvas"],
+        }
+
+    def test_shared_validator_rejects_cross_category_canvas_name(self):
+        with pytest.raises(SessionToolOverrideError, match="run_command"):
+            validate_session_tool_overrides({"tools": {"canvas": ["run_command"]}})
+
+    def test_shared_validator_ignores_non_session_categories(self):
+        assert validate_session_tool_overrides(
+            {
+                "tools": {
+                    "canvas": ["get_canvas"],
+                    "shell": ["run_command"],
+                }
+            }
+        ) == {"canvas": ["get_canvas"]}
 
     def test_fleet_management_disabled_detection(self):
         assert orch_main._fleet_management_explicitly_disabled(

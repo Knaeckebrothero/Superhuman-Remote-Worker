@@ -186,6 +186,13 @@ ingress:
     enabled: true
     issuerName: mkcert-issuer
 
+# Dynamic Canvas live workspace applications remain gated until the separate
+# wildcard viewer origin and proxy land. File viewing/editing is unaffected.
+canvas:
+  livePreview:
+    enabled: false
+    deniedPorts: []
+
 # -----------------------------------------------------------------------------
 # Agent pool — no warm/buffer slots; agents spin up on demand only
 # -----------------------------------------------------------------------------

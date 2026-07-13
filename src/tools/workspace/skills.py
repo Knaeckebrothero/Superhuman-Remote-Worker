@@ -82,6 +82,20 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
         Returns:
             The SKILL.md body, or a friendly message if the skill is not present.
         """
+        scoped_skills = context.config.get("_resolved_skills") or {}
+        menu = scoped_skills.get("menu") if isinstance(scoped_skills, dict) else None
+        allowed_names = {
+            item.get("name")
+            for item in menu or []
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        if skill_name not in allowed_names:
+            return (
+                f"Skill '{skill_name}' is not available for the current session "
+                "capabilities. Use only skills listed in the current "
+                "available_skills menu, by their exact name."
+            )
+
         skill_md = f"skills/{skill_name}/SKILL.md"
         try:
             if not workspace.exists(skill_md):

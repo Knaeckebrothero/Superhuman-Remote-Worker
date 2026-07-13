@@ -927,6 +927,43 @@ describe('PersistentChatService — connect()', () => {
         expect(connectingWs.send).not.toHaveBeenCalled();
     });
 
+    it('flushes only the latest committed source update when the control socket reconnects', () => {
+        const {service, threadTransport, wsInstances} = createService();
+        const connectingWs = createMockWs();
+        connectingWs.readyState = WebSocket.CONNECTING;
+        service.threadId.set('thread-canvas');
+        (service as any).controlWs = connectingWs;
+
+        // A newer REST mutation can complete before an older in-flight one.
+        // The late response must not replace the queued latest revision.
+        for (const revision of [5, 4]) {
+            expect(threadTransport.sendCanvasControl('thread-canvas', {
+                method: 'canvas.source_updated',
+                canvas_id: 'main',
+                path: 'output/report.md',
+                presentation_revision: revision,
+                source_version: `sha256:revision-${revision}`,
+            })).toBe(false);
+        }
+
+        (service as any)._installControlWs('thread-canvas', 'ws://reconnected');
+        const reconnected = wsInstances.at(-1);
+        reconnected.onopen();
+
+        expect(reconnected.send).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(reconnected.send.mock.calls[0][0])).toEqual({
+            method: 'canvas.source_updated',
+            canvas_id: 'main',
+            path: 'output/report.md',
+            presentation_revision: 5,
+            source_version: 'sha256:revision-5',
+        });
+
+        // Duplicate browser open notifications cannot replay an accepted frame.
+        reconnected.onopen();
+        expect(reconnected.send).toHaveBeenCalledTimes(1);
+    });
+
     it('forwards a direct reconcile-required control frame without an SSE sequence', async () => {
         const {service, mockHttp, wsInstances, threadTransport} = createService();
         mockHttp.get.mockImplementation(() =>

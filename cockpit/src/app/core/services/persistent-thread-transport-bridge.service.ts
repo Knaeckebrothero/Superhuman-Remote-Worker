@@ -34,7 +34,28 @@ export interface CanvasSourceUpdatedControl {
   readonly source_version: string;
 }
 
-export type CanvasControl = CanvasSourceUpdatedControl;
+export interface CanvasUserEditingControl {
+  readonly method: 'canvas.user_editing';
+  readonly canvas_id: CanvasId;
+  readonly path: string;
+  readonly presentation_revision: number;
+  readonly source_version: string;
+  readonly editing_session_id: string;
+}
+
+export interface CanvasUserIdleControl {
+  readonly method: 'canvas.user_idle';
+  readonly canvas_id: CanvasId;
+  readonly path: string;
+  readonly presentation_revision: number;
+  readonly source_version: string;
+  readonly editing_session_id: string;
+}
+
+export type CanvasControl =
+  | CanvasSourceUpdatedControl
+  | CanvasUserEditingControl
+  | CanvasUserIdleControl;
 
 type CanvasControlSender = (threadId: string, control: CanvasControl) => boolean;
 
@@ -44,6 +65,20 @@ const CANVAS_METHODS = new Set<CanvasInvalidationMethod>([
   'canvas.source_updated',
   'canvas.reconcile_required',
 ]);
+
+export interface CanvasAwarenessEvent {
+  readonly threadId: string;
+  readonly method: 'canvas.user_editing' | 'canvas.user_idle';
+  readonly canvasId: CanvasId;
+  readonly path: string;
+  readonly presentationRevision: number;
+  readonly sourceVersion: string;
+  readonly editingSessionId: string;
+  readonly senderId: string;
+  readonly ttlMs: number | null;
+}
+
+const CANVAS_AWARENESS_METHODS = new Set(['canvas.user_editing', 'canvas.user_idle']);
 
 /**
  * Read-only seam over the transport still owned by PersistentChatService.
@@ -64,6 +99,11 @@ export class PersistentThreadTransportBridge {
   readonly canvasInvalidations$: Observable<CanvasInvalidation> = this.events$.pipe(
     map((event) => this.asCanvasInvalidation(event)),
     filter((event): event is CanvasInvalidation => event !== null),
+  );
+
+  readonly canvasAwareness$: Observable<CanvasAwarenessEvent> = this.events$.pipe(
+    map(event => this.asCanvasAwareness(event)),
+    filter((event): event is CanvasAwarenessEvent => event !== null),
   );
 
   /** @internal Called only by the existing persistent-thread transport owner. */
@@ -133,4 +173,55 @@ export class PersistentThreadTransportBridge {
       updatedAt: typeof rawUpdatedAt === 'string' ? rawUpdatedAt : null,
     };
   }
+
+  private asCanvasAwareness(
+    event: PersistentThreadTransportEvent,
+  ): CanvasAwarenessEvent | null {
+    if (!CANVAS_AWARENESS_METHODS.has(event.method)) return null;
+    const canvasId = event.params['canvas_id'];
+    const path = event.params['path'];
+    const revision = event.params['presentation_revision'];
+    const sourceVersion = event.params['source_version'];
+    const editingSessionId = event.params['editing_session_id'];
+    const senderId = event.params['sender_id'];
+    const ttlMs = event.params['ttl_ms'];
+    if (
+      canvasId !== MAIN_CANVAS_ID ||
+      typeof path !== 'string' ||
+      !path ||
+      typeof revision !== 'number' ||
+      !Number.isSafeInteger(revision) ||
+      revision < 1 ||
+      typeof sourceVersion !== 'string' ||
+      !sourceVersion ||
+      typeof editingSessionId !== 'string' ||
+      !editingSessionId ||
+      editingSessionId.length > 128 ||
+      typeof senderId !== 'string' ||
+      !senderId ||
+      senderId.length > 128 ||
+      (event.method === 'canvas.user_editing' && !isAwarenessTtl(ttlMs)) ||
+      (event.method === 'canvas.user_idle' && ttlMs !== undefined && !isAwarenessTtl(ttlMs))
+    ) {
+      return null;
+    }
+    return {
+      threadId: event.threadId,
+      method: event.method as CanvasAwarenessEvent['method'],
+      canvasId: MAIN_CANVAS_ID,
+      path,
+      presentationRevision: revision,
+      sourceVersion,
+      editingSessionId,
+      senderId,
+      ttlMs: typeof ttlMs === 'number' ? ttlMs : null,
+    };
+  }
+}
+
+function isAwarenessTtl(value: unknown): value is number {
+  return typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 1_000 &&
+    value <= 60_000;
 }

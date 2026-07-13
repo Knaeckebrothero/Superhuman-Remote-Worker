@@ -522,6 +522,21 @@ class WorkspaceBackend(ABC):
         """
         return True
 
+    # Canvas is consumed by a different process than the agent. A backend must
+    # therefore opt in only when the orchestrator can materialize the same
+    # workspace generation through an attested transport. This is a mutable
+    # class default so provisioned RemoteBackend instances can carry the
+    # orchestrator's per-attach boolean without making generic/custom backends
+    # accidentally presentable.
+    supports_canvas_presentation: bool = False
+
+    # Live workspace applications are a narrower capability than file
+    # presentation. The orchestrator sets this only when the deployment-wide
+    # live-preview gate is enabled *and* the exact remote workspace has the
+    # attested Canvas transport required for loopback direct channels. Keeping
+    # it separate prevents a file-capable backend from advertising ports.
+    supports_canvas_live_apps: bool = False
+
     # --- Lifecycle ---
 
     @abstractmethod

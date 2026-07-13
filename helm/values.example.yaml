@@ -157,6 +157,13 @@ ingress:
     enabled: true
     issuerName: letsencrypt-prod
 
+# Workspace-port Canvas previews remain unavailable until the deployment has
+# the separate viewer domain/edge and has passed the browser security gates.
+canvas:
+  livePreview:
+    enabled: false
+    deniedPorts: []
+
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
 # (docs/features/direct_session_websockets.md)

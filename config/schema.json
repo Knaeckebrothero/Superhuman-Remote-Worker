@@ -384,6 +384,20 @@
             ]
           ]
         },
+        "canvas": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Dynamic Canvas presentation tools for persistent sessions (src/tools/canvas/)",
+          "examples": [
+            [
+              "get_canvas",
+              "set_canvas",
+              "clear_canvas"
+            ]
+          ]
+        },
         "agent_catalog": {
           "type": "array",
           "items": {

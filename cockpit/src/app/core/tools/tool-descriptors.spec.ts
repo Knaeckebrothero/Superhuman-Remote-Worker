@@ -107,6 +107,32 @@ describe('buildToolCardView', () => {
         expect(v.params).toContainEqual({label: 'N', value: '3', kind: 'text'});
         expect(v.result?.kind).toBe('text');
     });
+
+    it('set_canvas renders a compact trusted action without echoing state JSON', () => {
+        const result = JSON.stringify({
+            canvas_id: 'main',
+            presentation_revision: 7,
+            content_url: '/api/secret-bearing-pointer',
+        });
+        const v = buildToolCardView(norm({
+            tool: 'set_canvas',
+            args: {source_type: 'workspace_file', path: 'output/report.md', renderer: 'markdown'},
+            result,
+        }));
+
+        expect(v.title).toBe('Present in Canvas');
+        expect(v.subtitle).toBe('report.md');
+        expect(v.result).toBeUndefined();
+        expect(v.action).toEqual({kind: 'open_canvas', presentationRevision: 7});
+        expect(JSON.stringify(v)).not.toContain('secret-bearing-pointer');
+    });
+
+    it('offers no Canvas action for a pending, denied, or failed set', () => {
+        for (const status of ['pending', 'denied', 'error'] as const) {
+            const v = buildToolCardView(norm({tool: 'set_canvas', status, result: '{"presentation_revision": 2}'}));
+            expect(v.action).toBeUndefined();
+        }
+    });
 });
 
 describe('toolCardViewFromEvent', () => {

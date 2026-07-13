@@ -11,11 +11,19 @@ from src.tools.context import ToolContext
 from src.tools.workspace.skills import create_skill_tools
 
 
-def _use_skill(tmp_path):
+def _use_skill(tmp_path, *, allowed=("hello-skill", "nope")):
     ws = WorkspaceManager(
         job_id="t", base_path=tmp_path, backend=FilesystemTestBackend(tmp_path)
     )
-    ctx = ToolContext(workspace_manager=ws)
+    ctx = ToolContext(
+        workspace_manager=ws,
+        config={
+            "_resolved_skills": {
+                "menu": [{"name": name} for name in allowed],
+                "files": {},
+            }
+        },
+    )
     tools = {t.name: t for t in create_skill_tools(ctx)}
     return ws, tools["use_skill"]
 
@@ -57,7 +65,15 @@ class _ShellFsBackend(FilesystemTestBackend):
 
 def _use_skill_on(backend, tmp_path):
     ws = WorkspaceManager(job_id="t", base_path=tmp_path, backend=backend)
-    ctx = ToolContext(workspace_manager=ws)
+    ctx = ToolContext(
+        workspace_manager=ws,
+        config={
+            "_resolved_skills": {
+                "menu": [{"name": "word-count"}, {"name": "hello-skill"}],
+                "files": {},
+            }
+        },
+    )
     tools = {t.name: t for t in create_skill_tools(ctx)}
     return ws, tools["use_skill"]
 
@@ -98,3 +114,17 @@ def test_prompt_only_skill_on_lite_tier_has_no_note(tmp_path):
     out = use_skill.invoke({"skill_name": "hello-skill"})
     assert "Just guidance." in out
     assert "request_workspace_upgrade" not in out  # no scripts/ → no note
+
+
+def test_stale_skill_bytes_are_inert_when_name_leaves_scoped_menu(tmp_path):
+    ws, use_skill = _use_skill(tmp_path, allowed=())
+    ws.backend.mkdir("skills/present-with-canvas")
+    ws.write_file(
+        "skills/present-with-canvas/SKILL.md",
+        "---\nname: present-with-canvas\n---\nSTALE-CANVAS-GUIDANCE",
+    )
+
+    out = use_skill.invoke({"skill_name": "present-with-canvas"})
+
+    assert "not available" in out.lower()
+    assert "STALE-CANVAS-GUIDANCE" not in out

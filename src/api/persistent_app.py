@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +37,7 @@ from .persistent_session import (
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
 from ..core.context import extract_summary_text, repair_tool_pairing
+from ..core.session_tool_overrides import validate_session_tool_overrides
 from ..core.workspace_backend import WorkspaceUnavailableError
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
@@ -145,6 +147,25 @@ _vm_upgrade_poll_timeout: int = int(os.environ.get("VM_UPGRADE_POLL_TIMEOUT", "9
 # dropped (token-stream pacing semantics).
 _SUBSCRIBER_QUEUE_MAXSIZE: int = 1000
 _subscribers: Dict[str, asyncio.Queue] = {}
+
+_CANVAS_AWARENESS_TTL_S: float = max(
+    15.0, min(60.0, float(os.environ.get("CANVAS_AWARENESS_TTL_S", "15")))
+)
+_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S = 0.5
+_CANVAS_AWARENESS_RENEW_MIN_INTERVAL_S = 1.0
+
+
+@dataclass(frozen=True)
+class _CanvasAwarenessLease:
+    task: asyncio.Task
+    params: Dict[str, Any]
+    renewed_at: float
+    validated_at: float
+
+
+_canvas_awareness: Dict[str, _CanvasAwarenessLease] = {}
+_canvas_control_validation_at: Dict[tuple[str, str], float] = {}
+_canvas_source_updates: Dict[str, tuple[str, int, str]] = {}
 
 # Idle keepalive on the control WS (see _run_subscriber_pump). Must be
 # shorter than the cockpit's CONTROL_WS_WATCHDOG_TIMEOUT_MS and any
@@ -1188,6 +1209,7 @@ def _session_backend_is_lite(config: Optional[Dict[str, Any]]) -> bool:
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
+_CANVAS_DISABLED_KEY = "_canvas_disabled"
 
 
 def _apply_session_tool_group_markers(
@@ -1202,6 +1224,7 @@ def _apply_session_tool_group_markers(
         "orchestrator": _FLEET_MANAGEMENT_DISABLED_KEY,
         "agent_catalog": _AGENT_CATALOG_DISABLED_KEY,
         "workflows": _WORKFLOWS_DISABLED_KEY,
+        "canvas": _CANVAS_DISABLED_KEY,
     }
     for group, marker in group_markers.items():
         if group not in tools:
@@ -1210,6 +1233,30 @@ def _apply_session_tool_group_markers(
             merged_config[marker] = True
         else:
             merged_config.pop(marker, None)
+
+
+def _sanitize_live_session_config_override(
+    config_override: Any,
+) -> Dict[str, Any]:
+    """Fence the live config surface before it reaches generic config loading.
+
+    Only the closed session-facing tool groups are mutable through this
+    WebSocket path.  Unknown categories retain the create endpoint's existing
+    ignore semantics, while a known group carrying an unknown or foreign tool
+    name raises.  Returning a copy keeps the caller-owned WebSocket payload
+    immutable.
+    """
+
+    if not isinstance(config_override, dict):
+        raise ValueError("Session config override must be an object")
+    sanitized = dict(config_override)
+    if "tools" in sanitized:
+        accepted_tools = validate_session_tool_overrides(sanitized)
+        if accepted_tools:
+            sanitized["tools"] = accepted_tools
+        else:
+            sanitized.pop("tools", None)
+    return sanitized
 
 
 async def _resolve_event_journal_epoch(postgres_conn: Any, thread_id: str) -> int:
@@ -1275,6 +1322,7 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
         tool_context = getattr(failed_session, "tool_context", None)
         if tool_context is not None:
             tool_context.citation_verdict_callback = None
+            tool_context.canvas_event_callback = None
         try:
             await failed_session.cleanup()
         except Exception as exc:
@@ -1294,6 +1342,7 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     _loop_interrupt_flag = None
     _hard_interrupt_event = None
     _loop_last_user_content = [""]
+    _clear_all_canvas_awareness()
     _subscribers.clear()
 
 
@@ -1316,6 +1365,8 @@ async def _attach_session(
     """
     global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
     global _event_writer
+
+    _clear_all_canvas_awareness()
 
     if _session is not None:
         raise RuntimeError(
@@ -1750,6 +1801,7 @@ async def _attach_session(
     # (so it's wired before the lazily-built CitationEngine is first used).
     if _session is not None and _session.tool_context is not None:
         _session.tool_context.citation_verdict_callback = _emit_citation_verdict
+        _session.tool_context.canvas_event_callback = _emit_canvas_event
 
     # Allocate one authoritative generation per runtime attach before the first
     # broadcast. This is unconditional even when the previous generation has no
@@ -2127,6 +2179,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     _loop_interrupt_flag = None
     _hard_interrupt_event = None
     _loop_last_user_content = [""]
+    _clear_all_canvas_awareness()
     _subscribers.clear()
 
     # Phase 2 event-log cursor reset. The next session attach reads the
@@ -2649,6 +2702,13 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                 if content and _loop_user_queue is not None:
                     await _accept_user_input(content)
 
+            elif method in {
+                "canvas.source_updated",
+                "canvas.user_editing",
+                "canvas.user_idle",
+            }:
+                await _handle_canvas_control(ws, data, client_id)
+
             elif method == "approve":
                 # Phase 3: resolve the most-recent-pending permission
                 # request in the DB. Cockpit can pass an explicit
@@ -2792,6 +2852,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
         # or out-of-band _terminate_session intervenes. We do NOT cancel
         # _loop_task here, and we do NOT schedule pod exit.
         _unsubscribe(client_id)
+        _clear_canvas_awareness(client_id)
         if not pump_task.done():
             pump_task.cancel()
             try:
@@ -3261,6 +3322,350 @@ def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
         )
     except Exception as e:
         logger.debug("citation.verdict broadcast failed (non-fatal): %s", e)
+
+
+def _emit_canvas_event(method: str, params: Dict[str, Any]) -> None:
+    """Route a committed tool-originated Canvas invalidation through `_broadcast`."""
+    if method not in {"canvas.updated", "canvas.cleared"}:
+        logger.warning("Ignored unsupported Canvas callback method: %s", method)
+        return
+    try:
+        _broadcast(method, params)
+    except Exception as exc:
+        # The orchestrator row is already committed. The Canvas tool treats this
+        # callback as best-effort and the Cockpit reconciles from REST.
+        logger.warning("Canvas invalidation broadcast failed: %s", exc)
+
+
+async def _current_canvas_for_control() -> dict[str, Any] | None:
+    """Load authoritative Canvas state with the attached delegated owner."""
+
+    if _session is None or _thread_id is None or _session.tool_context is None:
+        return None
+    context = _session.tool_context
+    user_id = str(context.user_id or "").strip()
+    if not user_id:
+        return None
+    config_name = str(context.config.get("agent_id") or _config_path or "persistent")
+    client = create_orchestrator_client_from_env(config_name, user_id=user_id)
+    try:
+        return await client.get_thread_canvas(_thread_id)
+    finally:
+        await client.close()
+
+
+def _validated_canvas_control_state(
+    data: Dict[str, Any], state: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Match an untrusted control frame to the exact authorized file state."""
+
+    if state is None or data.get("canvas_id") != "main":
+        return None
+    source = state.get("source")
+    revision = data.get("presentation_revision")
+    if (
+        not isinstance(source, dict)
+        or source.get("type") != "workspace_file"
+        or not isinstance(data.get("path"), str)
+        or data["path"] != source.get("path")
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision != state.get("presentation_revision")
+        or not isinstance(data.get("source_version"), str)
+        or data["source_version"] != state.get("source_version")
+    ):
+        return None
+    return state
+
+
+def _cancel_canvas_awareness(client_id: str) -> _CanvasAwarenessLease | None:
+    lease = _canvas_awareness.pop(client_id, None)
+    if lease is not None and lease.task is not asyncio.current_task():
+        lease.task.cancel()
+    return lease
+
+
+def _fan_out_canvas_idle(client_id: str, params: Dict[str, Any]) -> None:
+    _fan_out_live_frame(
+        {
+            "method": "canvas.user_idle",
+            "params": {**params, "sender_id": client_id},
+        }
+    )
+
+
+async def _expire_canvas_awareness(
+    client_id: str, editing_session_id: str, params: Dict[str, Any]
+) -> None:
+    try:
+        await asyncio.sleep(_CANVAS_AWARENESS_TTL_S)
+    except asyncio.CancelledError:
+        return
+    lease = _canvas_awareness.get(client_id)
+    if (
+        lease is None
+        or lease.task is not asyncio.current_task()
+        or lease.params.get("editing_session_id") != editing_session_id
+    ):
+        return
+    _canvas_awareness.pop(client_id, None)
+    _fan_out_canvas_idle(client_id, params)
+
+
+def _clear_canvas_awareness(client_id: str) -> None:
+    """Expire every courtesy lease owned by one disconnected connection."""
+
+    lease = _cancel_canvas_awareness(client_id)
+    if lease is not None:
+        _fan_out_canvas_idle(client_id, lease.params)
+    for key in [key for key in _canvas_control_validation_at if key[0] == client_id]:
+        _canvas_control_validation_at.pop(key, None)
+    _canvas_source_updates.pop(client_id, None)
+
+
+def _clear_all_canvas_awareness() -> None:
+    """Cancel leases without emitting across a detach/reattach boundary."""
+
+    leases = list(_canvas_awareness.values())
+    _canvas_awareness.clear()
+    _canvas_control_validation_at.clear()
+    _canvas_source_updates.clear()
+    for lease in leases:
+        lease.task.cancel()
+
+
+def _start_canvas_awareness(
+    client_id: str,
+    params: Dict[str, Any],
+    *,
+    renewed_at: float,
+    validated_at: float,
+) -> None:
+    editing_session_id = str(params["editing_session_id"])
+    task = asyncio.create_task(
+        _expire_canvas_awareness(client_id, editing_session_id, params),
+        name=f"canvas-awareness-{client_id[:8]}",
+    )
+    _canvas_awareness[client_id] = _CanvasAwarenessLease(
+        task=task,
+        params=params,
+        renewed_at=renewed_at,
+        validated_at=validated_at,
+    )
+    _fan_out_live_frame(
+        {
+            "method": "canvas.user_editing",
+            "params": {
+                **params,
+                "sender_id": client_id,
+                "ttl_ms": int(_CANVAS_AWARENESS_TTL_S * 1000),
+            },
+        }
+    )
+
+
+async def _handle_canvas_control(
+    ws: WebSocket, data: Dict[str, Any], client_id: str
+) -> bool:
+    """Handle validated edit invalidation and live-only awareness frames."""
+
+    method = data.get("method")
+    allowed = {
+        "canvas.source_updated",
+        "canvas.user_editing",
+        "canvas.user_idle",
+    }
+    if method not in allowed:
+        return False
+    expected_fields = {
+        "method",
+        "canvas_id",
+        "path",
+        "presentation_revision",
+        "source_version",
+    }
+    if method in {"canvas.user_editing", "canvas.user_idle"}:
+        expected_fields.add("editing_session_id")
+    if set(data) != expected_fields:
+        await _ws_send(
+            ws,
+            "error",
+            {
+                "code": "invalid_canvas_control",
+                "message": "Canvas control message is invalid",
+            },
+        )
+        return True
+    editing_session_id = data.get("editing_session_id")
+    if method in {"canvas.user_editing", "canvas.user_idle"} and (
+        not isinstance(editing_session_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", editing_session_id)
+    ):
+        await _ws_send(
+            ws,
+            "error",
+            {
+                "code": "invalid_canvas_control",
+                "message": "Canvas editing session is invalid",
+            },
+        )
+        return True
+    path = data.get("path")
+    revision = data.get("presentation_revision")
+    source_version = data.get("source_version")
+    if (
+        data.get("canvas_id") != "main"
+        or not isinstance(path, str)
+        or not 0 < len(path) <= 4096
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(source_version, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", source_version)
+    ):
+        await _ws_send(
+            ws,
+            "error",
+            {
+                "code": "invalid_canvas_control",
+                "message": "Canvas control message is invalid",
+            },
+        )
+        return True
+
+    now = asyncio.get_running_loop().time()
+    if method in {"canvas.user_editing", "canvas.user_idle"}:
+        lease = _canvas_awareness.get(client_id)
+        if lease is not None and all(
+            data.get(field) == lease.params.get(field)
+            for field in (
+                "canvas_id",
+                "path",
+                "presentation_revision",
+                "source_version",
+                "editing_session_id",
+            )
+        ):
+            if method == "canvas.user_idle":
+                _cancel_canvas_awareness(client_id)
+                _fan_out_canvas_idle(client_id, lease.params)
+                return True
+            if now - lease.validated_at < _CANVAS_AWARENESS_TTL_S:
+                if now - lease.renewed_at < _CANVAS_AWARENESS_RENEW_MIN_INTERVAL_S:
+                    # Exact duplicate/over-eager renewal: the current server TTL
+                    # is still live, so avoid task churn and redundant fan-out.
+                    return True
+                _cancel_canvas_awareness(client_id)
+                _start_canvas_awareness(
+                    client_id,
+                    lease.params,
+                    renewed_at=now,
+                    validated_at=lease.validated_at,
+                )
+                return True
+
+    source_identity: tuple[str, int, str] | None = None
+    if method == "canvas.source_updated":
+        source_identity = (path, revision, source_version)
+        if _canvas_source_updates.get(client_id) == source_identity:
+            # The successful save response may be retried. A real subsequent
+            # save advances the revision, so only the exact last accepted
+            # identity is safe to deduplicate locally.
+            return True
+
+        # Do not drop a distinct committed revision. Pace authoritative checks
+        # instead, bounding invalid/mismatched spam without losing a real save.
+        validation_key = (client_id, "source")
+        last_validation = _canvas_control_validation_at.get(validation_key)
+        if last_validation is not None:
+            remaining = _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S - (
+                now - last_validation
+            )
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                now = asyncio.get_running_loop().time()
+        _canvas_control_validation_at[validation_key] = now
+    else:
+        validation_key = (client_id, "awareness")
+        last_validation = _canvas_control_validation_at.get(validation_key)
+        if (
+            last_validation is not None
+            and now - last_validation < _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S
+        ):
+            await _ws_send(
+                ws,
+                "error",
+                {
+                    "code": "canvas_control_rate_limited",
+                    "message": "Canvas control messages are arriving too quickly",
+                },
+            )
+            return True
+        _canvas_control_validation_at[validation_key] = now
+
+    try:
+        state = await _current_canvas_for_control()
+    except Exception as exc:
+        logger.warning("Canvas control state validation failed: %s", exc)
+        await _ws_send(
+            ws,
+            "error",
+            {
+                "code": "canvas_control_unavailable",
+                "message": "Canvas state could not be validated",
+            },
+        )
+        return True
+    state = _validated_canvas_control_state(data, state)
+    if state is None:
+        await _ws_send(
+            ws,
+            "error",
+            {
+                "code": "canvas_control_stale",
+                "message": "Canvas state changed; reload before continuing",
+            },
+        )
+        return True
+
+    if method == "canvas.source_updated":
+        if _session is not None and _session.tool_context is not None:
+            _session.tool_context.invalidate_recent_read(path)
+        _broadcast(
+            "canvas.source_updated",
+            {
+                "canvas_id": "main",
+                "presentation_revision": state["presentation_revision"],
+                "source_type": "workspace_file",
+                "updated_at": state.get("updated_at"),
+            },
+        )
+        assert source_identity is not None
+        _canvas_source_updates[client_id] = source_identity
+        return True
+
+    awareness_params = {
+        "canvas_id": "main",
+        "path": path,
+        "presentation_revision": state["presentation_revision"],
+        "source_version": state["source_version"],
+        "editing_session_id": editing_session_id,
+    }
+    assert isinstance(editing_session_id, str)
+    previous = _cancel_canvas_awareness(client_id)
+    if previous is not None:
+        _fan_out_canvas_idle(client_id, previous.params)
+    if method == "canvas.user_idle":
+        _fan_out_canvas_idle(client_id, awareness_params)
+        return True
+
+    _start_canvas_awareness(
+        client_id,
+        awareness_params,
+        renewed_at=now,
+        validated_at=now,
+    )
+    return True
 
 
 async def _run_subscriber_pump(
@@ -4891,6 +5296,15 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
         return
 
     try:
+        config_override = _sanitize_live_session_config_override(config_override)
+        if not config_override:
+            await _ws_send(
+                ws,
+                "error",
+                {"message": "No supported session config fields were provided"},
+            )
+            return
+
         import dataclasses
 
         from ..core.loader import (
@@ -4918,7 +5332,13 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
             config_override.get("llm", {}).get("model")
             or config_override.get("auxiliary", {}).get("model")
             or any(k in env_block for k in embedding_env_keys)
+            # Tool changes are not credential-bearing, but they are an
+            # authorization boundary.  They must pass through the
+            # orchestrator's owner-grant validation and durable merge before
+            # this runtime reloads anything locally.
+            or config_override.get("tools")
         )
+        tools_update = bool(config_override.get("tools"))
         effective_override = config_override
         if _orchestrator_client and _thread_id and needs_enrichment:
             try:
@@ -4928,12 +5348,35 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 if enriched is not None:
                     effective_override = enriched
                 else:
+                    if tools_update:
+                        await _ws_send(
+                            ws,
+                            "error",
+                            {"message": "Session tool update was rejected"},
+                        )
+                        return
                     logger.warning(
                         "Orchestrator config enrichment failed; falling back to "
                         "raw override (custom endpoints may misroute)"
                     )
             except Exception:
+                if tools_update:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": "Session tool update could not be authorized"},
+                    )
+                    return
                 logger.warning("Config persistence to orchestrator failed (non-fatal)")
+        elif tools_update:
+            # A tool update without the authoritative orchestrator is unsafe:
+            # local registry loading cannot evaluate owner capability grants.
+            await _ws_send(
+                ws,
+                "error",
+                {"message": "Session tool update could not be authorized"},
+            )
+            return
 
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, effective_override)
@@ -5337,6 +5780,9 @@ async def _poll_workspace_ready(
         if vm_status == "ready" and ws.get("vm_ssh_host"):
             return {
                 "backend": "vm",
+                # Slice 1 has no trusted VM host-identity adapter.
+                "canvas_presentation_available": False,
+                "canvas_live_apps_available": False,
                 "remote": {
                     "host": ws["vm_ssh_host"],
                     "port": ws.get("vm_ssh_port", 22),
@@ -5363,6 +5809,14 @@ async def _poll_workspace_ready(
         if status == "ready" and ws.get("pod_ip"):
             return {
                 "backend": "sandbox",
+                # This is an orchestrator-attested capability, not a property
+                # inferred from the backend label or endpoint reachability.
+                "canvas_presentation_available": (
+                    ws.get("canvas_presentation_available") is True
+                ),
+                "canvas_live_apps_available": (
+                    ws.get("canvas_live_apps_available") is True
+                ),
                 "remote": {
                     "host": ws["pod_ip"],
                     "port": ws.get("pod_port") or 30022,
@@ -5587,6 +6041,15 @@ async def _handle_workspace_upgrade(
             max_retries=remote.get("max_retries", 5),
             retry_timeouts_as_booting=remote.get("retry_timeouts_as_booting", False),
             sudo_action=sudo_action,
+        )
+        # Capability is attested by the orchestrator from a paired generation
+        # and pinned workspace identity. Never infer it from "sandbox": a
+        # usable Docker workspace may intentionally lack Canvas attestation.
+        new_backend.supports_canvas_presentation = (
+            ws_config.get("canvas_presentation_available") is True
+        )
+        new_backend.supports_canvas_live_apps = (
+            ws_config.get("canvas_live_apps_available") is True
         )
 
         # 4. Connect the new backend now so the SEED copy (next) runs while BOTH

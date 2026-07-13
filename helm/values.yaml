@@ -322,6 +322,20 @@ cockpit:
   # Admin → Providers. See docs/features/db_backed_llm_config.md.
 
 # =============================================================================
+# Dynamic Canvas
+# =============================================================================
+canvas:
+  livePreview:
+    # -- Master capability gate for workspace-port live preview. The proxy,
+    # isolated viewer origin, and browser acceptance gates must all fail closed
+    # when this is false. Wildcard DNS/TLS and a viewer domain are intentionally
+    # configured by a later slice; enabling this flag alone exposes nothing.
+    enabled: false
+    # -- Additional workspace loopback ports which live preview must reject.
+    # The built-in control-port denylist remains enforced independently.
+    deniedPorts: []
+
+# =============================================================================
 # Auth — cockpit cookie BFF + (future) PAT system
 # =============================================================================
 # Knobs for the orchestrator's cookie-backed session layer for the cockpit.

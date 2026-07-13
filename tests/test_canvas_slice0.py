@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -371,7 +372,9 @@ def test_get_route_returns_204_for_absent_and_revalidates_present_state(
     )
     assert not_modified.status_code == 304
     assert not not_modified.content
-    assert len(owner_calls) == 3
+    # Present state is re-authorized after its potentially remote
+    # representation is materialized, including the conditional-GET path.
+    assert len(owner_calls) == 5
     assert all(call == (db, _THREAD_ID) for call in owner_calls)
 
 
@@ -424,7 +427,7 @@ def test_routes_fail_at_owner_gate_before_canvas_access(monkeypatch) -> None:
     assert db.acquire_count == 0
 
 
-def test_main_app_mounts_only_slice_zero_public_canvas_routes() -> None:
+def test_main_app_mounts_slice_one_canvas_routes() -> None:
     from main import app
 
     routes = {
@@ -435,10 +438,13 @@ def test_main_app_mounts_only_slice_zero_public_canvas_routes() -> None:
     path = "/api/persistent/threads/{thread_id}/canvases/main"
     assert ("GET", path) in routes
     assert ("DELETE", path) in routes
-    assert not any(
-        route_path.startswith("/api/internal/") and "canvas" in route_path
-        for _, route_path in routes
-    )
+    internal = "/api/internal/persistent/threads/{thread_id}/canvases/main"
+    assert ("GET", internal) in routes
+    assert ("DELETE", internal) in routes
+    assert (
+        "POST",
+        "/api/internal/persistent/threads/{thread_id}/canvases/main/set",
+    ) in routes
 
 
 def test_main_cors_exposes_canvas_etag_to_local_cockpit(monkeypatch) -> None:
@@ -458,14 +464,19 @@ def test_main_cors_exposes_canvas_etag_to_local_cockpit(monkeypatch) -> None:
         headers={"Origin": "http://localhost:4200"},
     )
     assert response.status_code == 200
-    assert response.headers["access-control-expose-headers"] == "ETag"
+    assert response.headers["access-control-expose-headers"] == (
+        "ETag, X-Canvas-Content-ETag"
+    )
     assert response.headers["access-control-allow-origin"] == "http://localhost:4200"
 
 
 def test_canvas_migration_has_thread_cascade_and_single_slot_key() -> None:
-    migration = Path(
-        "orchestrator/database/migrations/app/0058_canvases.sql"
-    ).read_text()
+    migration_path = Path("orchestrator/database/migrations/app/0058_canvases.sql")
+    migration_bytes = migration_path.read_bytes()
+    migration = migration_bytes.decode()
+    assert hashlib.sha256(migration_bytes).hexdigest() == (
+        "e04eb6a4e27a120ec86682226b3cfa9c6abeeeb64d53b9781a45ae83ef11cff5"
+    )
     assert (
         "thread_id             UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE"
         in migration
@@ -473,7 +484,6 @@ def test_canvas_migration_has_thread_cascade_and_single_slot_key() -> None:
     assert "UNIQUE (thread_id, canvas_id)" in migration
     assert "presentation_revision BIGINT NOT NULL DEFAULT 0" in migration
     assert "uq_canvases_origin_generation" in migration
-    assert "squawk-ignore require-concurrent-index-creation" in migration
 
 
 def test_browser_source_public_shape_does_not_expose_generation() -> None:

@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import socket
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
@@ -37,6 +38,120 @@ class SessionGrantDenied(Exception):
     RuntimeError so the pool-mode ``except RuntimeError`` attach handler doesn't
     swallow it. See docs/issues/session_permission_mode_grant_denied_ready_timeout.md.
     """
+
+
+class CanvasClientError(RuntimeError):
+    """A model-safe failure from a delegated Dynamic Canvas request.
+
+    ``httpx.HTTPStatusError`` includes the full request URL in its string form.
+    Persistent tool failures are returned to the model, so propagating that
+    exception would disclose internal service names, routes, and thread IDs.
+    Keep only a fixed public error code/message and the response status.
+    """
+
+    def __init__(
+        self, code: str, message: str, *, status_code: int | None = None
+    ) -> None:
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        status = f", HTTP {status_code}" if status_code is not None else ""
+        super().__init__(f"Canvas request failed [{code}{status}]: {message}")
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasClearResult:
+    """Internal clear response plus its non-model-visible mutation signal."""
+
+    state: dict[str, Any]
+    changed: bool
+
+
+# Server-side Canvas validation has a deliberately bounded but longer envelope
+# than this client's ordinary 30-second control-plane requests: capacity queue
+# waits plus pinned SFTP/rclone materialization and image validation can exceed
+# 30 seconds. Keep the delegated mutation/read request alive beyond that hard
+# path so the tool cannot report a timeout while the handler is still capable
+# of committing the presentation. End-to-end idempotency remains the stronger
+# future answer for an actual connection loss after commit.
+CANVAS_REQUEST_TIMEOUT_SECONDS = 120.0
+
+
+_CANVAS_PUBLIC_ERROR_MESSAGES = {
+    # This is deliberately a closed vocabulary. Orchestrator response bodies
+    # cross an internal-to-model trust boundary, so neither an arbitrary code
+    # nor an arbitrary detail.message may become a tool exception.
+    "canvas_alt_text_required": "Raster images require meaningful alt text",
+    "canvas_cleared": "Canvas is cleared",
+    "canvas_file_not_found": "Canvas file was not found",
+    "canvas_file_too_large": "Canvas content is too large",
+    "canvas_image_too_large": "Canvas image is too large",
+    "canvas_not_file": "Canvas is not file-backed",
+    "canvas_precondition_failed": "Canvas state changed; inspect it and try again",
+    "canvas_precondition_required": "Canvas state must be inspected before changing it",
+    "canvas_presentation_changed": "Canvas presentation changed; inspect it and try again",
+    "canvas_port_reserved": "Canvas application port is reserved",
+    "canvas_regular_file_required": "Canvas sources must be regular files",
+    "canvas_replaced": "Canvas source was replaced; inspect it and try again",
+    "canvas_symlink_rejected": "Canvas paths may not contain symlinks",
+    "invalid_canvas_image": "Canvas image is invalid or unsafe",
+    "invalid_canvas_entry_path": "Canvas application entry path is invalid",
+    "invalid_canvas_path": "File path is invalid",
+    "invalid_canvas_port": "Canvas application port is invalid",
+    "mime_renderer_mismatch": "The requested renderer is incompatible with the file",
+    "source_changed": "Workspace content changed; publish the Canvas again",
+    "unsupported_canvas_file": "File type is not supported by Canvas",
+    "workspace_generation_changed": "The workspace changed; publish the Canvas again",
+    "workspace_unavailable": "The workspace is unavailable",
+}
+
+
+def _canvas_response_error(response: httpx.Response) -> CanvasClientError:
+    """Map an HTTP response to a stable error without retaining its request URL."""
+
+    status_code = response.status_code
+    if status_code >= 500:
+        return CanvasClientError(
+            "canvas_service_unavailable",
+            "Canvas service is temporarily unavailable",
+            status_code=status_code,
+        )
+
+    default_code = {
+        400: "invalid_canvas_request",
+        401: "canvas_not_authorized",
+        403: "canvas_not_authorized",
+        404: "canvas_not_found",
+        409: "canvas_conflict",
+        413: "canvas_file_too_large",
+        422: "invalid_canvas_request",
+        429: "canvas_rate_limited",
+    }.get(status_code, "canvas_request_failed")
+    default_message = {
+        401: "Canvas authorization failed",
+        403: "Canvas authorization failed",
+        404: "Canvas resource was not found",
+        409: "Canvas state changed; inspect it and try again",
+        413: "Canvas content is too large",
+        429: "Canvas is temporarily rate limited",
+    }.get(status_code, "Canvas request was rejected")
+
+    code = default_code
+    message = default_message
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if isinstance(detail, dict):
+        candidate_code = detail.get("code")
+        if isinstance(candidate_code, str) and candidate_code in (
+            _CANVAS_PUBLIC_ERROR_MESSAGES
+        ):
+            code = candidate_code
+            message = _CANVAS_PUBLIC_ERROR_MESSAGES[candidate_code]
+
+    return CanvasClientError(code, message, status_code=status_code)
 
 
 class UploadedFileInfo(BaseModel):
@@ -470,6 +585,129 @@ class OrchestratorClient:
         except Exception as e:
             logger.debug(f"Failed to get thread workspace: {e}")
             return None
+
+    async def get_thread_canvas(self, thread_id: str) -> dict[str, Any] | None:
+        """Fetch the delegated user's logical ``main`` Canvas state.
+
+        ``204`` means the Canvas has never been created. HTTP and authorization
+        failures are deliberately raised so a tool call cannot misrepresent
+        them as an empty stage.
+        """
+        if not self._client:
+            await self.connect()
+        assert self._client is not None
+
+        url = (
+            f"{self.orchestrator_url}/api/internal/persistent/threads/{thread_id}"
+            "/canvases/main"
+        )
+        try:
+            response = await self._client.get(
+                url, timeout=CANVAS_REQUEST_TIMEOUT_SECONDS
+            )
+        except httpx.RequestError:
+            raise CanvasClientError(
+                "canvas_service_unavailable",
+                "Canvas service is temporarily unavailable",
+            ) from None
+        if response.status_code == 204:
+            return None
+        if not response.is_success:
+            raise _canvas_response_error(response)
+        try:
+            data = response.json()
+        except Exception:
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            ) from None
+        if not isinstance(data, dict):
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            )
+        return data
+
+    async def set_thread_canvas(
+        self, thread_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Set ``main`` through the internal delegated-user Canvas adapter."""
+        if not self._client:
+            await self.connect()
+        assert self._client is not None
+
+        url = (
+            f"{self.orchestrator_url}/api/internal/persistent/threads/{thread_id}"
+            "/canvases/main/set"
+        )
+        try:
+            response = await self._client.post(
+                url,
+                json=payload,
+                timeout=CANVAS_REQUEST_TIMEOUT_SECONDS,
+            )
+        except httpx.RequestError:
+            raise CanvasClientError(
+                "canvas_service_unavailable",
+                "Canvas service is temporarily unavailable",
+            ) from None
+        if not response.is_success:
+            raise _canvas_response_error(response)
+        try:
+            data = response.json()
+        except Exception:
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            ) from None
+        if not isinstance(data, dict):
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            )
+        return data
+
+    async def clear_thread_canvas(self, thread_id: str) -> CanvasClearResult | None:
+        """Clear ``main`` through the internal delegated-user Canvas adapter.
+
+        ``204`` means no Canvas row has ever existed. An already-cleared row is
+        returned with ``changed=False`` so the tool can expose its revisioned
+        logical state without emitting a duplicate transition invalidation.
+        """
+        if not self._client:
+            await self.connect()
+        assert self._client is not None
+
+        url = (
+            f"{self.orchestrator_url}/api/internal/persistent/threads/{thread_id}"
+            "/canvases/main"
+        )
+        try:
+            response = await self._client.delete(
+                url, timeout=CANVAS_REQUEST_TIMEOUT_SECONDS
+            )
+        except httpx.RequestError:
+            raise CanvasClientError(
+                "canvas_service_unavailable",
+                "Canvas service is temporarily unavailable",
+            ) from None
+        if response.status_code == 204:
+            return None
+        if not response.is_success:
+            raise _canvas_response_error(response)
+        try:
+            data = response.json()
+        except Exception:
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            ) from None
+        if not isinstance(data, dict):
+            raise CanvasClientError(
+                "invalid_canvas_response", "Canvas service returned an invalid response"
+            )
+        return CanvasClearResult(
+            state=data,
+            changed=(
+                response.headers.get("X-Canvas-Mutation-Changed", "true").lower()
+                == "true"
+            ),
+        )
 
     async def request_job_workspace_upgrade(
         self, job_id: str, target_tier: str = "sandbox"
@@ -1422,7 +1660,9 @@ class OrchestratorClient:
             return None
 
 
-def create_orchestrator_client_from_env(config_name: str) -> OrchestratorClient:
+def create_orchestrator_client_from_env(
+    config_name: str, *, user_id: str | None = None
+) -> OrchestratorClient:
     """Create an OrchestratorClient from environment variables.
 
     Optional environment variables:
@@ -1433,6 +1673,8 @@ def create_orchestrator_client_from_env(config_name: str) -> OrchestratorClient:
 
     Args:
         config_name: Agent configuration name
+        user_id: Optional delegated persistent-session owner UUID. When set,
+            the client sends it alongside the internal service credential.
 
     Returns:
         OrchestratorClient configured from environment
@@ -1454,4 +1696,5 @@ def create_orchestrator_client_from_env(config_name: str) -> OrchestratorClient:
         pod_port=pod_port,
         hostname=hostname,
         config_name=config_name,
+        user_id=user_id,
     )

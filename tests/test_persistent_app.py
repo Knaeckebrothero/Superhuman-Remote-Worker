@@ -7,11 +7,12 @@ on_tool_result truncation, check_interrupt closure, WS message routing,
 health endpoints, _ws_send, create_persistent_app, on_turn callbacks.
 """
 
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call as mock_call, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -1587,6 +1588,8 @@ class TestPollWorkspaceReady:
             "vm_ssh_host": "10.0.0.5",
             "vm_ssh_port": 2222,
             "git_remote_url": "http://gitea/repo",
+            "canvas_presentation_available": True,
+            "canvas_live_apps_available": True,
         }
 
         result = await _poll_workspace_ready(client, "tid", timeout=5)
@@ -1595,6 +1598,8 @@ class TestPollWorkspaceReady:
         assert result["backend"] == "vm"
         assert result["remote"]["host"] == "10.0.0.5"
         assert result["remote"]["port"] == 2222
+        assert result["canvas_presentation_available"] is False
+        assert result["canvas_live_apps_available"] is False
 
     @pytest.mark.asyncio
     async def test_returns_container_config_when_ready(self):
@@ -1604,6 +1609,8 @@ class TestPollWorkspaceReady:
             "status": "ready",
             "pod_ip": "172.16.0.10",
             "git_remote_url": "http://gitea/repo",
+            "canvas_presentation_available": True,
+            "canvas_live_apps_available": True,
         }
 
         result = await _poll_workspace_ready(client, "tid", timeout=5)
@@ -1612,6 +1619,23 @@ class TestPollWorkspaceReady:
         assert result["backend"] == "sandbox"
         assert result["remote"]["host"] == "172.16.0.10"
         assert result["remote"]["port"] == 30022
+        assert result["canvas_presentation_available"] is True
+        assert result["canvas_live_apps_available"] is True
+
+    @pytest.mark.asyncio
+    async def test_container_without_attestation_disables_canvas(self):
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {
+            "status": "ready",
+            "pod_ip": "172.16.0.10",
+        }
+
+        result = await _poll_workspace_ready(client, "tid", timeout=5)
+
+        assert result is not None
+        assert result["backend"] == "sandbox"
+        assert result["canvas_presentation_available"] is False
+        assert result["canvas_live_apps_available"] is False
 
     @pytest.mark.asyncio
     async def test_returns_none_on_status_none_no_vm(self):
@@ -2611,6 +2635,58 @@ class TestHandleWorkspaceUpgradeVm:
         client.abort_thread_vm_upgrade.assert_not_called()
 
 
+class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("attested", "live_attested"),
+        [(True, True), (True, False), (False, False)],
+    )
+    async def test_live_swap_uses_attested_canvas_capability(
+        self, attested, live_attested
+    ):
+        import sys
+
+        ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = True
+        client.get_thread_workspace.return_value = {}
+        old_backend = SimpleNamespace(supports_shell=False)
+        session = MagicMock()
+        session.config.extra = {"shell": {}}
+        session.workspace_manager.backend = old_backend
+        session.swap_backend = MagicMock()
+        session.resetup_tools_for_backend = MagicMock()
+        new_backend = MagicMock()
+        new_backend.connect = MagicMock()
+        remote_module = MagicMock()
+        remote_module.RemoteBackend.return_value = new_backend
+        workspace = {
+            "backend": "sandbox",
+            "canvas_presentation_available": attested,
+            "canvas_live_apps_available": live_attested,
+            "remote": {"host": "workspace.test", "port": 30022},
+        }
+
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._orchestrator_client", client),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._poll_workspace_ready",
+                new_callable=AsyncMock,
+                return_value=workspace,
+            ),
+            patch.dict(sys.modules, {"src.core.backends.remote": remote_module}),
+            patch("src.core.backends.seed.seed_workspace", return_value=1),
+        ):
+            await _handle_workspace_upgrade(ws, target_tier="sandbox")
+
+        assert new_backend.supports_canvas_presentation is attested
+        assert new_backend.supports_canvas_live_apps is live_attested
+        session.swap_backend.assert_called_once_with(new_backend)
+        session.resetup_tools_for_backend.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # 3.17 _ws_send()
 # ---------------------------------------------------------------------------
@@ -3592,6 +3668,199 @@ class TestCreatePersistentApp:
         assert mod._thread_id is None
 
 
+class TestCanvasControlMessages:
+    @staticmethod
+    def _state():
+        return {
+            "canvas_id": "main",
+            "source": {"type": "workspace_file", "path": "output/report.md"},
+            "presentation_revision": 4,
+            "source_version": "sha256:" + "a" * 64,
+            "updated_at": "2026-07-13T12:00:00Z",
+        }
+
+    @staticmethod
+    def _frame(
+        method: str,
+        *,
+        editing_session_id: str | None = None,
+        revision: int = 4,
+        version_char: str = "a",
+    ):
+        frame = {
+            "method": method,
+            "canvas_id": "main",
+            "path": "output/report.md",
+            "presentation_revision": revision,
+            "source_version": "sha256:" + version_char * 64,
+        }
+        if editing_session_id is not None:
+            frame["editing_session_id"] = editing_session_id
+        return frame
+
+    @pytest.mark.asyncio
+    async def test_source_updated_invalidates_read_and_uses_distinct_event(
+        self, monkeypatch
+    ):
+        import src.api.persistent_app as mod
+
+        mod._clear_all_canvas_awareness()
+        tool_context = MagicMock()
+        monkeypatch.setattr(mod, "_session", SimpleNamespace(tool_context=tool_context))
+        next_state = {
+            **self._state(),
+            "presentation_revision": 5,
+            "source_version": "sha256:" + "b" * 64,
+            "updated_at": "2026-07-13T12:00:01Z",
+        }
+        state_loader = AsyncMock(side_effect=[self._state(), next_state])
+        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
+        monkeypatch.setattr(mod, "_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S", 0)
+        broadcast = MagicMock()
+        monkeypatch.setattr(mod, "_broadcast", broadcast)
+
+        try:
+            handled = await mod._handle_canvas_control(
+                MagicMock(), self._frame("canvas.source_updated"), "client-a"
+            )
+            # An exact retry is deduplicated, while a real subsequent save has
+            # a new revision and must invalidate again.
+            assert await mod._handle_canvas_control(
+                MagicMock(), self._frame("canvas.source_updated"), "client-a"
+            )
+            assert await mod._handle_canvas_control(
+                MagicMock(),
+                self._frame("canvas.source_updated", revision=5, version_char="b"),
+                "client-a",
+            )
+        finally:
+            mod._clear_all_canvas_awareness()
+
+        assert handled is True
+        assert state_loader.await_count == 2
+        assert tool_context.invalidate_recent_read.call_args_list == [
+            mock_call("output/report.md"),
+            mock_call("output/report.md"),
+        ]
+        assert broadcast.call_args_list == [
+            mock_call(
+                "canvas.source_updated",
+                {
+                    "canvas_id": "main",
+                    "presentation_revision": 4,
+                    "source_type": "workspace_file",
+                    "updated_at": "2026-07-13T12:00:00Z",
+                },
+            ),
+            mock_call(
+                "canvas.source_updated",
+                {
+                    "canvas_id": "main",
+                    "presentation_revision": 5,
+                    "source_type": "workspace_file",
+                    "updated_at": "2026-07-13T12:00:01Z",
+                },
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_malformed_source_update_is_rejected_before_validation(
+        self, monkeypatch
+    ):
+        import src.api.persistent_app as mod
+
+        state_loader = AsyncMock()
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
+        monkeypatch.setattr(mod, "_ws_send", send)
+        malformed = self._frame("canvas.source_updated")
+        malformed["presentation_revision"] = True
+        ws = MagicMock()
+
+        assert await mod._handle_canvas_control(ws, malformed, "client-b")
+
+        state_loader.assert_not_awaited()
+        send.assert_awaited_once_with(
+            ws,
+            "error",
+            {
+                "code": "invalid_canvas_control",
+                "message": "Canvas control message is invalid",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_awareness_is_one_live_only_lease_and_local_renew_idle(
+        self, monkeypatch
+    ):
+        import src.api.persistent_app as mod
+
+        mod._clear_all_canvas_awareness()
+        state_loader = AsyncMock(return_value=self._state())
+        frames = []
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
+        monkeypatch.setattr(mod, "_fan_out_live_frame", frames.append)
+        monkeypatch.setattr(mod, "_ws_send", send)
+        monkeypatch.setattr(mod, "_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S", 0)
+        try:
+            first = self._frame(
+                "canvas.user_editing", editing_session_id="editor_session_a"
+            )
+            assert await mod._handle_canvas_control(MagicMock(), first, "client-a")
+            assert state_loader.await_count == 1
+            assert list(mod._canvas_awareness) == ["client-a"]
+            assert frames[-1]["method"] == "canvas.user_editing"
+            assert frames[-1]["params"]["editing_session_id"] == "editor_session_a"
+            assert frames[-1]["params"]["ttl_ms"] >= 15_000
+
+            # Exact rapid renewal is deduplicated locally, without another
+            # delegated orchestrator request or another task/lease.
+            assert await mod._handle_canvas_control(MagicMock(), first, "client-a")
+            assert state_loader.await_count == 1
+            assert len(mod._canvas_awareness) == 1
+
+            # Local renewals periodically revalidate ownership/current state;
+            # they cannot keep a revoked lease alive forever.
+            from dataclasses import replace
+
+            lease = mod._canvas_awareness["client-a"]
+            mod._canvas_awareness["client-a"] = replace(
+                lease,
+                validated_at=(
+                    asyncio.get_running_loop().time() - mod._CANVAS_AWARENESS_TTL_S - 1
+                ),
+            )
+            assert await mod._handle_canvas_control(MagicMock(), first, "client-a")
+            assert state_loader.await_count == 2
+            assert len(mod._canvas_awareness) == 1
+
+            replacement = self._frame(
+                "canvas.user_editing", editing_session_id="editor_session_b"
+            )
+            assert await mod._handle_canvas_control(
+                MagicMock(), replacement, "client-a"
+            )
+            assert state_loader.await_count == 3
+            assert len(mod._canvas_awareness) == 1
+            assert frames[-2]["method"] == "canvas.user_idle"
+            assert frames[-2]["params"]["editing_session_id"] == "editor_session_a"
+            assert "ttl_ms" not in frames[-2]["params"]
+            assert frames[-1]["params"]["editing_session_id"] == "editor_session_b"
+
+            idle = self._frame(
+                "canvas.user_idle", editing_session_id="editor_session_b"
+            )
+            assert await mod._handle_canvas_control(MagicMock(), idle, "client-a")
+            assert state_loader.await_count == 3
+            assert mod._canvas_awareness == {}
+            assert frames[-1]["method"] == "canvas.user_idle"
+            assert "ttl_ms" not in frames[-1]["params"]
+            send.assert_not_awaited()
+        finally:
+            mod._clear_all_canvas_awareness()
+
+
 # ---------------------------------------------------------------------------
 # Auxiliary + embedding hot-swap in _handle_config_update
 # ---------------------------------------------------------------------------
@@ -3635,6 +3904,60 @@ class TestHandleConfigUpdateEnrichmentGate:
                 f"Embedding env key {key} must be in the gate's "
                 "credential-bearing-keys tuple."
             )
+
+    def test_gate_checks_tool_updates_before_local_reload(self):
+        from inspect import getsource
+
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert 'or config_override.get("tools")' in src
+        assert src.index("update_thread_config(") < src.index(
+            "resetup_tools_for_backend()"
+        )
+
+    def test_live_tool_override_sanitizer_keeps_only_closed_session_groups(self):
+        from src.api.persistent_app import _sanitize_live_session_config_override
+
+        original = {
+            "llm": {"temperature": 0.2},
+            "tools": {
+                "canvas": ["get_canvas"],
+                "shell": ["run_command"],
+            },
+        }
+        sanitized = _sanitize_live_session_config_override(original)
+
+        assert sanitized == {
+            "llm": {"temperature": 0.2},
+            "tools": {"canvas": ["get_canvas"]},
+        }
+        assert original["tools"]["shell"] == ["run_command"]
+
+    @pytest.mark.asyncio
+    async def test_live_cross_category_tool_smuggling_never_reloads_tools(
+        self, monkeypatch
+    ):
+        import src.api.persistent_app as mod
+
+        session = SimpleNamespace(resetup_tools_for_backend=MagicMock())
+        orchestrator_client = SimpleNamespace(update_thread_config=AsyncMock())
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_session", session)
+        monkeypatch.setattr(mod, "_orchestrator_client", orchestrator_client)
+        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod, "_ws_send", send)
+
+        await mod._handle_config_update(
+            MagicMock(), {"tools": {"canvas": ["run_command"]}}
+        )
+
+        orchestrator_client.update_thread_config.assert_not_awaited()
+        session.resetup_tools_for_backend.assert_not_called()
+        send.assert_awaited_once()
+        event, payload = send.await_args.args[1:]
+        assert event == "error"
+        assert "run_command" in payload["message"]
 
     def test_rebuilds_auxiliary_llm_from_override(self):
         """When auxiliary section is in the enriched override, a session-

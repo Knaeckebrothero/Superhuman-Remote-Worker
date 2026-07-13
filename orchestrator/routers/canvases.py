@@ -1,31 +1,119 @@
-"""Owner-facing Dynamic Canvas state routes (Slice 0).
-
-Only authoritative state reads and conditional clear are public in this slice.
-There is intentionally no public source setter, no internal agent adapter, and
-no file/live-app content route until a usable source validator ships.
-"""
+"""Dynamic Canvas state, file content, and delegated-agent adapters."""
 
 from __future__ import annotations
 
-from typing import Any
+from email.utils import format_datetime
+from email.utils import parsedate_to_datetime
+from pathlib import PurePosixPath
+import re
+import secrets
+from tempfile import SpooledTemporaryFile
+from typing import Any, Literal
+from urllib.parse import quote, urlencode
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from security.access import require_thread_owner
+from security.access import require_internal, require_thread_owner
 from services.canvas import (
+    CanvasCapabilities,
+    CanvasEditError,
     CanvasPreconditionFailed,
     CanvasPreconditionRequired,
     CanvasPublicState,
+    CanvasRecord,
+    CanvasRenderer,
     CanvasService,
+    CanvasSetInput,
+    WorkspaceAppSource,
+    WorkspaceFileSource,
     build_public_canvas_representation,
+)
+from services.canvas_apps import (
+    CanvasAppError,
+    ThreadWorkspaceAppGateway,
+    canvas_live_preview_enabled,
+)
+from services.canvas_files import (
+    MAX_TEXT_BYTES,
+    CanvasFileError,
+    CanvasResponseLease,
+    ThreadWorkspaceFileGateway,
+    ValidatedCanvasFile,
+    acquire_canvas_response_lease,
+    current_workspace_generation,
 )
 
 router = APIRouter(
     prefix="/api/persistent/threads/{thread_id}/canvases",
     tags=["Dynamic Canvas"],
 )
+internal_router = APIRouter(
+    prefix="/api/internal/persistent/threads/{thread_id}/canvases",
+    tags=["Dynamic Canvas (internal)"],
+)
 
 _STATE_CACHE_CONTROL = "private, no-cache"
+_CONTENT_CACHE_CONTROL = "private, no-cache"
+
+
+class _LeasedContentResponse(Response):
+    """Keep a Canvas buffer lease until the body is sent or cancelled."""
+
+    def __init__(self, *args: Any, lease: CanvasResponseLease, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._canvas_lease = lease
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._canvas_lease.release()
+
+
+class CanvasSetRequest(BaseModel):
+    """Closed flat tool transport; no caller-owned context or address fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_type: Literal["workspace_file", "workspace_port"]
+    path: str | None = Field(default=None, min_length=1, max_length=4096)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    entry_path: str | None = Field(default=None, min_length=1, max_length=2048)
+    title: str | None = Field(default=None, max_length=200)
+    renderer: CanvasRenderer = "auto"
+    editable: bool = False
+    alt_text: str | None = Field(default=None, max_length=1000)
+    new_app: bool = False
+
+    @field_validator("title")
+    @classmethod
+    def _nonblank_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("title must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def _source_fields_do_not_mix(self) -> "CanvasSetRequest":
+        if self.source_type == "workspace_file":
+            if self.path is None:
+                raise ValueError("workspace_file requires path")
+            if self.port is not None or self.entry_path is not None or self.new_app:
+                raise ValueError("workspace_file does not accept live-app fields")
+            return self
+
+        if self.port is None:
+            raise ValueError("workspace_port requires port")
+        if self.path is not None or self.alt_text is not None:
+            raise ValueError("workspace_port does not accept file fields")
+        if self.renderer != "auto" or self.editable:
+            raise ValueError(
+                "workspace_port requires renderer='auto' and editable=false"
+            )
+        return self
 
 
 def _get_db() -> Any:
@@ -40,28 +128,40 @@ def _get_canvas_service(db: Any) -> CanvasService:
     return CanvasService(db)
 
 
-def _state_response(payload: bytes, etag: str, *, status_code: int = 200) -> Response:
+def _get_file_gateway(db: Any | None = None) -> ThreadWorkspaceFileGateway:
+    return ThreadWorkspaceFileGateway(
+        thread_loader=getattr(db, "get_thread", None) if db is not None else None
+    )
+
+
+def _get_app_gateway(db: Any | None = None) -> ThreadWorkspaceAppGateway:
+    return ThreadWorkspaceAppGateway(
+        thread_loader=getattr(db, "get_thread", None) if db is not None else None
+    )
+
+
+def _state_response(
+    payload: bytes,
+    etag: str,
+    *,
+    status_code: int = 200,
+    extra_headers: dict[str, str] | None = None,
+) -> Response:
+    headers = {"ETag": etag, "Cache-Control": _STATE_CACHE_CONTROL}
+    headers.update(extra_headers or {})
     return Response(
         content=payload,
         status_code=status_code,
         media_type="application/json",
-        headers={
-            "ETag": etag,
-            "Cache-Control": _STATE_CACHE_CONTROL,
-        },
+        headers=headers,
     )
 
 
 def _no_content_response() -> Response:
-    return Response(
-        status_code=204,
-        headers={"Cache-Control": _STATE_CACHE_CONTROL},
-    )
+    return Response(status_code=204, headers={"Cache-Control": _STATE_CACHE_CONTROL})
 
 
 def _if_none_match_matches(header_value: str | None, current_etag: str) -> bool:
-    """Apply weak comparison for a conditional GET (RFC 9110 section 13.1.2)."""
-
     if not header_value:
         return False
     for candidate in header_value.split(","):
@@ -75,24 +175,248 @@ def _if_none_match_matches(header_value: str | None, current_etag: str) -> bool:
     return False
 
 
+def _raise_file_error(error: CanvasFileError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": error.message},
+    ) from error
+
+
+def _raise_edit_error(error: CanvasEditError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": error.message},
+    ) from error
+
+
+def _raise_app_error(error: CanvasAppError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": error.message},
+    ) from error
+
+
+def _required_edit_preconditions(request: Request) -> tuple[str, int]:
+    """Parse both conditional-save headers without touching the body."""
+
+    content_etag = request.headers.get("If-Match")
+    revision = request.headers.get("X-Canvas-Presentation-Revision")
+    if content_etag is None or revision is None:
+        raise CanvasEditError(
+            428,
+            "canvas_precondition_required",
+            "If-Match and X-Canvas-Presentation-Revision are required",
+        )
+    value = content_etag.strip()
+    if not value or not revision.strip():
+        raise CanvasEditError(
+            400,
+            "invalid_canvas_precondition",
+            "Canvas edit precondition headers are malformed",
+        )
+    if not re.fullmatch(r'"sha256:[0-9a-f]{64}"', value):
+        raise CanvasEditError(
+            400,
+            "invalid_canvas_precondition",
+            "If-Match must contain one quoted strong Canvas content hash",
+        )
+    if not re.fullmatch(r"[1-9][0-9]*", revision.strip()):
+        raise CanvasEditError(
+            400,
+            "invalid_canvas_precondition",
+            "X-Canvas-Presentation-Revision must be a positive integer",
+        )
+    return value[1:-1], int(revision)
+
+
+async def _read_bounded_edit_body(request: Request) -> bytes:
+    """Spool one bounded request before any coordinator or Canvas row lock."""
+
+    content_encoding = request.headers.get("Content-Encoding")
+    if content_encoding is not None and content_encoding.strip().lower() != "identity":
+        raise CanvasFileError(
+            415,
+            "unsupported_canvas_content_encoding",
+            "Canvas edits require identity content encoding",
+        )
+
+    raw_length = request.headers.get("Content-Length")
+    declared: int | None = None
+    if raw_length is not None:
+        try:
+            declared = int(raw_length)
+        except ValueError as exc:
+            raise CanvasFileError(
+                400, "invalid_canvas_content", "Content-Length is invalid"
+            ) from exc
+        if declared < 0:
+            raise CanvasFileError(
+                400, "invalid_canvas_content", "Content-Length is invalid"
+            )
+        if declared > MAX_TEXT_BYTES:
+            raise CanvasFileError(
+                413, "canvas_file_too_large", "Canvas text content is too large"
+            )
+
+    spool = SpooledTemporaryFile(max_size=min(MAX_TEXT_BYTES, 256 * 1024), mode="w+b")
+    total = 0
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > MAX_TEXT_BYTES:
+                raise CanvasFileError(
+                    413, "canvas_file_too_large", "Canvas text content is too large"
+                )
+            spool.write(chunk)
+        if declared is not None and declared != total:
+            raise CanvasFileError(
+                400,
+                "invalid_canvas_content",
+                "Content-Length does not match the received Canvas content",
+            )
+        spool.seek(0)
+        return spool.read()
+    finally:
+        spool.close()
+
+
+async def _require_empty_refresh_body(request: Request) -> None:
+    """Reject source/path payloads; refresh derives everything from state."""
+
+    raw_length = request.headers.get("Content-Length")
+    if raw_length is not None:
+        try:
+            declared = int(raw_length)
+        except ValueError as exc:
+            raise CanvasFileError(
+                400, "invalid_canvas_content", "Content-Length is invalid"
+            ) from exc
+        if declared != 0:
+            raise CanvasFileError(
+                400,
+                "invalid_canvas_refresh",
+                "Canvas refresh does not accept a request body",
+            )
+    async for chunk in request.stream():
+        if chunk:
+            raise CanvasFileError(
+                400,
+                "invalid_canvas_refresh",
+                "Canvas refresh does not accept a request body",
+            )
+
+
+def _content_url(thread_id: str, record: CanvasRecord) -> str:
+    assert record.source_fingerprint is not None
+    assert record.source_version is not None
+    query = urlencode(
+        {
+            "presentation_revision": record.presentation_revision,
+            "source_fingerprint": record.source_fingerprint,
+            "source_version": record.source_version,
+            "ngsw-bypass": "true",
+        }
+    )
+    return (
+        f"/api/persistent/threads/{quote(thread_id, safe='')}/canvases/main/content"
+        f"?{query}"
+    )
+
+
+async def _represent(
+    thread_id: str,
+    thread: dict[str, Any],
+    record: CanvasRecord,
+    *,
+    browser_content_url: bool,
+    db: Any | None = None,
+):
+    status = "cleared" if record.source is None else "unavailable"
+    capabilities = CanvasCapabilities()
+    content_url = None
+    if isinstance(record.source, WorkspaceFileSource):
+        try:
+            materialized = await _get_file_gateway(db).materialize_current(
+                thread, record
+            )
+            if materialized.source_version == record.source_version:
+                status = "ready"
+                capabilities = CanvasCapabilities(
+                    can_edit=(
+                        record.editable
+                        and _get_file_gateway(db).supports_editing(thread, record)
+                    )
+                )
+                if browser_content_url:
+                    content_url = _content_url(thread_id, record)
+            else:
+                status = "source_changed"
+        except CanvasFileError as exc:
+            if exc.code == "source_changed":
+                status = "source_changed"
+            elif exc.code in {
+                "workspace_unavailable",
+                "workspace_generation_changed",
+                "canvas_file_not_found",
+            }:
+                status = "unavailable"
+            else:
+                status = "error"
+    elif isinstance(record.source, WorkspaceAppSource):
+        # Slice 3A exposes only callable state/status. Viewer sessions and
+        # iframe URLs arrive with the isolated-origin proxy; never manufacture
+        # a same-origin fallback while that boundary is absent or disabled.
+        if canvas_live_preview_enabled():
+            status = await _get_app_gateway(db).status_for_record(thread, record)
+    return build_public_canvas_representation(
+        record,
+        status=status,
+        capabilities=capabilities,
+        content_url=content_url,
+    )
+
+
+async def _require_delegated_owner(
+    request: Request, db: Any, thread_id: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    await require_internal(request)
+    delegated_id = request.headers.get("X-MCP-User-Id", "").strip()
+    if not delegated_id:
+        raise HTTPException(status_code=401, detail="Delegated user is required")
+    user, thread = await require_thread_owner(request, db, thread_id)
+    if str(user.get("id") or "") != delegated_id:
+        raise HTTPException(status_code=401, detail="Delegated user does not match")
+    return user, thread
+
+
 @router.get(
     "/main",
     response_model=CanvasPublicState,
     responses={
-        204: {"description": "No Canvas has been created for this thread"},
-        304: {"description": "The caller's cached representation is current"},
+        204: {"description": "No Canvas exists"},
+        304: {"description": "Not modified"},
     },
 )
 async def get_main_canvas(thread_id: str, request: Request) -> Response:
-    """Return authoritative state, or 204 if this thread never had a Canvas."""
-
     db = _get_db()
-    await require_thread_owner(request, db, thread_id)
+    _, thread = await require_thread_owner(request, db, thread_id)
     record = await _get_canvas_service(db).get(thread_id)
     if record is None:
         return _no_content_response()
-
-    representation = build_public_canvas_representation(record)
+    representation = await _represent(
+        thread_id, thread, record, browser_content_url=True, db=db
+    )
+    await require_thread_owner(request, db, thread_id)
+    latest = await _get_canvas_service(db).get(thread_id)
+    if (
+        latest is not None
+        and latest.presentation_revision != record.presentation_revision
+    ):
+        record = latest
+        representation = await _represent(
+            thread_id, thread, record, browser_content_url=True, db=db
+        )
+        await require_thread_owner(request, db, thread_id)
     if _if_none_match_matches(
         request.headers.get("If-None-Match"), representation.etag
     ):
@@ -109,51 +433,644 @@ async def get_main_canvas(thread_id: str, request: Request) -> Response:
 @router.delete(
     "/main",
     response_model=CanvasPublicState,
-    responses={
-        204: {"description": "Canvas was absent or already cleared"},
-        412: {"description": "If-Match does not match current Canvas state"},
-        428: {"description": "If-Match is required for a populated Canvas"},
-    },
+    responses={204: {"description": "Absent/already cleared"}, 412: {}, 428: {}},
 )
 async def clear_main_canvas(thread_id: str, request: Request) -> Response:
-    """Clear the current source without deleting it.
-
-    A populated row requires the exact current public state ETag.  An absent or
-    already-cleared row is an idempotent 204 even without ``If-Match``.
-    """
-
     db = _get_db()
-    await require_thread_owner(request, db, thread_id)
+    _, thread = await require_thread_owner(request, db, thread_id)
     service = _get_canvas_service(db)
+    current = await service.get(thread_id)
+    if current is None or current.source is None:
+        return _no_content_response()
+    visible = await _represent(
+        thread_id, thread, current, browser_content_url=True, db=db
+    )
+
+    def visible_builder(record: CanvasRecord):
+        content_url = (
+            _content_url(thread_id, record)
+            if visible.state.content_url is not None
+            and isinstance(record.source, WorkspaceFileSource)
+            else None
+        )
+        return build_public_canvas_representation(
+            record,
+            status=visible.state.status,
+            capabilities=visible.state.capabilities,
+            content_url=content_url,
+        )
+
+    await require_thread_owner(request, db, thread_id)
     try:
         mutation = await service.clear(
             thread_id,
             expected_etag=request.headers.get("If-Match"),
+            representation_builder=visible_builder,
         )
     except CanvasPreconditionRequired as exc:
         raise HTTPException(
             status_code=428,
-            detail={
-                "code": "canvas_precondition_required",
-                "message": str(exc),
-            },
+            detail={"code": "canvas_precondition_required", "message": str(exc)},
         ) from exc
     except CanvasPreconditionFailed as exc:
         raise HTTPException(
             status_code=412,
-            detail={
-                "code": "canvas_precondition_failed",
-                "message": str(exc),
-            },
+            detail={"code": "canvas_precondition_failed", "message": str(exc)},
         ) from exc
-
     if not mutation.changed:
         return _no_content_response()
-
-    # ``changed`` implies a committed cleared record.
     assert mutation.record is not None
     representation = build_public_canvas_representation(mutation.record)
     return _state_response(representation.payload, representation.etag)
 
 
-__all__ = ["router"]
+def _verify_content_identity(
+    record: CanvasRecord | None,
+    *,
+    presentation_revision: int,
+    source_fingerprint: str,
+    source_version: str,
+) -> CanvasRecord:
+    if record is None or record.source is None:
+        raise CanvasFileError(409, "canvas_cleared", "Canvas is cleared")
+    if not isinstance(record.source, WorkspaceFileSource):
+        raise CanvasFileError(409, "canvas_replaced", "Canvas source was replaced")
+    if source_fingerprint != record.source_fingerprint:
+        raise CanvasFileError(409, "canvas_replaced", "Canvas source was replaced")
+    if presentation_revision != record.presentation_revision:
+        raise CanvasFileError(
+            409,
+            "canvas_presentation_changed",
+            "Canvas presentation changed; reload its current state",
+        )
+    if source_version != record.source_version:
+        raise CanvasFileError(
+            409,
+            "canvas_presentation_changed",
+            "Canvas content version changed; reload its current state",
+        )
+    return record
+
+
+def _parse_single_range(value: str, size: int) -> tuple[int, int]:
+    if size <= 0 or not value.startswith("bytes=") or "," in value:
+        raise CanvasFileError(416, "invalid_range", "Only one byte range is supported")
+    spec = value[6:].strip()
+    match = re.fullmatch(r"([0-9]*)-([0-9]*)", spec)
+    if match is None or not any(match.groups()):
+        raise CanvasFileError(416, "invalid_range", "Byte range is invalid")
+    start_raw, end_raw = match.groups()
+    try:
+        if not start_raw:
+            suffix = int(end_raw)
+            if suffix <= 0:
+                raise ValueError
+            start, end = max(0, size - suffix), size - 1
+        else:
+            start = int(start_raw)
+            end = int(end_raw) if end_raw else size - 1
+            if start < 0 or end < start or start >= size:
+                raise ValueError
+            end = min(end, size - 1)
+    except ValueError as exc:
+        raise CanvasFileError(
+            416, "invalid_range", "Byte range is unsatisfiable"
+        ) from exc
+    return start, end
+
+
+def _if_range_allows(value: str | None, file: ValidatedCanvasFile) -> bool:
+    if value is None:
+        return True
+    etag = f'"{file.source_version}"'
+    value = value.strip()
+    if value.startswith('"') or value.startswith("W/"):
+        return value == etag
+    if file.last_modified is None:
+        return False
+    try:
+        candidate = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if candidate.tzinfo is None:
+        return False
+    return file.last_modified.replace(microsecond=0) <= candidate.replace(microsecond=0)
+
+
+def _content_headers(file: ValidatedCanvasFile, *, length: int) -> dict[str, str]:
+    disposition = "attachment" if file.renderer == "html" else "inline"
+    headers = {
+        "ETag": f'"{file.source_version}"',
+        "Content-Type": file.media_type,
+        "Content-Length": str(length),
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": (
+            f"{disposition}; filename*=UTF-8''{quote(file.filename, safe='')}"
+        ),
+        "Cache-Control": _CONTENT_CACHE_CONTROL,
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+    if file.last_modified is not None:
+        headers["Last-Modified"] = format_datetime(file.last_modified, usegmt=True)
+    if file.renderer == "html":
+        headers["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'none'; style-src 'none'; "
+            "img-src 'none'; connect-src 'none'; form-action 'none'; "
+            "base-uri 'none'; object-src 'none'; sandbox"
+        )
+    return headers
+
+
+def _file_mutation_response(
+    thread_id: str,
+    record: CanvasRecord,
+    *,
+    can_edit: bool,
+) -> Response:
+    representation = build_public_canvas_representation(
+        record,
+        status="ready",
+        capabilities=CanvasCapabilities(can_edit=can_edit),
+        content_url=_content_url(thread_id, record),
+    )
+    assert record.source_version is not None
+    return _state_response(
+        representation.payload,
+        representation.etag,
+        extra_headers={
+            "X-Canvas-Content-ETag": f'"{record.source_version}"',
+        },
+    )
+
+
+@router.api_route("/main/content", methods=["GET", "HEAD"])
+async def get_main_canvas_content(
+    thread_id: str,
+    request: Request,
+    presentation_revision: int = Query(ge=1),
+    source_fingerprint: str = Query(pattern=r"^sha256:[0-9a-f]{64}$"),
+    source_version: str = Query(pattern=r"^sha256:[0-9a-f]{64}$"),
+    ngsw_bypass: Literal["true"] = Query(alias="ngsw-bypass"),
+) -> Response:
+    db = _get_db()
+    _, thread = await require_thread_owner(request, db, thread_id)
+    response_lease: CanvasResponseLease | None = None
+    try:
+        try:
+            service = _get_canvas_service(db)
+            record = _verify_content_identity(
+                await service.get(thread_id),
+                presentation_revision=presentation_revision,
+                source_fingerprint=source_fingerprint,
+                source_version=source_version,
+            )
+            # Reserve a bounded response slot before retaining workspace bytes.
+            # Its lifetime transfers to the response for non-empty GET bodies.
+            response_lease = await acquire_canvas_response_lease()
+            file = await _get_file_gateway(db).materialize_current(thread, record)
+            if file.source_version != record.source_version:
+                raise CanvasFileError(
+                    409,
+                    "source_changed",
+                    "Workspace bytes changed; ask the agent to refresh the Canvas",
+                )
+            # The file read can be expensive. Re-check the authoritative Canvas row
+            # after it so a concurrent clear/replace cannot release bytes under the
+            # old renderer identity.
+            _verify_content_identity(
+                await service.get(thread_id),
+                presentation_revision=presentation_revision,
+                source_fingerprint=source_fingerprint,
+                source_version=source_version,
+            )
+            # Authorization may be revoked while SFTP/rclone is materializing.
+            # Re-admit immediately before any content response (including 304).
+            await require_thread_owner(request, db, thread_id)
+        except CanvasFileError:
+            raise
+
+        etag = f'"{file.source_version}"'
+        headers = _content_headers(file, length=len(file.data))
+        if _if_none_match_matches(request.headers.get("If-None-Match"), etag):
+            # A 304 has no response body. Reusing the representation's
+            # Content-Length makes Uvicorn correctly reject the framing as a
+            # short body, so retain validators/metadata but omit that field.
+            not_modified_headers = {
+                key: value
+                for key, value in headers.items()
+                if key.lower() != "content-length"
+            }
+            return Response(status_code=304, headers=not_modified_headers)
+
+        status_code = 200
+        content = file.data
+        range_header = request.headers.get("Range")
+        if range_header and _if_range_allows(request.headers.get("If-Range"), file):
+            try:
+                start, end = _parse_single_range(range_header, len(file.data))
+            except CanvasFileError:
+                return Response(
+                    status_code=416,
+                    headers={
+                        **headers,
+                        "Content-Length": "0",
+                        "Content-Range": f"bytes */{len(file.data)}",
+                    },
+                )
+            content = file.data[start : end + 1]
+            status_code = 206
+            headers["Content-Length"] = str(len(content))
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(file.data)}"
+
+        if request.method == "HEAD":
+            return Response(content=b"", status_code=status_code, headers=headers)
+        assert response_lease is not None
+        response = _LeasedContentResponse(
+            content=content,
+            status_code=status_code,
+            headers=headers,
+            lease=response_lease,
+        )
+        response_lease = None
+        return response
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    finally:
+        if response_lease is not None:
+            response_lease.release()
+
+
+@router.put("/main/content", response_model=CanvasPublicState)
+async def put_main_canvas_content(
+    thread_id: str,
+    request: Request,
+    presentation_revision: int = Query(ge=1),
+    source_fingerprint: str = Query(pattern=r"^sha256:[0-9a-f]{64}$"),
+    source_version: str = Query(pattern=r"^sha256:[0-9a-f]{64}$"),
+    ngsw_bypass: Literal["true"] = Query(alias="ngsw-bypass"),
+) -> Response:
+    """Conditionally replace one editable text Canvas source."""
+
+    del ngsw_bypass
+    db = _get_db()
+    _, thread = await require_thread_owner(request, db, thread_id)
+    try:
+        expected_source_version, expected_revision = _required_edit_preconditions(
+            request
+        )
+        service = _get_canvas_service(db)
+        record = _verify_content_identity(
+            await service.get(thread_id),
+            presentation_revision=presentation_revision,
+            source_fingerprint=source_fingerprint,
+            source_version=source_version,
+        )
+        if expected_revision != record.presentation_revision:
+            raise CanvasEditError(
+                409,
+                "canvas_presentation_changed",
+                "Canvas presentation changed; reload its current state",
+            )
+        if not record.editable:
+            raise CanvasEditError(
+                409,
+                "canvas_not_editable",
+                "The current Canvas presentation is not editable",
+            )
+        if not secrets.compare_digest(
+            expected_source_version, str(record.source_version)
+        ):
+            raise CanvasEditError(
+                412,
+                "canvas_content_precondition_failed",
+                "Canvas content changed; reload before saving",
+            )
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    except CanvasEditError as exc:
+        _raise_edit_error(exc)
+
+    try:
+        candidate = await _read_bounded_edit_body(request)
+        gateway = _get_file_gateway(db)
+        await gateway.validate_edit_candidate(record, candidate)
+        if not gateway.supports_editing(thread, record):
+            raise CanvasFileError(
+                409,
+                "canvas_editing_unavailable",
+                "This workspace is not currently writable through Canvas",
+            )
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+
+    # Body spooling and candidate validation are complete. Re-admit immediately
+    # before taking the cross-replica coordinator and Canvas row lock.
+    _, fresh_thread = await require_thread_owner(request, db, thread_id)
+    locked_gateway = _get_file_gateway()
+
+    async def write_locked(current: CanvasRecord, locked_thread: dict[str, Any]) -> str:
+        result = await locked_gateway.replace_current(
+            locked_thread,
+            current,
+            candidate,
+            expected_source_version=expected_source_version,
+        )
+        return result.source_version
+
+    try:
+        mutation = await service.edit_file(
+            thread_id,
+            expected_presentation_revision=expected_revision,
+            expected_source_fingerprint=source_fingerprint,
+            expected_source_version=expected_source_version,
+            expected_thread_user_id=str(fresh_thread.get("user_id") or ""),
+            writer=write_locked,
+        )
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    except CanvasEditError as exc:
+        _raise_edit_error(exc)
+
+    await require_thread_owner(request, db, thread_id)
+    assert mutation.record is not None
+    return _file_mutation_response(
+        thread_id,
+        mutation.record,
+        can_edit=(
+            mutation.record.editable
+            and gateway.supports_editing(fresh_thread, mutation.record)
+        ),
+    )
+
+
+@router.post("/main/refresh", response_model=CanvasPublicState)
+async def refresh_main_canvas(thread_id: str, request: Request) -> Response:
+    """Validate and adopt the current bytes of the selected workspace file."""
+
+    db = _get_db()
+    _, thread = await require_thread_owner(request, db, thread_id)
+    expected_etag = request.headers.get("If-Match")
+    if expected_etag is None:
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "code": "canvas_precondition_required",
+                "message": "If-Match is required to refresh a Canvas",
+            },
+        )
+    if not re.fullmatch(r'"canvas:[0-9]+:[0-9a-f]{64}"', expected_etag.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_canvas_precondition",
+                "message": "If-Match must contain one strong Canvas state ETag",
+            },
+        )
+    try:
+        await _require_empty_refresh_body(request)
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    service = _get_canvas_service(db)
+    current = await service.get(thread_id)
+    if current is None or current.source is None:
+        _raise_edit_error(CanvasEditError(409, "canvas_cleared", "Canvas is cleared"))
+    if not isinstance(current.source, WorkspaceFileSource):
+        _raise_edit_error(
+            CanvasEditError(
+                409, "canvas_not_file", "The current Canvas is not file-backed"
+            )
+        )
+
+    visible = await _represent(
+        thread_id, thread, current, browser_content_url=True, db=db
+    )
+
+    def visible_builder(record: CanvasRecord):
+        content_url = (
+            _content_url(thread_id, record)
+            if visible.state.content_url is not None
+            else None
+        )
+        return build_public_canvas_representation(
+            record,
+            status=visible.state.status,
+            capabilities=visible.state.capabilities,
+            content_url=content_url,
+        )
+
+    _, fresh_thread = await require_thread_owner(request, db, thread_id)
+    locked_gateway = _get_file_gateway()
+
+    async def refresh_locked(
+        record: CanvasRecord, locked_thread: dict[str, Any]
+    ) -> str:
+        file = await locked_gateway.materialize_for_refresh(locked_thread, record)
+        return file.source_version
+
+    try:
+        mutation = await service.refresh_file(
+            thread_id,
+            expected_etag=expected_etag,
+            expected_thread_user_id=str(fresh_thread.get("user_id") or ""),
+            refresher=refresh_locked,
+            representation_builder=visible_builder,
+        )
+    except CanvasPreconditionRequired as exc:
+        raise HTTPException(
+            status_code=428,
+            detail={"code": "canvas_precondition_required", "message": str(exc)},
+        ) from exc
+    except CanvasPreconditionFailed as exc:
+        raise HTTPException(
+            status_code=412,
+            detail={"code": "canvas_precondition_failed", "message": str(exc)},
+        ) from exc
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    except CanvasEditError as exc:
+        _raise_edit_error(exc)
+
+    await require_thread_owner(request, db, thread_id)
+    assert mutation.record is not None
+    return _file_mutation_response(
+        thread_id,
+        mutation.record,
+        can_edit=(
+            mutation.record.editable
+            and locked_gateway.supports_editing(fresh_thread, mutation.record)
+        ),
+    )
+
+
+@internal_router.get("/main", response_model=CanvasPublicState)
+async def internal_get_main_canvas(thread_id: str, request: Request) -> Response:
+    db = _get_db()
+    _, thread = await _require_delegated_owner(request, db, thread_id)
+    record = await _get_canvas_service(db).get(thread_id)
+    if record is None:
+        return _no_content_response()
+    representation = await _represent(
+        thread_id, thread, record, browser_content_url=False, db=db
+    )
+    await _require_delegated_owner(request, db, thread_id)
+    latest = await _get_canvas_service(db).get(thread_id)
+    if (
+        latest is not None
+        and latest.presentation_revision != record.presentation_revision
+    ):
+        representation = await _represent(
+            thread_id, thread, latest, browser_content_url=False, db=db
+        )
+        await _require_delegated_owner(request, db, thread_id)
+    return _state_response(representation.payload, representation.etag)
+
+
+@internal_router.post("/main/set", response_model=CanvasPublicState)
+async def internal_set_main_canvas(
+    thread_id: str, request: Request, body: CanvasSetRequest
+) -> Response:
+    db = _get_db()
+    _, thread = await _require_delegated_owner(request, db, thread_id)
+
+    if body.source_type == "workspace_port":
+        assert body.port is not None
+        if not canvas_live_preview_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "canvas_live_preview_disabled",
+                    "message": "Canvas live preview is not enabled",
+                },
+            )
+
+        app_gateway = _get_app_gateway(db)
+        try:
+            validated = await app_gateway.validate_for_presentation(
+                thread,
+                body.port,
+                entry_path=body.entry_path or "/",
+            )
+        except CanvasAppError as exc:
+            _raise_app_error(exc)
+
+        # Remote readiness can take long enough for the delegated owner,
+        # deployment gate, or workspace generation to change. Re-admit and
+        # re-bind immediately before committing the durable pointer.
+        _, fresh_thread = await _require_delegated_owner(request, db, thread_id)
+        if not canvas_live_preview_enabled():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "canvas_live_preview_disabled",
+                    "message": "Canvas live preview is not enabled",
+                },
+            )
+        try:
+            app_gateway.revalidate_for_commit(fresh_thread, validated)
+        except CanvasAppError as exc:
+            _raise_app_error(exc)
+
+        mutation = await _get_canvas_service(db).set(
+            thread_id,
+            CanvasSetInput(
+                source=validated.source,
+                title=body.title or "Workspace application",
+                renderer="auto",
+                editable=False,
+                alt_text=None,
+                source_version=None,
+                new_app=body.new_app,
+            ),
+        )
+        assert mutation.record is not None
+        representation = build_public_canvas_representation(
+            mutation.record,
+            status=validated.status,
+            capabilities=CanvasCapabilities(),
+            content_url=None,
+        )
+        return _state_response(representation.payload, representation.etag)
+
+    assert body.path is not None
+    gateway = _get_file_gateway(db)
+    try:
+        generation, file = await gateway.validate_for_presentation(
+            thread,
+            body.path,
+            requested_renderer=body.renderer,
+            alt_text=body.alt_text,
+        )
+        if body.editable and (
+            file.renderer not in {"markdown", "text", "html"}
+            or not gateway.supports_editing(thread)
+        ):
+            raise CanvasFileError(
+                422,
+                "canvas_editing_unsupported",
+                "This Canvas source or workspace does not support text editing",
+            )
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+
+    title = body.title or PurePosixPath(file.path).name[:200]
+    # The delegated user/thread relationship may be revoked during the remote
+    # file validation above. Do not commit after that authorization expires.
+    _, fresh_thread = await _require_delegated_owner(request, db, thread_id)
+    try:
+        if current_workspace_generation(fresh_thread) != generation:
+            raise CanvasFileError(
+                409,
+                "workspace_generation_changed",
+                "The workspace changed while the Canvas file was being validated",
+            )
+        if body.editable and not gateway.supports_editing(fresh_thread):
+            raise CanvasFileError(
+                422,
+                "canvas_editing_unsupported",
+                "This workspace no longer supports Canvas editing",
+            )
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    mutation = await _get_canvas_service(db).set(
+        thread_id,
+        CanvasSetInput(
+            source=WorkspaceFileSource(path=file.path, workspace_generation=generation),
+            title=title,
+            renderer=file.renderer,
+            editable=body.editable,
+            alt_text=body.alt_text.strip() if body.alt_text else None,
+            source_version=file.source_version,
+        ),
+    )
+    assert mutation.record is not None
+    representation = build_public_canvas_representation(
+        mutation.record,
+        status="ready",
+        capabilities=CanvasCapabilities(can_edit=mutation.record.editable),
+    )
+    return _state_response(representation.payload, representation.etag)
+
+
+@internal_router.delete("/main", response_model=CanvasPublicState)
+async def internal_clear_main_canvas(thread_id: str, request: Request) -> Response:
+    db = _get_db()
+    await _require_delegated_owner(request, db, thread_id)
+    mutation = await _get_canvas_service(db).clear(
+        thread_id,
+        expected_etag=None,
+        require_precondition=False,
+    )
+    if mutation.record is None:
+        return _no_content_response()
+    representation = build_public_canvas_representation(mutation.record)
+    return _state_response(
+        representation.payload,
+        representation.etag,
+        extra_headers={
+            "X-Canvas-Mutation-Changed": "true" if mutation.changed else "false"
+        },
+    )
+
+
+__all__ = ["internal_router", "router"]

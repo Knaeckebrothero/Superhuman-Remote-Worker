@@ -258,14 +258,24 @@ X11Forwarding no
 PrintMotd no
 AcceptEnv LANG LC_*
 Subsystem sftp /usr/lib/openssh/sftp-server
+# Canvas reaches declared workspace HTTP ports only through request-scoped
+# direct-tcpip channels on this authenticated SSH transport. Keep forwarding
+# local to the SSH client, restrict its destination to workspace loopback, and
+# disable the unrelated forwarding/tunnel surfaces explicitly.
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:*
+GatewayPorts no
+AllowAgentForwarding no
+PermitTunnel no
 # Keep connections alive (agent may have idle periods between tool calls)
 ClientAliveInterval 60
 ClientAliveCountMax 720
 MaxStartups 10:30:100
 SSHEOF
 
-# Generate host keys (normally done on first boot)
-RUN ssh-keygen -A
+# Host keys are generated at runtime into the workspace-system volume. Baking
+# them into the image would give every workspace the same SSH identity.
+RUN rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
 
 # ---------------------------------------------------------------------------
 # 6. tmux config (mirrors provision.sh lines 255-262)

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Present with Canvas"
+  short_description: "Present substantial artifacts on the shared canvas"
+  default_prompt: "Use $present-with-canvas to put this artifact on the shared stage."

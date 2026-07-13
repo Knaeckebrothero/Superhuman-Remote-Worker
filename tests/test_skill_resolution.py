@@ -4,7 +4,12 @@ Mirrors the experts precedence model (src/core/expert_resolution.py) but the
 menu keeps ALL names (bundled is the floor) instead of picking one winner.
 """
 
-from src.core.skill_resolution import resolve_skill_menu, skill_files_to_workspace
+from src.core.skill_resolution import (
+    add_default_canvas_skill,
+    resolve_skill_menu,
+    scope_skills_for_tools,
+    skill_files_to_workspace,
+)
 from src.core.expert_resolution import fence_skills_menu
 
 U = "11111111-1111-1111-1111-111111111111"
@@ -60,6 +65,50 @@ def test_files_to_workspace_prefixes_skill_dir():
         "skills/hello/SKILL.md": "x",
         "skills/hello/references/g.md": "y",
     }
+
+
+def test_canvas_skill_requires_use_skill_and_file_set_capability():
+    skills = {
+        "menu": [
+            {"name": "present-with-canvas"},
+            {"name": "ordinary-skill"},
+        ],
+        "files": {
+            "present-with-canvas": {"SKILL.md": "canvas"},
+            "ordinary-skill": {"SKILL.md": "ordinary"},
+        },
+    }
+
+    for tools in ([], ["use_skill"], ["set_canvas"]):
+        scoped = scope_skills_for_tools(skills, tools)
+        assert [item["name"] for item in scoped["menu"]] == ["ordinary-skill"]
+        assert set(scoped["files"]) == {"ordinary-skill"}
+
+    scoped = scope_skills_for_tools(skills, ["use_skill", "set_canvas"])
+    assert [item["name"] for item in scoped["menu"]] == [
+        "present-with-canvas",
+        "ordinary-skill",
+    ]
+    assert set(scoped["files"]) == {"present-with-canvas", "ordinary-skill"}
+    # The helper is pure so backend re-scoping can restore the skill later.
+    assert "present-with-canvas" in skills["files"]
+
+
+def test_default_canvas_skill_is_the_only_catalog_floor_when_db_payload_is_empty():
+    catalog = add_default_canvas_skill({})
+
+    assert [item["name"] for item in catalog["menu"]] == ["present-with-canvas"]
+    assert set(catalog["files"]) == {"present-with-canvas"}
+    assert "Present With Canvas" in catalog["files"]["present-with-canvas"]["SKILL.md"]
+
+
+def test_default_canvas_skill_does_not_override_resolved_replacement():
+    replacement = {
+        "menu": [{"name": "present-with-canvas", "description": "custom"}],
+        "files": {"present-with-canvas": {"SKILL.md": "custom body"}},
+    }
+
+    assert add_default_canvas_skill(replacement) == replacement
 
 
 def test_fence_skills_menu_empty_is_blank():
