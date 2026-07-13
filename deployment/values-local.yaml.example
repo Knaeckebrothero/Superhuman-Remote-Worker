@@ -146,16 +146,12 @@ secrets:
     NEXTCLOUD_S3_ACCESS_KEY: "stub"
     NEXTCLOUD_S3_SECRET_KEY: "stub"
 
-    # Object store — root creds of the local single-node MinIO
-    # (deployment/tilt-minio.yaml; only deployed under `tilt up`). Used by both
-    # the workspace snapshot service + IDE-session blobs (SNAPSHOT_S3_*, bucket
-    # srw-snapshots) and the virtual workspace tier's rclone (VIRTUAL_WORKSPACE_S3_*,
-    # bucket srw-workspaces). The matching non-secret endpoints live in
-    # values-tilt.yaml (s3.endpoint / virtualWorkspace.s3.endpoint).
-    SNAPSHOT_S3_ACCESS_KEY_ID: "minioadmin"
-    SNAPSHOT_S3_SECRET_ACCESS_KEY: "minioadmin_secret"
-    VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID: "minioadmin"
-    VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY: "minioadmin_secret"
+    # Object store — the bundled Garage store (garage.enabled=true in
+    # values-tilt.yaml) auto-generates its own native-format keys in this Secret
+    # at render time (SNAPSHOT_S3_* + VIRTUAL_WORKSPACE_S3_*, both buckets), so do
+    # NOT set them here: an operator value would win, and the bootstrap Job's
+    # key/import rejects non-Garage-format keys (id must be "GK"+24 hex). Leave
+    # them unset. (Only override if you point at an EXTERNAL S3 instead of Garage.)
 
     # Email/notifications/integrations — chart refs are gated/optional, so
     # entries here are only required when you flip `email.enabled=true` or wire
