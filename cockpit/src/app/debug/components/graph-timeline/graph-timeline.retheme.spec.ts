@@ -7,6 +7,7 @@ describe('GraphTimelineComponent.rethemeGraph', () => {
     const style = vi.fn(() => ({update}));
     const comp = Object.create(GraphTimelineComponent.prototype);
     comp.cy = {style};
+    comp.ngZone = {runOutsideAngular: (fn: () => void) => fn()};
     comp.rethemeGraph();
     expect(style).toHaveBeenCalledOnce();
     const applied = JSON.stringify(style.mock.calls[0][0]);

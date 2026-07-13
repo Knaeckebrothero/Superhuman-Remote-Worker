@@ -801,7 +801,7 @@ import {ModelService} from '../../core/services/model.service';
       margin-left: 2px;
     }
     .info-icon:hover, .info-icon:focus-visible {
-      color: var(--text-secondary, #9399b2);
+      color: var(--text-secondary);
     }
     .lite-hint {
       margin: 4px 0 8px;

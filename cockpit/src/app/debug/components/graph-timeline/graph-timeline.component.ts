@@ -629,7 +629,9 @@ export class GraphTimelineComponent implements OnDestroy {
   /** Rebuild the Cytoscape stylesheet from the current theme's tokens. */
   rethemeGraph(): void {
     if (!this.cy) return;
-    this.cy.style(buildCytoscapeStyles(resolveGraphColors())).update();
+    this.ngZone.runOutsideAngular(() => {
+      this.cy?.style(buildCytoscapeStyles(resolveGraphColors())).update();
+    });
   }
 
   /**
