@@ -1,5 +1,27 @@
 # Ephemeral Workspace Lifecycle
 
+**Status:** Historical implementation record; static Docker reuse design superseded
+**Last updated:** 2026-07-13
+
+> **Static Docker safety correction:** Production/default Compose workspaces are
+> durable-inventory endpoints, not disposable pool slots. A fresh endpoint enters
+> the released pool only through the one-time
+> `DOCKER_WORKSPACE_BOOTSTRAP_ATTESTED_ENDPOINTS` import with an exact
+> `WORKSPACE_HOST_KEY_FINGERPRINTS` match. Operators must first recreate the
+> container **and** replace or independently sanitize persistent
+> `/home/agent-host` data, then remove the bootstrap variable immediately after a
+> successful import. Release snapshots and quarantines the endpoint; only explicit
+> recreation/data reset and fresh attestation may return it to production use.
+> Container restart and SSH deletion are not tenant resets.
+>
+> `DOCKER_WORKSPACE_TRUSTED_DEV_REUSE=true` retains pinned-SSH cleanup only for
+> disposable single-user/same-trust development. It is never production
+> attestation. The no-fingerprint dev seed can receive one initial lease, but
+> release cannot make an unpinned SSH connection and therefore quarantines it.
+> Configure exact fingerprints for repeated dev reuse. Workspace containers listen
+> on `30022` internally; the dev Compose file publishes those endpoints as
+> `localhost:2201`, `localhost:2202`, and `localhost:2203`.
+
 ## Problem
 
 Workspace environments (containers and VMs) accumulate state across jobs and sessions. Two bugs compound the issue:
@@ -123,10 +145,10 @@ Job/session completes or is paused
     │       - already implemented, just needs consistent invocation
     │
     ▼
-Environment terminated (container deleted / VM destroyed / pool slot reset)
+Environment retired (container deleted / VM destroyed / static Docker host quarantined)
     │
     ▼
-[Ready for next assignment: fresh environment]
+[Next assignment uses a fresh or explicitly recreated-and-attested environment]
 ```
 
 ### Resume from checkpoint
@@ -142,7 +164,7 @@ Already partially implemented at `main.py:4485-4505`:
 | Provisioner | Creates | Deletes | Snapshots before delete | Resets between jobs |
 |---|---|---|---|---|
 | **ContainerProvisioner** (K8s) | Per-job pods, `emptyDir` | `delete_workspace()` | Only for VMs at `main.py:6061` | N/A (ephemeral volume) |
-| **DockerProvisioner** (compose) | Static pool assignment | `release_workspace()` | Yes (calls SnapshotService) | No (documented gap) |
+| **DockerProvisioner** (compose) | Durable host-inventory lease | Snapshot + quarantine | Yes (calls SnapshotService) | Only after explicit recreation/data reset/attestation; same-trust dev has an opt-in exception |
 | **VMProvisioner** (KubeVirt/NATS/Docker) | Per-job VMs | `delete_vm()` | Only at job completion, **not** threads | N/A (VM destroyed) |
 | **WorkspaceSuspensionService** (K8s) | Restore from snapshot | Suspend to S3 | Yes (full pattern) | N/A (pod recreated) |
 
@@ -168,14 +190,16 @@ K8s containers are already ephemeral (emptyDir). The only gap is snapshotting be
 
 | Aspect | Containers (DockerProvisioner) | VMs (DockerProvisioner, QEMU-in-Docker) |
 |--------|-------------------------------|----------------------------------------|
-| **Provisioning** | Static pool from `WORKSPACE_HOSTS` (e.g. `localhost:2201,2202,2203`). Assignment tracked in DB. | Static pool from `VM_HOSTS`. Assignment tracked in DB. |
-| **Isolation** | Container-local storage (no named volumes for workspace data). Persists across container restarts but not recreation. | QEMU disk image. Persists until container recreation. |
-| **Current cleanup** | `release_workspace()` snapshots to S3, marks slot as released. **Does not reset workspace directory.** | `assign_vm()` / pool tracking only. No release method. |
-| **Resume** | Re-assign same or different container + `restore_snapshot_for_resume()` | Re-assign same or different VM + restore |
-| **What's needed** | SSH-based workspace reset after snapshot (Phase 3) | Add `release_vm()` with snapshot (Phase 2a) |
-| **No Docker socket** | Orchestrator cannot restart containers. SSH cleanup only. | Same constraint. |
+| **Provisioning** | Static endpoints from `WORKSPACE_HOSTS`; production availability is tracked in durable host-keyed inventory and owner rows carry concrete lease IDs. Full-stack endpoints use `workspace-N:30022`; dev-published endpoints use `localhost:2201`-`2203`. | Static pool from `VM_HOSTS`. Assignment tracked in DB. |
+| **Isolation** | Container state survives restart; persistent `/home/agent-host` data may also survive recreation when backed by a volume. Both are part of the reset boundary. | QEMU disk image. Persists until container recreation. |
+| **Current cleanup** | `release_workspace()` snapshots, transitions the lease with compare-and-swap, and quarantines it by default. | `assign_vm()` / pool tracking only. No release method. |
+| **Resume** | Restore only into a fresh/attested production endpoint, or an explicitly same-trust development endpoint. | Re-assign same or different VM + restore |
+| **Production reuse** | Explicitly recreate the container, replace or independently sanitize persistent workspace data, and attest the resulting endpoint. No automatic controller exists yet. | Add `release_vm()` with snapshot (Phase 2a) |
+| **No Docker socket** | The orchestrator cannot recreate containers. SSH cleanup is available only in opt-in trusted-dev mode and is not a security reset. | Same constraint. |
 
-Docker Compose is the problematic deployment: containers are long-lived, the orchestrator can't restart them, and `release_workspace()` doesn't reset the filesystem. This is the source of the stale workspace bug.
+Docker Compose endpoints are long-lived and cannot be proven clean by restart or file
+deletion. The production solution is to keep endpoint state independent of owner rows
+and quarantine after every use, rather than advertise a best-effort cleanup as a reset.
 
 ### Auto-detection (`docker_provisioner.py:89-118`)
 
@@ -184,10 +208,18 @@ In dev mode, if `WORKSPACE_HOSTS` is not set but `.dev/ssh-keys/id_ed25519` exis
 - `WORKSPACE_IDE_HOSTS=localhost:18081,localhost:18082,localhost:18083`
 - `SSH_KEY_PATH=.dev/ssh-keys/id_ed25519`
 
+This detection removes the need to export connection coordinates for an initial dev
+lease; it does **not** opt the endpoint into reusable cleanup. Repeated same-trust dev
+reuse requires both `DOCKER_WORKSPACE_TRUSTED_DEV_REUSE=true` and exact
+`WORKSPACE_HOST_KEY_FINGERPRINTS` entries for the published endpoints. Without the
+pins, release fails closed and quarantines the initial lease.
+
 
 ## Implementation Status
 
-All five phases have been implemented. Changes summarized below with references to modified files.
+The five historical phases were implemented, but the static Docker portions of
+Phases 3 and 5 were later restricted or disabled by the safety correction above.
+Changes are summarized below with references to modified files.
 
 ### Phase 1: Immediate bug fixes -- DONE
 
@@ -227,16 +259,25 @@ Replaced all 4 scattered cleanup blocks:
 
 `snapshot_service.connect()` moved before provisioner inits so it can be passed to all three provisioners.
 
-### Phase 3: Docker Compose workspace reset -- DONE
+### Phase 3: Docker Compose SSH workspace reset -- SUPERSEDED
 
 **`orchestrator/services/docker_provisioner.py`:**
 
-Added `_reset_workspace_via_ssh(host, port)` that SSHs into the workspace container and runs:
+The original Phase 3 added `_reset_workspace_via_ssh(host, port)` and treated the
+result as a generally reusable workspace. That cross-tenant claim is superseded.
+The helper is now reachable only when
+`DOCKER_WORKSPACE_TRUSTED_DEV_REUSE=true`, for same-trust development, and it
+requires pinned SSH. Its historical cleanup command is retained here for context:
+
 ```
 rm -rf ~/workspace/* ~/workspace/.[!.]* 2>/dev/null; mkdir -p ~/workspace
 ```
 
-Handles: missing `SSH_KEY_PATH`, connection timeouts (30s), SSH errors. Called from both `release_workspace()` and `release_thread_workspace()` after snapshot and before marking the slot as released. This closes the gap where Docker Compose containers were snapshotted but never cleaned.
+Missing keys, missing fingerprints, timeouts, SSH errors, and cleanup failures all
+quarantine the endpoint. Production/default release does not run this command: it
+snapshots and quarantines because processes, open file descriptors, system changes,
+and persistent data outside the glob may survive. An unpinned automatic dev seed can
+be assigned once, but cannot be cleaned for reuse.
 
 ### Phase 4: Snapshot tar excludes -- DONE
 
@@ -246,7 +287,7 @@ Added exclude patterns to reduce snapshot size by skipping regenerated content:
 - `*/repos/*` — repository datasources re-cloned from remotes on workspace init
 - `*/node_modules/*` — reinstalled from package.json on restore
 
-### Phase 5: Generalized WorkspaceSuspensionService -- DONE
+### Phase 5: Generalized WorkspaceSuspensionService -- PARTIALLY SUPERSEDED
 
 **`orchestrator/services/workspace_suspension.py`:**
 
@@ -254,13 +295,15 @@ Extended (not replaced) the existing service to be provisioner-aware:
 
 - `connect()` now accepts `docker_provisioner` and `vm_provisioner` (backward compatible)
 - `is_enabled` returns true if S3 + any provisioner is available (not just K8s)
-- **`suspend_workspace()`** dispatches based on workspace metadata:
+- **`suspend_workspace()`** historically dispatched based on workspace metadata:
   - K8s container: snapshot → delete pod
-  - Docker Compose: snapshot → SSH reset workspace (container stays alive)
+  - Docker Compose: snapshot → SSH reset workspace (superseded; production/default
+    static Docker suspension is disabled and release quarantines instead)
   - VM: snapshot → delete VM
-- **`restore_workspace()`** dispatches based on workspace metadata:
+- **`restore_workspace()`** historically dispatched based on workspace metadata:
   - K8s container: create pod → extract snapshot
-  - Docker Compose: re-assign slot if needed → extract snapshot (container already running)
+  - Docker Compose: re-assign slot if needed → extract snapshot (superseded for
+    production static Docker until explicit recreation and attestation exists)
   - VM: create VM → extract snapshot
 - Thread variants generalized identically
 - Idle sweepers (`check_idle_all`, `check_idle_threads`) now also detect idle VMs via `context->'vm'->>'status' = 'ready'`
@@ -268,6 +311,12 @@ Extended (not replaced) the existing service to be provisioner-aware:
 
 
 ## Architecture Summary
+
+The diagram below records the original generalized-cleanup design. Its Docker
+`SSH reset` branch is superseded: production/default Docker release is now
+`snapshot -> durable lease transition -> quarantine`, and restore requires a
+separately recreated/data-reset/attested endpoint. The K8s and VM branches remain
+historical implementation context.
 
 ```
                      main.py completion/cancel/thread-end handlers
@@ -283,7 +332,7 @@ Extended (not replaced) the existing service to be provisioner-aware:
                      Snapshot ───► SnapshotService ◄─── Snapshot
                           │      (capture + upload)      │
                           ▼           │           ▼
-                     Delete pod   SSH reset   Delete VM
+                     Delete pod   QUARANTINE  Delete VM
                                       │
                                       ▼
                               s3://srw-snapshots/
@@ -315,6 +364,6 @@ Extended (not replaced) the existing service to be provisioner-aware:
 |-------|-------|--------|----------------|
 | **1** | Bug fixes (workspace cleanup + datasource SQL) | Done | `src/core/workspace.py`, `orchestrator/database/postgres.py` |
 | **2** | Consistent snapshot-before-delete, centralized cleanup helper | Done | `orchestrator/services/vm_provisioner.py`, `orchestrator/services/container_provisioner.py`, `orchestrator/main.py` |
-| **3** | Docker Compose SSH-based workspace reset | Done | `orchestrator/services/docker_provisioner.py` |
+| **3** | Docker Compose SSH-based workspace reset | Superseded; trusted-dev-only behind explicit opt-in and fingerprint pinning | `orchestrator/services/docker_provisioner.py` |
 | **4** | Snapshot tar exclude tuning | Done | `orchestrator/services/snapshot_service.py` |
-| **5** | Generalized WorkspaceSuspensionService | Done | `orchestrator/services/workspace_suspension.py`, `orchestrator/main.py`, `tests/test_workspace_suspension.py` |
+| **5** | Generalized WorkspaceSuspensionService | Partially superseded; static Docker suspend/restore disabled pending recreation + attestation | `orchestrator/services/workspace_suspension.py`, `orchestrator/main.py`, `tests/test_workspace_suspension.py` |

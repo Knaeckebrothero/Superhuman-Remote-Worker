@@ -14,6 +14,8 @@ aliases:
 related:
   - "[[shared_browser]]"
   - "[[agent_skills]]"
+  - "[[dynamic_canvas_slice1_verification]]"
+  - "[[dynamic_canvas_slice2_verification]]"
   - "[[shared_application_action_layer]]"
   - "[[builder_to_sessions_consolidation]]"
   - "[[persistent_chat_ui_redesign]]"
@@ -28,10 +30,21 @@ related:
 > file, open the IDE, forward a port, copy a proxy URL, or reconstruct an image
 > from chat output just to see and collaborate on the result.
 
-**Status:** Slice 0 state/event foundation implemented 2026-07-13; Slices 1–6
-remain planned. Original brainstorm filed 2026-05-13. Pointer model agreed and
-repository, security, accessibility, and comparable-product audits completed
-2026-07-13.
+**Status:** Slices 0–2 are implemented as of 2026-07-13. The primary
+file-presentation path and the Slice-2 conditional-editing API are live-verified
+on local k3d, including a two-replica save race and final browser-visible CORS
+validator exposure. The orchestrator and Cockpit rollouts were ready after the
+final verification. The Slice-1 bodyless-`304` framing defect found during the
+first acceptance pass is fixed and reverified.
+The default-off Slice-3A callable/SSH foundation is also implemented and
+verified, but it deliberately exposes no viewer URL, proxy, or Cockpit live-app
+renderer and does not count as a user-facing Slice-3 release. User-facing
+Slices 3–6 remain planned. Original brainstorm filed 2026-05-13. Pointer model
+agreed and repository, security, accessibility, and comparable-product audits
+completed 2026-07-13. See the
+[[dynamic_canvas_slice1_verification|Slice-1 verification record]] and
+[[dynamic_canvas_slice2_verification|Slice-2 verification record]], plus the
+[[dynamic_canvas_slice3a_verification|Slice-3A foundation record]].
 
 ## Decision Summary
 
@@ -483,18 +496,30 @@ The provisioner must capture/persist the workspace SSH host-key fingerprint for
 the runtime generation, and both the upstream connector and file gateway must pin
 it. A host-key mismatch invalidates the generation and closes all origin
 sessions and direct channels.
-Current container images generate SSH host keys at image build, so replicas may
-share them; that is not a runtime identity. Slice 1 moves generation to
-workspace first boot/init, obtains the public-key SHA-256 fingerprint through
-the trusted Kubernetes/VM-controller/provisioner path (not TOFU on the same SSH
-socket), and persists it atomically with `workspace_generation` before Canvas
-connects. Pre-provisioned Docker inventory must provide an equivalent pinned
-fingerprint. Private host keys never leave the workspace.
+Older container images generated SSH host keys at image build, so replicas
+could share them; that is not a runtime identity. Slice 1 generates the key on
+workspace first boot/init. The Kubernetes provisioner obtains its public-key
+SHA-256 fingerprint through the trusted control plane (not TOFU on the same SSH
+socket) and persists it with `workspace_generation` before Canvas connects.
+Pre-provisioned Docker inventory must provide an equivalent exact, endpoint-
+keyed fingerprint. Private host keys never leave the workspace.
 
-This choice works for Docker, pod, and VM workspaces without widening
-NetworkPolicy. It also lets prototype servers bind to `127.0.0.1` (preferred)
-or `0.0.0.0`. A direct Kubernetes connector may be added later behind the same
-`CanvasUpstreamConnector` interface if scale data justifies it.
+The Slice-1 file gateway enables this path for provisioner-attested Kubernetes
+workspaces and explicitly inventoried static Docker workspaces. VM Canvas stays
+capability-gated until the VM controller can attest the runtime host key and
+route that exact generation back to the orchestrator; key regeneration alone is
+not attestation. Durable shared virtual storage uses its own backing identity
+instead of SSH. The eventual direct-channel design can support Docker, pod, and
+VM workspaces without widening NetworkPolicy once each adapter supplies the
+same identity contract. It also lets prototype servers bind to `127.0.0.1`
+(preferred) or `0.0.0.0`.
+
+Static Docker containers are not a cross-tenant reset boundary. By default a
+released Docker lease is quarantined until a future controller attests that the
+container was recreated. `DOCKER_WORKSPACE_TRUSTED_DEV_REUSE=true` may enable
+pinned-SSH convenience cleanup and reuse only in an explicitly single-user,
+same-trust development deployment. Docker suspension/restore is disabled; it
+must not bypass the shared job/thread lease CAS or reset a reassigned host.
 
 Multiple independent public origins **within one presented app** are deferred.
 They are occasionally useful for OAuth or deliberate cross-origin testing, but
@@ -511,10 +536,10 @@ registers renderers for untrusted or user-authored content.
 
 | Source/content | First delivery | Editing |
 |---|---|---|
-| Markdown (`text/markdown`) | Dedicated Marked instance + bounded KaTeX pass | Slice 2 |
-| Plain text / code | Read-only text renderer first; shared lazy Monaco adapter in Slice 2 | Slice 2 |
-| LaTeX source (`.tex`) | Safe source text; Markdown math covers the common preview case | Slice 2; full document preview deferred |
-| Strict static HTML | Sanitized, script-free opaque `srcdoc` iframe | Source text in Slice 2 |
+| Markdown (`text/markdown`) | Dedicated Marked instance + bounded KaTeX pass in Slice 1 | Slice 2 |
+| Plain text / code | Read-only text renderer in Slice 1; shared lazy Monaco adapter in Slice 2 | Slice 2 |
+| LaTeX source (`.tex`) | Safe source text in Slice 1; Markdown math covers the common preview case | Slice 2; full document preview deferred |
+| Strict static HTML | Sanitized, script-free opaque `srcdoc` iframe in Slice 1 | Source text in Slice 2 |
 | PNG/JPEG/WebP/GIF | Raster image viewer with versioned content URL | No |
 | SVG | `<img>` rendering only after a focused safety test; never inline in v1 | Deferred from first file slice |
 | PDF | Native viewer/open fallback with Range support | Deferred from first file slice |
@@ -550,13 +575,21 @@ Renderer rules:
   Canvas source. This prevents external tracking and data-URL resource bombs.
 - A strict static HTML file is self-contained and script-free. Anything needing
   JavaScript, sibling assets, client routing, network access, or a backend is a
-  `workspace_port`/`workspace_app`.
-- Monaco is installed but its current loader is private to the diff review. Do
-  not copy that component: extract a shared lazy loader, language mapper, and
-  model/editor disposal helper in Slice 2.
-- Text bytes, binary bytes, decoded image pixels, Markdown output nodes, and
-  later PDF pages all have deployment-configurable limits. Unknown or
-  incompatible types fail closed to metadata plus an authorized download.
+  `workspace_port`/`workspace_app`. Slice 1 also strips image/font sources and
+  permits no `data:` assets; present a raster image as its own validated source.
+- Slice 2 extracted the diff-review Monaco integration into a shared lazy
+  loader and language mapper with lifecycle-safe model/editor disposal. Canvas
+  and diff review use that shared adapter rather than owning duplicate loaders.
+- Text bytes, binary bytes, decoded image pixels, Markdown parser work, CSS,
+  output nodes, and later PDF pages all have explicit limits. Before Marked can
+  allocate a token tree, Slice 1 scans the at-most-2-MiB source once and rejects
+  more than 10,000 lines or 40,000 syntax markers; the parsed tree is then
+  capped at 10,000 tokens. Markdown and static HTML are both capped at 20,000
+  sanitized nodes and 4 MiB of serialized output. Static HTML removes style
+  blocks and active CSS properties, limits one inline style to 2 KiB and all
+  retained inline styles to 64 KiB, and keeps only a small inert property
+  allowlist. These complement the server byte/image limits. Unknown or
+  incompatible types fail closed.
 - Renderer overrides are an allowlisted enum. The agent cannot name a Cockpit
   component class or module path.
 - Renderer capabilities are returned by the server. An older Cockpit or a
@@ -700,11 +733,21 @@ workspace backend and feature flags are resolved. The skill resolver includes
 merely from the expert name. If a future browser-only runtime has Canvas but no
 `use_skill`, keep essential safety/handoff etiquette in the tool description.
 
-Expose get/set/clear only in persistent sessions and capability-filter source
-kinds. File presentation requires a readable durable/remote workspace; apps
-require a live shell-capable workspace; browser requires a stable Shared Browser
-generation. `workspace.backend = none` does not receive a nonfunctional file
-canvas.
+Expose get/set/clear only in authenticated persistent sessions with a nonblank
+delegated internal key, then capability-filter source kinds. File presentation
+requires a readable durable/remote workspace; apps require a live shell-capable
+workspace; browser requires a stable Shared Browser generation. `none`,
+process-local virtual memory, unattested VM/direct-remote backends, and a runtime
+without `MCP_INTERNAL_KEY` do not receive nonfunctional file Canvas tools or the
+companion skill.
+
+The provisioner/runtime handoff exposes only the positive boolean
+`canvas_presentation_available`. It becomes true only after the current thread
+is paired with the exact usable workspace generation and, for SSH-backed
+storage, its attested host-key fingerprint and lease. Initial attachment and
+live capability upgrades consume the same bit. Lease IDs, trust provenance,
+backing IDs, fingerprints, and generation internals remain server-side and are
+removed from public job/thread representations.
 
 These tools change only thread-authorized presentation state and do not mutate
 file content or start processes, but they still respect the session's existing
@@ -775,19 +818,28 @@ For a shared browser:
 The tools define the mechanical contract. A bundled skill teaches judgment and
 workflow that does not belong in every tool description.
 
-Planned location:
+Implemented location:
 
 ```text
 config/skills/present-with-canvas/SKILL.md
 ```
 
-The first version needs only `SKILL.md`; it does not justify scripts, assets, or
-reference files. Keep it concise and imperative. Its frontmatter name is
+The first version uses `SKILL.md` plus package metadata only; it does not justify
+scripts, assets, or reference files. It is concise and imperative. Its
+frontmatter name is
 `present-with-canvas`, and its description should trigger when the agent has a
 substantial visual/editable artifact, a local web prototype, or a browser state
 that the user would benefit from seeing.
 
-The body should cover:
+The deployed file-only skill covers presentation judgment, refresh discipline,
+editable-file re-read/preservation, static-HTML limits, and stage safety. It
+intentionally refuses to guess app, port, browser, or routing fields which are
+not advertised by the current tool schema. Extend it with app/browser guidance
+only as those corresponding end-to-end presentation surfaces land. The
+default-off Slice-3A callable foundation alone is not such a user-facing
+surface.
+
+The current and planned guidance contract covers:
 
 - When substantial content belongs on the canvas rather than in chat.
 - Choosing `workspace_file`, `workspace_port`, `workspace_app`, or `browser`.
@@ -809,8 +861,8 @@ The body should cover:
 - Avoiding the canvas for short answers or tiny snippets that read better in
   chat.
 
-The skill lands with the tools and is placed in scope only when Canvas tools are
-available. Use model-invoked activation initially; a hard
+The skill is deployed with the tools and is placed in scope only when Canvas
+tools are available. It uses model-invoked activation initially; a hard
 `before_tool:set_canvas` binding can dead-end a `workspace.backend = none`
 runtime where `use_skill`/Canvas capabilities are absent. Critical security
 rules stay enforced in code and summarized in the tool description. After
@@ -822,9 +874,9 @@ hard first-use gate.
 ### Desktop
 
 The current `/sessions/:threadId` route uses a thin `ChatPageComponent` wrapper
-around `PersistentChatComponent`. The canvas should be a sibling at that
-wrapper, not another responsibility inserted into the already-large persistent
-chat component.
+around `PersistentChatComponent`. Slice 1 delivered Canvas as a sibling at that
+wrapper rather than inserting another responsibility into the already-large
+persistent chat component.
 
 ```html
 <as-split>
@@ -850,23 +902,26 @@ split. The pane has Cockpit-owned chrome that agent content cannot cover:
 
 `CanvasService` is keyed by `threadId`, cancels stale requests on route changes,
 and has no fallback to a previously viewed thread while the root draft has no
-ID. A new source opens the pane by default; a user preference may change that
-to a badge. Republishing the same source refreshes without stealing focus or
-resetting scroll/editor selection. Closing the pane is a local presentation
-action; `clear_canvas` changes shared thread state.
+ID. A new source opens the desktop pane by default. On mobile it is mounted and
+announced but remains behind the trusted Canvas toggle/tool card until the user
+enters it; automatically making it full-screen would strand the currently
+focused chat control inside a newly inert subtree. A user preference may later
+change desktop auto-open to a badge. Republishing the same source refreshes
+without stealing focus or resetting scroll/editor selection. Closing the pane
+is a local presentation action; `clear_canvas` changes shared thread state.
 
 An invalidation never overwrites a dirty editor buffer. If the source version
 changes while the user has unsaved edits, keep the buffer and show a trusted
 “source updated—compare/reload” banner. Read-only same-source updates preserve
 scroll/zoom where the renderer can map them safely.
 
-The existing `PersistentChatService` privately owns both the canonical SSE
-stream and control sender. A sibling cannot consume Canvas events today. Slice
-0 chooses the smaller typed-bridge change: keep SSE/WebSocket lifecycle in the
-existing singleton owner, but expose a read-only decoded `{method, params}`
-event stream and a narrow typed `sendCanvasControl(...)` API through a
-`PersistentThreadTransportBridge`. Do not move Canvas state into the
-already-large chat service; a later transport extraction is separate refactoring.
+`PersistentChatService` continues to own the canonical SSE stream and control
+sender. Slice 0 delivered the smaller typed bridge: SSE/WebSocket lifecycle
+stays in the existing singleton owner, while
+`PersistentThreadTransportBridge` exposes a read-only decoded
+`{method, params}` event stream and a narrow typed `sendCanvasControl(...)` API
+to the sibling. Canvas state remains outside the already-large chat service; a
+later general transport extraction is separate refactoring.
 
 Because the current chat header also lives inside `PersistentChatComponent`,
 the wrapper owns an accessible Canvas toggle/floating action instead of reaching
@@ -933,8 +988,17 @@ the presented content is not accessible:
 **Workspace/live source is authoritative for content. PostgreSQL is
 authoritative for shared presentation state.**
 
-Use the next available application migration number; the original brainstorm's
-`0002_canvases.sql` name is obsolete. A v1 shape is:
+The implemented application migration sequence is:
+
+- `0058_canvases.sql` creates the thread-scoped presentation state;
+- `0059_docker_workspace_leases.sql` supplies the durable static-Docker
+  endpoint authority required by the trusted file gateway; and
+- `0060_canvas_events_epoch_comment.sql` records the newer event-generation
+  catalog comment without modifying the already-applied `0058` bytes.
+
+Applied migrations are checksum-tracked and immutable. Restore any drift to the
+recorded bytes and put later changes in a superseding migration; never rewrite a
+`schema_migrations` checksum. The implemented v1 state shape is:
 
 ```sql
 CREATE TABLE canvases (
@@ -1030,14 +1094,14 @@ State transitions are atomic at the row level:
 
 ## Thread Workspace File Gateway
 
-Persistent threads have upload-only file routes today. The existing job file
-routes are text-only and do not address a persistent thread's SFTP/virtual
-workspace. File viewing is therefore **net-new infrastructure**, not reuse of a
-general thread file API.
+Before Slice 1, persistent threads had upload-only file routes. The existing
+job file routes were text-only and did not address a persistent thread's
+SFTP/virtual workspace. Slice 1 therefore introduced net-new, Canvas-scoped
+file infrastructure rather than reusing a general thread file API.
 
-Create a Canvas-scoped gateway protected by `require_thread_owner` (including
-its existing unscoped-admin bypass) rather than an arbitrary thread filesystem
-browser:
+The delivered gateway is protected by `require_thread_owner` (including its
+existing unscoped-admin bypass) and does not expose an arbitrary thread
+filesystem browser:
 
 ```text
 GET/HEAD /api/persistent/threads/{thread_id}/canvases/main/content
@@ -1106,13 +1170,15 @@ typed `409 source_changed`; do not show different bytes as the same published
 presentation. The UI offers “ask agent to refresh” or an explicit “load current
 workspace version”.
 
-For unversioned SFTP, read the bounded regular file into a memory/spooled
-temporary buffer and hash those exact bytes before sending headers; do not mint
-a strong ETag from size/mtime and then stream potentially different bytes.
-Version-aware object stores may use their native conditional Range API. Limit
-concurrent SFTP materializations and delete every spool on response completion
-or cancellation. Any disk spill is private (`0600`) and excluded from logs and
-backups; this is transient delivery, not artifact persistence.
+For unversioned SFTP, read the bounded regular file into memory and hash those
+exact bytes before sending headers; do not mint a strong ETag from size/mtime
+and then stream potentially different bytes. Shared virtual storage likewise
+uses a transport-level `max + 1` read, so a stale object HEAD cannot turn into
+an unbounded `rclone cat`. Materialization, CPU validation, retained response
+buffers, and backend reads each have bounded concurrency/queue waits. A response
+buffer lease is acquired before the read and held through the final ASGI send or
+cancellation, preventing slow clients from retaining unlimited 25 MiB bodies.
+This is transient delivery, not artifact persistence.
 
 Default configurable limits for the first slice are 2 MiB text/Markdown/HTML,
 25 MiB encoded raster image, 40 megapixels decoded image, and 50 MiB absolute
@@ -1181,11 +1247,12 @@ arbitrary source-setting is not part of v1; the delegated internal agent action
 uses one explicit transport adapter:
 
 ```text
+GET    /api/internal/persistent/threads/{thread_id}/canvases/main
 POST   /api/internal/persistent/threads/{thread_id}/canvases/main/set
 DELETE /api/internal/persistent/threads/{thread_id}/canvases/main
 ```
 
-The internal route requires both a valid `X-Internal-Key` and delegated
+The internal routes require both a valid `X-Internal-Key` and delegated
 `X-MCP-User-Id`; anonymous-internal and BFF-only callers are rejected, and
 public ingress strips `/api/internal/*` plus those headers. Authentication
 constructs the delegated user principal, `require_thread_owner` applies the
@@ -1293,20 +1360,18 @@ newer than the one applied, and then fetches content through the authorized
 adapter. It also reconciles when the route/tab regains focus after a bounded
 staleness interval. Canvas does not add its own stream.
 
-There is a prerequisite correctness fix: `_broadcast` allocates sequences in
-order but currently starts independent fire-and-forget database writes. A later
-sequence can land first; the SSE poller advances past it and can permanently
-miss the late lower sequence. Before adding Canvas events, route persistence
-through one per-runtime ordered, batch-capable writer/queue. It inserts batches
-in sequence order; any overflow policy may coalesce token deltas but must not
-silently drop state invalidations. A failed write is logged and forces clients
-to reconcile. Retry Canvas/state invalidations within a bounded queue. On
-terminal persistence failure, send live subscribers a direct, non-journaled
+Slice 0 fixed the prerequisite ordering defect in `_broadcast`: sequence-bearing
+events now pass through one per-runtime ordered, batch-capable writer instead
+of independent fire-and-forget database writes. It inserts batches in sequence
+order; overflow may coalesce token deltas but never silently drops state
+invalidations. A failed write is logged and forces clients to reconcile.
+Canvas/state invalidations retry within a bounded queue. On terminal persistence
+failure, live subscribers receive a direct, non-journaled
 `canvas.reconcile_required` control frame which the typed bridge handles even
-though normal `_seq` WebSocket duplicates are discarded. With no live control
-channel, convergence occurs only on route/focus reload. This improves all
-persistent events but still does not claim transactional or exactly-once
-delivery; Canvas REST reconciliation is what makes missed invalidations safe.
+when normal `_seq` WebSocket duplicates are discarded. With no live control
+channel, convergence occurs on route/focus reload. This improves all persistent
+events but does not claim transactional or exactly-once delivery; authoritative
+Canvas REST reconciliation makes missed invalidations safe.
 
 The current transport split matters:
 
@@ -1317,10 +1382,11 @@ The current transport split matters:
 - **Cockpit-originated edit:** after a successful conditional file save, the
   shared transport sends
   `{"method":"canvas.source_updated","canvas_id":"main",...}` on the
-  control WebSocket. Add `ToolContext.invalidate_recent_read(path)` and have the
-  runtime call it, rather than mutating the private `_recent_reads` deque
-  externally. It then reloads current Canvas state and broadcasts an
-  invalidation. The saving Cockpit applies the REST response immediately.
+  control WebSocket. The runtime calls
+  `ToolContext.invalidate_recent_read(path)` rather than mutating the private
+  `_recent_reads` deque externally, then reloads current Canvas state and
+  broadcasts an invalidation. The saving Cockpit applies the REST response
+  immediately.
 - **No live agent:** the durable Canvas row/file write still succeeds when the
   workspace is available. A later route load reconciles from REST; live
   cross-tab fan-out while no session runtime exists is deferred rather than
@@ -1392,12 +1458,12 @@ all production backends and agent file tools with a shared atomic CAS contract
 before changing the claim; otherwise revisit CRDTs only after real simultaneous
 editing demand appears.
 
-For targeted collaboration, Slice 2 may attach the user's text selection to the
-next chat message as `{canvas_id, path, source_version, range, selected_text}`.
-The agent still reloads the file; selection metadata is a locator, not content
-authority. Live-app form results are separate: an untrusted iframe can propose
-a result through the Canvas bridge, but Cockpit must show a trusted “Send to
-agent” confirmation before it becomes user input.
+Selection-to-message metadata is deferred. If later implemented, it may attach
+`{canvas_id, path, source_version, range, selected_text}` to the next chat
+message, but the agent must still reload the file: selection metadata is a
+locator, not content authority. Live-app form results are separate: an
+untrusted iframe can propose a result through the Canvas bridge, but Cockpit
+must show a trusted “Send to agent” confirmation before it becomes user input.
 
 ## Security Model
 
@@ -1422,6 +1488,10 @@ placement is a UX choice, not a trust boundary.
 - Revalidate current thread authorization, workspace generation, origin
   generation, route, and origin session on each request. Never keep routing to a recycled workspace
   IP or old SSH target.
+- Disable AsyncSSH's default-user `known_hosts` fallback explicitly and accept
+  only the provisioner-recorded Ed25519 SHA-256 fingerprint. An unrelated
+  matching entry in the orchestrator user's home directory is never authority
+  for a Canvas generation.
 - Do not expose pod IPs, internal DNS names, internal keys, or proxy credentials
   to the model or browser.
 - Canonicalize file paths on the target and reject a symlink in **any** path
@@ -1463,8 +1533,8 @@ Baseline CSP:
 default-src 'none';
 script-src 'none';
 style-src 'unsafe-inline';
-img-src data: blob:;
-font-src data:;
+img-src 'none';
+font-src 'none';
 connect-src 'none';
 form-action 'none';
 base-uri 'none';
@@ -1906,11 +1976,13 @@ revocation, thread switch, workspace generation change, or clear.
 - Thread-owner/admin-authorized `ThreadWorkspaceFileGateway` for remote and
   shared-virtual persistent-thread files, including MIME/hash/Range/limits.
 - `CanvasPaneComponent`, renderer registry, file renderer adapters, and service.
-- Best-effort conditional file writes/conflict UX in a later slice.
+- Best-effort conditional file writes, refresh, conflict UX, and editing
+  awareness in Slice 2.
 - Separate user-content domain, wildcard ingress/TLS, partitioned viewer-session
   bootstrap, and per-app origin generations.
-- Async SSH upstream connector, manifest route table, and safe streaming
-  HTTP/WebSocket multiplexer.
+- Shared pinned AsyncSSH transport and bounded one-port readiness in Slice 3A;
+  long-lived proxy channel registration, the manifest route table, and the safe
+  streaming HTTP/WebSocket multiplexer remain.
 - Canvas skill and capability-aware scope.
 - Browser renderer adapter once shared-browser streaming exists.
 
@@ -1923,8 +1995,16 @@ revocation, thread switch, workspace generation change, or clear.
 owner-protected public state/conditional-clear routes, ordered persistent-event
 writing with fail-closed per-runtime epochs and direct reconciliation on
 terminal Canvas failures, and the typed Cockpit transport/state bridge.
-Source-setting HTTP adapters, model tools, and the companion skill intentionally
-remain in Slice 1.
+Source-setting HTTP adapters, model tools, and the companion skill were
+intentionally assigned to Slice 1 and are now implemented below.
+
+The first local rollout exposed an immutable-history violation: `0058` had
+already been applied with SHA-256
+`e04eb6a4e27a120ec86682226b3cfa9c6abeeeb64d53b9781a45ae83ef11cff5`,
+but its repository copy was later edited. The repair restores those exact bytes,
+pins the checksum in the Canvas migration test, excludes the immutable file from
+new Squawk annotations, and moves the later `threads.events_epoch` comment into
+forward-only migration `0060`. The database migration ledger was not edited.
 
 - application migration `0058` and `CanvasService`
   with `require_thread_owner`-protected `main` routes and atomic revision
@@ -1934,22 +2014,30 @@ remain in Slice 1.
   typed bridge over the existing transport owner;
 - unit-test state transitions and missed/duplicate-event REST reconciliation.
 
-This is a narrow platform prerequisite PR. It does not claim the feature is
-useful until the file stage lands, and it does not register model tools with no
+This was a narrow platform prerequisite PR. It did not claim the feature was
+useful until the file stage landed, and it did not register model tools with no
 usable source kind.
 
 ### Slice 1 — View-only file-backed shared stage
 
-Prove the complete control loop with one `main` canvas per persistent thread:
+**Implementation status:** Implemented as of 2026-07-13; the primary
+write/present/render path is live-verified on local k3d. The conditional-content
+`304` framing defect found by the first pass was fixed at the start of Slice 2
+and reverified against the real ASGI server. The secure VM identity adapter and
+cross-tenant static-Docker recreation controller are explicit gates, not hidden
+partial support.
 
-- mint/persist `workspace_generation` through all thread workspace lifecycle
-  paths;
+The complete control loop uses one `main` canvas per persistent thread:
+
+- mint/persist `workspace_generation` for durable virtual storage and trusted
+  Kubernetes/Docker lifecycle adapters; fail closed for unattested VM/direct
+  remote and process-local backends;
 - `ThreadWorkspaceFileGateway` for remote and shared durable virtual backends,
   including provisioner-captured host fingerprints, the pinned async SSH/SFTP
   pool, canonical path, MIME, hash, GET/HEAD/Range, limits, and suspended state
   behavior;
 - add the `canvas` tool category, file-only flat get/set/clear adapters,
-  internal set/clear routes with mandatory internal + delegated-user headers,
+  internal get/set/clear routes with mandatory internal + delegated-user headers,
   delegated-user orchestrator client pattern, and post-commit
   `canvas_event_callback`;
 - `ChatPageComponent` split with a Canvas pane;
@@ -1961,10 +2049,62 @@ Prove the complete control loop with one `main` canvas per persistent thread:
   and translated English/German copy;
 - concise `present-with-canvas` skill, model-invoked and scoped only with tools.
 
+Static Docker hosts listen on container port `30022`; Compose passes the exact
+private-key path to the orchestrator and keys every fingerprint inventory entry
+by the endpoint the orchestrator actually uses. Migration `0059` makes the
+endpoint-keyed `docker_workspace_leases` table the durable occupancy authority;
+job/thread JSONB is only an atomic mirror. Allocation is one
+PostgreSQL-advisory-lock transaction across both owner kinds, and exact endpoint,
+owner, lease, status, lifecycle edge, trust provenance, and fingerprint checks
+guard every transition. Quarantine survives owner deletion and blocks stale
+finalizers and later allocation.
+
+First discovery is unavailable by default. A production bootstrap may import an
+endpoint as attested only after both its container and persistent workspace data
+were independently recreated or sanitized and an exact host-key fingerprint was
+captured. That bootstrap is one-time: configuration cannot promote an existing
+quarantine and must be removed after the clean import. `ready -> releasing ->
+released|quarantined` is the only reusable cleanup path; default production
+release quarantines because SSH deletion is not a tenant reset. Only explicit
+same-trust, single-user development reuse may return an unrecreated static host
+to the pool.
+
 This slice delivers the central promise: the agent writes a file and puts it in
 front of the user without an IDE detour.
 
+Final repository validation replayed all application migrations into fresh
+PostgreSQL and regenerated/checked `schema_current.sql`; passed 199 focused
+Canvas, lifecycle, and configuration tests with 4 environment skips, the full
+1,007-test Cockpit suite, production Cockpit build, i18n checks, changed-Canvas
+style checks, Ruff, Squawk, Helm overlays, Docker Compose rendering, workspace
+shell syntax, and companion-skill validation. Repository-wide Stylelint still
+has unrelated baseline findings and is not claimed clean by this slice.
+
+Local k3d acceptance on 2026-07-13 exercised the original user flow on thread
+`5432783a…`. After both orchestrator replicas converged on one current image, the
+legacy durable-virtual thread was rebound to a current agent. Its backend
+reported `supports_canvas=True`; it loaded `get_canvas`, `set_canvas`, and
+`clear_canvas`, and deployed the `present-with-canvas` skill. The authenticated
+internal adapter presented the existing `test.md` as **Test Document**, the
+Cockpit rendered it, and the authorized gateway bytes hashed to the stored
+`source_version`. The user confirmed the pane worked.
+
+That pass also established an operational constraint: Canvas tool/skill scope is
+resolved when an agent process is set up, so an already-running stale agent does
+not hot-load a new registry and must be recreated/re-attached. Slice 2 removed
+the representation `Content-Length` from bodyless `304` responses; a live
+conditional request now returns a clean `304` with no Uvicorn framing error. The
+exact evidence lives in [[dynamic_canvas_slice1_verification]]. The remaining
+live-app real-browser matrix belongs to Slice 3 and is not claimed by this
+file-only slice.
+
 ### Slice 2 — Bidirectional editing
+
+**Implementation status:** Implemented as of 2026-07-13. The conditional-edit
+backend and cross-replica coordinator are live-verified on local k3d. Cockpit's
+editor/conflict behavior is covered by component and service tests and a
+production build; a user-driven browser acceptance pass of the Monaco workflow
+is still useful follow-up evidence, not an implementation blocker.
 
 - Editable Markdown/text/code/LaTeX source.
 - Shared Monaco loader/disposal helper.
@@ -1973,12 +2113,82 @@ front of the user without an IDE detour.
   cross-replica PostgreSQL advisory coordinator lock, safe
   temp/rename/readback behavior, and explicit best-effort guarantee.
 - Ephemeral user-editing awareness.
-- Recent-read invalidation, agent refresh/preserve-user-edit tests, and optional
-  selection-to-next-message metadata.
-- Decide and implement the first full LaTeX preview path only if it fits this
-  slice; source editing does not wait for it.
+- Recent-read invalidation and agent refresh/preserve-user-edit coverage;
+  selection-to-next-message metadata remains deferred.
+- Safe LaTeX source editing through the text renderer; compiled document
+  preview remains deferred.
+
+The delivered slice includes:
+
+- `editable` in the file-only tool/internal-set contract, accepted only for a
+  writable UTF-8 Markdown, text/code/LaTeX, or static-HTML presentation;
+- owner-authorized bounded `PUT .../main/content` and conditional
+  `POST .../main/refresh` responses with server-issued versioned content URLs,
+  complete-state and content ETags, exact strong precondition parsing, and
+  typed `428`/`412`/`409`/`423` outcomes;
+- a bounded mutation-admission gate, stable SHA-256-derived signed advisory-lock
+  key for `(thread_id, canonical_path)`, dedicated PostgreSQL session lock,
+  locked thread-owner snapshot, Canvas row revalidation, and row update held
+  across the workspace write/readback;
+- same-directory exclusive SFTP temporary writes with permission preservation
+  and POSIX rename, plus best-effort rclone temporary-object copy/replacement;
+- refresh of both editable and read-only drifted files after rerunning the full
+  path, generation, renderer, MIME, and size validation chain;
+- a version-aware agent read-before-write guard: text `read_file` records the
+  full-byte SHA-256, and `write_file`/`edit_file` require current bytes to match
+  even when the best-effort browser control frame was missed;
+- a validated, paced, exact-revision-deduplicated `canvas.source_updated`
+  control path that invalidates the agent's recent read and reconciles live
+  clients; Cockpit keeps only the latest committed update while its control
+  socket reconnects and flushes it on open; plus one TTL-bound non-journaled
+  editing-awareness lease per WebSocket client with periodic
+  authorization/state revalidation;
+- a pane-local dirty buffer, lazy shared Monaco adapter, edit/preview mode,
+  read-only source-refresh action, original-source chrome preservation,
+  reactive read-only state, model/editor disposal, and distinct conflict
+  recovery without discarding user bytes on save failure, republish,
+  replacement, clear, pane hide, or preview; thread/auth teardown does clear it;
+- English/German UI copy and the updated `present-with-canvas` skill, which tells
+  the agent to re-read shared editable bytes immediately before overwriting and
+  to republish with the same editability choice.
+
+Selection-to-message metadata and a full compiled LaTeX document preview remain
+deferred. The implemented LaTeX path is safe source editing with the existing
+text renderer. This slice still makes the documented best-effort claim: a shell
+or another process which writes outside the coordinator can race the final
+check/write interval, so it is not a cross-backend atomic CAS or CRDT.
+
+Repository validation passed 426 focused Python tests, 1,030 Cockpit tests,
+focused Ruff check/format, i18n checks, Canvas Stylelint, the companion-skill
+validator, `git diff --check`, and a production Cockpit build (with the existing
+bundle/CommonJS warnings). Local k3d then returned `200` for editable set/save
+and refresh, a bodyless header-correct `304`, the specified stale-save `409`, and
+one `200` plus one `409 canvas_presentation_changed` when identical preconditions
+were raced directly against the two orchestrator replicas. The final deployed
+cross-origin response also exposed both state and content validators to the
+supported local Cockpit origin. See
+[[dynamic_canvas_slice2_verification]].
 
 ### Slice 3 — Isolated one-port live preview
+
+**Foundation checkpoint (Slice 3A):** Implemented and default-off as of
+2026-07-13. This checkpoint adds the capability-gated flat `workspace_port`
+tool/internal adapter, canonical port and entry-path policy, status-only public
+state, complete pre-commit workspace target revalidation, a shared pinned
+AsyncSSH transport with request-scoped `127.0.0.1` direct channels, bounded TCP
+readiness, per-target connection single-flight, generation-scoped eviction,
+workspace `sshd` restrictions, and Helm/Compose gate plus additional-denylist
+plumbing. It creates no local listener and sends no HTTP bytes.
+
+The master gate remains false in defaults and examples. An enabled gate still
+does not create a browser-reachable viewer: no viewer session, URL, isolated
+origin, proxy, or Cockpit iframe ships in 3A. Existing agent/session pods must
+be recycled after a capability ConfigMap change; the orchestrator's server-side
+gate makes disablement fail closed during that rollout. The companion skill
+stays file-focused until presenting an app produces a usable user-facing stage.
+See [[dynamic_canvas_slice3a_verification]].
+
+The remaining Slice-3 work is:
 
 - Provision a separate registrable wildcard Canvas domain, DNS/TLS/ingress, and
   per-source origin generations. Production app-cookie mode waits for an
@@ -1987,9 +2197,9 @@ front of the user without an IDE detour.
 - Complete the partitioned-cookie/bootstrap/wrapper-pop-out browser matrix;
   browsers without the embedded authentication flow report live preview as
   unsupported rather than opening untrusted content top-level.
-- Extend the Slice-1 AsyncSSH pool with request-scoped loopback direct channels
-  and explicit workspace `sshd` forwarding configuration; do not create a local
-  TCP listener.
+- Extend the short-lived 3A direct-channel health path into request-scoped proxy
+  channels with active in-flight registration/cancellation on revocation; keep
+  the fixed loopback destination and never create a local TCP listener.
 - Ship `workspace_port` for bounded ordinary HTTP first, with fixed iframe
   sandbox/Permissions Policy, bounded decoded/reframed request bodies, streamed
   response bodies, cancellation,
@@ -1997,8 +2207,9 @@ front of the user without an IDE detour.
   origin-session teardown, and origin-rotation attack tests. SSE and WebSocket are not
   advertised yet.
 
-Do not merge this slice until real browsers prove no BFF/Keycloak cookie or
-authorization-header leakage.
+Do not enable or claim the user-facing slice complete until real browsers prove
+no BFF/Keycloak cookie or authorization-header leakage. The default-off 3A
+foundation does not satisfy or bypass that launch gate.
 
 ### Slice 4 — Multi-port and streaming apps
 
@@ -2041,7 +2252,7 @@ authorization-header leakage.
 - `require_thread_owner` checks, including its existing admin bypass, cover
   state, content, edit, viewer-session creation/revocation, pop-out, HTTP, and
   WebSocket entry points.
-- The internal set/clear routes reject missing/invalid `X-Internal-Key`, missing
+- The internal get/set/clear routes reject missing/invalid `X-Internal-Key`, missing
   delegated user, BFF-only/public-ingress access, and a delegated caller without
   owner/admin authorization; its accepted request reaches the same service
   semantics as other adapters.
@@ -2057,8 +2268,15 @@ authorization-header leakage.
 - Remote SFTP and shared durable virtual reads produce the same hash/MIME/range
   contract; process-local memory, scratch, suspended, missing, oversized, and
   unsupported backends return typed outcomes.
+- A virtual object which grows after HEAD is stopped at the transport-level
+  byte limit. Slow/cancelled ASGI sends retain at most the configured response
+  leases and release them exactly once.
 - Traversal, symlink escape, MIME spoofing, incompatible renderer, stale source
   version, malformed Range, and decoded-image bombs fail closed.
+- Docker allocation serializes jobs and threads across replicas; releasing and
+  quarantined leases remain occupied, failed cleanup is never advertised as
+  reusable, and suspension/restore cannot bypass the lease CAS. Multi-user
+  defaults require controller-attested recreation rather than SSH cleanup.
 - Editing requires both preconditions and distinguishes `428`, `412`, and
   same-presentation/source replacement outcomes; candidate type validation and
   readback version become the returned/stored source version. Refresh reruns all
@@ -2090,7 +2308,9 @@ authorization-header leakage.
   `412`, same-source presentation change, source replacement, and clear
   conflict UI without mislabeling a republish as replacement.
 - Static HTML sanitizer removes scripts, handlers, forms, base/navigation, and
-  external resource URLs; Markdown raw HTML/external images are disabled.
+  all image/font/resource URLs; Markdown raw HTML/external images are disabled.
+- Pathological Markdown/static HTML fails with translated complexity UX before
+  attaching oversized sanitized DOM or `srcdoc` output.
 - New/hidden/refresh behavior preserves scroll/editor selection and focus; tool
   cards identify replaced non-restorable revisions honestly.
 - Splitter keyboard behavior, status announcements, iframe titles, image alt,
@@ -2164,7 +2384,7 @@ claimed as Safari coverage. Cover:
 - When multiple humans can edit one thread, is awareness per canvas sufficient,
   or does it need per-user cursors/locks?
 
-None of these blocks Slices 0–1. The browser authentication matrix is a blocking
+None of these blocked Slices 0–2. The browser authentication matrix is a blocking
 acceptance gate for Slice 3, not an unanswered architecture choice hidden in
 the file-stage scope.
 

@@ -177,9 +177,10 @@ secrets:
 
 ### Mode 3 — Chart-created Secret (evaluation / dev only)
 
-The chart generates `APP_ENCRYPTION_KEY` if absent, preserves it across
-upgrades via `lookup`, and inlines any keys you provide in `secrets.values`.
-**Do not use in production** — values end up in `helm get values` output.
+The chart generates `APP_ENCRYPTION_KEY` and `MCP_INTERNAL_KEY` independently
+when absent, preserves both across upgrades via `lookup`, and inlines any keys
+you provide in `secrets.values`. **Do not use in production** — values end up
+in `helm get values` output.
 
 ```yaml
 secrets:
@@ -251,13 +252,20 @@ only the credentials live in Vault.
 - `DISCORD_WEBHOOK_URL`, `SLACK_WEBHOOK_URL` (chat notifications)
 - `TAILSCALE_AUTH_KEY` (when `agent.tailscale.enabled`)
 - `CODEX_MANAGEMENT_KEY` (when `codexProxy.enabled`)
-- `MCP_INTERNAL_KEY` (when `mcp.enabled`)
+- `MCP_INTERNAL_KEY` (when `mcp.enabled` or delegated Dynamic Canvas tools are
+  enabled). External-Secret and pre-existing-Secret deployments must provide
+  this independently generated shared secret. If it is absent, the
+  orchestrator remains available, but persistent agents withhold the Canvas
+  tools and the `present-with-canvas` companion skill rather than advertising
+  a broken capability; an enabled MCP pod also requires the key to start.
+  Chart-created mode generates and preserves it automatically.
 - `DEFAULT_DS_WEBDAV_*` (auto-configure a default WebDAV datasource for new users)
 
 A skeleton `srw.env` to feed into `kubectl create secret generic ... --from-env-file=`:
 
 ```env
 APP_ENCRYPTION_KEY=<base64-encoded 32-byte key>
+MCP_INTERNAL_KEY=<independently-generated random shared secret>
 POSTGRES_USER=srw
 POSTGRES_PASSWORD=changeme
 VECTOR_POSTGRES_USER=srw
@@ -268,7 +276,12 @@ CLOUD_SERVICE_USER=agent
 CLOUD_SERVICE_PASSWORD=changeme
 ```
 
-Generate `APP_ENCRYPTION_KEY` with: `openssl rand -base64 32`
+Generate the independent keys with:
+
+```bash
+openssl rand -base64 32  # APP_ENCRYPTION_KEY
+openssl rand -base64 48  # MCP_INTERNAL_KEY
+```
 
 ---
 

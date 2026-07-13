@@ -1,5 +1,10 @@
 # Persistent chat — component style budget keeps growing
 
+**Canvas outcome (2026-07-13):** Dynamic Canvas did not add its pane to this
+component. It landed as a sibling under `ChatPageComponent`, with shared thread
+transport exposed through a narrow bridge. The component-style budget problem
+described here remains independently open.
+
 ## Symptom (observed 2026-05-11, CI build of `aa722c5`)
 
 The cockpit Docker build fails in `npm run build` with:
@@ -45,7 +50,9 @@ Every new feature lands as more inline SCSS in the same component. The component
 - Hides the real signal — budgets exist precisely to flag "this file is too big."
 - The bigger the inline style block, the slower the change-detection / template compile feedback loop in dev.
 - Style isolation per-component is the only Angular-native lever; once you stop respecting the budget, you also lose tree-shakeable, scoped style optimization gains.
-- Pattern of "bump and ship" means we will hit this again on the next feature (likely Dynamic Canvas / audio polish, per `docs/features/dynamic_canvas.md`).
+- Pattern of "bump and ship" means another persistent-chat feature can hit this
+  again. Dynamic Canvas avoided adding to the monolith by landing as a sibling;
+  audio and composer work still exercise this budget.
 
 ## Proposed fix
 
@@ -95,5 +102,7 @@ Step 3 (budget revert): trivial.
 
 ## Related
 
-- `docs/features/dynamic_canvas.md` will add another panel into this surface; do this refactor first or it'll land into the same monolith.
+- `docs/features/dynamic_canvas.md` added a sibling panel under
+  `ChatPageComponent`, not inside `PersistentChatComponent`; its transport bridge
+  is a useful boundary for later extractions.
 - Component-style budget pattern also applies to `instruction-builder.component.ts` and `job-list.component.ts`, but those are below thresholds today.
