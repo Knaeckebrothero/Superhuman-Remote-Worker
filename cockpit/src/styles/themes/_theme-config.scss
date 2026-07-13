@@ -47,6 +47,17 @@ $travertine-theme: (
   'gutter-color':  #dccfb6,
   'gutter-hover':  #c2b294,
 
+  // Categorical ramp — Imperial-harmonized (see spec 2026-07-13). Slots 2/3/6
+  // reuse alert/warning/info; 1 & 4 are offset cousins of danger/success; 5/7/8 new.
+  'cat-1': #a8492f, // terracotta
+  'cat-2': #c2722a, // copper
+  'cat-3': #9a7822, // gold
+  'cat-4': #6e7534, // olive
+  'cat-5': #2f7d74, // slate-teal
+  'cat-6': #3f5e8c, // lapis
+  'cat-7': #6f5591, // violet
+  'cat-8': #8f4d63, // mauve
+
   // Interactive overlays (light)
   'hover':  rgba(42, 29, 18, 0.04),
   'active': rgba(42, 29, 18, 0.08),
@@ -113,6 +124,16 @@ $senate-theme: (
   'track-bg':      #24242c,
   'gutter-color':  #33333d,
   'gutter-hover':  #46464f,
+
+  // Categorical ramp — Imperial-harmonized (see spec 2026-07-13).
+  'cat-1': #c8674e, // terracotta
+  'cat-2': #d48a4d, // copper
+  'cat-3': #cdab68, // gold
+  'cat-4': #a7b06a, // olive
+  'cat-5': #5fb0a8, // slate-teal
+  'cat-6': #7a9bc6, // lapis
+  'cat-7': #a98fc4, // violet
+  'cat-8': #c98aa3, // mauve
 
   // Interactive overlays
   'hover':  rgba(255, 255, 255, 0.04),
