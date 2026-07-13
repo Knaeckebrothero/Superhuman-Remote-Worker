@@ -43,7 +43,7 @@ import { PanelHeaderComponent } from '../panel-header/panel-header.component';
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg);
       }
 
       .component-content {

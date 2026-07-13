@@ -130,15 +130,15 @@ interface MenuSection {
         border: none;
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         cursor: pointer;
         transition: background 0.15s, color 0.15s;
       }
 
       .menu-button:hover,
       .menu-button.active {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0);
+        color: var(--text-primary);
       }
 
       .menu-button svg {
@@ -153,8 +153,8 @@ interface MenuSection {
         width: 280px;
         max-height: 80vh;
         overflow-y: auto;
-        background: var(--panel-bg, #181825);
-        border: 1px solid var(--border-color, #313244);
+        background: var(--panel-bg);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-surface);
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
         z-index: 1000;
@@ -162,7 +162,7 @@ interface MenuSection {
 
       .menu-section {
         padding: 8px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color);
       }
 
       .menu-section:last-of-type {
@@ -174,7 +174,7 @@ interface MenuSection {
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 1px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         padding: 4px 8px;
         margin: 0;
       }
@@ -186,7 +186,7 @@ interface MenuSection {
         padding: 10px 12px;
         border-radius: var(--radius-control);
         text-decoration: none;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         cursor: pointer;
         transition: background 0.15s;
         border: none;
@@ -196,7 +196,7 @@ interface MenuSection {
       }
 
       .menu-item:hover {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
       }
 
       .settings-item {
@@ -228,26 +228,26 @@ interface MenuSection {
       .item-description {
         display: block;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         margin-top: 2px;
       }
 
       .external-icon {
         width: 14px;
         height: 14px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex-shrink: 0;
       }
 
       .chevron-icon {
         width: 14px;
         height: 14px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex-shrink: 0;
       }
 
       .menu-item.active .chevron-icon {
-        color: var(--accent, #89b4fa);
+        color: var(--cat-6);
       }
 
       .layout-section {
@@ -256,9 +256,9 @@ interface MenuSection {
 
       .menu-footer {
         padding: 8px 12px;
-        background: var(--timeline-bg, #11111b);
+        background: var(--timeline-bg);
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         text-align: center;
       }
     `,

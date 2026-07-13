@@ -142,7 +142,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg);
         position: relative;
       }
 
@@ -151,8 +151,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: flex;
         gap: 4px;
         padding: 8px;
-        background: var(--surface-0, #313244);
-        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--surface-0);
+        border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
       }
 
@@ -164,7 +164,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         border: none;
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 12px;
         font-family: inherit;
         cursor: pointer;
@@ -172,13 +172,13 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .table-tab:hover {
-        background: var(--panel-header-bg, #1e1e2e);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--panel-header-bg);
+        color: var(--text-primary);
       }
 
       .table-tab.active {
-        background: var(--accent-color, #cba6f7);
-        color: var(--on-accent, var(--timeline-bg, #11111b));
+        background: var(--accent-color);
+        color: var(--on-accent, var(--timeline-bg));
       }
 
       .row-count {
@@ -198,15 +198,15 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         border: none;
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 14px;
         cursor: pointer;
         transition: all 0.15s ease;
       }
 
       .refresh-btn:hover:not(:disabled) {
-        background: var(--panel-header-bg, #1e1e2e);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--panel-header-bg);
+        color: var(--text-primary);
       }
 
       .refresh-btn:disabled {
@@ -236,21 +236,21 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: #f38ba8;
+        color: var(--danger);
         flex: 1;
       }
 
       .error-state button {
         padding: 8px 16px;
-        border: 1px solid #f38ba8;
+        border: 1px solid var(--danger);
         border-radius: var(--radius-control);
         background: transparent;
-        color: #f38ba8;
+        color: var(--danger);
         cursor: pointer;
       }
 
       .error-state button:hover {
-        background: rgba(243, 139, 168, 0.1);
+        background: color-mix(in srgb, var(--danger) 10%, transparent);
       }
 
       /* Empty State */
@@ -261,7 +261,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex: 1;
       }
 
@@ -294,7 +294,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .data-table td {
         padding: 8px 12px;
         text-align: left;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color);
         max-width: 300px;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -304,8 +304,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .data-table th {
         position: sticky;
         top: 0;
-        background: var(--panel-header-bg, #1e1e2e);
-        color: var(--text-secondary, #a6adc8);
+        background: var(--panel-header-bg);
+        color: var(--text-secondary);
         font-weight: 600;
         text-transform: uppercase;
         font-size: 11px;
@@ -314,11 +314,11 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .data-table td {
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
       }
 
       .data-table tbody tr:hover {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
       }
 
       /* Column type styling */
@@ -337,19 +337,19 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .col-date {
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .col-json {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: #a6e3a1;
+        color: var(--success);
         max-width: 200px;
       }
 
       .col-binary {
         font-style: italic;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       /* Pagination */
@@ -358,14 +358,14 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         align-items: center;
         justify-content: space-between;
         padding: 8px 12px;
-        background: var(--surface-0, #313244);
-        border-top: 1px solid var(--border-color, #313244);
+        background: var(--surface-0);
+        border-top: 1px solid var(--border-color);
         flex-shrink: 0;
       }
 
       .page-info {
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .page-controls {
@@ -376,19 +376,19 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .page-btn {
         padding: 4px 12px;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         font-size: 12px;
         cursor: pointer;
         transition: all 0.15s ease;
       }
 
       .page-btn:hover:not(:disabled) {
-        background: var(--panel-header-bg, #1e1e2e);
-        color: var(--text-primary, #cdd6f4);
-        border-color: var(--text-muted, #6c7086);
+        background: var(--panel-header-bg);
+        color: var(--text-primary);
+        border-color: var(--text-muted);
       }
 
       .page-btn:disabled {
@@ -398,7 +398,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .page-number {
         font-size: 12px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
       }
     `,
   ],

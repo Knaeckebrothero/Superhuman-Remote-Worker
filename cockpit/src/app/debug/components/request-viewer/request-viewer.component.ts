@@ -224,7 +224,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg);
         position: relative;
       }
 
@@ -233,33 +233,33 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: flex;
         gap: 8px;
         padding: 8px;
-        background: var(--surface-0, #313244);
-        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--surface-0);
+        border-bottom: 1px solid var(--border-color);
         flex-shrink: 0;
       }
 
       .doc-id-input {
         flex: 1;
         padding: 6px 10px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
-        background: var(--panel-bg, #181825);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--panel-bg);
+        color: var(--text-primary);
         font-size: 12px;
         font-family: 'JetBrains Mono', monospace;
       }
 
       .doc-id-input:focus {
         outline: none;
-        border-color: var(--accent-color, #cba6f7);
+        border-color: var(--accent-color);
       }
 
       .load-btn {
         padding: 6px 16px;
         border: none;
         border-radius: var(--radius-control);
-        background: var(--accent-color, #cba6f7);
-        color: var(--on-accent, var(--timeline-bg, #11111b));
+        background: var(--accent-color);
+        color: var(--on-accent, var(--timeline-bg));
         font-size: 12px;
         font-weight: 500;
         cursor: pointer;
@@ -278,9 +278,9 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       /* Error Banner */
       .error-banner {
         padding: 8px 12px;
-        background: rgba(243, 139, 168, 0.15);
-        border-bottom: 1px solid #f38ba8;
-        color: #f38ba8;
+        background: color-mix(in srgb, var(--danger) 15%, transparent);
+        border-bottom: 1px solid var(--danger);
+        color: var(--danger);
         font-size: 12px;
       }
 
@@ -306,7 +306,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         flex: 1;
         text-align: center;
       }
@@ -332,7 +332,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       /* Metadata Card */
       .metadata-card {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
         border-radius: var(--radius-surface);
         padding: 12px;
         margin-bottom: 16px;
@@ -350,12 +350,12 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .meta-label {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         min-width: 60px;
       }
 
       .meta-value {
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
       }
 
       .meta-value.mono {
@@ -363,7 +363,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .estimated-badge {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 10px;
         margin-left: 4px;
       }
@@ -374,10 +374,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         margin: 16px 0 8px 0;
         padding-bottom: 4px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color);
       }
 
       /* Messages Container */
@@ -419,8 +419,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .bubble-system {
-        background: rgba(69, 71, 90, 0.5);
-        color: var(--text-secondary, #a6adc8);
+        background: color-mix(in srgb, var(--surface-1) 50%, transparent);
+        color: var(--text-secondary);
         font-style: italic;
         text-align: left;
         max-width: 95%;
@@ -428,21 +428,21 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .bubble-human,
       .bubble-user {
-        background: rgba(166, 227, 161, 0.2);
-        border: 1px solid rgba(166, 227, 161, 0.3);
-        color: var(--text-primary, #cdd6f4);
+        background: color-mix(in srgb, var(--success) 20%, transparent);
+        border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
+        color: var(--text-primary);
       }
 
       .bubble-assistant {
-        background: rgba(137, 180, 250, 0.2);
-        border: 1px solid rgba(137, 180, 250, 0.3);
-        color: var(--text-primary, #cdd6f4);
+        background: color-mix(in srgb, var(--cat-6) 20%, transparent);
+        border: 1px solid color-mix(in srgb, var(--cat-6) 30%, transparent);
+        color: var(--text-primary);
       }
 
       .bubble-tool {
-        background: rgba(203, 166, 247, 0.2);
-        border: 1px solid rgba(203, 166, 247, 0.3);
-        color: var(--text-primary, #cdd6f4);
+        background: color-mix(in srgb, var(--cat-7) 20%, transparent);
+        border: 1px solid color-mix(in srgb, var(--cat-7) 30%, transparent);
+        color: var(--text-primary);
         font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
       }
@@ -473,7 +473,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: #fab387;
+        color: var(--cat-2);
         margin-bottom: 8px;
       }
 
@@ -488,11 +488,11 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .tool-name {
         display: inline-block;
         padding: 2px 8px;
-        background: rgba(250, 179, 135, 0.2);
+        background: color-mix(in srgb, var(--cat-2) 20%, transparent);
         border-radius: var(--radius-tag);
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: #fab387;
+        color: var(--cat-2);
         margin-bottom: 4px;
       }
 
@@ -503,7 +503,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         border-radius: var(--radius-tag);
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: #a6e3a1;
+        color: var(--success);
         overflow-x: auto;
         white-space: pre-wrap;
         word-break: break-all;
@@ -517,18 +517,18 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .tool-label {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
       }
 
       .tool-value {
         font-family: 'JetBrains Mono', monospace;
-        color: #cba6f7;
+        color: var(--cat-7);
       }
 
       /* Tool Definitions Section */
       .tools-section {
         margin-top: 8px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
         border-radius: var(--radius-surface);
         overflow: hidden;
       }
@@ -547,7 +547,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .tools-list {
         padding: 8px 12px;
-        border-top: 1px solid var(--border-color, #45475a);
+        border-top: 1px solid var(--border-color);
         display: flex;
         flex-direction: column;
         gap: 6px;
@@ -565,7 +565,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       }
 
       .tool-desc {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted);
         font-size: 11px;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -575,7 +575,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       /* Reasoning Section */
       .reasoning-section {
         margin-top: 16px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0);
         border-radius: var(--radius-surface);
         overflow: hidden;
       }
@@ -585,7 +585,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         cursor: pointer;
         font-size: 12px;
         font-weight: 500;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary);
         user-select: none;
       }
 
@@ -595,10 +595,10 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .reasoning-content {
         padding: 12px 14px;
-        border-top: 1px solid var(--border-color, #45475a);
+        border-top: 1px solid var(--border-color);
         font-size: 12px;
         line-height: 1.6;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary);
         white-space: pre-wrap;
         max-height: 400px;
         overflow-y: auto;
