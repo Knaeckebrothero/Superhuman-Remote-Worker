@@ -36,29 +36,17 @@ workspace:
   prewarm:
     enabled: false
 
-# Virtual workspace tier (no_workspace_agent_mode.md §4/§5). A single-node MinIO
-# is deployed for local dev (deployment/tilt-minio.yaml, wired in the Tiltfile),
-# so the `virtual` backend exercises the real rclone -> S3 write path against a
-# durable, inspectable bucket (srw-workspaces). Credentials come from
-# values-local.yaml (VIRTUAL_WORKSPACE_S3_*). Swap rclone.type back to "memory"
-# to drop the MinIO dependency for pure smoke tests.
-virtualWorkspace:
-  rclone:
-    type: "s3"
-    root: "srw-workspaces"
-  s3:
-    endpoint: "http://minio.srw.svc.cluster.local:9000"
-
-# Snapshot + IDE-session object store (helm `s3.*`). The cluster overlay
-# (values-experimental.yaml) points this at the external MinIO so the workspace
-# snapshot service + idle sweeper actually run; locally we aim it at the SAME
-# single-node MinIO fixture (deployment/tilt-minio.yaml) so dev exercises the real
-# boto3 -> S3 path instead of leaving snapshots disabled (empty S3_ENDPOINT also
-# short-circuits the idle sweeper -> ws-thread-* pods would pile up). Credentials
-# (SNAPSHOT_S3_*) come from values-local.yaml; bucket (srw-snapshots) + region
-# (us-east-1) take chart defaults. Mirrors the virtualWorkspace.s3 wiring above.
-s3:
-  endpoint: "http://minio.srw.svc.cluster.local:9000"
+# Object store — bundled single-node Garage (`garage.enabled`), the same opt-in
+# store self-hosters get. Replaces the old separate MinIO fixture: the chart
+# deploys Garage + an idempotent bootstrap Job (buckets srw-snapshots +
+# srw-workspaces, native-format keys) and AUTO-WIRES both seams to it — snapshots
+# (S3_ENDPOINT, boto3) and the virtual tier (VIRTUAL_WORKSPACE_*, rclone provider
+# "Other"). So NO endpoint/credential wiring is needed here, and s3.endpoint /
+# virtualWorkspace.s3.endpoint MUST stay empty (a set endpoint bypasses Garage).
+# Creds auto-generate in the chart Secret (secrets.create). For a pure no-store
+# smoke test: garage.enabled=false + virtualWorkspace.rclone.type="memory".
+garage:
+  enabled: true
 
 # Cockpit dev image runs `ng serve`, which serves files from the Angular
 # source tree at /app/src/assets/. Land the chart-rendered env.js there so
