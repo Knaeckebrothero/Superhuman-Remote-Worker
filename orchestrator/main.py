@@ -2983,7 +2983,7 @@ def _is_lite_config_override(config_override: Any) -> bool:
 # Session workspace tiers selectable at create time (vm is upgrade-only) and
 # the platform default applied when neither the request nor the owner's saved
 # settings.persistent_agent.workspace_backend pick one. An S3 object store is
-# an assumed platform prerequisite (docs/issues/s3_object_store_bundled_fallback.md),
+# an assumed platform prerequisite (docs/done/s3_object_store_bundled_fallback.md),
 # so the default is the instant lite tier — see
 # docs/features/instant_landing_session.md.
 SESSION_WORKSPACE_BACKENDS = ("sandbox", "virtual", "none")
@@ -3142,7 +3142,7 @@ def _object_store_startup_warning(
     default UX. Returns None only when BOTH seams have a durable store. Replaces
     the scattered, late per-feature failures (``LiteWorkspaceConfigError`` at
     dispatch, silent snapshot no-ops) with one signal at startup. See
-    docs/issues/s3_object_store_bundled_fallback.md item 3.
+    docs/done/s3_object_store_bundled_fallback.md item 3.
     """
     env = os.environ if env is None else env
     s3_endpoint = (env.get("S3_ENDPOINT") or "").strip()
@@ -3174,7 +3174,7 @@ def _object_store_startup_warning(
         + "; ".join(bullets)
         + ". Fix: point at an external S3 (S3_ENDPOINT / VIRTUAL_WORKSPACE_S3_*) "
         "or enable the chart-bundled store (garage.enabled=true). "
-        "See docs/issues/s3_object_store_bundled_fallback.md."
+        "See docs/done/s3_object_store_bundled_fallback.md."
     )
 
 
@@ -6369,7 +6369,7 @@ async def lifespan(app: FastAPI):
     # One loud, early signal when either object-store seam is unconfigured,
     # replacing the scattered late failures (virtual-session dispatch, snapshot
     # no-ops). Fail-closed (raise, crash-loop) when OBJECT_STORE_REQUIRED is
-    # set; warn-only otherwise. docs/issues/s3_object_store_bundled_fallback.md.
+    # set; warn-only otherwise. docs/done/s3_object_store_bundled_fallback.md.
     _store_warning = _check_object_store_config()
     if _store_warning:
         logger.warning(_store_warning)

@@ -1,7 +1,7 @@
 # Instant Landing Session ("type first, provision on send")
 
 **Status**: IMPLEMENTED + live-verified on k3d (2026-07-12, uncommitted).
-S3 assumed present platform-wide (`docs/issues/s3_object_store_bundled_fallback.md`);
+S3 assumed present platform-wide (`docs/done/s3_object_store_bundled_fallback.md`);
 platform default = virtual. See "As built" at the bottom.
 **Scope**: orchestrator (default-settings chain) + cockpit (draft mode + settings UI)
 **Related**: `docs/features/no_workspace_agent_mode.md` (virtual/lite tiers),
@@ -78,7 +78,7 @@ Two things, and the second is the foundation for the first:
 gains `workspace_backend: "virtual"`. An S3-compatible object store is an
 assumed platform prerequisite (decision 2026-07-12) — no availability
 probing, no fallback logic; store-less installs are addressed once at the
-deployment layer by `docs/issues/s3_object_store_bundled_fallback.md`. A
+deployment layer by `docs/done/s3_object_store_bundled_fallback.md`. A
 store-less install that ignores that still fails fast with the actionable
 `LiteWorkspaceConfigError` message at attach.
 
@@ -186,7 +186,7 @@ returns to a fresh draft. Attachments stay disabled until connected
   Users can configure "always container" in Settings.
 - **S3 store is an assumed platform prerequisite** (2026-07-12) — no
   capability flag, no fallback logic; bundled-store fallback parked in
-  `docs/issues/s3_object_store_bundled_fallback.md`.
+  `docs/done/s3_object_store_bundled_fallback.md`.
 - **Platform default = `virtual`** — most sessions don't need shell tools;
   container is one Settings change or one in-place upgrade away.
 - **Default project** — instant sessions attach the user's default project
