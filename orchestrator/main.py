@@ -3435,6 +3435,44 @@ def _get_container_context(job: dict) -> dict:
     return ctx.get("workspace_container", {})
 
 
+def _scholar_provision_parent_id(job: dict) -> str | None:
+    """Parent id a provisioning-scholar subjob should provision the shared,
+    parent-owned workspace under, or None for a normal job.
+
+    A scholar spawned before its parent had any workspace carries
+    ``context.provisions_parent_workspace = <parentId>`` (stamped by
+    ``_spawn_scholar_subjob``). It provisions the ONE pod ``workspace-<parentId>``
+    under the parent's identity and rides it, rather than self-provisioning a
+    throwaway pod (Phase 1,
+    docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
+    """
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    pid = ctx.get("provisions_parent_workspace")
+    return str(pid) if pid else None
+
+
+def _scholar_should_provision_parent_container(config_override: Any) -> bool:
+    """True if a scholar spawned with no parent workspace should provision the
+    parent's SHARED container workspace (Phase 1) rather than self-provision.
+
+    Backend gate only: container/sandbox (or unset → default sandbox) qualifies;
+    VM/remote and lite (virtual/none) parents keep today's behavior. The dispatch
+    seam additionally enforces a k8s in-cluster provisioner before acting on the
+    marker, so a non-k8s deployment falls through to the self-provision path.
+    """
+    backend = _backend_from_override(config_override)
+    if backend in ("vm", "remote"):
+        return False
+    if backend in LITE_BACKENDS:
+        return False
+    return True
+
+
 # Bounded wait for a subjob to inherit its parent's provisioned workspace.
 # Parent container/VM readiness is an async event that lands AFTER the subjob is
 # spawned (a scholar is created ~3s after its parent, mid-provisioning), so we
@@ -3629,6 +3667,118 @@ async def _fail_subjob_and_unblock_parent(job: dict, message: str) -> None:
                 e,
                 exc_info=True,
             )
+
+
+async def _provision_parent_workspace_for_scholar(job: dict, parent_id: str) -> str:
+    """Drive the PARENT's shared workspace container toward ready on a scholar's
+    behalf, then promote the scholar to a normal inheriting subjob.
+
+    Phase 1 (docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md):
+    a scholar spawned before its parent had any workspace provisions the parent's
+    ONE shared pod (``workspace-<parentId>``, owner = parent) instead of a
+    throwaway pod of its own, so the parent and later the critic ride the same
+    pod. ``create_workspace`` keys the pod name and the context write-back on the
+    owner, so provisioning under ``WorkspaceOwner.job(parent_id)`` lands the ready
+    host/pod_ip on the PARENT's row automatically — no copy-back needed.
+
+    Returns:
+      ``"wait"``     — parent workspace still provisioning; retry next tick.
+      ``"promoted"`` — parent workspace ready; the scholar row now inherits it and
+                       dispatches via the normal inherit path on its next tick.
+      ``"fail"``     — provisioning failed; the scholar was failed and its parent
+                       unblocked via ``_fail_subjob_and_unblock_parent``.
+    """
+    scholar_id = str(job["id"])
+    parent = await postgres_db.get_job(parent_id)
+    if not parent:
+        await _fail_subjob_and_unblock_parent(
+            job,
+            f"Parent job {parent_id} no longer exists; cannot provision its "
+            "shared workspace for the research phase.",
+        )
+        return "fail"
+
+    parent_ctx = parent.get("context") or {}
+    if isinstance(parent_ctx, str):
+        try:
+            parent_ctx = json.loads(parent_ctx)
+        except (json.JSONDecodeError, ValueError):
+            parent_ctx = {}
+    parent_container = parent_ctx.get("workspace_container") or {}
+
+    parent_co = parent.get("config_override") or {}
+    if isinstance(parent_co, str):
+        try:
+            parent_co = json.loads(parent_co)
+        except (json.JSONDecodeError, ValueError):
+            parent_co = {}
+    ws_cfg = (parent_co.get("workspace") or {}).get("container") or {}
+
+    res = await ensure_workspace(
+        WorkspaceOwner.job(parent_id),
+        provisioner=container_provisioner,
+        suspension=workspace_suspension_service,
+        current_status=parent_container.get("status"),
+        ws_config={
+            k: ws_cfg[k]
+            for k in ("cpu", "memory", "cpu_limit", "memory_limit", "image")
+            if k in ws_cfg
+        },
+    )
+    if res.outcome is EnsureOutcome.FAILED:
+        await _fail_subjob_and_unblock_parent(
+            job,
+            "Shared parent workspace could not be created for the research "
+            "phase (see orchestrator logs for image/resource/RBAC details).",
+        )
+        return "fail"
+    if res.outcome is EnsureOutcome.PENDING:
+        logger.info(
+            "Dispatcher: scholar %s provisioning shared parent workspace "
+            "workspace-%s (status=%s) — waiting",
+            scholar_id,
+            parent_id[:12],
+            res.status,
+        )
+        return "wait"
+
+    # READY — re-read the parent row for the host/pod_ip create_workspace wrote,
+    # then promote the scholar to inherit the now-ready shared workspace so the
+    # normal inherit path (resolver overlay + worktree injection) dispatches it.
+    fresh_parent = await postgres_db.get_job(parent_id)
+    fresh_ctx = (fresh_parent or {}).get("context") or {}
+    if isinstance(fresh_ctx, str):
+        try:
+            fresh_ctx = json.loads(fresh_ctx)
+        except (json.JSONDecodeError, ValueError):
+            fresh_ctx = {}
+    ready_container = fresh_ctx.get("workspace_container") or parent_container
+
+    worktree_path = (
+        "/home/agent-host/workspace/worktrees/"
+        f"{scholar_id[:8]}-{job.get('config_name') or 'scholar'}"
+    )
+    await postgres_db.merge_job_context(
+        scholar_id,
+        {
+            "inherits_parent_workspace": True,
+            "workspace_container": ready_container,
+        },
+    )
+    async with postgres_db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET worktree_path = $1 WHERE id = $2::uuid",
+            worktree_path,
+            scholar_id,
+        )
+    logger.info(
+        "Dispatcher: scholar %s promoted to inherit shared parent workspace "
+        "workspace-%s (host=%s)",
+        scholar_id,
+        parent_id[:12],
+        ready_container.get("host") or ready_container.get("pod_ip"),
+    )
+    return "promoted"
 
 
 def _apply_sticky_sudo_denial(job: dict, config_override: dict | None) -> dict | None:
@@ -4988,6 +5138,23 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                     logger.info("Dispatcher: job %s using VM workspace", job_id)
                 elif _job_needs_sandbox(job):
+                    # Phase 1: a pre-agent scholar spawned before its parent had a
+                    # workspace provisions the parent's ONE shared pod under the
+                    # parent's identity and rides it, instead of self-provisioning
+                    # a throwaway pod. k8s only — VM/docker parents fall through to
+                    # the normal self-provision path below.
+                    provision_parent_id = _scholar_provision_parent_id(job)
+                    if (
+                        provision_parent_id
+                        and container_provisioner.is_available
+                        and container_provisioner.in_cluster
+                    ):
+                        await _provision_parent_workspace_for_scholar(
+                            job, provision_parent_id
+                        )
+                        # wait → retry next tick; promoted → dispatches next tick
+                        # via the inherit path; fail → already failed + unblocked.
+                        continue
                     container_ctx = _get_container_context(job)
                     container_status = container_ctx.get("status")
                     # K8s in-cluster takes priority; a local kubeconfig must not
@@ -10573,16 +10740,24 @@ async def _spawn_scholar_subjob(
         except (json.JSONDecodeError, ValueError):
             parent_ctx = {}
     # Stamp the explicit inherit flag ONLY when we actually copy the parent's
-    # workspace. When the parent has none yet (idle cluster) the scholar copies
-    # nothing, self-provisions its own pod, and MUST NOT be treated as inheriting
-    # by _resolve_subjob_inherited_workspace — else it strands both itself and the
-    # parent. See docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
+    # existing workspace (busy cluster — the parent already provisioned). When the
+    # parent has none yet (idle cluster), the scholar instead provisions the
+    # parent's ONE shared workspace under the parent's identity and rides it
+    # (marker below) — never a throwaway pod of its own. The flag and the marker
+    # are mutually exclusive: the flag routes into the inherit/wait path, the
+    # marker into the provision-under-parent path. See
+    # docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
     if parent_ctx.get("vm"):
         scholar_context["vm"] = parent_ctx["vm"]
         scholar_context["inherits_parent_workspace"] = True
     elif parent_ctx.get("workspace_container"):
         scholar_context["workspace_container"] = parent_ctx["workspace_container"]
         scholar_context["inherits_parent_workspace"] = True
+    elif _scholar_should_provision_parent_container(config_override):
+        # Container/sandbox backend: provision the parent's shared pod (Phase 1).
+        # VM/remote and lite parents fall through with neither flag nor marker and
+        # keep today's behavior (self-provision / pod-less).
+        scholar_context["provisions_parent_workspace"] = job_id
 
     # Disable nested subjob spawning on the scholar
     scholar_override: dict[str, Any] = {
