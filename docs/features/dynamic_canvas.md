@@ -18,6 +18,7 @@ related:
   - "[[dynamic_canvas_slice2_verification]]"
   - "[[dynamic_canvas_slice3a_verification]]"
   - "[[dynamic_canvas_slice3b_verification]]"
+  - "[[dynamic_canvas_slice3c_verification]]"
   - "[[shared_application_action_layer]]"
   - "[[builder_to_sessions_consolidation]]"
   - "[[persistent_chat_ui_redesign]]"
@@ -41,17 +42,38 @@ first acceptance pass is fixed and reverified.
 The default-off Slice-3A callable/SSH foundation and Slice-3B isolated
 ordinary-HTTP viewer checkpoint are also implemented and repository-verified.
 Slice 3B includes the viewer-session control plane, dedicated gateway, strict
-one-port proxy, Cockpit iframe lifecycle, and dark deployment plumbing, but the
-chart intentionally publishes no wildcard ingress and all viewer gates remain
-off by default. It therefore does not count as a production or user-facing
-Slice-3 release. Multi-port/streaming apps and Slices 4–6 remain planned.
+one-port proxy, browser-bound BFF challenge/exchange (with no credential in the
+iframe URL), Cockpit iframe lifecycle, dark deployment plumbing, and the
+trusted-parent anti-framing response boundary. Cockpit production and dev
+documents, orchestrator/BFF responses, and optional MCP OAuth documents now
+emit enforced `frame-ancestors 'none'` plus legacy `DENY` protection without
+overwriting route-specific CSP. The separately hosted IDE/API compatibility
+path remains restricted to same-origin framing rather than bypassing the
+boundary, and unhandled ASGI `500` responses are protected before Starlette's
+outer error renderer can answer. The Cockpit app-shell hash was bumped so the
+next service-worker update detects and refetches the shell; already-open tabs
+still require worker activation/reload. The Slice-3C gateway database boundary
+is also implemented: the gateway constructs only a dedicated
+`CANVAS_VIEWER_POSTGRES_*` pool, requires the authenticated PostgreSQL login to
+remain the active role, self-attests its exact effective privileges before
+serving, receives an allowlisted gateway-only ConfigMap and credential Secret,
+and has no shared application DB fallback. Bundled-Postgres
+development can reconcile the fixed restricted role through a bounded one-shot
+Job; production requires an operator-provisioned role and separate Secret. The
+packaged grants and denial contract passed a fresh fully migrated PostgreSQL 15
+integration run. The
+`srwcanvas.works` wildcard DNS/TLS coordinates are recorded, but the chart
+intentionally publishes no wildcard ingress and all viewer gates remain off by
+default. It therefore does not count as a production or user-facing Slice-3
+release. Multi-port/streaming apps and Slices 4–6 remain planned.
 Original brainstorm filed 2026-05-13. Pointer model agreed and repository,
 security, accessibility, and comparable-product audits completed 2026-07-13.
 See the
 [[dynamic_canvas_slice1_verification|Slice-1 verification record]] and
 [[dynamic_canvas_slice2_verification|Slice-2 verification record]], plus the
 [[dynamic_canvas_slice3a_verification|Slice-3A foundation record]] and
-[[dynamic_canvas_slice3b_verification|Slice-3B ordinary-HTTP record]].
+[[dynamic_canvas_slice3b_verification|Slice-3B ordinary-HTTP record]], and the
+[[dynamic_canvas_slice3c_verification|Slice-3C database-isolation record]].
 
 ## Decision Summary
 
@@ -1001,11 +1023,20 @@ The implemented application migration sequence is:
 - `0059_docker_workspace_leases.sql` supplies the durable static-Docker
   endpoint authority required by the trusted file gateway; and
 - `0060_canvas_events_epoch_comment.sql` records the newer event-generation
-  catalog comment without modifying the already-applied `0058` bytes.
+  catalog comment without modifying the already-applied `0058` bytes;
+- `0061_canvas_viewer_sessions.sql` creates hashed origin sessions,
+  non-credential attachments, initial bootstrap state, cleanup indexes, and
+  revocation triggers; and
+- `0062_canvas_bootstrap_exchange.sql` adds attachment cookie-mode binding and
+  replaces transferable bootstrap state with the browser-bound
+  challenge/exchange contract without modifying already-applied `0061` bytes.
 
 Applied migrations are checksum-tracked and immutable. Restore any drift to the
 recorded bytes and put later changes in a superseding migration; never rewrite a
-`schema_migrations` checksum. The implemented v1 state shape is:
+`schema_migrations` checksum. A local rollout later detected drift in
+already-applied `0061`; the repair restored its recorded bytes and kept the
+subsequent attachment `cookie_mode` column and constraint in `0062`. The
+migration ledger was not edited. The implemented v1 state shape is:
 
 ```sql
 CREATE TABLE canvases (
@@ -1044,7 +1075,7 @@ Important boundaries:
   HTTP ETag.
 - `source_fingerprint` is computed from the normalized-source contract above
   and stored atomically with `source`; adapters never supply it.
-- Signed viewer tokens, resolved workspace IPs, and generated proxy URLs are
+- Viewer secrets, resolved workspace IPs, and generated proxy URLs are
   short-lived derived values and are never stored in `source`.
 - `status` is derived from current source/runtime health. Invalid or
   unauthorized mutations are request errors and are not persisted as state.
@@ -1059,15 +1090,19 @@ Important boundaries:
       fingerprint, workspace/origin generations, embedding site/cookie mode,
       expiry, and revoked timestamps;
     - `canvas_view_attachments` tracks non-credential per-frame/window IDs,
-      parent-issued bridge nonces, last-seen/closed timestamps, and the shared
-      origin session they use (nullable until bootstrap exchange);
-    - `canvas_view_bootstraps` contains one-time token hashes bound to an
-      attachment, expected presentation/origin identity, expiry, and consumed
-      timestamp. A session can therefore admit a new tab without storing a list
-      of bootstrap secrets or overwriting its shared cookie.
+      hashed parent bridge nonces, issuance embedding origin and cookie mode,
+      last-seen/closed timestamps, and the shared origin session they use
+      (nullable until bootstrap exchange);
+    - `canvas_view_bootstraps` contains one state row per attachment. It moves
+      from created, to browser-challenged, to parent-authorized, to consumed,
+      storing only purpose-separated hashes of the challenge, transient browser
+      binding, ready receipt, and one-time exchange code alongside the expected
+      presentation/origin identity and expiry. A session can therefore admit a
+      new tab without a transferable URL bearer or overwriting its shared
+      cookie.
 
-  Plaintext bearer material is never persisted; expiry indexes support cleanup
-  across multiple orchestrator replicas.
+  Plaintext handshake/session material is never persisted; expiry indexes
+  support cleanup across multiple orchestrator replicas.
 
 Example stored source:
 
@@ -1307,19 +1342,25 @@ the iframe URL:
 
 ```text
 POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments
+POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{id}/authorize
 POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{id}/renew
 DELETE /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{id}
 ```
 
 Creation requires the current Canvas `If-Match`, derives the embedding site and
 allowed cookie mode from trusted request/deployment state, and returns a bounded
-attachment ID plus single-use `/_canvas/bootstrap?...` URL. It never accepts a
-caller-selected upstream or origin. Renewal extends the linked origin session
-only while authorization and every source/workspace/origin identity still
-match. Attachment delete is an idempotent presence close, not a shared-session
-revocation. These non-safe APIs retain BFF CSRF protection; global logout,
-clear/replacement, and trusted “reset app storage/origin” use service-level bulk
-revocation after their authoritative state transition.
+attachment ID, an exact `/_canvas/bootstrap?attachment_id=<uuid>` locator, and a
+one-use bridge nonce held only in trusted Cockpit memory. The URL contains no
+credential. The authorize endpoint accepts the gateway challenge, ready receipt,
+and bridge nonce through the exact parent BFF session and returns a short-lived
+exchange code only after user/thread/session/origin/source identity is
+revalidated. It never accepts a caller-selected upstream or origin. Renewal
+extends the linked origin session only while authorization and every
+source/workspace/origin identity still match. Attachment delete is an
+idempotent presence close, not a shared-session revocation. These non-safe APIs
+retain BFF CSRF protection; global logout, clear/replacement, and trusted “Reset
+app storage/origin” use service-level bulk revocation after their authoritative
+state transition.
 
 Use separate serializers: the agent gets logical metadata/capabilities,
 while the Cockpit REST response may also get a relative authorized `content_url`
@@ -1485,7 +1526,8 @@ placement is a UX choice, not a trust boundary.
   visibility. Apply it to every state, content, viewer-session bootstrap, and
   proxy request—not only pointer creation.
 - Cockpit state/content mutations retain the existing non-safe-method CSRF
-  guard (`X-CSRF`) and reject an unexpected browser Origin. Viewer bootstrap is
+  guard (`X-CSRF`) and reject an unexpected browser Origin. The public viewer
+  locator grants nothing; its BFF-authorized browser-bound exchange is
   single-use and does not become a general CSRF bypass.
 - Resolve paths, SSH targets, browser generations, workspace generations, and
   ports from authorized thread state. A live-app upstream is always
@@ -1561,13 +1603,35 @@ real isolated canvas origin, separate from the Cockpit's registrable domain:
 
 ```text
 cockpit.example.com
-<random-origin-generation>.canvas.example-userland.com
+<random-origin-generation>.example-userland.com
 ```
 
 This separation is mandatory. The production BFF cookie can be scoped to the
 platform parent domain, so a sibling such as `canvas.example.com` could receive
 trusted session material. Canvas needs separate wildcard DNS, TLS, ingress, and
 an independently registrable user-content domain.
+
+For production, `hostSuffix` equals `.` plus that dedicated domain, and the
+domain's exact name is the attested effective private-PSL rule. This removes an
+otherwise dangerous ambiguity where an operator might attest the registered
+root while placing generated hosts below a deeper shared registrable label.
+Development-only cookie-free deployments may still use a nested suffix.
+
+For the hosted SRW deployment, the reserved user-content domain is
+`srwcanvas.works`. Origins use exactly one generated label, making the private
+PSL boundary and hostname-validation invariant exact:
+
+```text
+https://<origin-generation>.srwcanvas.works
+DNS/TLS host: *.srwcanvas.works
+effective private PSL rule: srwcanvas.works
+```
+
+The Fleet overlay records this domain, `.srwcanvas.works` host suffix, and
+canonical `https://cockpit.srw.works` embedding origin. Both Canvas gates and
+both deployment attestations remain false, and the edge selectors remain empty
+so Helm refuses accidental enablement. The domain choice is therefore inert
+configuration, not a launch claim.
 
 Do not reuse a stable origin for unrelated apps. Cookies, local storage, cache,
 and Service Workers survive within an origin and an old app could affect its
@@ -1582,53 +1646,75 @@ A normal cookie on the separate domain is third-party inside Cockpit. The
 selected flow is:
 
 1. The authorized Cockpit parent calls a same-origin API to register one pending
-   non-credential view attachment and one-time bootstrap, bound to user, thread,
-   `main`, normalized source fingerprint, workspace generation, origin
-   generation, embedding site, cookie mode, and expected presentation revision.
-2. Cockpit loads the returned bootstrap URL on the random Canvas host. The token
-   is high entropy, single-use, short-lived, redacted from logs, and delivered
-   with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
-3. Before looking up or consuming the token, the Canvas gateway requires a
-   browser iframe navigation (`Sec-Fetch-Dest: iframe`, navigation mode, and the
-   expected Fetch Metadata site relationship) and applies `frame-ancestors` for
-   the configured Cockpit origins to the bootstrap and clean response. A
-   top-level/document navigation is rejected without setting a cookie or
-   consuming the token. Browsers which do not supply an enforceable Fetch
-   Metadata/embedding signal join the unsupported matrix; v1 never treats a
-   top-level bootstrap as compatibility behavior.
-4. The Canvas gateway consumes it. If the request already carries a valid origin
-   session cookie for the same user/source/workspace/origin/embedding identity,
-   it attaches the new view to that session and may reissue the same validated
-   value to refresh browser retention up to the immutable parent-session bound.
-   If not, it creates a short-lived **origin session** and links the attachment.
-   The gateway returns a minimal server-owned transition document plus a
-   host-only cookie:
+   non-credential view attachment, bound to user, thread, `main`, the exact
+   parent `srw_session`, normalized source fingerprint, workspace generation,
+   origin generation, embedding origin, cookie mode, and expected presentation
+   revision. The BFF response contains a random attachment ID, an exact
+   `/_canvas/bootstrap?attachment_id=<uuid>` URL, and a one-use bridge nonce.
+   The nonce remains only in trusted parent memory; the URL is a public locator,
+   not a bearer credential.
+2. Cockpit binds the exact iframe `WindowProxy` before mounting that URL. Before
+   starting a challenge, the Canvas gateway requires a cross-site browser iframe
+   navigation (`Sec-Fetch-Dest: iframe`, navigation mode, and the expected Fetch
+   Metadata relationship), exact raw path/query/UUID host, bounded headers, and
+   no body. It applies `frame-ancestors` for configured Cockpit origins and
+   returns `Cache-Control: private, no-store` plus `Referrer-Policy: no-referrer`.
+   Top-level/document navigation is rejected before changing handshake state.
+3. The gateway creates a one-time challenge, ready receipt, and browser binding,
+   persists only their purpose-separated hashes, and sets an attachment-specific
+   transient cookie:
+
+   ```text
+   __Host-canvas_bootstrap_<attachment-uuid>=...; Secure; HttpOnly;
+   SameSite=None; Partitioned; Path=/
+   ```
+
+   Its minimal server-owned document posts the versioned challenge and receipt
+   only to the exact stored Cockpit origin. It contains neither the bridge nonce
+   nor browser-binding value.
+4. Cockpit accepts that message only from the bound `WindowProxy`, exact Canvas
+   origin, expected attachment, and closed protocol schema. It sends the
+   challenge, receipt, and in-memory bridge nonce to the BFF authorize endpoint.
+   The BFF requires the exact user/thread/parent `srw_session` and Cockpit
+   `Origin`, revalidates current Canvas/workspace/origin/policy identity, and
+   returns one short-lived exchange code. A copied locator—including one opened
+   by the same user under a different BFF session—cannot authorize this step.
+5. Cockpit verifies every BFF echo, then posts the exchange code back only to the
+   bound iframe and exact Canvas origin. The gateway document accepts it only
+   from `parent` at the stored Cockpit origin, then performs a same-origin JSON
+   `POST /_canvas/exchange`. That endpoint requires exact Fetch Metadata,
+   `Origin`, framing, schema, challenge, exchange-code hash, UUID host, and the
+   transient browser cookie. PostgreSQL atomically admits one exchange across
+   replicas. It clears the transient cookie and either creates a short-lived
+   **origin session** or reuses a still-valid same-parent/same-source session,
+   setting/reissuing only the reserved viewer cookie:
 
    ```text
    __Host-canvas_session=...; Secure; HttpOnly; SameSite=None;
    Partitioned; Path=/
    ```
 
-   Its nonce-bound inline script calls `location.replace()` with the canonical
-   entry path. The next navigation is therefore initiated by a document on the
-   allocated Canvas origin, removes the bootstrap token from the live URL, and
-   carries `Sec-Fetch-Site: same-origin`.
+   The document posts an exact challenge/receipt `ready` message before calling
+   `location.replace()` with the canonical entry path. Cockpit does not treat an
+   iframe `load` event as authenticated readiness. The next navigation is
+   initiated by the allocated Canvas origin and carries
+   `Sec-Fetch-Site: same-origin`; no secret ever appeared in the URL.
 
    Record the presentation revision at issuance for audit, but authorize
    requests by the still-current origin/source/workspace identity: an unchanged
    same-app health refresh may advance presentation revision without killing
    mounted frames.
-5. Every ordinary app request requires `Sec-Fetch-Site: same-origin` before
+6. Every ordinary app request requires `Sec-Fetch-Site: same-origin` before
    cookie authentication. A browser which ignores the unknown `Partitioned`
    attribute might store the viewer cookie unpartitioned, but an attacker-site
    image/fetch/iframe request is still rejected before it can reach an app with
    a state-changing GET. Only the one-time cross-site iframe bootstrap is
    admitted; browsers without enforceable Fetch Metadata are unsupported.
-6. The fixed cookie identifies the shared origin session, not one tab. Main
+7. The fixed cookie identifies the shared origin session, not one tab. Main
    pane, second Cockpit tab, and wrapper pop-out in the same cookie partition
    reuse it; their attachment IDs/nonces drive UI presence only. Closing one
    attachment never revokes or overwrites the session for the others.
-7. A normal Cockpit-wrapper pop-out stays embedded and uses the same flow. If a
+8. A normal Cockpit-wrapper pop-out stays embedded and uses the same flow. If a
    target browser does not support the embedded partitioned-cookie flow, live
    Canvas preview is unsupported in v1. Do not open the app top-level, relax the
    sandbox, or leave a bearer token in asset URLs as a compatibility fallback.
@@ -1706,11 +1792,15 @@ Cockpit binds only a server-generated URL and uses fixed attributes:
 </iframe>
 ```
 
-The separate registrable origin is what makes `allow-scripts` plus
-`allow-same-origin` acceptable; those flags are unsafe when parent and frame can
-become same-origin. Top navigation, popups, downloads, modals, pointer lock,
-fullscreen, and powerful device capabilities remain absent until a future
-explicit grant model exists.
+The separate registrable origin is necessary for `allow-scripts` plus
+`allow-same-origin`, but it is not sufficient by itself: a hostile app can
+self-navigate its frame. Every trusted Cockpit/BFF document must deny framing
+with a response `frame-ancestors 'none'` policy (and compatible legacy header),
+or the renderer must interpose a cross-origin wrapper, so navigation onto the
+trusted parent origin cannot turn the frame same-origin with Cockpit. This is a
+production launch gate, not something the warning substitutes for. Top
+navigation, popups, downloads, modals, pointer lock, fullscreen, and powerful
+device capabilities remain absent until a future explicit grant model exists.
 
 The proxy adds a non-relaxable response-header CSP. A practical development
 baseline allows same-origin scripts/styles/images/fonts and same-origin
@@ -1736,13 +1826,15 @@ gateway-owned policy is the only response-header policy. An application may
 add a stricter in-document meta policy where the platform supports it, but that
 is not part of the security boundary. External CDN/assets and API calls are
 blocked by default, so prototypes vendor dependencies or route through declared
-workspace services. A script can still navigate its own
-iframe to an external page—CSP `connect-src` is not a complete information-flow
-guarantee, and browser APIs such as WebRTC need explicit adversarial testing.
-The parent cannot reliably distinguish every self-navigation using SOP alone;
-an optional bridge heartbeat is only a heuristic, never authorization. Live
-content therefore retains an untrusted/“do not enter secrets” warning and the
-document does not market the default CSP as a complete no-egress sandbox.
+workspace services. A script can still navigate its own iframe to an external
+page—CSP `connect-src` is not a complete information-flow guarantee, and browser
+APIs such as WebRTC need explicit adversarial testing. Navigation to a trusted
+platform origin must fail at that origin's anti-framing response boundary as
+described above. The parent cannot reliably distinguish every self-navigation
+using SOP alone; an optional bridge heartbeat is only a heuristic, never
+authorization. Live content therefore retains an untrusted/“do not enter
+secrets” warning and the document does not market the default CSP as a complete
+no-egress sandbox.
 
 ### Proxy invariants
 
@@ -1892,7 +1984,7 @@ All services in one route table are one same-origin trust unit. Browser code
 uses relative URLs. The gateway forwards the allocated public Canvas host, but
 the agent starts the server before that random host exists. The workspace
 therefore receives a non-secret deployment setting such as
-`SRW_CANVAS_HOST_SUFFIX=.canvas.example-userland.com`. Vite may allow that exact
+`SRW_CANVAS_HOST_SUFFIX=.example-userland.com`. Vite may allow that exact
 deployment-controlled suffix (its leading-dot subdomain syntax), proxy HMR
 WebSockets, derive the HMR host from the page, and use a strict port. It must
 never use `allowedHosts: true`, a generic public suffix, or a browser-direct
@@ -2210,18 +2302,24 @@ stays file-focused until presenting an app produces a usable user-facing stage.
 See [[dynamic_canvas_slice3a_verification]].
 
 **Ordinary-HTTP viewer checkpoint (Slice 3B):** Implemented and default-off as
-of 2026-07-13. It adds:
+of 2026-07-13, with the browser-bound bootstrap hardening completed in migration
+`0062`. It adds:
 
-- migration `0061` with hashed origin-session and one-time bootstrap secrets,
-  non-credential view attachments, parent-BFF-session bounds, cleanup indexes,
-  and transaction-delivered revocation notifications;
-- owner-authorized create/renew/close attachment routes which require one exact
-  BFF cookie, reject Bearer/internal-auth hybrids, bind creation to the current
-  Canvas state ETag, and never return a reusable gateway credential to Cockpit;
-- one exact UUID host per `origin_generation`, iframe-only one-time bootstrap,
-  a reserved host-only `Secure; HttpOnly; SameSite=None; Partitioned` viewer
-  cookie, policy-rollover revocation, and PostgreSQL revalidation on every
-  request and at most every configured 15 seconds while an exchange is active;
+- immutable migration `0061` provides hashed origin sessions, non-credential
+  attachments, parent-BFF-session bounds, cleanup indexes, and
+  transaction-delivered revocation notifications; forward-only migration
+  `0062` adds attachment cookie-mode binding and the purpose-separated
+  challenge/browser-binding/receipt/exchange state machine;
+- owner-authorized create/authorize/renew/close attachment routes which require
+  one exact BFF cookie, reject Bearer/internal-auth hybrids, bind creation to the
+  current Canvas state ETag, and never put a gateway credential in the iframe
+  URL;
+- one exact UUID host per `origin_generation`, an iframe-only public attachment
+  locator, exact parent `postMessage` bridge, attachment-specific transient
+  browser cookie, atomic same-origin exchange, and reserved host-only
+  `Secure; HttpOnly; SameSite=None; Partitioned` viewer cookie, with policy
+  rollover and PostgreSQL revalidation on every request and at most every
+  configured 15 seconds while an exchange is active;
 - a dedicated ASGI gateway with no API fallback, exact raw-path/host parsing,
   bounded authentication admission and active-connection registration,
   fail-closed notification/listener behavior, client-disconnect propagation,
@@ -2232,20 +2330,36 @@ of 2026-07-13. It adds:
   same-origin/entry-loopback redirects, streamed bounded responses, and
   gateway-owned no-store/CSP/header policy;
 - a Cockpit attachment controller, exact default-port HTTPS UUID-origin and
-  bootstrap-URL validation before the resource-URL trust boundary, fixed
-  sandbox/referrer/Permissions Policy, teardown on presentation/thread/pane
-  lifecycle changes, and a persistent **do not enter passwords or secrets**
-  warning; and
+  credential-free bootstrap-URL validation before the resource-URL trust
+  boundary, exact `WindowProxy`/origin/schema/challenge/receipt checks,
+  bind-before-navigation, authenticated-ready (never iframe-load) semantics,
+  fixed sandbox/referrer/Permissions Policy, teardown on presentation/thread/
+  pane lifecycle changes, and a persistent **do not enter passwords or
+  secrets** warning; and
 - conditional Helm and Compose gateway plumbing, an internal-only service,
   fail-closed gateway/workspace NetworkPolicies, runtime Cockpit host-suffix
-  injection, and no published development port or chart-owned Ingress.
+  injection, and no published development port or chart-owned Ingress; and
+- trusted-parent anti-framing at every repository-owned document seam which can
+  appear on the Cockpit host: production Nginx, Angular's development server,
+  orchestrator/BFF HTTP responses, and the optional MCP HTTP/OAuth service.
+  Existing route CSP is preserved as an independent enforced policy. VS Code
+  webviews receive only `frame-ancestors 'self'` plus `SAMEORIGIN` for
+  `/api/ide/...` on the exact separately configured API/IDE authority; the same
+  path on a Cockpit authority remains denied. Explicit default ports, trailing
+  DNS dots, missing/duplicate Host fields, and unhandled `500` responses are
+  covered by fail-closed regressions. Deployments which place the IDE/API and
+  Cockpit on the same authority intentionally lose IDE webview compatibility
+  and must retain the chart's distinct API authority.
 
-The browser may retain the opaque viewer cookie only until the immutable parent
-BFF session's absolute expiry. That retention is not authorization: the shorter
-renewable PostgreSQL origin-session expiry remains authoritative on every
-gateway request. A newly authorized bootstrap may reissue the already-validated
-same-host cookie to refresh its browser retention bound; the parent renewal API
-extends only the server lease and cannot silently resurrect an expired session.
+The bootstrap URL now carries only the canonical attachment UUID. A copied URL
+does not carry the bridge nonce, browser binding, or BFF session and therefore
+cannot authorize or exchange a viewer session. The browser may retain the
+opaque viewer cookie only until the immutable parent BFF session's absolute
+expiry. That retention is not authorization: the shorter renewable PostgreSQL
+origin-session expiry remains authoritative on every gateway request. A newly
+authorized exchange may reissue the already-validated same-host cookie to
+refresh its browser retention bound; the parent renewal API extends only the
+server lease and cannot silently resurrect an expired session.
 
 Application traffic is deliberately **cookie-free in both deployment modes in
 this checkpoint**. The gateway consumes the reserved viewer cookie, forwards no
@@ -2255,11 +2369,52 @@ claim full app-cookie support. SSE, multipart live streams, upgrades, and
 WebSockets fail closed and remain Slice 4 work. The proxy supports only the one
 `entry_port`; it does not interpret a multi-port route manifest yet.
 
-Repository verification covers policy rollover, expiry, renewal, shared-session
-reuse, revocation/cancellation, framing ambiguity, body/response limits,
-redirects, header/cookie stripping, SSH-close stalls, exact frontend URL
-validation, renderer lifecycle, default-off manifests, and conditional network
-policy. See [[dynamic_canvas_slice3b_verification]].
+Repository verification additionally covers exact parent-BFF binding (including
+same user/different session), canonical non-credential URLs, closed bridge
+schemas, wrong-frame/origin/challenge/receipt rejection, transient-cookie
+binding, strict same-origin exchange, and two-replica single consumption. It
+continues to cover policy rollover, expiry, renewal, shared-session reuse,
+revocation/cancellation, framing ambiguity, body/response limits, redirects,
+header/cookie stripping, SSH-close stalls, renderer lifecycle, default-off
+manifests, and conditional network policy. See
+[[dynamic_canvas_slice3b_verification]].
+
+**Gateway database-isolation checkpoint (Slice 3C):** Implemented and
+default-off as of 2026-07-13. The dedicated gateway now:
+
+- lazily constructs a small pool only from required
+  `CANVAS_VIEWER_POSTGRES_*` parts and cannot fall back to `DATABASE_URL` or the
+  orchestrator's `POSTGRES_*` identity;
+- requires `session_user = current_user`, then attests `CONNECT`, schema
+  `USAGE`, every required column grant, and the absence of extra
+  column/relation or sequence privileges, unrelated public-table access,
+  elevated attributes, role membership, and database/schema `CREATE` before it
+  checks schema readiness or starts the notification listener;
+- replaces its shared `envFrom` projection with a dedicated allowlisted
+  ConfigMap plus two explicit keys from a separate credential Secret;
+- requires an operator-owned existing credential Secret in production and
+  rejects chart-created credentials or automatic role provisioning there; and
+- supports development against bundled Postgres through a bounded,
+  service-account-token-free, deny-ingress role Job. Only that Job receives the
+  application DB administrator credential; the public gateway never does. Helm
+  and Compose use the same packaged psql grant contract.
+
+The role can read only the Canvas identity, admission, workspace-binding, BFF
+expiry, and viewer-state columns required by gateway authentication. It can
+insert only origin sessions and update only challenge/consumption,
+attachment-linkage, renewal, and revocation columns. It has no application
+schema DDL, DELETE/TRUNCATE/TRIGGER, authoritative-state mutation, token-column
+read, sequence, or unrelated-relation access. PostgreSQL's default PUBLIC
+temporary-table capability is not represented as application-schema DDL; an
+internal database whose PUBLIC role can create in `public` is rejected and must
+be hardened by its operator.
+
+The real-PostgreSQL migration CI now applies the packaged role script to a
+freshly migrated PostgreSQL 15 database, runs the same startup attestation as
+the gateway, rejects a broad authenticated session switched into the narrow
+role, and proves representative token reads, authoritative mutations, viewer
+deletes, sequence use, and public DDL fail with insufficient privilege. See
+[[dynamic_canvas_slice3c_verification]].
 
 The remaining Slice-3 launch work is:
 
@@ -2267,22 +2422,44 @@ The remaining Slice-3 launch work is:
   DNS/TLS/raw-path-preserving edge, effective private PSL boundary, and edge
   rate limits before the gateway; the chart intentionally does not infer or
   create those resources;
-- replace the gateway's shared application database credential and broad
-  ConfigMap projection with a least-privilege viewer-specific database role and
-  explicit gateway-only configuration/secret contract; and
+- deploy and black-box verify the implemented trusted-parent anti-framing
+  boundary through the production ingress/edge and service-worker lifecycle.
+  Repository tests now prove exact enforced `frame-ancestors 'none'` and
+  `X-Frame-Options: DENY` behavior without replacing route CSP, plus the
+  same-origin-only IDE compatibility policy. The checked-in app-shell policy
+  marker forces a new PWA asset hash, but activation/reload from an already
+  installed PWA, real-browser self-navigation, optional root-host routes, and
+  the separately hosted Keycloak response policy remain acceptance evidence;
+  and
 - pass the production-build Chromium, Firefox, WebKit, real Safari/iOS, and PWA
   iframe-authentication, partitioned-cookie, CSP/sandbox, navigation, leakage,
   logout, expiry, and cross-replica revocation matrix. Unsupported browsers
   must report live preview unavailable rather than open untrusted content
   top-level.
 
-These external launch gates do not justify expanding the shared-secret
+These remaining launch gates do not justify expanding the shared-secret
 architecture inside this checkpoint.
+
+**Hosted deployment checkpoint (2026-07-13):** `srwcanvas.works` is reserved
+with one-label origins at `<uuid>.srwcanvas.works`. Its proxied wildcard DNS
+record is now published: authoritative Cloudflare DNS returns A/AAAA records
+for a random UUID host, and the active edge certificate contains both
+`srwcanvas.works` and `*.srwcanvas.works`. A public UUID-host probe reaches
+Cloudflare and returns the intended catch-all `404`; no Canvas gateway route is
+published behind the wildcard yet.
+
+This proves DNS and edge-certificate provisioning only. The exact private PSL
+entry is not yet propagated, and the current Cloudflare Tunnel applies
+non-disableable baseline path normalization such as adjacent-slash merging.
+Cloudflare-proxied Universal SSL is therefore not a production-edge acceptance
+claim for the current raw-path contract. Keep `rawPathVerified`,
+`pslBoundaryVerified`, the viewer gate, and the master live-preview gate false
+until that contract is resolved and the other launch gates above land.
 
 Do not enable or claim the user-facing slice complete until real browsers prove
 no BFF/Keycloak cookie or authorization-header leakage. The default-off 3A/3B
-implementation does not satisfy or bypass that launch gate, and it was not
-enabled in local k3d during this checkpoint.
+and database-isolation 3C implementation does not satisfy or bypass that launch
+gate, and the viewer was not enabled in local k3d during these checkpoints.
 
 ### Slice 4 — Multi-port and streaming apps
 
@@ -2403,9 +2580,10 @@ claimed as Safari coverage. Cover:
   attempts and an always-available trusted escape control;
 - Chromium, Firefox, and WebKit embedded/wrapper-pop-out viewer authentication,
   iframe-only bootstrap rejection for top-level/document navigation,
-  unsupported-browser UX, logout/expiry/revocation, and no token in logs or
-  post-bootstrap URLs; repeat the relevant matrix on real Safari/iOS and
-  installed PWAs;
+  unsupported-browser UX, copied-locator/different-BFF rejection,
+  logout/expiry/revocation, and no bridge, binding, exchange, or session secret
+  in logs or URLs; repeat the relevant matrix on real Safari/iOS and installed
+  PWAs;
 - no BFF/Keycloak cookie/internal auth header upstream, sanitized application
   cookies, repeated `Set-Cookie`, and origin rotation preventing an old Service
   Worker/storage entry from controlling a replacement; production tests use an
@@ -2535,7 +2713,7 @@ Primary/official sources reviewed on 2026-07-12:
   — deterministic source-fingerprint serialization across implementations.
 - [W3C Fetch Metadata Request Headers](https://www.w3.org/TR/fetch-metadata/) —
   `Sec-Fetch-Dest`/mode/site distinctions used to reject top-level bootstrap
-  navigation before token consumption.
+  navigation before challenge state is created.
 - [Partitioned cookies](https://developer.mozilla.org/en-US/docs/Web/Privacy/Guides/Third-party_cookies/Partitioned_cookies),
   [third-party cookie guidance](https://developer.mozilla.org/en-US/docs/Web/Privacy/Guides/Third-party_cookies),
   and [secure cookies](https://developer.mozilla.org/en-US/docs/Web/Security/Practical_implementation_guides/Cookies)

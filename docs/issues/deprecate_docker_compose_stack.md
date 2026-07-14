@@ -6,7 +6,7 @@
 
 Local dev now runs the production Helm chart on k3d. Same chart, same templates,
 same secrets layout, same ingress topology as the homelab cluster — only the
-values overlay differs (`deployment/values-local.example.yaml`). The smoke-test
+values overlay differs (`deployment/values-local.yaml.example`). The smoke-test
 path documented in `README.md` ("Smoke-testing the install") was walked
 end-to-end and passes on a fresh install:
 
@@ -149,7 +149,7 @@ existing k3d dev loops mid-flight.
    to "require k8s API; fail to start if unavailable", which is the
    prod behavior already. Add a clear startup error message
    ("Kubernetes API unreachable; the orchestrator no longer supports
-   the Compose-static workspace pool — see deployment/values-local.example.yaml").
+   the Compose-static workspace pool — see deployment/values-local.yaml.example").
    Touches `main.py` (~50 lines net deletion after the branches collapse)
    plus tests under `tests/test_orchestrator_*` that mocked
    `docker_provisioner.is_available`. ~1 day.
@@ -175,7 +175,7 @@ existing k3d dev loops mid-flight.
 - [ ] `docs/docker_compose_mode.md` gone or moved under `docs/legacy/`
       with a banner
 - [ ] Fresh `./scripts/local-dev-up.sh` + `helm install srw ./helm -n srw
-      -f deployment/values-local.example.yaml` + the 5-step smoke-test
+      -f deployment/values-local.yaml.example` + the 5-step smoke-test
       from the README all still pass
 - [ ] Full pytest suite + `ruff check` + `ruff format --check` green
 

@@ -941,7 +941,7 @@ Local-k3d-only findings (not code bugs; dev/prod topology unaffected):
     appended to every tier policy. The local overlay adds the in-cluster
     Traefik hairpin (namespaceSelector `kube-system` + podSelector
     `app.kubernetes.io/name: traefik`, post-DNAT pod ports 8443/8000) —
-    see `deployment/values-local.example.yaml`. Default `[]`; real
+    see `deployment/values-local.yaml.example`. Default `[]`; real
     deployments don't need it.
   - `opencloud.mountInsecureTls` (Helm) →
     `OPENCLOUD_MOUNT_INSECURE_TLS` (orchestrator env) →

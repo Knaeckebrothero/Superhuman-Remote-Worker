@@ -217,11 +217,11 @@ then, the local image import above is required.
 | File | Purpose |
 |------|---------|
 | `scripts/local-dev-up.sh` | Idempotent bootstrap: creates k3d cluster, installs cert-manager, mkcert ClusterIssuer, srw namespace, dummy `srw-vm-ssh-key` Secret |
-| `deployment/values-local.example.yaml` | Committed template — devs `cp` to `values-local.yaml`, paste LLM keys, run helm install |
+| `deployment/values-local.yaml.example` | Committed template — devs `cp` to `values-local.yaml`, paste LLM keys, run helm install |
 | `deployment/values-local.yaml` | **Gitignored** — actual credentials |
 | README "Local Kubernetes Setup (k3d)" section | Full prereqs → bootstrap → install → login → daily lifecycle → troubleshooting |
 | CLAUDE.md "Local Kubernetes (k3d + Helm chart)" subsection | Quick-reference commands for the harness |
-| CLAUDE.md Deployment section | Updated — removed stale `deployment-local/` Kustomize reference; now points at `helm/` + `deployment/values-local.example.yaml` |
+| CLAUDE.md Deployment section | Updated — removed stale `deployment-local/` Kustomize reference; now points at `helm/` + `deployment/values-local.yaml.example` |
 | `.gitignore` | Added `deployment/values-local.yaml` |
 
 ### Untracked workarounds in the cluster (not in git)
@@ -244,7 +244,7 @@ then, the local image import above is required.
 | `localhost` hijacks the prod cockpit domain when k3d is running | LAN's DNS returns `::1` for the prod domain's AAAA record; k3d binds `[::]:443` dual-stack and "wins" happy-eyeballs over the legitimate Cloudflare IPv4 path. | `k3d cluster stop srw` when not using local cluster. Or recreate with IPv4-only port binding: `--port "0.0.0.0:443:443@loadbalancer"`. |
 | Docker Desktop GUI "stop container" doesn't free port 443 | k3d has multiple containers (`server-0`, `serverlb`, `registry`). The GUI stops only one at a time; `serverlb` is the one holding the port. | Use `k3d cluster stop srw` — it knows about all containers with label `k3d.cluster=srw`. |
 | `helm install` succeeds but pods stuck on `Pending` with `srw-workspace` PVC `ProvisioningFailed` | Chart hardcoded `accessModes: [ReadWriteMany]`; k3s local-path is RWO-only. | **Already patched** (see Chart patches above) — `workspace.accessMode: "ReadWriteOnce"` in `values-local.yaml`. |
-| Keycloak in `CreateContainerConfigError` for missing env var (e.g., `PGADMIN_OIDC_CLIENT_SECRET`, `SMTP_USER`) | The realm import does env-var substitution for every referenced var in the JSON, regardless of which services are enabled. | Include stubs for all in `secrets.values` (already done in `values-local.example.yaml`). |
+| Keycloak in `CreateContainerConfigError` for missing env var (e.g., `PGADMIN_OIDC_CLIENT_SECRET`, `SMTP_USER`) | The realm import does env-var substitution for every referenced var in the JSON, regardless of which services are enabled. | Include stubs for all in `secrets.values` (already done in `values-local.yaml.example`). |
 | Pre-existing PVC blocks `helm upgrade` with "field can not be less than previous value" | K8s rejects PVC shrinks. The chart's default for opencloud was 16Gi, but an earlier install had 64Gi. | Pin in `values-local.yaml` to the existing size (`opencloud.dataStorageSize: "64Gi"`), or delete the PVC and reinstall. |
 | Login: `{"detail":"Missing pre-auth state"}` | Pre-auth cookie set with `Domain=.localhost` rejected by browser; only Domain attribute that works is none (host-only). | **Already patched** — `cookieDomain: ""` in `values-local.yaml` + chart now honors empty string as host-only (vs. previous bug where empty fell back to `.<global.domain>`). |
 | Login: refresh loop with 401s after successful Keycloak callback | Session cookie is `SameSite=Lax` (server) AND third-party cookie blocking (browser). | `cookieSamesite: "none"` in `values-local.yaml` covers the server side. Browser side still needs Path B (same-origin restructure) or per-dev cookie allowlist (Path A). **Current open issue.** |

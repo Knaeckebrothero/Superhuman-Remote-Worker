@@ -91,7 +91,7 @@ Known remaining gaps:
   6 MiB write to `/cloud/home` landed server-side intact, zero TLS/refused
   errors. Both default off; dev/prod resolve the public hostname externally
   and were never affected (proven by §14). Concrete values blocks in
-  `deployment/values-local.example.yaml`.
+  `deployment/values-local.yaml.example`.
 
 ---
 
