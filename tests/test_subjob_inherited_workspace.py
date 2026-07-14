@@ -146,7 +146,12 @@ class TestSelfProvisionedDiscrimination:
         # then failed; new code proceeds immediately down the normal path.
         mock = patch_get_job({"status": "waiting", "context": {}})
         job = _subjob(
-            {"workspace_container": {"status": "creating", "pod_name": "workspace-self"}}
+            {
+                "workspace_container": {
+                    "status": "creating",
+                    "pod_name": "workspace-self",
+                }
+            }
         )
         assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
         mock.assert_not_awaited()
@@ -302,7 +307,9 @@ class TestFailSubjobUnblocksParent:
         parent_row = {"id": "parent-uuid", "status": "waiting", "context": {}}
 
         monkeypatch.setattr(
-            main.postgres_db, "update_job_status", AsyncMock(side_effect=fake_update_status)
+            main.postgres_db,
+            "update_job_status",
+            AsyncMock(side_effect=fake_update_status),
         )
         monkeypatch.setattr(
             main.postgres_db, "get_job", AsyncMock(return_value=parent_row)
