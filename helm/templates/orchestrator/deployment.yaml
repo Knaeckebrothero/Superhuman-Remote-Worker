@@ -164,11 +164,6 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CANVAS_VIEWER_COCKPIT_ORIGINS
-            - name: CANVAS_VIEWER_RAW_PATH_VERIFIED
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: CANVAS_VIEWER_RAW_PATH_VERIFIED
             - name: CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED
               valueFrom:
                 configMapKeyRef:

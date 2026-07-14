@@ -47,7 +47,6 @@ _VIEWER_ENV = (
     "CANVAS_VIEWER_DOMAIN",
     "CANVAS_VIEWER_HOST_SUFFIX",
     "CANVAS_VIEWER_COCKPIT_ORIGINS",
-    "CANVAS_VIEWER_RAW_PATH_VERIFIED",
     "CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED",
 )
 
@@ -65,7 +64,6 @@ def _enable_production(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CANVAS_VIEWER_DOMAIN", "user-content.test")
     monkeypatch.setenv("CANVAS_VIEWER_HOST_SUFFIX", ".user-content.test")
     monkeypatch.setenv("CANVAS_VIEWER_COCKPIT_ORIGINS", "https://cockpit.platform.test")
-    monkeypatch.setenv("CANVAS_VIEWER_RAW_PATH_VERIFIED", "true")
     monkeypatch.setenv("CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED", "true")
 
 

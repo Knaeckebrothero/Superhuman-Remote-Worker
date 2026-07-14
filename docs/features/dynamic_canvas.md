@@ -66,16 +66,18 @@ integration run. A secret-safe operator preflight/reconciler and production
 runbook now cover the out-of-band role plus either ESO-owned or explicit native
 Secret provisioning; both apply modes passed against disposable k3d objects
 and left the normal local cluster dark.
-The selected hosted edge is now staged in the HomeLab repository as a dark
-DNS-only wildcard → TCP HAProxy → WireGuard → dedicated NGINX → internal
-gateway route. Its NGINX boundary preserves raw request targets, validates UUID
-SNI/Host, trusts PROXYv2 only from the relay, rate-limits before the gateway,
-strips sensitive forwarding/auth headers, and logs no request target. The
-deployment overlay names its NetworkPolicy selectors and restricted ESO Secret,
-but the public relay, DNS cutover, PSL rule, rollout of the current SRW code,
-and hosted acceptance do not exist yet. The chart still publishes no wildcard
-ingress and all viewer/attestation gates remain off. This therefore does not
-count as a production or user-facing Slice-3 release. The current one-port
+The hosted edge was re-decided on 2026-07-14
+(`docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md`): the previously
+staged DNS-only wildcard → TCP HAProxy → WireGuard → dedicated NGINX relay is
+scrapped, and the wildcard rides the deployment's existing Cloudflare Tunnel
+to the internal gateway instead. Raw-path preservation is demoted from a
+universal launch gate to an optional property of an operator-chosen
+L4/SNI-passthrough edge; Cloudflare's baseline adjacent-slash normalization is
+an accepted, documented limitation of the tunnel mode, safe because it
+canonicalizes *before* the single gateway boundary. The chart additionally
+gained an optional, default-off wildcard Ingress for the gateway
+(`viewer.ingress`). All viewer/attestation gates remain off. This still does
+not count as a production or user-facing Slice-3 release. The current one-port
 proxy is cookie-free and rejects SSE, multipart streaming, and WebSocket
 upgrades. The trusted Slice-3 Cockpit closeout is now implemented: typed
 unsupported-browser/storage fallback, an authenticated
@@ -1733,9 +1735,10 @@ effective private PSL rule: srwcanvas.works
 
 The Fleet overlay records this domain, `.srwcanvas.works` host suffix, and
 canonical `https://cockpit.srw.works` embedding origin. Both Canvas gates and
-both deployment attestations remain false, and the edge selectors remain empty
-so Helm refuses accidental enablement. The domain choice is therefore inert
-configuration, not a launch claim.
+the PSL attestation remain false; the NetworkPolicy edge selectors name the
+existing Cloudflare Tunnel connector (cloudflared) as the only pod allowed to
+reach the gateway. The domain choice is therefore inert configuration, not a
+launch claim.
 
 Do not reuse a stable origin for unrelated apps. Cookies, local storage, cache,
 and Service Workers survive within an origin and an old app could affect its
@@ -2004,8 +2007,11 @@ server encode one framing mode. V1 sends `Connection: close` upstream and uses
 one HTTP request per SSH direct channel; the SSH transport, not an application
 TCP connection, is what gets pooled. Any parser/framing error closes the
 channel without reuse. Repository tests cover this strict adapter against
-framing differentials; the public edge/raw-path differential test remains a
-launch gate because no wildcard Canvas ingress is published yet.
+framing differentials. The public raw-path differential probe applies only to
+an edge that claims byte-exact path fidelity (L4/SNI passthrough); the
+selected Cloudflare-tunnel edge normalizes adjacent slashes upstream of the
+gateway by design and is verified without that probe
+(`docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md`).
 
 Queries are parsed independently of the path, preserve duplicate parameters,
 ordering, and blank values, and are re-encoded without logging their raw values.
@@ -2595,14 +2601,14 @@ but that new CI path has not yet reported acceptance evidence.
 
 The remaining Slice-3 launch work is:
 
-- deploy the staged operator-owned DNS/TLS/raw-path edge, provision its public
-  TCP relay and WireGuard route, cut the wildcard to DNS-only, and obtain then
-  verify the effective private PSL boundary in shipping browsers. The checked-in
-  NGINX edge implements pre-gateway rate limits, but the chart intentionally
-  does not infer or publish these operator resources;
+- publish the tunnel route (a `*.srwcanvas.works` ingress rule in the existing
+  cloudflared ConfigMap targeting the internal gateway Service) and obtain then
+  verify the effective private PSL boundary in shipping browsers
+  (`docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md`);
 - after the current release applies migrations through `0062`, run the
   implemented out-of-band workflow to provision the restricted gateway
-  PostgreSQL role and populate the dedicated ESO credential Secret;
+  PostgreSQL role and populate its dedicated Vault entry. The chart creates the
+  ESO credential mapping only when the viewer gate is enabled;
 - deploy and black-box verify the implemented trusted-parent anti-framing
   boundary through the production ingress/edge and service-worker lifecycle.
   Repository tests now prove exact enforced `frame-ancestors 'none'` and
@@ -2614,43 +2620,42 @@ The remaining Slice-3 launch work is:
   and
 - run the same authentication, CSP/sandbox, navigation, leakage, logout, expiry,
   reset, and cross-replica revocation matrix against the hosted Python gateway
-  and raw-path edge with real secure-context cookies. Repeat the device-only
-  portions on current desktop Safari, Safari/iOS, and installed PWAs; Playwright
-  WebKit is engine coverage, not shipping-Safari evidence.
+  behind the tunnel edge with real secure-context cookies. Repeat the
+  device-only portions on current desktop Safari, Safari/iOS, and installed
+  PWAs; Playwright WebKit is engine coverage, not shipping-Safari evidence.
 
 These remaining launch gates do not justify expanding the shared-secret
 architecture inside this checkpoint.
 
 **Hosted deployment checkpoint (2026-07-14):** `srwcanvas.works` is reserved
-with one-label origins at `<uuid>.srwcanvas.works`. Its current proxied wildcard
-still resolves through Cloudflare and returns the inert catch-all `404`; no
-Canvas gateway route is published behind it. Cloudflare's non-disableable
-baseline normalization merges adjacent slashes, so the proxied record and
-Tunnel are explicitly disqualified from the raw-path boundary.
+with one-label origins at `<uuid>.srwcanvas.works`. Its proxied wildcard and
+Cloudflare Universal SSL certificate are live but resolve to the inert
+catch-all `404`; no Canvas gateway route is published behind them.
 
-The selected replacement is checked in under
-`HomeLab/deployments_managed/canvas-edge/`: a DNS-only wildcard targets a public
-TCP-mode HAProxy relay, which crosses WireGuard to a dedicated MetalLB address
-and non-root NGINX edge before the internal gateway. The staged edge has strict
-UUID SNI/Host admission, PROXYv2 pinning, a URI-less proxy route, pre-gateway
-request/connection limits, redacted logs, exact edge/gateway NetworkPolicies,
-DNS-01 wildcard TLS, and a dedicated ESO database credential mapping. Its
-pinned NGINX configuration passed syntax/startup, HTTP/1.1 and HTTP/2 raw-target
-differentials, header stripping, host/SNI rejection, and a bounded burst which
-returned both admitted responses and `429`s. These are repository/local edge
-tests, not public-route evidence.
+The edge decision was then revisited
+(`docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md`): the previously
+staged DNS-only/HAProxy/WireGuard/NGINX relay was scrapped as
+homelab-specific over-engineering for a raw-path requirement that is not
+load-bearing when normalization happens upstream of the single gateway
+boundary. The hosted route is the existing Cloudflare Tunnel with a wildcard
+ingress rule targeting the internal gateway Service; chart consumers get the
+same result through the optional `viewer.ingress` wildcard Ingress or any
+route to the ClusterIP Service. Raw-path fidelity remains available to
+deployments that front the gateway with an L4/SNI-passthrough load balancer
+and is verified there with the verifier's explicit `--probe-raw-path`
+differential. The dedicated database credential mapping belongs to the SRW
+Helm release and is rendered only with the internal viewer gate.
 
 The secret-safe production role/Secret workflow and the redacted
 `scripts/verify-canvas-hosted-edge.py` harness are also implemented. The live
 cluster still runs the older `sha-3a14ada` release and lacks migrations through
-`0062`, the gateway, restricted role, and dedicated Secret. The relay and
-WireGuard route have not been provisioned, the wildcard has not been changed to
-DNS-only, and the authoritative PSL has no exact private `srwcanvas.works`
-rule. The live verifier therefore fails Cockpit/API/IDE/PWA protection,
-raw-path routing, and PSL as expected; Keycloak's final login document already
-blocks cross-origin framing. Keep `rawPathVerified`, `pslBoundaryVerified`, the
-viewer gate, and the master live-preview gate false until the public route,
-shipping-browser PSL behavior, and complete hosted acceptance matrix pass.
+`0062`, the gateway, restricted role, and dedicated Secret. No tunnel ingress
+rule targets the gateway yet, and the authoritative PSL has no exact private
+`srwcanvas.works` rule. The live verifier therefore fails Cockpit/API/IDE/PWA
+protection and PSL as expected; Keycloak's final login document already blocks
+cross-origin framing. Keep `pslBoundaryVerified`, the viewer gate, and the
+master live-preview gate false until the tunnel route, shipping-browser PSL
+behavior, and complete hosted acceptance matrix pass.
 
 Do not enable or claim the user-facing slice complete until real browsers prove
 no BFF/Keycloak cookie or authorization-header leakage. The default-off 3A–3C

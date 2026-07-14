@@ -115,8 +115,20 @@ def test_public_examples_keep_live_preview_disabled() -> None:
     assert "CANVAS_LIVE_PREVIEW_DENIED_PORTS=8501,9000" in env_example
     assert local_values["canvas"]["livePreview"]["enabled"] is False
     assert local_values["canvas"]["livePreview"]["deniedPorts"] == []
+    assert (
+        local_values["canvas"]["livePreview"]["viewer"]["database"]["credentials"][
+            "vaultPath"
+        ]
+        == ""
+    )
     assert production_values["canvas"]["livePreview"]["enabled"] is False
     assert production_values["canvas"]["livePreview"]["deniedPorts"] == []
+    assert (
+        production_values["canvas"]["livePreview"]["viewer"]["database"]["credentials"][
+            "vaultPath"
+        ]
+        == ""
+    )
 
 
 def test_experimental_overlay_reserves_canvas_domain_without_enabling_it() -> None:
@@ -131,10 +143,22 @@ def test_experimental_overlay_reserves_canvas_domain_without_enabling_it() -> No
     assert viewer["domain"] == "srwcanvas.works"
     assert viewer["hostSuffix"] == ".srwcanvas.works"
     assert viewer["cockpitOrigins"] == ["https://cockpit.srw.works"]
-    assert viewer["rawPathVerified"] is False
     assert viewer["pslBoundaryVerified"] is False
-    assert viewer["networkPolicy"]["edgeNamespaceSelector"] == {}
-    assert viewer["networkPolicy"]["edgePodSelector"] == {}
+    assert viewer["database"]["credentials"] == {
+        "create": False,
+        "existingSecret": "",
+        "vaultPath": "homelab/superhuman-remote-worker/canvas-gateway-db",
+        "usernameKey": "username",
+        "passwordKey": "password",
+    }
+    # The edge is the existing Cloudflare Tunnel connector (see
+    # docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md).
+    assert viewer["networkPolicy"]["edgeNamespaceSelector"] == {
+        "matchLabels": {"kubernetes.io/metadata.name": "cloudflare-tunnel"}
+    }
+    assert viewer["networkPolicy"]["edgePodSelector"] == {
+        "matchLabels": {"app": "cloudflared"}
+    }
 
 
 def test_canvas_viewer_chart_values_are_default_off_and_fail_closed() -> None:
@@ -145,13 +169,13 @@ def test_canvas_viewer_chart_values_are_default_off_and_fail_closed() -> None:
     assert viewer["domain"] == ""
     assert viewer["hostSuffix"] == ""
     assert viewer["cockpitOrigins"] == []
-    assert viewer["rawPathVerified"] is False
     assert viewer["pslBoundaryVerified"] is False
     assert viewer["database"] == {
         "username": "srw_canvas_gateway",
         "credentials": {
             "create": False,
             "existingSecret": "",
+            "vaultPath": "",
             "usernameKey": "username",
             "passwordKey": "password",
         },
@@ -230,18 +254,30 @@ def test_canvas_gateway_compose_contract_is_profiled_internal_and_healthy() -> N
         assert "/api/health" not in healthcheck["test"][3]
 
 
-def test_canvas_gateway_templates_preserve_no_ingress_boundary() -> None:
+def test_canvas_gateway_templates_default_dark_with_optional_ingress() -> None:
     gateway_dir = ROOT / "helm/templates/canvas-gateway"
     templates = {path.name: path.read_text() for path in gateway_dir.glob("*.yaml")}
     assert set(templates) == {
         "configmap.yaml",
+        "database-external-secret.yaml",
         "database-role-job.yaml",
         "database-secret.yaml",
         "deployment.yaml",
+        "ingress.yaml",
         "network-policy.yaml",
         "service.yaml",
     }
-    assert all("kind: Ingress" not in source for source in templates.values())
+    # The optional plug-and-play wildcard route is the only Ingress and is
+    # double-gated: it renders nothing unless the viewer AND the ingress are
+    # both explicitly enabled (docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md).
+    assert all(
+        "kind: Ingress" not in source
+        for name, source in templates.items()
+        if name != "ingress.yaml"
+    )
+    ingress = templates["ingress.yaml"]
+    assert "kind: Ingress" in ingress
+    assert "if and $viewer.enabled $viewer.ingress.enabled" in ingress
     assert "type: ClusterIP" in templates["service.yaml"]
     assert "port: 8086" in templates["service.yaml"]
 
@@ -258,6 +294,12 @@ def test_canvas_gateway_templates_preserve_no_ingress_boundary() -> None:
     assert "- name: POSTGRES_USER" not in deployment
     assert "- name: POSTGRES_PASSWORD" not in deployment
     assert "DATABASE_URL" not in deployment
+
+    database_external_secret = templates["database-external-secret.yaml"]
+    assert "$viewer.enabled" in database_external_secret
+    assert "$credentials.vaultPath" in database_external_secret
+    assert "kind: ExternalSecret" in database_external_secret
+    assert "dataFrom:" not in database_external_secret
 
     gateway_config = templates["configmap.yaml"]
     assert "CANVAS_VIEWER_POSTGRES_HOST:" in gateway_config
@@ -307,6 +349,14 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         == "canvas-gateway"
         for item in default_objects
     )
+    assert not any(
+        item.get("kind") == "ExternalSecret"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway-credentials"
+        for item in default_objects
+    )
 
     enabled_args = [
         "--set",
@@ -321,8 +371,6 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         "canvas.livePreview.viewer.hostSuffix=.example-userland.test",
         "--set-string",
         "canvas.livePreview.viewer.cockpitOrigins[0]=https://cockpit.example.test",
-        "--set",
-        "canvas.livePreview.viewer.rawPathVerified=true",
         "--set",
         "canvas.livePreview.viewer.pslBoundaryVerified=true",
         "--set-string",
@@ -438,6 +486,14 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         text=True,
     ).stdout
     objects = [item for item in yaml.safe_load_all(rendered) if item]
+    assert not any(
+        item.get("kind") == "ExternalSecret"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway-credentials"
+        for item in objects
+    )
     gateway_objects = [
         item
         for item in objects
@@ -545,6 +601,198 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
+    chart = ROOT / "helm"
+    test_values = chart / "ci/test-values.yaml"
+    experimental_values = ROOT / "deployment/values-experimental.yaml"
+    base = ["helm", "template", "canvas-test", str(chart), "-f", str(test_values)]
+    vault_path = "test/canvas-gateway-db"
+
+    # A production overlay may reserve its Vault coordinates ahead of launch.
+    # While the viewer is off this must neither contact the provider nor require
+    # the path/properties to exist.
+    experimental_render = subprocess.run(
+        [
+            "helm",
+            "template",
+            "srw",
+            str(chart),
+            "-f",
+            str(experimental_values),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    experimental_objects = [
+        item for item in yaml.safe_load_all(experimental_render) if item
+    ]
+    assert not any(
+        item.get("kind") == "ExternalSecret"
+        and item.get("metadata", {}).get("name") == "srw-canvas-gateway-db"
+        for item in experimental_objects
+    )
+    assert not any(
+        item.get("kind") == "Deployment"
+        and item.get("metadata", {}).get("name") == "srw-canvas-gateway"
+        for item in experimental_objects
+    )
+
+    # Even disabling ESO entirely remains valid while the viewer is off.
+    disabled_render = subprocess.run(
+        [
+            *base,
+            "--set",
+            "externalSecrets.enabled=false",
+            "--set-string",
+            f"canvas.livePreview.viewer.database.credentials.vaultPath={vault_path}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    disabled_objects = [item for item in yaml.safe_load_all(disabled_render) if item]
+    assert not any(
+        item.get("kind") == "ExternalSecret"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway-credentials"
+        for item in disabled_objects
+    )
+
+    enabled_args = [
+        "--set",
+        "canvas.livePreview.enabled=true",
+        "--set",
+        "canvas.livePreview.viewer.enabled=true",
+        "--set-string",
+        "canvas.livePreview.viewer.cookieMode=psl-isolated",
+        "--set-string",
+        "canvas.livePreview.viewer.domain=example-userland.test",
+        "--set-string",
+        "canvas.livePreview.viewer.hostSuffix=.example-userland.test",
+        "--set-string",
+        "canvas.livePreview.viewer.cockpitOrigins[0]=https://cockpit.example.test",
+        "--set",
+        "canvas.livePreview.viewer.pslBoundaryVerified=true",
+        "--set-string",
+        "canvas.livePreview.viewer.networkPolicy.edgeNamespaceSelector.matchLabels.edge=trusted",
+        "--set-string",
+        "canvas.livePreview.viewer.networkPolicy.edgePodSelector.matchLabels.app=viewer-edge",
+    ]
+
+    no_source = subprocess.run(
+        [*base, *enabled_args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert no_source.returncode != 0
+    assert (
+        "require exactly one" in no_source.stderr
+        or "'oneOf' failed" in no_source.stderr
+    )
+
+    vault_without_eso = subprocess.run(
+        [
+            *base,
+            *enabled_args,
+            "--set",
+            "externalSecrets.enabled=false",
+            "--set-string",
+            f"canvas.livePreview.viewer.database.credentials.vaultPath={vault_path}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert vault_without_eso.returncode != 0
+    assert "requires externalSecrets.enabled=true" in vault_without_eso.stderr
+
+    multiple_sources = subprocess.run(
+        [
+            *base,
+            *enabled_args,
+            "--set-string",
+            "canvas.livePreview.viewer.database.credentials.existingSecret=canvas-viewer-db",
+            "--set-string",
+            f"canvas.livePreview.viewer.database.credentials.vaultPath={vault_path}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert multiple_sources.returncode != 0
+    assert (
+        "require exactly one" in multiple_sources.stderr
+        or "'oneOf' failed" in multiple_sources.stderr
+    )
+
+    vault_render = subprocess.run(
+        [
+            *base,
+            *enabled_args,
+            "--set-string",
+            f"canvas.livePreview.viewer.database.credentials.vaultPath={vault_path}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    objects = [item for item in yaml.safe_load_all(vault_render) if item]
+    external_secrets = [
+        item
+        for item in objects
+        if item.get("kind") == "ExternalSecret"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway-credentials"
+    ]
+    assert len(external_secrets) == 1
+    external_secret = external_secrets[0]
+    assert "dataFrom" not in external_secret["spec"]
+    assert external_secret["spec"]["data"] == [
+        {
+            "secretKey": "username",
+            "remoteRef": {"key": vault_path, "property": "username"},
+        },
+        {
+            "secretKey": "password",
+            "remoteRef": {"key": vault_path, "property": "password"},
+        },
+    ]
+    secret_name = external_secret["spec"]["target"]["name"]
+    assert secret_name == external_secret["metadata"]["name"]
+
+    gateway = next(
+        item
+        for item in objects
+        if item.get("kind") == "Deployment"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "canvas-gateway"
+    )
+    credential_refs = {
+        entry["name"]: entry["valueFrom"]["secretKeyRef"]
+        for entry in gateway["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "valueFrom" in entry
+    }
+    assert credential_refs == {
+        "CANVAS_VIEWER_POSTGRES_USER": {
+            "name": secret_name,
+            "key": "username",
+        },
+        "CANVAS_VIEWER_POSTGRES_PASSWORD": {
+            "name": secret_name,
+            "key": "password",
+        },
+    }
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_canvas_gateway_development_can_provision_restricted_internal_role() -> None:
     chart = ROOT / "helm"
     test_values = chart / "ci/test-values.yaml"
@@ -570,8 +818,6 @@ def test_canvas_gateway_development_can_provision_restricted_internal_role() -> 
             "canvas.livePreview.viewer.hostSuffix=.canvas.example-userland.test",
             "--set-string",
             "canvas.livePreview.viewer.cockpitOrigins[0]=https://cockpit.example.test",
-            "--set",
-            "canvas.livePreview.viewer.rawPathVerified=true",
             "--set",
             "canvas.livePreview.viewer.database.credentials.create=true",
             "--set",

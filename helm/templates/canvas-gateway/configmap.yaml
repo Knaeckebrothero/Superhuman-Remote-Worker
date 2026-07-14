@@ -16,7 +16,6 @@ data:
   CANVAS_VIEWER_DOMAIN: {{ $viewer.domain | quote }}
   CANVAS_VIEWER_HOST_SUFFIX: {{ $viewer.hostSuffix | quote }}
   CANVAS_VIEWER_COCKPIT_ORIGINS: {{ join "," $viewer.cockpitOrigins | quote }}
-  CANVAS_VIEWER_RAW_PATH_VERIFIED: {{ ternary "true" "false" $viewer.rawPathVerified | quote }}
   CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED: {{ ternary "true" "false" $viewer.pslBoundaryVerified | quote }}
   CANVAS_VIEWER_SESSION_TTL_SECONDS: {{ $viewer.sessionTtlSeconds | int | quote }}
   CANVAS_VIEWER_BOOTSTRAP_TTL_SECONDS: {{ $viewer.bootstrapTtlSeconds | int | quote }}

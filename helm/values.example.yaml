@@ -158,10 +158,14 @@ ingress:
     issuerName: letsencrypt-prod
 
 # Workspace-port Canvas previews remain unavailable until the deployment has
-# a separate viewer domain/edge and has passed the browser security gates. The
-# chart can render an internal gateway, but intentionally creates no wildcard
-# ingress or TLS route for it. An enabled production viewer must reference a
-# separately provisioned, least-privilege database credential Secret.
+# a separate viewer domain and has passed the browser security gates. The
+# gateway can be fronted three ways: the optional chart Ingress below
+# (viewer.ingress, wildcard host + cert-manager DNS-01), a Cloudflare tunnel
+# entry pointing at the gateway Service, or an operator-owned edge. Ordinary
+# normalizing proxies are supported (see
+# docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). An enabled
+# production viewer must reference a separately provisioned, least-privilege
+# database credential Secret.
 canvas:
   livePreview:
     enabled: false
@@ -173,13 +177,25 @@ canvas:
       domain: ""
       hostSuffix: ""
       cockpitOrigins: []
-      rawPathVerified: false
       pslBoundaryVerified: false
+      # Optional wildcard Ingress for the gateway (`*` + hostSuffix); off when
+      # a tunnel or operator edge routes to the Service directly.
+      ingress:
+        enabled: false
+        className: ""
+        annotations: {}
+        tls:
+          enabled: true
+          issuerName: ""   # needs a DNS-01 solver for wildcard certs
+          secretName: ""
       database:
         username: "srw_canvas_gateway"
         credentials:
           create: false
           existingSecret: ""
+          # Alternatively, set a Vault path while using externalSecrets; it is
+          # synced only after viewer.enabled becomes true.
+          vaultPath: ""
           usernameKey: "username"
           passwordKey: "password"
         provisionRole: false
@@ -187,7 +203,8 @@ canvas:
           min: 1
           max: 4
       # Keep both selectors empty while disabled. Enabling requires non-empty
-      # selectors for the operator-owned edge and opens only TCP/8086 from it.
+      # selectors for whatever fronts the gateway (cloudflared, the cluster's
+      # ingress-controller pods, or a dedicated edge); only TCP/8086 opens.
       networkPolicy:
         edgeNamespaceSelector: {}
         edgePodSelector: {}
