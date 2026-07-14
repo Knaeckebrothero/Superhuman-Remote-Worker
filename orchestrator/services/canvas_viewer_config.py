@@ -203,10 +203,11 @@ def canvas_viewer_config() -> CanvasViewerConfig:
         raise CanvasViewerConfigurationError(
             "Enabled Canvas viewers require HTTPS Cockpit origins"
         )
-    if not _truthy("CANVAS_VIEWER_RAW_PATH_VERIFIED"):
-        raise CanvasViewerConfigurationError(
-            "Canvas viewer ingress raw-path preservation is not attested"
-        )
+    # Raw-path preservation is deliberately NOT an attestation gate: a
+    # normalizing proxy (Cloudflare tunnel, ordinary ingress) in front of the
+    # gateway canonicalizes before the security boundary, which is the safe
+    # direction — the gateway checks and forwards the same string. See
+    # docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md.
     if profile == "production":
         if cookie_mode != "psl-isolated":
             raise CanvasViewerConfigurationError(

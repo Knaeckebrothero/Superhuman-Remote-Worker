@@ -166,8 +166,29 @@
                   },
                   "uniqueItems": true
                 },
-                "rawPathVerified": { "type": "boolean" },
+                "rawPathVerified": {
+                  "type": "boolean",
+                  "description": "Deprecated (2026-07-14), no effect: raw-path fidelity is an optional property of the operator's edge, not a launch gate. See docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md."
+                },
                 "pslBoundaryVerified": { "type": "boolean" },
+                "ingress": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "className": { "type": "string" },
+                    "annotations": { "type": "object" },
+                    "tls": {
+                      "type": "object",
+                      "properties": {
+                        "enabled": { "type": "boolean" },
+                        "issuerName": { "type": "string" },
+                        "secretName": { "type": "string" }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "additionalProperties": false
+                },
                 "sessionTtlSeconds": {
                   "type": "integer",
                   "minimum": 60,
@@ -204,6 +225,10 @@
                           "type": "string",
                           "maxLength": 253,
                           "pattern": "^$|^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                        },
+                        "vaultPath": {
+                          "type": "string",
+                          "maxLength": 512
                         },
                         "usernameKey": {
                           "type": "string",
@@ -274,7 +299,6 @@
                       "domain",
                       "hostSuffix",
                       "cockpitOrigins",
-                      "rawPathVerified",
                       "networkPolicy",
                       "database"
                     ],
@@ -285,12 +309,11 @@
                       "domain": { "minLength": 4 },
                       "hostSuffix": { "minLength": 5 },
                       "cockpitOrigins": { "minItems": 1 },
-                      "rawPathVerified": { "const": true },
                       "database": {
                         "required": ["username", "credentials", "provisionRole", "pool"],
                         "properties": {
                           "credentials": {
-                            "required": ["create", "existingSecret", "usernameKey", "passwordKey"]
+                            "required": ["create", "existingSecret", "vaultPath", "usernameKey", "passwordKey"]
                           },
                           "pool": { "required": ["min", "max"] }
                         }
@@ -328,9 +351,22 @@
                         "properties": {
                           "credentials": {
                             "properties": {
-                              "create": { "const": false },
-                              "existingSecret": { "minLength": 1 }
-                            }
+                              "create": { "const": false }
+                            },
+                            "oneOf": [
+                              {
+                                "properties": {
+                                  "existingSecret": { "minLength": 1 },
+                                  "vaultPath": { "maxLength": 0 }
+                                }
+                              },
+                              {
+                                "properties": {
+                                  "existingSecret": { "maxLength": 0 },
+                                  "vaultPath": { "minLength": 1 }
+                                }
+                              }
+                            ]
                           },
                           "provisionRole": { "const": false }
                         }
