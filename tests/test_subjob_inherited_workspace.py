@@ -1,16 +1,28 @@
 """Tests for subjob workspace inheritance resolved live at dispatch.
 
-Regression coverage for
-docs/issues/subjob_inherits_stale_workspace_container_snapshot.md: a scholar/
-critic subjob copies the parent's ``workspace_container`` / ``vm`` context by
-value at spawn time. When the scholar is spawned ~3s after its parent (before
-the parent pod is ready) that snapshot is frozen at ``status='created'`` with
-no SSH host and strands the subjob at ``init_workspace``.
+Regression coverage for two coupled issues:
 
-``_resolve_subjob_inherited_workspace`` (orchestrator/main.py) re-reads the
-parent's LIVE context at dispatch and overlays it, so the subjob rides the
-parent pod instead of stranding. These tests exercise the real function with a
-mocked ``postgres_db.get_job``.
+* docs/issues/subjob_inherits_stale_workspace_container_snapshot.md — a
+  scholar/critic subjob copies the parent's ``workspace_container`` / ``vm``
+  context by value at spawn time. When the scholar is spawned ~3s after its
+  parent (before the parent pod is ready) that snapshot is frozen at
+  ``status='created'`` with no SSH host and strands the subjob at
+  ``init_workspace``. ``_resolve_subjob_inherited_workspace`` re-reads the
+  parent's LIVE context at dispatch and overlays it.
+
+* docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md —
+  when the parent has NO workspace at scholar-spawn (idle cluster), the scholar
+  inherits nothing and self-provisions its OWN pod, writing its own
+  ``workspace_container`` into context. The old resolver keyed the inherit path
+  off mere *presence* of that key, so it misread the self-provisioned scholar as
+  "inheriting", waited 600s on a parent workspace that never exists, then failed
+  — and the dispatch-path failure never unblocked the parent, stranding it in
+  ``waiting`` forever. The fix: inheriting subjobs carry an explicit
+  ``inherits_parent_workspace`` flag (stamped only when they actually copy the
+  parent's snapshot); the resolver gates on the flag, not on key presence; and a
+  dispatch-time subjob failure routes through the parent-unblock handlers.
+
+These tests exercise the real functions with a mocked ``postgres_db``.
 """
 
 from __future__ import annotations
@@ -43,6 +55,23 @@ def _subjob(context, *, parent_id="parent-uuid", age_s=5.0):
         "context": context,
         "created_at": datetime.now(timezone.utc) - timedelta(seconds=age_s),
     }
+
+
+def _inherited(container=None, vm=None):
+    """Context of a subjob that INHERITED its parent's workspace at spawn.
+
+    Carries the explicit ``inherits_parent_workspace`` flag (stamped by
+    ``_spawn_scholar_subjob`` / ``_trigger_verification_on_complete`` when they
+    copy the parent's ``vm`` / ``workspace_container``) plus the copied snapshot.
+    Contrast a *self-provisioned* subjob, whose context carries the same
+    workspace key with NO flag.
+    """
+    ctx: dict = {"inherits_parent_workspace": True}
+    if container is not None:
+        ctx["workspace_container"] = container
+    if vm is not None:
+        ctx["vm"] = vm
+    return ctx
 
 
 @pytest.fixture
@@ -80,9 +109,54 @@ class TestNonInheriting:
         mock = patch_get_job(
             {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
         )
-        job = _subjob({"workspace_container": dict(READY_CONTAINER)})
+        job = _subjob(_inherited(container=dict(READY_CONTAINER)))
         assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
         mock.assert_awaited_once_with("parent-uuid")
+
+
+class TestSelfProvisionedDiscrimination:
+    """A subjob that self-provisioned its OWN workspace (no inherit flag) must
+    ride the normal dispatch path — never wait on, or fail against, a parent
+    workspace that will never exist.
+
+    Regression for
+    docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
+    The old resolver keyed off presence of ``workspace_container`` / ``vm`` and
+    so misclassified these as inheriting.
+    """
+
+    @pytest.mark.asyncio
+    async def test_self_provisioned_ready_container_proceeds_without_flag(
+        self, patch_get_job
+    ):
+        # Scholar self-provisioned: it wrote its OWN ready container into context
+        # but carries NO inherits_parent_workspace flag. Must proceed WITHOUT even
+        # consulting the (workspace-less) parent.
+        mock = patch_get_job(None)
+        job = _subjob({"workspace_container": dict(READY_CONTAINER)})
+        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_provisioned_creating_container_proceeds_not_waits(
+        self, patch_get_job
+    ):
+        # The exact shape that used to strand: a self-provisioned pod mid-creation
+        # (status=creating) with no flag. Old code waited on the parent for 600s
+        # then failed; new code proceeds immediately down the normal path.
+        mock = patch_get_job({"status": "waiting", "context": {}})
+        job = _subjob(
+            {"workspace_container": {"status": "creating", "pod_name": "workspace-self"}}
+        )
+        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_provisioned_vm_proceeds_without_flag(self, patch_get_job):
+        mock = patch_get_job(None)
+        job = _subjob({"vm": {"status": "creating", "requested": True}})
+        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        mock.assert_not_awaited()
 
 
 class TestContainerInheritance:
@@ -91,7 +165,7 @@ class TestContainerInheritance:
         patch_get_job(
             {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
         )
-        job = _subjob({"workspace_container": dict(STALE_CONTAINER)})
+        job = _subjob(_inherited(container=dict(STALE_CONTAINER)))
         result = await main._resolve_subjob_inherited_workspace(job)
         assert result == ("proceed", None)
         # In-memory context now carries the parent's ready host/pod_ip.
@@ -106,9 +180,9 @@ class TestContainerInheritance:
                 "context": {"workspace_container": {"status": "creating"}},
             }
         )
-        job = _subjob({"workspace_container": dict(STALE_CONTAINER)}, age_s=5.0)
+        job = _subjob(_inherited(container=dict(STALE_CONTAINER)), age_s=5.0)
         assert await main._resolve_subjob_inherited_workspace(job) == ("wait", None)
-        # Context left untouched while waiting.
+        # Inherited snapshot left untouched while waiting.
         assert job["context"]["workspace_container"] == STALE_CONTAINER
 
     @pytest.mark.asyncio
@@ -120,7 +194,7 @@ class TestContainerInheritance:
             }
         )
         job = _subjob(
-            {"workspace_container": dict(STALE_CONTAINER)},
+            _inherited(container=dict(STALE_CONTAINER)),
             age_s=main._INHERIT_WORKSPACE_MAX_WAIT_S + 60,
         )
         action, msg = await main._resolve_subjob_inherited_workspace(job)
@@ -135,7 +209,7 @@ class TestContainerInheritance:
                 "context": {"workspace_container": {"status": "failed"}},
             }
         )
-        job = _subjob({"workspace_container": dict(STALE_CONTAINER)})
+        job = _subjob(_inherited(container=dict(STALE_CONTAINER)))
         action, msg = await main._resolve_subjob_inherited_workspace(job)
         assert action == "fail"
         assert "unavailable" in msg
@@ -148,7 +222,7 @@ class TestContainerInheritance:
                 "context": {"workspace_container": {"status": "deleted"}},
             }
         )
-        job = _subjob({"workspace_container": dict(READY_CONTAINER)})
+        job = _subjob(_inherited(container=dict(READY_CONTAINER)))
         action, msg = await main._resolve_subjob_inherited_workspace(job)
         assert action == "fail"
         assert "unavailable" in msg
@@ -161,14 +235,14 @@ class TestContainerInheritance:
                 "context": {"workspace_container": {"status": "creating"}},
             }
         )
-        job = _subjob({"workspace_container": dict(STALE_CONTAINER)})
+        job = _subjob(_inherited(container=dict(STALE_CONTAINER)))
         action, _ = await main._resolve_subjob_inherited_workspace(job)
         assert action == "fail"
 
     @pytest.mark.asyncio
     async def test_parent_missing_fails_fast(self, patch_get_job):
         patch_get_job(None)
-        job = _subjob({"workspace_container": dict(STALE_CONTAINER)})
+        job = _subjob(_inherited(container=dict(STALE_CONTAINER)))
         action, msg = await main._resolve_subjob_inherited_workspace(job)
         assert action == "fail"
         assert "no longer exists" in msg
@@ -180,7 +254,7 @@ class TestContainerInheritance:
         patch_get_job(
             {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
         )
-        job = _subjob(json.dumps({"workspace_container": dict(STALE_CONTAINER)}))
+        job = _subjob(json.dumps(_inherited(container=dict(STALE_CONTAINER))))
         result = await main._resolve_subjob_inherited_workspace(job)
         assert result == ("proceed", None)
         assert job["context"]["workspace_container"]["status"] == "ready"
@@ -190,7 +264,7 @@ class TestVmInheritance:
     @pytest.mark.asyncio
     async def test_stale_vm_overlays_parent_ready_vm(self, patch_get_job):
         patch_get_job({"status": "waiting", "context": {"vm": READY_VM}})
-        job = _subjob({"vm": {"status": "creating", "requested": True}})
+        job = _subjob(_inherited(vm={"status": "creating", "requested": True}))
         result = await main._resolve_subjob_inherited_workspace(job)
         assert result == ("proceed", None)
         assert job["context"]["vm"]["status"] == "ready"
@@ -201,8 +275,74 @@ class TestVmInheritance:
         patch_get_job(
             {"status": "waiting", "context": {"vm": {"status": "provisioning"}}}
         )
-        job = _subjob({"vm": {"status": "creating", "requested": True}}, age_s=5.0)
+        job = _subjob(
+            _inherited(vm={"status": "creating", "requested": True}), age_s=5.0
+        )
         assert await main._resolve_subjob_inherited_workspace(job) == ("wait", None)
+
+
+class TestFailSubjobUnblocksParent:
+    """A subjob failed at dispatch time (e.g. it cannot inherit its parent's
+    workspace) must also unblock its parent, which _spawn_scholar_subjob left
+    held in 'waiting'. Otherwise the parent strands forever — the secondary bug
+    in scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
+    """
+
+    @pytest.fixture
+    def patch_db(self, monkeypatch):
+        """Record status transitions + context merges; parent starts 'waiting'."""
+        calls = {"status": [], "merge": []}
+
+        async def fake_update_status(job_id, status=None, **kw):
+            calls["status"].append((job_id, status, kw.get("error_message")))
+
+        async def fake_merge(job_id, delta):
+            calls["merge"].append((job_id, delta))
+
+        parent_row = {"id": "parent-uuid", "status": "waiting", "context": {}}
+
+        monkeypatch.setattr(
+            main.postgres_db, "update_job_status", AsyncMock(side_effect=fake_update_status)
+        )
+        monkeypatch.setattr(
+            main.postgres_db, "get_job", AsyncMock(return_value=parent_row)
+        )
+        monkeypatch.setattr(
+            main.postgres_db, "merge_job_context", AsyncMock(side_effect=fake_merge)
+        )
+        monkeypatch.setattr(main, "_trigger_dispatch", lambda *a, **k: None)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_failed_scholar_unblocks_waiting_parent(self, patch_db):
+        job = _subjob({"scholar_target": "parent-uuid"})
+        job["id"] = "scholar-uuid"
+        job["status"] = "created"
+        job["creation_order"] = None
+
+        await main._fail_subjob_and_unblock_parent(job, "cannot inherit: boom")
+
+        # 1. Scholar marked failed with the diagnostic message.
+        assert ("scholar-uuid", "failed", "cannot inherit: boom") in patch_db["status"]
+        # 2. Parent flipped waiting -> created (the unblock).
+        assert ("parent-uuid", "created", None) in patch_db["status"]
+        # 3. scholar_failed recorded on the parent context.
+        assert ("parent-uuid", {"scholar_failed": True}) in patch_db["merge"]
+
+    @pytest.mark.asyncio
+    async def test_non_scholar_subjob_still_marked_failed(self, patch_db):
+        # A subjob that isn't a scholar/delegation child (no scholar_target, no
+        # creation_order) is still failed; there is simply no parent to unblock.
+        job = _subjob({"verification_target": "parent-uuid"})
+        job["id"] = "critic-uuid"
+        job["status"] = "created"
+        job["creation_order"] = None
+
+        await main._fail_subjob_and_unblock_parent(job, "workspace gone")
+
+        assert ("critic-uuid", "failed", "workspace gone") in patch_db["status"]
+        # No unblock: parent was never transitioned to created.
+        assert not any(s == "created" for _, s, _ in patch_db["status"])
 
 
 # =============================================================================
