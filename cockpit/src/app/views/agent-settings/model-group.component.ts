@@ -5,7 +5,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {ModelService} from '../../core/services/model.service';
 import {EffectiveModels, EffectiveModelSlot} from '../../core/models/api.model';
 import {computeModelMismatch, ModelMismatch, readConfigPath, SettingsMode} from './agent-settings.types';
-import {reasoningOptionsForModel} from './reasoning-options';
+import {defaultSelectableReasoning, getSelectableReasoningOptions, reasoningOptionsForModel} from './reasoning-options';
 import {formatTokens} from '../../core/util/format-tokens';
 
 // UI-only "last selected model" preselect keys (localStorage). Deliberately NOT
@@ -161,29 +161,34 @@ const STORAGE_KEYS = {
         </div>
 
         <!-- Session: reasoning level for the model in effect (options are
-             capability-driven per family; the value rides llm.reasoning_level). -->
-        <div class="field-row" [class.modified]="sessionReasoning() !== null">
-          <label class="field-label">{{ 'agentSettings.model.reasoning' | transloco }}</label>
-          <div class="field-control">
-            <select
-              class="form-input"
-              [ngModel]="sessionReasoning() ?? resolvedSessionReasoning()"
-              (ngModelChange)="onSessionReasoningChange($event)"
-              [disabled]="disabled()"
-            >
-              @for (opt of sessionReasoningOptions(); track opt.value) {
-                @if (opt.value === null) {
-                  <option [ngValue]="null">{{ opt.label }}</option>
-                } @else {
-                  <option [value]="opt.value">{{ opt.label }}</option>
+             capability-driven per family; the value rides llm.reasoning_level).
+             No "Default" sentinel — the resolved default is preselected and
+             marked, like the model picker; hidden when the model offers no
+             choice (method none / always_on). -->
+        @if (sessionReasoningOptions().length) {
+          <div class="field-row" [class.modified]="sessionReasoning() !== null">
+            <label class="field-label">{{ 'agentSettings.model.reasoning' | transloco }}</label>
+            <div class="field-control">
+              <select
+                class="form-input"
+                [ngModel]="sessionReasoning() ?? resolvedSessionReasoning()"
+                (ngModelChange)="onSessionReasoningChange($event)"
+                [disabled]="disabled()"
+              >
+                @for (opt of sessionReasoningOptions(); track opt.value) {
+                  <option [value]="opt.value">
+                    {{ opt.value === resolvedSessionReasoning()
+                      ? ('agentSettings.model.reasoningDefaultOption' | transloco: {label: opt.label})
+                      : opt.label }}
+                  </option>
                 }
+              </select>
+              @if (sessionReasoning() !== null) {
+                <button type="button" class="reset-btn" (click)="onSessionReasoningChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco"><app-icon size="xs">close</app-icon></button>
               }
-            </select>
-            @if (sessionReasoning() !== null) {
-              <button type="button" class="reset-btn" (click)="onSessionReasoningChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco"><app-icon size="xs">close</app-icon></button>
-            }
+            </div>
           </div>
-        </div>
+        }
       }
     </div>
   `,
@@ -350,9 +355,17 @@ export class ModelGroupComponent {
   readonly resolvedSessionModel = computed(() =>
     (readConfigPath(this.config(), 'llm.model') as string) ?? null
   );
-  readonly resolvedSessionReasoning = computed(() =>
-    (readConfigPath(this.config(), 'llm.reasoning_level') as string) ?? null
-  );
+  // The reasoning value in effect when the user picks nothing: a config-pinned
+  // level (when the model's option set actually contains it) else the family
+  // default. Never an unmatched value — a native select with no matching
+  // option renders blank.
+  readonly resolvedSessionReasoning = computed(() => {
+    const options = this.sessionReasoningOptions();
+    if (!options.length) return null;
+    const pin = (readConfigPath(this.config(), 'llm.reasoning_level') as string) ?? null;
+    if (pin && options.some((o) => o.value === pin)) return pin;
+    return defaultSelectableReasoning(this.sessionReasoningCap());
+  });
 
   // Server-resolved effective slot ({model, source}) or null when unavailable.
   readonly effectiveStrategic = computed(() => this.effectiveModels()?.strategic ?? null);
@@ -380,9 +393,15 @@ export class ModelGroupComponent {
   readonly tacticalReasoningOptions = computed(() =>
     reasoningOptionsForModel(this.tacticalInEffect(), this.modelService.reasoningByModel()),
   );
-  /** Reasoning options for the session model in effect. */
+  /** Reasoning capability of the session model in effect (null when unknown). */
+  private readonly sessionReasoningCap = computed(() => {
+    const model = this.sessionInEffect();
+    return model ? (this.modelService.reasoningByModel()[model] ?? null) : null;
+  });
+  /** Concrete reasoning options (no "Default" sentinel — the resolved default
+   *  is preselected instead, like the model picker). Empty hides the field. */
   readonly sessionReasoningOptions = computed(() =>
-    reasoningOptionsForModel(this.sessionInEffect(), this.modelService.reasoningByModel()),
+    getSelectableReasoningOptions(this.sessionReasoningCap()),
   );
 
   /**
@@ -462,7 +481,10 @@ export class ModelGroupComponent {
   }
 
   onSessionReasoningChange(value: string | null): void {
-    this.sessionReasoning.set(value);
+    // Picking the resolved default = no override (mirrors Image Quality).
+    const normalized =
+      value === null || value === this.resolvedSessionReasoning() ? null : value;
+    this.sessionReasoning.set(normalized);
     this.change.emit();
   }
 

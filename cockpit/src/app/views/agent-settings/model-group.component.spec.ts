@@ -292,14 +292,35 @@ describe('ModelGroupComponent', () => {
       expect(component.sessionReasoning()).toBeNull();
     });
 
-    it('derives its options from the session model in effect', () => {
+    it('derives concrete options (no Default sentinel) from the session model in effect', () => {
       const {component} = createComponent();
       component.sessionModel.set('gemma-4-moe');
       expect(component.sessionReasoningOptions()).toEqual([
-        {value: null, label: 'Default'},
         {value: 'on', label: 'On'},
         {value: 'off', label: 'Off'},
       ]);
+    });
+
+    it('resolves to the family default and treats picking it as no override', () => {
+      const {component} = createComponent();
+      component.sessionModel.set('gemma-4-moe');
+      expect(component.resolvedSessionReasoning()).toBe('on');
+
+      // Selecting the default is not an override…
+      component.onSessionReasoningChange('on');
+      expect(component.sessionReasoning()).toBeNull();
+      expect(component.getOverrides()).toEqual({});
+
+      // …selecting anything else is.
+      component.onSessionReasoningChange('off');
+      expect(component.sessionReasoning()).toBe('off');
+    });
+
+    it('offers nothing for a model without a selectable capability (field hidden)', () => {
+      const {component} = createComponent();
+      component.sessionModel.set('gpt-4o');
+      expect(component.sessionReasoningOptions()).toEqual([]);
+      expect(component.resolvedSessionReasoning()).toBeNull();
     });
 
     it('is dropped on a session model change (no cross-family leak)', () => {
