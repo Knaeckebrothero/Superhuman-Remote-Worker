@@ -20,7 +20,9 @@ from services.canvas_ssh import RemoteWorkspaceTarget
 from services.canvas_viewer_config import CanvasViewerConfig
 from services.canvas_viewer_sessions import (
     CanvasBootstrapExchange,
+    CanvasBootstrapStart,
     CanvasOriginSession,
+    canvas_bootstrap_cookie_name,
 )
 
 
@@ -68,21 +70,46 @@ class _FakeTransportPool:
 class _FakeDB:
     def __init__(self, thread: dict):
         self.thread = thread
+        self.thread_queries: list[tuple[str, object]] = []
 
-    async def get_thread(self, thread_id: str):
-        assert thread_id == str(self.thread["id"])
+    @asynccontextmanager
+    async def acquire(self):
+        yield self
+
+    async def fetchrow(self, query: str, thread_id: object):
+        normalized = " ".join(query.split())
+        assert normalized == ("SELECT id, user_id, metadata FROM threads WHERE id = $1")
+        assert str(thread_id) == str(self.thread["id"])
+        self.thread_queries.append((normalized, thread_id))
         return self.thread
 
 
 class _FakeSessions:
     def __init__(self, session: CanvasOriginSession):
         self.session = session
+        self.attachment_id = uuid4()
+        self.challenge = "c" * 43
+        self.ready_receipt = "r" * 43
+        self.browser_binding = "b" * 43
+        self.exchange_code = "e" * 43
         self.cookie_expires_at = session.expires_at + timedelta(hours=1)
         self.bootstrap_calls = []
+        self.exchange_calls = []
         self.authenticate_calls = []
 
-    async def consume_bootstrap(self, **kwargs):
+    async def begin_bootstrap(self, **kwargs):
         self.bootstrap_calls.append(kwargs)
+        return CanvasBootstrapStart(
+            attachment_id=self.attachment_id,
+            challenge=self.challenge,
+            ready_receipt=self.ready_receipt,
+            browser_binding=self.browser_binding,
+            embedding_origin=self.session.embedding_origin,
+            expires_at=datetime.now(UTC) + timedelta(seconds=60),
+        )
+
+    async def exchange_bootstrap(self, **kwargs):
+        self.exchange_calls.append(kwargs)
         source = self.session.record.source
         assert isinstance(source, WorkspaceAppSource)
         return CanvasBootstrapExchange(
@@ -172,7 +199,7 @@ def _client(app: CanvasGatewayApp, session: CanvasOriginSession):
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_requires_iframe_metadata_before_token_consumption() -> None:
+async def test_bootstrap_requires_iframe_metadata_before_challenge_start() -> None:
     config, session, sessions, db = _fixture()
     app = CanvasGatewayApp(
         db=db,
@@ -182,7 +209,7 @@ async def test_bootstrap_requires_iframe_metadata_before_token_consumption() -> 
     )
     async with _client(app, session) as client:
         response = await client.get(
-            "/_canvas/bootstrap?token=" + "t" * 43,
+            f"/_canvas/bootstrap?attachment_id={sessions.attachment_id}",
             headers={"Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate"},
         )
     assert response.status_code == 403
@@ -191,9 +218,7 @@ async def test_bootstrap_requires_iframe_metadata_before_token_consumption() -> 
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_sets_cookie_then_uses_same_origin_transition_document() -> (
-    None
-):
+async def test_bootstrap_serves_bound_challenge_and_only_transient_cookie() -> None:
     config, session, sessions, db = _fixture()
     app = CanvasGatewayApp(
         db=db,
@@ -203,7 +228,7 @@ async def test_bootstrap_sets_cookie_then_uses_same_origin_transition_document()
     )
     async with _client(app, session) as client:
         response = await client.get(
-            "/_canvas/bootstrap?token=" + "t" * 43,
+            f"/_canvas/bootstrap?attachment_id={sessions.attachment_id}",
             headers={
                 "Sec-Fetch-Dest": "iframe",
                 "Sec-Fetch-Mode": "navigate",
@@ -213,23 +238,198 @@ async def test_bootstrap_sets_cookie_then_uses_same_origin_transition_document()
         )
     assert response.status_code == 200
     assert "location" not in response.headers
-    assert 'location.replace("/demo")' in response.text
+    assert str(sessions.attachment_id) in response.text
+    assert sessions.challenge in response.text
+    assert sessions.ready_receipt in response.text
+    assert session.embedding_origin in response.text
+    assert sessions.browser_binding not in response.text
+    assert sessions.exchange_code not in response.text
+    assert "bridge_nonce" not in response.text
     assert "token" not in response.text
+    assert 'fetch("/_canvas/exchange"' in response.text
+    assert "event.source!==parent" in response.text
+    assert "event.origin!==bootstrap.parentOrigin" in response.text
+    assert "bootstrap.parentOrigin" in response.text
     nonce = re.search(
         r"script-src 'nonce-([A-Za-z0-9_-]+)'",
         response.headers["content-security-policy"],
     )
     assert nonce is not None
     assert f'nonce="{nonce.group(1)}"' in response.text
-    cookie = response.headers["set-cookie"]
-    assert cookie.startswith("__Host-canvas_session=")
+    assert "connect-src 'self'" in response.headers["content-security-policy"]
+    cookies = response.headers.get_list("set-cookie")
+    assert len(cookies) == 1
+    cookie = cookies[0]
+    bootstrap_cookie = canvas_bootstrap_cookie_name(sessions.attachment_id)
+    assert cookie.startswith(f"{bootstrap_cookie}={sessions.browser_binding}")
+    assert "__Host-canvas_session=" not in cookie
     assert "Secure" in cookie
     assert "HttpOnly" in cookie
     assert "SameSite=None" in cookie
     assert "Partitioned" in cookie
     max_age = int(cookie.split("Max-Age=", 1)[1].split(";", 1)[0])
-    assert max_age > config.session_ttl_seconds
+    assert 0 < max_age <= config.bootstrap_ttl_seconds
     assert len(sessions.bootstrap_calls) == 1
+    assert sessions.bootstrap_calls[0] == {
+        "attachment_id": sessions.attachment_id,
+        "host_generation": session.origin_generation,
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_origin_exchange_sets_viewer_and_clears_transient_cookie() -> None:
+    config, session, sessions, db = _fixture()
+    app = CanvasGatewayApp(
+        db=db,
+        config=config,
+        session_service=sessions,  # type: ignore[arg-type]
+        registry=CanvasConnectionRegistry(max_connections=4),
+    )
+    origin = f"https://{session.origin_generation}.canvas.user-content.test"
+    bootstrap_cookie = canvas_bootstrap_cookie_name(sessions.attachment_id)
+    async with _client(app, session) as client:
+        response = await client.post(
+            "/_canvas/exchange",
+            json={
+                "attachment_id": str(sessions.attachment_id),
+                "challenge": sessions.challenge,
+                "exchange_code": sessions.exchange_code,
+            },
+            headers={
+                "Cookie": (
+                    f"{bootstrap_cookie}={sessions.browser_binding}; "
+                    f"__Host-canvas_session={'s' * 43}"
+                ),
+                "Origin": origin,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"entry_path": "/demo"}
+    assert sessions.challenge not in response.text
+    assert sessions.exchange_code not in response.text
+    assert len(sessions.exchange_calls) == 1
+    assert sessions.exchange_calls[0] == {
+        "attachment_id": sessions.attachment_id,
+        "challenge": sessions.challenge,
+        "exchange_code": sessions.exchange_code,
+        "browser_binding": sessions.browser_binding,
+        "host_generation": session.origin_generation,
+        "existing_session_secret": "s" * 43,
+    }
+    cookies = response.headers.get_list("set-cookie")
+    assert len(cookies) == 2
+    assert any(
+        cookie.startswith(f"{bootstrap_cookie}=;") and "Max-Age=0" in cookie
+        for cookie in cookies
+    )
+    viewer = next(
+        cookie for cookie in cookies if cookie.startswith("__Host-canvas_session=")
+    )
+    assert viewer.startswith("__Host-canvas_session=" + "n" * 43)
+    for attribute in ("Path=/", "Secure", "HttpOnly", "SameSite=None", "Partitioned"):
+        assert attribute in viewer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "expected_status"),
+    [
+        (
+            {
+                "Origin": "https://attacker.test",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            403,
+        ),
+        (
+            {
+                "Origin": "https://placeholder.invalid",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "cross-site",
+            },
+            403,
+        ),
+    ],
+)
+async def test_exchange_rejects_non_same_origin_context_before_authorization(
+    headers: dict[str, str], expected_status: int
+) -> None:
+    config, session, sessions, db = _fixture()
+    app = CanvasGatewayApp(
+        db=db,
+        config=config,
+        session_service=sessions,  # type: ignore[arg-type]
+        registry=CanvasConnectionRegistry(max_connections=4),
+    )
+    origin = f"https://{session.origin_generation}.canvas.user-content.test"
+    request_headers = dict(headers)
+    if request_headers["Origin"] == "https://placeholder.invalid":
+        request_headers["Origin"] = origin
+    async with _client(app, session) as client:
+        response = await client.post(
+            "/_canvas/exchange",
+            json={
+                "attachment_id": str(sessions.attachment_id),
+                "challenge": sessions.challenge,
+                "exchange_code": sessions.exchange_code,
+            },
+            headers=request_headers,
+        )
+
+    assert response.status_code == expected_status
+    assert sessions.exchange_calls == []
+    assert "set-cookie" not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["extra_field", "wrong_attachment_cookie"])
+async def test_exchange_requires_exact_schema_and_attachment_browser_binding(
+    failure: str,
+) -> None:
+    config, session, sessions, db = _fixture()
+    app = CanvasGatewayApp(
+        db=db,
+        config=config,
+        session_service=sessions,  # type: ignore[arg-type]
+        registry=CanvasConnectionRegistry(max_connections=4),
+    )
+    origin = f"https://{session.origin_generation}.canvas.user-content.test"
+    payload = {
+        "attachment_id": str(sessions.attachment_id),
+        "challenge": sessions.challenge,
+        "exchange_code": sessions.exchange_code,
+    }
+    if failure == "extra_field":
+        payload["origin"] = origin
+    cookie_attachment = (
+        uuid4() if failure == "wrong_attachment_cookie" else sessions.attachment_id
+    )
+    async with _client(app, session) as client:
+        response = await client.post(
+            "/_canvas/exchange",
+            json=payload,
+            headers={
+                "Cookie": (
+                    f"{canvas_bootstrap_cookie_name(cookie_attachment)}="
+                    f"{sessions.browser_binding}"
+                ),
+                "Origin": origin,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+
+    assert response.status_code == (400 if failure == "extra_field" else 401)
+    assert sessions.exchange_calls == []
+    assert "set-cookie" not in response.headers
 
 
 @pytest.mark.asyncio
@@ -243,7 +443,7 @@ async def test_bootstrap_rejects_duplicate_fetch_metadata() -> None:
     )
     async with _client(app, session) as client:
         response = await client.get(
-            "/_canvas/bootstrap?token=" + "t" * 43,
+            f"/_canvas/bootstrap?attachment_id={sessions.attachment_id}",
             headers=[
                 ("Sec-Fetch-Dest", "iframe"),
                 ("Sec-Fetch-Dest", "iframe"),
@@ -254,6 +454,40 @@ async def test_bootstrap_rejects_duplicate_fetch_metadata() -> None:
 
     assert response.status_code == 400
     assert sessions.bootstrap_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        "token=" + "t" * 43,
+        "attachment_id=7F2640CB-8584-4AB1-A68E-95B2C9274419",
+        "attachment_id=7f2640cb-8584-4ab1-a68e-95b2c9274419&token=secret",
+    ],
+)
+async def test_bootstrap_rejects_credentials_and_noncanonical_locator(
+    query: str,
+) -> None:
+    config, session, sessions, db = _fixture()
+    app = CanvasGatewayApp(
+        db=db,
+        config=config,
+        session_service=sessions,  # type: ignore[arg-type]
+        registry=CanvasConnectionRegistry(max_connections=4),
+    )
+    async with _client(app, session) as client:
+        response = await client.get(
+            f"/_canvas/bootstrap?{query}",
+            headers={
+                "Sec-Fetch-Dest": "iframe",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+
+    assert response.status_code == 400
+    assert sessions.bootstrap_calls == []
+    assert "set-cookie" not in response.headers
 
 
 @pytest.mark.asyncio
@@ -441,3 +675,11 @@ async def test_ordinary_http_proxies_over_one_direct_channel_without_identity_le
     assert b"x-forwarded-for" not in upstream
     assert pool.writer.closed
     assert len(pool.calls) == 1
+    generation = await pool.calls[0]["generation_resolver"]()
+    assert generation == db.thread
+    assert db.thread_queries == [
+        (
+            "SELECT id, user_id, metadata FROM threads WHERE id = $1",
+            session.thread_id,
+        )
+    ]

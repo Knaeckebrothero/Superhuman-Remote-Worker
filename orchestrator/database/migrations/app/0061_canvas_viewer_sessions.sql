@@ -8,7 +8,7 @@
 -- transactional: yes
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS canvas_origin_sessions (
+CREATE TABLE canvas_origin_sessions (
     id                           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_secret_hash          VARCHAR(64) NOT NULL UNIQUE,
     user_id                      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -38,26 +38,19 @@ CREATE TABLE IF NOT EXISTS canvas_origin_sessions (
         CHECK ((revoked_at IS NULL) = (revocation_reason IS NULL))
 );
 
--- Every index below is built on one of the three brand-new empty tables in
--- this transactional migration. CONCURRENTLY cannot run in the transaction
--- and provides no availability benefit before any row can exist.
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_origin_sessions_active_identity
+CREATE INDEX idx_canvas_origin_sessions_active_identity
     ON canvas_origin_sessions (origin_generation, thread_id, canvas_id)
     WHERE revoked_at IS NULL;
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_origin_sessions_parent
+CREATE INDEX idx_canvas_origin_sessions_parent
     ON canvas_origin_sessions (parent_srw_session_id)
     WHERE revoked_at IS NULL AND parent_srw_session_id IS NOT NULL;
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_origin_sessions_user_active
+CREATE INDEX idx_canvas_origin_sessions_user_active
     ON canvas_origin_sessions (user_id)
     WHERE revoked_at IS NULL;
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_origin_sessions_expires
+CREATE INDEX idx_canvas_origin_sessions_expires
     ON canvas_origin_sessions (expires_at);
 
-CREATE TABLE IF NOT EXISTS canvas_view_attachments (
+CREATE TABLE canvas_view_attachments (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id               UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     thread_id             UUID NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
@@ -66,31 +59,25 @@ CREATE TABLE IF NOT EXISTS canvas_view_attachments (
     origin_session_id     UUID REFERENCES canvas_origin_sessions(id) ON DELETE SET NULL,
     bridge_nonce_hash     VARCHAR(64) NOT NULL,
     embedding_origin      TEXT NOT NULL,
-    cookie_mode           VARCHAR(32) NOT NULL,
     expires_at            TIMESTAMPTZ NOT NULL,
     last_seen_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     closed_at             TIMESTAMPTZ,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT ck_canvas_attachment_nonce_hash
-        CHECK (bridge_nonce_hash ~ '^[0-9a-f]{64}$'),
-    CONSTRAINT ck_canvas_attachment_cookie_mode
-        CHECK (cookie_mode IN ('development-cookie-free', 'psl-isolated'))
+        CHECK (bridge_nonce_hash ~ '^[0-9a-f]{64}$')
 );
 
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_view_attachments_active
+CREATE INDEX idx_canvas_view_attachments_active
     ON canvas_view_attachments (thread_id, canvas_id, user_id)
     WHERE closed_at IS NULL;
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_view_attachments_origin_session
+CREATE INDEX idx_canvas_view_attachments_origin_session
     ON canvas_view_attachments (origin_session_id)
     WHERE closed_at IS NULL AND origin_session_id IS NOT NULL;
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_view_attachments_expires
+CREATE INDEX idx_canvas_view_attachments_expires
     ON canvas_view_attachments (expires_at);
 
-CREATE TABLE IF NOT EXISTS canvas_view_bootstraps (
+CREATE TABLE canvas_view_bootstraps (
     id                             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     token_hash                     VARCHAR(64) NOT NULL UNIQUE,
     attachment_id                  UUID NOT NULL REFERENCES canvas_view_attachments(id) ON DELETE CASCADE,
@@ -109,12 +96,10 @@ CREATE TABLE IF NOT EXISTS canvas_view_bootstraps (
         CHECK (expected_presentation_revision > 0)
 );
 
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_view_bootstraps_pending
+CREATE INDEX idx_canvas_view_bootstraps_pending
     ON canvas_view_bootstraps (token_hash)
     WHERE consumed_at IS NULL;
--- squawk-ignore require-concurrent-index-creation
-CREATE INDEX IF NOT EXISTS idx_canvas_view_bootstraps_expires
+CREATE INDEX idx_canvas_view_bootstraps_expires
     ON canvas_view_bootstraps (expires_at);
 
 -- Transaction-delivered notifications contain opaque row identifiers only.

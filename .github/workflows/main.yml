@@ -109,6 +109,10 @@ jobs:
                 -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
                 -summary
 
+      - name: Verify chart-created Secret contract
+        if: matrix.scenario == 'eval'
+        run: bash scripts/check-chart-created-secret.sh
+
   # ---------------------------------------------------------------------------
   # Schema negative test — proves values.schema.json rejects bad input. A
   # deliberately-invalid values file MUST make `helm template` fail. Hard gate.

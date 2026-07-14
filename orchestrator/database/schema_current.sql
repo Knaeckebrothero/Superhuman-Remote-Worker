@@ -436,11 +436,11 @@ CREATE TABLE public.canvas_view_attachments (
     origin_session_id uuid,
     bridge_nonce_hash character varying(64) NOT NULL,
     embedding_origin text NOT NULL,
-    cookie_mode character varying(32) NOT NULL,
     expires_at timestamp with time zone NOT NULL,
     last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
     closed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    cookie_mode character varying(32) NOT NULL,
     CONSTRAINT ck_canvas_attachment_cookie_mode CHECK (((cookie_mode)::text = ANY ((ARRAY['development-cookie-free'::character varying, 'psl-isolated'::character varying])::text[]))),
     CONSTRAINT ck_canvas_attachment_nonce_hash CHECK (((bridge_nonce_hash)::text ~ '^[0-9a-f]{64}$'::text))
 );
@@ -459,7 +459,7 @@ COMMENT ON TABLE public.canvas_view_attachments IS 'Non-credential frame/window 
 
 CREATE TABLE public.canvas_view_bootstraps (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    token_hash character varying(64) NOT NULL,
+    exchange_token_hash character varying(64),
     attachment_id uuid NOT NULL,
     expected_presentation_revision bigint NOT NULL,
     source_fingerprint text NOT NULL,
@@ -469,7 +469,15 @@ CREATE TABLE public.canvas_view_bootstraps (
     consumed_at timestamp with time zone,
     consumed_origin_session_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT ck_canvas_bootstrap_hash CHECK (((token_hash)::text ~ '^[0-9a-f]{64}$'::text)),
+    challenge_hash character varying(64),
+    browser_binding_hash character varying(64),
+    ready_receipt_hash character varying(64),
+    authorized_at timestamp with time zone,
+    CONSTRAINT ck_canvas_bootstrap_binding_hash CHECK (((browser_binding_hash IS NULL) OR ((browser_binding_hash)::text ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT ck_canvas_bootstrap_challenge_hash CHECK (((challenge_hash IS NULL) OR ((challenge_hash)::text ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT ck_canvas_bootstrap_exchange_hash CHECK (((exchange_token_hash IS NULL) OR ((exchange_token_hash)::text ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT ck_canvas_bootstrap_exchange_state CHECK ((((challenge_hash IS NULL) AND (browser_binding_hash IS NULL) AND (ready_receipt_hash IS NULL) AND (exchange_token_hash IS NULL) AND (authorized_at IS NULL) AND (consumed_at IS NULL) AND (consumed_origin_session_id IS NULL)) OR ((challenge_hash IS NOT NULL) AND (browser_binding_hash IS NOT NULL) AND (ready_receipt_hash IS NOT NULL) AND (exchange_token_hash IS NULL) AND (authorized_at IS NULL) AND (consumed_at IS NULL) AND (consumed_origin_session_id IS NULL)) OR ((challenge_hash IS NOT NULL) AND (browser_binding_hash IS NOT NULL) AND (ready_receipt_hash IS NOT NULL) AND (exchange_token_hash IS NOT NULL) AND (authorized_at IS NOT NULL) AND (((consumed_at IS NULL) AND (consumed_origin_session_id IS NULL)) OR ((consumed_at IS NOT NULL) AND (consumed_origin_session_id IS NOT NULL)))))),
+    CONSTRAINT ck_canvas_bootstrap_receipt_hash CHECK (((ready_receipt_hash IS NULL) OR ((ready_receipt_hash)::text ~ '^[0-9a-f]{64}$'::text))),
     CONSTRAINT ck_canvas_bootstrap_revision CHECK ((expected_presentation_revision > 0))
 );
 
@@ -478,7 +486,7 @@ CREATE TABLE public.canvas_view_bootstraps (
 -- Name: TABLE canvas_view_bootstraps; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON TABLE public.canvas_view_bootstraps IS 'Single-use, short-lived iframe bootstrap credentials stored only as SHA-256 hashes.';
+COMMENT ON TABLE public.canvas_view_bootstraps IS 'Single-use Canvas bootstrap challenge/exchange state; every browser and authorization secret is stored only as a purpose-separated SHA-256 hash.';
 
 
 --
@@ -2152,14 +2160,6 @@ ALTER TABLE ONLY public.canvas_view_bootstraps
 
 
 --
--- Name: canvas_view_bootstraps canvas_view_bootstraps_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.canvas_view_bootstraps
-    ADD CONSTRAINT canvas_view_bootstraps_token_hash_key UNIQUE (token_hash);
-
-
---
 -- Name: canvases canvases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2512,6 +2512,14 @@ ALTER TABLE ONLY public.threads
 
 
 --
+-- Name: canvas_view_bootstraps uq_canvas_bootstrap_attachment; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_view_bootstraps
+    ADD CONSTRAINT uq_canvas_bootstrap_attachment UNIQUE (attachment_id);
+
+
+--
 -- Name: canvases uq_canvases_thread_canvas; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2731,6 +2739,13 @@ CREATE INDEX idx_canvas_view_attachments_origin_session ON public.canvas_view_at
 
 
 --
+-- Name: idx_canvas_view_bootstraps_exchange_token; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_canvas_view_bootstraps_exchange_token ON public.canvas_view_bootstraps USING btree (exchange_token_hash) WHERE (exchange_token_hash IS NOT NULL);
+
+
+--
 -- Name: idx_canvas_view_bootstraps_expires; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2741,7 +2756,7 @@ CREATE INDEX idx_canvas_view_bootstraps_expires ON public.canvas_view_bootstraps
 -- Name: idx_canvas_view_bootstraps_pending; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_canvas_view_bootstraps_pending ON public.canvas_view_bootstraps USING btree (token_hash) WHERE (consumed_at IS NULL);
+CREATE INDEX idx_canvas_view_bootstraps_pending ON public.canvas_view_bootstraps USING btree (attachment_id, expires_at) WHERE (consumed_at IS NULL);
 
 
 --
@@ -3616,7 +3631,7 @@ ALTER TABLE ONLY public.canvas_view_bootstraps
 --
 
 ALTER TABLE ONLY public.canvas_view_bootstraps
-    ADD CONSTRAINT canvas_view_bootstraps_consumed_origin_session_id_fkey FOREIGN KEY (consumed_origin_session_id) REFERENCES public.canvas_origin_sessions(id) ON DELETE SET NULL;
+    ADD CONSTRAINT canvas_view_bootstraps_consumed_origin_session_id_fkey FOREIGN KEY (consumed_origin_session_id) REFERENCES public.canvas_origin_sessions(id) ON DELETE CASCADE;
 
 
 --

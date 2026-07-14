@@ -18,6 +18,12 @@
 
 load('ext://helm_resource', 'helm_resource')
 
+# The full chart's first Helm install can exceed Tilt's 30-second custom-deploy
+# default even on a healthy local k3d cluster. Let Helm finish recording the
+# release instead of killing it after resources have already been applied and
+# leaving a `pending-install` revision behind.
+update_settings(k8s_upsert_timeout_secs=180)
+
 # -----------------------------------------------------------------------------
 # Global watch exclusions — paths Tilt must never treat as a code change.
 #
@@ -217,11 +223,13 @@ docker_build(
         # Layout matches the Dockerfile's COPYs:
         #   orchestrator/mcp/   → /app/
         #   orchestrator/services/formatters.py  → /app/services/formatters.py
+        #   orchestrator/security/anti_framing.py → /app/security/anti_framing.py
         # The services/__init__.py is copied during build and is small +
         # rarely touched, so it falls into the same sync — `formatters.py`
         # is the only file outside mcp/ that's imported by server.py.
         sync('orchestrator/mcp/', '/app/'),
         sync('orchestrator/services/formatters.py', '/app/services/formatters.py'),
+        sync('orchestrator/security/anti_framing.py', '/app/security/anti_framing.py'),
     ],
     ignore=[
         '**/__pycache__',
@@ -306,6 +314,10 @@ helm_resource(
     chart='./helm',
     namespace='srw',
     flags=[
+        # A custom-deploy Force Update runs the extension's delete helper first.
+        # The chart-managed Secret is resource-policy=keep; reclaim that same
+        # object on reinstall so generated encryption/Garage keys do not rotate.
+        '--take-ownership',
         '--values=deployment/values-local.yaml',
         '--values=deployment/values-tilt.yaml',
     ],

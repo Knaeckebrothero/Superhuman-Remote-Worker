@@ -212,6 +212,11 @@ def canvas_viewer_config() -> CanvasViewerConfig:
             raise CanvasViewerConfigurationError(
                 "Production Canvas viewers require psl-isolated cookie mode"
             )
+        if suffix != f".{domain}":
+            raise CanvasViewerConfigurationError(
+                "Production Canvas viewers require CANVAS_VIEWER_HOST_SUFFIX "
+                "to equal the exact effective-PSL CANVAS_VIEWER_DOMAIN"
+            )
         if not _truthy("CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED"):
             raise CanvasViewerConfigurationError(
                 "Production Canvas viewers require an attested PSL boundary"

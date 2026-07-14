@@ -108,6 +108,12 @@
         },
         "serve": {
           "builder": "@angular/build:dev-server",
+          "options": {
+            "headers": {
+              "Content-Security-Policy": "frame-ancestors 'none'",
+              "X-Frame-Options": "DENY"
+            }
+          },
           "configurations": {
             "production": {
               "buildTarget": "cockpit:build:production"

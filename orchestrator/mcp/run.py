@@ -23,10 +23,23 @@ import os
 import sys
 from pathlib import Path
 
+from starlette.middleware import Middleware
+
 # Add parent directory to allow relative imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from server import mcp  # noqa: E402
+
+try:
+    # Flattened MCP image: Docker copies the shared module to /app/security.
+    from security.anti_framing import (  # noqa: E402
+        TrustedParentAntiFramingMiddleware,
+    )
+except ImportError:
+    # Repository execution: orchestrator remains a package below the repo root.
+    from orchestrator.security.anti_framing import (  # type: ignore[no-redef]  # noqa: E402
+        TrustedParentAntiFramingMiddleware,
+    )
 
 
 def main():
@@ -40,7 +53,13 @@ def main():
         print(f"Starting MCP server on http://{host}:{port}")
         print(f"Health check: http://{host}:{port}/health")
         print(f"MCP endpoint: http://{host}:{port}/mcp/")
-        mcp.run(transport="streamable-http", host=host, port=port, stateless_http=True)
+        mcp.run(
+            transport="streamable-http",
+            host=host,
+            port=port,
+            stateless_http=True,
+            middleware=[Middleware(TrustedParentAntiFramingMiddleware)],
+        )
     else:
         # Local development (Claude Code via stdio)
         mcp.run(transport="stdio", log_level="ERROR", show_banner=False)

@@ -38,7 +38,7 @@ spec:
             - sh
             - -c
             - |
-              until nc -z {{ include "srw.natsName" . }} 4222; do
+              until nc -z -w 2 {{ include "srw.natsName" . }} 4222; do
                 echo "waiting for NATS..."
                 sleep 2
               done
