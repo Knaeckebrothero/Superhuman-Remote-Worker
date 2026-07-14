@@ -282,6 +282,54 @@ describe('ModelGroupComponent', () => {
     });
   });
 
+  describe('session reasoning override (Settings-tab field)', () => {
+    it('starts null, captures a pick, and clears via a null change', () => {
+      const {component} = createComponent();
+      expect(component.sessionReasoning()).toBeNull();
+      component.onSessionReasoningChange('high');
+      expect(component.sessionReasoning()).toBe('high');
+      component.onSessionReasoningChange(null);
+      expect(component.sessionReasoning()).toBeNull();
+    });
+
+    it('derives its options from the session model in effect', () => {
+      const {component} = createComponent();
+      component.sessionModel.set('gemma-4-moe');
+      expect(component.sessionReasoningOptions()).toEqual([
+        {value: null, label: 'Default'},
+        {value: 'on', label: 'On'},
+        {value: 'off', label: 'Off'},
+      ]);
+    });
+
+    it('is dropped on a session model change (no cross-family leak)', () => {
+      const {component} = createComponent();
+      component.onSessionModelChange('gpt-5.4');
+      component.onSessionReasoningChange('high');
+      component.onSessionModelChange('gemma-4-moe');
+      expect(component.sessionReasoning()).toBeNull();
+    });
+
+    it('is cleared by resetAll and by an expert prefill', () => {
+      const {component} = createComponent();
+      component.onSessionReasoningChange('high');
+      component.resetAll();
+      expect(component.sessionReasoning()).toBeNull();
+
+      component.onSessionReasoningChange('low');
+      component.prefillFromConfig({});
+      expect(component.sessionReasoning()).toBeNull();
+    });
+
+    it('does not leak into job-mode overrides', () => {
+      const {component} = createComponent();
+      component.onSessionReasoningChange('high');
+      // mode defaults to 'job' in this harness — the session-only field must
+      // not surface in the job override fragment.
+      expect(component.getOverrides()).toEqual({});
+    });
+  });
+
   describe('subagent (delegation reader) model', () => {
     it('starts null and is counted in job-mode modifiedCount', () => {
       const {component} = createComponent();

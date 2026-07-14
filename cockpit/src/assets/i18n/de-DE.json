@@ -2258,6 +2258,7 @@
       "tactical": "Taktisch",
       "subagent": "Subagent",
       "single": "Modell",
+      "reasoning": "Reasoning",
       "default": "Standard",
       "defaultResolved": "{{model}} ({{source}})",
       "defaultResolvedNoSource": "Standard · {{model}}",
