@@ -31,6 +31,9 @@ on:
       - 'orchestrator/database/*_current.sql'
       - 'orchestrator/services/canvas*.py'
       - 'helm/files/canvas-viewer-role.sql'
+      - 'scripts/provision-canvas-gateway-database.sh'
+      - 'tests/test_canvas_gateway_operator_provision.py'
+      - 'tests/test_canvas_gateway_role_sql.py'
       - 'tests/test_canvas_viewer_postgres_integration.py'
       - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
@@ -42,6 +45,9 @@ on:
       - 'orchestrator/database/*_current.sql'
       - 'orchestrator/services/canvas*.py'
       - 'helm/files/canvas-viewer-role.sql'
+      - 'scripts/provision-canvas-gateway-database.sh'
+      - 'tests/test_canvas_gateway_operator_provision.py'
+      - 'tests/test_canvas_gateway_role_sql.py'
       - 'tests/test_canvas_viewer_postgres_integration.py'
       - 'scripts/schema-snapshot.sh'
       - '.github/workflows/db-migrations.yml'
@@ -184,7 +190,11 @@ jobs:
         env:
           CANVAS_TEST_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
           PYTHONPATH: orchestrator:.
-        run: pytest -q tests/test_canvas_viewer_postgres_integration.py
+        run: >-
+          pytest -q
+          tests/test_canvas_viewer_postgres_integration.py
+          tests/test_canvas_gateway_role_sql.py
+          tests/test_canvas_gateway_operator_provision.py
 
   artifact:
     # The keystone drift gate (HF-1): regenerate the canonical *_current.sql

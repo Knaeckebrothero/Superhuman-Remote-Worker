@@ -20,7 +20,10 @@ SELECT :'canvas_role' ~ '^[a-z_][a-z0-9_]{0,62}$' AS canvas_role_valid
 BEGIN;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '30s';
-SELECT pg_advisory_xact_lock(hashtextextended('srw:canvas-gateway-role', 0));
+SELECT pg_advisory_xact_lock(
+    hashtextextended('srw:canvas-gateway-role', 0)
+) AS canvas_role_lock
+\gset
 
 SELECT EXISTS (
     SELECT 1 FROM pg_roles WHERE rolname = :'canvas_role'
@@ -121,6 +124,14 @@ WHERE has_sequence_privilege(
     :'canvas_role', format('%I.%I', sequence_schema, sequence_name), 'UPDATE'
 )
 \gexec
+-- Clear direct database grants from an earlier or operator-created role before
+-- restoring only CONNECT.  TEMP inherited from PostgreSQL's PUBLIC role is
+-- intentionally outside the application-schema contract, but CREATE is not.
+SELECT format(
+    'REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I',
+    current_database(), :'canvas_role'
+)
+\gexec
 SELECT format('REVOKE ALL PRIVILEGES ON SCHEMA %I FROM %I', nspname, :'canvas_role')
 FROM pg_namespace
 WHERE has_schema_privilege(:'canvas_role', oid, 'CREATE')
@@ -135,6 +146,15 @@ SELECT has_schema_privilege(:'canvas_role', 'public', 'CREATE')
 \gset
 \if :canvas_role_can_create
   \warn 'Canvas gateway role inherits CREATE on schema public; revoke it from PUBLIC first'
+  \quit 1
+\endif
+
+SELECT has_database_privilege(
+    :'canvas_role', current_database(), 'CREATE'
+) AS canvas_role_can_create_database
+\gset
+\if :canvas_role_can_create_database
+  \warn 'Canvas gateway role inherits CREATE on the application database; revoke it from PUBLIC first'
   \quit 1
 \endif
 
