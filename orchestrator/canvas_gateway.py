@@ -732,8 +732,8 @@ class CanvasGatewayApp:
             'headers:{"Content-Type":"application/json"},body:JSON.stringify({'
             "attachment_id:bootstrap.attachmentId,challenge:bootstrap.challenge,"
             "exchange_code:data.exchange_code})});"
-            'if(!response.ok){try{const rejected=await response.json();'
-            'if(rejected&&rejected.detail&&rejected.detail.code==='
+            "if(!response.ok){try{const rejected=await response.json();"
+            "if(rejected&&rejected.detail&&rejected.detail.code==="
             '"canvas_browser_storage_unavailable")failureCode='
             '"canvas_browser_storage_unavailable";}catch{}'
             'throw new Error("exchange rejected");}'
