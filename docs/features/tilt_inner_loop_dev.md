@@ -91,10 +91,16 @@ The OpenCloud + DB StatefulSets carry `resource-policy: keep` on their
 PVCs (OpenCloud's `pre-start hook`, DB volumes). We need both. **Use
 `helm_resource()`.**
 
-Consequence: there is no `helm uninstall` step. The first `tilt up` just
-issues `helm upgrade --install srw ./helm -n srw -f
-deployment/values-local.yaml --set image.X.tag=...` against whatever the
-cluster already has. The existing `helm install srw` is adopted in-place.
+Ordinary source updates issue `helm upgrade --install srw ./helm -n srw -f
+deployment/values-local.yaml --set image.X.tag=...` against the existing
+release. Tilt's custom-deploy **Force Update** path is different: its Helm
+extension calls `helm uninstall` before reinstalling. The chart-managed local
+Secret therefore carries `helm.sh/resource-policy: keep`, and the Tilt install
+uses `--take-ownership` to reclaim that same object. This preserves the app
+encryption root and Garage credential pairs across a force update; deleting the
+namespace or Secret explicitly still performs a real local-state reset. The
+bootstrap checks that the installed Helm exposes `--take-ownership` before
+starting Tilt.
 
 ### D2 — k3d image flow: k3d native `--registry-create` + Tilt `default_registry()`
 
@@ -238,7 +244,7 @@ don't pollute `values-local.yaml` (which the non-Tilt path uses).
 
 ### D6 — Pool + drift handling
 
-`deployment/values-local.example.yaml:149-157` already zeros the warm
+`deployment/values-local.yaml.example:149-157` already zeros the warm
 pool (`minAgents: 0`, `buffer: 0`, both reservations 0). Tilt mode
 inherits this — no warm pods means no stale-image survivors.
 

@@ -611,7 +611,7 @@ The picker is already catalog-driven, so new kinds appear automatically once Tas
 
 ### Task D1: Bring up k3d-local with the flag on, and verify
 
-- [ ] **Step 1: Enable the flag locally** — add to `deployment/values-local.yaml` (gitignored; create from `values-local.example.yaml` if absent):
+- [ ] **Step 1: Enable the flag locally** — add to `deployment/values-local.yaml` (gitignored; create from `values-local.yaml.example` if absent):
 ```yaml
 agent:
   configDbOverridesEnabled: "true"

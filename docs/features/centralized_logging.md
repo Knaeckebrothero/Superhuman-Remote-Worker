@@ -233,7 +233,7 @@ loggers should never log raw `config_override` / headers. Treat this as a Slice
   `src/core/logging_config.py` (separate images, no shared import path;
   `redact()` kept in sync, both covered by `tests/test_logging_config.py`, 32
   tests). `LOG_FORMAT=json|text` — code default `text`; `helm/values.yaml`=`json`,
-  `values-local.example.yaml`=`text` for readable local dev.
+  `values-local.yaml.example`=`text` for readable local dev.
 - Correlation wired: **`agent_id`** (pod name; `HOSTNAME`/`POD_NAME` fallback) at
   agent startup; **`job_id`** in the worker+dual job entry and the orchestrator
   dispatcher; **`thread_id`** at the persistent loop-start seam — bound before
