@@ -1,5 +1,14 @@
 # Bundled Garage object store — design
 
+> ## ✅ STATUS: COMPLETE — implemented on `develop` (unpushed) + live-verified on k3d, 2026-07-14
+>
+> Bundled single-node Garage (11 SDD tasks + 2 live-E2E fixes + final-review wave),
+> plus the item-3 startup warning (either-seam) + opt-in `OBJECT_STORE_REQUIRED`
+> fail-closed flag, plus the local-dev MinIO→Garage swap. Live-verified on k3d:
+> bootstrap idempotent, S3 round-trip, bucket-scoping, agent-rclone (provider
+> "Other") round-trip. Origin issue (kept in issues/):
+> `docs/issues/s3_object_store_bundled_fallback.md`.
+
 **Date**: 2026-07-12
 **Status**: Approved — ready for implementation plan
 **Issue**: `docs/issues/s3_object_store_bundled_fallback.md` (OPEN → in-progress)

@@ -1,11 +1,15 @@
 # A pre-job research scholar self-provisions its own workspace, but the inherit-workspace resolver misreads that self-provisioned `context.workspace_container` as an *inherited* one and blocks the scholar for 600s on the parent's never-provisioned workspace
 
-**Status:** ROOT CAUSE CONFIRMED on live local k3d 2026-07-13, UNFIXED. Regression
+**Status:** ROOT CAUSE CONFIRMED on live local k3d 2026-07-13 **and observed on
+the dev cluster 2026-07-14** (image `sha-c2fbe06`), UNFIXED. Regression
 introduced by commit `5a6f5a49` ("Introduce robust workspace inheritance handling
 for subjobs", 2026-07-10) — the same change documented in
 `subjob_inherits_stale_workspace_container_snapshot.md`. That fix hardened the
 *inherit* path but did not distinguish an inheriting subjob from a
-self-provisioning one, so it now traps every **root-job pre-research scholar**.
+self-provisioning one, so it now traps every **root-job pre-research scholar**
+whose parent hasn't already provisioned a workspace. This is **not**
+k3d-specific: it is deployed cluster code, gated only by a create-time race (see
+"Affected scope").
 
 **Motivating incident:** root job **`981b1275-11ae-4646-8ded-082bcecda02f`**
 ("Calculator", *test's Project*, `runner_kind=user`), local k3d cluster
@@ -132,13 +136,42 @@ should route through the parent-unblock handler.
 
 ## Affected scope
 
-Every **root job with the scholar/research phase enabled**: the parent is always
-held in `waiting` at creation (no workspace), so its scholar always
-self-provisions and always trips the misclassification. This is a regression
-window opened on **2026-07-10** by `5a6f5a49`; the `waiting`-hold itself predates
-it (`181d21cf`) and is not the bug. Delegation/critic subjobs that genuinely
-inherit a live parent workspace are unaffected (they legitimately have a parent
-workspace to wait on).
+Any **root job with the scholar/research phase enabled** is at risk, but whether
+a given job trips the bug is decided by a **create-time race**. In `create_job`
+the parent is written `status='created'` (dispatchable) at `main.py:7485` and is
+only flipped to `waiting` later, inside `_spawn_scholar_subjob` (`main.py:~10426`),
+with `provision_job_repo` (Gitea) + datasource `await`s in between. Two outcomes:
+
+- **No concurrent dispatch tick fires in that window** (idle/quiet cluster) → the
+  parent reaches `waiting` before it ever provisions → the scholar has nothing to
+  inherit → **self-provisions → misclassified → 600s timeout** (this bug).
+- **A dispatch tick provisions the parent first** (busy cluster) → the scholar
+  **inherits** a real parent workspace and dodges this bug — but is then exposed
+  to the sibling failure modes (stale-snapshot path in
+  `subjob_inherits_stale_workspace_container_snapshot.md`; SSH-connect timeouts).
+
+So it is **load-sensitive, not environment-specific**: it reproduces reliably on
+an idle cluster (local k3d, or a dev cluster during a quiet window) and is masked
+on a busy one. Backend-agnostic — hits both the container and VM seams.
+
+**Observed incidents:**
+
+| date | env | parent | scholar | note |
+|---|---|---|---|---|
+| 2026-07-13 | local k3d `k3d-srw` | `981b1275` "Calculator" (`runner_kind=user`) | `94e4d0e6` | full root-cause trace (this doc) |
+| 2026-07-14 09:00 UTC | **dev cluster** (`sha-c2fbe06`) | `fdb60a9a` "Design the UI theme…" (project *Better Resavio*) | `36969384`, failed `627s (container=None, vm=None)` | scheduled/cron project kickoff on an otherwise-idle cluster — exactly the race's bug branch |
+
+The dev incident makes the practical impact concrete: **scheduled/project jobs
+that kick off during quiet periods reliably strand.** A scan of the 100 most
+recent dev failures through 2026-07-12 found zero occurrences (the dev job above
+was created 2026-07-14, after that window); note `list_jobs` has no `waiting`
+filter, so stranded parents are invisible to it — only their failed scholar
+siblings surface.
+
+This is a regression window opened on **2026-07-10** by `5a6f5a49`; the
+`waiting`-hold itself predates it (`181d21cf`) and is not the bug. Delegation /
+critic subjobs that genuinely inherit a live parent workspace are unaffected
+(they legitimately have a parent workspace to wait on).
 
 ## Fix options
 

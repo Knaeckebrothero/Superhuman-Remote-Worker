@@ -1,5 +1,13 @@
 # Bundled Garage object store — Implementation Plan
 
+> ## ✅ STATUS: COMPLETE — all 11 tasks executed on `develop` (unpushed) + live-verified on k3d, 2026-07-14
+>
+> 11 tasks + 2 live-E2E fixes (garage container `command`, GK-format keys) +
+> final-review fix wave (layout idempotency + polish). Chart CI: 4 scenarios lint
+> + kubeconform 0-errors. Fast-follows in later commits: item-3 startup warning,
+> `OBJECT_STORE_REQUIRED` flag, local-dev MinIO→Garage swap. Design:
+> `docs/done/2026-07-12-bundled-garage-object-store-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add an opt-in, single-node Garage S3 object store to the Helm chart that, when enabled, auto-backs workspace snapshots and the virtual workspace tier with zero external S3 dependency.
@@ -20,7 +28,7 @@
 - **Follow existing patterns/helpers:** `srw.fullname`, `srw.serviceName (dict "context" . "component" "garage")`, `srw.componentLabels`, `srw.componentSelectorLabels`, `srw.secretName`, `srw.configMapName`.
 - **Readiness must be TCP, not Garage `/health`.** `/health` returns 503 until a layout is applied — an httpGet readiness probe would deadlock the bootstrap (Service has no endpoints → Job can't reach admin API to apply the layout). Use `tcpSocket: 3900`.
 - **Git:** work on `develop`. Commit after every task. **Do NOT push** (ask first).
-- **Spec:** `docs/superpowers/specs/2026-07-12-bundled-garage-object-store-design.md`.
+- **Spec:** `docs/done/2026-07-12-bundled-garage-object-store-design.md`.
 
 ## File Structure
 
@@ -995,8 +1003,8 @@ git commit -m "test(chart): render + validate bundled garage in the eval CI scen
 Change the header `**Status**` line to:
 ```markdown
 **Status**: IN PROGRESS (2026-07-12) — chart-bundled Garage store.
-Spec: `docs/superpowers/specs/2026-07-12-bundled-garage-object-store-design.md`.
-Plan: `docs/superpowers/plans/2026-07-12-bundled-garage-object-store.md`.
+Spec: `docs/done/2026-07-12-bundled-garage-object-store-design.md`.
+Plan: `docs/done/2026-07-12-bundled-garage-object-store-plan.md`.
 ```
 Under "Proposal", note that item 1 (bundled Garage backing snapshots + virtual
 tier) is being implemented; item 3 (orchestrator no-store startup warning)
