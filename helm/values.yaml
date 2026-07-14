@@ -1021,14 +1021,17 @@ nextcloud:
 
 opencloud:
   enabled: true
-  # PINNED — do not float this tag. `:latest` (and `7.2`/`7`) currently resolve
-  # to 7.2.2, which hard-requires a sharing service-account id our provisioning
-  # doesn't set, so the pod CrashLoops on boot:
-  #   "service account id has not been configured for sharing"
-  # 7.2.0 is the last release proven healthy on the homelab's (7.x-native) data.
-  # Before bumping to 7.2.1+, wire OC_SERVICE_ACCOUNT_ID/_SECRET via ESO and
-  # validate a rollout — then re-pin deliberately. See the 2026-07-14 incident.
-  image: docker.io/opencloudeu/opencloud:7.2.0
+  # PINNED — do not float this tag, and do not move to a 7.x tag yet. The entire
+  # OpenCloud 7.x line (verified on 7.2.0 AND 7.2.2) hard-requires a sharing
+  # service-account id our provisioning never sets, so the pod CrashLoops on
+  # boot:  "service account id has not been configured for sharing".
+  # `:latest`/`7.2`/`7` all resolve to a 7.x image and will break. 4.0.8 is the
+  # last release before that requirement and the version that ran healthy on the
+  # homelab (config PVC is 4.x-written; the chart's `echo no | opencloud init`
+  # never overwrites it). To move onto 7.x, first wire OC_SERVICE_ACCOUNT_ID/
+  # _SECRET via ESO (reuse the id/secret opencloud init wrote to the config PVC),
+  # validate a rollout, then re-pin deliberately. See the 2026-07-14 incident.
+  image: docker.io/opencloudeu/opencloud:4.0.8
   storageClass: ""
   # OpenCloud's decomposeds3 driver buffers TUS uploads on the local PVC
   # before promoting them to S3 on finalize. 16Gi is a light-use baseline
