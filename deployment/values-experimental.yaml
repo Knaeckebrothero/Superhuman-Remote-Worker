@@ -63,15 +63,15 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-3a14ada
+    tag: sha-29badb0
   agent:
-    tag: sha-3a14ada
+    tag: sha-29badb0
   cockpit:
-    tag: sha-3a14ada
+    tag: sha-29badb0
   mcp:
-    tag: sha-2a71df3
+    tag: sha-29badb0
   workspace:
-    tag: sha-01bf2c9
+    tag: sha-29badb0
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
 # (docs/operations/orchestrator_m1_go_live.md)
@@ -117,7 +117,6 @@ ingress:
     # CORS_ORIGINS env and the Traefik CORS middleware allow-list.
     additionalOrigins:
       - "https://cockpit.superhuman-remote-worker.com"
-
 # -----------------------------------------------------------------------------
 # Dynamic Canvas live preview (reserved production coordinates; still dark)
 # -----------------------------------------------------------------------------
