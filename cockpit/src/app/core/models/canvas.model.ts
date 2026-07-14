@@ -132,3 +132,9 @@ export interface CanvasMutationResponse {
   readonly stateEtag: string;
   readonly contentEtag: string;
 }
+
+/** A Canvas state mutation which does not read or replace workspace bytes. */
+export interface CanvasStateMutationResponse {
+  readonly state: CanvasState;
+  readonly stateEtag: string;
+}

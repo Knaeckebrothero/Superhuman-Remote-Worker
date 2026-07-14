@@ -34,6 +34,13 @@ export interface CanvasSourceUpdatedControl {
   readonly source_version: string;
 }
 
+/** A committed non-file Canvas mutation which other views must reconcile. */
+export interface CanvasPresentationUpdatedControl {
+  readonly method: 'canvas.presentation_updated';
+  readonly canvas_id: CanvasId;
+  readonly presentation_revision: number;
+}
+
 export interface CanvasUserEditingControl {
   readonly method: 'canvas.user_editing';
   readonly canvas_id: CanvasId;
@@ -54,6 +61,7 @@ export interface CanvasUserIdleControl {
 
 export type CanvasControl =
   | CanvasSourceUpdatedControl
+  | CanvasPresentationUpdatedControl
   | CanvasUserEditingControl
   | CanvasUserIdleControl;
 

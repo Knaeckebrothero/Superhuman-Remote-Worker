@@ -26,7 +26,12 @@
       "current": "aktuell",
       "currentStage": "öffnet aktuelle Bühne",
       "replaced": "Präsentation ersetzt",
-      "unavailable": "Canvas nicht verfügbar"
+      "unavailable": "Canvas nicht verfügbar",
+      "sourceKind": {
+        "file": "Datei",
+        "app": "Live-App",
+        "canvas": "Canvas"
+      }
     },
     "titles": {
       "read_file": "Datei lesen",
@@ -69,7 +74,9 @@
     "defaultTitle": "Canvas",
     "noSource": "Keine Quelle ausgewählt",
     "untrusted": "Vom Agenten bereitgestellter Inhalt",
+    "lastSynced": "Zuletzt synchronisiert",
     "refresh": "Canvas-Status aktualisieren",
+    "popOut": "Canvas in einem neuen Fenster öffnen",
     "close": "Canvas schließen",
     "open": "Canvas öffnen",
     "hide": "Canvas ausblenden",
@@ -79,6 +86,11 @@
     "empty": "Der Agent hat noch nichts präsentiert.",
     "unsupported": "Diese Canvas-Quelle wird von dieser Cockpit-Version nicht unterstützt.",
     "contentTooComplex": "Dieses Artefakt ist zu komplex, um es sicher darzustellen. Bitten Sie den Agenten, es zu vereinfachen.",
+    "sourceKind": {
+      "file": "Datei",
+      "app": "Live-App",
+      "unknown": "Canvas"
+    },
     "renderer": {
       "markdown": "Markdown",
       "text": "Text",
@@ -114,7 +126,43 @@
       "untrustedWarning": "Nicht vertrauenswürdige App — keine Passwörter oder Geheimnisse eingeben.",
       "connecting": "Verbindung zur isolierten Canvas-Anwendung wird hergestellt…",
       "renewing": "Die sichere Canvas-Verbindung wird aktualisiert…",
-      "unavailable": "Die isolierte Canvas-Anwendung konnte nicht geöffnet werden."
+      "unavailable": "Die isolierte Canvas-Anwendung konnte nicht geöffnet werden.",
+      "retry": "Sichere Vorschau erneut versuchen",
+      "failure": {
+        "disabled": {
+          "title": "Live-Vorschau ist deaktiviert",
+          "body": "In dieser Bereitstellung ist die isolierte Anzeige von Live-Apps nicht aktiviert."
+        },
+        "unsupported": {
+          "title": "Sichere Live-Vorschau wird nicht unterstützt",
+          "body": "Dieser Browser oder seine Datenschutzeinstellungen unterstützt die von Canvas benötigten sicheren Metadaten oder partitionierten Speicher nicht."
+        },
+        "temporary": {
+          "title": "Sichere Live-Vorschau ist nicht verfügbar",
+          "body": "Die eingebettete Vorschau konnte nicht hergestellt werden. Ursache kann ein vorübergehender Dienst-, Authentifizierungs- oder Browser-Datenschutzfehler sein."
+        },
+        "safeFallback": "Zur Sicherheit hat Canvas die App nicht als eigenständige Seite geöffnet. Verwenden Sie stattdessen die authentifizierte IDE oder den manuellen Vorschau-Workflow."
+      },
+      "reset": {
+        "action": "App-Ursprung zurücksetzen",
+        "confirm": "Mit neuem App-Ursprung starten",
+        "confirming": {
+          "title": "Mit einem neuen isolierten App-Ursprung starten?",
+          "body": "Die Ursprungsgeneration der App wird gewechselt, alte Vorschauen werden stillgelegt und ihre Sitzungen widerrufen. Die Bereinigung von Browserdaten des alten Ursprungs erfolgt nach Möglichkeit."
+        },
+        "resetting": {
+          "title": "App-Ursprung wird zurückgesetzt…",
+          "body": "Canvas widerruft alte Ursprungssitzungen und verbindet diese Vorschau neu."
+        },
+        "success": {
+          "title": "App-Ursprung wurde zurückgesetzt",
+          "body": "Canvas verbindet die App mit einer neuen Ursprungsgeneration neu."
+        },
+        "error": {
+          "title": "App-Ursprung konnte nicht zurückgesetzt werden",
+          "body": "Canvas hat den aktuellen Stand neu geladen. Prüfen Sie die Verbindung und versuchen Sie es erneut."
+        }
+      }
     },
     "editor": {
       "label": "Editor für die Canvas-Quelle",
@@ -170,6 +218,7 @@
     "saved": "Gespeichert",
     "delete": "Löschen",
     "cancel": "Abbrechen",
+    "dismiss": "Schließen",
     "edit": "Bearbeiten",
     "rename": "Umbenennen",
     "copy": "Kopieren",

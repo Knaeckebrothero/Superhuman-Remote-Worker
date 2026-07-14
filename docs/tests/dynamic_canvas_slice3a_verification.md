@@ -2,8 +2,10 @@
 
 **Status:** The one-port callable, validation, and SSH transport foundation is
 implemented and passed automated and default-off local-k3d verification on
-2026-07-13. It is intentionally dark-shipped: no viewer session, user-content
-origin, HTTP proxy, iframe renderer, or live-app URL is exposed yet.
+2026-07-13. At this checkpoint it was intentionally dark-shipped: no viewer
+session, user-content origin, HTTP proxy, iframe renderer, or live-app URL had
+landed. Slice 3B subsequently added the default-off ordinary-HTTP viewer and
+Slice 3C added gateway database isolation; all viewer gates remain off.
 
 **Feature:** `docs/features/dynamic_canvas.md`
 
@@ -16,9 +18,11 @@ origin, HTTP proxy, iframe renderer, or live-app URL is exposed yet.
   that default-off gate is disabled, even if an already-running agent retained
   stale capability state;
 - one integer port and one canonical origin-form entry path normalize to the
-  existing private `WorkspaceAppSource`; public and model-facing state expose
-  only `type=workspace_app` and `entry_path`, never the port, SSH target,
-  fingerprint, generation, origin generation, or a fabricated viewer URL;
+  existing private `WorkspaceAppSource`; public state exposes
+  `type=workspace_app`, `entry_path`, and a `manifest_path: null` compatibility
+  placeholder, while the model-facing state exposes only the first two. Neither
+  exposes the port, SSH target, fingerprint, generation, origin generation, or
+  a fabricated viewer URL;
 - app publication checks TCP acceptance without sending HTTP bytes through a
   request-scoped SSH `direct-tcpip` channel to fixed `127.0.0.1`;
 - the shared SSH transport uses exact Ed25519 host-key pinning, per-target
@@ -29,12 +33,14 @@ origin, HTTP proxy, iframe renderer, or live-app URL is exposed yet.
 - workspace SSH configurations allow only client-local forwarding to workspace
   loopback and disable gateway, agent, and tunnel forwarding.
 
-This checkpoint does **not** prove or ship browser authentication, a separate
-user-content domain, wildcard DNS/TLS, an effective private PSL boundary, raw
-path preservation at ingress, HTTP framing, response streaming, redirects,
-cookies, CSP, iframe sandboxing, pop-out, SSE, WebSockets, multi-port routing,
-or shared-browser behavior. Cockpit therefore continues to treat
-`workspace_app` as unsupported, and the companion skill remains file-focused.
+At the 3A checkpoint this work did **not** prove or ship browser authentication,
+a separate user-content domain, wildcard DNS/TLS, an effective private PSL
+boundary, raw-path preservation at ingress, HTTP framing, response streaming,
+redirects, cookies, CSP, iframe sandboxing, pop-out, SSE, WebSockets, multi-port
+routing, or shared-browser behavior. Cockpit therefore still treated
+`workspace_app` as unsupported. Slice 3B later added the default-off one-port
+ordinary-HTTP iframe path, while the companion skill remains file-focused until
+that surface is enabled for users.
 
 ## Delivered implementation surfaces
 
@@ -56,18 +62,19 @@ add ports through `canvas.livePreview.deniedPorts` or
 always rejected. The application source never accepts a hostname or URL.
 
 `canvas.livePreview.enabled` and `CANVAS_LIVE_PREVIEW_ENABLED` default to
-`false`. Enabling the flag alone still creates no browser-reachable app. It is
-only a development gate for the callable foundation until the isolated viewer
-boundary lands. Changing ConfigMap-backed capability values requires recycling
-existing worker and persistent-session pods; their process environments do not
-change in place. Server-side rechecking makes disabling fail closed while pods
-are being recycled.
+`false`. Enabling the flag alone still creates no browser-reachable app; it
+exposes only the callable foundation. The subsequently delivered isolated
+viewer additionally requires `viewer.enabled` and the applicable validated
+viewer configuration/attestations. Changing ConfigMap-backed capability values
+requires recycling existing worker and persistent-session pods; their process
+environments do not change in place. Server-side rechecking makes disabling
+fail closed while pods are being recycled.
 
 The short 3A health operation revalidates the complete generation, endpoint,
-and fingerprint before and after opening its direct channel. The future
-long-lived proxy must additionally register and actively cancel in-flight SSH,
-HTTP, SSE, and WebSocket activity on revocation; the bounded idle cleanup used
-here is not presented as that later revocation protocol.
+and fingerprint before and after opening its direct channel. Slice 3B later
+added revocation-aware registration and cancellation for its ordinary-HTTP and
+SSH activity. SSE and WebSocket activity remain Slice-4 work; the bounded idle
+cleanup used by this 3A checkpoint is not presented as either later protocol.
 
 ## Local k3d execution record
 
@@ -109,8 +116,10 @@ checkpoint deliberately adds no frontend live-app code.
 
 Slice 3B subsequently delivered the default-off viewer-session, isolated
 gateway, ordinary-HTTP proxy, Cockpit iframe, and dark deployment plumbing; see
-`docs/tests/dynamic_canvas_slice3b_verification.md`. The external launch gate
-below remains intentionally unresolved.
+[[dynamic_canvas_slice3b_verification]]. Slice 3C subsequently delivered the
+restricted gateway database identity and deployment boundary; see
+[[dynamic_canvas_slice3c_verification]]. The external launch gate below remains
+intentionally unresolved, and all viewer gates remain off.
 
 Enable user-facing Slice 3 only after the deployment has a separately
 registrable user-content domain, wildcard DNS/TLS, an effective private PSL

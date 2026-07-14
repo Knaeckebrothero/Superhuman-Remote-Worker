@@ -112,6 +112,8 @@ describe('buildToolCardView', () => {
         const result = JSON.stringify({
             canvas_id: 'main',
             presentation_revision: 7,
+            title: 'Research report',
+            source: {type: 'workspace_file', path: 'output/report.md'},
             content_url: '/api/secret-bearing-pointer',
         });
         const v = buildToolCardView(norm({
@@ -124,7 +126,19 @@ describe('buildToolCardView', () => {
         expect(v.subtitle).toBe('report.md');
         expect(v.result).toBeUndefined();
         expect(v.action).toEqual({kind: 'open_canvas', presentationRevision: 7});
+        expect(v.canvasPresentation).toEqual({sourceKind: 'file', title: 'Research report'});
         expect(JSON.stringify(v)).not.toContain('secret-bearing-pointer');
+    });
+
+    it('normalizes legacy workspace_port Canvas results as a live app summary', () => {
+        const v = buildToolCardView(norm({
+            tool: 'set_canvas',
+            args: {source_type: 'workspace_port', port: 8501, title: 'Prototype'},
+            result: '{"presentation_revision": 8}',
+        }));
+
+        expect(v.canvasPresentation).toEqual({sourceKind: 'app', title: 'Prototype'});
+        expect(JSON.stringify(v.canvasPresentation)).not.toContain('8501');
     });
 
     it('offers no Canvas action for a pending, denied, or failed set', () => {

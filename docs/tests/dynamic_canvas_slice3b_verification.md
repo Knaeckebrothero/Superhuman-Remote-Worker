@@ -1,10 +1,16 @@
 # Dynamic Canvas Slice 3B — isolated ordinary-HTTP viewer verification
 
-**Status:** The default-off one-port viewer checkpoint is implemented, passed
-repository verification, and the enclosing chart now deploys cleanly through
-local k3d/Tilt. It remains dark-shipped: the chart creates no wildcard
-Ingress/TLS resource, viewer gates remain disabled, and this record does not
-claim production-browser or enabled live-app acceptance.
+**Status:** The default-off one-port viewer checkpoint and its trusted Cockpit
+closeout are implemented. The original checkpoint passed repository
+verification and the enclosing chart deploys cleanly through local k3d/Tilt; a
+local production-bundle Playwright conformance harness defines the same wrapper
+and synthetic browser-visible protocol cases for Chromium, Firefox, and WebKit.
+Chromium and Firefox pass on the host; WebKit passes in the exact official
+Playwright Ubuntu Noble container after the Fedora-native launch hit an ABI
+mismatch, as recorded below. It
+remains dark-shipped: the chart creates no wildcard Ingress/TLS resource,
+viewer gates remain disabled, and this record does not claim a live Python-
+gateway/TLS/CHIPS/PSL or enabled live-app acceptance.
 
 **Feature:** `docs/features/dynamic_canvas.md`
 
@@ -41,8 +47,11 @@ claim production-browser or enabled live-app acceptance.
 
 This checkpoint is one-port ordinary HTTP. It does **not** implement a
 multi-port route manifest, application cookies, SSE, multipart live streams,
-WebSockets/HMR, a wrapper pop-out, shared browser, or a chart-owned external
-edge. Both `development-cookie-free` and `psl-isolated` modes strip all
+WebSockets/HMR, shared browser, or a chart-owned external edge. The authenticated
+wrapper pop-out, trusted reset-origin action, and causal unsupported-browser/
+storage fallback are implemented, but remain unavailable to users while the
+viewer gates are off.
+Both `development-cookie-free` and `psl-isolated` modes strip all
 application `Cookie` and `Set-Cookie` fields; the latter is a production
 configuration precondition, not a claim that app-cookie support has shipped.
 
@@ -63,9 +72,12 @@ invalidates an unconsumed bootstrap.
 | Create/challenge/authorize/exchange/authenticate/renew/close/revoke/cleanup semantics | `orchestrator/services/canvas_viewer_sessions.py` |
 | Cross-replica notification listener and bounded active-operation registry | `orchestrator/services/canvas_session_notifications.py` |
 | Parent BFF create/authorize/renew/close routes and public capability | `orchestrator/routers/canvases.py`, `orchestrator/services/canvas.py` |
+| Conditional live-app origin rotation and old-generation revocation | `orchestrator/routers/canvases.py`, `orchestrator/services/canvas.py`, `0061_canvas_viewer_sessions.sql` |
 | Dedicated no-fallback ASGI gateway | `orchestrator/canvas_gateway.py` |
 | Request/response policy and strict HTTP-over-SSH adapter | `orchestrator/services/canvas_proxy_policy.py`, `orchestrator/services/canvas_http.py`, `orchestrator/services/canvas_ssh.py` |
-| Pane-local attachment lifecycle and fixed iframe renderer | `cockpit/src/app/views/canvas/canvas-viewer.controller.ts`, `canvas-live-app-renderer.component.ts`, `canvas-pane.component.ts` |
+| Pane-local attachment lifecycle, typed safe fallback, fixed iframe renderer, reset UI, and source/sync chrome | `cockpit/src/app/views/canvas/canvas-viewer.controller.ts`, `canvas-live-app-unavailable.component.ts`, `canvas-live-app-renderer.component.ts`, `canvas-pane.component.ts` |
+| Authenticated minimal wrapper and same-browser revision-only invalidation | `cockpit/src/app/views/canvas/canvas-popout-page.component.ts`, `cockpit/src/app/core/services/canvas.service.ts`, `cockpit/src/app/app.routes.ts` |
+| Production-bundle three-engine local conformance harness | `cockpit/e2e/canvas/` |
 | Default-off gateway service/deployment/network policy and Compose profile | `helm/templates/canvas-gateway/`, `docker-compose.yaml`, `docker-compose.local.yaml` |
 | Trusted Cockpit/BFF document anti-framing, including optional root-host MCP OAuth pages | `orchestrator/security/anti_framing.py`, `docker/cockpit-nginx.conf`, `cockpit/angular.json`, `orchestrator/mcp/run.py` |
 
@@ -90,6 +102,12 @@ record was written:
   cookie, accepts the exchange only as a strictly framed same-origin browser
   POST, atomically consumes it across replicas, clears the transient value, and
   only then issues/reuses the viewer cookie;
+- parent attachment creation now requires exact same-origin/same-site CORS Fetch
+  Metadata and returns `canvas_browser_unsupported` before creating state when
+  that browser boundary is unavailable. A missing transient cookie at exchange
+  returns only `canvas_browser_storage_unavailable`; Cockpit maps those two
+  causal outcomes to trusted unsupported guidance and leaves generic failures
+  non-causal;
 - renewal takes locks in Canvas-then-session order, avoiding a replacement/
   revocation-trigger deadlock;
 - authentication and renewal revoke sessions minted under a different cookie
@@ -115,6 +133,11 @@ record was written:
 - shared viewer cookies are cleared only for credential failures, so an
   attacker cannot log out a shared origin session by inducing an unrelated
   capacity, framing, or upstream failure;
+- the authenticated pop-out renders the same fixed sandbox inside trusted
+  Cockpit chrome, opens with `noopener,noreferrer`, and never top-level-navigates
+  to the user-content origin. Conditional reset-origin preserves the app
+  pointer, rotates the origin generation under the state ETag, and retires the
+  previous generation through the existing cross-replica revocation trigger;
 - Cockpit production and development documents, orchestrator/BFF HTTP
   responses, and optional MCP OAuth/error documents now independently enforce
   `frame-ancestors 'none'` and `X-Frame-Options: DENY`. The ASGI boundary
@@ -174,10 +197,30 @@ record was written:
   MCP image built successfully and its live HTTP `404` carried the same
   boundary. Related Canvas/IDE/proxy and MCP suites passed, and focused
   Ruff/format/diff checks stayed clean.
+- **2026-07-14 trusted-UI/browser closeout:** the focused backend/security suite
+  passed 367 tests and Ruff passed. The full Cockpit run passed 1,085 tests in
+  86 files; TypeScript compilation, all 1,993 English/German i18n keys, and the
+  production build passed with only the existing budget/CommonJS warnings.
+  Playwright listed 27 cases and passed all nine in host Chromium plus all nine
+  in host Firefox in 27.9 seconds. The Ubuntu WebKit bundle could not launch
+  natively on Fedora 44 because the host lacked its pinned `libicu74` and
+  `libjpeg-turbo8` ABIs. Running the same production tree in the exact
+  `mcr.microsoft.com/playwright:v1.59.0-noble` image passed all nine WebKit
+  cases in 19.4 seconds. Main and Develop CI now install all three engines with
+  Ubuntu system dependencies and run the same production bundle, but that new
+  CI job has not yet supplied acceptance evidence.
 
-No real-browser or enabled local-k3d live-app acceptance is claimed. jsdom
-cannot prove partitioned-cookie, Fetch Metadata, CSP/sandbox, service-worker,
-navigation, or credential-leakage behavior, and the local chart intentionally
+No deployed real-boundary or enabled local-k3d live-app acceptance is claimed.
+The new Playwright suite defines Chromium, Firefox, and WebKit projects against
+the production Angular bundle; the local evidence above comes from Chromium and
+Firefox on the host and WebKit in the matching Linux container. Its BFF is an
+in-process fixture and its HTTPS viewer is supplied by request interception.
+The supported viewer path explicitly emulates partitioned-cookie persistence;
+the forced missing-cookie case disables that emulation and proves only the
+trusted fallback branch. It therefore does not prove the
+Python gateway/SSH path, public DNS/TLS, a real CHIPS/third-party-cookie policy,
+effective PSL separation, cross-replica PostgreSQL cancellation, installed
+service workers/PWA mode, or shipping Safari. The local chart intentionally
 lacks the required isolated wildcard edge. A source-of-truth repair corrected
 the chart-created Secret rendering and added a value-safe regression check. The
 next rollout exposed checksum drift in already-applied migration `0061`; its
@@ -211,8 +254,8 @@ recorded in [[dynamic_canvas_slice3c_verification]].
 
 Before enabling the viewer, provide the separately registrable wildcard
 user-content DNS/TLS edge, effective private PSL boundary, verified raw-path
-host dispatch, pre-gateway rate limits, and the full Chromium/Firefox/WebKit
-plus Safari/iOS/PWA security matrix. The repository-owned trusted
+host dispatch, pre-gateway rate limits, and rerun the authentication/security
+matrix against that deployed Python gateway. The repository-owned trusted
 Cockpit/BFF/MCP response seams now deny framing without weakening existing CSP;
 the production edge, installed-PWA upgrade/browser self-navigation behavior,
 optional root-host routes, same-origin code-server webviews on the distinct API
@@ -221,8 +264,10 @@ launch gate is attested.
 Browsers which cannot satisfy the embedded authentication flow must show
 unsupported UX rather than receive a top-level fallback.
 
-The restricted gateway credential/configuration work is complete. The next
-repository step is the production-browser harness and explicit unsupported-
-browser UX. After the external Slice-3 launch gates are evidenced, Slice 4 can
+The restricted gateway credential/configuration work, trusted Cockpit closeout,
+and local browser harness are complete. The next acceptance step is a hosted,
+raw-path-preserving one-port run with real secure-context cookies, followed by
+current Safari/iOS and installed-PWA/device coverage. After the external
+Slice-3 launch gates are evidenced, Slice 4 can
 add the validated multi-port route manifest, SSE, and WebSocket/HMR on the same
 isolated-origin and revocation foundation.

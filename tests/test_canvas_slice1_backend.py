@@ -1103,6 +1103,7 @@ def test_state_content_head_range_and_conditional_clear(monkeypatch) -> None:
     state = client.get(state_url)
     assert state.status_code == 200
     assert state.json()["status"] == "ready"
+    assert state.json()["capabilities"]["can_pop_out"] is True
     content_url = state.json()["content_url"]
     assert content_url and parse_qs(urlsplit(content_url).query)["ngsw-bypass"] == [
         "true"
@@ -1418,6 +1419,7 @@ def test_editable_content_put_uses_both_preconditions_and_returns_new_state(
     assert saved.status_code == 200
     assert saved.json()["editable"] is True
     assert saved.json()["capabilities"]["can_edit"] is True
+    assert saved.json()["capabilities"]["can_pop_out"] is True
     assert saved.json()["presentation_revision"] == 2
     assert saved.json()["source_version"] == gateway.file.source_version
     assert saved.headers["x-canvas-content-etag"] == (

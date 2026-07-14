@@ -26,10 +26,12 @@ scope is still undecided, so there's no design doc or implementation plan yet. C
 The idea: add a browser-based remote desktop ("RDP") so a less-technical user can "visit"
 the machine the agent runs on.
 
-The finding: the concrete use cases that motivated it are largely **already
-covered** by two features we've designed — [[shared_browser]] (CDP screencast of
-the agent's browser) and the planned `workspace_port` / `workspace_app` sources
-of [[dynamic_canvas]]. The only thing a true remote desktop adds beyond those is
+The finding: the concrete use cases that motivated it are largely **covered or
+planned** by two features — [[shared_browser]] (CDP screencast of the agent's
+browser) and the live-app sources of [[dynamic_canvas]]. Canvas's one-port
+`workspace_port` source is implemented but default-off; multi-port
+`workspace_app` remains Slice 4 work, and the shared `browser` source remains
+Slice 5 work. The only thing a true remote desktop adds beyond those is
 **non-web GUI** (file manager, native apps, OS dialogs).
 
 **Decision:** defer the remote-desktop / RDP capability. Build the dynamic canvas
@@ -76,9 +78,10 @@ Two consequences for any "visit the machine" feature:
 ## Relationship to the two existing designs
 
 - **[[dynamic_canvas]]** is the artifacts-style shared stage. V1 has one typed
-  `main` presentation pointer per thread; file presentation is implemented,
-  while `workspace_port` / `workspace_app` and `browser` sources are later
-  slices. Any future desktop capability should be another trusted Canvas
+  `main` presentation pointer per thread. File presentation is implemented;
+  the one-port `workspace_port` path is implemented and default-off in Slice 3,
+  while multi-port `workspace_app` is planned for Slice 4 and `browser` for
+  Slice 5. Any future desktop capability should be another trusted Canvas
   source/renderer, not a separate top-level UI.
 - **[[shared_browser]]** is watch / take-control of the agent's browser. It deliberately chose
   **CDP screencast and rejected noVNC/VNC desktop**, because noVNC needs Xvfb + a *headed*
@@ -91,7 +94,7 @@ Two consequences for any "visit the machine" feature:
 | Motivating need | Covered by |
 |---|---|
 | See **and take over** the browser the agent opened (tax form) | [[shared_browser]] — view (Phase 1) + take-control (Phase 2) |
-| Test an app without port-forwarding / CORS | Planned — [[dynamic_canvas]] Slice 3 adds isolated `workspace_port` / `workspace_app` proxying; a browser *truly on the machine* remains a separate headful-browser option. |
+| Test an app without port-forwarding / CORS | Partly implemented, default-off — [[dynamic_canvas]] Slice 3 provides isolated one-port `workspace_port` proxying; Slice 4 plans multi-port `workspace_app`. A browser *truly on the machine* remains a separate headful-browser option, while the shared Canvas `browser` source is planned for Slice 5. |
 | General "visit the machine" / RDP | **Not covered** — the only genuinely net-new piece |
 
 **The genuine gap:** the only thing a true desktop adds beyond screencast +
@@ -102,12 +105,16 @@ screencast's blind spots), and arbitrary windows.
 ## Options considered (for when we revisit)
 
 All three live *inside* the Canvas host vision (each is a trusted
-source/renderer), and all reuse the existing authenticated proxy. Ordered by
-increasing capability:
+source/renderer) and reuse existing authenticated workspace-resolution and
+delivery boundaries, but not one common proxy: live Canvas apps use the
+dedicated Canvas gateway/viewer flow, while the IDE proxy is only a reference
+for workspace resolution and any future noVNC transport. Ordered by increasing
+capability:
 
 **A — Build what's specced (no desktop).** Ship [[shared_browser]] (view +
 take-control) and the Canvas workspace-app sources. Covers the tax-form case and
-most app-testing. Lightest; reuses headless Chromium and the existing proxy.
+most app-testing. Lightest; reuses headless Chromium and the existing
+Canvas/Shared Browser foundations.
 Trade-off: app-testing goes through the proxy (origin rewriting); no native GUI.
 
 **B — On-machine browser (the screencast "escape hatch").** Flip the agent's Chromium to

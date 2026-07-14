@@ -897,9 +897,24 @@ def test_attachment_route_requires_bff_cookie_and_exact_state_etag(
             "Cookie": f"srw_session={parent}",
             "If-Match": '"canvas:stale"',
             "Origin": "https://cockpit.platform.test",
+            "Sec-Fetch-Site": "same-site",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
         },
     )
     assert stale.status_code == 412
+    assert viewer.calls == []
+
+    unsupported = client.post(
+        url,
+        headers={
+            "Cookie": f"srw_session={parent}",
+            "If-Match": representation.etag,
+            "Origin": "https://cockpit.platform.test",
+        },
+    )
+    assert unsupported.status_code == 409
+    assert unsupported.json()["detail"]["code"] == "canvas_browser_unsupported"
     assert viewer.calls == []
 
     response = client.post(
@@ -908,6 +923,9 @@ def test_attachment_route_requires_bff_cookie_and_exact_state_etag(
             "Cookie": f"srw_session={parent}",
             "If-Match": representation.etag,
             "Origin": "https://cockpit.platform.test",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
         },
     )
     assert response.status_code == 200

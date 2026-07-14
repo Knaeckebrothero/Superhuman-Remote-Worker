@@ -1,14 +1,19 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   ElementRef,
   computed,
   effect,
   inject,
   input,
   output,
+  signal,
   viewChild,
 } from '@angular/core';
+import {DatePipe} from '@angular/common';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {CanvasService} from '../../core/services/canvas.service';
 import {AppBadgeComponent} from '../../ui/badge';
@@ -22,12 +27,47 @@ import {
   CanvasMarkdownRendererComponent,
   CanvasTextRendererComponent,
 } from './canvas-renderers.component';
-import {selectCanvasChromeState, selectCanvasRenderer} from './canvas-rendering';
+import {
+  canvasSourceKey,
+  selectCanvasChromeState,
+  selectCanvasRenderer,
+} from './canvas-rendering';
 import {CanvasContentController} from './canvas-content.controller';
 import {CanvasEditController} from './canvas-edit.controller';
 import {CanvasEditorComponent} from './canvas-editor.component';
 import {CanvasViewerController} from './canvas-viewer.controller';
 import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.component';
+import {
+  CanvasLiveAppUnavailableComponent,
+  canvasLiveAppFailureKind,
+} from './canvas-live-app-unavailable.component';
+
+export type CanvasResetStatus = 'idle' | 'confirming' | 'resetting' | 'success' | 'error';
+
+export interface CanvasResetTarget {
+  readonly stateEtag: string;
+  readonly presentationRevision: number;
+  readonly sourceKey: string;
+}
+
+export function canvasResetTargetMatches(
+  target: CanvasResetTarget,
+  stateEtag: string | null,
+  presentationRevision: number | null,
+  sourceKey: string | null,
+): boolean {
+  return target.stateEtag === stateEtag &&
+    target.presentationRevision === presentationRevision &&
+    target.sourceKey === sourceKey;
+}
+
+/** Keep untrusted Canvas content in a wrapper and sever opener/referrer state. */
+export function openCanvasPopOut(
+  url: string,
+  openWindow: (url: string, target: string, features: string) => unknown,
+): void {
+  openWindow(url, '_blank', 'noopener,noreferrer');
+}
 
 @Component({
   selector: 'app-canvas-pane',
@@ -35,6 +75,7 @@ import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.compone
   changeDetection: ChangeDetectionStrategy.OnPush,
   providers: [CanvasContentController, CanvasEditController, CanvasViewerController],
   imports: [
+    DatePipe,
     TranslocoPipe,
     AppBadgeComponent,
     AppButtonComponent,
@@ -44,6 +85,7 @@ import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.compone
     CanvasHtmlRendererComponent,
     CanvasImageRendererComponent,
     CanvasLiveAppRendererComponent,
+    CanvasLiveAppUnavailableComponent,
     CanvasMarkdownRendererComponent,
     CanvasTextRendererComponent,
     CanvasEditorComponent,
@@ -68,7 +110,14 @@ import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.compone
         </div>
         <div class="canvas-trust">
           <app-badge tone="warning" size="xs">{{ 'canvas.untrusted' | transloco }}</app-badge>
+          <app-badge tone="neutral" size="xs">{{ sourceKindLabel() }}</app-badge>
           <span>{{ rendererLabel() }}</span>
+          @if (lastSyncedAt(); as syncedAt) {
+            <time [attr.datetime]="syncedAt | date:'yyyy-MM-ddTHH:mm:ssXXX'"
+                  [title]="syncedAt | date:'medium'">
+              {{ 'canvas.lastSynced' | transloco }} {{ syncedAt | date:'short' }}
+            </time>
+          }
         </div>
         <div class="canvas-actions">
           @if (editor.hasSession()) {
@@ -92,6 +141,23 @@ import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.compone
                            (clicked)="canvas.reconcile()">
             <app-icon size="sm">refresh</app-icon>
           </app-icon-button>
+          @if (isLiveAppSource()) {
+            <app-icon-button size="sm"
+                             [ariaLabel]="'canvas.app.reset.action' | transloco"
+                             [tooltip]="'canvas.app.reset.action' | transloco"
+                             [loading]="resetStatus() === 'resetting'"
+                             [disabled]="!canResetOrigin()"
+                             (clicked)="requestOriginReset()">
+              <app-icon size="sm">delete_sweep</app-icon>
+            </app-icon-button>
+          }
+          @if (canPopOut()) {
+            <app-icon-button size="sm" [ariaLabel]="'canvas.popOut' | transloco"
+                             [tooltip]="'canvas.popOut' | transloco"
+                             (clicked)="popOutCanvas()">
+              <app-icon size="sm">open_in_new</app-icon>
+            </app-icon-button>
+          }
           <app-icon-button size="sm" [ariaLabel]="'canvas.close' | transloco"
                            [tooltip]="'canvas.close' | transloco"
                            (clicked)="closeRequested.emit()">
@@ -103,6 +169,40 @@ import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.compone
       <div class="canvas-announcement" aria-live="polite" aria-atomic="true">
         {{ statusText() }}
       </div>
+
+      @if (resetStatus() !== 'idle') {
+        <div class="canvas-reset-notice"
+             [class.canvas-reset-notice--error]="resetStatus() === 'error'"
+             [class.canvas-reset-notice--success]="resetStatus() === 'success'"
+             [attr.role]="resetStatus() === 'confirming' || resetStatus() === 'error' ? 'alert' : 'status'"
+             aria-labelledby="canvas-reset-title" aria-describedby="canvas-reset-body">
+          <app-icon size="sm">
+            {{ resetStatus() === 'error' ? 'error' : resetStatus() === 'success' ? 'check_circle' : 'delete_sweep' }}
+          </app-icon>
+          <div class="canvas-reset-notice__copy">
+            <strong id="canvas-reset-title">
+              {{ ('canvas.app.reset.' + resetStatus() + '.title') | transloco }}
+            </strong>
+            <span id="canvas-reset-body">
+              {{ ('canvas.app.reset.' + resetStatus() + '.body') | transloco }}
+            </span>
+          </div>
+          <div class="canvas-reset-notice__actions">
+            @if (resetStatus() === 'confirming') {
+              <app-button size="sm" variant="ghost" (clicked)="cancelOriginReset()">
+                {{ 'common.cancel' | transloco }}
+              </app-button>
+              <app-button size="sm" variant="danger" (clicked)="confirmOriginReset()">
+                {{ 'canvas.app.reset.confirm' | transloco }}
+              </app-button>
+            } @else if (resetStatus() !== 'resetting') {
+              <app-button size="sm" variant="ghost" (clicked)="dismissOriginResetNotice()">
+                {{ 'common.dismiss' | transloco }}
+              </app-button>
+            }
+          </div>
+        </div>
+      }
 
       @if (editor.conflict(); as conflict) {
         <div class="canvas-edit-notice" role="alert">
@@ -153,7 +253,10 @@ import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.compone
           }
         }
         @if (!editor.editMode()) {
-          @if (hasVisual()) {
+          @if (liveAppFailureVisible()) {
+            <app-canvas-live-app-unavailable [errorCode]="liveAppErrorCode()"
+                                             (retry)="viewer.retry()" />
+          } @else if (hasVisual()) {
             @switch (effectiveRenderer()) {
               @case ('markdown') {
                 <app-canvas-markdown-renderer [content]="previewContent()" />
@@ -208,6 +311,7 @@ import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.compone
 export class CanvasPaneComponent {
   readonly active = input(true);
   readonly mobile = input(false);
+  readonly popout = input(false);
   readonly closeRequested = output<void>();
   readonly returnToChat = output<void>();
   readonly dirtyChange = output<boolean>();
@@ -217,6 +321,8 @@ export class CanvasPaneComponent {
   readonly editor = inject(CanvasEditController);
   readonly viewer = inject(CanvasViewerController);
   private readonly transloco = inject(TranslocoService);
+  private readonly router = inject(Router);
+  private readonly destroyRef = inject(DestroyRef);
   private readonly contentViewport = viewChild<ElementRef<HTMLElement>>('contentViewport');
   private readonly canvasEditor = viewChild<CanvasEditorComponent>('canvasEditor');
 
@@ -228,6 +334,8 @@ export class CanvasPaneComponent {
   readonly imageUrl = this.content.imageUrl;
   readonly contentStatus = this.content.contentStatus;
   readonly contentErrorCode = this.content.contentErrorCode;
+  readonly resetStatus = signal<CanvasResetStatus>('idle');
+  readonly resetTarget = signal<CanvasResetTarget | null>(null);
 
   readonly state = this.canvas.state;
   readonly chromeState = computed(() =>
@@ -236,6 +344,9 @@ export class CanvasPaneComponent {
       this.editor.sessionState(),
       this.editor.hasSession() && !!(this.editor.dirty() || this.editor.conflict()),
     ),
+  );
+  readonly preservingEditSession = computed(() =>
+    this.editor.hasSession() && !!(this.editor.dirty() || this.editor.conflict()),
   );
   readonly effectiveRenderer = computed(() => {
     if (this.editor.hasSession() && (this.editor.dirty() || this.editor.conflict())) {
@@ -272,6 +383,38 @@ export class CanvasPaneComponent {
   readonly rendererLabel = computed(() =>
     this.transloco.translate(`canvas.renderer.${this.effectiveRenderer()}`),
   );
+  readonly isLiveAppSource = computed(() => this.chromeState()?.source?.type === 'workspace_app');
+  readonly sourceKindLabel = computed(() => {
+    const type = this.chromeState()?.source?.type;
+    const kind = type === 'workspace_file' ? 'file' : type === 'workspace_app' ? 'app' : 'unknown';
+    return this.transloco.translate(`canvas.sourceKind.${kind}`);
+  });
+  readonly lastSyncedAt = computed(() =>
+    this.preservingEditSession() ? null : this.canvas.lastSuccessfulSyncAt(),
+  );
+  readonly canPopOut = computed(() =>
+    !this.popout() &&
+    !this.preservingEditSession() &&
+    !!this.canvas.threadId() &&
+    this.state()?.capabilities.can_pop_out === true,
+  );
+  readonly canResetOrigin = computed(() =>
+    this.isLiveAppSource() &&
+    !!this.canvas.stateEtag() &&
+    this.canvas.loadStatus() !== 'loading' &&
+    this.resetStatus() !== 'resetting',
+  );
+  readonly liveAppErrorCode = computed(() => {
+    if (!this.isLiveAppSource()) return null;
+    if (
+      this.state()?.status === 'ready' &&
+      this.state()?.capabilities.can_create_viewer_session !== true
+    ) {
+      return 'canvas_viewer_not_configured';
+    }
+    return this.viewer.viewerStatus() === 'error' ? this.viewer.viewerErrorCode() : null;
+  });
+  readonly liveAppFailureVisible = computed(() => this.liveAppErrorCode() !== null);
   readonly imageAlt = computed(() =>
     this.displayState()?.alt_text?.trim() || this.transloco.translate('canvas.image.missingAlt'),
   );
@@ -303,6 +446,14 @@ export class CanvasPaneComponent {
   });
   readonly statusText = computed(() => {
     const state = this.state();
+    if (this.liveAppFailureVisible()) {
+      return this.transloco.translate(
+        `canvas.app.failure.${canvasLiveAppFailureKind(this.liveAppErrorCode())}.title`,
+      );
+    }
+    if (this.resetStatus() === 'success' || this.resetStatus() === 'error') {
+      return this.transloco.translate(`canvas.app.reset.${this.resetStatus()}.title`);
+    }
     if (state?.status === 'source_changed' || this.contentStatus() === 'source_changed') {
       return this.transloco.translate('canvas.status.sourceChanged');
     }
@@ -335,6 +486,9 @@ export class CanvasPaneComponent {
     return '';
   });
   readonly emptyText = computed(() => {
+    if (this.isLiveAppSource() && this.state()?.status !== 'ready') {
+      return this.statusText() || this.transloco.translate('canvas.app.unavailable');
+    }
     if (selectCanvasRenderer(this.state()) === 'unsupported') {
       return this.transloco.translate('canvas.unsupported');
     }
@@ -369,6 +523,23 @@ export class CanvasPaneComponent {
       this.canvas.stateEtag(),
     ));
     effect(() => this.dirtyChange.emit(this.editor.dirty()));
+    effect(() => {
+      if (!this.isLiveAppSource() && this.resetStatus() !== 'idle') {
+        this.resetStatus.set('idle');
+        this.resetTarget.set(null);
+      }
+    });
+    effect(() => {
+      const target = this.resetTarget();
+      if (
+        target &&
+        this.resetStatus() === 'confirming' &&
+        !this.currentResetTargetMatches(target)
+      ) {
+        this.resetStatus.set('idle');
+        this.resetTarget.set(null);
+      }
+    });
   }
 
   focusContent(): void {
@@ -386,6 +557,80 @@ export class CanvasPaneComponent {
     }
     this.editor.enterEdit();
     queueMicrotask(() => this.canvasEditor()?.focus());
+  }
+
+  popOutCanvas(): void {
+    const threadId = this.canvas.threadId();
+    if (!threadId || !this.canPopOut() || typeof window === 'undefined') return;
+    const url = this.router.serializeUrl(
+      this.router.createUrlTree(['/sessions', threadId, 'canvas']),
+    );
+    openCanvasPopOut(url, (href, target, features) => window.open(href, target, features));
+  }
+
+  requestOriginReset(): void {
+    const state = this.state();
+    const stateEtag = this.canvas.stateEtag();
+    const sourceKey = canvasSourceKey(state);
+    if (!this.canResetOrigin() || !state || !stateEtag || !sourceKey) return;
+    // Origin rotation remains available for a live-app source even when this
+    // deployment has viewing disabled: it is a trusted revocation action, not
+    // a viewer-session capability. Bind confirmation to this exact app state.
+    this.resetTarget.set({
+      stateEtag,
+      presentationRevision: state.presentation_revision,
+      sourceKey,
+    });
+    this.resetStatus.set('confirming');
+  }
+
+  cancelOriginReset(): void {
+    if (this.resetStatus() === 'confirming') {
+      this.resetStatus.set('idle');
+      this.resetTarget.set(null);
+    }
+  }
+
+  confirmOriginReset(): void {
+    const target = this.resetTarget();
+    if (
+      this.resetStatus() !== 'confirming' ||
+      !this.canResetOrigin() ||
+      !target ||
+      !this.currentResetTargetMatches(target)
+    ) {
+      this.resetStatus.set('idle');
+      this.resetTarget.set(null);
+      return;
+    }
+    this.resetStatus.set('resetting');
+    this.canvas.resetOrigin(target.stateEtag).pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
+      next: () => {
+        this.resetTarget.set(null);
+        this.resetStatus.set('success');
+      },
+      error: () => {
+        this.resetTarget.set(null);
+        this.resetStatus.set('error');
+        this.canvas.reconcile();
+      },
+    });
+  }
+
+  dismissOriginResetNotice(): void {
+    if (this.resetStatus() === 'success' || this.resetStatus() === 'error') {
+      this.resetStatus.set('idle');
+      this.resetTarget.set(null);
+    }
+  }
+
+  private currentResetTargetMatches(target: CanvasResetTarget): boolean {
+    return canvasResetTargetMatches(
+      target,
+      this.canvas.stateEtag(),
+      this.state()?.presentation_revision ?? null,
+      canvasSourceKey(this.state()),
+    );
   }
 
   isReloadConflict(): boolean {

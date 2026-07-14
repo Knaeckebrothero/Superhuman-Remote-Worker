@@ -26,7 +26,12 @@
       "current": "current",
       "currentStage": "opens current stage",
       "replaced": "presentation replaced",
-      "unavailable": "Canvas unavailable"
+      "unavailable": "Canvas unavailable",
+      "sourceKind": {
+        "file": "File",
+        "app": "Live app",
+        "canvas": "Canvas"
+      }
     },
     "titles": {
       "read_file": "Read file",
@@ -69,7 +74,9 @@
     "defaultTitle": "Canvas",
     "noSource": "No source selected",
     "untrusted": "Agent-provided content",
+    "lastSynced": "Last synced",
     "refresh": "Refresh Canvas status",
+    "popOut": "Open Canvas in a new window",
     "close": "Close Canvas",
     "open": "Open Canvas",
     "hide": "Hide Canvas",
@@ -79,6 +86,11 @@
     "empty": "The agent has not presented anything yet.",
     "unsupported": "This Canvas source is not supported by this version of Cockpit.",
     "contentTooComplex": "This artifact is too complex to render safely. Ask the agent to simplify it.",
+    "sourceKind": {
+      "file": "File",
+      "app": "Live app",
+      "unknown": "Canvas"
+    },
     "renderer": {
       "markdown": "Markdown",
       "text": "Text",
@@ -114,7 +126,43 @@
       "untrustedWarning": "Untrusted app — do not enter passwords or secrets.",
       "connecting": "Connecting to the isolated Canvas application…",
       "renewing": "Refreshing the secure Canvas connection…",
-      "unavailable": "The isolated Canvas application could not be opened."
+      "unavailable": "The isolated Canvas application could not be opened.",
+      "retry": "Retry secure preview",
+      "failure": {
+        "disabled": {
+          "title": "Live preview is disabled",
+          "body": "This deployment has not enabled isolated live-app viewing."
+        },
+        "unsupported": {
+          "title": "Secure live preview is not supported",
+          "body": "This browser or its privacy settings does not support the secure metadata or partitioned storage required by Canvas."
+        },
+        "temporary": {
+          "title": "Secure live preview is unavailable",
+          "body": "The embedded preview could not be established. This may be a temporary service, authentication, or browser privacy-policy failure."
+        },
+        "safeFallback": "For safety, Canvas did not open the app as a top-level page. Use the authenticated IDE or manual-preview workflow instead."
+      },
+      "reset": {
+        "action": "Reset app origin",
+        "confirm": "Start with a fresh app origin",
+        "confirming": {
+          "title": "Start with a fresh isolated app origin?",
+          "body": "This rotates the app's origin generation, retires old previews, and revokes their sessions. Browser cleanup of storage left on the retired origin is best-effort."
+        },
+        "resetting": {
+          "title": "Resetting app origin…",
+          "body": "Canvas is revoking old origin sessions and reconnecting this preview."
+        },
+        "success": {
+          "title": "App origin was reset",
+          "body": "Canvas is reconnecting the app with a fresh origin generation."
+        },
+        "error": {
+          "title": "App origin could not be reset",
+          "body": "Canvas reloaded the latest state. Check the connection and try again."
+        }
+      }
     },
     "editor": {
       "label": "Canvas source editor",
@@ -170,6 +218,7 @@
     "saved": "Saved",
     "delete": "Delete",
     "cancel": "Cancel",
+    "dismiss": "Dismiss",
     "edit": "Edit",
     "rename": "Rename",
     "copy": "Copy",

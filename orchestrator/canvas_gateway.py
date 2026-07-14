@@ -726,12 +726,17 @@ class CanvasGatewayApp:
             "data.attachment_id!==bootstrap.attachmentId||"
             "data.challenge!==bootstrap.challenge||!secret.test(data.exchange_code))return;"
             "accepted=true;"
-            'try{const response=await fetch("/_canvas/exchange",{method:"POST",'
+            'let failureCode="exchange_failed";try{const response=await fetch('
+            '"/_canvas/exchange",{method:"POST",'
             'credentials:"same-origin",redirect:"error",'
             'headers:{"Content-Type":"application/json"},body:JSON.stringify({'
             "attachment_id:bootstrap.attachmentId,challenge:bootstrap.challenge,"
             "exchange_code:data.exchange_code})});"
-            'if(!response.ok)throw new Error("exchange rejected");'
+            'if(!response.ok){try{const rejected=await response.json();'
+            'if(rejected&&rejected.detail&&rejected.detail.code==='
+            '"canvas_browser_storage_unavailable")failureCode='
+            '"canvas_browser_storage_unavailable";}catch{}'
+            'throw new Error("exchange rejected");}'
             "const result=await response.json();"
             'if(!keys(result,["entry_path"])||typeof result.entry_path!=="string"||'
             '!result.entry_path.startsWith("/")||result.entry_path.startsWith("//"))'
@@ -742,7 +747,7 @@ class CanvasGatewayApp:
             "location.replace(result.entry_path);"
             '}catch(error){parent.postMessage({channel,version,type:"error",'
             "attachment_id:bootstrap.attachmentId,challenge:bootstrap.challenge,"
-            'ready_receipt:bootstrap.readyReceipt,code:"exchange_failed"},'
+            "ready_receipt:bootstrap.readyReceipt,code:failureCode},"
             "bootstrap.parentOrigin);}"
             "});announce();</script>"
         ).encode("ascii")
@@ -897,9 +902,9 @@ class CanvasGatewayApp:
         browser_binding = _reserved_cookie(headers, bootstrap_cookie)
         if browser_binding is None:
             raise CanvasViewerError(
-                401,
-                "canvas_bootstrap_invalid",
-                "Canvas bootstrap browser binding is missing",
+                409,
+                "canvas_browser_storage_unavailable",
+                "Canvas browser storage is unavailable for secure embedding",
             )
         existing = _reserved_cookie(headers, CANVAS_VIEWER_COOKIE)
         exchange = await self._initial_authorization(

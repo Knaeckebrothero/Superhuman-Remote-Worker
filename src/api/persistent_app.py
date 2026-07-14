@@ -166,6 +166,7 @@ class _CanvasAwarenessLease:
 _canvas_awareness: Dict[str, _CanvasAwarenessLease] = {}
 _canvas_control_validation_at: Dict[tuple[str, str], float] = {}
 _canvas_source_updates: Dict[str, tuple[str, int, str]] = {}
+_canvas_presentation_updates: Dict[str, int] = {}
 
 # Idle keepalive on the control WS (see _run_subscriber_pump). Must be
 # shorter than the cockpit's CONTROL_WS_WATCHDOG_TIMEOUT_MS and any
@@ -2703,6 +2704,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                     await _accept_user_input(content)
 
             elif method in {
+                "canvas.presentation_updated",
                 "canvas.source_updated",
                 "canvas.user_editing",
                 "canvas.user_idle",
@@ -3357,20 +3359,26 @@ async def _current_canvas_for_control() -> dict[str, Any] | None:
 def _validated_canvas_control_state(
     data: Dict[str, Any], state: dict[str, Any] | None
 ) -> dict[str, Any] | None:
-    """Match an untrusted control frame to the exact authorized file state."""
+    """Match an untrusted control frame to exact authoritative Canvas state."""
 
     if state is None or data.get("canvas_id") != "main":
         return None
-    source = state.get("source")
     revision = data.get("presentation_revision")
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision != state.get("presentation_revision")
+    ):
+        return None
+    if data.get("method") == "canvas.presentation_updated":
+        return state
+
+    source = state.get("source")
     if (
         not isinstance(source, dict)
         or source.get("type") != "workspace_file"
         or not isinstance(data.get("path"), str)
         or data["path"] != source.get("path")
-        or isinstance(revision, bool)
-        or not isinstance(revision, int)
-        or revision != state.get("presentation_revision")
         or not isinstance(data.get("source_version"), str)
         or data["source_version"] != state.get("source_version")
     ):
@@ -3421,6 +3429,7 @@ def _clear_canvas_awareness(client_id: str) -> None:
     for key in [key for key in _canvas_control_validation_at if key[0] == client_id]:
         _canvas_control_validation_at.pop(key, None)
     _canvas_source_updates.pop(client_id, None)
+    _canvas_presentation_updates.pop(client_id, None)
 
 
 def _clear_all_canvas_awareness() -> None:
@@ -3430,6 +3439,7 @@ def _clear_all_canvas_awareness() -> None:
     _canvas_awareness.clear()
     _canvas_control_validation_at.clear()
     _canvas_source_updates.clear()
+    _canvas_presentation_updates.clear()
     for lease in leases:
         lease.task.cancel()
 
@@ -3471,21 +3481,25 @@ async def _handle_canvas_control(
 
     method = data.get("method")
     allowed = {
+        "canvas.presentation_updated",
         "canvas.source_updated",
         "canvas.user_editing",
         "canvas.user_idle",
     }
     if method not in allowed:
         return False
-    expected_fields = {
-        "method",
-        "canvas_id",
-        "path",
-        "presentation_revision",
-        "source_version",
-    }
-    if method in {"canvas.user_editing", "canvas.user_idle"}:
-        expected_fields.add("editing_session_id")
+    if method == "canvas.presentation_updated":
+        expected_fields = {"method", "canvas_id", "presentation_revision"}
+    else:
+        expected_fields = {
+            "method",
+            "canvas_id",
+            "path",
+            "presentation_revision",
+            "source_version",
+        }
+        if method in {"canvas.user_editing", "canvas.user_idle"}:
+            expected_fields.add("editing_session_id")
     if set(data) != expected_fields:
         await _ws_send(
             ws,
@@ -3513,16 +3527,19 @@ async def _handle_canvas_control(
     path = data.get("path")
     revision = data.get("presentation_revision")
     source_version = data.get("source_version")
-    if (
+    invalid_identity = (
         data.get("canvas_id") != "main"
-        or not isinstance(path, str)
-        or not 0 < len(path) <= 4096
         or isinstance(revision, bool)
         or not isinstance(revision, int)
         or revision < 1
+    )
+    invalid_file_identity = method != "canvas.presentation_updated" and (
+        not isinstance(path, str)
+        or not 0 < len(path) <= 4096
         or not isinstance(source_version, str)
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", source_version)
-    ):
+    )
+    if invalid_identity or invalid_file_identity:
         await _ws_send(
             ws,
             "error",
@@ -3566,6 +3583,8 @@ async def _handle_canvas_control(
 
     source_identity: tuple[str, int, str] | None = None
     if method == "canvas.source_updated":
+        assert isinstance(path, str) and isinstance(revision, int)
+        assert isinstance(source_version, str)
         source_identity = (path, revision, source_version)
         if _canvas_source_updates.get(client_id) == source_identity:
             # The successful save response may be retried. A real subsequent
@@ -3576,6 +3595,20 @@ async def _handle_canvas_control(
         # Do not drop a distinct committed revision. Pace authoritative checks
         # instead, bounding invalid/mismatched spam without losing a real save.
         validation_key = (client_id, "source")
+        last_validation = _canvas_control_validation_at.get(validation_key)
+        if last_validation is not None:
+            remaining = _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S - (
+                now - last_validation
+            )
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                now = asyncio.get_running_loop().time()
+        _canvas_control_validation_at[validation_key] = now
+    elif method == "canvas.presentation_updated":
+        assert isinstance(revision, int)
+        if _canvas_presentation_updates.get(client_id) == revision:
+            return True
+        validation_key = (client_id, "presentation")
         last_validation = _canvas_control_validation_at.get(validation_key)
         if last_validation is not None:
             remaining = _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S - (
@@ -3626,6 +3659,22 @@ async def _handle_canvas_control(
                 "message": "Canvas state changed; reload before continuing",
             },
         )
+        return True
+
+    if method == "canvas.presentation_updated":
+        source = state.get("source")
+        source_type = source.get("type") if isinstance(source, dict) else None
+        _broadcast(
+            "canvas.updated",
+            {
+                "canvas_id": "main",
+                "presentation_revision": state["presentation_revision"],
+                "source_type": source_type,
+                "updated_at": state.get("updated_at"),
+            },
+        )
+        assert isinstance(revision, int)
+        _canvas_presentation_updates[client_id] = revision
         return True
 
     if method == "canvas.source_updated":

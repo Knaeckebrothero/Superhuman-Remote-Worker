@@ -3764,6 +3764,72 @@ class TestCanvasControlMessages:
         ]
 
     @pytest.mark.asyncio
+    async def test_presentation_updated_reloads_authority_and_broadcasts_state(
+        self, monkeypatch
+    ):
+        import src.api.persistent_app as mod
+
+        mod._clear_all_canvas_awareness()
+        tool_context = MagicMock()
+        monkeypatch.setattr(mod, "_session", SimpleNamespace(tool_context=tool_context))
+        state = {
+            **self._state(),
+            "source": {"type": "workspace_app", "entry_path": "/demo"},
+            "source_version": None,
+        }
+        state_loader = AsyncMock(return_value=state)
+        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
+        monkeypatch.setattr(mod, "_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S", 0)
+        broadcast = MagicMock()
+        monkeypatch.setattr(mod, "_broadcast", broadcast)
+        control = {
+            "method": "canvas.presentation_updated",
+            "canvas_id": "main",
+            "presentation_revision": 4,
+        }
+
+        try:
+            assert await mod._handle_canvas_control(MagicMock(), control, "client-p")
+            assert await mod._handle_canvas_control(MagicMock(), control, "client-p")
+        finally:
+            mod._clear_all_canvas_awareness()
+
+        state_loader.assert_awaited_once()
+        tool_context.invalidate_recent_read.assert_not_called()
+        broadcast.assert_called_once_with(
+            "canvas.updated",
+            {
+                "canvas_id": "main",
+                "presentation_revision": 4,
+                "source_type": "workspace_app",
+                "updated_at": "2026-07-13T12:00:00Z",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_presentation_updated_rejects_extra_file_identity(self, monkeypatch):
+        import src.api.persistent_app as mod
+
+        state_loader = AsyncMock()
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
+        monkeypatch.setattr(mod, "_ws_send", send)
+        malformed = self._frame("canvas.presentation_updated")
+        ws = MagicMock()
+
+        assert await mod._handle_canvas_control(ws, malformed, "client-p")
+
+        state_loader.assert_not_awaited()
+        send.assert_awaited_once_with(
+            ws,
+            "error",
+            {
+                "code": "invalid_canvas_control",
+                "message": "Canvas control message is invalid",
+            },
+        )
+
+    @pytest.mark.asyncio
     async def test_malformed_source_update_is_rejected_before_validation(
         self, monkeypatch
     ):

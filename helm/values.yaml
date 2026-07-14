@@ -328,21 +328,26 @@ canvas:
   livePreview:
     # -- Master capability gate for workspace-port live preview. The proxy,
     # isolated viewer origin, and browser acceptance gates must all fail closed
-    # when this is false. Wildcard DNS/TLS and a viewer domain are intentionally
-    # configured by a later slice; enabling this flag alone exposes nothing.
+    # when this is false. Viewer/domain configuration and the dedicated internal
+    # gateway are charted below, but wildcard DNS/TLS and the public edge remain
+    # operator-owned. Enabling this flag alone admits `workspace_port` only for
+    # positively attested eligible agents/internal calls; it creates no
+    # browser-facing viewer or public route.
     enabled: false
     # -- Additional workspace loopback ports which live preview must reject.
     # The built-in control-port denylist remains enforced independently.
     deniedPorts: []
     # Browser-facing live-app delivery is a separate, stricter gate. The
     # conditional gateway below is internal-only: this chart intentionally
-    # renders no wildcard ingress or TLS route for it. Before production launch,
-    # provision a least-privilege Canvas database credential and replace the
-    # broad shared ConfigMap projection with an explicit gateway-only contract.
+    # renders no wildcard ingress or TLS route for it. Its dedicated allowlisted
+    # ConfigMap and database-credential boundary are implemented. Production
+    # operators must still supply the restricted database role/Secret, public
+    # edge, and verified deployment attestations.
     viewer:
       # -- Create the internal Canvas gateway and let the orchestrator advertise
       # viewer-session capability. Also requires livePreview.enabled=true and
-      # every deployment attestation below.
+      # the applicable deployment attestations below: raw-path verification in
+      # every profile, plus PSL-boundary verification in production.
       enabled: false
       # -- `production` requires a verified effective-PSL boundary and
       # psl-isolated cookies. `development` may use cookie-free proxy mode but
