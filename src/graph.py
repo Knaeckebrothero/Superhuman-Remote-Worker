@@ -370,6 +370,32 @@ def _is_insufficient_quota(exc: BaseException) -> bool:
     return "insufficient_quota" in str(exc).lower()
 
 
+# Transport-level phrases that mark a *transient* mid-stream disconnect. The
+# Codex/CLIProxyAPI proxy (and some providers) surface a dropped SSE/HTTP
+# response stream as an ``invalid_request_error`` — the same ``type`` a
+# deterministic bad-request uses — so the ``type`` alone would misroute it to
+# ``permanent``. The tell is the message, not the type: a stream that
+# "disconnected before completion" / "closed before response.completed" is
+# transport, not input, and a retry clears it. Incident: scholar subjob
+# 35b23256 lost 3.5h of finished research when a 408 "stream disconnected
+# before completion" (type=invalid_request_error) was classified permanent and
+# hard-failed on the very first attempt.
+_STREAM_DISCONNECT_MARKERS = (
+    "stream disconnected",
+    "disconnected before completion",
+    "stream closed before",
+    "closed before response.completed",
+    "incomplete chunked read",
+    "peer closed connection",
+    "connection reset by peer",
+)
+
+
+def _is_stream_disconnect(text: str) -> bool:
+    """True if ``text`` (already lowercased) describes a transient stream drop."""
+    return any(marker in text for marker in _STREAM_DISCONNECT_MARKERS)
+
+
 def _classify_llm_error(error: Exception) -> str:
     """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
 
@@ -432,6 +458,13 @@ def _classify_llm_error(error: Exception) -> str:
                                 return "rate_limit"
                             if code == "tool_use_failed":
                                 return "transient"
+                            if _is_stream_disconnect(
+                                (err_obj.get("message") or "").lower()
+                            ):
+                                # A dropped stream mislabeled as a 400
+                                # invalid_request_error — transient transport,
+                                # not a deterministic input rejection.
+                                return "transient"
                             # 'invalid_request_error' is the OpenAI/Anthropic
                             # vocabulary; MiniMax says 'bad_request_error'
                             # (e.g. "invalid function arguments json string" —
@@ -458,6 +491,11 @@ def _classify_llm_error(error: Exception) -> str:
                 return "permanent"
             if 500 <= status_code < 600:
                 return "transient"
+            if status_code == 408:
+                # 408 Request Timeout is how a dropped response stream most
+                # often surfaces (frequently mislabeled type=invalid_request_error
+                # in the body — see _is_stream_disconnect). Always retryable.
+                return "transient"
 
         cls_name = type(current).__name__
         if cls_name in (
@@ -483,6 +521,8 @@ def _classify_llm_error(error: Exception) -> str:
                     if "rate" in code or "rate" in etype:
                         return "rate_limit"
                     if code == "tool_use_failed":
+                        return "transient"
+                    if _is_stream_disconnect((err_obj.get("message") or "").lower()):
                         return "transient"
                     if etype in ("invalid_request_error", "bad_request_error"):
                         return "permanent"
@@ -513,6 +553,12 @@ def _classify_llm_error(error: Exception) -> str:
         or "too many requests" in error_str
     ):
         return "rate_limit"
+    if "error code: 408" in error_str or _is_stream_disconnect(error_str):
+        # 408 Request Timeout / dropped response stream that lost its exception
+        # class — transient transport, even when the body mislabels it
+        # invalid_request_error. Scholar subjob 35b23256 lost 3.5h of work when
+        # this exact 408 stream-disconnect was classified permanent.
+        return "transient"
     if (
         "bad_request_error" in error_str or "invalid_request_error" in error_str
     ) and "tool_use_failed" not in error_str:
