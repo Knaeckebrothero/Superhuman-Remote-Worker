@@ -159,6 +159,31 @@ const STORAGE_KEYS = {
             }
           </div>
         </div>
+
+        <!-- Session: reasoning level for the model in effect (options are
+             capability-driven per family; the value rides llm.reasoning_level). -->
+        <div class="field-row" [class.modified]="sessionReasoning() !== null">
+          <label class="field-label">{{ 'agentSettings.model.reasoning' | transloco }}</label>
+          <div class="field-control">
+            <select
+              class="form-input"
+              [ngModel]="sessionReasoning() ?? resolvedSessionReasoning()"
+              (ngModelChange)="onSessionReasoningChange($event)"
+              [disabled]="disabled()"
+            >
+              @for (opt of sessionReasoningOptions(); track opt.value) {
+                @if (opt.value === null) {
+                  <option [ngValue]="null">{{ opt.label }}</option>
+                } @else {
+                  <option [value]="opt.value">{{ opt.label }}</option>
+                }
+              }
+            </select>
+            @if (sessionReasoning() !== null) {
+              <button type="button" class="reset-btn" (click)="onSessionReasoningChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco"><app-icon size="xs">close</app-icon></button>
+            }
+          </div>
+        </div>
       }
     </div>
   `,
@@ -294,6 +319,12 @@ export class ModelGroupComponent {
   // Session mode: single model override
   readonly sessionModel = signal<string | null>(null);
 
+  // Session mode: reasoning-level override for the model in effect. Owned here
+  // (not in the Advanced accordion) so session mode has exactly one writer of
+  // llm.reasoning_level; cleared on every model change so a level picked for
+  // one model can't silently ride into another family's option set.
+  readonly sessionReasoning = signal<string | null>(null);
+
   // Config-derived default (fallback when the server `effective_models` is
   // absent — e.g. older API or the "defaults" virtual expert). The server value
   // is authoritative because it includes the account/system default floor this
@@ -318,6 +349,9 @@ export class ModelGroupComponent {
   );
   readonly resolvedSessionModel = computed(() =>
     (readConfigPath(this.config(), 'llm.model') as string) ?? null
+  );
+  readonly resolvedSessionReasoning = computed(() =>
+    (readConfigPath(this.config(), 'llm.reasoning_level') as string) ?? null
   );
 
   // Server-resolved effective slot ({model, source}) or null when unavailable.
@@ -391,6 +425,7 @@ export class ModelGroupComponent {
       if (this.subagentModel() !== null) count++;
     } else {
       if (this.sessionModel() !== null) count++;
+      if (this.sessionReasoning() !== null) count++;
     }
     return count;
   });
@@ -419,7 +454,15 @@ export class ModelGroupComponent {
   onSessionModelChange(value: string | null): void {
     const resolved = value === this.resolvedSessionModel() ? null : value;
     this.sessionModel.set(resolved);
+    // A reasoning pick is model-specific intent — drop it with the model so a
+    // stale level never leaks into another family's option set.
+    this.sessionReasoning.set(null);
     this.persistModel('session', resolved);
+    this.change.emit();
+  }
+
+  onSessionReasoningChange(value: string | null): void {
+    this.sessionReasoning.set(value);
     this.change.emit();
   }
 
@@ -437,6 +480,8 @@ export class ModelGroupComponent {
     } else {
       const m = this.sessionModel();
       if (m) llm['model'] = m;
+      const r = this.sessionReasoning();
+      if (r !== null) llm['reasoning_level'] = r;
     }
 
     return Object.keys(llm).length > 0 ? { llm } : {};
@@ -447,6 +492,7 @@ export class ModelGroupComponent {
     this.tacticalModel.set(null);
     this.subagentModel.set(null);
     this.sessionModel.set(null);
+    this.sessionReasoning.set(null);
   }
 
   /** Prefill from expert config (called by parent when expert changes).
@@ -470,6 +516,9 @@ export class ModelGroupComponent {
       sub?.['model'] || tact?.['model'] || baseModel ? null : this.loadSavedModel('subagent'),
     );
     this.sessionModel.set(baseModel ? null : this.loadSavedModel('session'));
+    // Reasoning picks don't survive an expert switch — the new expert's config
+    // (and possibly family) makes the old level meaningless.
+    this.sessionReasoning.set(null);
   }
 
   private loadSavedModel(key: keyof typeof STORAGE_KEYS): string | null {
