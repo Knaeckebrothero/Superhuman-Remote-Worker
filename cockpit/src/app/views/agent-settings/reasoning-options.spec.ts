@@ -1,5 +1,10 @@
 import {describe, it, expect} from 'vitest';
-import {getReasoningOptions, reasoningOptionsForModel} from './reasoning-options';
+import {
+  defaultSelectableReasoning,
+  getReasoningOptions,
+  getSelectableReasoningOptions,
+  reasoningOptionsForModel,
+} from './reasoning-options';
 
 describe('getReasoningOptions (capability-driven)', () => {
   it('returns Default-only for method=none', () => {
@@ -83,5 +88,48 @@ describe('reasoningOptionsForModel', () => {
     expect(reasoningOptionsForModel(null, byModel)).toEqual([
       {value: null, label: 'Default'},
     ]);
+  });
+});
+
+describe('getSelectableReasoningOptions (no Default sentinel)', () => {
+  it('returns the concrete options for a toggle family', () => {
+    expect(
+      getSelectableReasoningOptions({method: 'binary_toggle', default: 'on', options: ['on', 'off']}),
+    ).toEqual([
+      {value: 'on', label: 'On'},
+      {value: 'off', label: 'Off'},
+    ]);
+  });
+
+  it('is empty when there is nothing to choose', () => {
+    expect(getSelectableReasoningOptions(null)).toEqual([]);
+    expect(getSelectableReasoningOptions({method: 'none', default: null, options: []})).toEqual([]);
+    expect(getSelectableReasoningOptions({method: 'always_on', default: 'on', options: []})).toEqual([]);
+    expect(getSelectableReasoningOptions({method: 'effort_enum', default: 'high', options: []})).toEqual([]);
+  });
+});
+
+describe('defaultSelectableReasoning', () => {
+  it('resolves to the family default when selectable', () => {
+    expect(
+      defaultSelectableReasoning({method: 'binary_toggle', default: 'on', options: ['on', 'off']}),
+    ).toBe('on');
+    expect(
+      defaultSelectableReasoning({method: 'effort_enum', default: 'high', options: ['low', 'medium', 'high']}),
+    ).toBe('high');
+  });
+
+  it('falls back to the first option when the default is out of set', () => {
+    expect(
+      defaultSelectableReasoning({method: 'effort_enum', default: 'turbo', options: ['low', 'medium', 'high']}),
+    ).toBe('low');
+    expect(
+      defaultSelectableReasoning({method: 'effort_enum', default: null, options: ['low', 'high']}),
+    ).toBe('low');
+  });
+
+  it('is null when nothing is selectable', () => {
+    expect(defaultSelectableReasoning(null)).toBeNull();
+    expect(defaultSelectableReasoning({method: 'none', default: null, options: []})).toBeNull();
   });
 });

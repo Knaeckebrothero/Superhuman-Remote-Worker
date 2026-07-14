@@ -59,3 +59,33 @@ export function reasoningOptionsForModel(
 ): ReasoningOption[] {
   return getReasoningOptions(modelId ? byModel[modelId] : null);
 }
+
+/**
+ * Concrete options WITHOUT the "Default" sentinel, for controls that preselect
+ * the resolved default value instead of offering a Default entry (the
+ * Settings-tab Reasoning select). Empty when the capability offers nothing the
+ * user can choose (`none`, `always_on`, missing/empty options) — callers hide
+ * the control entirely in that case.
+ */
+export function getSelectableReasoningOptions(
+  cap?: ReasoningCapability | null,
+): ReasoningOption[] {
+  if (!cap || cap.method === 'none' || cap.method === 'always_on') return [];
+  if (!cap.options?.length) return [];
+  return cap.options.map((o) => ({value: o, label: labelFor(o)}));
+}
+
+/**
+ * The value a capability resolves to when the user picks nothing: the family
+ * default when it is one of the selectable options, else the first option (an
+ * out-of-set default must not leave a native select unmatched — that renders
+ * as a blank control). `null` when nothing is selectable.
+ */
+export function defaultSelectableReasoning(
+  cap?: ReasoningCapability | null,
+): string | null {
+  const options = getSelectableReasoningOptions(cap);
+  if (!options.length) return null;
+  const fam = cap?.default ?? null;
+  return options.some((o) => o.value === fam) ? fam : options[0].value;
+}
