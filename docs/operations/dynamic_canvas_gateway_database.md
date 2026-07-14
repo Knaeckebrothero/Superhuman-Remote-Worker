@@ -83,7 +83,7 @@ operator:
 ```
 
 The homelab deployment uses this path. Its operator-owned manifest is
-`HomeLab/deployments_managed/canvas-edge/15-external-secret.yaml`; it maps only
+`HomeLab/deployments_managed/canvas-edge/15-database-eso.yaml`; it maps only
 the `username` and `password` properties from the dedicated Vault KV path
 `homelab/superhuman-remote-worker/canvas-gateway-db` into
 `srw-canvas-gateway-db`. Populate that path with the same password file used by

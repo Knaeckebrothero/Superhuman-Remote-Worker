@@ -134,10 +134,12 @@ ingress:
 # gate or assert either verification flag yet. The exact `srwcanvas.works`
 # private PSL rule has not propagated, and the current Cloudflare Tunnel
 # normalizes some request paths before the gateway. Universal SSL therefore is
-# not a production-edge acceptance claim for the current raw-path contract. The
-# production browser acceptance matrix and external-edge checks remain launch
-# gates. The gateway-specific database identity/config boundary is implemented,
-# but production still requires an operator-provisioned restricted role Secret.
+# not a production-edge acceptance claim for the current raw-path contract. A
+# dedicated DNS-only/L4/Canvas-edge route is staged in the HomeLab repository,
+# but it must not receive public DNS until its external relay and acceptance
+# checks exist. The production browser matrix remains a launch gate. The
+# gateway-specific database identity/config boundary is implemented; the named
+# restricted-role Secret is still provisioned out of band before enablement.
 canvas:
   livePreview:
     enabled: false
@@ -156,7 +158,7 @@ canvas:
         username: "srw_canvas_gateway"
         credentials:
           create: false
-          existingSecret: ""
+          existingSecret: "srw-canvas-gateway-db"
           usernameKey: "username"
           passwordKey: "password"
         provisionRole: false
@@ -164,11 +166,16 @@ canvas:
           min: 1
           max: 4
       networkPolicy:
-        # Intentionally empty so Helm also refuses accidental enablement. The
-        # existing cloudflared and Traefik HTTP edges normalize request paths;
-        # fill these only after selecting and proving a conforming edge.
-        edgeNamespaceSelector: {}
-        edgePodSelector: {}
+        # The selected edge is a dedicated NGINX boundary reached only through
+        # a DNS-only, TCP-preserving relay. These selectors are inert while the
+        # viewer is disabled; rawPathVerified and pslBoundaryVerified stay false
+        # until the public black-box gates pass.
+        edgeNamespaceSelector:
+          matchLabels:
+            srw.io/canvas-edge: "true"
+        edgePodSelector:
+          matchLabels:
+            srw.io/component: canvas-edge
         extraEgress: []
 # -----------------------------------------------------------------------------
 # Admin UIs

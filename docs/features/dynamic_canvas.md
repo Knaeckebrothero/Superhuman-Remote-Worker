@@ -19,6 +19,7 @@ related:
   - "[[dynamic_canvas_slice3a_verification]]"
   - "[[dynamic_canvas_slice3b_verification]]"
   - "[[dynamic_canvas_slice3c_verification]]"
+  - "[[dynamic_canvas_hosted_edge]]"
   - "[[shared_application_action_layer]]"
   - "[[builder_to_sessions_consolidation]]"
   - "[[persistent_chat_ui_redesign]]"
@@ -61,13 +62,23 @@ and has no shared application DB fallback. Bundled-Postgres
 development can reconcile the fixed restricted role through a bounded one-shot
 Job; production requires an operator-provisioned role and separate Secret. The
 packaged grants and denial contract passed a fresh fully migrated PostgreSQL 15
-integration run. The
-`srwcanvas.works` wildcard DNS/TLS coordinates are recorded, but the chart
-intentionally publishes no wildcard ingress and all viewer gates remain off by
-default. It therefore does not count as a production or user-facing Slice-3
-release. The current one-port proxy is cookie-free and rejects SSE, multipart
-streaming, and WebSocket upgrades. The trusted Slice-3 Cockpit closeout is now
-implemented: typed unsupported-browser/storage fallback, an authenticated
+integration run. A secret-safe operator preflight/reconciler and production
+runbook now cover the out-of-band role plus either ESO-owned or explicit native
+Secret provisioning; both apply modes passed against disposable k3d objects
+and left the normal local cluster dark.
+The selected hosted edge is now staged in the HomeLab repository as a dark
+DNS-only wildcard → TCP HAProxy → WireGuard → dedicated NGINX → internal
+gateway route. Its NGINX boundary preserves raw request targets, validates UUID
+SNI/Host, trusts PROXYv2 only from the relay, rate-limits before the gateway,
+strips sensitive forwarding/auth headers, and logs no request target. The
+deployment overlay names its NetworkPolicy selectors and restricted ESO Secret,
+but the public relay, DNS cutover, PSL rule, rollout of the current SRW code,
+and hosted acceptance do not exist yet. The chart still publishes no wildcard
+ingress and all viewer/attestation gates remain off. This therefore does not
+count as a production or user-facing Slice-3 release. The current one-port
+proxy is cookie-free and rejects SSE, multipart streaming, and WebSocket
+upgrades. The trusted Slice-3 Cockpit closeout is now implemented: typed
+unsupported-browser/storage fallback, an authenticated
 wrapper pop-out, conditional reset-origin UI/API, true client last-sync and
 source-kind chrome, and normalized Canvas tool cards. A local production-build
 Playwright harness exercises that UI and an intercepted synthetic viewer, with
@@ -78,6 +89,12 @@ evidence for live TLS, the deployed Python gateway, real CHIPS/PSL behavior,
 Safari/iOS/PWA, the hosted edge, or an
 enabled k3d live-app flow. Those external browser/edge gates remain Slice-3
 launch work; multi-port/streaming apps and Slices 4–6 remain planned.
+A cookie-free hosted black-box verifier now checks Cockpit/deep routes,
+API/IDE, Keycloak, the deployed PWA shell hash, the authoritative PRIVATE PSL
+rule, and opt-in raw-path/rate boundaries without printing URLs, response
+bodies, cookies, or headers. Against the still-old hosted release it correctly
+fails Cockpit/API/IDE/PWA, raw-path routing, and PSL while the final Keycloak
+login document passes. No attestation was changed from that evidence.
 Original brainstorm filed 2026-05-13. Pointer model agreed and repository,
 security, accessibility, and comparable-product audits completed 2026-07-13.
 See the
@@ -2578,12 +2595,14 @@ but that new CI path has not yet reported acceptance evidence.
 
 The remaining Slice-3 launch work is:
 
-- provision an operator-owned, separately registrable wildcard Canvas domain,
-  DNS/TLS/raw-path-preserving edge, effective private PSL boundary, and edge
-  rate limits before the gateway; the chart intentionally does not infer or
-  create those resources;
-- provision the operator-owned restricted gateway PostgreSQL role and dedicated
-  credential Secret for production;
+- deploy the staged operator-owned DNS/TLS/raw-path edge, provision its public
+  TCP relay and WireGuard route, cut the wildcard to DNS-only, and obtain then
+  verify the effective private PSL boundary in shipping browsers. The checked-in
+  NGINX edge implements pre-gateway rate limits, but the chart intentionally
+  does not infer or publish these operator resources;
+- after the current release applies migrations through `0062`, run the
+  implemented out-of-band workflow to provision the restricted gateway
+  PostgreSQL role and populate the dedicated ESO credential Secret;
 - deploy and black-box verify the implemented trusted-parent anti-framing
   boundary through the production ingress/edge and service-worker lifecycle.
   Repository tests now prove exact enforced `frame-ancestors 'none'` and
@@ -2602,21 +2621,36 @@ The remaining Slice-3 launch work is:
 These remaining launch gates do not justify expanding the shared-secret
 architecture inside this checkpoint.
 
-**Hosted deployment checkpoint (2026-07-13):** `srwcanvas.works` is reserved
-with one-label origins at `<uuid>.srwcanvas.works`. Its proxied wildcard DNS
-record is now published: authoritative Cloudflare DNS returns A/AAAA records
-for a random UUID host, and the active edge certificate contains both
-`srwcanvas.works` and `*.srwcanvas.works`. A public UUID-host probe reaches
-Cloudflare and returns the intended catch-all `404`; no Canvas gateway route is
-published behind the wildcard yet.
+**Hosted deployment checkpoint (2026-07-14):** `srwcanvas.works` is reserved
+with one-label origins at `<uuid>.srwcanvas.works`. Its current proxied wildcard
+still resolves through Cloudflare and returns the inert catch-all `404`; no
+Canvas gateway route is published behind it. Cloudflare's non-disableable
+baseline normalization merges adjacent slashes, so the proxied record and
+Tunnel are explicitly disqualified from the raw-path boundary.
 
-This proves DNS and edge-certificate provisioning only. The exact private PSL
-entry is not yet propagated, and the current Cloudflare Tunnel applies
-non-disableable baseline path normalization such as adjacent-slash merging.
-Cloudflare-proxied Universal SSL is therefore not a production-edge acceptance
-claim for the current raw-path contract. Keep `rawPathVerified`,
-`pslBoundaryVerified`, the viewer gate, and the master live-preview gate false
-until that contract is resolved and the other launch gates above land.
+The selected replacement is checked in under
+`HomeLab/deployments_managed/canvas-edge/`: a DNS-only wildcard targets a public
+TCP-mode HAProxy relay, which crosses WireGuard to a dedicated MetalLB address
+and non-root NGINX edge before the internal gateway. The staged edge has strict
+UUID SNI/Host admission, PROXYv2 pinning, a URI-less proxy route, pre-gateway
+request/connection limits, redacted logs, exact edge/gateway NetworkPolicies,
+DNS-01 wildcard TLS, and a dedicated ESO database credential mapping. Its
+pinned NGINX configuration passed syntax/startup, HTTP/1.1 and HTTP/2 raw-target
+differentials, header stripping, host/SNI rejection, and a bounded burst which
+returned both admitted responses and `429`s. These are repository/local edge
+tests, not public-route evidence.
+
+The secret-safe production role/Secret workflow and the redacted
+`scripts/verify-canvas-hosted-edge.py` harness are also implemented. The live
+cluster still runs the older `sha-3a14ada` release and lacks migrations through
+`0062`, the gateway, restricted role, and dedicated Secret. The relay and
+WireGuard route have not been provisioned, the wildcard has not been changed to
+DNS-only, and the authoritative PSL has no exact private `srwcanvas.works`
+rule. The live verifier therefore fails Cockpit/API/IDE/PWA protection,
+raw-path routing, and PSL as expected; Keycloak's final login document already
+blocks cross-origin framing. Keep `rawPathVerified`, `pslBoundaryVerified`, the
+viewer gate, and the master live-preview gate false until the public route,
+shipping-browser PSL behavior, and complete hosted acceptance matrix pass.
 
 Do not enable or claim the user-facing slice complete until real browsers prove
 no BFF/Keycloak cookie or authorization-header leakage. The default-off 3A–3C
