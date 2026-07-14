@@ -38,7 +38,10 @@ def _ensure(outcome, status):
 # --------------------------------------------------------------------------- #
 class TestScholarProvisionMarker:
     def test_marker_present_returns_parent_id(self):
-        job = {"id": "scholar", "context": {"provisions_parent_workspace": "parent-uuid"}}
+        job = {
+            "id": "scholar",
+            "context": {"provisions_parent_workspace": "parent-uuid"},
+        }
         assert main._scholar_provision_parent_id(job) == "parent-uuid"
 
     def test_marker_present_in_json_string_context(self):
@@ -67,9 +70,12 @@ class TestScholarProvisionMarker:
 # --------------------------------------------------------------------------- #
 class TestScholarShouldProvision:
     def test_sandbox_backend_provisions(self):
-        assert main._scholar_should_provision_parent_container(
-            {"workspace": {"backend": "sandbox"}}
-        ) is True
+        assert (
+            main._scholar_should_provision_parent_container(
+                {"workspace": {"backend": "sandbox"}}
+            )
+            is True
+        )
 
     def test_unset_backend_provisions(self):
         # No explicit backend defaults to the sandbox container path.
@@ -78,20 +84,32 @@ class TestScholarShouldProvision:
 
     def test_vm_backend_does_not_provision(self):
         # VM/remote parents keep today's behavior (out of Slice 1 scope).
-        assert main._scholar_should_provision_parent_container(
-            {"workspace": {"backend": "vm"}}
-        ) is False
-        assert main._scholar_should_provision_parent_container(
-            {"workspace": {"backend": "remote"}}
-        ) is False
+        assert (
+            main._scholar_should_provision_parent_container(
+                {"workspace": {"backend": "vm"}}
+            )
+            is False
+        )
+        assert (
+            main._scholar_should_provision_parent_container(
+                {"workspace": {"backend": "remote"}}
+            )
+            is False
+        )
 
     def test_lite_backend_does_not_provision(self):
-        assert main._scholar_should_provision_parent_container(
-            {"workspace": {"backend": "virtual"}}
-        ) is False
-        assert main._scholar_should_provision_parent_container(
-            {"workspace": {"backend": "none"}}
-        ) is False
+        assert (
+            main._scholar_should_provision_parent_container(
+                {"workspace": {"backend": "virtual"}}
+            )
+            is False
+        )
+        assert (
+            main._scholar_should_provision_parent_container(
+                {"workspace": {"backend": "none"}}
+            )
+            is False
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -135,65 +153,106 @@ class TestProvisionParentWorkspaceForScholar:
         """Patch DB + ensure_workspace + unblock; return handles for assertions."""
         state = {"merge": [], "conn": _FakeConn(), "fail": AsyncMock()}
 
-        monkeypatch.setattr(main.postgres_db, "merge_job_context",
-                            AsyncMock(side_effect=lambda jid, delta: state["merge"].append((jid, delta))))
-        monkeypatch.setattr(main.postgres_db, "acquire", lambda: _FakeAcquire(state["conn"]))
+        monkeypatch.setattr(
+            main.postgres_db,
+            "merge_job_context",
+            AsyncMock(
+                side_effect=lambda jid, delta: state["merge"].append((jid, delta))
+            ),
+        )
+        monkeypatch.setattr(
+            main.postgres_db, "acquire", lambda: _FakeAcquire(state["conn"])
+        )
         monkeypatch.setattr(main, "_fail_subjob_and_unblock_parent", state["fail"])
         return state
 
     @pytest.mark.asyncio
     async def test_pending_returns_wait(self, monkeypatch, scholar_job, wire):
-        parent = {"id": "parent-uuid", "context": {"workspace_container": {"status": "creating"}}, "config_override": {}}
+        parent = {
+            "id": "parent-uuid",
+            "context": {"workspace_container": {"status": "creating"}},
+            "config_override": {},
+        }
         monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=parent))
-        monkeypatch.setattr(main, "ensure_workspace",
-                            AsyncMock(return_value=_ensure(main.EnsureOutcome.PENDING, "creating")))
+        monkeypatch.setattr(
+            main,
+            "ensure_workspace",
+            AsyncMock(return_value=_ensure(main.EnsureOutcome.PENDING, "creating")),
+        )
 
-        result = await main._provision_parent_workspace_for_scholar(scholar_job, "parent-uuid")
+        result = await main._provision_parent_workspace_for_scholar(
+            scholar_job, "parent-uuid"
+        )
 
         assert result == "wait"
         assert state_unchanged(wire)
 
     @pytest.mark.asyncio
-    async def test_failed_returns_fail_and_unblocks(self, monkeypatch, scholar_job, wire):
+    async def test_failed_returns_fail_and_unblocks(
+        self, monkeypatch, scholar_job, wire
+    ):
         parent = {"id": "parent-uuid", "context": {}, "config_override": {}}
         monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=parent))
-        monkeypatch.setattr(main, "ensure_workspace",
-                            AsyncMock(return_value=_ensure(main.EnsureOutcome.FAILED, "failed")))
+        monkeypatch.setattr(
+            main,
+            "ensure_workspace",
+            AsyncMock(return_value=_ensure(main.EnsureOutcome.FAILED, "failed")),
+        )
 
-        result = await main._provision_parent_workspace_for_scholar(scholar_job, "parent-uuid")
+        result = await main._provision_parent_workspace_for_scholar(
+            scholar_job, "parent-uuid"
+        )
 
         assert result == "fail"
         wire["fail"].assert_awaited_once()
         assert not wire["merge"]  # not promoted
 
     @pytest.mark.asyncio
-    async def test_missing_parent_returns_fail_without_provisioning(self, monkeypatch, scholar_job, wire):
+    async def test_missing_parent_returns_fail_without_provisioning(
+        self, monkeypatch, scholar_job, wire
+    ):
         monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=None))
         ensure = AsyncMock()
         monkeypatch.setattr(main, "ensure_workspace", ensure)
 
-        result = await main._provision_parent_workspace_for_scholar(scholar_job, "gone-uuid")
+        result = await main._provision_parent_workspace_for_scholar(
+            scholar_job, "gone-uuid"
+        )
 
         assert result == "fail"
         wire["fail"].assert_awaited_once()
         ensure.assert_not_awaited()  # never tried to provision a dead parent
 
     @pytest.mark.asyncio
-    async def test_ready_promotes_scholar_to_inherit(self, monkeypatch, scholar_job, wire):
+    async def test_ready_promotes_scholar_to_inherit(
+        self, monkeypatch, scholar_job, wire
+    ):
         # Initial read: parent still creating (no host). Fresh read after ready:
         # the parent row now carries the ready container that create_workspace wrote.
-        parent_creating = {"id": "parent-uuid",
-                           "context": {"workspace_container": {"status": "creating"}},
-                           "config_override": {"workspace": {"container": {"cpu": "500m"}}}}
-        parent_ready = {"id": "parent-uuid",
-                        "context": {"workspace_container": dict(READY_CONTAINER)},
-                        "config_override": {}}
-        monkeypatch.setattr(main.postgres_db, "get_job",
-                            AsyncMock(side_effect=[parent_creating, parent_ready]))
-        monkeypatch.setattr(main, "ensure_workspace",
-                            AsyncMock(return_value=_ensure(main.EnsureOutcome.READY, "ready")))
+        parent_creating = {
+            "id": "parent-uuid",
+            "context": {"workspace_container": {"status": "creating"}},
+            "config_override": {"workspace": {"container": {"cpu": "500m"}}},
+        }
+        parent_ready = {
+            "id": "parent-uuid",
+            "context": {"workspace_container": dict(READY_CONTAINER)},
+            "config_override": {},
+        }
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_job",
+            AsyncMock(side_effect=[parent_creating, parent_ready]),
+        )
+        monkeypatch.setattr(
+            main,
+            "ensure_workspace",
+            AsyncMock(return_value=_ensure(main.EnsureOutcome.READY, "ready")),
+        )
 
-        result = await main._provision_parent_workspace_for_scholar(scholar_job, "parent-uuid")
+        result = await main._provision_parent_workspace_for_scholar(
+            scholar_job, "parent-uuid"
+        )
 
         assert result == "promoted"
         wire["fail"].assert_not_awaited()
@@ -214,4 +273,6 @@ class TestProvisionParentWorkspaceForScholar:
 
 def state_unchanged(wire) -> bool:
     """No promotion side effects happened."""
-    return not wire["merge"] and not wire["conn"].executed and not wire["fail"].await_count
+    return (
+        not wire["merge"] and not wire["conn"].executed and not wire["fail"].await_count
+    )

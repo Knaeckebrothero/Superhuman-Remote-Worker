@@ -3647,9 +3647,7 @@ async def _fail_subjob_and_unblock_parent(job: dict, message: str) -> None:
     failure is self-healing, not just today's inherit-timeout.
     """
     job_id = str(job["id"])
-    await postgres_db.update_job_status(
-        job_id, status="failed", error_message=message
-    )
+    await postgres_db.update_job_status(job_id, status="failed", error_message=message)
     # The unblock handlers classify the outcome from job['status']; the in-memory
     # row still holds the pre-fail status, so sync it before delegating. Each
     # handler is a no-op for the wrong subjob type (scholar_target / creation_order
