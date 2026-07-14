@@ -336,7 +336,9 @@ async def test_same_origin_exchange_sets_viewer_and_clears_transient_cookie() ->
 
 
 @pytest.mark.asyncio
-async def test_exchange_reports_browser_storage_when_partitioned_binding_is_missing() -> None:
+async def test_exchange_reports_browser_storage_when_partitioned_binding_is_missing() -> (
+    None
+):
     config, session, sessions, db = _fixture()
     app = CanvasGatewayApp(
         db=db,
@@ -362,9 +364,7 @@ async def test_exchange_reports_browser_storage_when_partitioned_binding_is_miss
         )
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == (
-        "canvas_browser_storage_unavailable"
-    )
+    assert response.json()["detail"]["code"] == ("canvas_browser_storage_unavailable")
     assert sessions.exchange_calls == []
 
 
