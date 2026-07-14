@@ -303,8 +303,7 @@ def _require_canvas_parent_fetch_metadata(request: Request) -> None:
             detail={
                 "code": "canvas_browser_unsupported",
                 "message": (
-                    "This browser cannot enforce the Canvas live-app isolation "
-                    "contract"
+                    "This browser cannot enforce the Canvas live-app isolation contract"
                 ),
             },
         )
