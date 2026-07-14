@@ -1,8 +1,8 @@
 # S3 object store is a near-hard requirement — ship a bundled fallback
 
 **Status**: RESOLVED (2026-07-14) — all 3 proposal items shipped (unpushed on
-develop, live-verified on k3d). Kept in issues/ (not archived to done/) because
-the orchestrator startup warning + chart NOTES/values cite this exact path.
+develop, live-verified on k3d). Archived to done/; the orchestrator startup
+warning message + its test/doc references were updated to this path.
 Spec: `docs/superpowers/specs/2026-07-12-bundled-garage-object-store-design.md`.
 Plan: `docs/superpowers/plans/2026-07-12-bundled-garage-object-store.md`.
 

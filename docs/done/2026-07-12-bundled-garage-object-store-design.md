@@ -6,12 +6,12 @@
 > plus the item-3 startup warning (either-seam) + opt-in `OBJECT_STORE_REQUIRED`
 > fail-closed flag, plus the local-dev MinIO→Garage swap. Live-verified on k3d:
 > bootstrap idempotent, S3 round-trip, bucket-scoping, agent-rclone (provider
-> "Other") round-trip. Origin issue (kept in issues/):
-> `docs/issues/s3_object_store_bundled_fallback.md`.
+> "Other") round-trip. Origin issue:
+> `docs/done/s3_object_store_bundled_fallback.md`.
 
 **Date**: 2026-07-12
 **Status**: Approved — ready for implementation plan
-**Issue**: `docs/issues/s3_object_store_bundled_fallback.md` (OPEN → in-progress)
+**Issue**: `docs/done/s3_object_store_bundled_fallback.md` (OPEN → in-progress)
 **Scope**: Helm chart only. No orchestrator/agent code changes.
 
 ## Problem
@@ -215,7 +215,7 @@ update them.
 - `helm/templates/external-secret.yaml` — map `GARAGE_*`
 - `helm/templates/NOTES.txt` — warning block
 - `helm/ci/*-values.yaml` — a variant with `garage.enabled=true`
-- `docs/issues/s3_object_store_bundled_fallback.md` — status → in-progress,
+- `docs/done/s3_object_store_bundled_fallback.md` — status → in-progress,
   link this spec
 
 ## Open questions for implementation
