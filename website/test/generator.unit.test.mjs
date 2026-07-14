@@ -13,8 +13,18 @@ function collectEnumPaths(node, prefix = '') {
   }
   return out;
 }
-// Keep in sync with the structural rules in generator.mjs's validate().
-const KNOWN_ENUM_PATHS = ['databases.neo4j.edition', 'vmController.transport'];
+// Tripwire: every enum in helm/values.schema.json must be acknowledged here so a
+// newly-added one forces a conscious call — either wire a structural rule into
+// generator.mjs's validate() (customer-facing profile fields) or whitelist it as
+// operator-only. `databases.neo4j.edition` + `vmController.transport` are the
+// generator-validated ones; the `canvas.livePreview.viewer.*` enums are operator
+// edge-topology settings the customer config generator never surfaces.
+const KNOWN_ENUM_PATHS = [
+  'databases.neo4j.edition',
+  'vmController.transport',
+  'canvas.livePreview.viewer.deploymentProfile',
+  'canvas.livePreview.viewer.cookieMode',
+];
 
 const evalInputs = {
   licenseAccepted: true, domain: 'eval.example.com',
