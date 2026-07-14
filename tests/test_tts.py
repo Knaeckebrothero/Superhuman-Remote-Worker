@@ -2221,8 +2221,13 @@ class TestAuxThinkLeakControl:
         assert _aux_extra_body("gemma-4-moe", "off") == {
             "chat_template_kwargs": {"enable_thinking": False}
         }
-        # minimax: family reasoning_split; its reasoning method is 'none' so no toggle.
-        assert _aux_extra_body("MiniMax-M3", "off") == {"reasoning_split": True}
+        # minimax-m3: family reasoning_split merges with the thinking toggle
+        # (binary_toggle since the native-API promotion) — read-aloud "off" now
+        # genuinely disables M3 thinking, a time-to-first-audio win.
+        assert _aux_extra_body("MiniMax-M3", "off") == {
+            "reasoning_split": True,
+            "thinking": {"type": "disabled"},
+        }
 
 
 class TestThinkStrip:
