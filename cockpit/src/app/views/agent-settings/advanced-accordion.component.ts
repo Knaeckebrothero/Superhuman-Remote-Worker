@@ -135,27 +135,10 @@ import {ModelService} from '../../core/services/model.service';
                 </div>
               </div>
             } @else {
-              <!-- Session: single model inference settings -->
-              <div class="field-row" [class.modified]="sessionReasoning() !== null">
-                <label class="field-label">{{ 'advanced.labels.reasoning' | transloco }}</label>
-                <div class="field-control">
-                  <select class="form-input"
-                    [ngModel]="sessionReasoning() ?? resolvedSessionReasoning()"
-                    (ngModelChange)="onSessionReasoningChange($event)"
-                    [disabled]="disabled()">
-                    @for (opt of sessionReasoningOptions(); track opt.value) {
-                      @if (opt.value === null) {
-                        <option [ngValue]="null">{{ opt.label }}</option>
-                      } @else {
-                        <option [value]="opt.value">{{ opt.label }}</option>
-                      }
-                    }
-                  </select>
-                  @if (sessionReasoning() !== null) {
-                    <button type="button" class="reset-btn" (click)="sessionReasoning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                  }
-                </div>
-              </div>
+              <!-- Session: single model inference settings. The Reasoning
+                   select moved to the Settings tab's MODEL group
+                   (model-group.component.ts), which is the single session-mode
+                   writer of llm.reasoning_level. -->
               <div class="field-row" [class.modified]="sessionTemperature() !== null">
                 <label class="field-label">
                   {{ 'advanced.labels.temperature' | transloco: {value: effectiveSessionTemp()} }}
@@ -905,7 +888,6 @@ export class AdvancedAccordionComponent {
   readonly tacticalReasoning = signal<string | null>(null);
   readonly tacticalTemperature = signal<number | null>(null);
   readonly tacticalMultimodal = signal<boolean | null>(null);
-  readonly sessionReasoning = signal<string | null>(null);
   readonly sessionTemperature = signal<number | null>(null);
   readonly sessionMultimodal = signal<boolean | null>(null);
   readonly topP = signal<number | null>(null);
@@ -994,7 +976,6 @@ export class AdvancedAccordionComponent {
     (this.r('llm.tactical.temperature') ?? this.mv(this.effectiveTacticalModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
   readonly resolvedTacticalMultimodal = computed(() =>
     (this.r('llm.tactical.multimodal') ?? this.mv(this.effectiveTacticalModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
-  readonly resolvedSessionReasoning = computed(() => this.r('llm.reasoning_level') as string | null);
   readonly resolvedSessionTemp = computed(() =>
     (this.mv(this.effectiveSessionModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
   readonly resolvedSessionMultimodal = computed(() =>
@@ -1080,13 +1061,6 @@ export class AdvancedAccordionComponent {
       this.modelService.reasoningByModel(),
     )
   );
-  readonly sessionReasoningOptions = computed(() =>
-    reasoningOptionsForModel(
-      this.sessionModelOverride() ?? this.r('llm.model') as string | null,
-      this.modelService.reasoningByModel(),
-    )
-  );
-
   readonly inferenceModifiedCount = computed(() => {
     let c = 0;
     if (this.strategicReasoning() !== null) c++;
@@ -1095,7 +1069,6 @@ export class AdvancedAccordionComponent {
     if (this.tacticalReasoning() !== null) c++;
     if (this.tacticalTemperature() !== null) c++;
     if (this.tacticalMultimodal() !== null) c++;
-    if (this.sessionReasoning() !== null) c++;
     if (this.sessionTemperature() !== null) c++;
     if (this.sessionMultimodal() !== null) c++;
     if (this.topP() !== null) c++;
@@ -1143,7 +1116,6 @@ export class AdvancedAccordionComponent {
   onTacticalReasoningChange(v: string | null): void { this.tacticalReasoning.set(v); this.emitChange(); }
   onTacticalTempChange(v: number): void { this.tacticalTemperature.set(this.clampTemp(v)); this.emitChange(); }
   onTacticalMultimodalChange(e: Event): void { this.tacticalMultimodal.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onSessionReasoningChange(v: string | null): void { this.sessionReasoning.set(v); this.emitChange(); }
   onSessionTempChange(v: number): void { this.sessionTemperature.set(this.clampTemp(v)); this.emitChange(); }
   onSessionMultimodalChange(e: Event): void { this.sessionMultimodal.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onTopPChange(v: number | null): void { this.topP.set(v); this.emitChange(); }
@@ -1176,7 +1148,7 @@ export class AdvancedAccordionComponent {
       if (this.tacticalMultimodal() !== null) t['multimodal'] = this.tacticalMultimodal();
       if (Object.keys(t).length) llm['tactical'] = t;
     } else {
-      if (this.sessionReasoning() !== null) llm['reasoning_level'] = this.sessionReasoning();
+      // llm.reasoning_level is owned by ModelGroupComponent in session mode.
       if (this.sessionTemperature() !== null) llm['temperature'] = this.sessionTemperature();
       if (this.sessionMultimodal() !== null) llm['multimodal'] = this.sessionMultimodal();
     }
@@ -1287,7 +1259,6 @@ export class AdvancedAccordionComponent {
     this.tacticalReasoning.set(null);
     this.tacticalTemperature.set(null);
     this.tacticalMultimodal.set(null);
-    this.sessionReasoning.set(null);
     this.sessionTemperature.set(null);
     this.sessionMultimodal.set(null);
     this.topP.set(null);
