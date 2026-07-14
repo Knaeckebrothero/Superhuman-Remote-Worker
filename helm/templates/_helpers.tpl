@@ -567,3 +567,17 @@ path-style). Otherwise the configured provider (default "Minio").
 {{- .Values.virtualWorkspace.s3.provider | default "Minio" -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Effective Secret name for the Canvas gateway's restricted PostgreSQL login.
+Chart-created and Vault/ESO sources use the stable chart-owned name; an
+operator-precreated Secret keeps its explicit name.
+*/}}
+{{- define "srw.canvasGatewayDatabaseSecretName" -}}
+{{- $credentials := .Values.canvas.livePreview.viewer.database.credentials -}}
+{{- if or $credentials.create (ne (trim $credentials.vaultPath) "") -}}
+{{- printf "%s-canvas-gateway-db" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- $credentials.existingSecret -}}
+{{- end -}}
+{{- end -}}

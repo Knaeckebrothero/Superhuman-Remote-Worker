@@ -18,9 +18,10 @@ PSL, raw-path, and browser acceptance gates remain independent.
 
 Production Helm renders never receive an application-database administrator
 credential and never create this role. The operator applies the packaged
-least-privilege SQL out of band, then points
+least-privilege SQL out of band, then either points
 `canvas.livePreview.viewer.database.credentials.existingSecret` at a Secret
-containing only the restricted username and password.
+containing only the restricted username and password or selects the conditional
+ESO mapping with `credentials.vaultPath`.
 
 ## Preconditions
 
@@ -82,15 +83,16 @@ operator:
 ./scripts/provision-canvas-gateway-database.sh --apply
 ```
 
-The homelab deployment uses this path. Its operator-owned manifest is
-`HomeLab/deployments_managed/canvas-edge/15-database-eso.yaml`; it maps only
-the `username` and `password` properties from the dedicated Vault KV path
-`homelab/superhuman-remote-worker/canvas-gateway-db` into
-`srw-canvas-gateway-db`. Populate that path with the same password file used by
-the role reconciler through the Vault UI or another secret-safe operator
-workflow before Fleet reconciles it. Do not place the gateway credential in the
-shared `srw-secrets` bundle and do not use `--apply-secret` when ESO owns the
-target Secret.
+The homelab deployment uses the chart's feature-gated ESO path. Set
+`canvas.livePreview.viewer.database.credentials.vaultPath` to
+`homelab/superhuman-remote-worker/canvas-gateway-db`; when—and only when—
+`canvas.livePreview.viewer.enabled=true`, the SRW chart maps the `username` and
+`password` properties into `srw-canvas-gateway-db`. Merely configuring the path
+while the gateway is disabled creates no ExternalSecret and makes no provider
+request, matching the lifecycle of other optional workloads. Populate the Vault
+path with the same password file used by the role reconciler before enabling
+the viewer. Do not place the gateway credential in the shared `srw-secrets`
+bundle and do not use `--apply-secret` when ESO owns the target Secret.
 
 For an operator-managed native Kubernetes Secret, set an explicit target and
 apply both surfaces:
@@ -130,7 +132,8 @@ canvas:
         username: srw_canvas_gateway
         credentials:
           create: false
-          existingSecret: srw-canvas-gateway-db
+          existingSecret: ""
+          vaultPath: homelab/superhuman-remote-worker/canvas-gateway-db
           usernameKey: username
           passwordKey: password
         provisionRole: false
@@ -148,8 +151,8 @@ kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
   -o jsonpath='{.metadata.name}{"\n"}'
 ```
 
-For the homelab ESO path, also require a Ready condition without displaying
-Secret data:
+After enabling the homelab viewer, also require the conditionally rendered ESO
+resource to become Ready without displaying Secret data:
 
 ```bash
 kubectl --context main --namespace superhuman-remote-worker \
