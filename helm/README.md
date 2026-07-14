@@ -238,6 +238,9 @@ that role with only the documented Canvas viewer grants. For development with
 the bundled database, `credentials.create=true` plus `provisionRole=true`
 generates a dedicated Secret and runs the bounded role reconciler. That mode is
 rejected for a production viewer.
+The secret-safe production workflow, preflight, direct-Secret option, and
+rotation cautions are documented in
+`docs/operations/dynamic_canvas_gateway_database.md`.
 
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)

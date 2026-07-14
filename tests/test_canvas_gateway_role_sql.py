@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ROLE_SQL = ROOT / "helm/files/canvas-viewer-role.sql"
+OPERATOR_SCRIPT = ROOT / "scripts/provision-canvas-gateway-database.sh"
 
 
 def test_canvas_gateway_role_script_is_secret_safe_and_fail_closed() -> None:
@@ -28,6 +29,9 @@ def test_canvas_gateway_role_script_is_secret_safe_and_fail_closed() -> None:
     assert "pg_auth_members" in source
     assert "pg_shdepend" in source
     assert "has_schema_privilege(:'canvas_role', 'public', 'CREATE')" in source
+    assert "REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I" in source
+    assert "has_database_privilege(" in source
+    assert "canvas_role_can_create_database" in source
 
 
 def test_canvas_gateway_role_script_grants_only_the_gateway_write_surface() -> None:
@@ -64,3 +68,20 @@ def test_canvas_gateway_role_script_is_packaged_once_for_helm_and_compose() -> N
     for relative_path in ("docker-compose.yaml", "docker-compose.local.yaml"):
         compose = (ROOT / relative_path).read_text()
         assert compose.count("./helm/files/canvas-viewer-role.sql:") == 1
+
+
+def test_canvas_gateway_operator_script_keeps_secrets_out_of_argv_and_output() -> None:
+    source = OPERATOR_SCRIPT.read_text()
+
+    assert "set +x" in source
+    assert "umask 077" in source
+    assert "CANVAS_VIEWER_POSTGRES_PASSWORD_FILE" in source
+    assert 'PGPASSWORD="$CANVAS_VIEWER_POSTGRES_PASSWORD"' in source
+    assert "unset PGPASSWORD" in source
+    assert '--from-file="$CANVAS_VIEWER_SECRET_PASSWORD_KEY=' in source
+    assert "--from-literal" not in source
+    assert "--dry-run=client -o yaml" in source
+    assert "apply -f - >/dev/null" in source
+    assert "export CANVAS_VIEWER_POSTGRES_PASSWORD" not in source
+    assert "echo $CANVAS_VIEWER_POSTGRES_PASSWORD" not in source
+    assert "printf '%s' \"$CANVAS_VIEWER_POSTGRES_PASSWORD\"" in source
