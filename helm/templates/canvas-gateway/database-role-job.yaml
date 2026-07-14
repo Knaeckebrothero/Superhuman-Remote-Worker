@@ -1,10 +1,7 @@
 {{- if and .Values.canvas.livePreview.viewer.enabled .Values.canvas.livePreview.viewer.database.provisionRole }}
 {{- $database := .Values.canvas.livePreview.viewer.database -}}
 {{- $credentials := $database.credentials -}}
-{{- $databaseSecretName := $credentials.existingSecret -}}
-{{- if $credentials.create -}}
-{{- $databaseSecretName = printf "%s-canvas-gateway-db" (include "srw.fullname" .) -}}
-{{- end -}}
+{{- $databaseSecretName := include "srw.canvasGatewayDatabaseSecretName" . -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
