@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
-from datetime import UTC, datetime, timedelta
+import re
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -29,6 +31,7 @@ from services.canvas_viewer_config import (
     canvas_viewer_config,
 )
 from services.canvas_viewer_sessions import (
+    CanvasBootstrapAuthorization,
     CanvasViewerAttachmentGrant,
     CanvasViewerError,
     CanvasViewerSessionService,
@@ -60,7 +63,7 @@ def _enable_production(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CANVAS_VIEWER_DEPLOYMENT_PROFILE", "production")
     monkeypatch.setenv("CANVAS_VIEWER_COOKIE_MODE", "psl-isolated")
     monkeypatch.setenv("CANVAS_VIEWER_DOMAIN", "user-content.test")
-    monkeypatch.setenv("CANVAS_VIEWER_HOST_SUFFIX", ".canvas.user-content.test")
+    monkeypatch.setenv("CANVAS_VIEWER_HOST_SUFFIX", ".user-content.test")
     monkeypatch.setenv("CANVAS_VIEWER_COCKPIT_ORIGINS", "https://cockpit.platform.test")
     monkeypatch.setenv("CANVAS_VIEWER_RAW_PATH_VERIFIED", "true")
     monkeypatch.setenv("CANVAS_VIEWER_PSL_BOUNDARY_VERIFIED", "true")
@@ -84,7 +87,7 @@ def test_production_viewer_requires_all_isolation_attestations(
     _enable_production(monkeypatch)
     config = canvas_viewer_config()
     generation = uuid4()
-    host = f"{generation}.canvas.user-content.test"
+    host = f"{generation}.user-content.test"
 
     assert config.enabled is True
     assert config.cookie_mode == "psl-isolated"
@@ -113,6 +116,38 @@ def test_production_viewer_requires_all_isolation_attestations(
         canvas_viewer_config()
 
 
+def test_production_viewer_accepts_origins_directly_below_dedicated_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_viewer_env(monkeypatch)
+    _enable_production(monkeypatch)
+    monkeypatch.setenv("CANVAS_VIEWER_HOST_SUFFIX", ".user-content.test")
+
+    config = canvas_viewer_config()
+    generation = uuid4()
+
+    assert config.generation_for_host(f"{generation}.user-content.test") == generation
+    assert config.public_origin(generation) == (
+        f"https://{generation}.user-content.test"
+    )
+    with pytest.raises(CanvasViewerConfigurationError, match="host is invalid"):
+        config.generation_for_host(f"nested.{generation}.user-content.test")
+
+
+def test_production_viewer_rejects_suffix_below_attested_psl_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_viewer_env(monkeypatch)
+    _enable_production(monkeypatch)
+    monkeypatch.setenv(
+        "CANVAS_VIEWER_HOST_SUFFIX",
+        ".canvas.user-content.test",
+    )
+
+    with pytest.raises(CanvasViewerConfigurationError, match="exact effective-PSL"):
+        canvas_viewer_config()
+
+
 def test_cookie_free_mode_is_development_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -130,10 +165,10 @@ def test_cookie_free_mode_is_development_only(
 @pytest.mark.parametrize(
     "host",
     [
-        "not-a-uuid.canvas.user-content.test",
-        "00000000-0000-0000-0000-000000000000.evil.canvas.user-content.test",
-        "00000000-0000-0000-0000-000000000000.canvas.user-content.test:443",
-        "00000000-0000-0000-0000-000000000000.canvas.user-content.test.evil",
+        "not-a-uuid.user-content.test",
+        "00000000-0000-0000-0000-000000000000.evil.user-content.test",
+        "00000000-0000-0000-0000-000000000000.user-content.test:443",
+        "00000000-0000-0000-0000-000000000000.user-content.test.evil",
     ],
 )
 def test_viewer_host_resolution_is_exact(
@@ -147,11 +182,12 @@ def test_viewer_host_resolution_is_exact(
 
 def test_viewer_secret_hashes_are_purpose_separated_and_never_plaintext() -> None:
     secret = "a" * 43
-    bootstrap = hash_canvas_viewer_secret("bootstrap", secret)
-    session = hash_canvas_viewer_secret("session", secret)
-    assert bootstrap != session
-    assert secret not in bootstrap
-    assert len(bootstrap) == 64
+    purposes = ("binding", "bridge", "challenge", "exchange", "receipt", "session")
+    hashes = {
+        purpose: hash_canvas_viewer_secret(purpose, secret) for purpose in purposes
+    }
+    assert len(set(hashes.values())) == len(purposes)
+    assert all(secret not in digest and len(digest) == 64 for digest in hashes.values())
     with pytest.raises(ValueError):
         hash_canvas_viewer_secret("unknown", secret)
 
@@ -195,24 +231,58 @@ async def test_notification_listener_cancels_the_matching_session_only() -> None
 
 
 def test_viewer_migration_stores_only_hashes_and_installs_revocation_triggers() -> None:
-    migration = Path(
+    initial_path = Path(
         "orchestrator/database/migrations/app/0061_canvas_viewer_sessions.sql"
-    ).read_text()
+    )
+    initial_bytes = initial_path.read_bytes()
+    initial = initial_bytes.decode()
+    assert hashlib.sha256(initial_bytes).hexdigest() == (
+        "e6a379188114dab466690ec7397300d8ae952a5077880be87b6de6fe05cdb003"
+    )
     for table in (
         "canvas_origin_sessions",
         "canvas_view_attachments",
         "canvas_view_bootstraps",
     ):
-        assert f"CREATE TABLE IF NOT EXISTS {table}" in migration
-    assert "session_secret_hash" in migration
-    assert "token_hash" in migration
-    assert "session_secret TEXT" not in migration
-    assert "bootstrap_token" not in migration
-    assert "ck_canvas_attachment_cookie_mode" in migration
-    assert "trg_canvas_revoke_retired_origin" in migration
-    assert "trg_canvas_revoke_bff_session" in migration
-    assert "trg_canvas_revoke_user_admission" in migration
-    assert "canvas_session_changes" in migration
+        assert f"CREATE TABLE {table}" in initial
+    assert "session_secret_hash" in initial
+    assert "token_hash" in initial
+    assert "session_secret TEXT" not in initial
+    assert "bootstrap_token" not in initial
+    assert "ck_canvas_attachment_cookie_mode" not in initial
+    assert "trg_canvas_revoke_retired_origin" in initial
+    assert "trg_canvas_revoke_bff_session" in initial
+    assert "trg_canvas_revoke_user_admission" in initial
+    assert "canvas_session_changes" in initial
+
+    exchange_path = Path(
+        "orchestrator/database/migrations/app/0062_canvas_bootstrap_exchange.sql"
+    )
+    exchange_bytes = exchange_path.read_bytes()
+    exchange = exchange_bytes.decode()
+    assert hashlib.sha256(exchange_bytes).hexdigest() == (
+        "53b5956c4f7dc31cf4a7277521244d8f26f62832321dcbfc6ee212d88d902a6d"
+    )
+    for stored_hash in (
+        "exchange_token_hash",
+        "challenge_hash",
+        "browser_binding_hash",
+        "ready_receipt_hash",
+    ):
+        assert stored_hash in exchange
+    assert "ck_canvas_bootstrap_exchange_state" in exchange
+    assert "ck_canvas_attachment_cookie_mode" in exchange
+    assert "uq_canvas_bootstrap_attachment" in exchange
+    assert "ALTER COLUMN exchange_token_hash DROP NOT NULL" in exchange
+    assert "REFERENCES canvas_origin_sessions(id) ON DELETE CASCADE" in exchange
+    for plaintext_column in (
+        "exchange_code TEXT",
+        "challenge TEXT",
+        "browser_binding TEXT",
+        "ready_receipt TEXT",
+        "bridge_nonce TEXT",
+    ):
+        assert plaintext_column not in exchange
 
 
 class _RouteCanvasService:
@@ -225,13 +295,36 @@ class _RouteCanvasService:
 
 
 class _RouteViewerService:
-    def __init__(self, grant: CanvasViewerAttachmentGrant):
+    def __init__(
+        self,
+        grant: CanvasViewerAttachmentGrant,
+        *,
+        authorization: CanvasBootstrapAuthorization | None = None,
+        authorized_parent: object | None = None,
+    ):
         self.grant = grant
         self.calls: list[dict[str, object]] = []
+        self.authorization = authorization
+        self.authorized_parent = authorized_parent
+        self.authorization_calls: list[dict[str, object]] = []
 
     async def create_attachment(self, **kwargs):
         self.calls.append(kwargs)
         return self.grant
+
+    async def authorize_bootstrap(self, **kwargs):
+        self.authorization_calls.append(kwargs)
+        if (
+            self.authorized_parent is not None
+            and kwargs.get("parent_session_id") != self.authorized_parent
+        ):
+            raise CanvasViewerError(
+                403,
+                "canvas_bootstrap_forbidden",
+                "Canvas bootstrap does not belong to this session",
+            )
+        assert self.authorization is not None
+        return self.authorization
 
 
 def _app_record() -> CanvasRecord:
@@ -343,16 +436,123 @@ class _ViewerPolicyDB:
         return _AsyncValueContext(self.connection)
 
 
-class _BootstrapPolicyConnection:
-    def __init__(self, row: dict[str, object]):
-        self.row = row
+class _CreateAttachmentConnection:
+    def __init__(self, *, record: CanvasRecord, user_id: object, parent_id: object):
+        self.record = record
+        self.user_id = user_id
+        self.parent_id = parent_id
+        self.executions: list[tuple[str, tuple[object, ...]]] = []
 
     def transaction(self):
         return _AsyncValueContext(self)
 
     async def fetchrow(self, query: str, *args):
-        assert "FROM canvas_view_bootstraps" in query
-        return self.row
+        if "FROM srw_sessions" in query:
+            assert args == (self.parent_id, str(self.user_id))
+            return {
+                "id": self.parent_id,
+                "user_id": self.user_id,
+                "absolute_expires_at": datetime.now(UTC) + timedelta(hours=1),
+                "revoked_at": None,
+            }
+        if "FROM users" in query:
+            return {"id": self.user_id, "is_admin": False, "is_approved": True}
+        if "FROM threads" in query:
+            return {
+                "id": self.record.thread_id,
+                "user_id": str(self.user_id),
+                "metadata": {},
+            }
+        if "FROM canvases" in query:
+            return {
+                "thread_id": self.record.thread_id,
+                "canvas_id": self.record.canvas_id,
+                "source": self.record.source.model_dump(mode="json"),
+                "title": self.record.title,
+                "renderer": self.record.renderer,
+                "editable": self.record.editable,
+                "alt_text": self.record.alt_text,
+                "presentation_revision": self.record.presentation_revision,
+                "source_fingerprint": self.record.source_fingerprint,
+                "source_version": self.record.source_version,
+                "origin_generation": self.record.origin_generation,
+                "created_at": self.record.created_at,
+                "updated_at": self.record.updated_at,
+            }
+        raise AssertionError(f"Unexpected query: {query}")
+
+    async def execute(self, query: str, *args):
+        self.executions.append((query, args))
+        return "INSERT 0 1"
+
+
+@pytest.mark.asyncio
+async def test_attachment_url_is_only_canonical_public_locator() -> None:
+    record = _app_record()
+    assert record.origin_generation is not None
+    user_id = uuid4()
+    parent_id = uuid4()
+    connection = _CreateAttachmentConnection(
+        record=record,
+        user_id=user_id,
+        parent_id=parent_id,
+    )
+    config = _viewer_config(origins=frozenset({"https://cockpit.platform.test"}))
+    service = CanvasViewerSessionService(
+        _ViewerPolicyDB(connection),
+        config=config,
+    )
+
+    grant = await service.create_attachment(
+        user_id=str(user_id),
+        thread_id=record.thread_id,
+        parent_session_id=parent_id,
+        embedding_origin="https://cockpit.platform.test",
+        expected_record=record,
+    )
+
+    assert grant.bootstrap_url == (
+        f"{config.public_origin(record.origin_generation)}/_canvas/bootstrap?"
+        f"attachment_id={grant.attachment_id}"
+    )
+    assert "token=" not in grant.bootstrap_url
+    assert grant.bridge_nonce not in grant.bootstrap_url
+    assert re.fullmatch(r"[A-Za-z0-9_-]{32,128}", grant.bridge_nonce)
+    assert grant.bootstrap_expires_at <= grant.expires_at
+    persisted_arguments = repr(connection.executions)
+    assert grant.bridge_nonce not in persisted_arguments
+
+
+class _BootstrapPolicyConnection:
+    def __init__(self, row: dict[str, object], record: CanvasRecord):
+        self.row = row
+        self.record = record
+
+    def transaction(self):
+        return _AsyncValueContext(self)
+
+    async def fetchrow(self, query: str, *args):
+        if "SELECT a.thread_id" in query:
+            return {"thread_id": self.record.thread_id}
+        if "FROM canvases" in query:
+            return {
+                "thread_id": self.record.thread_id,
+                "canvas_id": self.record.canvas_id,
+                "source": self.record.source.model_dump(mode="json"),
+                "title": self.record.title,
+                "renderer": self.record.renderer,
+                "editable": self.record.editable,
+                "alt_text": self.record.alt_text,
+                "presentation_revision": self.record.presentation_revision,
+                "source_fingerprint": self.record.source_fingerprint,
+                "source_version": self.record.source_version,
+                "origin_generation": self.record.origin_generation,
+                "created_at": self.record.created_at,
+                "updated_at": self.record.updated_at,
+            }
+        if "FROM canvas_view_bootstraps" in query:
+            return self.row
+        raise AssertionError(f"Unexpected query: {query}")
 
 
 @pytest.mark.asyncio
@@ -366,26 +566,37 @@ class _BootstrapPolicyConnection:
 async def test_bootstrap_rejects_attachment_after_viewer_policy_change(
     stored_origin: str, stored_mode: str
 ) -> None:
-    generation = uuid4()
+    record = _app_record()
+    assert record.origin_generation is not None
+    assert record.source_fingerprint is not None
+    assert isinstance(record.source, WorkspaceAppSource)
+    generation = record.origin_generation
     now = datetime.now(UTC)
     connection = _BootstrapPolicyConnection(
         {
             "bootstrap_id": uuid4(),
             "attachment_id": uuid4(),
-            "expected_presentation_revision": 1,
-            "source_fingerprint": "sha256:" + "a" * 64,
-            "workspace_generation": uuid4(),
+            "expected_presentation_revision": record.presentation_revision,
+            "source_fingerprint": record.source_fingerprint,
+            "workspace_generation": record.source.workspace_generation,
             "origin_generation": generation,
             "bootstrap_expires_at": now + timedelta(seconds=30),
             "user_id": uuid4(),
-            "thread_id": uuid4(),
+            "thread_id": record.thread_id,
             "canvas_id": "main",
             "parent_srw_session_id": uuid4(),
             "embedding_origin": stored_origin,
             "attachment_cookie_mode": stored_mode,
             "attachment_expires_at": now + timedelta(minutes=10),
             "closed_at": None,
-        }
+            "challenge_hash": None,
+            "browser_binding_hash": None,
+            "ready_receipt_hash": None,
+            "exchange_token_hash": None,
+            "authorized_at": None,
+            "consumed_at": None,
+        },
+        record,
     )
     service = CanvasViewerSessionService(
         _ViewerPolicyDB(connection),
@@ -393,14 +604,123 @@ async def test_bootstrap_rejects_attachment_after_viewer_policy_change(
     )
 
     with pytest.raises(CanvasViewerError) as rejected:
-        await service.consume_bootstrap(
-            token="b" * 43,
+        await service.begin_bootstrap(
+            attachment_id=connection.row["attachment_id"],
             host_generation=generation,
-            existing_session_secret=None,
         )
 
-    assert rejected.value.status_code == 401
-    assert rejected.value.code == "canvas_bootstrap_invalid"
+    assert rejected.value.status_code == 409
+    assert rejected.value.code == "canvas_bootstrap_unavailable"
+
+
+class _AuthorizeIdentityConnection:
+    def __init__(
+        self,
+        *,
+        record: CanvasRecord,
+        attachment_id: object,
+        stored_user_id: object,
+        stored_parent_id: object,
+    ):
+        self.record = record
+        self.attachment_id = attachment_id
+        self.stored_user_id = stored_user_id
+        self.stored_parent_id = stored_parent_id
+        self.bootstrap_queries: list[tuple[object, ...]] = []
+
+    def transaction(self):
+        return _AsyncValueContext(self)
+
+    async def fetchrow(self, query: str, *args):
+        if "FROM srw_sessions" in query:
+            return {
+                "id": args[0],
+                "user_id": args[1],
+                "absolute_expires_at": datetime.now(UTC) + timedelta(hours=1),
+                "revoked_at": None,
+            }
+        if "FROM users" in query:
+            # Model an approved admin so different-user denial is specifically
+            # the attachment/BFF binding, not thread authorization.
+            return {"id": args[0], "is_admin": True, "is_approved": True}
+        if "FROM threads" in query:
+            return {
+                "id": self.record.thread_id,
+                "user_id": self.stored_user_id,
+                "metadata": {},
+            }
+        if "FROM canvases" in query:
+            return {
+                "thread_id": self.record.thread_id,
+                "canvas_id": self.record.canvas_id,
+                "source": self.record.source.model_dump(mode="json"),
+                "title": self.record.title,
+                "renderer": self.record.renderer,
+                "editable": self.record.editable,
+                "alt_text": self.record.alt_text,
+                "presentation_revision": self.record.presentation_revision,
+                "source_fingerprint": self.record.source_fingerprint,
+                "source_version": self.record.source_version,
+                "origin_generation": self.record.origin_generation,
+                "created_at": self.record.created_at,
+                "updated_at": self.record.updated_at,
+            }
+        if "FROM canvas_view_bootstraps" in query:
+            self.bootstrap_queries.append(args)
+            if args == (
+                self.attachment_id,
+                self.stored_user_id,
+                self.record.thread_id,
+                self.stored_parent_id,
+            ):
+                raise AssertionError(
+                    "denial fixture unexpectedly matched stored identity"
+                )
+            return None
+        raise AssertionError(f"Unexpected query: {query}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity_mismatch", ["different_user", "different_parent"])
+async def test_bootstrap_authorization_is_bound_to_exact_user_and_parent_session(
+    identity_mismatch: str,
+) -> None:
+    record = _app_record()
+    attachment_id = uuid4()
+    stored_user = uuid4()
+    stored_parent = uuid4()
+    caller_user = uuid4() if identity_mismatch == "different_user" else stored_user
+    caller_parent = (
+        uuid4() if identity_mismatch == "different_parent" else stored_parent
+    )
+    connection = _AuthorizeIdentityConnection(
+        record=record,
+        attachment_id=attachment_id,
+        stored_user_id=str(stored_user),
+        stored_parent_id=stored_parent,
+    )
+    service = CanvasViewerSessionService(
+        _ViewerPolicyDB(connection),
+        config=_viewer_config(origins=frozenset({"https://cockpit.platform.test"})),
+    )
+
+    with pytest.raises(CanvasViewerError) as rejected:
+        await service.authorize_bootstrap(
+            attachment_id=attachment_id,
+            user_id=str(caller_user),
+            thread_id=record.thread_id,
+            parent_session_id=caller_parent,
+            embedding_origin="https://cockpit.platform.test",
+            challenge="c" * 43,
+            ready_receipt="r" * 43,
+            bridge_nonce="b" * 43,
+        )
+
+    assert rejected.value.status_code == 403
+    assert rejected.value.code == "canvas_bootstrap_forbidden"
+    assert connection.bootstrap_queries == [
+        (attachment_id, str(caller_user), record.thread_id, caller_parent)
+    ]
 
 
 @pytest.mark.asyncio
@@ -509,13 +829,14 @@ def test_attachment_route_requires_bff_cookie_and_exact_state_etag(
         capabilities=CanvasCapabilities(can_create_viewer_session=True),
     )
     now = datetime.now(UTC)
+    attachment_id = uuid4()
+    origin = f"https://{record.origin_generation}.canvas.user-content.test"
     grant = CanvasViewerAttachmentGrant(
-        attachment_id=uuid4(),
-        origin=f"https://{record.origin_generation}.canvas.user-content.test",
-        bootstrap_url=(
-            f"https://{record.origin_generation}.canvas.user-content.test/"
-            "_canvas/bootstrap?token=secret"
-        ),
+        attachment_id=attachment_id,
+        origin=origin,
+        bootstrap_url=f"{origin}/_canvas/bootstrap?attachment_id={attachment_id}",
+        bridge_nonce="b" * 43,
+        bootstrap_expires_at=now + timedelta(seconds=60),
         expires_at=now + timedelta(minutes=20),
         renew_after=now + timedelta(minutes=10),
     )
@@ -590,8 +911,143 @@ def test_attachment_route_requires_bff_cookie_and_exact_state_etag(
         },
     )
     assert response.status_code == 200
-    assert response.json()["attachment_id"] == str(grant.attachment_id)
+    payload = response.json()
+    assert payload["attachment_id"] == str(grant.attachment_id)
+    assert payload["bootstrap_url"] == (
+        f"{origin}/_canvas/bootstrap?attachment_id={grant.attachment_id}"
+    )
+    assert payload["bridge_nonce"] == "b" * 43
+    assert "token=" not in payload["bootstrap_url"]
+    assert payload["bridge_nonce"] not in payload["bootstrap_url"]
+    assert "exchange_code" not in payload
     assert response.headers["cache-control"] == "private, no-store"
     assert len(viewer.calls) == 1
     assert viewer.calls[0]["parent_session_id"] == parent
     assert viewer.calls[0]["expected_record"] is record
+
+
+def test_authorize_route_requires_exact_bff_session_origin_and_closed_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _app_record()
+    now = datetime.now(UTC)
+    attachment_id = uuid4()
+    parent = uuid4()
+    origin = f"https://{record.origin_generation}.canvas.user-content.test"
+    challenge = "c" * 43
+    receipt = "r" * 43
+    bridge = "b" * 43
+    exchange = "e" * 43
+    grant = CanvasViewerAttachmentGrant(
+        attachment_id=attachment_id,
+        origin=origin,
+        bootstrap_url=f"{origin}/_canvas/bootstrap?attachment_id={attachment_id}",
+        bridge_nonce=bridge,
+        bootstrap_expires_at=now + timedelta(seconds=60),
+        expires_at=now + timedelta(minutes=20),
+        renew_after=now + timedelta(minutes=10),
+    )
+    authorization = CanvasBootstrapAuthorization(
+        challenge=challenge,
+        ready_receipt=receipt,
+        exchange_code=exchange,
+        expires_at=now + timedelta(seconds=30),
+    )
+    viewer = _RouteViewerService(
+        grant,
+        authorization=authorization,
+        authorized_parent=parent,
+    )
+    db = SimpleNamespace()
+    user_id = "b4444444-4444-4444-4444-444444444444"
+
+    async def owner(request, current_db, thread_id):
+        assert current_db is db
+        return {"id": user_id}, {"id": thread_id, "user_id": user_id}
+
+    monkeypatch.setattr(canvas_routes, "_get_db", lambda: db)
+    monkeypatch.setattr(canvas_routes, "_get_viewer_service", lambda current_db: viewer)
+    monkeypatch.setattr(canvas_routes, "require_thread_owner", owner)
+    app = FastAPI()
+    app.include_router(canvas_routes.router)
+    client = TestClient(app)
+    url = (
+        f"/api/persistent/threads/{record.thread_id}/canvases/main/"
+        f"view-attachments/{attachment_id}/authorize"
+    )
+    body = {
+        "challenge": challenge,
+        "ready_receipt": receipt,
+        "bridge_nonce": bridge,
+    }
+
+    copied_to_other_bff = client.post(
+        url,
+        json=body,
+        headers={
+            "Cookie": f"srw_session={uuid4()}",
+            "Origin": "https://cockpit.platform.test",
+        },
+    )
+    assert copied_to_other_bff.status_code == 403
+    assert copied_to_other_bff.json()["detail"]["code"] == "canvas_bootstrap_forbidden"
+
+    calls_before_schema_rejection = len(viewer.authorization_calls)
+    extra_field = client.post(
+        url,
+        json={**body, "origin": origin},
+        headers={
+            "Cookie": f"srw_session={parent}",
+            "Origin": "https://cockpit.platform.test",
+        },
+    )
+    assert extra_field.status_code == 422
+    short_challenge = client.post(
+        url,
+        json={**body, "challenge": "short"},
+        headers={
+            "Cookie": f"srw_session={parent}",
+            "Origin": "https://cockpit.platform.test",
+        },
+    )
+    assert short_challenge.status_code == 422
+    assert len(viewer.authorization_calls) == calls_before_schema_rejection
+
+    hybrid = client.post(
+        url,
+        json=body,
+        headers={
+            "Cookie": f"srw_session={parent}",
+            "Origin": "https://cockpit.platform.test",
+            "Authorization": "Bearer must-not-authorize-canvas",
+        },
+    )
+    assert hybrid.status_code == 401
+    assert len(viewer.authorization_calls) == calls_before_schema_rejection
+
+    response = client.post(
+        url,
+        json=body,
+        headers={
+            "Cookie": f"srw_session={parent}",
+            "Origin": "https://cockpit.platform.test",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "private, no-store"
+    payload = response.json()
+    assert set(payload) == {"challenge", "ready_receipt", "exchange_code", "expires_at"}
+    assert payload["challenge"] == challenge
+    assert payload["ready_receipt"] == receipt
+    assert payload["exchange_code"] == exchange
+    call = viewer.authorization_calls[-1]
+    assert call == {
+        "attachment_id": attachment_id,
+        "user_id": user_id,
+        "thread_id": record.thread_id,
+        "parent_session_id": parent,
+        "embedding_origin": "https://cockpit.platform.test",
+        "challenge": challenge,
+        "ready_receipt": receipt,
+        "bridge_nonce": bridge,
+    }

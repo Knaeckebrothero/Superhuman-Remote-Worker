@@ -3,6 +3,7 @@ import katex from 'katex';
 import {Marked, MarkedExtension, Renderer} from 'marked';
 import {CanvasState} from '../../core/models/canvas.model';
 import {environment} from '../../core/environment';
+import {isCanonicalCanvasUuid} from './canvas-viewer-protocol';
 
 export type CanvasTrustedRenderer =
   | 'markdown'
@@ -188,10 +189,12 @@ export function selectCanvasRenderer(state: CanvasState | null): CanvasTrustedRe
 export function resolveCanvasViewerBootstrapUrl(
   bootstrapUrl: string,
   origin: string,
+  attachmentId: string,
   hostSuffix = environment.canvasViewerHostSuffix,
   documentBase = typeof document === 'undefined' ? 'https://cockpit.invalid/' : document.baseURI,
 ): string | null {
   if (
+    !isCanonicalCanvasUuid(attachmentId) ||
     !hostSuffix ||
     !/^\.[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(hostSuffix) ||
     hostSuffix.includes('..') ||
@@ -237,12 +240,12 @@ export function resolveCanvasViewerBootstrapUrl(
     ) {
       return null;
     }
-    const tokens = bootstrap.searchParams.getAll('token');
+    const attachmentIds = bootstrap.searchParams.getAll('attachment_id');
     if (
-      tokens.length !== 1 ||
-      !/^[A-Za-z0-9_-]{32,128}$/.test(tokens[0]) ||
-      bootstrap.search !== `?token=${tokens[0]}` ||
-      Array.from(bootstrap.searchParams.keys()).some(key => key !== 'token')
+      attachmentIds.length !== 1 ||
+      attachmentIds[0] !== attachmentId ||
+      bootstrap.search !== `?attachment_id=${attachmentId}` ||
+      Array.from(bootstrap.searchParams.keys()).some(key => key !== 'attachment_id')
     ) {
       return null;
     }

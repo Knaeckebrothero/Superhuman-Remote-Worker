@@ -48,6 +48,17 @@ workspace:
 garage:
   enabled: true
 
+# Older private values-local.yaml files carried MinIO-style placeholder S3
+# credentials. Garage rejects those identifiers, so the later Tilt overlay
+# deliberately clears them and lets the chart generate/preserve native scoped
+# keys. This is inert when Garage is disabled outside Tilt.
+secrets:
+  values:
+    SNAPSHOT_S3_ACCESS_KEY_ID: ""
+    SNAPSHOT_S3_SECRET_ACCESS_KEY: ""
+    VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID: ""
+    VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY: ""
+
 # Cockpit dev image runs `ng serve`, which serves files from the Angular
 # source tree at /app/src/assets/. Land the chart-rendered env.js there so
 # Tilt-mode browsers get correct (Traefik-routed) URLs without having to

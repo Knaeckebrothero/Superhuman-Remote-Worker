@@ -440,6 +440,38 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Development-only reconciler for the gateway's restricted database login.
+  # Administrator credentials terminate here and never reach the public
+  # wildcard-origin process.
+  canvas-gateway-role:
+    image: docker.io/library/postgres:15
+    container_name: srw-canvas-gateway-role
+    profiles: ["canvas-viewer"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-srw}
+      PGUSER: ${POSTGRES_USER:-srw}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-srw_password}
+      CANVAS_VIEWER_POSTGRES_USER: ${CANVAS_VIEWER_POSTGRES_USER:-srw_canvas_gateway}
+      CANVAS_VIEWER_POSTGRES_PASSWORD: ${CANVAS_VIEWER_POSTGRES_PASSWORD:-srw_canvas_gateway_password}
+    command:
+      - sh
+      - -ec
+      - |
+        if [ "$${#CANVAS_VIEWER_POSTGRES_PASSWORD}" -lt 16 ]; then
+          echo "Canvas gateway database password must contain at least 16 characters" >&2
+          exit 1
+        fi
+        exec psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
+          --file /etc/srw-canvas-db/provision.sql
+    volumes:
+      - ./helm/files/canvas-viewer-role.sql:/etc/srw-canvas-db/provision.sql:ro
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    restart: "no"
+
   # Internal-only Canvas origin gateway. The opt-in profile and absent host
   # port are deliberate: an operator-owned wildcard TLS edge with raw-path
   # preservation is still required before a browser can reach this service.
@@ -459,9 +491,14 @@ services:
       - --no-access-log
     environment:
       PORT: 8086
-      DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
+      CANVAS_VIEWER_POSTGRES_USER: ${CANVAS_VIEWER_POSTGRES_USER:-srw_canvas_gateway}
+      CANVAS_VIEWER_POSTGRES_PASSWORD: ${CANVAS_VIEWER_POSTGRES_PASSWORD:-srw_canvas_gateway_password}
+      CANVAS_VIEWER_POSTGRES_HOST: postgres
+      CANVAS_VIEWER_POSTGRES_PORT: "5432"
+      CANVAS_VIEWER_POSTGRES_DB: ${POSTGRES_DB:-srw}
+      CANVAS_VIEWER_POSTGRES_MIN_CONNECTIONS: "1"
+      CANVAS_VIEWER_POSTGRES_MAX_CONNECTIONS: "4"
       CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
-      CANVAS_LIVE_PREVIEW_DENIED_PORTS: "${CANVAS_LIVE_PREVIEW_DENIED_PORTS:-}"
       CANVAS_VIEWER_ENABLED: "${CANVAS_VIEWER_ENABLED:-false}"
       CANVAS_VIEWER_DEPLOYMENT_PROFILE: "${CANVAS_VIEWER_DEPLOYMENT_PROFILE:-production}"
       CANVAS_VIEWER_COOKIE_MODE: "${CANVAS_VIEWER_COOKIE_MODE:-}"
@@ -485,8 +522,6 @@ services:
       CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS: "${CANVAS_VIEWER_CONNECT_TIMEOUT_SECONDS:-5}"
       CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS: "${CANVAS_VIEWER_IDLE_TIMEOUT_SECONDS:-60}"
       CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS: "${CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS:-300}"
-      WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1:30022,workspace-2:30022,workspace-3:30022,workspace-4:30022,workspace-5:30022}
-      WORKSPACE_HOST_KEY_FINGERPRINTS: ${WORKSPACE_HOST_KEY_FINGERPRINTS:-}
       SSH_KEY_PATH: /run/secrets/ssh/id_ed25519
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
@@ -496,6 +531,8 @@ services:
     depends_on:
       orchestrator:
         condition: service_healthy
+      canvas-gateway-role:
+        condition: service_completed_successfully
       ssh-keygen:
         condition: service_completed_successfully
     # Override the orchestrator image's /api/health probe: this image runs the

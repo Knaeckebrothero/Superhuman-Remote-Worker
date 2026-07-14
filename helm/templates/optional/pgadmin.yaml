@@ -96,7 +96,7 @@ spec:
           command:
             - sh
             - -c
-            - "until nc -z {{ $fullname }}-postgres 5432; do sleep 2; done"
+            - "until nc -z -w 2 {{ $fullname }}-postgres 5432; do sleep 2; done"
         {{- if $prereg }}
         # Build a libpq passfile (chmod 600, owned by the pgadmin uid 5050) from
         # the Secret so servers.json's PassFile entries resolve without prompting.

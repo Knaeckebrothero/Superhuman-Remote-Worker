@@ -71,8 +71,21 @@ export interface CanvasViewAttachment {
   readonly attachment_id: string;
   readonly origin: string;
   readonly bootstrap_url: string;
+  /**
+   * Per-attachment parent proof. This value is returned only to the trusted
+   * Cockpit and must never be placed in the iframe URL or application state.
+   */
+  readonly bridge_nonce: string;
+  readonly bootstrap_expires_at: string;
   readonly expires_at: string;
   readonly renew_after: string;
+}
+
+export interface CanvasViewAuthorization {
+  readonly challenge: string;
+  readonly ready_receipt: string;
+  readonly exchange_code: string;
+  readonly expires_at: string;
 }
 
 export interface CanvasViewAttachmentRenewal {

@@ -284,7 +284,7 @@ The script's behaviour is documented inline; if anything fails it bails out with
 
 ### 2. Set the OpenCloud OIDC workaround address
 
-OpenCloud's proxy needs to reach Keycloak from inside the pod, and on k3d `auth.localhost` resolves to the pod's own loopback. `values-local.example.yaml` ships a `hostAliases` block that maps `auth.localhost` to Traefik's ClusterIP — but that IP is determined at cluster-create time, so grab it now:
+OpenCloud's proxy needs to reach Keycloak from inside the pod, and on k3d `auth.localhost` resolves to the pod's own loopback. `values-local.yaml.example` ships a `hostAliases` block that maps `auth.localhost` to Traefik's ClusterIP — but that IP is determined at cluster-create time, so grab it now:
 
 ```bash
 kubectl --context=k3d-srw -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}'
@@ -304,7 +304,7 @@ kubectl --context=k3d-srw -n srw create secret generic srw-session-jwt \
 ### 4. Copy the values template and install the chart
 
 ```bash
-cp deployment/values-local.example.yaml deployment/values-local.yaml
+cp deployment/values-local.yaml.example deployment/values-local.yaml
 $EDITOR deployment/values-local.yaml
 # - paste at least one LLM key (OPENAI_API_KEY / ANTHROPIC_API_KEY / GROQ_API_KEY)
 # - paste the Traefik ClusterIP from step 2 into opencloud.hostAliases[0].ip
@@ -411,7 +411,13 @@ tilt version
 ./scripts/local-dev-tilt-up.sh
 ```
 
-This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath (cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the `srw-session-jwt` Secret, syncs the current Traefik ClusterIP into `values-local.yaml`'s `opencloud.hostAliases` entry, mirrors the MinIO images into the cluster registry (the `virtual` workspace tier and workspace snapshots / IDE-session blobs run on a single-node MinIO fixture, `deployment/tilt-minio.yaml`, deployed by the Tiltfile — k3d's node has no external DNS, so the images must be pre-loaded into the registry), and finally runs `tilt up` in the foreground.
+This bootstrap is idempotent — it runs `scripts/local-dev-up.sh` underneath
+(cluster + cert-manager + namespace + vm-ssh-key Secret), then adds the
+`srw-session-jwt` Secret, syncs the current Traefik ClusterIP into
+`values-local.yaml`'s `opencloud.hostAliases` entry, and runs `tilt up` in the
+foreground. The chart deploys and bootstraps its bundled single-node Garage for
+the `virtual` workspace tier and workspace snapshot/IDE-session storage; no
+separate MinIO image mirror is required.
 
 **Run Tilt — subsequent sessions**: the cluster, secrets, and Helm release persist across `k3d cluster stop/start`, and the Traefik ClusterIP is stable for the life of the cluster, so you don't need the bootstrap again. Just bring the cluster back and start Tilt directly (always cluster first, then Tilt — Tilt deploys *into* a running cluster):
 
@@ -500,9 +506,9 @@ k3d cluster delete srw                     # destroy the whole cluster (includin
     --docker-username=<github-user> --docker-password=<github-PAT-with-read:packages>
   ```
 - **`PersistentVolumeClaim ... is invalid: ... storage: Forbidden: field can not be less than previous value`** — you tried to shrink a PVC. Either bump the size back up in `values-local.yaml` or delete the PVC and re-upgrade (`kubectl -n srw delete pvc <name>`).
-- **Keycloak in `CreateContainerConfigError` for missing secret keys** — the realm import references env vars for every OIDC client (even disabled ones). Check that all keys from `values-local.example.yaml` are present in `values-local.yaml`.
+- **Keycloak in `CreateContainerConfigError` for missing secret keys** — the realm import references env vars for every OIDC client (even disabled ones). Check that all keys from `values-local.yaml.example` are present in `values-local.yaml`.
 - **`https://localhost/` returns 404 right after `k3d cluster start srw`** — Traefik's endpoint discovery can go stale through a long idle (the pod restart cascade after `k3d cluster stop`/`start` sometimes leaves Traefik holding empty endpoint state). Kick it: `kubectl --context=k3d-srw -n kube-system rollout restart deploy/traefik`.
-- **Login lands in a 401-refresh loop in Brave/Firefox** — the chart defaults to `auth.bff.sameOriginApi: true` in `values-local.example.yaml` so the cockpit and BFF share an origin and the session cookie is first-party. If you flipped that off, either flip it back on or allowlist `[*.]localhost` for cookies in the browser. Symptom in orchestrator logs: `GET /auth/callback 302` immediately followed by `GET /api/auth/me 401` on repeat.
+- **Login lands in a 401-refresh loop in Brave/Firefox** — the chart defaults to `auth.bff.sameOriginApi: true` in `values-local.yaml.example` so the cockpit and BFF share an origin and the session cookie is first-party. If you flipped that off, either flip it back on or allowlist `[*.]localhost` for cookies in the browser. Symptom in orchestrator logs: `GET /auth/callback 302` immediately followed by `GET /api/auth/me 401` on repeat.
 - **New session stuck on "Provisioning agent" / WebSocket errors `Unexpected response code: 200`** — usually the cockpit's Service Worker (`ngsw-worker.js`) is serving stale assets that point at the legacy `/ws/persistent/...` WS path (which the orchestrator no longer hosts). In DevTools → Application → Service Workers, **Unregister** all SWs and clear caches under Storage, then hard-reload. Programmatic version:
   ```js
   (await navigator.serviceWorker.getRegistrations()).forEach(r => r.unregister());

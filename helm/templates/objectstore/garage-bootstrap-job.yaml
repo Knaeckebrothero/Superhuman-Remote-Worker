@@ -83,12 +83,18 @@ spec:
             - -c
             - |
               set -eu
+              umask 077
+              trap 'rm -f /tmp/k /tmp/keys' EXIT
               ADMIN="http://${GARAGE_SVC}:3903"
               AUTH="Authorization: Bearer ${GARAGE_ADMIN_TOKEN}"
+              # A Service endpoint can exist before its first listener accepts
+              # connections. Bound every admin request so one stale TCP attempt
+              # cannot wedge this Helm hook until Tilt kills the deployment.
+              CURL="curl --connect-timeout 2 --max-time 10"
 
               # 1. Wait for the admin API.
               i=0
-              until curl -sf -H "$AUTH" "$ADMIN/v1/status" >/tmp/status 2>/dev/null; do
+              until $CURL -sf -H "$AUTH" "$ADMIN/v1/status" >/tmp/status 2>/dev/null; do
                 i=$((i+1)); [ "$i" -gt 90 ] && { echo "garage admin API not ready"; exit 1; }
                 echo "waiting for garage admin API ($i)"; sleep 2
               done
@@ -104,20 +110,20 @@ spec:
               # while version stays 0, so a grep would falsely skip and the Job
               # would exit 0 over a store with no active layout. version only
               # advances on a successful apply.
-              curl -sf -H "$AUTH" "$ADMIN/v1/layout" >/tmp/layout
+              $CURL -sf -H "$AUTH" "$ADMIN/v1/layout" >/tmp/layout
               VER=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' /tmp/layout | head -1)
               VER=${VER:-0}
               if [ "$VER" -lt 1 ]; then
                 # stage this node's role (tolerate an already-staged retry) ...
-                curl -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+                $CURL -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                   -d "[{\"id\":\"$NODE\",\"zone\":\"dc1\",\"capacity\":${GARAGE_CAPACITY_BYTES},\"tags\":[]}]" \
                   "$ADMIN/v1/layout" >/dev/null || true
                 # ... then apply it.
-                curl -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+                $CURL -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                   -d "{\"version\":$((VER+1))}" "$ADMIN/v1/layout/apply" >/dev/null
                 # Verify the apply actually took — never report success over a
                 # store whose layout is still unapplied.
-                curl -sf -H "$AUTH" "$ADMIN/v1/layout" >/tmp/layout2
+                $CURL -sf -H "$AUTH" "$ADMIN/v1/layout" >/tmp/layout2
                 NEWVER=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' /tmp/layout2 | head -1)
                 NEWVER=${NEWVER:-0}
                 [ "$NEWVER" -ge 1 ] || { echo "layout apply did not take (version=$NEWVER)"; cat /tmp/layout2; exit 1; }
@@ -129,17 +135,58 @@ spec:
               # 3. Bucket + scoped-key setup.
               setup() {
                 bucket="$1"; keyid="$2"; keysec="$3"; keyname="$4"
-                curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+                $CURL -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                   -d "{\"globalAlias\":\"$bucket\"}" "$ADMIN/v1/bucket" >/dev/null || true
-                curl -sf -H "$AUTH" "$ADMIN/v1/bucket?globalAlias=$bucket" >/tmp/b
+                $CURL -sf -H "$AUTH" "$ADMIN/v1/bucket?globalAlias=$bucket" >/tmp/b
                 bid=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{16,\}\)".*/\1/p' /tmp/b | head -1)
                 [ -n "$bid" ] || { echo "no bucket id for $bucket"; cat /tmp/b; exit 1; }
-                curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
-                  -d "{\"name\":\"$keyname\",\"accessKeyId\":\"$keyid\",\"secretAccessKey\":\"$keysec\"}" \
-                  "$ADMIN/v1/key/import" >/dev/null || true
-                curl -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+                # Existing keys make upgrades idempotent, but only when their
+                # secret still matches the chart Secret. Never hide an import
+                # error and then grant a credential Garage did not accept.
+                if $CURL -sf -H "$AUTH" \
+                    "$ADMIN/v1/key?id=$keyid&showSecretKey=true" >/tmp/k; then
+                  existing_secret=$(sed -n 's/.*"secretAccessKey"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /tmp/k | head -1)
+                  rm -f /tmp/k
+                  [ "$existing_secret" = "$keysec" ] || {
+                    echo "existing Garage key $keyname has a different secret; use an explicit revocation/rotation procedure"
+                    exit 1
+                  }
+                else
+                  rm -f /tmp/k
+                  $CURL -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+                    -d "{\"name\":\"$keyname\",\"accessKeyId\":\"$keyid\",\"secretAccessKey\":\"$keysec\"}" \
+                    "$ADMIN/v1/key/import" >/dev/null
+                fi
+                $CURL -sf -X POST -H "$AUTH" -H 'Content-Type: application/json' \
                   -d "{\"bucketId\":\"$bid\",\"accessKeyId\":\"$keyid\",\"permissions\":{\"read\":true,\"write\":true,\"owner\":false}}" \
                   "$ADMIN/v1/bucket/allow" >/dev/null
+
+                # This chart owns these two exact key names. Earlier Tilt Force
+                # Updates could delete the Secret and import a new ID, leaving
+                # the unreachable prior key authorized. Once the desired key is
+                # verified and allowed, revoke every stale same-name ID.
+                $CURL -sf -H "$AUTH" "$ADMIN/v1/key" >/tmp/keys
+                stale_ids=$(awk -v keyname="$keyname" '
+                  BEGIN { RS = "}" }
+                  {
+                    compact = $0
+                    gsub(/[[:space:]]/, "", compact)
+                  }
+                  index(compact, "\"name\":\"" keyname "\"") {
+                    id = compact
+                    sub(/^.*"id":"/, "", id)
+                    sub(/".*$/, "", id)
+                    if (id ~ /^GK[0-9A-Fa-f]+$/ && length(id) == 26) print id
+                  }
+                ' /tmp/keys)
+                rm -f /tmp/keys
+                for stale_id in $stale_ids; do
+                  if [ "$stale_id" != "$keyid" ]; then
+                    $CURL -sf -X DELETE -H "$AUTH" \
+                      "$ADMIN/v1/key?id=$stale_id" >/dev/null
+                    echo "removed stale chart-managed Garage key name=$keyname"
+                  fi
+                done
                 echo "configured bucket=$bucket key=$keyname"
               }
               setup "$SNAPSHOT_BUCKET" "$SNAPSHOT_S3_ACCESS_KEY_ID" "$SNAPSHOT_S3_SECRET_ACCESS_KEY" "srw-snapshots"

@@ -117,6 +117,59 @@ ingress:
     # CORS_ORIGINS env and the Traefik CORS middleware allow-list.
     additionalOrigins:
       - "https://cockpit.superhuman-remote-worker.com"
+
+# -----------------------------------------------------------------------------
+# Dynamic Canvas live preview (reserved production coordinates; still dark)
+# -----------------------------------------------------------------------------
+# srwcanvas.works is a dedicated user-content domain, separate from the trusted
+# srw.works BFF/Keycloak cookie boundary. UUID origins live directly below the
+# registered domain, making the effective-PSL boundary exact and keeping the
+# public hostname contract to one `*.srwcanvas.works` wildcard:
+#
+#   https://<origin-generation>.srwcanvas.works
+#
+# The proxied `*.srwcanvas.works` DNS record and Cloudflare Universal SSL
+# certificate are live, but no Canvas gateway route is published behind them;
+# unmatched UUID hosts intentionally return the edge's 404. Do not enable either
+# gate or assert either verification flag yet. The exact `srwcanvas.works`
+# private PSL rule has not propagated, and the current Cloudflare Tunnel
+# normalizes some request paths before the gateway. Universal SSL therefore is
+# not a production-edge acceptance claim for the current raw-path contract. The
+# production browser acceptance matrix and external-edge checks remain launch
+# gates. The gateway-specific database identity/config boundary is implemented,
+# but production still requires an operator-provisioned restricted role Secret.
+canvas:
+  livePreview:
+    enabled: false
+    deniedPorts: []
+    viewer:
+      enabled: false
+      deploymentProfile: production
+      cookieMode: psl-isolated
+      domain: "srwcanvas.works"
+      hostSuffix: ".srwcanvas.works"
+      cockpitOrigins:
+        - "https://cockpit.srw.works"
+      rawPathVerified: false
+      pslBoundaryVerified: false
+      database:
+        username: "srw_canvas_gateway"
+        credentials:
+          create: false
+          existingSecret: ""
+          usernameKey: "username"
+          passwordKey: "password"
+        provisionRole: false
+        pool:
+          min: 1
+          max: 4
+      networkPolicy:
+        # Intentionally empty so Helm also refuses accidental enablement. The
+        # existing cloudflared and Traefik HTTP edges normalize request paths;
+        # fill these only after selecting and proving a conforming edge.
+        edgeNamespaceSelector: {}
+        edgePodSelector: {}
+        extraEgress: []
 # -----------------------------------------------------------------------------
 # Admin UIs
 # -----------------------------------------------------------------------------

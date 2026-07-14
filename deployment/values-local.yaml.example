@@ -4,7 +4,7 @@
 # This file is committed to git. Copy it to `values-local.yaml` (gitignored)
 # and fill in your LLM provider keys before installing.
 #
-#   cp deployment/values-local.example.yaml deployment/values-local.yaml
+#   cp deployment/values-local.yaml.example deployment/values-local.yaml
 #   $EDITOR deployment/values-local.yaml   # paste at least one LLM key
 #   helm install srw ./helm -n srw --create-namespace -f deployment/values-local.yaml
 #
@@ -148,10 +148,10 @@ secrets:
 
     # Object store — the bundled Garage store (garage.enabled=true in
     # values-tilt.yaml) auto-generates its own native-format keys in this Secret
-    # at render time (SNAPSHOT_S3_* + VIRTUAL_WORKSPACE_S3_*, both buckets), so do
-    # NOT set them here: an operator value would win, and the bootstrap Job's
-    # key/import rejects non-Garage-format keys (id must be "GK"+24 hex). Leave
-    # them unset. (Only override if you point at an EXTERNAL S3 instead of Garage.)
+    # at render time (SNAPSHOT_S3_* + VIRTUAL_WORKSPACE_S3_*, both buckets), so
+    # do NOT set them here. The chart preserves each valid ID/secret pair
+    # atomically and rejects implicit rotation; Garage IDs must be "GK"+24 hex.
+    # Only supply these values when Garage is disabled in favor of external S3.
 
     # Email/notifications/integrations — chart refs are gated/optional, so
     # entries here are only required when you flip `email.enabled=true` or wire
@@ -188,8 +188,8 @@ ingress:
 
 # Dynamic Canvas live workspace applications remain gated. The chart now knows
 # how to render an internal-only gateway, but deliberately provides no wildcard
-# viewer ingress/TLS; file viewing/editing is unaffected. The shared development
-# DB/config credentials are not a production deployment contract.
+# viewer ingress/TLS; file viewing/editing is unaffected. For an isolated local
+# edge test, the chart can generate and reconcile its fixed restricted DB role.
 canvas:
   livePreview:
     enabled: false
@@ -203,6 +203,19 @@ canvas:
       cockpitOrigins: []
       rawPathVerified: false
       pslBoundaryVerified: false
+      database:
+        username: "srw_canvas_gateway"
+        credentials:
+          # Keep false while the viewer is disabled. A development-only enabled
+          # viewer may set create=true together with provisionRole=true.
+          create: false
+          existingSecret: ""
+          usernameKey: "username"
+          passwordKey: "password"
+        provisionRole: false
+        pool:
+          min: 1
+          max: 4
       # Keep these empty while disabled. Enabling requires both selectors to
       # identify an already-provisioned local wildcard edge.
       networkPolicy:

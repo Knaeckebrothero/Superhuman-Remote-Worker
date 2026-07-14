@@ -145,6 +145,9 @@ from security.credential_files import (  # noqa: E402
     normalize_credential_files,
 )
 from security.csrf import CSRFMiddleware  # noqa: E402
+from security.anti_framing import (  # noqa: E402
+    TrustedParentAntiFramingMiddleware,
+)
 from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
 from routers import canvases_router, internal_canvases_router  # noqa: E402
@@ -6865,8 +6868,90 @@ async def request_logging_middleware(request: Request, call_next):
     return response
 
 
-# request_id correlation — added last so it is OUTERMOST (wraps the access-log
-# middleware above). See CorrelationIdMiddleware in logging_config.
+# Trusted Cockpit/BFF responses must never become documents inside an untrusted
+# Canvas app iframe. Register this outside route/CORS/CSRF handling so redirects,
+# errors, and same-origin API responses receive the same response boundary. It
+# appends (rather than replaces) any route-specific CSP.
+#
+# The IDE proxy is the one intentional frame-based application on this ASGI
+# service (VS Code webviews). It receives a same-origin-only framing policy on
+# the exact, separately hosted IDE/API authority. The same path on a Cockpit
+# authority is still denied, closing the Canvas self-navigation boundary without
+# breaking code-server webviews on api.<domain>.
+def _origin_authority(value: str) -> tuple[str, int] | None:
+    try:
+        parsed = urlparse(value.strip())
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+        if not hostname:
+            return None
+        hostname = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return None
+    if not hostname:
+        return None
+    return hostname, port or (443 if parsed.scheme == "https" else 80)
+
+
+def _origin_host_headers(value: str) -> tuple[str, ...]:
+    """Host spellings a proxy may preserve for one configured web origin."""
+
+    authority = _origin_authority(value)
+    if authority is None:
+        return ()
+    hostname, port = authority
+    host_literal = f"[{hostname}]" if ":" in hostname else hostname
+    parsed = urlparse(value.strip())
+    default_port = 443 if parsed.scheme == "https" else 80
+    if port == default_port:
+        return host_literal, f"{host_literal}:{port}"
+    return (f"{host_literal}:{port}",)
+
+
+def _isolated_ide_frame_authorities() -> dict[str, tuple[str, ...]]:
+    cockpit_origins = {
+        "http://localhost:4200",
+        "http://127.0.0.1:4200",
+        "http://localhost:4000",
+        "http://127.0.0.1:4000",
+        os.environ.get("SRW_SPA_BASE_URL", ""),
+        *os.environ.get("CORS_ORIGINS", "").split(","),
+    }
+    cockpit_authorities = {
+        authority
+        for origin in cockpit_origins
+        if (authority := _origin_authority(origin)) is not None
+    }
+    ide_origin = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
+    ide_authority = _origin_authority(ide_origin)
+    if ide_authority is None or ide_authority in cockpit_authorities:
+        return {}
+    return {"/api/ide/": _origin_host_headers(ide_origin)}
+
+
+app.add_middleware(
+    TrustedParentAntiFramingMiddleware,
+    same_origin_frameable_path_authorities=_isolated_ide_frame_authorities(),
+)
+
+
+# request_id correlation — added last so it is OUTERMOST (wraps both the
+# access-log and anti-framing middleware above). See CorrelationIdMiddleware in
+# logging_config.
 app.add_middleware(CorrelationIdMiddleware)
 
 

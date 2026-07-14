@@ -18,7 +18,6 @@ import secrets
 from typing import Any, Awaitable, Callable
 from uuid import UUID
 
-from database.postgres import PostgresDB
 from services import resolve_ssh_key_path
 from services.canvas import WorkspaceAppSource
 from services.canvas_http import open_canvas_http_exchange, spool_canvas_request_body
@@ -46,18 +45,27 @@ from services.canvas_viewer_config import (
     CanvasViewerConfigurationError,
     canvas_viewer_config,
 )
+from services.canvas_viewer_database import (
+    attest_canvas_viewer_database_privileges,
+    create_canvas_viewer_database,
+)
 from services.canvas_viewer_sessions import (
     CANVAS_VIEWER_COOKIE,
     CanvasOriginSession,
     CanvasViewerError,
     CanvasViewerSessionService,
+    canvas_bootstrap_cookie_name,
 )
 
 logger = logging.getLogger(__name__)
 
 _BOOTSTRAP_PATH = b"/_canvas/bootstrap"
-_BOOTSTRAP_TOKEN = re.compile(rb"^[A-Za-z0-9_-]{32,128}$")
+_EXCHANGE_PATH = b"/_canvas/exchange"
+_SECRET_TOKEN = re.compile(rb"^[A-Za-z0-9_-]{32,128}$")
 _COOKIE_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_ATTACHMENT_QUERY = re.compile(
+    rb"^attachment_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
+)
 _NO_STORE_HEADERS = (
     (b"cache-control", b"private, no-store"),
     (b"referrer-policy", b"no-referrer"),
@@ -65,6 +73,7 @@ _NO_STORE_HEADERS = (
 )
 
 SessionFactory = Callable[[Any, CanvasViewerConfig], CanvasViewerSessionService]
+DatabaseFactory = Callable[[], Any]
 KeyResolver = Callable[[], str | Awaitable[str]]
 InitialAuthorization = Callable[[], Awaitable[Any]]
 _MAX_PENDING_AUTHORIZATIONS = 32
@@ -79,6 +88,36 @@ def _headers(scope: dict[str, Any]) -> list[tuple[bytes, bytes]]:
             )
         result.append((name.lower(), value))
     return result
+
+
+def _require_header_limits(
+    headers: list[tuple[bytes, bytes]], limits: CanvasProxyLimits
+) -> None:
+    """Apply the proxy's bounded header admission to control endpoints too."""
+
+    if len(headers) > limits.max_header_fields:
+        raise CanvasProxyError(
+            431, "canvas_headers_too_large", "Too many HTTP header fields"
+        )
+    total = 2
+    for name, value in headers:
+        total += len(name) + len(value) + 4
+        if total > limits.max_header_bytes:
+            raise CanvasProxyError(
+                431, "canvas_headers_too_large", "HTTP header block is too large"
+            )
+        try:
+            name_text = name.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise CanvasProxyError(
+                400, "canvas_headers_invalid", "Canvas header name is invalid"
+            ) from exc
+        if not _COOKIE_NAME.fullmatch(name_text) or any(
+            byte in {0, 10, 13, 127} or (byte < 32 and byte != 9) for byte in value
+        ):
+            raise CanvasProxyError(
+                400, "canvas_headers_invalid", "Canvas request headers are invalid"
+            )
 
 
 def _single_header(
@@ -101,6 +140,8 @@ def _host_generation(
     assert host is not None
     try:
         value = host.decode("ascii")
+        if value != value.strip().lower():
+            raise CanvasViewerConfigurationError("Canvas viewer host is invalid")
         return config.generation_for_host(value)
     except (UnicodeDecodeError, CanvasViewerConfigurationError) as exc:
         raise CanvasProxyError(
@@ -108,7 +149,11 @@ def _host_generation(
         ) from exc
 
 
-def _reserved_cookie(headers: list[tuple[bytes, bytes]]) -> str | None:
+def _reserved_cookie(
+    headers: list[tuple[bytes, bytes]], cookie_name: str
+) -> str | None:
+    """Extract exactly one opaque host-only gateway cookie by name."""
+
     raw = _single_header(headers, b"cookie")
     if raw is None:
         return None
@@ -128,34 +173,40 @@ def _reserved_cookie(headers: list[tuple[bytes, bytes]]) -> str | None:
             raise CanvasProxyError(
                 400, "canvas_cookie_invalid", "Canvas cookie header is malformed"
             )
-        if name == CANVAS_VIEWER_COOKIE:
-            if not _BOOTSTRAP_TOKEN.fullmatch(value.encode("ascii")):
+        if name == cookie_name:
+            if not _SECRET_TOKEN.fullmatch(value.encode("ascii")):
                 raise CanvasProxyError(
                     400,
                     "canvas_cookie_invalid",
-                    "Canvas viewer cookie is malformed",
+                    "Reserved Canvas cookie is malformed",
                 )
             values.append(value)
     if len(values) > 1:
         raise CanvasProxyError(
             400,
             "canvas_cookie_invalid",
-            "Reserved Canvas viewer cookie is duplicated",
+            "Reserved Canvas cookie is duplicated",
         )
     return values[0] if values else None
 
 
-def _bootstrap_token(raw_query: bytes) -> str:
-    if len(raw_query) > 256 or not raw_query.startswith(b"token=") or b"&" in raw_query:
+def _bootstrap_attachment(raw_query: bytes) -> UUID:
+    match = _ATTACHMENT_QUERY.fullmatch(raw_query)
+    if match is None:
         raise CanvasProxyError(
             400, "canvas_bootstrap_invalid", "Canvas bootstrap request is invalid"
         )
-    token = raw_query[6:]
-    if not _BOOTSTRAP_TOKEN.fullmatch(token):
+    try:
+        attachment_id = UUID(match.group(1).decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise CanvasProxyError(
+            400, "canvas_bootstrap_invalid", "Canvas bootstrap request is invalid"
+        ) from exc
+    if str(attachment_id).encode("ascii") != match.group(1):
         raise CanvasProxyError(
             400, "canvas_bootstrap_invalid", "Canvas bootstrap request is invalid"
         )
-    return token.decode("ascii")
+    return attachment_id
 
 
 def _frame_ancestors(config: CanvasViewerConfig) -> bytes:
@@ -169,9 +220,9 @@ def _frame_ancestors(config: CanvasViewerConfig) -> bytes:
 def _bootstrap_headers(
     config: CanvasViewerConfig, *, script_nonce: str
 ) -> list[tuple[bytes, bytes]]:
-    policy = _frame_ancestors(config) + (f"; script-src 'nonce-{script_nonce}'").encode(
-        "ascii"
-    )
+    policy = _frame_ancestors(config) + (
+        f"; script-src 'nonce-{script_nonce}'; connect-src 'self'"
+    ).encode("ascii")
     return [
         *_NO_STORE_HEADERS,
         (b"content-security-policy", policy),
@@ -211,6 +262,34 @@ def _session_cookie(secret: str, expires_at: datetime) -> bytes:
         f"{CANVAS_VIEWER_COOKIE}={secret}; Path=/; Max-Age={seconds}; "
         "Secure; HttpOnly; SameSite=None; Partitioned"
     ).encode("ascii")
+
+
+def _bootstrap_cookie(name: str, secret: str, expires_at: datetime) -> bytes:
+    seconds = max(
+        0,
+        int((expires_at.astimezone(UTC) - datetime.now(UTC)).total_seconds()),
+    )
+    return (
+        f"{name}={secret}; Path=/; Max-Age={seconds}; "
+        "Secure; HttpOnly; SameSite=None; Partitioned"
+    ).encode("ascii")
+
+
+def _clear_cookie(name: str) -> bytes:
+    return (
+        f"{name}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=None; Partitioned"
+    ).encode("ascii")
+
+
+def _script_json(value: Any) -> str:
+    """Serialize trusted bootstrap values without creating a script end tag."""
+
+    return (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+        .replace("<", r"\u003c")
+        .replace(">", r"\u003e")
+        .replace("&", r"\u0026")
+    )
 
 
 async def _request_chunks(receive: Callable[[], Awaitable[dict[str, Any]]]):
@@ -289,6 +368,7 @@ class CanvasGatewayApp:
         self,
         *,
         db: Any | None = None,
+        database_factory: DatabaseFactory | None = None,
         config: CanvasViewerConfig | None = None,
         session_service: CanvasViewerSessionService | None = None,
         registry: CanvasConnectionRegistry | None = None,
@@ -297,7 +377,11 @@ class CanvasGatewayApp:
         limits: CanvasProxyLimits | None = None,
         authorization_limit: asyncio.Semaphore | None = None,
     ) -> None:
-        self._db = db or PostgresDB()
+        # Construct the dedicated viewer pool only after the fail-closed viewer
+        # configuration has passed lifespan startup. Importing this ASGI module
+        # must never fall back to the orchestrator's shared database identity.
+        self._db = db
+        self._database_factory = database_factory or create_canvas_viewer_database
         self._owns_db = db is None
         self._config = config
         self._session_service = session_service
@@ -312,6 +396,8 @@ class CanvasGatewayApp:
 
     def _service(self) -> CanvasViewerSessionService:
         assert self._config is not None
+        if self._db is None:
+            raise RuntimeError("Canvas viewer database is not initialized")
         if self._session_service is None:
             self._session_service = CanvasViewerSessionService(
                 self._db, config=self._config
@@ -341,16 +427,36 @@ class CanvasGatewayApp:
                             "Canvas viewer gateway cannot start while disabled"
                         )
                     self._config = config
+                    if self._db is None:
+                        self._db = self._database_factory()
                     if self._owns_db:
                         await self._db.connect()
                     # Fail/retry until the authoritative orchestrator has
                     # applied the viewer-session migration.
                     async with self._db.acquire() as conn:
-                        present = await conn.fetchval(
-                            "SELECT to_regclass('public.canvas_origin_sessions')"
+                        await attest_canvas_viewer_database_privileges(conn)
+                        schema_ready = await conn.fetchval(
+                            """
+                            SELECT to_regclass('public.canvas_origin_sessions')
+                                       IS NOT NULL
+                               AND COUNT(*) = 5
+                            FROM information_schema.columns
+                            WHERE table_schema = 'public'
+                              AND table_name = 'canvas_view_bootstraps'
+                              AND column_name = ANY($1::text[])
+                            """,
+                            [
+                                "authorized_at",
+                                "browser_binding_hash",
+                                "challenge_hash",
+                                "exchange_token_hash",
+                                "ready_receipt_hash",
+                            ],
                         )
-                    if present is None:
-                        raise RuntimeError("Canvas viewer schema is not installed")
+                    if schema_ready is not True:
+                        raise RuntimeError(
+                            "Canvas viewer challenge/exchange schema is not installed"
+                        )
                     self._service()
                     self._listener = CanvasSessionNotificationListener(
                         self._db, self._registry
@@ -371,7 +477,7 @@ class CanvasGatewayApp:
                 if self._listener is not None:
                     await self._listener.stop()
                 await self._transport_pool.close_all()
-                if self._owns_db:
+                if self._owns_db and self._db is not None:
                     await self._db.disconnect()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
@@ -396,6 +502,7 @@ class CanvasGatewayApp:
 
         try:
             headers = _headers(scope)
+            _require_header_limits(headers, self._limits)
             generation = _host_generation(headers, config)
             raw_path = scope.get("raw_path")
             if not isinstance(raw_path, bytes):
@@ -406,6 +513,11 @@ class CanvasGatewayApp:
                 )
             if raw_path == _BOOTSTRAP_PATH:
                 await self._bootstrap(
+                    scope, receive, send, headers=headers, generation=generation
+                )
+                return
+            if raw_path == _EXCHANGE_PATH:
+                await self._exchange(
                     scope, receive, send, headers=headers, generation=generation
                 )
                 return
@@ -554,11 +666,10 @@ class CanvasGatewayApp:
             raise CanvasProxyError(
                 404, "canvas_control_not_found", "Canvas control path not found"
             )
-        token = _bootstrap_token(scope.get("query_string") or b"")
-        existing = _reserved_cookie(headers)
+        attachment_id = _bootstrap_attachment(scope.get("query_string") or b"")
 
         # A GET bootstrap never accepts a request body. Check ASGI framing
-        # without consuming the one-time token on a malformed exchange.
+        # without starting the one-time challenge on a malformed request.
         content_length = _single_header(headers, b"content-length")
         if (
             content_length not in {None, b"0"}
@@ -569,45 +680,263 @@ class CanvasGatewayApp:
                 "canvas_bootstrap_invalid",
                 "Canvas bootstrap request body is not allowed",
             )
-        exchange = await self._initial_authorization(
-            lambda: self._service().consume_bootstrap(
-                token=token,
+        start = await self._initial_authorization(
+            lambda: self._service().begin_bootstrap(
+                attachment_id=attachment_id,
                 host_generation=generation,
-                existing_session_secret=existing,
             )
         )
+        if start.attachment_id != attachment_id:
+            raise CanvasViewerError(
+                500,
+                "canvas_bootstrap_invalid",
+                "Canvas bootstrap identity could not be established",
+            )
         script_nonce = secrets.token_urlsafe(18)
-        target = (
-            json.dumps(exchange.entry_path, ensure_ascii=True)
-            .replace("<", r"\u003c")
-            .replace(">", r"\u003e")
-            .replace("&", r"\u0026")
+        bootstrap_values = _script_json(
+            {
+                "attachmentId": str(start.attachment_id),
+                "challenge": start.challenge,
+                "parentOrigin": start.embedding_origin,
+                "readyReceipt": start.ready_receipt,
+            }
         )
         body = (
             "<!doctype html><meta charset=utf-8>"
             "<title>Opening Canvas</title>"
-            f'<script nonce="{script_nonce}">location.replace({target})</script>'
+            f'<script nonce="{script_nonce}">'
+            f"const bootstrap={bootstrap_values};"
+            'const channel="srw.canvas.bootstrap",version=1;'
+            "const secret=/^[A-Za-z0-9_-]{32,128}$/;"
+            "let accepted=false;"
+            "const keys=(value,expected)=>{"
+            'if(!value||typeof value!=="object"||Array.isArray(value))return false;'
+            "const actual=Object.keys(value).sort();"
+            "return actual.length===expected.length&&"
+            "actual.every((key,index)=>key===expected[index]);};"
+            'const announce=()=>parent.postMessage({channel,version,type:"challenge",'
+            "attachment_id:bootstrap.attachmentId,challenge:bootstrap.challenge,"
+            "ready_receipt:bootstrap.readyReceipt},bootstrap.parentOrigin);"
+            'addEventListener("message",async event=>{'
+            "if(accepted||event.source!==parent||event.origin!==bootstrap.parentOrigin)"
+            "return;const data=event.data;"
+            'if(!keys(data,["attachment_id","challenge","channel",'
+            '"exchange_code","type","version"])||'
+            'data.channel!==channel||data.version!==version||data.type!=="authorize"||'
+            "data.attachment_id!==bootstrap.attachmentId||"
+            "data.challenge!==bootstrap.challenge||!secret.test(data.exchange_code))return;"
+            "accepted=true;"
+            'try{const response=await fetch("/_canvas/exchange",{method:"POST",'
+            'credentials:"same-origin",redirect:"error",'
+            'headers:{"Content-Type":"application/json"},body:JSON.stringify({'
+            "attachment_id:bootstrap.attachmentId,challenge:bootstrap.challenge,"
+            "exchange_code:data.exchange_code})});"
+            'if(!response.ok)throw new Error("exchange rejected");'
+            "const result=await response.json();"
+            'if(!keys(result,["entry_path"])||typeof result.entry_path!=="string"||'
+            '!result.entry_path.startsWith("/")||result.entry_path.startsWith("//"))'
+            'throw new Error("exchange response invalid");'
+            'parent.postMessage({channel,version,type:"ready",'
+            "attachment_id:bootstrap.attachmentId,challenge:bootstrap.challenge,"
+            "ready_receipt:bootstrap.readyReceipt},bootstrap.parentOrigin);"
+            "location.replace(result.entry_path);"
+            '}catch(error){parent.postMessage({channel,version,type:"error",'
+            "attachment_id:bootstrap.attachmentId,challenge:bootstrap.challenge,"
+            'ready_receipt:bootstrap.readyReceipt,code:"exchange_failed"},'
+            "bootstrap.parentOrigin);}"
+            "});announce();</script>"
         ).encode("ascii")
         response_headers = [
             *_bootstrap_headers(self._config, script_nonce=script_nonce),
             (b"content-type", b"text/html; charset=utf-8"),
+            (
+                b"set-cookie",
+                _bootstrap_cookie(
+                    canvas_bootstrap_cookie_name(start.attachment_id),
+                    start.browser_binding,
+                    start.expires_at,
+                ),
+            ),
         ]
-        if exchange.session_secret is not None:
-            response_headers.append(
-                (
-                    b"set-cookie",
-                    _session_cookie(
-                        exchange.session_secret,
-                        exchange.cookie_expires_at or exchange.session.expires_at,
-                    ),
-                )
-            )
-        # A trusted same-origin transition document is deliberate. Its
-        # navigation makes subsequent app requests `Sec-Fetch-Site:
-        # same-origin`; requiring that signal prevents browsers which silently
-        # ignore `Partitioned` from sending an unpartitioned viewer cookie on
-        # attacker-site GET/HEAD subrequests.
         await _send_response(send, status=200, headers=response_headers, body=body)
+
+    async def _exchange(
+        self,
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+        *,
+        headers: list[tuple[bytes, bytes]],
+        generation: UUID,
+    ) -> None:
+        """Exchange a parent-authorized challenge inside its bound browser."""
+
+        assert self._config is not None
+        if scope.get("method") != "POST":
+            raise CanvasProxyError(
+                405,
+                "canvas_exchange_method_invalid",
+                "Canvas bootstrap exchange requires POST",
+            )
+        if scope.get("raw_path") != _EXCHANGE_PATH or scope.get("query_string"):
+            raise CanvasProxyError(
+                400, "canvas_exchange_invalid", "Canvas bootstrap exchange is invalid"
+            )
+        if (
+            _single_header(headers, b"sec-fetch-site") != b"same-origin"
+            or _single_header(headers, b"sec-fetch-mode") != b"cors"
+            or _single_header(headers, b"sec-fetch-dest") != b"empty"
+        ):
+            raise CanvasProxyError(
+                403,
+                "canvas_exchange_origin_required",
+                "Canvas bootstrap exchange requires a same-origin browser request",
+            )
+        origin = _single_header(headers, b"origin", required=True)
+        expected_origin = self._config.public_origin(generation).encode("ascii")
+        if origin != expected_origin:
+            raise CanvasProxyError(
+                403,
+                "canvas_exchange_origin_required",
+                "Canvas bootstrap exchange requires its allocated origin",
+            )
+        content_type = _single_header(headers, b"content-type", required=True)
+        if content_type is None or content_type.strip().lower() != b"application/json":
+            raise CanvasProxyError(
+                415,
+                "canvas_exchange_content_type_invalid",
+                "Canvas bootstrap exchange requires application/json",
+            )
+        if (
+            _single_header(headers, b"transfer-encoding") is not None
+            or _single_header(headers, b"trailer") is not None
+        ):
+            raise CanvasProxyError(
+                400,
+                "canvas_exchange_framing_invalid",
+                "Canvas bootstrap exchange framing is invalid",
+            )
+        declared_length = _single_header(headers, b"content-length")
+        expected_length: int | None = None
+        if declared_length is not None:
+            if not re.fullmatch(rb"0|[1-9][0-9]{0,4}", declared_length):
+                raise CanvasProxyError(
+                    400,
+                    "canvas_exchange_framing_invalid",
+                    "Canvas bootstrap exchange framing is invalid",
+                )
+            expected_length = int(declared_length)
+            if expected_length > 4096:
+                raise CanvasProxyError(
+                    413,
+                    "canvas_exchange_too_large",
+                    "Canvas bootstrap exchange body is too large",
+                )
+
+        chunks: list[bytes] = []
+        body_length = 0
+        async for chunk in _request_chunks(receive):
+            body_length += len(chunk)
+            if body_length > 4096:
+                raise CanvasProxyError(
+                    413,
+                    "canvas_exchange_too_large",
+                    "Canvas bootstrap exchange body is too large",
+                )
+            chunks.append(chunk)
+        if expected_length is not None and body_length != expected_length:
+            raise CanvasProxyError(
+                400,
+                "canvas_exchange_framing_invalid",
+                "Canvas bootstrap exchange framing is invalid",
+            )
+        try:
+            payload = json.loads(b"".join(chunks))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CanvasProxyError(
+                400, "canvas_exchange_invalid", "Canvas bootstrap exchange is invalid"
+            ) from exc
+        if not isinstance(payload, dict) or set(payload) != {
+            "attachment_id",
+            "challenge",
+            "exchange_code",
+        }:
+            raise CanvasProxyError(
+                400, "canvas_exchange_invalid", "Canvas bootstrap exchange is invalid"
+            )
+        try:
+            attachment_id = UUID(payload["attachment_id"])
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise CanvasProxyError(
+                400, "canvas_exchange_invalid", "Canvas bootstrap exchange is invalid"
+            ) from exc
+        if str(attachment_id) != payload["attachment_id"]:
+            raise CanvasProxyError(
+                400, "canvas_exchange_invalid", "Canvas bootstrap exchange is invalid"
+            )
+        challenge = payload["challenge"]
+        exchange_code = payload["exchange_code"]
+        try:
+            challenge_bytes = challenge.encode("ascii")
+            exchange_code_bytes = exchange_code.encode("ascii")
+        except (AttributeError, UnicodeEncodeError) as exc:
+            raise CanvasProxyError(
+                400, "canvas_exchange_invalid", "Canvas bootstrap exchange is invalid"
+            ) from exc
+        if (
+            not isinstance(challenge, str)
+            or not isinstance(exchange_code, str)
+            or not _SECRET_TOKEN.fullmatch(challenge_bytes)
+            or not _SECRET_TOKEN.fullmatch(exchange_code_bytes)
+        ):
+            raise CanvasProxyError(
+                400, "canvas_exchange_invalid", "Canvas bootstrap exchange is invalid"
+            )
+
+        bootstrap_cookie = canvas_bootstrap_cookie_name(attachment_id)
+        browser_binding = _reserved_cookie(headers, bootstrap_cookie)
+        if browser_binding is None:
+            raise CanvasViewerError(
+                401,
+                "canvas_bootstrap_invalid",
+                "Canvas bootstrap browser binding is missing",
+            )
+        existing = _reserved_cookie(headers, CANVAS_VIEWER_COOKIE)
+        exchange = await self._initial_authorization(
+            lambda: self._service().exchange_bootstrap(
+                attachment_id=attachment_id,
+                challenge=challenge,
+                exchange_code=exchange_code,
+                browser_binding=browser_binding,
+                host_generation=generation,
+                existing_session_secret=existing,
+            )
+        )
+        if exchange.session_secret is None:
+            raise CanvasViewerError(
+                500,
+                "canvas_session_invalid",
+                "Canvas viewer session could not be established",
+            )
+        response_body = json.dumps(
+            {"entry_path": exchange.entry_path}, separators=(",", ":")
+        ).encode("utf-8")
+        response_headers = [
+            (b"content-type", b"application/json"),
+            *_NO_STORE_HEADERS,
+            (b"content-security-policy", b"default-src 'none'"),
+            (b"set-cookie", _clear_cookie(bootstrap_cookie)),
+            (
+                b"set-cookie",
+                _session_cookie(
+                    exchange.session_secret,
+                    exchange.cookie_expires_at or exchange.session.expires_at,
+                ),
+            ),
+        ]
+        await _send_response(
+            send, status=200, headers=response_headers, body=response_body
+        )
 
     async def _key_path(self) -> str:
         value = self._key_resolver()
@@ -663,8 +992,18 @@ class CanvasGatewayApp:
         key_path = await self._key_path()
 
         async def generation_resolver() -> dict[str, Any]:
-            current = await self._db.get_thread(str(session.thread_id))
-            return current or {}
+            if self._db is None:
+                raise RuntimeError("Canvas viewer database is not initialized")
+            async with self._db.acquire() as conn:
+                current = await conn.fetchrow(
+                    """
+                    SELECT id, user_id, metadata
+                    FROM threads
+                    WHERE id = $1
+                    """,
+                    session.thread_id,
+                )
+            return dict(current) if current is not None else {}
 
         async with AsyncExitStack() as stack:
             try:

@@ -6,7 +6,7 @@
 # Idempotent: re-runs are safe. Skips anything that already exists.
 #
 # After this, copy the values template and `helm install`:
-#   cp deployment/values-local.example.yaml deployment/values-local.yaml
+#   cp deployment/values-local.yaml.example deployment/values-local.yaml
 #   $EDITOR deployment/values-local.yaml      # paste at least one LLM key
 #   helm install srw ./helm -n srw -f deployment/values-local.yaml
 #
@@ -156,7 +156,7 @@ cat <<EOF
 $(printf '\033[1;32m✓ Local cluster ready.\033[0m')
 
 Next:
-  cp deployment/values-local.example.yaml deployment/values-local.yaml
+  cp deployment/values-local.yaml.example deployment/values-local.yaml
   \$EDITOR deployment/values-local.yaml      # paste at least one LLM key
   helm install srw ./helm -n $NAMESPACE -f deployment/values-local.yaml
 

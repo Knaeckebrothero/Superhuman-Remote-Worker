@@ -171,7 +171,10 @@ import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.compone
               @case ('app') {
                 <app-canvas-live-app-renderer [src]="viewer.frameUrl()!"
                                               [title]="liveAppFrameTitle()"
-                                              [warning]="'canvas.app.untrustedWarning' | transloco" />
+                                              [warning]="'canvas.app.untrustedWarning' | transloco"
+                                              (frameBound)="viewer.bindFrame($event)"
+                                              (frameUnbound)="viewer.unbindFrame($event)"
+                                              (frameMessage)="viewer.handleFrameMessage($event)" />
               }
             }
             @if (showOverlay()) {

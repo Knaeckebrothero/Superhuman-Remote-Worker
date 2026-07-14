@@ -66,6 +66,7 @@ internal_router = APIRouter(
 
 _STATE_CACHE_CONTROL = "private, no-cache"
 _CONTENT_CACHE_CONTROL = "private, no-cache"
+_VIEWER_SECRET_PATTERN = r"^[A-Za-z0-9_-]{32,128}$"
 
 
 class _LeasedContentResponse(Response):
@@ -125,6 +126,22 @@ class CanvasSetRequest(BaseModel):
                 "workspace_port requires renderer='auto' and editable=false"
             )
         return self
+
+
+class CanvasBootstrapAuthorizeRequest(BaseModel):
+    """Closed parent-to-BFF proof for one gateway-created frame challenge."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challenge: str = Field(
+        min_length=32, max_length=128, pattern=_VIEWER_SECRET_PATTERN
+    )
+    ready_receipt: str = Field(
+        min_length=32, max_length=128, pattern=_VIEWER_SECRET_PATTERN
+    )
+    bridge_nonce: str = Field(
+        min_length=32, max_length=128, pattern=_VIEWER_SECRET_PATTERN
+    )
 
 
 def _get_db() -> Any:
@@ -628,6 +645,40 @@ async def create_main_canvas_view_attachment(
         _raise_viewer_error(exc)
     return JSONResponse(
         grant.public_dict(), headers={"Cache-Control": "private, no-store"}
+    )
+
+
+@router.post(
+    "/main/view-attachments/{attachment_id}/authorize",
+    responses={401: {}, 403: {}, 409: {}, 422: {}, 503: {}},
+)
+async def authorize_main_canvas_view_attachment(
+    thread_id: str,
+    attachment_id: UUID,
+    payload: CanvasBootstrapAuthorizeRequest,
+    request: Request,
+) -> Response:
+    """Bind one gateway challenge to this exact authenticated BFF session."""
+
+    parent_session_id = _required_parent_session_id(request)
+    db = _get_db()
+    user, _ = await require_thread_owner(request, db, thread_id)
+    try:
+        authorization = await _get_viewer_service(db).authorize_bootstrap(
+            attachment_id=attachment_id,
+            user_id=str(user["id"]),
+            thread_id=thread_id,
+            parent_session_id=parent_session_id,
+            embedding_origin=request.headers.get("Origin"),
+            challenge=payload.challenge,
+            ready_receipt=payload.ready_receipt,
+            bridge_nonce=payload.bridge_nonce,
+        )
+    except CanvasViewerError as exc:
+        _raise_viewer_error(exc)
+    return JSONResponse(
+        authorization.public_dict(),
+        headers={"Cache-Control": "private, no-store"},
     )
 
 

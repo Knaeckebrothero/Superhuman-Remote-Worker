@@ -36,6 +36,8 @@ die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 # --- 0. Tilt-specific prereq -------------------------------------------------
 command -v tilt >/dev/null \
   || die "tilt not on PATH — install per docs/features/tilt_inner_loop_dev.md"
+helm upgrade --help 2>/dev/null | grep -F -- '--take-ownership' >/dev/null \
+  || die "helm lacks --take-ownership — install a current Helm 3 release before using Tilt Force Update"
 
 # --- 1. Base bootstrap -------------------------------------------------------
 log "running base bootstrap (cluster + cert-manager + namespace + vm-ssh-key)"
@@ -70,41 +72,12 @@ elif [[ -f "$VALUES_LOCAL" ]] && grep -q 'auth.localhost' "$VALUES_LOCAL"; then
   fi
 elif [[ ! -f "$VALUES_LOCAL" ]]; then
   log "values-local.yaml not found — copy from the example then re-run this script:"
-  log "  cp deployment/values-local.example.yaml deployment/values-local.yaml"
+  log "  cp deployment/values-local.yaml.example deployment/values-local.yaml"
   log "  \$EDITOR deployment/values-local.yaml   # paste at least one LLM key"
   die "create values-local.yaml first"
 fi
 
-# --- 4. Mirror MinIO images into the cluster registry ------------------------
-# The `virtual` workspace tier AND the snapshot/IDE object store both run on a
-# single-node MinIO (deployment/tilt-minio.yaml, deployed by the Tiltfile). The
-# k3d node has no external DNS, so MinIO's images must be pushed into the
-# in-cluster registry first — otherwise the minio pods sit in ImagePullBackOff
-# and snapshots + the virtual tier are dead. Idempotent: skips images already
-# present. The registry host port is read from the container (5005 on a fresh
-# cluster, 5000 on older ones), so this works regardless of which it is.
-REGISTRY_CTR=$(docker ps --filter "name=${CLUSTER_NAME}-registry" --format '{{.Names}}' 2>/dev/null | head -1 || true)
-REG_PORT=""
-[[ -n "$REGISTRY_CTR" ]] && REG_PORT=$(docker port "$REGISTRY_CTR" 5000 2>/dev/null | head -1 | sed -E 's/.*:([0-9]+)$/\1/' || true)
-if [[ -z "$REG_PORT" ]]; then
-  log "k3d registry not found / no published port — skipping MinIO mirror."
-  log "  (minio pods will ImagePullBackOff; mirror manually, then 'kubectl -n $NAMESPACE delete pod -l app=minio')"
-else
-  for img in minio/minio:latest minio/mc:latest; do
-    repo="${img%:*}"
-    if curl -fsS "http://localhost:${REG_PORT}/v2/${repo}/tags/list" >/dev/null 2>&1; then
-      skip "registry already has $img"
-    elif docker pull "$img" >/dev/null 2>&1 \
-         && docker tag "$img" "localhost:${REG_PORT}/${img}" \
-         && docker push "localhost:${REG_PORT}/${img}" >/dev/null 2>&1; then
-      ok "mirrored $img → localhost:${REG_PORT}"
-    else
-      log "WARN: could not mirror $img (offline / rate-limited?) — minio will ImagePullBackOff until you mirror it"
-    fi
-  done
-fi
-
-# --- 5. Run Tilt -------------------------------------------------------------
+# --- 4. Run Tilt -------------------------------------------------------------
 cat <<EOF
 
 $(printf '\033[1;32m✓ Cluster ready. Starting Tilt.\033[0m')
