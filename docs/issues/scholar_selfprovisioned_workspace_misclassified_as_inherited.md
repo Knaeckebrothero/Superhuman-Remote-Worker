@@ -224,6 +224,40 @@ Phase 0 removes the *symptom*. Phase 1 removes the *ambiguity* by collapsing to 
 single workspace per job that every phase rides — treat the field as **the job's
 one workspace** that everyone checks before creating one.
 
+### Slice 1 status — IMPLEMENTED + k3d-verified (2026-07-14, `develop`, unpushed)
+
+The **scholar** half of the model is built and live-verified. On an idle cluster
+the scholar now provisions the parent's ONE shared pod *under the parent's
+identity* instead of a throwaway pod of its own:
+
+- **Spawn** (`_spawn_scholar_subjob`): stamps `context.provisions_parent_workspace
+  =<parentId>` on the idle path, gated to container/sandbox backends by
+  `_scholar_should_provision_parent_container` (VM/remote and lite fall through).
+- **Dispatch seam** (`_job_needs_sandbox` branch): a scholar carrying the marker
+  (k8s in-cluster only) runs `_provision_parent_workspace_for_scholar`, which drives
+  `ensure_workspace(WorkspaceOwner.job(parentId))`. Because `create_workspace` keys
+  the pod name **and** the context write-back on the owner, `workspace-<parentId>`
+  is created and its ready status lands on the **parent's** row automatically — no
+  copy-back. On ready it *promotes* the scholar (`inherits_parent_workspace` + the
+  container + `worktree_path`); the scholar then dispatches via the already-shipped
+  inherit path (resolver overlay → `_job_needs_sandbox`=False → worktree injection).
+- **k3d evidence** (parent `82aa33f2` / scholar `e7695593`, idle cluster): exactly
+  **one** pod `workspace-82aa33f2` (never `workspace-e7695593`); the parent row
+  carries that pod as its own `workspace_container`; the scholar was promoted with
+  `worktree_path=/home/agent-host/workspace/worktrees/e7695593-scholar` and rode the
+  shared pod (agent pod dispatched, `job/start → 202`). The one-workspace-pod
+  invariant held for the entire run. Unit coverage:
+  `tests/test_scholar_provisions_parent_workspace.py` (12 tests).
+
+**Scope:** container/sandbox backend only. VM/remote and lite parents, and non-k8s
+(docker) deployments, keep today's behavior. **No reaper/metering change was
+needed** — metering/snapshots already key single-owner on the parent (subjobs never
+self-provision), and the scholar→parent handoff is status-safe (parent
+`waiting`/`created`/`processing`, none reapable; child-keyed teardown
+`workspace-<scholarId>` structurally can't reach `workspace-<parentId>`). The
+critic-handoff reaper gap (parent `reviewing`) is the separate, already-filed
+`reviewing_parent_pod_reaped_under_critic.md` (Slice 2, not in scope here).
+
 ### Principle
 
 One workspace per root job, **owned by the parent** (`workspace-<parentid>`),
