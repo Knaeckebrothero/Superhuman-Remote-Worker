@@ -687,6 +687,55 @@ class TestClassifyLlmError:
         )
         assert _classify_llm_error(err) == "transient"
 
+    def test_408_stream_disconnect_is_transient(self):
+        """A 408 whose body mislabels a dropped response stream as
+        type=invalid_request_error is a *transient* transport failure, NOT a
+        deterministic input rejection. The 2026-07-14 incident: scholar subjob
+        35b23256 lost 3.5h of finished research when this exact 408 was
+        classified 'permanent' and hard-failed on the first attempt (0 retries).
+        """
+        err = _make_sdk_error(
+            "APIStatusError",
+            408,
+            body={
+                "error": {
+                    "message": (
+                        "stream error: stream disconnected before completion: "
+                        "stream closed before response.completed"
+                    ),
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "transient"
+
+    def test_stringified_408_stream_disconnect_is_transient(self):
+        """The production audit shape: a stringified 408 stream-disconnect that
+        lost its exception class must still reach the text fallback as
+        transient, not be swallowed 'permanent' by the invalid_request_error
+        heuristic."""
+        err = Exception(
+            "Error code: 408 - {'error': {'message': 'stream error: stream "
+            "disconnected before completion: stream closed before "
+            "response.completed', 'type': 'invalid_request_error'}}"
+        )
+        assert _classify_llm_error(err) == "transient"
+
+    def test_400_stream_disconnect_is_transient(self):
+        """Defense-in-depth: a dropped stream surfaced as a 400 (rather than
+        408) invalid_request_error is still transport, not input — retry it."""
+        err = _make_sdk_error(
+            "BadRequestError",
+            400,
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "stream closed before response.completed",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "transient"
+
     def test_429_is_rate_limit(self):
         err = _make_sdk_error("RateLimitError", 429)
         assert _classify_llm_error(err) == "rate_limit"
