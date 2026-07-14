@@ -164,6 +164,38 @@ describe('Canvas live-app viewer lifecycle', () => {
     http.expectOne(request => request.url.endsWith(`/view-attachments/${ATTACHMENT_ONE}`)).flush(null);
   });
 
+  it('surfaces the typed unsupported-browser response for trusted fallback UX', () => {
+    controller.syncPresentation(true, 'thread-1', appState(1), '"canvas:1"');
+    http.expectOne(request => request.url.endsWith('/view-attachments')).flush(
+      {detail: {code: 'canvas_browser_unsupported'}},
+      {status: 409, statusText: 'Conflict'},
+    );
+
+    expect(controller.frameUrl()).toBeNull();
+    expect(controller.viewerStatus()).toBe('error');
+    expect(controller.viewerErrorCode()).toBe('canvas_browser_unsupported');
+  });
+
+  it('retries the isolated attachment flow without creating a top-level URL', () => {
+    controller.syncPresentation(true, 'thread-1', appState(1), '"canvas:1"');
+    http.expectOne(request => request.url.endsWith('/view-attachments')).flush(
+      {detail: {code: 'canvas_viewer_unavailable'}},
+      {status: 503, statusText: 'Service Unavailable'},
+    );
+    expect(controller.viewerStatus()).toBe('error');
+    expect(controller.frameUrl()).toBeNull();
+
+    controller.retry();
+    const retry = http.expectOne(request => request.url.endsWith('/view-attachments'));
+    expect(retry.request.method).toBe('POST');
+    expect(retry.request.headers.get('If-Match')).toBe('"canvas:1"');
+    retry.flush(attachment());
+    expect(controller.frameUrl()).not.toBeNull();
+
+    controller.syncPresentation(false, 'thread-1', appState(1), '"canvas:1"');
+    http.expectOne(request => request.url.endsWith(`/${ATTACHMENT_ONE}`)).flush(null);
+  });
+
   it('authorizes only an exact frame challenge and becomes ready only on the receipt', () => {
     controller.syncPresentation(true, 'thread-1', appState(1), '"canvas:1"');
     http.expectOne(request => request.url.endsWith('/view-attachments')).flush(attachment());
@@ -254,6 +286,26 @@ describe('Canvas live-app viewer lifecycle', () => {
     expect(authorize.cancelled).toBe(true);
     expect(controller.frameUrl()).toBeNull();
     expect(controller.viewerErrorCode()).toBe('canvas_viewer_bootstrap_failed');
+    http.expectOne(request => request.url.endsWith(`/${ATTACHMENT_ONE}`)).flush(null);
+  });
+
+  it('surfaces a missing partitioned bootstrap cookie as browser storage unavailable', () => {
+    controller.syncPresentation(true, 'thread-1', appState(1), '"canvas:1"');
+    http.expectOne(request => request.url.endsWith('/view-attachments')).flush(attachment());
+    const frame = frameWindow();
+    controller.bindFrame(frame);
+    controller.handleFrameMessage(frameEvent(frame, challenge()));
+    const authorize = http.expectOne(request => request.url.endsWith('/authorize'));
+
+    controller.handleFrameMessage(frameEvent(frame, {
+      ...challenge(),
+      type: 'error',
+      code: 'canvas_browser_storage_unavailable',
+    }));
+
+    expect(authorize.cancelled).toBe(true);
+    expect(controller.frameUrl()).toBeNull();
+    expect(controller.viewerErrorCode()).toBe('canvas_browser_storage_unavailable');
     http.expectOne(request => request.url.endsWith(`/${ATTACHMENT_ONE}`)).flush(null);
   });
 

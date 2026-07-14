@@ -161,6 +161,14 @@ describe('PersistentThreadTransportBridge', () => {
     expect(bridge.sendCanvasControl('thread-1', control)).toBe(true);
     expect(sender).toHaveBeenCalledWith('thread-1', control);
 
+    const presentationControl = {
+      method: 'canvas.presentation_updated' as const,
+      canvas_id: 'main' as const,
+      presentation_revision: 6,
+    };
+    expect(bridge.sendCanvasControl('thread-1', presentationControl)).toBe(true);
+    expect(sender).toHaveBeenCalledWith('thread-1', presentationControl);
+
     detach();
     expect(bridge.sendCanvasControl('thread-1', control)).toBe(false);
   });

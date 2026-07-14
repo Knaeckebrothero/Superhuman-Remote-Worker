@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from services.canvas import (
     BrowserSource,
     CanvasCapabilities,
+    CanvasEditError,
     CanvasPreconditionFailed,
     CanvasPreconditionRequired,
     CanvasService,
@@ -64,6 +65,13 @@ class _FakeCanvasDB:
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         sql = " ".join(query.split())
+
+        if sql.startswith("SELECT id, user_id, metadata FROM threads"):
+            return {
+                "id": str(args[0]),
+                "user_id": "user-1",
+                "metadata": {},
+            }
 
         if sql.startswith("SELECT thread_id"):
             key = (str(args[0]), str(args[1]))
@@ -130,6 +138,18 @@ class _FakeCanvasDB:
                 "source_fingerprint": None,
                 "source_version": None,
                 "origin_generation": None,
+                "updated_at": self._tick(),
+            }
+            self.rows[key] = row
+            return dict(row)
+
+        if sql.startswith("UPDATE canvases SET origin_generation"):
+            key = (str(args[0]), str(args[1]))
+            existing = self.rows[key]
+            row = {
+                **existing,
+                "origin_generation": args[2],
+                "presentation_revision": existing["presentation_revision"] + 1,
                 "updated_at": self._tick(),
             }
             self.rows[key] = row
@@ -319,6 +339,84 @@ async def test_conditional_clear_and_repeated_clear_semantics() -> None:
 
 
 @pytest.mark.asyncio
+async def test_conditional_live_app_origin_reset_preserves_source() -> None:
+    db = _FakeCanvasDB()
+    callbacks: list[str] = []
+
+    async def callback(event) -> None:
+        assert not db.in_transaction
+        callbacks.append(event.method)
+
+    service = CanvasService(db, event_callback=callback)
+    source = WorkspaceAppSource(
+        entry_port=5173,
+        entry_path="/demo",
+        workspace_generation=_WORKSPACE_GENERATION,
+    )
+    presented = await service.set(
+        _THREAD_ID,
+        CanvasSetInput(source=source, title="Prototype"),
+    )
+    assert presented.record is not None
+    before = presented.record
+    representation = build_public_canvas_representation(before)
+
+    with pytest.raises(CanvasPreconditionRequired):
+        await service.reset_origin(
+            _THREAD_ID,
+            expected_etag=None,
+            expected_thread_user_id="user-1",
+        )
+    with pytest.raises(CanvasPreconditionFailed):
+        await service.reset_origin(
+            _THREAD_ID,
+            expected_etag='"canvas:stale"',
+            expected_thread_user_id="user-1",
+        )
+
+    reset = await service.reset_origin(
+        _THREAD_ID,
+        expected_etag=representation.etag,
+        expected_thread_user_id="user-1",
+    )
+    assert reset.record is not None
+    assert reset.record.source == before.source
+    assert reset.record.source_fingerprint == before.source_fingerprint
+    assert reset.record.title == before.title
+    assert reset.record.presentation_revision == before.presentation_revision + 1
+    assert reset.record.origin_generation != before.origin_generation
+    assert callbacks == ["canvas.updated", "canvas.updated"]
+
+
+@pytest.mark.asyncio
+async def test_origin_reset_revalidates_owner_and_rejects_files() -> None:
+    db = _FakeCanvasDB()
+    service = CanvasService(db)
+    await service.set(_THREAD_ID, _file_set())
+    record = await service.get(_THREAD_ID)
+    assert record is not None
+    etag = build_public_canvas_representation(record).etag
+
+    with pytest.raises(CanvasEditError) as not_app:
+        await service.reset_origin(
+            _THREAD_ID,
+            expected_etag=etag,
+            expected_thread_user_id="user-1",
+        )
+    assert not_app.value.status_code == 409
+    assert not_app.value.code == "canvas_not_live_app"
+
+    with pytest.raises(CanvasEditError) as unauthorized:
+        await service.reset_origin(
+            _THREAD_ID,
+            expected_etag=etag,
+            expected_thread_user_id="other-user",
+        )
+    assert unauthorized.value.status_code == 403
+    assert unauthorized.value.code == "canvas_not_authorized"
+
+
+@pytest.mark.asyncio
 async def test_only_main_canvas_is_accepted() -> None:
     service = CanvasService(_FakeCanvasDB())
     with pytest.raises(ValueError, match="only canvas_id='main'"):
@@ -409,6 +507,88 @@ def test_delete_route_requires_exact_etag_then_becomes_idempotent(monkeypatch) -
     assert persisted.json()["presentation_revision"] == 2
 
 
+def test_reset_origin_route_is_conditional_and_never_exposes_generation(
+    monkeypatch,
+) -> None:
+    db = _FakeCanvasDB()
+    source = WorkspaceAppSource(
+        entry_port=5173,
+        entry_path="/demo",
+        workspace_generation=_WORKSPACE_GENERATION,
+    )
+    asyncio.run(
+        CanvasService(db).set(
+            _THREAD_ID,
+            CanvasSetInput(source=source, title="Prototype"),
+        )
+    )
+    before = asyncio.run(CanvasService(db).get(_THREAD_ID))
+    assert before is not None and before.origin_generation is not None
+
+    app, _ = _route_app(monkeypatch, db)
+    client = TestClient(app)
+    base = f"/api/persistent/threads/{_THREAD_ID}/canvases/main"
+    reset_url = f"{base}/reset-origin"
+
+    missing = client.post(reset_url)
+    assert missing.status_code == 428
+    assert missing.json()["detail"]["code"] == "canvas_precondition_required"
+
+    malformed = client.post(reset_url, headers={"If-Match": "not-an-etag"})
+    assert malformed.status_code == 400
+    assert malformed.json()["detail"]["code"] == "invalid_canvas_precondition"
+
+    current = client.get(base)
+    assert current.status_code == 200
+    stale = client.post(
+        reset_url,
+        headers={"If-Match": '"canvas:1:' + "0" * 64 + '"'},
+    )
+    assert stale.status_code == 412
+    assert stale.json()["detail"]["code"] == "canvas_precondition_failed"
+
+    reset = client.post(reset_url, headers={"If-Match": current.headers["etag"]})
+    assert reset.status_code == 200
+    assert reset.headers["cache-control"] == "private, no-cache"
+    assert reset.headers["etag"].startswith('"canvas:2:')
+    assert reset.json()["presentation_revision"] == 2
+    assert reset.json()["source"] == {
+        "type": "workspace_app",
+        "manifest_path": None,
+        "entry_path": "/demo",
+    }
+    assert "origin_generation" not in reset.text
+
+    persisted = asyncio.run(CanvasService(db).get(_THREAD_ID))
+    assert persisted is not None
+    assert persisted.source == before.source
+    assert persisted.origin_generation != before.origin_generation
+
+
+def test_reset_origin_route_rejects_non_app_and_request_body(monkeypatch) -> None:
+    db = _FakeCanvasDB()
+    _seed_presented(db)
+    app, _ = _route_app(monkeypatch, db)
+    client = TestClient(app)
+    base = f"/api/persistent/threads/{_THREAD_ID}/canvases/main"
+    state = client.get(base)
+
+    body = client.post(
+        f"{base}/reset-origin",
+        headers={"If-Match": state.headers["etag"]},
+        json={"source": "caller-controlled"},
+    )
+    assert body.status_code == 400
+    assert body.json()["detail"]["code"] == "invalid_canvas_refresh"
+
+    not_app = client.post(
+        f"{base}/reset-origin",
+        headers={"If-Match": state.headers["etag"]},
+    )
+    assert not_app.status_code == 409
+    assert not_app.json()["detail"]["code"] == "canvas_not_live_app"
+
+
 def test_routes_fail_at_owner_gate_before_canvas_access(monkeypatch) -> None:
     from routers import canvases as canvases_router_module
 
@@ -439,6 +619,10 @@ def test_main_app_mounts_slice_one_canvas_routes() -> None:
     path = "/api/persistent/threads/{thread_id}/canvases/main"
     assert ("GET", path) in routes
     assert ("DELETE", path) in routes
+    assert (
+        "POST",
+        "/api/persistent/threads/{thread_id}/canvases/main/reset-origin",
+    ) in routes
     internal = "/api/internal/persistent/threads/{thread_id}/canvases/main"
     assert ("GET", internal) in routes
     assert ("DELETE", internal) in routes

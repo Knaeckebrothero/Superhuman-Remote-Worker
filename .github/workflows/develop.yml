@@ -709,13 +709,13 @@ jobs:
         run: pytest tests/ -x -q --tb=short
 
   # ---------------------------------------------------------------------------
-  # Cockpit (Angular) tests (change-based)
+  # Cockpit unit + production-browser conformance tests (change-based)
   # ---------------------------------------------------------------------------
   test-cockpit:
     needs: [changes]
     if: needs.changes.outputs.cockpit-changed == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -732,6 +732,25 @@ jobs:
       - name: Run tests
         working-directory: cockpit
         run: npm test
+      - name: Install Canvas browser engines
+        working-directory: cockpit
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Build production Cockpit
+        working-directory: cockpit
+        run: npm run build
+      - name: Run Dynamic Canvas browser conformance
+        working-directory: cockpit
+        run: npm run test:e2e:canvas:no-build
+      - name: Upload Dynamic Canvas browser report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canvas-browser-report-develop-${{ github.run_attempt }}
+          path: |
+            cockpit/playwright-report/
+            cockpit/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Image builds — change-based, SHA + :experimental tags only

@@ -9,6 +9,7 @@ import {DiffLine} from '../../core/util/line-diff';
 import {ToolCardAction, ToolCardStatus, ToolCardView, ToolResult} from '../../core/models/tool-card.model';
 import {CanvasService} from '../../core/services/canvas.service';
 import {CanvasState} from '../../core/models/canvas.model';
+import {CanvasToolCardPresentationComponent} from './canvas-tool-card-presentation.component';
 
 /** Lines of a text/code/terminal result shown before "show N more". */
 const RESULT_LINE_CAP = 200;
@@ -37,14 +38,20 @@ export function canvasToolCardContext(
     selector: 'app-tool-card',
     standalone: true,
     changeDetection: ChangeDetectionStrategy.OnPush,
-    imports: [TranslocoPipe, MarkdownComponent, AppIconComponent, AppIconButtonComponent],
+    imports: [
+        TranslocoPipe,
+        MarkdownComponent,
+        AppIconComponent,
+        AppIconButtonComponent,
+        CanvasToolCardPresentationComponent,
+    ],
     template: `
     <details class="tc" [class.tc--error]="status() === 'error'" [class.tc--denied]="status() === 'denied'"
              [attr.open]="open() ? '' : null">
       <summary class="tc__head">
         <app-icon size="sm" class="tc__icon">{{ view().icon }}</app-icon>
         <span class="tc__title">{{ title() }}</span>
-        @if (view().subtitle) {
+        @if (!view().canvasPresentation && view().subtitle) {
           <span class="tc__hint" [title]="view().subtitle">{{ view().subtitle }}</span>
         }
         <span class="tc__status" [class]="'tc__status--' + status()">
@@ -52,11 +59,11 @@ export function canvasToolCardContext(
           {{ statusLabel() }}
         </span>
         @if (view().action; as action) {
-          <span class="tc__canvas-context">{{ canvasContextLabel() }}</span>
-          <button type="button" class="tc__action" [disabled]="!canvasActionAvailable()"
-                  (click)="requestAction($event, action)">
-            {{ 'toolCard.canvas.open' | transloco }}
-          </button>
+          <app-canvas-tool-card-presentation [presentation]="view().canvasPresentation"
+                                             [action]="action"
+                                             [contextLabel]="canvasContextLabel()"
+                                             [available]="canvasActionAvailable()"
+                                             (requested)="requestAction($event)" />
         }
       </summary>
 
@@ -249,9 +256,7 @@ export class AppToolCardComponent implements OnDestroy {
         this.copiedTimer = setTimeout(() => this.copied.set(false), COPIED_RESET_MS);
     }
 
-    requestAction(event: MouseEvent, action: ToolCardAction): void {
-        event.preventDefault();
-        event.stopPropagation();
+    requestAction(action: ToolCardAction): void {
         if (this.canvasActionAvailable()) this.actionRequested.emit(action);
     }
 

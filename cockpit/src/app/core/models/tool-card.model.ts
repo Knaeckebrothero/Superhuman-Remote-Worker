@@ -61,6 +61,14 @@ export interface ToolCardAction {
     readonly presentationRevision?: number;
 }
 
+export type CanvasPresentationKind = 'file' | 'app' | 'canvas';
+
+/** Bounded display metadata extracted from a successful trusted Canvas result. */
+export interface CanvasPresentationSummary {
+    readonly sourceKind: CanvasPresentationKind;
+    readonly title?: string;
+}
+
 /**
  * The complete, render-ready description of one tool call. Produced by
  * `buildToolCardView()` from a `NormalizedToolCall`; consumed by
@@ -81,6 +89,8 @@ export interface ToolCardView {
     details: ToolDetail[];
     /** Optional trusted Cockpit action; never an agent-supplied URL. */
     action?: ToolCardAction;
+    /** Normalized type/title only; never includes source URLs or workspace internals. */
+    canvasPresentation?: CanvasPresentationSummary;
     /** Explicit error message (audit) or the errored output (live). */
     error?: string;
 }

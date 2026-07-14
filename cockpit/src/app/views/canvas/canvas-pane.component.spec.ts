@@ -6,6 +6,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {CanvasState} from '../../core/models/canvas.model';
 import {CanvasService} from '../../core/services/canvas.service';
 import {CanvasContentController} from './canvas-content.controller';
+import {canvasResetTargetMatches, openCanvasPopOut} from './canvas-pane.component';
 
 function contentUrl(revision: number): string {
   return (
@@ -224,4 +225,45 @@ describe('Canvas pane content lifecycle', () => {
       },
     );
   }
+});
+
+describe('Canvas pane trusted chrome', () => {
+  it('opens only the Cockpit wrapper with opener and referrer isolation', () => {
+    const openWindow = vi.fn();
+
+    openCanvasPopOut('/sessions/thread-1/canvas', openWindow);
+
+    expect(openWindow).toHaveBeenCalledWith(
+      '/sessions/thread-1/canvas',
+      '_blank',
+      'noopener,noreferrer',
+    );
+  });
+
+  it('binds origin-rotation confirmation to the exact app presentation', () => {
+    const target = {
+      stateEtag: '"canvas:7:app-a"',
+      presentationRevision: 7,
+      sourceKey: 'workspace_app:/demo',
+    };
+
+    expect(canvasResetTargetMatches(
+      target,
+      '"canvas:7:app-a"',
+      7,
+      'workspace_app:/demo',
+    )).toBe(true);
+    expect(canvasResetTargetMatches(
+      target,
+      '"canvas:8:republished"',
+      8,
+      'workspace_app:/demo',
+    )).toBe(false);
+    expect(canvasResetTargetMatches(
+      target,
+      '"canvas:8:app-b"',
+      8,
+      'workspace_app:/other',
+    )).toBe(false);
+  });
 });

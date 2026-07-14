@@ -284,6 +284,32 @@ def _required_parent_session_id(request: Request) -> UUID:
     return session_id
 
 
+def _require_canvas_parent_fetch_metadata(request: Request) -> None:
+    """Reject browsers that cannot enforce the live-app fetch boundary."""
+
+    site = request.headers.getlist("sec-fetch-site")
+    mode = request.headers.getlist("sec-fetch-mode")
+    destination = request.headers.getlist("sec-fetch-dest")
+    if (
+        len(site) != 1
+        or site[0].strip().lower() not in {"same-origin", "same-site"}
+        or len(mode) != 1
+        or mode[0].strip().lower() != "cors"
+        or len(destination) != 1
+        or destination[0].strip().lower() != "empty"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "canvas_browser_unsupported",
+                "message": (
+                    "This browser cannot enforce the Canvas live-app isolation "
+                    "contract"
+                ),
+            },
+        )
+
+
 def _required_edit_preconditions(request: Request) -> tuple[str, int]:
     """Parse both conditional-save headers without touching the body."""
 
@@ -433,7 +459,8 @@ async def _represent(
                     can_edit=(
                         record.editable
                         and _get_file_gateway(db).supports_editing(thread, record)
-                    )
+                    ),
+                    can_pop_out=True,
                 )
                 if browser_content_url:
                     content_url = _content_url(thread_id, record)
@@ -462,7 +489,10 @@ async def _represent(
                 except CanvasViewerConfigurationError:
                     viewer = None
                 if viewer is not None and viewer.enabled:
-                    capabilities = CanvasCapabilities(can_create_viewer_session=True)
+                    capabilities = CanvasCapabilities(
+                        can_pop_out=True,
+                        can_create_viewer_session=True,
+                    )
     return build_public_canvas_representation(
         record,
         status=status,
@@ -589,6 +619,7 @@ async def create_main_canvas_view_attachment(
     """Create one iframe-only bootstrap from exact authorized Canvas state."""
 
     parent_session_id = _required_parent_session_id(request)
+    _require_canvas_parent_fetch_metadata(request)
     try:
         await _require_empty_refresh_body(request)
     except CanvasFileError as exc:
@@ -844,7 +875,7 @@ def _file_mutation_response(
     representation = build_public_canvas_representation(
         record,
         status="ready",
-        capabilities=CanvasCapabilities(can_edit=can_edit),
+        capabilities=CanvasCapabilities(can_edit=can_edit, can_pop_out=True),
         content_url=_content_url(thread_id, record),
     )
     assert record.source_version is not None
@@ -1156,6 +1187,85 @@ async def refresh_main_canvas(thread_id: str, request: Request) -> Response:
     )
 
 
+@router.post("/main/reset-origin", response_model=CanvasPublicState)
+async def reset_main_canvas_origin(thread_id: str, request: Request) -> Response:
+    """Rotate the current live application's isolated browser origin."""
+
+    db = _get_db()
+    _, thread = await require_thread_owner(request, db, thread_id)
+    expected_etag = request.headers.get("If-Match")
+    if expected_etag is None:
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "code": "canvas_precondition_required",
+                "message": "If-Match is required to reset a Canvas origin",
+            },
+        )
+    if not re.fullmatch(r'"canvas:[0-9]+:[0-9a-f]{64}"', expected_etag.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_canvas_precondition",
+                "message": "If-Match must contain one strong Canvas state ETag",
+            },
+        )
+    try:
+        await _require_empty_refresh_body(request)
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+
+    service = _get_canvas_service(db)
+    current = await service.get(thread_id)
+    if current is None or current.source is None:
+        _raise_edit_error(CanvasEditError(409, "canvas_cleared", "Canvas is cleared"))
+    if not isinstance(current.source, WorkspaceAppSource):
+        _raise_edit_error(
+            CanvasEditError(
+                409,
+                "canvas_not_live_app",
+                "The current Canvas is not a live workspace application",
+            )
+        )
+
+    visible = await _represent(
+        thread_id, thread, current, browser_content_url=True, db=db
+    )
+
+    def visible_builder(record: CanvasRecord):
+        return build_public_canvas_representation(
+            record,
+            status=visible.state.status,
+            capabilities=visible.state.capabilities,
+        )
+
+    _, fresh_thread = await require_thread_owner(request, db, thread_id)
+    try:
+        mutation = await service.reset_origin(
+            thread_id,
+            expected_etag=expected_etag,
+            expected_thread_user_id=str(fresh_thread.get("user_id") or ""),
+            representation_builder=visible_builder,
+        )
+    except CanvasPreconditionRequired as exc:
+        raise HTTPException(
+            status_code=428,
+            detail={"code": "canvas_precondition_required", "message": str(exc)},
+        ) from exc
+    except CanvasPreconditionFailed as exc:
+        raise HTTPException(
+            status_code=412,
+            detail={"code": "canvas_precondition_failed", "message": str(exc)},
+        ) from exc
+    except CanvasEditError as exc:
+        _raise_edit_error(exc)
+
+    await require_thread_owner(request, db, thread_id)
+    assert mutation.record is not None
+    representation = visible_builder(mutation.record)
+    return _state_response(representation.payload, representation.etag)
+
+
 @internal_router.get("/main", response_model=CanvasPublicState)
 async def internal_get_main_canvas(thread_id: str, request: Request) -> Response:
     db = _get_db()
@@ -1300,7 +1410,10 @@ async def internal_set_main_canvas(
     representation = build_public_canvas_representation(
         mutation.record,
         status="ready",
-        capabilities=CanvasCapabilities(can_edit=mutation.record.editable),
+        capabilities=CanvasCapabilities(
+            can_edit=mutation.record.editable,
+            can_pop_out=True,
+        ),
     )
     return _state_response(representation.payload, representation.etag)
 

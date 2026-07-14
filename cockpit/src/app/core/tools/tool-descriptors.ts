@@ -1,6 +1,8 @@
 import {lineDiff} from '../util/line-diff';
 import {
     NormalizedToolCall,
+    CanvasPresentationKind,
+    CanvasPresentationSummary,
     ParamKind,
     ToolCardView,
     ToolDetail,
@@ -293,21 +295,59 @@ function buildResult(
     };
 }
 
-function canvasAction(n: NormalizedToolCall): ToolCardView['action'] {
+interface CanvasResultMetadata {
+    readonly revision?: number;
+    readonly presentation: CanvasPresentationSummary;
+}
+
+function canvasPresentationKind(value: unknown): CanvasPresentationKind {
+    if (value === 'workspace_file') return 'file';
+    if (value === 'workspace_app' || value === 'workspace_port') return 'app';
+    return 'canvas';
+}
+
+function parseCanvasResultMetadata(
+    n: NormalizedToolCall,
+    args: Record<string, unknown>,
+): CanvasResultMetadata | undefined {
     if (n.tool !== 'set_canvas' || n.status !== 'ok') return undefined;
     const result = n.result ?? '';
     let revision: number | undefined;
+    let parsedTitle = '';
+    let parsedSourceType: unknown;
     try {
         const parsed = JSON.parse(result) as Record<string, unknown>;
         const value = parsed['presentation_revision'];
         if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) revision = value;
+        if (typeof parsed['title'] === 'string') parsedTitle = parsed['title'];
+        const source = parsed['source'];
+        if (source && typeof source === 'object' && !Array.isArray(source)) {
+            parsedSourceType = (source as Record<string, unknown>)['type'];
+        }
     } catch {
         const match = result.match(/["']?presentation_revision["']?\s*[:=]\s*(\d+)/);
         if (match) revision = Number(match[1]);
     }
-    return revision === undefined
+    const title = clampLine(
+        parsedTitle ||
+        pickArg(args, 'title') ||
+        basename(pickArg(args, 'path')),
+        80,
+    );
+    return {
+        revision,
+        presentation: {
+            sourceKind: canvasPresentationKind(parsedSourceType ?? args['source_type']),
+            ...(title ? {title} : {}),
+        },
+    };
+}
+
+function canvasAction(metadata: CanvasResultMetadata | undefined): ToolCardView['action'] {
+    if (!metadata) return undefined;
+    return metadata.revision === undefined
         ? {kind: 'open_canvas'}
-        : {kind: 'open_canvas', presentationRevision: revision};
+        : {kind: 'open_canvas', presentationRevision: metadata.revision};
 }
 
 function buildDetails(n: NormalizedToolCall): ToolDetail[] {
@@ -333,6 +373,7 @@ export function buildToolCardView(n: NormalizedToolCall): ToolCardView {
     const args = n.args || {};
     const result = buildResult(d, n, args);
     const subtitle = d.subtitle ? clampLine(d.subtitle(args)) : '';
+    const canvasMetadata = parseCanvasResultMetadata(n, args);
     return {
         tool: n.tool,
         title: d.title,
@@ -342,7 +383,8 @@ export function buildToolCardView(n: NormalizedToolCall): ToolCardView {
         params: buildParams(d, args),
         result,
         details: buildDetails(n),
-        action: canvasAction(n),
+        action: canvasAction(canvasMetadata),
+        canvasPresentation: canvasMetadata?.presentation,
         error: n.error ? String(n.error) : undefined,
     };
 }

@@ -6,6 +6,8 @@ component/service suites and production build. The final local deployment was
 ready at two orchestrator replicas and one Cockpit replica, and the deployed
 cross-origin response exposed both Canvas validators. A human browser pass
 through the Monaco edit/conflict controls remains useful follow-up evidence.
+The default-off Slice-3A one-port foundation, Slice-3B ordinary-HTTP viewer, and
+Slice-3C gateway database isolation landed subsequently, but remain dark-shipped.
 
 **Feature:** `docs/features/dynamic_canvas.md`
 
@@ -98,6 +100,10 @@ record.
    user edit through a fresh `read_file` and subsequent `set_canvas` republish.
 
 These checks are acceptance follow-ups, not missing implementation. The
-default-off Slice-3A callable/SSH foundation was implemented next and is
-recorded in [[dynamic_canvas_slice3a_verification]]; the isolated viewer/proxy
-and real-browser boundary remain the next user-facing Slice-3 work.
+default-off Slice-3A callable/SSH foundation, Slice-3B isolated ordinary-HTTP
+viewer/proxy, and Slice-3C restricted gateway database boundary were implemented
+subsequently and are recorded in [[dynamic_canvas_slice3a_verification]],
+[[dynamic_canvas_slice3b_verification]], and
+[[dynamic_canvas_slice3c_verification]]. They remain dark-shipped; the
+production-browser harness, explicit unsupported-browser UX, and external launch
+gates remain the next user-facing Slice-3 work.
