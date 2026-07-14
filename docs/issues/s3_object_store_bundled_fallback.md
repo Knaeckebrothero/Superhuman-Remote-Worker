@@ -1,12 +1,13 @@
 # S3 object store is a near-hard requirement — ship a bundled fallback
 
-**Status**: IN PROGRESS (2026-07-12) — chart-bundled Garage store.
+**Status**: IMPLEMENTED + LOCAL-VERIFIED (2026-07-13) — chart-bundled
+single-node Garage store.
 Spec: `docs/superpowers/specs/2026-07-12-bundled-garage-object-store-design.md`.
 Plan: `docs/superpowers/plans/2026-07-12-bundled-garage-object-store.md`.
 
 **Decision of record**: platform features may **assume an S3-compatible
 object store is present**. Self-host installs without an external store are
-served by a future chart-bundled option, not by per-feature fallback logic.
+served by the chart-bundled Garage option, not by per-feature fallback logic.
 
 ## Problem
 
@@ -29,11 +30,10 @@ quietly become load-bearing. Consumers today:
   `helm/values.yaml:859+`) — the prod-private OpenCloud layout runs against
   an external bucket.
 
-The chart itself deploys **no** store (`helm/values.yaml:63` — the MinIO
-host value is a cockpit deep-link only). Prod-private brings its own MinIO
-(`minio.minio.svc`); local k3d has MinIO parity tooling. A fresh self-host
-install with none of these silently loses virtual sessions, snapshots, and
-suspension — each failing at a different, late point.
+Before this work, the chart deployed **no** store. Prod-private supplied an
+external S3-compatible service, while local k3d carried separate parity
+tooling. A fresh self-host install with neither silently lost virtual sessions,
+snapshots, and suspension — each failing at a different, late point.
 
 ## Proposal
 
@@ -62,7 +62,17 @@ almost always point at the same store, so a half-config is usually a mistake,
 and virtual being the default session backend means a snapshots-only config
 silently breaks the default UX; silent only when both seams have a durable
 store (unit-tested in `tests/test_lite_workspace_dispatch.py`). All three
-proposal items now addressed; unpushed on develop.
+proposal items are addressed.
+
+The 2026-07-13 local rollout also closed the chart-created credential lifecycle:
+Garage keys render under `stringData`, `MCP_INTERNAL_KEY` is emitted, S3 IDs and
+secrets are validated/preserved as atomic pairs, and malformed/orphan-prone
+states fail closed. The bootstrap verifies an existing key's secret before
+granting it and removes stale same-name chart-managed keys. Garage watches
+Secret changes through Reloader. Chart-managed Secrets survive Tilt's
+uninstall/reinstall Force Update and are reclaimed with `--take-ownership`.
+A live force cycle preserved the Secret UID and full data digest and left
+exactly one managed key for each bundled bucket; no Secret value was printed.
 
 ## Non-goals
 

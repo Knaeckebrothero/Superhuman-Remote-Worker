@@ -464,7 +464,7 @@ new options up from /api/models with no frontend change."
 - Modify: `helm/values.yaml:1119` (chart default `:latest` → pinned)
 - Modify: `deployment/values-experimental.yaml:129-140` (homelab dev pin + comment)
 - Modify: `deployment/values-local.yaml:287-289` (local k3d pin)
-- Modify: `deployment/values-local.example.yaml:240-242` (example pin)
+- Modify: `deployment/values-local.yaml.example:240-242` (example pin)
 
 **Interfaces:**
 - Consumes: nothing from Tasks 1-2 (independent; deployable alone).
@@ -502,7 +502,7 @@ with:
   image: docker.io/eceasy/cli-proxy-api:v7.2.61
 ```
 
-`deployment/values-local.yaml` and `deployment/values-local.example.yaml` — replace:
+`deployment/values-local.yaml` and `deployment/values-local.yaml.example` — replace:
 
 ```yaml
   image: docker.io/eceasy/cli-proxy-api:v7.2.27
@@ -522,7 +522,7 @@ Expected: one line, `image: docker.io/eceasy/cli-proxy-api:v7.2.61`. (If the cha
 - [x] **Step 4: Commit**
 
 ```bash
-git add helm/values.yaml deployment/values-experimental.yaml deployment/values-local.yaml deployment/values-local.example.yaml
+git add helm/values.yaml deployment/values-experimental.yaml deployment/values-local.yaml deployment/values-local.yaml.example
 git commit -m "chore(helm): bump codex proxy to v7.2.61 (GPT-5.6 registry)
 
 v7.2.27 predates GPT-5.6 support (registry v7.2.55, Sol revision v7.2.59);

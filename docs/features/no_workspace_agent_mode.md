@@ -62,12 +62,12 @@ credentials via the bundled Secret — see the 2026-06-12 update below). A
 contract-roundtrip test feeds the orchestrator-emitted payload straight into the
 agent's `create_lite_backend` and round-trips a file, so S1 and S2 are proven to
 agree without a cluster. **Local-dev story** (§13): dev/k3d originally used the
-`memory` object store, but **as of 2026-06-14 it runs a single-node MinIO fixture**
-(`deployment/tilt-minio.yaml`) so `deployment/values-tilt.yaml` points
-`virtualWorkspace.rclone.type: s3` at the `srw-workspaces` bucket — the real
-rclone→S3 path, matching prod; the snapshot + IDE-session store shares the same
-MinIO (`s3.endpoint`, bucket `srw-snapshots`). Production points `virtualWorkspace.rclone`
-at the external MinIO S3. **Validated on `k3d-srw` 2026-06-11** (§12): `virtual` and `none`
+`memory` object store and later a MinIO fixture; it now runs the chart-bundled
+single-node Garage selected by `deployment/values-tilt.yaml`.
+`virtualWorkspace.rclone.type: s3` points at the `srw-workspaces` bucket — the
+real rclone→S3 path — and the snapshot + IDE-session store shares Garage through
+the `srw-snapshots` bucket. Production uses an external S3-compatible store.
+**Validated on `k3d-srw` 2026-06-11** (§12): `virtual` and `none`
 jobs each run as a single agent pod with no workspace pod/PVC, the agent boots
 the lite backend from the live dispatch payload (`Lite workspace backend ready
 (backend=virtual, no workspace pod)`), a `virtual` job wrote `notes/plan.md`
@@ -516,10 +516,11 @@ observed demand.
   the shared `_inject_lite_workspace_config`, repository-datasource validation
   (400 at create, fail-job at dispatch), Helm values for the object-store
   endpoint (`virtualWorkspace.rclone.*`). Local-dev story: `memory` store in
-  dev/k3d, MinIO S3 in prod — **superseded 2026-06-14: dev/k3d now uses a local
-  MinIO fixture too** (`values-tilt.yaml` → `rclone.type: s3`). Unit + contract-
-  roundtrip tests green; **validated on k3d 2026-06-11** (§12 — #1/#2/#5/#7
-  pass; #4/#6 pass once S3's capability gate landed).
+  dev/k3d and external S3 in prod — **superseded: dev/k3d now uses the
+  chart-bundled single-node Garage too** (`values-tilt.yaml` →
+  `rclone.type: s3`). Unit + contract-roundtrip tests green; **validated on k3d
+  2026-06-11** (§12 — #1/#2/#5/#7 pass; #4/#6 pass once S3's capability gate
+  landed).
 - **S3 — capability-gated tools (~0.5 day): DONE 2026-06-11.** Reframed from
   the originally sketched "lite presets" (which would have relied on every
   preset author trimming the tool lists): tool binding is now gated by
@@ -599,17 +600,12 @@ the session-view affordance-hiding (code-server/workspace links) remains.
 - ~~**rclone subprocess vs boto3** for the backend's op layer~~ — **resolved
   (S1): rclone**, behind the swappable `ObjectStore` seam (§5). boto3 stays a
   drop-in alternative if the v1.1 latency revisit favors it.
-- ~~**Local k3d object store:** dev-only MinIO vs WebDAV remote against the
-  bundled cloud (S2).~~ — **resolved (S2): the `memory` object store** in
-  dev/k3d (`deployment/values-tilt.yaml` originally set `virtualWorkspace.rclone.type:
-  memory`; **superseded 2026-06-14 — now `type: s3` against a local single-node
-  MinIO fixture, `deployment/tilt-minio.yaml`, the durable rclone→S3 path**). The
-  original in-process `memory` store was non-durable: a `virtual` job/session runs
-  as a single pod and round-trips files within the agent's lifetime, with no
-  MinIO dependency — enough for the §12 smoke. A dev MinIO or WebDAV-against-
-  bundled-cloud remains a drop-in (`type`+`config`) for when durability or
-  external inspection (`rclone lsjson`/`mc ls`) is wanted. Production uses
-  `type: s3` against MinIO.
+- ~~**Local k3d object store:** dev-only object store vs WebDAV remote against
+  the bundled cloud (S2).~~ — **resolved: chart-bundled single-node Garage.**
+  `deployment/values-tilt.yaml` enables Garage and uses the durable rclone→S3
+  path for the virtual tier and snapshots. The original `memory` mode remains a
+  no-store smoke-test option; production uses `type: s3` against an external
+  S3-compatible store.
 
 ## 14. Decision summary
 
