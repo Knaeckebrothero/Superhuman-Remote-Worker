@@ -22,6 +22,7 @@ import {reduce, ReducerAction} from './turn-reducer';
 import {AppToastService} from '../../ui/toast';
 import {
     CanvasControl,
+    CanvasPresentationUpdatedControl,
     CanvasSourceUpdatedControl,
     PersistentThreadTransportBridge,
 } from './persistent-thread-transport-bridge.service';
@@ -58,6 +59,13 @@ import {
 
 const CONTROL_WS_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000];
 const CONTROL_WS_RECONNECT_MAX_ATTEMPTS = 8;
+
+function isCommittedCanvasControl(
+    control: CanvasControl,
+): control is CanvasSourceUpdatedControl | CanvasPresentationUpdatedControl {
+    return control.method === 'canvas.source_updated' ||
+        control.method === 'canvas.presentation_updated';
+}
 
 /** Session title from a landing draft's first message: first line, collapsed
  *  whitespace, capped at 60 chars (on a word boundary when one is near). */
@@ -681,7 +689,7 @@ export class PersistentChatService {
     /** Latest committed user edit waiting for a reconnecting control socket. */
     private pendingCanvasSourceUpdate: {
         threadId: string;
-        control: CanvasSourceUpdatedControl;
+        control: CanvasSourceUpdatedControl | CanvasPresentationUpdatedControl;
     } | null = null;
     private intentionalClose = false;
     /**
@@ -1746,7 +1754,7 @@ export class PersistentChatService {
         if (this.intentionalClose || this.threadId() !== threadId) return false;
         const ws = this.controlWs;
         if (!ws || ws.readyState !== WebSocket.OPEN) {
-            if (data.method === 'canvas.source_updated') {
+            if (isCommittedCanvasControl(data)) {
                 this._queueCanvasSourceUpdate(threadId, data);
             }
             this._ensureControlWs();
@@ -1754,7 +1762,7 @@ export class PersistentChatService {
         }
         let outgoing = data;
         if (
-            data.method === 'canvas.source_updated' &&
+            isCommittedCanvasControl(data) &&
             this.pendingCanvasSourceUpdate?.threadId === threadId &&
             this.pendingCanvasSourceUpdate.control.presentation_revision >
                 data.presentation_revision
@@ -1763,7 +1771,7 @@ export class PersistentChatService {
         }
         try {
             ws.send(JSON.stringify(outgoing));
-            if (outgoing.method === 'canvas.source_updated') {
+            if (isCommittedCanvasControl(outgoing)) {
                 const pendingRevision =
                     this.pendingCanvasSourceUpdate?.control.presentation_revision ?? -1;
                 if (pendingRevision <= outgoing.presentation_revision) {
@@ -1772,7 +1780,7 @@ export class PersistentChatService {
             }
             return true;
         } catch {
-            if (data.method === 'canvas.source_updated') {
+            if (isCommittedCanvasControl(data)) {
                 this._queueCanvasSourceUpdate(threadId, data);
             }
             return false;
@@ -1781,7 +1789,7 @@ export class PersistentChatService {
 
     private _queueCanvasSourceUpdate(
         threadId: string,
-        control: CanvasSourceUpdatedControl,
+        control: CanvasSourceUpdatedControl | CanvasPresentationUpdatedControl,
     ): void {
         const pending = this.pendingCanvasSourceUpdate;
         if (

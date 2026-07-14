@@ -65,7 +65,19 @@ integration run. The
 `srwcanvas.works` wildcard DNS/TLS coordinates are recorded, but the chart
 intentionally publishes no wildcard ingress and all viewer gates remain off by
 default. It therefore does not count as a production or user-facing Slice-3
-release. Multi-port/streaming apps and Slices 4–6 remain planned.
+release. The current one-port proxy is cookie-free and rejects SSE, multipart
+streaming, and WebSocket upgrades. The trusted Slice-3 Cockpit closeout is now
+implemented: typed unsupported-browser/storage fallback, an authenticated
+wrapper pop-out, conditional reset-origin UI/API, true client last-sync and
+source-kind chrome, and normalized Canvas tool cards. A local production-build
+Playwright harness exercises that UI and an intercepted synthetic viewer, with
+27 cases across Chromium, Firefox, and WebKit projects. Chromium and Firefox
+pass on the host; WebKit passes in Playwright's exact Ubuntu Noble container
+after the Fedora-native launch hit an ABI mismatch. This is not
+evidence for live TLS, the deployed Python gateway, real CHIPS/PSL behavior,
+Safari/iOS/PWA, the hosted edge, or an
+enabled k3d live-app flow. Those external browser/edge gates remain Slice-3
+launch work; multi-port/streaming apps and Slices 4–6 remain planned.
 Original brainstorm filed 2026-05-13. Pointer model agreed and repository,
 security, accessibility, and comparable-product audits completed 2026-07-13.
 See the
@@ -78,18 +90,21 @@ See the
 ## Decision Summary
 
 The Dynamic Canvas is a shared, persistent presentation surface attached to a
-persistent thread. It sits beside chat and can display a workspace file, a live
-application running on one or more workspace ports, or the agent's browser.
+persistent thread. It sits beside chat. The implemented user-facing surface
+displays workspace files; a one-port live application surface is implemented
+behind disabled launch gates. Multi-port applications and the agent's browser
+remain planned source types.
 
 The important architectural decision is:
 
 > **The canvas is a presentation control plane, not an automatic copy of every
 > artifact.**
 
-The content remains where it naturally belongs:
+The content remains where it naturally belongs as each source adapter lands:
 
-- Markdown, text, LaTeX, HTML, SVG, images, PDFs, and code remain workspace
-  files.
+- Currently supported Markdown, text, LaTeX source, strict static HTML, raster
+  images, and code remain workspace files. SVG/PDF adapters are planned rather
+  than implied by their presence in a workspace.
 - Streamlit, Vite, FastAPI, and other interactive prototypes remain processes
   listening on workspace ports.
 - A shared browser remains a browser session owned by the agent runtime.
@@ -117,9 +132,13 @@ The agent changes the stage with a small typed tool surface:
 
 ```text
 get_canvas()     -> inspect what is currently on stage
-set_canvas(...)  -> point the stage at a file, workspace app, or browser
+set_canvas(...)  -> point the stage at a supported file or gated workspace port
 clear_canvas()   -> close the shared source without deleting the source itself
 ```
+
+The eventual typed union also contains `workspace_app` and `browser`, but those
+forms are not advertised until their Slice-4 and Slice-5 end-to-end adapters
+exist. A disabled Slice-3 deployment likewise withholds `workspace_port`.
 
 For v1 there is one visible canvas named `main` per thread. Repeated
 `set_canvas()` calls replace or refresh that stage. `canvas_id` remains an
@@ -140,7 +159,8 @@ Agent ──── conversation ─┤          │                 │
                          │          │           │
                   workspace file  workspace   agent browser
                                     app
-                                  (1..N ports)
+                              (one port dark;
+                               multi-port planned)
 ```
 
 Chat is the coordination surface. The canvas is the material and visual
@@ -203,32 +223,37 @@ Canvas renderer implementation.
 
 ## Representative Use Cases
 
-- A writer produces `output/report.md`; the agent presents it, the user edits a
-  paragraph, and the agent reads the changed file before continuing.
-- A researcher updates a comparison table in place while explaining sources in
-  chat.
-- A scholar and user work on a Markdown document with math or a LaTeX source
-  file and rendered preview.
-- A data analyst writes `output/chart.png`; the image refreshes in place after
-  the next analysis pass.
-- A designer builds a self-contained HTML mockup and presents it in a sandboxed
-  renderer.
-- An agent starts a Vite frontend on port 5173 and a FastAPI backend on port
-  8000; the user sees one embedded application whose `/api` requests reach the
-  backend.
-- The agent opens a browser, fills part of a form, and presents the browser so
-  the user can inspect or take control.
-- An agent presents a live monitoring view or local dashboard as a workspace
-  application source. Native multipart/MJPEG camera feeds are deferred until
-  they have streaming-specific limits and browser tests; v1 does not imply them
-  through ordinary HTTP support.
+These span delivered and planned slices; they are labeled so the product vision
+is not mistaken for the current tool schema.
+
+- **Delivered:** A writer produces `output/report.md`; the agent presents it,
+  the user edits a paragraph, and the agent reads the changed file before
+  continuing.
+- **Delivered:** A researcher updates a comparison table in place while
+  explaining sources in chat.
+- **Delivered:** A scholar and user work on a Markdown document with math
+  preview or edit a LaTeX source file. Full-document LaTeX preview is deferred.
+- **Delivered:** A data analyst writes `output/chart.png`; the image refreshes
+  in place after the next analysis pass.
+- **Delivered:** A designer builds a self-contained HTML mockup and presents it
+  in a sandboxed renderer.
+- **Planned Slice 4:** An agent starts a Vite frontend on port 5173 and a FastAPI
+  backend on port 8000; the user sees one embedded application whose `/api`
+  requests reach the backend.
+- **Planned Slice 5:** The agent opens a browser, fills part of a form, and
+  presents the browser so the user can inspect or take control.
+- **Dark-shipped one-port / later streaming:** An agent presents a local
+  dashboard as a one-port workspace application. Native multipart/MJPEG camera
+  feeds remain deferred until they have streaming-specific limits and browser
+  tests; ordinary HTTP support does not imply them.
 
 ## Source Model
 
-Canvas uses a discriminated logical source internally; the flat model-facing
-tool arguments normalize into it. Neither form accepts a pod IP, generated proxy
-URL, bearer token, or arbitrary hostname. The orchestrator resolves the source
-against the current thread and its authorized workspace/browser runtime.
+Canvas uses an eventual discriminated logical source internally; the flat
+model-facing tool advertises only the source forms whose end-to-end adapters
+are available. Neither form accepts a pod IP, generated proxy URL, bearer token,
+or arbitrary hostname. The orchestrator resolves an admitted source against the
+current thread and its authorized workspace/runtime.
 
 ### Workspace generation identity
 
@@ -319,12 +344,14 @@ routes. The port is an integer; there is deliberately no `host` field.
 "Workspace port 8501" always means port 8501 on the workspace attached to the
 current thread.
 
-### `workspace_app`
+### `workspace_app` (planned Slice 4)
 
-Points at a browser application whose normalized route table is read from a
-small workspace manifest. A manifest keeps the model-facing tool schema flat;
-the existing fleet has weaker models which misformat nested list-of-object tool
-arguments.
+This planned source points at a browser application whose normalized route
+table is read from a small workspace manifest. It is the Slice-4 extension of
+the implemented-but-dark one-port `workspace_port` source; the current tool and
+gateway do not read this manifest. A manifest keeps the eventual model-facing
+tool schema flat; the existing fleet has weaker models which misformat nested
+list-of-object tool arguments.
 
 ```json
 {
@@ -347,10 +374,10 @@ routes:
     port: 8000
 ```
 
-`set_canvas` reads and validates the manifest, then stores the normalized route
-table and its manifest hash in presentation state. Later edits to the manifest
-do not silently reconfigure an already-published proxy; the agent calls
-`set_canvas` again.
+When Slice 4 lands, `set_canvas` will read and validate the manifest, then store
+the normalized route table and its manifest hash in presentation state. Later
+edits to the manifest must not silently reconfigure an already-published proxy;
+the agent will call `set_canvas` again.
 
 The browser sees one isolated origin:
 
@@ -361,15 +388,17 @@ https://<origin-generation>.canvas.example/api/*      -> workspace:8000
 https://<origin-generation>.canvas.example/ws/*       -> workspace:8000
 ```
 
-HTTP, streaming responses, SSE, and WebSocket upgrades follow the same route
-mapping. Longest path-**segment** prefix wins (`/api` matches `/api/x`, never
-`/apix`); the entry port receives everything else. V1 preserves the prefix.
-Prefix stripping is deferred because `X-Forwarded-Prefix` is non-standard and
-rewriting `Location` cannot repair absolute paths embedded in HTML/JavaScript.
+The planned HTTP, streaming-response, SSE, and WebSocket paths follow the same
+route mapping. Longest path-**segment** prefix wins (`/api` matches `/api/x`,
+never `/apix`); the entry port receives everything else. Slice 4 preserves the
+prefix. Prefix stripping remains deferred because `X-Forwarded-Prefix` is
+non-standard and rewriting `Location` cannot repair absolute paths embedded in
+HTML/JavaScript.
 
-### `browser`
+### `browser` (planned Slice 5)
 
-Points at a browser session available to the current agent runtime.
+This planned source points at a browser session available to the current agent
+runtime.
 
 ```json
 {
@@ -378,12 +407,12 @@ Points at a browser session available to the current agent runtime.
 }
 ```
 
-The canvas does not implement CDP streaming itself. It selects the trusted
-`SharedBrowserComponent`, which uses the authenticated screencast/control
-channel from `shared_browser.md`. `browser_id = current` is accepted only at
-tool-call time and resolves immediately to a concrete opaque browser
-**generation**. The stored pointer never follows whichever browser happens to
-become current later.
+The Canvas will not implement CDP streaming itself. Its Slice-5 adapter will
+select the trusted `SharedBrowserComponent`, which uses the authenticated
+screencast/control channel from `shared_browser.md`. `browser_id = current`
+will be accepted only at tool-call time and resolve immediately to a concrete
+opaque browser **generation**. The stored pointer must never follow whichever
+browser happens to become current later.
 
 ### Deferred source types
 
@@ -397,13 +426,15 @@ become current later.
 - **Desktop/RDP** — a future trusted renderer/source adapter if real non-web GUI
   demand appears. See `rdp.md`.
 
-## Multi-Port Workspace Applications
+## Multi-Port Workspace Applications (planned Slice 4)
 
 A frontend and backend may use two workspace ports, but the user should not see
 two unrelated public endpoints. The default is one canvas origin with internal
 path routing.
 
-There are two supported authoring patterns:
+The implemented one-port checkpoint can already use the first pattern after its
+launch gates are enabled. The second pattern and every streaming/WebSocket
+behavior below are Slice-4 design, not current tool behavior:
 
 1. **Frontend-owned proxy.** Configure Vite, Next, or the chosen development
    server to proxy `/api` to `localhost:8000` inside the workspace. The canvas
@@ -493,10 +524,10 @@ probe proves that contract end to end.
 
 ### Upstream transport decision
 
-Arbitrary workspace ports are **not reachable today**: the Kubernetes
+Arbitrary workspace ports are **not directly reachable**: the Kubernetes
 NetworkPolicy admits orchestrator traffic only to SSH and code-server, and the
-local Docker setup publishes only management ports. V1 will not open a broad
-workspace port range.
+local Docker setup publishes only management ports. Slice 3 did not open a
+broad workspace port range.
 
 The selected transport is an orchestrator-owned SSH `direct-tcpip` channel over
 the already-authorized workspace SSH connection:
@@ -508,12 +539,13 @@ public canvas proxy
     -> 127.0.0.1:<declared app port> inside the workspace
 ```
 
-Implementation extends the Canvas async SSH pool with direct TCP channels.
+Slice 3 extended the Canvas async SSH pool with direct TCP channels.
 Pool only the authenticated SSH transport by `(thread_id,
 workspace_generation)`; each proxy connection calls AsyncSSH
 `open_connection("127.0.0.1", port)` through a connector which also receives and
-revalidates `origin_generation` and origin-session identity. Use a thin async
-HTTP/WebSocket transport adapter over those reader/writer streams. Do **not**
+revalidates `origin_generation` and origin-session identity. The current thin
+adapter speaks strict ordinary HTTP over those reader/writer streams; Slice 4
+adds the WebSocket transport. Do **not**
 open a localhost TCP forwarder: another process/sidecar in the orchestrator pod
 could bypass Canvas authorization by connecting to it. Workspace `sshd` should
 make the intended boundary explicit with `AllowTcpForwarding local`,
@@ -573,8 +605,9 @@ registers renderers for untrusted or user-authored content.
 | SVG | `<img>` rendering only after a focused safety test; never inline in v1 | Deferred from first file slice |
 | PDF | Native viewer/open fallback with Range support | Deferred from first file slice |
 | Mermaid | Dedicated renderer with strict/sandbox security mode | Net-new and deferred |
-| `workspace_port` / `workspace_app` | Isolated-origin iframe | Through the app |
-| `browser` | `SharedBrowserComponent` | Shared Browser control lease |
+| `workspace_port` | Default-off isolated-origin iframe in Slice 3 | Through the app |
+| `workspace_app` | Planned multi-port isolated-origin iframe in Slice 4 | Through the app |
+| `browser` | Planned `SharedBrowserComponent` in Slice 5 | Shared Browser control lease |
 
 Renderer rules:
 
@@ -604,8 +637,9 @@ Renderer rules:
   Canvas source. This prevents external tracking and data-URL resource bombs.
 - A strict static HTML file is self-contained and script-free. Anything needing
   JavaScript, sibling assets, client routing, network access, or a backend is a
-  `workspace_port`/`workspace_app`. Slice 1 also strips image/font sources and
-  permits no `data:` assets; present a raster image as its own validated source.
+  gated one-port `workspace_port` today or the planned multi-port
+  `workspace_app` in Slice 4. Slice 1 also strips image/font sources and permits
+  no `data:` assets; present a raster image as its own validated source.
 - Slice 2 extracted the diff-review Monaco integration into a shared lazy
   loader and language mapper with lifecycle-safe model/editor disposal. Canvas
   and diff review use that shared adapter rather than owning duplicate loaders.
@@ -622,8 +656,9 @@ Renderer rules:
 - Renderer overrides are an allowlisted enum. The agent cannot name a Cockpit
   component class or module path.
 - Renderer capabilities are returned by the server. An older Cockpit or a
-  disabled renderer shows a useful metadata/download/chat fallback rather than
-  a blank pane.
+  disabled renderer currently preserves trusted title/source chrome and shows
+  a generic unsupported-content message rather than a blank pane. Download and
+  guided manual-preview fallbacks remain planned UX.
 
 ## Agent Tool Contract
 
@@ -676,10 +711,11 @@ Behavior:
 1. Apply thread-owner authorization through the existing
    `require_thread_owner` helper, including its unscoped-admin bypass, and
    validate the logical source against the current thread/runtime capabilities.
-2. For a file, read metadata/allowed bytes through the new thread-file gateway,
-   detect the renderer, and capture a strong `source_version`. For an app,
-   normalize the port/manifest and bind it to the current workspace generation.
-   For a browser, resolve `current` to a concrete browser generation.
+2. For a file, read metadata/allowed bytes through the thread-file gateway,
+   detect the renderer, and capture a strong `source_version`. The implemented
+   app shorthand normalizes one port and binds it to the current workspace
+   generation. Manifest normalization and concrete browser-generation
+   resolution remain the Slice-4 and Slice-5 extensions.
 3. In one SQL transaction, lock/upsert `main` and increment
    `presentation_revision`. First set becomes revision 1.
 4. Preserve `origin_generation` only for an unchanged normalized live-app
@@ -698,7 +734,9 @@ Behavior:
 
 App publication may succeed as `starting` when the loopback port is not open
 yet. The readiness check is a bounded TCP connect, not an unsolicited GET to an
-agent-chosen path; the viewer retries visibly once the app is ready.
+agent-chosen path. The current viewer creates an attachment only for a ready
+source and has no automatic readiness poll; the agent must republish or the
+trusted client must explicitly reconcile after the process becomes ready.
 
 Calling `set_canvas` again with the same file is the explicit v1 refresh
 mechanism. It captures the new source hash and advances the presentation
@@ -707,7 +745,9 @@ and gives media a new URL. Calling it with an unchanged live app refreshes
 health/status without discarding that app's browser storage or HMR connection.
 When a different project/process takes over the same ports and route table, the
 agent must set `new_app=True`; port equality is not application identity. The
-Cockpit also exposes a trusted “Reset app storage/origin” action.
+implemented one-port tool can use `new_app=True` to rotate the origin. The
+trusted Cockpit “Reset app storage” action lets the user conditionally rotate
+the current live app's origin without changing its pointer.
 
 ### `get_canvas`
 
@@ -742,6 +782,8 @@ Authorization and source errors are HTTP/tool errors, not durable Canvas
 statuses: `403` when `require_thread_owner` denies the caller, `404` for a
 missing thread/source, `422` for an invalid pointer/renderer/manifest, and a
 typed capability error when the workspace cannot support the requested source.
+Manifest-specific validation applies only after the planned `workspace_app`
+adapter lands.
 
 ### Registration and approval behavior
 
@@ -756,11 +798,13 @@ This is a closed loader surface, so implementation must update all of it:
 `ToolsConfig.canvas`, config parsing/defaults, `get_all_tool_names`, the registry
 factory branch, persistent-session create override/disabled-marker allowlists,
 and any admin tool catalog. Apply the final capability filter only after the
-workspace backend and feature flags are resolved. The skill resolver includes
-`present-with-canvas` only when **both** `use_skill` and at least one
-`set_canvas` source kind survived that filter; it does not infer availability
-merely from the expert name. If a future browser-only runtime has Canvas but no
-`use_skill`, keep essential safety/handoff etiquette in the tool description.
+workspace backend and feature flags are resolved. The current skill resolver
+includes `present-with-canvas` only when **both** `use_skill` and `set_canvas`
+survived that filter; the current registry guarantees that an admitted
+`set_canvas` includes file support. It does not infer availability merely from
+the expert name. A future browser-only runtime must revisit this file-oriented
+scoping rule and keep essential safety/handoff etiquette in its tool
+description if `use_skill` is absent.
 
 Expose get/set/clear only in authenticated persistent sessions with a nonblank
 delegated internal key, then capability-filter source kinds. File presentation
@@ -815,25 +859,28 @@ For a file artifact:
 6. After writing, call set_canvas again to refresh the stage.
 ```
 
-For a live application:
+For a one-port live application (**implemented but dark-shipped Slice 3**):
 
 ```text
-1. Build the frontend/backend in the workspace.
-2. Make browser requests relative; configure a frontend proxy or
-   `.srw/canvas.yaml` routes.
+1. Build the application in the workspace.
+2. Make browser requests relative. If it needs a backend today, configure the
+   frontend development server to proxy it behind the one presented port.
 3. Prefer binding servers to `127.0.0.1`; the SSH connector reaches workspace
    loopback without exposing the port on the pod/VM network.
 4. Configure the development server with the deployment-provided Canvas host
    suffix and a strict port; never use a wildcard/all-host bypass.
-5. Start the processes and verify the entry port and supporting routes.
-6. Call set_canvas with workspace_port or workspace_app.
+5. Start the process and verify the entry port.
+6. Call set_canvas with workspace_port.
 7. Keep the processes alive while the user is interacting.
-8. On restart or route changes, call set_canvas again to refresh status/config.
+8. On restart, call set_canvas again to refresh status/config.
    Use new_app=true when the restart is a different application/trust unit,
    not a normal restart of the same prototype.
 ```
 
-For a shared browser:
+The `.srw/canvas.yaml`/`workspace_app` route-manifest workflow is planned Slice
+4. It is not an alternative available to agents in the current schema.
+
+For a shared browser (**planned Slice 5**):
 
 ```text
 1. Navigate the agent browser to the relevant state.
@@ -855,17 +902,17 @@ config/skills/present-with-canvas/SKILL.md
 
 The first version uses `SKILL.md` plus package metadata only; it does not justify
 scripts, assets, or reference files. It is concise and imperative. Its
-frontmatter name is
-`present-with-canvas`, and its description should trigger when the agent has a
-substantial visual/editable artifact, a local web prototype, or a browser state
-that the user would benefit from seeing.
+frontmatter name is `present-with-canvas`, and its current description triggers
+for substantial visual/editable workspace-file artifacts, including a strict
+static-HTML prototype. Live web prototypes and browser state belong in the
+future app/browser description only after those user-facing surfaces land.
 
 The deployed file-only skill covers presentation judgment, refresh discipline,
 editable-file re-read/preservation, static-HTML limits, and stage safety. It
 intentionally refuses to guess app, port, browser, or routing fields which are
 not advertised by the current tool schema. Extend it with app/browser guidance
 only as those corresponding end-to-end presentation surfaces land. The
-default-off Slice-3A/3B implementation is not yet a deployed user-facing
+default-off Slice-3A–3C implementation is not yet a deployed user-facing
 surface, so the bundled skill remains file-focused for this checkpoint.
 
 The current and planned guidance contract covers:
@@ -890,13 +937,20 @@ The current and planned guidance contract covers:
 - Avoiding the canvas for short answers or tiny snippets that read better in
   chat.
 
-The skill is deployed with the tools and is placed in scope only when Canvas
-tools are available. It uses model-invoked activation initially; a hard
+The skill is deployed with the tools and is placed in scope only when both
+`use_skill` and `set_canvas` are available. It uses model-invoked activation
+initially; a hard
 `before_tool:set_canvas` binding can dead-end a `workspace.backend = none`
 runtime where `use_skill`/Canvas capabilities are absent. Critical security
 rules stay enforced in code and summarized in the tool description. After
 capability-aware bindings exist, telemetry can justify upgrading the skill to a
 hard first-use gate.
+
+The bundled package is a catalog floor, not an overwrite policy. A resolved
+user/global `present-with-canvas` entry replaces it as a whole. Runtime
+capability re-scoping withdraws only unchanged files previously created by SRW;
+modified skill files and unrelated files in that directory are preserved as
+user content.
 
 ## Cockpit Experience
 
@@ -918,22 +972,27 @@ persistent chat component.
 </as-split>
 ```
 
-The existing `angular-split` dependency is suitable for the first chat/canvas
-split. The pane has Cockpit-owned chrome that agent content cannot cover:
+The existing `angular-split` dependency implements the first chat/canvas split.
+The current pane has Cockpit-owned chrome that agent content cannot cover:
 
-- title and source-kind indicator;
+- title, source summary, and renderer indicator;
 - agent-generated/untrusted-content label where applicable;
-- loading, starting, disconnected, and error states;
+- loading, starting, source-changed, unavailable, ended, and error states;
 - edit/preview toggle for editable files;
-- refresh, close, and pop-out controls;
+- refresh and close controls;
 - source path or logical service summary without leaking internal addresses;
-- "agent is updating", "you are editing", and last-synced status.
+- updating/editing/saved and presentation-revision status;
+- a normalized file/live-app source-kind badge and the browser time of the last
+  successful authoritative state GET or mutation (suppressed while a dirty
+  editor buffer is intentionally preserving older state); and
+- capability-gated pop-out plus live-app origin-reset controls.
 
 `CanvasService` is keyed by `threadId`, cancels stale requests on route changes,
 and has no fallback to a previously viewed thread while the root draft has no
-ID. A new source opens the desktop pane by default. On mobile it is mounted and
-announced but remains behind the trusted Canvas toggle/tool card until the user
-enters it; automatically making it full-screen would strand the currently
+ID. A new source opens the desktop pane by default. On mobile the pane remains
+mounted but `inert` and `aria-hidden` behind the trusted Canvas toggle/tool card
+until the user enters it; its internal live region therefore does not announce
+while hidden. Automatically making it full-screen would strand the currently
 focused chat control inside a newly inert subtree. A user preference may later
 change desktop auto-open to a badge. Republishing the same source refreshes
 without stealing focus or resetting scroll/editor selection. Closing the pane
@@ -956,12 +1015,16 @@ Because the current chat header also lives inside `PersistentChatComponent`,
 the wrapper owns an accessible Canvas toggle/floating action instead of reaching
 into that header. Tool cards provide the second reopen path.
 
-Each successful `set_canvas` tool result also gets a compact trusted tool card
-in chat: title/type, “Open Canvas”, and whether that presentation has since been
-replaced. This keeps the artifact discoverable after the pane is closed and
-decouples the durable conversation affordance from one side-pane layout. Since
-v1 does not snapshot bytes, an old card cannot pretend to restore an old file;
-it opens the current stage or explains that its revision was replaced.
+Each successful `set_canvas` tool result gets a compact trusted tool card in
+chat with the generic presentation action, a sanitized basename-oriented
+subtitle, revision context, “Open Canvas”, and whether that presentation has
+since been replaced. This keeps the artifact discoverable after the pane is
+closed and decouples the durable conversation affordance from one side-pane
+layout. Since v1 does not snapshot bytes, an old card cannot pretend to restore
+an old file; it opens the current stage or explains that its revision was
+replaced. The card now renders a bounded normalized file/live-app/Canvas kind
+and sanitized title without echoing a port, URL, or workspace-internal pointer;
+its rendered action and current/replaced context have component coverage.
 
 ### Mobile
 
@@ -972,24 +1035,33 @@ mobile in v1. Use the existing 768 px `ViewportService` breakpoint.
 
 Switching between Chat and Canvas in the **same thread** keeps a live iframe
 mounted to preserve form/app state, but makes the hidden pane `inert` and
-`aria-hidden` and pauses host-owned browser streaming. The app may still consume
-network/CPU while hidden, so the chrome keeps a visible Close action. Switching
-threads, clearing/replacing the source, or closing Canvas tears it down and
-closes that view attachment. It does not revoke a shared origin session which
-another Cockpit tab/pop-out is still using.
+`aria-hidden`. The app may still consume network/CPU while hidden, so the chrome
+keeps a visible Close action. Slice 5 must pause host-owned browser streaming
+while its future renderer is hidden. Switching threads, clearing/replacing the
+source, or closing Canvas tears the current source down and closes any live-app
+view attachment. It does not revoke a shared origin session which another
+Cockpit tab or authenticated wrapper pop-out is still using.
 
 ### Pop-out
 
-File viewers and the normal live-app pop-out use a Cockpit wrapper route under
-normal BFF authentication; the live app remains a labeled iframe using its
-short-lived origin session. Pop-out is another rendering target for the same
-logical source, not a second persistence model. V1 never opens an untrusted live
-app top-level: that would remove the fixed iframe sandbox and persistent trusted
-escape chrome. The wrapper uses `noopener`/`noreferrer` and works only when the
-same embedded origin-session flow is supported. If that flow is unavailable,
-Cockpit marks live Canvas preview unsupported in that browser and points the
-user to the existing authenticated IDE/manual-preview workflow; it does not
-weaken isolation with a bearer URL.
+The authenticated `/sessions/:threadId/canvas` wrapper route renders the same
+`CanvasPaneComponent` under the normal auth guard. Ready workspace files expose
+`can_pop_out=true`; a ready live app does so only when viewer-session creation
+is configured. Cockpit opens only that wrapper with `noopener,noreferrer`,
+suppresses the normal sidebar/PWA/readiness banners there, and retains trusted
+close/navigation chrome. Pop-out is another rendering target for the same
+logical source, not a second persistence model.
+
+An untrusted live app remains a labeled sandboxed iframe using the same
+short-lived embedded origin-session flow; it is never opened top-level. The
+wrapper reconciles authoritative state while visible, and a bounded
+`BroadcastChannel` revision pointer accelerates same-browser convergence without
+trusting or copying Canvas state across tabs. Browsers missing the parent Fetch
+Metadata contract, or unable to retain the transient partitioned bootstrap
+cookie, receive typed trusted unsupported UX. Every other bootstrap/service
+failure uses non-causal temporary-unavailable copy. Both paths direct the user
+to the authenticated IDE/manual-preview workflow without a bearer URL or a
+weaker top-level fallback.
 
 ## Accessibility Contract
 
@@ -1009,8 +1081,8 @@ the presented content is not accessible:
   editor or iframe. Closing a mobile view restores focus to its opener.
 - The host reflows at 320 CSS px, keeps visible focus, respects reduced motion,
   and uses at least 24×24 CSS px pointer targets.
-- Real-browser tests cover iframe tab order, splitter keys, mobile back/focus,
-  and screen-reader names; jsdom alone cannot prove these behaviors.
+- Real-browser tests must cover iframe tab order, splitter keys, mobile
+  back/focus, and screen-reader names; jsdom alone cannot prove these behaviors.
 
 ## Persistence Model
 
@@ -1068,8 +1140,9 @@ Important boundaries:
   immutable artifact version.
 - There is no `_index.yaml`; ordering/layout does not exist for the single
   canvas. If multiple canvases arrive, shared ordering can be added then.
-- Split size, open/closed state, and similar personal UI preferences stay in
-  Cockpit local/user settings, not in the shared canvas row.
+- Split size, open/closed state, and similar personal UI preferences stay out
+  of the shared canvas row. They are ephemeral component signals today;
+  persistent Cockpit local/user settings remain a follow-up.
 - `presentation_revision` and `source_version` have distinct meanings. Use
   `sha256:<lowercase-hex>` as the file version and emit it as a quoted strong
   HTTP ETag.
@@ -1082,8 +1155,8 @@ Important boundaries:
 - V1 is thread-scoped. Batch-job canvases can be added later with an explicit
   scope model rather than a nullable `job_id`/`thread_id` combination that
   permits both.
-- Short-lived live-app authentication does not overload this row. Slice 3 adds
-  shared stores/tables:
+- Short-lived live-app authentication does not overload this row. Slice 3B
+  added shared stores/tables:
 
     - `canvas_origin_sessions` contains only a hash of the gateway-cookie secret
       plus user, thread/canvas, issued presentation revision, normalized source
@@ -1104,7 +1177,7 @@ Important boundaries:
   Plaintext handshake/session material is never persisted; expiry indexes
   support cleanup across multiple orchestrator replicas.
 
-Example stored source:
+Planned Slice-4 multi-port stored source:
 
 ```json
 {
@@ -1120,6 +1193,11 @@ Example stored source:
 }
 ```
 
+The current one-port shorthand normalizes to the same private source family but
+stores one `entry_port`, an `entry_path`, an empty route table, and no manifest
+path/version. It does not accept the example above from the tool or internal
+adapter yet.
+
 State transitions are atomic at the row level:
 
 - `set_canvas` locks/upserts the row and advances the revision once; first set
@@ -1129,8 +1207,9 @@ State transitions are atomic at the row level:
   `origin_generation`, title/alt metadata, sets editability to `false`, resets renderer to
   `auto`, revokes matching origin sessions/direct channels, and advances once;
   repeated clear is a no-op;
-- user clear/edit supplies the expected presentation revision so it cannot act
-  on a source which was replaced between render and click/save;
+- user clear supplies the exact current state ETag, while file edit supplies
+  both the presentation revision and source-version preconditions, so neither
+  can act on a source replaced between render and click/save;
 - the service restricts callers to `main` in v1 even though the schema leaves
   room for later named canvases.
 
@@ -1273,13 +1352,13 @@ Do not implement separate semantics in the agent tool, REST route, and future
 MCP adapter. Put validation and state transitions in one orchestrator service
 or shared application action, then keep adapters thin.
 
-Suggested user-facing API:
+Implemented user-facing state/file and trusted live-app mutation API:
 
 ```text
 GET    /api/persistent/threads/{thread_id}/canvases/main
 DELETE /api/persistent/threads/{thread_id}/canvases/main
 POST   /api/persistent/threads/{thread_id}/canvases/main/refresh
-POST   /api/persistent/threads/{thread_id}/canvases/main/reset-origin # Slice 3
+POST   /api/persistent/threads/{thread_id}/canvases/main/reset-origin
 ```
 
 `GET` returns `204 No Content` when no row has ever existed. Conditional
@@ -1313,12 +1392,13 @@ revision. This is the explicit implementation of “load current workspace
 version”. Before adopting, it reruns workspace-generation, regular-file,
 whole-chain symlink, size, byte-signature/MIME, renderer-compatibility,
 decoded-image, and required-alt validation. Any validation/read failure leaves
-the row unchanged. Live-app-only `reset-origin` likewise accepts no pointer: it
-preserves
-the normalized app source, rotates `origin_generation`, advances presentation
-revision, and revokes the retired generation's origin sessions/direct channels.
-It implements the trusted “Reset app storage/origin” action without exposing an
-arbitrary browser source mutation.
+the row unchanged. The live-app-only `reset-origin` likewise accepts no pointer:
+it preserves the normalized app source and presentation metadata while
+atomically rotating `origin_generation` and advancing presentation revision.
+The existing database trigger revokes the retired generation's origin sessions,
+notifies every gateway replica, and cancels registered ordinary-HTTP/direct-
+channel work. `new_app=true` remains the model-facing way to declare that an
+agent presentation on the same port is a different application.
 
 State `GET` returns a strong representation tag such as
 `ETag: "canvas:<presentation_revision>:<sha256-of-authorized-serialization>"`.
@@ -1326,19 +1406,22 @@ One deterministic serializer hashes the exact caller-visible response bytes,
 including derived status/capabilities and URLs; `presentation_revision` remains the separate
 domain revision used by events and content preconditions. State responses use
 `Cache-Control: private, no-cache` so conditional requests revalidate. A browser
-`DELETE`,
-`refresh`, or `reset-origin` of an existing row requires the exact current state
-tag in `If-Match`; missing/stale preconditions return `428`/`412`, including
-when health or caller capabilities changed. The agent tool uses a
+`DELETE` or `refresh` of an existing row requires the exact current state tag
+in `If-Match`; missing/stale preconditions return `428`/`412`, including when
+health or caller capabilities changed. `reset-origin` uses the same exact strong
+precondition and rejects a cleared or non-live-app Canvas. The agent tool uses a
 server-identifiable internal + delegated-user adapter and may intentionally
 replace current state under the row lock; never
 trust an actor field/header supplied by a public client to select that behavior.
 A successful browser mutation is applied from its REST response and sends a
-typed control invalidation through the active runtime; without a runtime, other
-tabs converge on reload just like user content edits.
+typed source or presentation invalidation through the active runtime. A bounded
+revision-only `BroadcastChannel` signal accelerates same-browser tab/pop-out
+reconciliation, while focus/visibility and wrapper polling repair a missed
+signal by fetching authoritative REST state; no channel payload is trusted as
+Canvas state.
 
-Slice 3 adds authenticated parent APIs rather than putting a reusable bearer in
-the iframe URL:
+Slice 3B added authenticated parent APIs rather than putting a reusable bearer
+in the iframe URL:
 
 ```text
 POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments
@@ -1347,8 +1430,11 @@ POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{id}/r
 DELETE /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{id}
 ```
 
-Creation requires the current Canvas `If-Match`, derives the embedding site and
-allowed cookie mode from trusted request/deployment state, and returns a bounded
+Creation requires the current Canvas `If-Match` and an exact same-origin/
+same-site CORS Fetch Metadata tuple. A client which cannot supply that browser
+boundary receives `409 canvas_browser_unsupported`. The route derives the
+embedding site and allowed cookie mode from trusted request/deployment state,
+and returns a bounded
 attachment ID, an exact `/_canvas/bootstrap?attachment_id=<uuid>` locator, and a
 one-use bridge nonce held only in trusted Cockpit memory. The URL contains no
 credential. The authorize endpoint accepts the gateway challenge, ready receipt,
@@ -1358,9 +1444,10 @@ revalidated. It never accepts a caller-selected upstream or origin. Renewal
 extends the linked origin session only while authorization and every
 source/workspace/origin identity still match. Attachment delete is an
 idempotent presence close, not a shared-session revocation. These non-safe APIs
-retain BFF CSRF protection; global logout, clear/replacement, and trusted “Reset
-app storage/origin” use service-level bulk revocation after their authoritative
-state transition.
+retain BFF CSRF protection; global logout and clear/replacement use
+service-level bulk revocation after their authoritative state transition.
+Reset-origin reaches the same revocation path through the authoritative
+origin-generation update rather than deleting one attachment.
 
 Use separate serializers: the agent gets logical metadata/capabilities,
 while the Cockpit REST response may also get a relative authorized `content_url`
@@ -1646,7 +1733,10 @@ A normal cookie on the separate domain is third-party inside Cockpit. The
 selected flow is:
 
 1. The authorized Cockpit parent calls a same-origin API to register one pending
-   non-credential view attachment, bound to user, thread, `main`, the exact
+   non-credential view attachment. That call requires the exact CORS Fetch
+   Metadata tuple in addition to BFF/CSRF authorization; missing or unenforceable
+   metadata returns `canvas_browser_unsupported` before creating state. The
+   attachment is bound to user, thread, `main`, the exact
    parent `srw_session`, normalized source fingerprint, workspace generation,
    origin generation, embedding origin, cookie mode, and expected presentation
    revision. The BFF response contains a random attachment ID, an exact
@@ -1700,6 +1790,12 @@ selected flow is:
    initiated by the allocated Canvas origin and carries
    `Sec-Fetch-Site: same-origin`; no secret ever appeared in the URL.
 
+   If the attachment-specific transient cookie is absent at exchange, the
+   gateway returns `canvas_browser_storage_unavailable`. Only that exact typed
+   storage failure, or the parent Fetch Metadata failure above, produces trusted
+   unsupported-browser/privacy copy; other exchange and service failures remain
+   generic secure-preview-unavailable errors.
+
    Record the presentation revision at issuance for audit, but authorize
    requests by the still-current origin/source/workspace identity: an unchanged
    same-app health refresh may advance presentation revision without killing
@@ -1710,18 +1806,20 @@ selected flow is:
    image/fetch/iframe request is still rejected before it can reach an app with
    a state-changing GET. Only the one-time cross-site iframe bootstrap is
    admitted; browsers without enforceable Fetch Metadata are unsupported.
-7. The fixed cookie identifies the shared origin session, not one tab. Main
-   pane, second Cockpit tab, and wrapper pop-out in the same cookie partition
-   reuse it; their attachment IDs/nonces drive UI presence only. Closing one
-   attachment never revokes or overwrites the session for the others.
-8. A normal Cockpit-wrapper pop-out stays embedded and uses the same flow. If a
-   target browser does not support the embedded partitioned-cookie flow, live
-   Canvas preview is unsupported in v1. Do not open the app top-level, relax the
-   sandbox, or leave a bearer token in asset URLs as a compatibility fallback.
+7. The fixed cookie identifies the shared origin session, not one tab. The main
+   pane, another Cockpit tab, and the authenticated wrapper pop-out in the same
+   cookie partition reuse it; their attachment IDs/nonces drive UI presence
+   only. Closing one attachment never revokes or overwrites the session for the
+   others.
+8. The Cockpit-wrapper pop-out stays embedded and uses this same flow. A target
+   browser which cannot support it receives trusted unsupported guidance for the
+   authenticated IDE/manual-preview workflow; it never receives a top-level app
+   fallback, relaxed sandbox, or bearer token in asset URLs.
 
 Logout, thread deletion, clear/replacement, workspace/origin generation change,
 and thread-owner/admin authorization revocation invalidate matching origin
-sessions and actively close their HTTP/SSE/WebSocket/direct-channel consumers.
+sessions and actively close their current ordinary-HTTP/direct-channel
+consumers. Slice 4 must extend the same guarantee to SSE and WebSockets.
 Expiry alone is not the logout mechanism. The Canvas cookie authorizes only
 that origin session's viewer/proxy
 requests; it cannot create/renew sessions, mutate Canvas state, or call Cockpit
@@ -1734,22 +1832,24 @@ Session enforcement is cluster-wide rather than a process-local cleanup hint:
   rechecks the current thread authorization, source fingerprint, workspace
   generation, and origin generation before it opens an upstream channel.
 - Each replica keeps a `CanvasConnectionRegistry` keyed by origin-session ID for
-  in-flight HTTP responses, SSE streams, WebSockets, and direct SSH channels.
-  Revocation commits update PostgreSQL first and then publish an opaque session
-  or generation ID through PostgreSQL `NOTIFY`; every listening replica cancels
-  matching upstream and downstream I/O. NATS may accelerate the same signal but
-  is not required for correctness.
+  in-flight ordinary HTTP exchanges and direct SSH channels. Its contract is
+  intentionally extensible to future SSE/WebSocket consumers. Revocation
+  commits update PostgreSQL first and then publish an opaque session or
+  generation ID through PostgreSQL `NOTIFY`; every listening replica cancels
+  matching current upstream and downstream I/O. NATS may accelerate the same
+  signal but is not required for correctness.
 - Notifications are not the safety boundary because a replica can miss one.
   Start a cancellation/revalidation guard as soon as an authenticated exchange
   begins—before reading a request body—and keep it through slow upload,
-  upstream connect/header wait, response streaming, and teardown. Every
-  SSE/WebSocket and any HTTP exchange still active at the interval revalidates
-  its session and Canvas generations against PostgreSQL at most every 15
-  seconds and at its current expiry deadline. Renewal updates the shared expiry
-  and notifies listeners; revocation, authorization loss, generation mismatch,
-  or final expiry closes both directions with no further upstream reads. Thus a
-  missed notification has a bounded revocation window rather than an
-  indefinitely valid socket, upload, header wait, or download.
+  upstream connect/header wait, response streaming, and teardown. Any current
+  HTTP exchange still active at the interval revalidates its session and Canvas
+  generations against PostgreSQL at most every 15 seconds and at its current
+  expiry deadline. Renewal updates the shared expiry and notifies listeners;
+  revocation, authorization loss, generation mismatch, or final expiry closes
+  both directions with no further upstream reads. Thus a missed notification
+  has a bounded revocation window rather than an indefinitely valid upload,
+  header wait, or download. Slice 4 must apply the same guard continuously to
+  SSE/WebSocket streams.
 - View attachments are presence/bridge records, not independent network
   credentials. Closing one attachment cancels connections naturally owned by
   that frame/window but does not revoke a shared origin session used by another
@@ -1760,24 +1860,34 @@ Session enforcement is cluster-wide rather than a process-local cleanup hint:
   transports have a bounded 60-second default TTL; every direct channel remains
   registered to and cancellable through its origin session.
 
-This flow requires a real-browser spike across Chrome, Firefox, Safari/iOS, PWA,
-embedded, and pop-out modes before the live-app viewer is enabled. Multi-tenant
-production also requires the Canvas tenant label to be an effective cookie
-boundary (normally a propagated private Public Suffix List entry). Proxy
-rewriting of upstream `Set-Cookie` cannot stop hostile JavaScript from setting a
-parent-`Domain` cookie with `document.cookie`, so PSL isolation is not merely
-defense in depth for app-cookie support. Plan submission/propagation early.
+The local production-build harness defines this flow, including the wrapper,
+for Playwright Chromium, Firefox, and WebKit against a synthetic intercepted
+gateway. Chromium and Firefox pass on the Fedora host; WebKit passes through
+the matching official Playwright Ubuntu Noble container. Before the live-app
+viewer is enabled, the same boundary
+still requires hosted/deployed-gateway acceptance plus current desktop Safari,
+Safari/iOS, installed PWA, and secure-context CHIPS coverage. Multi-tenant
+production also requires the
+Canvas tenant label to be an effective cookie boundary (normally a propagated
+private Public Suffix List entry). The current proxy forwards no application
+cookies, but hostile JavaScript can still set parent-`Domain` cookies with
+`document.cookie` and poison sibling cookie jars. PSL isolation is therefore a
+production boundary, not a claim that app-cookie forwarding has shipped. Plan
+submission/propagation early.
 
-A deployment without that boundary may run an explicit **insecure development
-cookie-free preview mode** only: the gateway drops all upstream `Set-Cookie` and
-forwards no application cookies (the reserved host-only viewer cookie still
-terminates at the gateway). This can support local/single-user development on a
-dedicated non-platform domain, but hostile JavaScript can still set parent-domain
-cookies and exhaust/poison sibling Canvas cookie jars. It therefore carries no
-cross-app cookie-isolation guarantee, is excluded from the origin-isolation
-acceptance claim, and must be impossible to enable in a production/multi-tenant
-security profile. Production live preview waits for an effective PSL or an
-equivalent enforceable per-app registrable-domain boundary.
+Both implemented deployment modes are currently application-cookie-free: the
+gateway drops all upstream `Set-Cookie` and forwards no application cookies
+(the reserved host-only viewer cookie still terminates at the gateway). The
+current validator allows a `development` deployment to select either
+`development-cookie-free` or `psl-isolated` without a PSL attestation. Without
+an effective boundary, either selection has only the explicitly insecure
+local/single-user development posture; the `psl-isolated` label alone does not
+establish cross-app cookie isolation. Prefer `development-cookie-free` there so
+that limitation is visible. Hostile JavaScript can still set parent-domain
+cookies and exhaust/poison sibling Canvas cookie jars. Production therefore
+accepts only `psl-isolated` after the effective PSL or an equivalent enforceable
+per-app registrable-domain boundary exists. Application-cookie
+forwarding/rewriting is deferred and requires its own threat review.
 
 ### Live-app iframe and network policy
 
@@ -1815,6 +1925,10 @@ base-uri 'self'; form-action 'self';
 frame-ancestors <configured Cockpit origins>;
 ```
 
+The current CSP reserves the exact same-origin WebSocket destination so the
+policy need not be weakened later, but the Slice-3 proxy still rejects every
+upgrade. That directive is not a claim that HMR/WebSocket transport is usable.
+
 Every live response also gets proxy-owned `Referrer-Policy: no-referrer`,
 `X-Content-Type-Options: nosniff`, and a deny-by-default Permissions Policy.
 The gateway does not add wildcard CORS; parent collaboration uses the audited
@@ -1849,10 +1963,10 @@ header boundary is also normative:
 | Incoming field | Upstream behavior |
 |---|---|
 | `Host` / HTTP/2 `:authority` | Require the exact allocated Canvas hostname. Send that same public host (and non-default port, if any) upstream so absolute URLs and development-server host checks describe the browser-visible origin. Never send an internal IP or SSH destination. |
-| `Origin` | If present, require the exact public Canvas origin and forward its canonical value. Require it for unsafe browser methods and WebSocket handshakes; reject cross-origin values. An absent `Origin` is accepted only for ordinary `GET`/`HEAD`. `Sec-Fetch-*` is a defense-in-depth signal, not authorization. |
+| `Origin` | If present, require the exact public Canvas origin and forward its canonical value. Require it for unsafe browser methods and, once Slice 4 exists, WebSocket handshakes; reject cross-origin values. An absent `Origin` is accepted only for ordinary `GET`/`HEAD`. `Sec-Fetch-*` is a defense-in-depth signal, not authorization. |
 | `Forwarded` / `X-Forwarded-*` | Drop all inbound values. Emit `Forwarded: proto=https;host="<public-host>"` plus gateway-owned `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Port`. Omit `for`/`X-Forwarded-For`; strip `X-Real-IP` so workspace code never receives the viewer IP. |
-| `Cookie` | Consume and remove `__Host-canvas_session`; reject malformed or duplicate reserved cookies. In PSL-isolated app-cookie mode, forward only the remaining application cookies after size/count checks. In cookie-free mode, forward none. Never forward known Cockpit/BFF/Keycloak cookie namespaces. |
-| `Authorization` / `Proxy-Authorization` | Strip both in v1. Viewer authentication uses only the reserved gateway cookie, and no ingress/auth middleware may inject platform credentials into the upstream request. Apps use application cookies or a non-reserved custom header; a future manifest-gated application-authorization capability requires a separate threat review. |
+| `Cookie` | Consume and remove `__Host-canvas_session`; reject malformed or duplicate reserved cookies. Forward no remaining application cookies in either current deployment mode. Never forward Cockpit/BFF/Keycloak cookie namespaces. Application-cookie support is deferred. |
+| `Authorization` / `Proxy-Authorization` | Strip both in v1. Viewer authentication uses only the reserved gateway cookie, and no ingress/auth middleware may inject platform credentials into the upstream request. A prototype may use an explicitly application-owned non-reserved custom header; manifest-gated application authorization requires a separate threat review. |
 | Hop-by-hop and ingress-private fields | Remove standard hop-by-hop fields and every header named by `Connection`. Strip internal routing/auth fields such as `X-Original-URL`, `X-Rewrite-URL`, `X-Forwarded-Client-Cert`, and deployment-specific identity headers. Rebuild only the fields explicitly listed here. |
 
 HTTP framing has one parser/encoder boundary. The edge server rejects multiple
@@ -1867,14 +1981,14 @@ chunks. Any disk spill is private (`0600`), unlogged, and removed on success,
 error, cancellation, or revocation.
 
 The response parser likewise rejects conflicting length/transfer metadata,
-invalid chunk syntax, forbidden trailers, and unexpected protocol switches;
-only a validated WebSocket `101` enters the separate WebSocket path. It strips
-upstream framing and lets the trusted downstream server encode one framing
-mode. V1 sends `Connection: close` upstream and uses one HTTP request per SSH
-direct channel; the SSH transport, not an application TCP connection, is what
-gets pooled. Any parser/framing error closes the channel without reuse. These
-rules and the public ingress configuration are tested together against request
-smuggling differentials.
+invalid chunk syntax, forbidden trailers, and every protocol switch, including
+upstream `101`. It strips upstream framing and lets the trusted downstream
+server encode one framing mode. V1 sends `Connection: close` upstream and uses
+one HTTP request per SSH direct channel; the SSH transport, not an application
+TCP connection, is what gets pooled. Any parser/framing error closes the
+channel without reuse. Repository tests cover this strict adapter against
+framing differentials; the public edge/raw-path differential test remains a
+launch gate because no wildcard Canvas ingress is published yet.
 
 Queries are parsed independently of the path, preserve duplicate parameters,
 ordering, and blank values, and are re-encoded without logging their raw values.
@@ -1903,11 +2017,9 @@ The response boundary is fail-closed:
   expired/revoked viewer must contact the gateway rather than replay
   authenticated app data from HTTP cache. More permissive immutable-asset
   caching requires generation/session-safe URLs and a separate design.
-- Preserve repeated `Set-Cookie` fields as separate headers, reject the reserved
-  cookie name, strip `Domain`, constrain `Path` to a safe application path, and
-  add `Secure`, `SameSite=None`, and `Partitioned` as required **only in
-  PSL-isolated app-cookie mode**. Cookie-free mode drops all application
-  `Set-Cookie` fields.
+- Drop every upstream `Set-Cookie` field in both current deployment modes.
+  Preserving and safely rewriting application cookies is deferred and must not
+  be inferred from selection of the `psl-isolated` profile.
 
 The gateway never follows a redirect. It handles `Location` as follows:
 
@@ -1919,90 +2031,96 @@ The gateway never follows a redirect. It handles `Location` as follows:
    effective port exactly equal the public Canvas origin.
 2. An absolute `http://127.0.0.1:<port>/...` or
    `http://localhost:<port>/...` URL may be rewritten to the public origin only
-   when the canonical returned path, passed through normal longest-prefix route
-   selection, resolves back to that exact declared port. Replace only the
-   authority; never infer/prepend a prefix. A backend behind `/api` must emit an
-   `/api/...` redirect, while an entry-port `/login` remains valid. No other
-   hostname is treated as workspace loopback.
+   when `<port>` is the exact current Slice-3 entry port. Slice 4 may extend this
+   to a declared supporting port only when the canonical returned path, passed
+   through normal longest-prefix route selection, resolves back to that port.
+   Replace only the authority; never infer/prepend a prefix. Under that future
+   route table, a backend behind `/api` must emit an `/api/...` redirect, while
+   an entry-port `/login` remains valid. No other hostname is treated as
+   workspace loopback.
 3. Return the normalized public `Location` for those two safe cases. For an
    external, undeclared-port, ambiguous, or invalid target, remove `Location`
    and return a typed `409 canvas_navigation_blocked`; the iframe never
-   auto-follows it. A well-formed external **HTTPS** target may create a
-   short-lived opaque navigation request and notify the authenticated Cockpit
-   parent. Only trusted parent chrome can confirm and open the stored target
-   with `noopener,noreferrer`; queries are neither logged nor placed in the
-   invalidation event. `javascript:`, `data:`, `blob:`, `file:`, custom schemes,
-   external plain HTTP, malformed URLs, and targets with credentials are
-   discarded without creating a confirmable record.
+   auto-follows it. The current Cockpit has no external-navigation confirmation
+   flow. A future opaque trusted-parent confirmation may be designed for
+   well-formed external HTTPS targets, but unsafe/custom schemes, plain HTTP,
+   malformed URLs, and targets with credentials remain non-confirmable.
 
-For WebSockets, require an exact public `Origin`, validate version/key and a
-bounded offered-subprotocol list, and rebuild `Connection: Upgrade`/`Upgrade:
-websocket` instead of forwarding raw connection fields. The selected upstream
-subprotocol must be one the client offered. V1 strips
-`Sec-WebSocket-Extensions` in both directions and disables `permessage-deflate`;
+**Planned Slice-4 WebSocket contract:** require an exact public `Origin`,
+validate version/key and a bounded offered-subprotocol list, and rebuild
+`Connection: Upgrade`/`Upgrade: websocket` instead of forwarding raw connection
+fields. The selected upstream subprotocol must be one the client offered. It
+must strip `Sec-WebSocket-Extensions` in both directions and disable
+`permessage-deflate`;
 later compression support needs decompression-ratio and memory accounting. The
-proxy preserves text/binary type and close code/reason, bounds both individual
+future proxy preserves text/binary type and close code/reason, bounds individual
 frames and complete reassembled messages, rate-limits messages, applies
 bidirectional backpressure, and closes both peers on cancellation or policy
 failure.
 
 Request bodies are decoded into a bounded private spool with cancellation and
 backpressure before reframing; HTTP responses stream without whole-body
-buffering. SSE disables buffering and has an explicit heartbeat/idle policy.
-Range/HEAD semantics are implemented rather than simulated after buffering. Cap headers,
-body, response, bandwidth, concurrent connections, route count, and
-origin-session duration. Key every open direct channel/cache entry by workspace
-and origin generation and register it to the origin session. The underlying
-authenticated SSH transport may be pooled per workspace generation, but every
-channel is cancellable independently on replacement, suspension, clear, or
-revocation.
+buffering. Range/HEAD semantics are implemented rather than simulated after
+buffering. Current limits cover headers, query, body, response bytes, HTTP
+concurrency, connection admission, timeouts, and origin-session duration. Key
+every open direct channel/cache entry by workspace and origin generation and
+register it to the origin session. The underlying authenticated SSH transport
+may be pooled per workspace generation, but every channel is cancellable
+independently on replacement, suspension, clear, or revocation. Slice 4 adds
+SSE heartbeat/idle handling, WebSocket backpressure, bandwidth limits, and
+stream-specific admission.
 
-Starting deployment defaults (configurable, and measured before raising) are:
+Implemented Slice-3B deployment defaults are:
 
 | Limit | Default |
 |---|---:|
-| Supporting routes | 8 |
+| Active connections per gateway replica | 256 |
 | Request or response header block | 64 KiB and 100 fields |
-| Application cookies | 100 cookies / 16 KiB combined |
+| Query | 16 KiB and 256 fields |
 | Request body | 10 MiB |
 | Ordinary response bytes | 100 MiB |
-| Sustained bandwidth per origin session | 20 MiB/s with a bounded burst |
-| Concurrent HTTP upstreams per origin session | 16 |
-| Concurrent SSE/WS streams per origin session | 4 |
-| WebSocket frame | 1 MiB |
-| WebSocket reassembled message | 4 MiB, compression disabled |
-| WebSocket message rate | 100/s with a bounded burst of 200 |
+| Concurrent HTTP upstreams per origin session, per gateway replica | 16 |
 | Origin session | 15 minutes, renewable by the authenticated parent |
-| Long-stream database revalidation | at most 15 seconds |
+| Attachment / bootstrap | 20 minutes / 60 seconds |
+| Active-exchange database revalidation | at most 15 seconds |
 | Ordinary upstream connect/idle timeout | 5 s / 60 s |
+| Request-body spool / upstream HTTP exchange | 300 s each |
 
-SSE/WS do not use the ordinary response-byte/idle limit; they use the stream
-count, per-frame/rate limits, heartbeat policy, renewable session, and hard
+Slice-4 design targets—not current Helm settings—include at most eight routes,
+four concurrent SSE/WebSocket streams per origin session, a 20 MiB/s bounded
+bandwidth policy, 1 MiB frames, 4 MiB reassembled messages with compression
+disabled, and 100 messages/s with a bounded burst of 200. SSE/WS will not use
+the ordinary response-byte/idle limit; they require stream counts,
+per-frame/rate limits, heartbeat policy, renewable sessions, and hard
 disconnect on revocation. Never buffer up to a limit before forwarding.
 
-All services in one route table are one same-origin trust unit. Browser code
-uses relative URLs. The gateway forwards the allocated public Canvas host, but
-the agent starts the server before that random host exists. The workspace
+The current one-port service is one same-origin trust unit. When Slice 4 adds a
+route table, every declared service in it belongs to that same unit. Browser
+code uses relative URLs. The gateway forwards the allocated public Canvas host,
+but the agent starts the server before that random host exists. The workspace
 therefore receives a non-secret deployment setting such as
 `SRW_CANVAS_HOST_SUFFIX=.example-userland.com`. Vite may allow that exact
-deployment-controlled suffix (its leading-dot subdomain syntax), proxy HMR
-WebSockets, derive the HMR host from the page, and use a strict port. It must
-never use `allowedHosts: true`, a generic public suffix, or a browser-direct
-workspace connection. The Canvas gateway still accepts only the exact allocated
-hostname, so the broader development-server suffix does not select another
-thread's upstream. Frameworks which cannot safely allow the fixed suffix need a
-future prepare-origin/restart flow; v1 does not weaken host validation for them.
+deployment-controlled suffix (its leading-dot subdomain syntax) and use a
+strict port. Once Slice 4 lands it may also proxy HMR WebSockets and derive the
+HMR host from the page. It must never use `allowedHosts: true`, a generic public
+suffix, or a browser-direct workspace connection. The Canvas gateway still
+accepts only the exact allocated hostname, so the broader development-server
+suffix does not select another thread's upstream. Frameworks which cannot
+safely allow the fixed suffix need a future prepare-origin/restart flow; v1 does
+not weaken host validation for them.
 
-### Optional Canvas application bridge
+### Optional Canvas application bridge (planned Slice 4)
 
-Live apps may opt into a small versioned `postMessage` bridge for `ready`,
-intrinsic resize, and a proposed form result. The parent validates exact
+The current `postMessage` surface is only the gateway-owned authentication
+bootstrap protocol. A later application bridge may let live apps opt into a
+small versioned protocol for `ready`, intrinsic resize, and a proposed form
+result. The parent must validate exact
 `event.source`, exact origin, a per-attachment nonce, message type/schema, size, and
-rate, and sends with an exact `targetOrigin`. Unknown messages fail closed and
-the bridge has a teardown handshake. Agent-authored data is never silently
+rate, and send with an exact `targetOrigin`. Unknown messages fail closed and
+the bridge needs a teardown handshake. Agent-authored data is never silently
 promoted to a trusted user message; Cockpit confirms it in host chrome.
 
-### Browser source
+### Browser source (planned Slice 5)
 
 - Reuse the shared-browser authorization and ownership protocol.
 - Canvas consumes a stable stream/control adapter; it never exposes the CDP
@@ -2023,23 +2141,24 @@ Different source types have different durability:
   durable virtual object store may remain readable; process-local memory does
   not magically become orchestrator-visible. Out-of-band byte changes are
   `source_changed` until explicitly adopted/republished.
-- **Workspace port/app:** presentation pointer persists, process does not. When
-  the workspace sleeps/restarts, revoke direct channels/origin sessions and
-  show `unavailable`.
+- **Workspace port (implemented, dark) / app manifest (planned):** presentation
+  pointer persists, process does not. When the workspace sleeps/restarts,
+  revoke direct channels/origin sessions and show `unavailable`.
   Never follow the same port into a new workspace generation automatically; the
   agent restarts the services and republishes.
-- **Browser:** pointer persists, browser session may not. Availability follows
-  the browser broker/runtime capability, not the workspace storage backend
-  alone. Show a clear ended or reconnect state; never silently select a
-  different browser.
+- **Browser (planned Slice 5):** pointer persists, browser session may not.
+  Availability follows the browser broker/runtime capability, not the workspace
+  storage backend alone. Show a clear ended or reconnect state; never silently
+  select a different browser.
 
 Validate source capability rather than assuming it from a backend name:
 
 | Source | Required runtime capability |
 |---|---|
 | `workspace_file` | readable thread workspace; writable for edit mode |
-| `workspace_port` / `workspace_app` | active SSH-reachable, shell-capable workspace and permitted loopback port |
-| `browser` | active authorized browser generation and stream broker |
+| `workspace_port` | active SSH-reachable, shell-capable workspace and permitted loopback port; implemented behind Slice-3 gates |
+| `workspace_app` | the same plus a validated route manifest; planned Slice 4 |
+| `browser` | active authorized browser generation and stream broker; planned Slice 5 |
 
 A durable virtual workspace can display files but cannot host a new server
 process until the existing user-approved workspace upgrade completes. A
@@ -2380,7 +2499,7 @@ manifests, and conditional network policy. See
 [[dynamic_canvas_slice3b_verification]].
 
 **Gateway database-isolation checkpoint (Slice 3C):** Implemented and
-default-off as of 2026-07-13. The dedicated gateway now:
+default-off as of 2026-07-14. The dedicated gateway now:
 
 - lazily constructs a small pool only from required
   `CANVAS_VIEWER_POSTGRES_*` parts and cannot fall back to `DATABASE_URL` or the
@@ -2416,12 +2535,55 @@ role, and proves representative token reads, authoritative mutations, viewer
 deletes, sequence use, and public DDL fail with insufficient privilege. See
 [[dynamic_canvas_slice3c_verification]].
 
+**Trusted UI and local browser-harness closeout:** Implemented as of
+2026-07-14. It adds:
+
+- exact parent Fetch Metadata rejection as `canvas_browser_unsupported` and an
+  exact missing-transient-cookie exchange outcome as
+  `canvas_browser_storage_unavailable`; Cockpit maps only those causal codes to
+  unsupported-browser/privacy guidance and keeps generic failures non-causal;
+- an authenticated, minimal `/sessions/:threadId/canvas` wrapper which reuses
+  the sandboxed pane, opens with `noopener,noreferrer`, and never promotes an
+  untrusted app to a top-level document;
+- `can_pop_out` for ready file sources and viewer-capable ready live apps,
+  normalized source-kind and true client-sync chrome, and bounded type/title
+  presentation context in rendered `set_canvas` tool cards;
+- an exact-ETag, live-app-only reset-origin mutation and confirmation bound to
+  the current source/revision/ETag. It rotates the origin generation, retires
+  sessions and active work on the old generation, then reconciles sibling
+  clients through authoritative events, a generic runtime presentation control,
+  and bounded same-browser invalidation; and
+- a pinned Playwright production-bundle harness with Chromium, Firefox, and
+  WebKit projects. Its in-process BFF plus intercepted synthetic HTTPS viewer
+  cover wrapper authentication, bootstrap/exchange, sandbox/CSP/navigation,
+  synthetic credential-name/header separation, typed storage failure, reset,
+  hard expiry, revocation, parent-auth expiry, and logout teardown.
+
+The harness is deliberately not a live gateway integration: it does not open
+TLS to `*.srwcanvas.works`, run the Python gateway/SSH proxy, exercise a real
+partitioned cookie jar or PSL boundary, or establish Safari/iOS/PWA behavior.
+The supported-path synthetic viewer emulates persistence of the partitioned
+bootstrap cookie; the forced-storage-loss case explicitly disables that
+emulation and proves the trusted fallback. Neither result is evidence for a
+browser's real CHIPS policy or for Safari.
+Those claims remain external acceptance gates. The closeout validation passed
+367 focused backend/security tests, the full 1,085-test Cockpit suite, i18n,
+TypeScript, Ruff, and a production build. Playwright listed 27 cases and passed
+nine Chromium plus nine Firefox cases on the host. Fedora 44 could not launch
+the Ubuntu WebKit bundle because its pinned `libicu74` and `libjpeg-turbo8`
+ABIs were unavailable; the exact
+`mcr.microsoft.com/playwright:v1.59.0-noble` runtime then passed all nine WebKit
+cases. Main/Develop CI now install all three engines with Ubuntu dependencies,
+but that new CI path has not yet reported acceptance evidence.
+
 The remaining Slice-3 launch work is:
 
 - provision an operator-owned, separately registrable wildcard Canvas domain,
   DNS/TLS/raw-path-preserving edge, effective private PSL boundary, and edge
   rate limits before the gateway; the chart intentionally does not infer or
   create those resources;
+- provision the operator-owned restricted gateway PostgreSQL role and dedicated
+  credential Secret for production;
 - deploy and black-box verify the implemented trusted-parent anti-framing
   boundary through the production ingress/edge and service-worker lifecycle.
   Repository tests now prove exact enforced `frame-ancestors 'none'` and
@@ -2431,11 +2593,11 @@ The remaining Slice-3 launch work is:
   installed PWA, real-browser self-navigation, optional root-host routes, and
   the separately hosted Keycloak response policy remain acceptance evidence;
   and
-- pass the production-build Chromium, Firefox, WebKit, real Safari/iOS, and PWA
-  iframe-authentication, partitioned-cookie, CSP/sandbox, navigation, leakage,
-  logout, expiry, and cross-replica revocation matrix. Unsupported browsers
-  must report live preview unavailable rather than open untrusted content
-  top-level.
+- run the same authentication, CSP/sandbox, navigation, leakage, logout, expiry,
+  reset, and cross-replica revocation matrix against the hosted Python gateway
+  and raw-path edge with real secure-context cookies. Repeat the device-only
+  portions on current desktop Safari, Safari/iOS, and installed PWAs; Playwright
+  WebKit is engine coverage, not shipping-Safari evidence.
 
 These remaining launch gates do not justify expanding the shared-secret
 architecture inside this checkpoint.
@@ -2457,9 +2619,10 @@ claim for the current raw-path contract. Keep `rawPathVerified`,
 until that contract is resolved and the other launch gates above land.
 
 Do not enable or claim the user-facing slice complete until real browsers prove
-no BFF/Keycloak cookie or authorization-header leakage. The default-off 3A/3B
-and database-isolation 3C implementation does not satisfy or bypass that launch
-gate, and the viewer was not enabled in local k3d during these checkpoints.
+no BFF/Keycloak cookie or authorization-header leakage. The default-off 3A–3C
+implementation and local intercepted-browser harness do not satisfy or bypass
+that hosted launch gate, and the viewer was not enabled in local k3d during
+these checkpoints.
 
 ### Slice 4 — Multi-port and streaming apps
 
@@ -2499,9 +2662,11 @@ gate, and the viewer was not enabled in local k3d during these checkpoints.
   rejects mixed/unknown/nested route forms; only `main` can be addressed.
   Omitted title/editability normalize to a descriptive source label and
   `false`, while unsupported or unwritable `editable=true` fails closed.
-- `require_thread_owner` checks, including its existing admin bypass, cover
-  state, content, edit, viewer-session creation/revocation, pop-out, HTTP, and
-  WebSocket entry points.
+- `require_thread_owner` checks, including its existing admin bypass, cover the
+  implemented state, content, edit, reset-origin, viewer-session creation/
+  revocation, and ordinary-HTTP entry points. The pop-out is an auth-guarded
+  Cockpit rendering target for those same owner-authorized APIs; the planned
+  WebSocket adapter must receive equivalent coverage when it lands.
 - The internal get/set/clear routes reject missing/invalid `X-Internal-Key`, missing
   delegated user, BFF-only/public-ingress access, and a delegated caller without
   owner/admin authorization; its accepted request reaches the same service
@@ -2531,20 +2696,23 @@ gate, and the viewer was not enabled in local k3d during these checkpoints.
   same-presentation/source replacement outcomes; candidate type validation and
   readback version become the returned/stored source version. Refresh reruns all
   source/renderer/image checks and leaves state unchanged on failure.
-- App validation rejects arbitrary hosts, reserved ports/control paths,
-  encoded separators, recursive percent encodings, backslashes, dot segments,
-  `/api`→`/apix`, duplicate/ambiguous routes, too many routes, and stale
-  workspace/origin generations. The canonical bytes selected for routing are
-  exactly those sent upstream.
-- Origin generation is preserved for an unchanged app refresh and rotates for
-  replacement, `new_app`, route/runtime changes, clear/re-present, and
-  source-wide security revocation; closing an individual view attachment or
-  revoking one origin session preserves it.
+- Current one-port app validation rejects arbitrary hosts, reserved
+  ports/control paths, encoded separators, recursive percent encodings,
+  backslashes, dot segments, and stale workspace/origin generations. Slice-4
+  manifest tests must add `/api`→`/apix`, duplicate/ambiguous route, route-count,
+  and exact selected-route byte coverage.
+- Origin generation is preserved for an unchanged one-port app refresh and
+  rotates for replacement, `new_app`, runtime changes, clear/re-present, and
+  the conditional trusted reset-origin action; reset preserves the source
+  fingerprint while retiring the previous generation's sessions and active
+  work. Closing an individual view attachment or revoking one origin session
+  preserves it. Route-change coverage joins this contract with Slice 4.
 - Multi-replica tests prove shared-session reuse across tabs, renewal, explicit
   revocation through PostgreSQL notification, and bounded closure after a
-  deliberately missed notification. Cancellation covers slow upload, upstream
-  header wait, HTTP/SSE/WebSocket response, and direct SSH I/O from the start of
-  the exchange; a closed attachment does not evict another tab.
+  deliberately missed notification. Current cancellation covers slow upload,
+  upstream header wait, ordinary HTTP response, and direct SSH I/O from the
+  start of the exchange; a closed attachment does not evict another tab. Slice
+  4 must extend it to SSE/WebSocket activity.
 
 ### Cockpit tests
 
@@ -2561,37 +2729,60 @@ gate, and the viewer was not enabled in local k3d during these checkpoints.
   all image/font/resource URLs; Markdown raw HTML/external images are disabled.
 - Pathological Markdown/static HTML fails with translated complexity UX before
   attaching oversized sanitized DOM or `srcdoc` output.
-- New/hidden/refresh behavior preserves scroll/editor selection and focus; tool
-  cards identify replaced non-restorable revisions honestly.
-- Splitter keyboard behavior, status announcements, iframe titles, image alt,
-  mobile Chat/Canvas focus/back behavior, and translated English/German labels
-  are covered. Run `npm run i18n:check`.
+- New/hidden/refresh behavior preserves scroll/editor selection and focus.
+  Tool-card tests cover normalized source kind/title, bounded metadata,
+  current/replaced revision semantics, and the rendered Open Canvas action.
+- Component/service tests cover live-app iframe titles, mobile Chat/Canvas
+  state, authenticated pop-out routing/polling, opener/referrer isolation,
+  reset-origin preconditions/control fan-out, revision-only cross-tab
+  invalidation, and causal unsupported/storage-failure classification. The i18n
+  check covers English/German key parity. Rendered assertions for the pane's
+  `aria-live` status and raster-image `alt` propagation remain follow-ups. The
+  splitter's ARIA configuration exists, but real
+  keyboard/ARIA-value/collapse behavior and physical focus return remain
+  browser-acceptance work. Run `npm run i18n:check`.
 
 ### Proxy and real-browser tests
 
 Vitest/jsdom cannot enforce CSP, cookies, service workers, iframe sandboxing,
-native PDF, or WebSocket proxy semantics. Add a production-build Playwright
-harness for Chromium, Firefox, and Playwright WebKit plus live-cluster checks.
-Real Safari/iOS and installed-PWA behavior stays in a physical-device,
-device-cloud, or explicit manual acceptance matrix; Playwright WebKit is not
-claimed as Safari coverage. Cover:
+native PDF, or WebSocket proxy semantics. The production-build Playwright
+harness now runs the real Angular wrapper/pane/controller, with Chromium,
+Firefox, and WebKit projects, while a local BFF fixture and request interception
+simulate the browser-visible gateway. The locally executed Chromium/Firefox
+projects cover the implemented wrapper, iframe bootstrap/exchange,
+sandbox/CSP/navigation probes, credential-name separation, copied
+top-level locator rejection, typed storage fallback, origin reset, hard expiry,
+authoritative revocation, parent-auth expiry, and logout teardown.
+
+That local conformance harness blocks service workers for determinism and does
+not exercise the Python gateway, SSH, public TLS/DNS, real third-party-cookie or
+CHIPS policy, an effective PSL boundary, cross-replica PostgreSQL cancellation,
+or the hosted raw-path edge. Playwright WebKit is not shipping Safari coverage.
+Its supported-path WebKit fixture emulates partitioned-cookie persistence; the
+missing-cookie test turns that emulation off. Those synthetic outcomes prove the
+UI/protocol branches only, not CHIPS enforcement.
+From `cockpit/`, install its pinned engines with
+`npm run test:e2e:canvas:install` and run the production-build suite with
+`npm run test:e2e:canvas`; `test:e2e:canvas:no-build` is only the iteration path
+for an already-built `dist/cockpit/browser` tree.
+Real Safari/iOS, installed-PWA/service-worker behavior, hosted-network probes,
+and enabled live-k3d acceptance remain a physical-device, device-cloud, or
+deployed-environment matrix. The broader remaining matrix includes:
 
 - static fake-login/script/form/popup/top-navigation/download/storage/network
   attempts and an always-available trusted escape control;
-- Chromium, Firefox, and WebKit embedded/wrapper-pop-out viewer authentication,
-  iframe-only bootstrap rejection for top-level/document navigation,
-  unsupported-browser UX, copied-locator/different-BFF rejection,
-  logout/expiry/revocation, and no bridge, binding, exchange, or session secret
-  in logs or URLs; repeat the relevant matrix on real Safari/iOS and installed
-  PWAs;
-- no BFF/Keycloak cookie/internal auth header upstream, sanitized application
-  cookies, repeated `Set-Cookie`, and origin rotation preventing an old Service
-  Worker/storage entry from controlling a replacement; production tests use an
-  effective PSL boundary, while insecure PSL-less development mode proves only
-  that application cookies never reach upstream;
+- hosted Chromium, Firefox, and WebKit embedded/wrapper authentication against
+  the real gateway, including copied-locator/different-BFF rejection and no
+  bridge, binding, exchange, or session secret in logs or URLs; repeat the
+  relevant matrix on current Safari/iOS and installed PWAs;
+- no BFF/Keycloak cookie/internal auth header upstream, no application cookies
+  or upstream `Set-Cookie` in either current mode, and origin rotation preventing
+  an old Service Worker/storage entry from controlling a replacement;
+  production tests use an effective PSL boundary, while insecure PSL-less
+  development proves only the explicitly limited cookie-free profile;
 - exact public `Host`/`Origin`, rebuilt forwarding headers without viewer IP,
   stripped platform `Authorization`, cookie-free mode, and rejection of
-  cross-origin HTTP/WebSocket requests;
+  cross-origin HTTP requests; add WebSocket Origin cases in Slice 4;
 - removal of upstream CSP/CORS/reporting/NEL/auth-challenge/refresh/clear-site
   and cache/validator headers, with gateway-owned policy/no-store winning and
   repeated safe application headers remaining intact; reload/back/history after
@@ -2600,22 +2791,22 @@ claimed as Safari coverage. Cover:
   object, worker, WebRTC/data-channel, camera/mic/geolocation, popup, download,
   self-navigation, and fake trusted-auth attacks, documenting any browser-level
   channel which cannot be blocked;
-- response first-byte streaming, indefinite SSE/heartbeat, decoded/reframed
-  chunked requests and streamed chunked responses,
-  cancellation, limits, multiple cookies, safe relative/same-origin and exact
-  loopback-route redirects, blocked external/ambiguous redirects plus trusted
-  parent confirmation, and non-confirmable unsafe/custom schemes; Range/HEAD and
-  every permitted method;
-- WebSocket HMR, binary/text, subprotocol negotiation, Origin, close
+- ordinary-response first-byte streaming, decoded/reframed chunked requests and
+  streamed chunked responses, cancellation, limits, safe relative/same-origin
+  and exact loopback-entry redirects, fail-closed external/ambiguous redirects,
+  Range/HEAD, and every permitted method; Slice 4 adds indefinite SSE/heartbeat,
+  multi-port loopback redirects, application-cookie behavior if separately
+  approved, and any trusted-parent external-navigation confirmation;
+- **Slice 4:** WebSocket HMR, binary/text, subprotocol negotiation, Origin, close
   code/reason, fragmented-message limits, rejected compression, message rate,
   cancellation, slow-client backpressure, and connection limits;
 - conflicting/multiple length headers, transfer-coding ambiguity, invalid
   chunks/trailers, unexpected upgrades, inbound chunked reframing, parser
   differential cases, no upstream request bytes before full framing/body
   validation, and close-without-reuse after every framing failure;
-- Vite + FastAPI with entry/API/WS ports through one origin and no browser
-  request to workspace localhost; the fixed deployment host suffix works while
-  `allowedHosts: true` and unallocated Canvas hosts fail;
+- **Slice 4:** Vite + FastAPI with entry/API/WS ports through one origin and no
+  browser request to workspace localhost; the fixed deployment host suffix
+  works while `allowedHosts: true` and unallocated Canvas hosts fail;
 - SSH direct-channel destination limited by service policy and teardown on workspace
   generation/host-key change, and no direct workspace-port ingress from
   Cockpit/other workspaces;
@@ -2635,15 +2826,16 @@ claimed as Safari coverage. Cover:
 - When multiple humans can edit one thread, is awareness per canvas sufficient,
   or does it need per-user cursors/locks?
 
-None of these blocked Slices 0–2 or the default-off 3A/3B implementation
+None of these blocked Slices 0–2 or the default-off 3A–3C implementation
 checkpoints. The browser authentication matrix is a blocking production
 acceptance gate for a user-facing Slice 3 release, not an unanswered
 architecture choice hidden in the file-stage scope.
 
 ## Relationship to Adjacent Features
 
-- **`shared_browser.md`** — supplies one live source/renderer. Canvas owns where
-  it appears; Shared Browser owns concrete browser generations, dedicated
+- **`shared_browser.md`** — will supply the planned Slice-5 live
+  source/renderer. Canvas owns where it appears; Shared Browser owns concrete
+  browser generations, dedicated
   profiles, transport, and the single-controller handoff. Canvas must not
   depend directly on experimental CDP screencast details.
 - **`agent_skills.md`** — supplies model-invoked bundled-skill discovery and

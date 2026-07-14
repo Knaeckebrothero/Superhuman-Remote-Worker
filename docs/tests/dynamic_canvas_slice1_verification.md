@@ -2,7 +2,10 @@
 
 **Status:** Primary file presentation passed on local k3d on 2026-07-13. The
 bodyless-`304` framing defect found in that pass was fixed and live-reverified
-during Slice 2 later the same day.
+during Slice 2 later the same day. The default-off Slice-3A one-port foundation,
+Slice-3B ordinary-HTTP viewer, and Slice-3C gateway database isolation landed
+subsequently, but remain dark-shipped and do not expand this Slice-1 acceptance
+claim.
 
 **Feature:** `docs/features/dynamic_canvas.md`
 
@@ -106,6 +109,7 @@ real ASGI server:
    tracked in [[dynamic_canvas_slice2_verification]].
 
 Editing was implemented and separately verified in
-[[dynamic_canvas_slice2_verification]]. Live applications, multi-port routing,
-and shared browser acceptance remain in Slices 3–5 and are not implied by this
-Slice-1 record.
+[[dynamic_canvas_slice2_verification]]. The default-off one-port foundation,
+ordinary-HTTP viewer, and gateway database boundary subsequently landed in
+Slices 3A–3C. Enabled live application, multi-port routing, and shared browser
+acceptance remain outstanding and are not implied by this Slice-1 record.

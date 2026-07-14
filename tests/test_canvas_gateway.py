@@ -247,6 +247,7 @@ async def test_bootstrap_serves_bound_challenge_and_only_transient_cookie() -> N
     assert "bridge_nonce" not in response.text
     assert "token" not in response.text
     assert 'fetch("/_canvas/exchange"' in response.text
+    assert "canvas_browser_storage_unavailable" in response.text
     assert "event.source!==parent" in response.text
     assert "event.origin!==bootstrap.parentOrigin" in response.text
     assert "bootstrap.parentOrigin" in response.text
@@ -332,6 +333,39 @@ async def test_same_origin_exchange_sets_viewer_and_clears_transient_cookie() ->
     assert viewer.startswith("__Host-canvas_session=" + "n" * 43)
     for attribute in ("Path=/", "Secure", "HttpOnly", "SameSite=None", "Partitioned"):
         assert attribute in viewer
+
+
+@pytest.mark.asyncio
+async def test_exchange_reports_browser_storage_when_partitioned_binding_is_missing() -> None:
+    config, session, sessions, db = _fixture()
+    app = CanvasGatewayApp(
+        db=db,
+        config=config,
+        session_service=sessions,  # type: ignore[arg-type]
+        registry=CanvasConnectionRegistry(max_connections=4),
+    )
+    origin = f"https://{session.origin_generation}.canvas.user-content.test"
+    async with _client(app, session) as client:
+        response = await client.post(
+            "/_canvas/exchange",
+            json={
+                "attachment_id": str(sessions.attachment_id),
+                "challenge": sessions.challenge,
+                "exchange_code": sessions.exchange_code,
+            },
+            headers={
+                "Origin": origin,
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "canvas_browser_storage_unavailable"
+    )
+    assert sessions.exchange_calls == []
 
 
 @pytest.mark.asyncio
@@ -427,7 +461,7 @@ async def test_exchange_requires_exact_schema_and_attachment_browser_binding(
             },
         )
 
-    assert response.status_code == (400 if failure == "extra_field" else 401)
+    assert response.status_code == (400 if failure == "extra_field" else 409)
     assert sessions.exchange_calls == []
     assert "set-cookie" not in response.headers
 

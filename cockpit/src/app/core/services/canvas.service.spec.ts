@@ -6,7 +6,7 @@ import {
 } from '@angular/common/http/testing';
 import {TestBed} from '@angular/core/testing';
 import {CanvasState} from '../models/canvas.model';
-import {CanvasService} from './canvas.service';
+import {CanvasService, parseCanvasBroadcastInvalidation} from './canvas.service';
 import {PersistentThreadTransportBridge} from './persistent-thread-transport-bridge.service';
 
 function canvasState(
@@ -369,6 +369,57 @@ describe('CanvasService', () => {
     }));
   });
 
+  it('conditionally rotates a live app origin without requiring a content ETag', () => {
+    const app = canvasState(8, {
+      source: {type: 'workspace_app', entry_path: '/demo'},
+      renderer: 'auto',
+      source_version: null,
+      status: 'ready',
+      capabilities: {
+        can_edit: false,
+        can_pop_out: true,
+        can_take_control: false,
+        can_create_viewer_session: true,
+      },
+    });
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(app, {
+      headers: {ETag: '"canvas:8:app"'},
+    });
+    const sender = vi.fn().mockReturnValue(true);
+    transport.attachControlSender(sender);
+
+    let result: unknown;
+    service.resetOrigin('"canvas:8:app"').subscribe(value => result = value);
+    const reset = http.expectOne(req => req.url.endsWith('/canvases/main/reset-origin'));
+    expect(reset.request.method).toBe('POST');
+    expect(reset.request.body).toBeNull();
+    expect(reset.request.headers.get('If-Match')).toBe('"canvas:8:app"');
+    reset.flush({...app, presentation_revision: 9}, {
+      headers: {ETag: '"canvas:9:fresh-origin"'},
+    });
+
+    expect(result).toEqual({
+      state: expect.objectContaining({presentation_revision: 9}),
+      stateEtag: '"canvas:9:fresh-origin"',
+    });
+    expect(service.state()?.presentation_revision).toBe(9);
+    expect(service.stateEtag()).toBe('"canvas:9:fresh-origin"');
+    expect(sender).toHaveBeenCalledWith('thread-1', {
+      method: 'canvas.presentation_updated',
+      canvas_id: 'main',
+      presentation_revision: 9,
+    });
+  });
+
+  it('refuses to reset app storage without an authoritative state ETag', () => {
+    let error: unknown;
+    service.resetOrigin().subscribe({error: value => error = value});
+
+    expect(error).toBeInstanceOf(Error);
+    http.expectNone(req => req.url.includes('/reset-origin'));
+  });
+
   it('does not notify the runtime from a mutation response older than current state', () => {
     service.selectThread('thread-1');
     http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
@@ -422,5 +473,112 @@ describe('CanvasService', () => {
       presentation_revision: 5,
       source_version: 'sha256:newer',
     }));
+  });
+});
+
+describe('CanvasService cross-tab invalidation', () => {
+  it('accepts only a bounded state pointer and never a Canvas state payload', () => {
+    expect(parseCanvasBroadcastInvalidation({
+      type: 'canvas.presentation_invalidated',
+      threadId: 'thread-1',
+      canvasId: 'main',
+      presentationRevision: 9,
+      state: {title: 'must not be trusted'},
+    })).toEqual({
+      type: 'canvas.presentation_invalidated',
+      threadId: 'thread-1',
+      canvasId: 'main',
+      presentationRevision: 9,
+    });
+    expect(parseCanvasBroadcastInvalidation({
+      type: 'canvas.presentation_invalidated',
+      threadId: 'thread-1',
+      canvasId: 'other',
+      presentationRevision: 9,
+    })).toBeNull();
+    expect(parseCanvasBroadcastInvalidation({
+      type: 'canvas.presentation_invalidated',
+      threadId: 'thread-1',
+      canvasId: 'main',
+      presentationRevision: -1,
+    })).toBeNull();
+  });
+
+  it('rebroadcasts transport pointers and reconciles received pointers without looping', () => {
+    class FakeBroadcastChannel {
+      static instances: FakeBroadcastChannel[] = [];
+      readonly postMessage = vi.fn();
+      readonly close = vi.fn();
+      private listener: ((event: MessageEvent<unknown>) => void) | null = null;
+
+      constructor(readonly name: string) {
+        FakeBroadcastChannel.instances.push(this);
+      }
+
+      addEventListener(_type: string, listener: EventListenerOrEventListenerObject): void {
+        if (typeof listener === 'function') {
+          this.listener = listener as (event: MessageEvent<unknown>) => void;
+        }
+      }
+
+      removeEventListener(): void {
+        this.listener = null;
+      }
+
+      emit(data: unknown): void {
+        this.listener?.(new MessageEvent('message', {data}));
+      }
+    }
+
+    const original = Object.getOwnPropertyDescriptor(window, 'BroadcastChannel');
+    Object.defineProperty(window, 'BroadcastChannel', {
+      configurable: true,
+      value: FakeBroadcastChannel as unknown as typeof BroadcastChannel,
+    });
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        CanvasService,
+        PersistentThreadTransportBridge,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+      ],
+    });
+    const service = TestBed.inject(CanvasService);
+    const transport = TestBed.inject(PersistentThreadTransportBridge);
+    const http = TestBed.inject(HttpTestingController);
+    const channel = FakeBroadcastChannel.instances[0]!;
+
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(canvasState(1));
+    transport.forwardEvent('thread-1', {
+      method: 'canvas.updated',
+      params: {canvas_id: 'main', presentation_revision: 2},
+    });
+    expect(channel.postMessage).toHaveBeenCalledWith({
+      type: 'canvas.presentation_invalidated',
+      threadId: 'thread-1',
+      canvasId: 'main',
+      presentationRevision: 2,
+    });
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(canvasState(2));
+
+    channel.postMessage.mockClear();
+    channel.emit({
+      type: 'canvas.presentation_invalidated',
+      threadId: 'thread-1',
+      canvasId: 'main',
+      presentationRevision: 3,
+      state: {title: 'ignored'},
+    });
+    expect(service.state()?.presentation_revision).toBe(2);
+    expect(channel.postMessage).not.toHaveBeenCalled();
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(canvasState(3));
+    expect(service.state()?.presentation_revision).toBe(3);
+
+    http.verify();
+    TestBed.resetTestingModule();
+    if (original) Object.defineProperty(window, 'BroadcastChannel', original);
+    else Reflect.deleteProperty(window, 'BroadcastChannel');
   });
 });

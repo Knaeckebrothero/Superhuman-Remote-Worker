@@ -10,6 +10,7 @@ import {ProjectDetailPageComponent} from './views/project-detail/project-detail.
 import {InboxPageComponent} from './views/inbox/inbox-page.component';
 import {MessageRedirectComponent} from './core/routing/message-redirect/message-redirect.component';
 import {ChatPageComponent} from './views/chat/chat-page.component';
+import {CanvasPopoutPageComponent} from './views/canvas/canvas-popout-page.component';
 import {SessionsPageComponent} from './views/sessions/sessions-page.component';
 import {SessionCreateComponent} from './views/session-create/session-create.component';
 import {DatasourcesPageComponent} from './views/datasources/datasources-page.component';
@@ -35,6 +36,12 @@ export const routes: Routes = [
   { path: '', component: ChatPageComponent, canActivate: [authGuard], data: { draft: true } },
     {path: 'sessions', component: SessionsPageComponent, canActivate: [authGuard]},
     {path: 'sessions/new', component: SessionCreateComponent, canActivate: [authGuard]},
+    {
+      path: 'sessions/:threadId/canvas',
+      component: CanvasPopoutPageComponent,
+      canActivate: [authGuard],
+      data: {canvasPopout: true},
+    },
     {path: 'sessions/:threadId', component: ChatPageComponent, canActivate: [authGuard]},
     {path: 'chat', redirectTo: 'sessions'},
   { path: 'jobs', component: JobsPageComponent, canActivate: [authGuard] },

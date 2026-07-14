@@ -1,6 +1,6 @@
 # Dynamic Canvas Slice 3C — gateway database isolation verification
 
-**Status:** Implemented, default-off, and repository-verified on 2026-07-13.
+**Status:** Implemented, default-off, and repository-verified on 2026-07-14.
 This checkpoint closes the gateway credential/configuration launch blocker. It
 does not enable the viewer or claim production-browser/edge acceptance.
 
@@ -102,6 +102,8 @@ installation where PUBLIC still grants `CREATE` on schema `public`.
 The viewer remains dark. User-facing Slice 3 still requires a raw-path-
 preserving wildcard edge, propagated private PSL boundary, edge rate limits,
 black-box trusted-parent/PWA validation, and the Chromium/Firefox/WebKit plus
-Safari/iOS authentication/security matrix. The next repository checkpoint is
-the production-browser harness and explicit trusted unsupported-browser UX;
+Safari/iOS authentication/security matrix. The local production-bundle
+Playwright harness, explicit unsupported/storage UX, authenticated wrapper
+pop-out, and conditional trusted reset-origin action have since landed. They do
+not replace a hosted Python-gateway/TLS/CHIPS/PSL run or device/PWA acceptance;
 multi-port, SSE, WebSocket/HMR, and Shared Browser remain later slices.

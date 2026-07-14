@@ -89,9 +89,10 @@ data:
   PROTECTED_CLOUD_MODE_ENABLED: {{ .Values.agent.protectedCloudModeEnabled | default "false" | quote }}
   # Dynamic Canvas workspace-port live preview master gate. The orchestrator
   # derives the positive attach capability and rechecks every mutation; agents
-  # never infer support from this environment value. Provisioned agents also
-  # inherit the shared ConfigMap, but no viewer host/domain is published by this
-  # foundation slice.
+  # never infer support from this environment value. Provisioned agents inherit
+  # this shared ConfigMap, while the public-origin gateway uses its dedicated
+  # allowlisted ConfigMap and separate database credential Secret. The
+  # operator-owned edge and verified deployment attestations remain required.
   CANVAS_LIVE_PREVIEW_ENABLED: {{ ternary "true" "false" .Values.canvas.livePreview.enabled | quote }}
   CANVAS_LIVE_PREVIEW_DENIED_PORTS: {{ join "," .Values.canvas.livePreview.deniedPorts | quote }}
   # Browser-facing viewer gate and isolation attestations. These stay present

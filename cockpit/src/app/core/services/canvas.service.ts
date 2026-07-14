@@ -8,6 +8,7 @@ import {
   CanvasMutationResponse,
   CanvasRequestError,
   CanvasState,
+  CanvasStateMutationResponse,
   MAIN_CANVAS_ID,
 } from '../models/canvas.model';
 import {environment} from '../environment';
@@ -18,6 +19,14 @@ import {
 
 /** Avoid a REST request on every focus bounce while still repairing missed SSE. */
 export const CANVAS_RECONCILE_STALE_MS = 30_000;
+export const CANVAS_BROADCAST_CHANNEL = 'srw.canvas.presentation.v1';
+
+interface CanvasBroadcastInvalidation {
+  readonly type: 'canvas.presentation_invalidated';
+  readonly threadId: string;
+  readonly canvasId: typeof MAIN_CANVAS_ID;
+  readonly presentationRevision: number;
+}
 
 /**
  * Authoritative Dynamic Canvas state for the selected persistent thread.
@@ -37,6 +46,8 @@ export class CanvasService {
   readonly stateEtag = signal<string | null>(null);
   readonly loadStatus = signal<CanvasLoadStatus>('idle');
   readonly requestError = signal<CanvasRequestError | null>(null);
+  /** Browser time of the last authoritative GET or mutation applied locally. */
+  readonly lastSuccessfulSyncAt = signal<number | null>(null);
 
   private requestSubscription: Subscription | null = null;
   private activeRequestToken: symbol | null = null;
@@ -45,12 +56,12 @@ export class CanvasService {
   private pendingRevision: number | null = null;
   private pendingRevisionFollowUpAllowed = false;
   private pendingForcedReconcile = false;
-  private lastSuccessfulReconcileAt = 0;
+  private broadcastChannel: BroadcastChannel | null = null;
 
   constructor() {
     this.transport.canvasInvalidations$
       .pipe(takeUntilDestroyed(this.destroyRef))
-      .subscribe((event) => this.handleInvalidation(event));
+      .subscribe((event) => this.handleInvalidation(event, true));
 
     if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       const reconcileIfVisible = () => {
@@ -63,6 +74,22 @@ export class CanvasService {
         window.removeEventListener('focus', reconcileIfVisible);
         document.removeEventListener('visibilitychange', reconcileIfVisible);
       });
+
+      if (typeof window.BroadcastChannel === 'function') {
+        try {
+          this.broadcastChannel = new window.BroadcastChannel(CANVAS_BROADCAST_CHANNEL);
+          this.broadcastChannel.addEventListener('message', this.handleBroadcastMessage);
+          this.destroyRef.onDestroy(() => {
+            this.broadcastChannel?.removeEventListener('message', this.handleBroadcastMessage);
+            this.broadcastChannel?.close();
+            this.broadcastChannel = null;
+          });
+        } catch {
+          // Some privacy modes expose the constructor but reject channel use.
+          // Focus/visibility reconciliation remains the bounded fallback.
+          this.broadcastChannel = null;
+        }
+      }
     }
 
     this.destroyRef.onDestroy(() => this.cancelRequest());
@@ -82,7 +109,7 @@ export class CanvasService {
     this.pendingRevision = null;
     this.pendingRevisionFollowUpAllowed = false;
     this.pendingForcedReconcile = false;
-    this.lastSuccessfulReconcileAt = 0;
+    this.lastSuccessfulSyncAt.set(null);
     this.threadId.set(threadId);
     this.state.set(null);
     this.stateEtag.set(null);
@@ -150,8 +177,42 @@ export class CanvasService {
     );
   }
 
-  private handleInvalidation(event: CanvasInvalidation): void {
+  /**
+   * Rotate a live app onto a fresh isolated origin.
+   *
+   * This is deliberately a pointer-free mutation: the server derives the
+   * current app, retires its old origin generation, and returns the new
+   * authoritative Canvas representation. It never returns a content ETag
+   * because workspace-app presentations do not expose editable file bytes.
+   */
+  resetOrigin(expectedStateEtag?: string): Observable<CanvasStateMutationResponse> {
+    const threadId = this.threadId();
+    const stateEtag = expectedStateEtag ?? this.stateEtag();
+    if (!threadId || !stateEtag) {
+      return throwError(() => new Error('Cannot reset Canvas app origin without current state'));
+    }
+    const url =
+      `${environment.apiUrl}/persistent/threads/${encodeURIComponent(threadId)}` +
+      `/canvases/${MAIN_CANVAS_ID}/reset-origin`;
+    return this.http.post<CanvasState>(url, null, {
+      headers: {'If-Match': stateEtag},
+      observe: 'response',
+    }).pipe(
+      map(response => this.parseStateMutationResponse(response)),
+      tap(response => this.applyMutationResponse(threadId, response, true)),
+    );
+  }
+
+  private handleInvalidation(event: CanvasInvalidation, rebroadcast: boolean): void {
     if (event.threadId !== this.threadId() || event.canvasId !== MAIN_CANVAS_ID) return;
+
+    // The chat tab owns the server transport; wrapper-only tabs intentionally
+    // do not. Relay only the bounded pointer so sibling wrappers reconcile via
+    // their own authenticated REST request. A BroadcastChannel receiver passes
+    // `false` to prevent rebroadcast loops.
+    if (rebroadcast && event.presentationRevision !== null) {
+      this.broadcastPresentationInvalidation(event.threadId, event.presentationRevision);
+    }
 
     const appliedRevision = this.state()?.presentation_revision ?? 0;
     if (
@@ -176,11 +237,24 @@ export class CanvasService {
     this.startReconcile(event.presentationRevision);
   }
 
+  private readonly handleBroadcastMessage = (event: MessageEvent<unknown>): void => {
+    const invalidation = parseCanvasBroadcastInvalidation(event.data);
+    if (!invalidation) return;
+    this.handleInvalidation({
+      threadId: invalidation.threadId,
+      method: 'canvas.updated',
+      canvasId: MAIN_CANVAS_ID,
+      presentationRevision: invalidation.presentationRevision,
+      sourceType: null,
+      updatedAt: null,
+    }, false);
+  };
+
   private reconcileIfStale(): void {
     if (!this.threadId() || this.activeRequestToken) return;
     if (
-      this.lastSuccessfulReconcileAt > 0 &&
-      Date.now() - this.lastSuccessfulReconcileAt < CANVAS_RECONCILE_STALE_MS
+      this.lastSuccessfulSyncAt() !== null &&
+      Date.now() - this.lastSuccessfulSyncAt()! < CANVAS_RECONCILE_STALE_MS
     ) {
       return;
     }
@@ -245,7 +319,7 @@ export class CanvasService {
       return;
     }
 
-    this.lastSuccessfulReconcileAt = Date.now();
+    this.lastSuccessfulSyncAt.set(Date.now());
     this.requestError.set(null);
     this.loadStatus.set('ready');
   }
@@ -270,7 +344,7 @@ export class CanvasService {
       this.pendingRevision = null;
       this.pendingRevisionFollowUpAllowed = false;
       this.pendingForcedReconcile = false;
-      this.lastSuccessfulReconcileAt = Date.now();
+      this.lastSuccessfulSyncAt.set(Date.now());
       return;
     }
 
@@ -341,23 +415,33 @@ export class CanvasService {
   }
 
   private parseMutationResponse(response: HttpResponse<CanvasState>): CanvasMutationResponse {
+    const stateResponse = this.parseStateMutationResponse(response);
+    const contentEtag = response.headers.get('X-Canvas-Content-ETag');
+    const expectedContentEtag = stateResponse.state.source_version
+      ? `"${stateResponse.state.source_version}"`
+      : null;
+    if (!contentEtag || contentEtag !== expectedContentEtag) {
+      throw new Error('Canvas mutation returned invalid precondition metadata');
+    }
+    return {...stateResponse, contentEtag};
+  }
+
+  private parseStateMutationResponse(
+    response: HttpResponse<CanvasState>,
+  ): CanvasStateMutationResponse {
     if (!isCanvasState(response.body)) {
       throw new Error('Canvas mutation returned invalid state');
     }
     const stateEtag = response.headers.get('ETag');
-    const contentEtag = response.headers.get('X-Canvas-Content-ETag');
-    const expectedContentEtag = response.body.source_version
-      ? `"${response.body.source_version}"`
-      : null;
-    if (!stateEtag || !contentEtag || contentEtag !== expectedContentEtag) {
+    if (!stateEtag) {
       throw new Error('Canvas mutation returned invalid precondition metadata');
     }
-    return {state: response.body, stateEtag, contentEtag};
+    return {state: response.body, stateEtag};
   }
 
   private applyMutationResponse(
     threadId: string,
-    response: CanvasMutationResponse,
+    response: CanvasStateMutationResponse,
     notifyRuntime: boolean,
   ): void {
     if (this.threadId() !== threadId) return;
@@ -367,25 +451,73 @@ export class CanvasService {
     this.stateEtag.set(response.stateEtag);
     this.loadStatus.set('ready');
     this.requestError.set(null);
-    this.lastSuccessfulReconcileAt = Date.now();
+    this.lastSuccessfulSyncAt.set(Date.now());
+    this.broadcastPresentationInvalidation(
+      threadId,
+      response.state.presentation_revision,
+    );
 
     const source = response.state.source;
+    if (!notifyRuntime) return;
     if (
-      !notifyRuntime ||
-      source?.type !== 'workspace_file' ||
-      typeof source.path !== 'string' ||
-      !response.state.source_version
+      source?.type === 'workspace_file' &&
+      typeof source.path === 'string' &&
+      response.state.source_version
     ) {
-      return;
+      this.transport.sendCanvasControl(threadId, {
+        method: 'canvas.source_updated',
+        canvas_id: MAIN_CANVAS_ID,
+        path: source.path,
+        presentation_revision: response.state.presentation_revision,
+        source_version: response.state.source_version,
+      });
+    } else if (source?.type === 'workspace_app') {
+      this.transport.sendCanvasControl(threadId, {
+        method: 'canvas.presentation_updated',
+        canvas_id: MAIN_CANVAS_ID,
+        presentation_revision: response.state.presentation_revision,
+      });
     }
-    this.transport.sendCanvasControl(threadId, {
-      method: 'canvas.source_updated',
-      canvas_id: MAIN_CANVAS_ID,
-      path: source.path,
-      presentation_revision: response.state.presentation_revision,
-      source_version: response.state.source_version,
-    });
   }
+
+  private broadcastPresentationInvalidation(threadId: string, revision: number): void {
+    try {
+      this.broadcastChannel?.postMessage({
+        type: 'canvas.presentation_invalidated',
+        threadId,
+        canvasId: MAIN_CANVAS_ID,
+        presentationRevision: revision,
+      } satisfies CanvasBroadcastInvalidation);
+    } catch {
+      // A browser may revoke storage-backed channel access after creation.
+      // The mutation is already authoritative; focus reconciliation repairs
+      // sibling tabs without turning this local optimization into a failure.
+      this.broadcastChannel?.close();
+      this.broadcastChannel = null;
+    }
+  }
+}
+
+export function parseCanvasBroadcastInvalidation(
+  value: unknown,
+): CanvasBroadcastInvalidation | null {
+  if (!isRecord(value)) return null;
+  const revision = value['presentationRevision'];
+  return value['type'] === 'canvas.presentation_invalidated' &&
+    typeof value['threadId'] === 'string' &&
+    value['threadId'].length > 0 &&
+    value['threadId'].length <= 256 &&
+    value['canvasId'] === MAIN_CANVAS_ID &&
+    typeof revision === 'number' &&
+    Number.isSafeInteger(revision) &&
+    revision >= 0
+    ? {
+        type: 'canvas.presentation_invalidated',
+        threadId: value['threadId'],
+        canvasId: MAIN_CANVAS_ID,
+        presentationRevision: revision,
+      }
+    : null;
 }
 
 const CANVAS_RENDERERS = new Set(['auto', 'markdown', 'text', 'html', 'image']);

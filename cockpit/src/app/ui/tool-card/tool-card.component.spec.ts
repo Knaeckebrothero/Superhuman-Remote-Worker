@@ -1,7 +1,27 @@
-import {describe, expect, it} from 'vitest';
+import {Component} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
+import {TranslocoTestingModule} from '@jsverse/transloco';
+import {afterEach, describe, expect, it} from 'vitest';
 import {CanvasState} from '../../core/models/canvas.model';
-import {ToolCardAction} from '../../core/models/tool-card.model';
+import {ToolCardAction, ToolCardView} from '../../core/models/tool-card.model';
+import {buildToolCardView} from '../../core/tools/tool-descriptors';
+import {CanvasToolCardPresentationComponent} from './canvas-tool-card-presentation.component';
 import {canvasToolCardContext} from './tool-card.component';
+
+@Component({
+  standalone: true,
+  imports: [CanvasToolCardPresentationComponent],
+  template: `
+    <app-canvas-tool-card-presentation [presentation]="view.canvasPresentation"
+                                       [action]="view.action!"
+                                       contextLabel="current" [available]="true"
+                                       (requested)="requested.push($event)" />
+  `,
+})
+class ToolCardHost {
+  view!: ToolCardView;
+  requested: ToolCardAction[] = [];
+}
 
 function state(revision: number): CanvasState {
   return {
@@ -20,6 +40,8 @@ function state(revision: number): CanvasState {
 }
 
 describe('set_canvas tool-card context', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
   const action: ToolCardAction = {kind: 'open_canvas', presentationRevision: 5};
 
   it('labels a historical presentation as current, replaced, or unavailable', () => {
@@ -34,5 +56,57 @@ describe('set_canvas tool-card context', () => {
     expect(canvasToolCardContext({kind: 'open_canvas'}, state(8))).toBe('currentStage');
     expect(Object.keys(action)).toEqual(['kind', 'presentationRevision']);
     expect(JSON.stringify(action)).not.toContain('/api/');
+  });
+
+  it('renders the normalized source/title summary and emits the trusted action', async () => {
+    TestBed.configureTestingModule({
+      imports: [
+        ToolCardHost,
+        TranslocoTestingModule.forRoot({
+          langs: {
+            en: {
+              toolCard: {
+                status: {ok: 'completed'},
+                titles: {set_canvas: 'Present in Canvas'},
+                canvas: {
+                  open: 'Open Canvas',
+                  current: 'current',
+                  sourceKind: {file: 'File', app: 'Live app', canvas: 'Canvas'},
+                },
+              },
+            },
+          },
+          translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        }),
+      ],
+    });
+    await TestBed.compileComponents();
+    const fixture = TestBed.createComponent(ToolCardHost);
+    const view = buildToolCardView({
+      tool: 'set_canvas',
+      args: {source_type: 'workspace_file', path: 'output/report.md'},
+      status: 'ok',
+      result: JSON.stringify({
+        presentation_revision: 5,
+        title: 'Quarterly report',
+        source: {type: 'workspace_file', path: 'output/report.md'},
+      }),
+    });
+    fixture.componentInstance.view = view;
+    fixture.detectChanges();
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const root = fixture.nativeElement as HTMLElement;
+    expect(root.querySelector('.tc-canvas__kind')?.textContent?.trim()).toBe('File');
+    expect(root.querySelector('.tc-canvas__title')?.textContent?.trim()).toBe('Quarterly report');
+    const open = root.querySelector('.tc-canvas__action') as HTMLButtonElement;
+    expect(open.textContent?.trim()).toBe('Open Canvas');
+    expect(open.disabled).toBe(false);
+    open.click();
+    expect(fixture.componentInstance.requested).toEqual([{
+      kind: 'open_canvas',
+      presentationRevision: 5,
+    }]);
   });
 });

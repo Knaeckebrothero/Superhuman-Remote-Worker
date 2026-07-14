@@ -908,6 +908,29 @@ describe('PersistentChatService — connect()', () => {
         expect(wsInstances[0].send).toHaveBeenCalledTimes(1);
     });
 
+    it('sends a committed presentation invalidation without file identity', async () => {
+        const {service, mockHttp, wsInstances, threadTransport} = createService();
+        mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await service.connect('thread-canvas');
+
+        const accepted = threadTransport.sendCanvasControl('thread-canvas', {
+            method: 'canvas.presentation_updated',
+            canvas_id: 'main',
+            presentation_revision: 6,
+        });
+
+        expect(accepted).toBe(true);
+        expect(wsInstances[0].send).toHaveBeenCalledWith(
+            JSON.stringify({
+                method: 'canvas.presentation_updated',
+                canvas_id: 'main',
+                presentation_revision: 6,
+            }),
+        );
+    });
+
     it('truthfully rejects a Canvas control while the WebSocket is still connecting', () => {
         const {service, threadTransport} = createService();
         const connectingWs = createMockWs();

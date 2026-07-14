@@ -1,5 +1,7 @@
-import {Component, computed, effect, inject, OnInit} from '@angular/core';
-import {RouterOutlet} from '@angular/router';
+import {Component, DestroyRef, computed, effect, inject, OnInit, signal} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {ActivatedRoute, NavigationEnd, Router, RouterOutlet} from '@angular/router';
+import {filter} from 'rxjs';
 import {SidebarComponent} from './shell/sidebar/sidebar.component';
 import {AppToastContainerComponent} from './ui/toast';
 import {ComponentRegistryService} from './core/services/component-registry.service';
@@ -49,7 +51,9 @@ import {AppIconComponent} from './ui/icon';
     AppIconComponent,
   ],
   template: `
-    <app-pwa-banner />
+    @if (!canvasPopoutRoute()) {
+      <app-pwa-banner />
+    }
     <div class="app-container">
       @if (showSidebar()) {
         <app-sidebar [class.collapsed]="sidebar.collapsed()" />
@@ -69,9 +73,11 @@ import {AppIconComponent} from './ui/icon';
             </div>
           </div>
         } @else {
-          <app-readiness-gate-banner />
-          <app-empty-catalog-banner />
-          <app-view-mode-banner />
+          @if (!canvasPopoutRoute()) {
+            <app-readiness-gate-banner />
+            <app-empty-catalog-banner />
+            <app-view-mode-banner />
+          }
           <router-outlet />
         }
       </div>
@@ -204,9 +210,15 @@ export class App implements OnInit {
   private readonly registry = inject(ComponentRegistryService);
   readonly sidebar = inject(SidebarService);
   private readonly actionCenter = inject(ActionCenterService);
+  private readonly router = inject(Router);
+  private readonly activatedRoute = inject(ActivatedRoute);
+  private readonly destroyRef = inject(DestroyRef);
+  readonly canvasPopoutRoute = signal(false);
 
   readonly showSidebar = computed(
-    () => this.userService.isAuthenticated() && this.userService.isApproved(),
+    () => !this.canvasPopoutRoute() &&
+      this.userService.isAuthenticated() &&
+      this.userService.isApproved(),
   );
 
   readonly showMobileBackdrop = computed(
@@ -219,6 +231,17 @@ export class App implements OnInit {
   );
 
   constructor() {
+    const updateShellMode = () => {
+      let route = this.activatedRoute;
+      while (route.firstChild) route = route.firstChild;
+      this.canvasPopoutRoute.set(route.snapshot.data['canvasPopout'] === true);
+    };
+    updateShellMode();
+    this.router.events.pipe(
+      filter((event): event is NavigationEnd => event instanceof NavigationEnd),
+      takeUntilDestroyed(this.destroyRef),
+    ).subscribe(updateShellMode);
+
     // Lock body scroll when mobile sidebar is open
     effect(() => {
       if (this.viewport.isMobile() && !this.sidebar.collapsed()) {

@@ -929,6 +929,102 @@ class CanvasService:
         await self._emit(refreshed_record, method="canvas.updated")
         return CanvasMutation(changed=True, record=refreshed_record)
 
+    async def reset_origin(
+        self,
+        thread_id: str,
+        *,
+        expected_etag: str | None,
+        expected_thread_user_id: str,
+        canvas_id: str = MAIN_CANVAS_ID,
+        representation_builder: CanvasRepresentationBuilder = (
+            build_public_canvas_representation
+        ),
+    ) -> CanvasMutation:
+        """Rotate one live application's isolated browser origin.
+
+        The source pointer is preserved, while the origin generation and
+        presentation revision advance atomically.  Migration ``0061`` revokes
+        sessions for the retired generation in the same transaction and emits
+        the cross-replica cancellation notification.
+        """
+
+        self._require_main(canvas_id)
+        reset_record: CanvasRecord | None = None
+        async with _canvas_mutation_admission():
+            async with self._db.acquire() as conn:
+                async with conn.transaction():
+                    thread_row = await conn.fetchrow(
+                        """
+                        SELECT id, user_id, metadata
+                        FROM threads
+                        WHERE id = $1
+                        FOR SHARE
+                        """,
+                        thread_id,
+                    )
+                    if thread_row is None or str(
+                        thread_row.get("user_id") or ""
+                    ) != str(expected_thread_user_id):
+                        raise CanvasEditError(
+                            403,
+                            "canvas_not_authorized",
+                            "Canvas thread authorization changed",
+                        )
+
+                    row = await conn.fetchrow(
+                        """
+                        SELECT thread_id, canvas_id, source, title, renderer,
+                               editable, alt_text, presentation_revision,
+                               source_fingerprint, source_version,
+                               origin_generation, created_at, updated_at
+                        FROM canvases
+                        WHERE thread_id = $1 AND canvas_id = $2
+                        FOR UPDATE
+                        """,
+                        thread_id,
+                        canvas_id,
+                    )
+                    if row is None or row.get("source") is None:
+                        raise CanvasEditError(
+                            409, "canvas_cleared", "Canvas is cleared"
+                        )
+                    current = CanvasRecord.from_row(row)
+                    if not isinstance(current.source, WorkspaceAppSource):
+                        raise CanvasEditError(
+                            409,
+                            "canvas_not_live_app",
+                            "The current Canvas is not a live workspace application",
+                        )
+                    if expected_etag is None:
+                        raise CanvasPreconditionRequired(
+                            "If-Match is required to reset a Canvas origin"
+                        )
+                    current_etag = representation_builder(current).etag
+                    if not secrets.compare_digest(expected_etag.strip(), current_etag):
+                        raise CanvasPreconditionFailed("Canvas state ETag is stale")
+
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE canvases
+                        SET origin_generation = $3,
+                            presentation_revision = presentation_revision + 1,
+                            updated_at = now()
+                        WHERE thread_id = $1 AND canvas_id = $2
+                        RETURNING thread_id, canvas_id, source, title, renderer,
+                                  editable, alt_text, presentation_revision,
+                                  source_fingerprint, source_version,
+                                  origin_generation, created_at, updated_at
+                        """,
+                        thread_id,
+                        canvas_id,
+                        uuid4(),
+                    )
+                    reset_record = CanvasRecord.from_row(updated)
+
+        assert reset_record is not None
+        await self._emit(reset_record, method="canvas.updated")
+        return CanvasMutation(changed=True, record=reset_record)
+
     async def clear(
         self,
         thread_id: str,

@@ -114,6 +114,17 @@ export class CanvasViewerController {
     this.createAttachment(desired);
   }
 
+  /** Retry the current trusted attachment flow without ever opening the app top-level. */
+  retry(): void {
+    const desired = this.desired;
+    if (!desired || this.viewerStatus() === 'loading' || this.viewerStatus() === 'renewing') {
+      return;
+    }
+    this.reset(true);
+    this.desired = desired;
+    this.createAttachment(desired);
+  }
+
   /** Bind the exact WindowProxy before the renderer mounts the remote URL. */
   bindFrame(frame: WindowProxy): void {
     const attachment = this.attachment;
@@ -371,7 +382,11 @@ export class CanvasViewerController {
     ) {
       return;
     }
-    this.failActiveAttachment('canvas_viewer_bootstrap_failed');
+    this.failActiveAttachment(
+      message.code === 'canvas_browser_storage_unavailable'
+        ? 'canvas_browser_storage_unavailable'
+        : 'canvas_viewer_bootstrap_failed',
+    );
   }
 
   private handleAuthorizationError(
@@ -435,11 +450,16 @@ export class CanvasViewerController {
   private handleCreateError(token: symbol, error: unknown): void {
     if (this.requestToken !== token) return;
     const status = httpStatus(error);
+    const code = httpErrorCode(error);
     this.cancelRequest();
     if (status === 412 || status === 401 || status === 403 || status === 404) {
       this.canvas.reconcile();
     }
-    this.fail('canvas_viewer_create_failed');
+    this.fail(
+      code === 'canvas_browser_unsupported'
+        ? 'canvas_browser_unsupported'
+        : 'canvas_viewer_create_failed',
+    );
   }
 
   private handleRenewError(
@@ -670,6 +690,16 @@ function parseTiming(
 
 function httpStatus(error: unknown): number | null {
   return error instanceof HttpErrorResponse ? error.status || null : null;
+}
+
+function httpErrorCode(error: unknown): string | null {
+  if (!(error instanceof HttpErrorResponse)) return null;
+  const payload = error.error;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const detail = (payload as Record<string, unknown>)['detail'];
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return null;
+  const code = (detail as Record<string, unknown>)['code'];
+  return typeof code === 'string' ? code : null;
 }
 
 function parseFutureTimestamp(value: unknown): number | null {
