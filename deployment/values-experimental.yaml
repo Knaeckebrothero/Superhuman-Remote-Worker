@@ -129,16 +129,18 @@ ingress:
 #
 # The proxied `*.srwcanvas.works` DNS record and Cloudflare Universal SSL
 # certificate are live, but no Canvas gateway route is published behind them;
-# unmatched UUID hosts intentionally return the edge's 404. Do not enable either
-# gate or assert either verification flag yet. The exact `srwcanvas.works`
-# private PSL rule has not propagated, and the current Cloudflare Tunnel
-# normalizes some request paths before the gateway. Universal SSL therefore is
-# not a production-edge acceptance claim for the current raw-path contract. A
-# dedicated DNS-only/L4/Canvas-edge route is staged in the HomeLab repository,
-# but it must not receive public DNS until its external relay and acceptance
-# checks exist. The production browser matrix remains a launch gate. The
-# gateway-specific database identity/config boundary is implemented; the named
-# restricted-role Secret is still provisioned out of band before enablement.
+# unmatched UUID hosts intentionally return the edge's 404. Do not enable the
+# gates or assert the PSL flag yet: the exact `srwcanvas.works` private PSL
+# rule has not propagated, and the production browser matrix remains a launch
+# gate. Transport decision (2026-07-14, docs/issues/
+# canvas_hosted_edge_use_cloudflare_tunnel.md): the wildcard rides the
+# existing Cloudflare Tunnel to the gateway Service — Cloudflare's
+# adjacent-slash normalization is an accepted, documented property of this
+# edge, not a launch blocker. The former DNS-only/VPS/WireGuard/NGINX
+# canvas-edge route is scrapped (HomeLab archive branch `canvas-edge-archive`).
+# The gateway-specific database identity/config boundary is implemented. The
+# Vault path may be declared while dark, but the chart does not render its
+# ExternalSecret or contact the provider until viewer.enabled=true.
 canvas:
   livePreview:
     enabled: false
@@ -151,13 +153,13 @@ canvas:
       hostSuffix: ".srwcanvas.works"
       cockpitOrigins:
         - "https://cockpit.srw.works"
-      rawPathVerified: false
       pslBoundaryVerified: false
       database:
         username: "srw_canvas_gateway"
         credentials:
           create: false
-          existingSecret: "srw-canvas-gateway-db"
+          existingSecret: ""
+          vaultPath: "homelab/superhuman-remote-worker/canvas-gateway-db"
           usernameKey: "username"
           passwordKey: "password"
         provisionRole: false
@@ -165,16 +167,16 @@ canvas:
           min: 1
           max: 4
       networkPolicy:
-        # The selected edge is a dedicated NGINX boundary reached only through
-        # a DNS-only, TCP-preserving relay. These selectors are inert while the
-        # viewer is disabled; rawPathVerified and pslBoundaryVerified stay false
+        # The edge is the existing Cloudflare Tunnel connector: only the
+        # cloudflared pods may reach the gateway on TCP/8086. Selectors are
+        # inert while the viewer is disabled; pslBoundaryVerified stays false
         # until the public black-box gates pass.
         edgeNamespaceSelector:
           matchLabels:
-            srw.io/canvas-edge: "true"
+            kubernetes.io/metadata.name: cloudflare-tunnel
         edgePodSelector:
           matchLabels:
-            srw.io/component: canvas-edge
+            app: cloudflared
         extraEgress: []
 # -----------------------------------------------------------------------------
 # Admin UIs

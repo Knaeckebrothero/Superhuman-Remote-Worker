@@ -20,8 +20,8 @@ spec:
   policyTypes:
     - Ingress
     - Egress
-  # Operator-owned wildcard edge. The chart still creates no Ingress/TLS
-  # resource; these required selectors open only its existing edge pods.
+  # Whatever fronts the gateway (cloudflared, ingress-controller pods, or a
+  # dedicated edge). The required selectors open only that source on 8086.
   ingress:
     - from:
         - namespaceSelector:

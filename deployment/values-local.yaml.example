@@ -201,7 +201,6 @@ canvas:
       domain: ""
       hostSuffix: ""
       cockpitOrigins: []
-      rawPathVerified: false
       pslBoundaryVerified: false
       database:
         username: "srw_canvas_gateway"
@@ -210,6 +209,7 @@ canvas:
           # viewer may set create=true together with provisionRole=true.
           create: false
           existingSecret: ""
+          vaultPath: ""
           usernameKey: "username"
           passwordKey: "password"
         provisionRole: false
