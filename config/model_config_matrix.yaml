@@ -102,9 +102,21 @@ minimax:
 # API (LangChain ChatOpenAI), so tool calls use standard parens-form
 # serialization and `default.yaml` guardrails apply.
 minimax-m3:
-  # M3 has an optional thinking toggle; rely on endpoint default for now.
-  # Candidate for binary_toggle in a later pass (verify the vLLM kwarg first).
-  reasoning: { method: none }
+  # M3 thinking toggle on the NATIVE MiniMax API (the current transport):
+  # `thinking: {"type": enabled|adaptive|disabled}` on the OpenAI-compat wire
+  # (platform.minimax.io OpenAI-SDK reference). `adaptive` ≈ enabled on M3
+  # today, so we expose on/off only. Default "on" is sent explicitly (gemma
+  # precedent — robust against upstream default flips). NOTE: if an M3 row is
+  # ever served from self-hosted vLLM instead, the kwarg differs
+  # (chat_template_kwargs — verify the parser) and OpenRouter can't express
+  # this at all (effort ignored, enabled:false 400s → its factory injects
+  # nothing, provider default applies).
+  reasoning:
+    method: binary_toggle
+    default: "on"
+    options: ["on", "off"]
+    toggle_param: thinking.type
+    toggle_map: { "on": "enabled", "off": "disabled" }
   prompts:
     systemprompt: systemprompt_minimax_m3.txt
     persona: persona_minimax_m3.txt

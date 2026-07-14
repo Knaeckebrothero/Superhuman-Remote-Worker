@@ -794,6 +794,56 @@ class TestFamilyCenteredReasoning:
         assert call_kwargs["extra_body"]["reasoning"] == {"effort": "xhigh"}
 
 
+class TestMinimaxM3ThinkingToggle:
+    """minimax-m3 (binary_toggle) drives the native MiniMax API's
+    ``thinking: {"type": enabled|disabled}`` — the control OpenRouter couldn't
+    express (effort ignored, enabled:false 400s), now reachable since M3 runs
+    against the MiniMax API directly."""
+
+    def test_capability_is_binary_toggle(self):
+        cap = reasoning_capability("MiniMax-M3")
+        assert cap["method"] == "binary_toggle"
+        assert cap["default"] == "on"
+        assert cap["options"] == ["on", "off"]
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_default_sends_thinking_enabled(self, mock_chat):
+        """Unset level → family default ON → explicit thinking.type=enabled,
+        robust against an upstream endpoint-default flip (gemma precedent)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="MiniMax-M3")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+        assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_off_sends_thinking_disabled(self, mock_chat):
+        """'off' (the cockpit option) → thinking.type=disabled (M3 supports it)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="MiniMax-M3", reasoning_level="off")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_toggle_coexists_with_declared_extra_body(self, mock_chat):
+        """The family's declared reasoning_split must survive alongside the
+        toggle — different extra_body keys, deep-merged."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="MiniMax-M3", extra_body={"reasoning_split": True})
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+        assert call_kwargs["extra_body"]["reasoning_split"] is True
+
+
 # =============================================================================
 # Declared provider params (config.extra_body → request extra_body)
 # =============================================================================
