@@ -3,11 +3,20 @@
 {{- $database := $viewer.database -}}
 {{- $credentials := $database.credentials -}}
 {{- $hasExistingSecret := ne (trim $credentials.existingSecret) "" -}}
+{{- $vaultPath := trim $credentials.vaultPath -}}
+{{- $hasVaultPath := ne $vaultPath "" -}}
+{{- $validCredentialSource := or
+      (and $credentials.create (not $hasExistingSecret) (not $hasVaultPath))
+      (and (not $credentials.create) $hasExistingSecret (not $hasVaultPath))
+      (and (not $credentials.create) (not $hasExistingSecret) $hasVaultPath) -}}
 {{- if not .Values.databases.postgres.enabled -}}
 {{- fail "canvas.livePreview.viewer.enabled requires databases.postgres.enabled=true" -}}
 {{- end -}}
-{{- if eq $credentials.create $hasExistingSecret -}}
-{{- fail "enabled Canvas viewer database credentials require exactly one of credentials.create=true or credentials.existingSecret" -}}
+{{- if not $validCredentialSource -}}
+{{- fail "enabled Canvas viewer database credentials require exactly one of credentials.create=true, credentials.existingSecret, or credentials.vaultPath" -}}
+{{- end -}}
+{{- if and $hasVaultPath (not .Values.externalSecrets.enabled) -}}
+{{- fail "canvas.livePreview.viewer.database.credentials.vaultPath requires externalSecrets.enabled=true when the Canvas viewer is enabled" -}}
 {{- end -}}
 {{- if eq $credentials.usernameKey $credentials.passwordKey -}}
 {{- fail "canvas.livePreview.viewer.database credential usernameKey and passwordKey must differ" -}}
@@ -24,16 +33,13 @@
 {{- if and $database.provisionRole (not .Values.databases.postgres.internal) -}}
 {{- fail "Canvas database role provisioning is supported only for chart-owned internal Postgres" -}}
 {{- end -}}
-{{- if and (eq $viewer.deploymentProfile "production") (or $credentials.create $database.provisionRole (not $hasExistingSecret)) -}}
-{{- fail "production Canvas viewers require an operator-provisioned role in database.credentials.existingSecret" -}}
+{{- if and (eq $viewer.deploymentProfile "production") (or $credentials.create $database.provisionRole) -}}
+{{- fail "production Canvas viewers require operator-provisioned credentials through database.credentials.existingSecret or database.credentials.vaultPath" -}}
 {{- end -}}
 {{- if and (eq $viewer.deploymentProfile "production") (eq $credentials.existingSecret (include "srw.secretName" .)) -}}
 {{- fail "production Canvas viewer database credentials must use a dedicated Secret, not the shared application Secret" -}}
 {{- end -}}
-{{- $databaseSecretName := $credentials.existingSecret -}}
-{{- if $credentials.create -}}
-{{- $databaseSecretName = printf "%s-canvas-gateway-db" (include "srw.fullname" .) -}}
-{{- end -}}
+{{- $databaseSecretName := include "srw.canvasGatewayDatabaseSecretName" . -}}
 {{- if not .Values.canvas.livePreview.enabled -}}
 {{- fail "canvas.livePreview.viewer.enabled requires canvas.livePreview.enabled=true" -}}
 {{- end -}}

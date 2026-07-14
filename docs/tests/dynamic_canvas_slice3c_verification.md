@@ -26,7 +26,8 @@ does not enable the viewer or claim production-browser/edge acceptance.
 - chart-owned development Postgres can reconcile the fixed restricted role
   without placing its administrator password in gateway argv, logs, or pod
   environment. Production and external Postgres require an operator-managed
-  role and existing dedicated Secret.
+  role and dedicated credentials supplied through either an existing Secret or
+  the feature-gated Vault/ESO path.
 
 ## Delivered surfaces
 
@@ -44,10 +45,13 @@ does not enable the viewer or claim production-browser/edge acceptance.
 
 ## Credential and grant contract
 
-Production viewers must set
-`canvas.livePreview.viewer.database.credentials.existingSecret` to a Secret
-separate from the main SRW application Secret. Chart-created credentials and
-automatic role provisioning are rejected under the production profile.
+Production viewers must select exactly one operator-managed credential source:
+`canvas.livePreview.viewer.database.credentials.existingSecret` names a Secret
+separate from the main SRW application Secret, while `credentials.vaultPath`
+asks the chart to map only `username` and `password` into a dedicated Secret
+through ESO. That ExternalSecret shares the viewer lifecycle and is absent while
+the viewer is disabled. Chart-created credentials and automatic role
+provisioning are rejected under the production profile.
 The operator workflow now has an explicit read-only preflight and opt-in
 database-only or database-plus-Secret apply path. It requires explicit
 database and Kubernetes targets, reads the restricted password from a private

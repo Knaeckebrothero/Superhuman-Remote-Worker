@@ -231,13 +231,17 @@ from `databases.<which>.externalHost/externalPort/externalDb` in values;
 only the credentials live in Vault.
 
 An enabled Dynamic Canvas viewer uses a separate PostgreSQL login and never
-receives the application `POSTGRES_*` credential. Production requires
-`canvas.livePreview.viewer.database.credentials.existingSecret` to name a
-dedicated Secret with the configured `usernameKey` and `passwordKey`; provision
-that role with only the documented Canvas viewer grants. For development with
-the bundled database, `credentials.create=true` plus `provisionRole=true`
-generates a dedicated Secret and runs the bounded role reconciler. That mode is
-rejected for a production viewer.
+receives the application `POSTGRES_*` credential. Production accepts either a
+pre-created dedicated Secret named by
+`canvas.livePreview.viewer.database.credentials.existingSecret`, or a dedicated
+Vault KV path in `credentials.vaultPath` that the chart maps into such a Secret
+through ESO. The Vault-backed ExternalSecret is rendered only while
+`viewer.enabled=true`; preconfiguring the path while the gateway is disabled
+does not contact the provider or require the properties to exist. Pick exactly
+one source and provision that role with only the documented Canvas viewer
+grants. For development with the bundled database, `credentials.create=true`
+plus `provisionRole=true` generates a dedicated Secret and runs the bounded
+role reconciler. That mode is rejected for a production viewer.
 The secret-safe production workflow, preflight, direct-Secret option, and
 rotation cautions are documented in
 `docs/operations/dynamic_canvas_gateway_database.md`.
