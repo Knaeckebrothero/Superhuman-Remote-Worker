@@ -2259,6 +2259,7 @@
       "subagent": "Subagent",
       "single": "Modell",
       "reasoning": "Reasoning",
+      "reasoningDefaultOption": "{{label}} (Standard)",
       "default": "Standard",
       "defaultResolved": "{{model}} ({{source}})",
       "defaultResolvedNoSource": "Standard · {{model}}",
