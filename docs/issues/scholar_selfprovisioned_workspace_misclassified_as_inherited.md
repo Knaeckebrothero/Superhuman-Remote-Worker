@@ -173,22 +173,194 @@ This is a regression window opened on **2026-07-10** by `5a6f5a49`; the
 critic subjobs that genuinely inherit a live parent workspace are unaffected
 (they legitimately have a parent workspace to wait on).
 
-## Fix options
+## Phase 0 — immediate hotfix (stop the bleeding)
+
+**Status: IMPLEMENTED on `develop` (TDD, uncommitted 2026-07-14).** Keeps today's
+two-pod design and just disambiguates. Low-risk, small diff, deterministic;
+shipped because real project jobs are stranding on the cluster.
 
 1. **Discriminate self-provisioned vs inherited** in
-   `_resolve_subjob_inherited_workspace`. Preferred: gate the inherit path on
-   `job.get("worktree_path")` (or a dedicated `context.inherit_workspace=True`
-   flag stamped at spawn in `_spawn_scholar_subjob`) rather than on the presence
-   of `context.workspace_container` / `context.vm`. A self-provisioned subjob
-   (`worktree_path is None`) must return `("proceed", …)` regardless of whether
-   its own workspace snapshot is present.
+   `_resolve_subjob_inherited_workspace` — gate the inherit path on a dedicated
+   `context.inherits_parent_workspace=True` flag rather than on the presence of
+   `context.workspace_container` / `context.vm`. A subjob with the flag absent
+   returns `("proceed", None)` **before** touching the parent, regardless of
+   whether its own workspace snapshot is present. (`worktree_path` is an existing
+   near-signal but is only set when Gitea is initialised, so it's a fragile
+   discriminator — the explicit flag is used instead.)
+   - The flag is stamped **at both spawn sites, only when the parent snapshot is
+     actually copied**: `_spawn_scholar_subjob` (`main.py:~10405`) and
+     `_trigger_verification_on_complete` (the critic, `main.py:~11192`).
+     ⚠️ Correction to the original plan: the critic did **not** set any implicit
+     flag — it copied `vm`/`workspace_container` by value exactly like the
+     scholar — so it had to be stamped too, or gating on the flag would make the
+     critic skip its stale-snapshot overlay (regressing
+     `subjob_inherits_stale_workspace_container_snapshot.md`). When the parent
+     has no workspace at scholar-spawn (the bug's trigger), nothing is copied, no
+     flag is set, and the self-provisioning scholar rides the normal path.
 2. **Route dispatch-path subjob failures through the unblock handler** so a
-   failed scholar (for any reason) flips its parent `waiting → created` instead
-   of stranding it. Call `_handle_scholar_completion` (or a shared unblock
-   helper) from the dispatcher `fail` branch at `main.py:~4695`.
+   failed subjob (for any reason) flips its held parent `waiting → created`
+   instead of stranding it. New helper `_fail_subjob_and_unblock_parent(job,
+   message)` (`main.py`, next to the resolver) marks the subjob failed, syncs
+   the in-memory `status`, then calls `_handle_scholar_completion` **and**
+   `_handle_delegation_child_completion` (each a no-op for the wrong subjob type)
+   — mirroring `complete_job`'s terminal-subjob unblock. The dispatcher `fail`
+   branch now calls this helper instead of a bare `update_job_status(..., failed)`.
 
 Both are needed: (1) stops the false failure; (2) is defense-in-depth so no
-future subjob-failure path can strand a parent.
+future subjob-failure path can strand a parent. Phase 0 does **not** change the
+resource model (still two sequential pods per job); Phase 1 does.
+
+**Tests (`tests/test_subjob_inherited_workspace.py`, 24 passing):** new
+`TestSelfProvisionedDiscrimination` (self-provisioned container/vm, flagless →
+`proceed` without consulting the parent) and `TestFailSubjobUnblocksParent`
+(failed scholar flips parent → `created`; non-scholar subjob failed without a
+spurious unblock). Existing inherit tests were migrated to carry the flag via an
+`_inherited(...)` helper, making the inherited-vs-self-provisioned distinction
+explicit in the fixtures.
+
+## Phase 1 — proper solution: one parent-owned workspace, shared across the whole job
+
+Phase 0 removes the *symptom*. Phase 1 removes the *ambiguity* by collapsing to a
+single workspace per job that every phase rides — treat the field as **the job's
+one workspace** that everyone checks before creating one.
+
+### Principle
+
+One workspace per root job, **owned by the parent** (`workspace-<parentid>`),
+used by every phase:
+
+| phase | relationship to the shared workspace | today |
+|---|---|---|
+| **scholar** (pre-agent research) | **rides it** (SSH + git worktree) | self-provisions its own throwaway pod ← the bug |
+| **parent agent** (main work) | runs on it | provisions its own |
+| **critic** (post-agent review) | rides it (SSH + git worktree) | already does this |
+
+The scholar becomes **symmetric to the critic** — a phase that rides the
+parent's pod, differing only in *when* (before vs after the parent's agent). This
+deletes the "inherited vs self-provisioned" distinction entirely: there is only
+"the parent's workspace." `_job_needs_sandbox` already returns `False` for any
+job that finds a `ready` workspace on its context (`main.py:3401`), and the
+dispatch injector already SSHes a subjob into the parent's host at its
+`worktree_path` (`main.py:2178`) — so **no second workspace pod is ever created**;
+the read-side machinery exists.
+
+### Two pods — don't conflate them
+
+Every running phase is **two** pods, managed by two provisioners:
+
+- **Agent pod** (`agent_provisioner`) — the LLM runtime + tunnel to the
+  workspace. **Ephemeral and already correct:** `reap_pods` deletes it
+  immediately on completion (`Succeeded/Failed → delete`), and it is only created
+  when a phase is dispatched. Agent pods therefore already cycle per phase
+  (scholar → parent → critic) and never sit idle — **Phase 1 changes nothing
+  here.**
+- **Workspace pod** (`container_provisioner`, `workspace-<id>`) — the SSH / code
+  workspace. **This is the pod Phase 1 makes persistent and parent-owned.**
+
+So "one persistent pod" means one persistent **workspace** pod, ridden by a
+*succession* of short-lived agent pods. The handoff is: the scholar's **agent
+pod is deleted** → the workspace pod momentarily has **no agent pod attached** →
+the parent's **agent pod is created** and connects to the same workspace pod.
+The window to protect from the reaper is exactly that no-agent-pod gap on the
+workspace pod — not the (already-correct, always-cycling) agent pods.
+
+### Who provisions the shared workspace, and when
+
+The parent is held in `waiting` at creation and provisions nothing, so the
+scholar (dispatched first) has nothing to ride. Two ways to fix that:
+
+- **(B) Parent provisions eagerly, then defers its agent.** Provision
+  `workspace-<parentid>` *before* the research wait, keep the parent's agent
+  unstarted, let the scholar ride it, start the parent agent only after research.
+  Cost: needs a **"provision workspace without dispatching the agent"** path —
+  provisioning is currently entangled with agent dispatch.
+
+- **(Hybrid A — recommended) The scholar provisions the shared workspace *under
+  the parent's identity* as part of its normal dispatch.** No new provision-only
+  path — the dispatcher already provisions on demand. The scholar's dispatch,
+  finding the parent's workspace empty, provisions **`workspace-<parentid>`**,
+  records it on the **parent's** context, does the git setup (below), and rides
+  it. The parent later inherits its own now-ready workspace. Race-free because
+  the parent stays held in `waiting` until the scholar completes, so exactly one
+  actor ever provisions.
+
+**Ownership is the crux — the pod must be keyed to the parent, not the scholar.**
+Teardown is keyed to the *owner*: `_archive_and_cleanup_workspace(owner_id)`
+fires at that owner's completion/cancel (`main.py:4007`, `7623`, `7762`). A pod
+owned by the scholar (`workspace-<scholarid>`, as today) is torn down the instant
+the scholar completes — the parent would inherit nothing. Keyed to the **parent**,
+scholar completion tears down *nothing* it owns, and the pod survives naturally
+into the parent and critic phases. This is what makes the hybrid safe.
+
+### Git / setup model (done by whoever provisions first — the scholar; not agent work)
+
+Workspace init is orchestrator/git work, not agent work, so the first phase to
+run performs it:
+
+1. clone/init the parent's Gitea repo; ensure **`main`** carries the parent job's
+   **initial content** (kickoff message / document);
+2. branch the scholar's worktree off `main`
+   (`worktree_path=/home/agent-host/workspace/worktrees/<id>-scholar`);
+3. scholar writes findings to `research/`, commits on its branch;
+4. on scholar completion, **merge `research/` → `main` locally on the shared pod**
+   — the current cross-repo graft becomes a local merge, no Gitea round-trip;
+5. the parent inherits the pod, works on `main` with research already present,
+   and starts its agent.
+
+Note: the shared workspace's **backend = the parent's backend**. A VM-backed
+parent means research runs on the VM (the scholar conforms to the parent's
+config); there is no separate light research container.
+
+### Reaper / lifecycle (the missing guard — also fixes the critic bug)
+
+This concerns the **workspace pod** teardown, not the agent-pod reaper (which is
+already liveness-based — heartbeat/phase/tunnel). Confirmed against the code: the
+workspace pod is released by `_archive_and_cleanup_workspace(owner_id)`, keyed to
+the **owner job's lifecycle**, with **no "is an agent pod attached" guard** (no
+in-use guards exist in `main.py`). That is exactly the existing
+**critic-reaps-parent** hazard (`critic_failure_leaves_parent_job_stuck_reviewing.md`):
+the workspace pod is torn down on the owner's *status* while a subjob's agent pod
+is still attached to it. The fix is shared with that bug:
+
+1. **Tear the workspace pod down by agent-pod liveness, not owner status.** Never
+   release a workspace pod that has a **live agent pod attached — scholar, parent
+   or critic.** One rule serves both this feature and the critic-reaps-parent bug.
+2. **Protect the handoff gap.** There is a window where the workspace pod has *no*
+   agent pod attached — the scholar's agent pod is deleted, then the parent's
+   agent pod is created and reconnects. Guard it with a short grace period and/or
+   an explicit **`reserved-for:<parentid>` lease** so the reaper can't grab the
+   workspace pod in that gap; clear the lease when the next agent pod attaches (or
+   at final teardown).
+3. **One persistent workspace pod across scholar → parent → critic.** Do **not**
+   release/reprovision the *workspace* pod between phases — that reintroduces a
+   second workspace pod and defeats the model. (Agent pods, by contrast, are
+   *meant* to cycle per phase; only the workspace pod persists.)
+
+### What Phase 1 dissolves
+
+- the **misclassification** — gone by construction (no self-provisioned scholar
+  workspace to misread);
+- the **stranded parent on scholar failure** — gone: the parent already owns a
+  ready workspace, so a failed scholar just means "start the parent agent now"
+  (the Phase 0 unblock becomes a non-event);
+- the **critic-reaps-parent** bug — folded into the reaper hardening.
+
+### Open questions for detailed design
+
+- **Atomic provision-under-parent** — the scholar's dispatch provisions
+  `workspace-<parentid>` and records it on the parent atomically, so if the
+  `waiting` hold is ever relaxed there's still no check-then-create double
+  provision (DB compare-and-set on `parent.context.workspace_container`).
+- **Handoff-protection mechanism** — grace-period vs. explicit lease; TTL; who
+  clears it; crash-safety (scholar dies mid-handoff).
+- **Backend conformance** — is running research on a (possibly heavy / VM) parent
+  workspace acceptable in every tier, or is there a case that needs an isolated /
+  cheap research env (which would argue for keeping two pods)?
+- **Metering & snapshots** — `workspace_metering` and S3 snapshot/suspend key off
+  the owner; confirm single parent-ownership across phases doesn't double-count
+  or mis-attribute the research phase.
+- **Lite / virtual tiers** — jobs with `backend ∈ LITE_BACKENDS` have no pod at
+  all; the scholar handoff must no-op there.
 
 ## Repro
 
@@ -203,6 +375,9 @@ pre-existing workspace (the normal case). The scholar self-provisions, then fail
 - `orchestrator/main.py:~4677` — dispatcher call site + `fail` branch (`~4695`)
 - `orchestrator/main.py:10336` — `_spawn_scholar_subjob` (root-job pre-research spawn; `waiting` hold; inherit-copy; `worktree_path`)
 - `orchestrator/main.py:10503` — `_handle_scholar_completion` (parent unblock, incl. `is_failure`)
+- `orchestrator/main.py:3401` — `_job_needs_sandbox` (returns `False` when a `ready` parent workspace is on context → **no second pod**; the shared-pod read-side)
+- `orchestrator/main.py:2178` — dispatch injector (`remote["workspace_path"] = worktree_path`; SSH host = parent's pod — proves inherit = shared pod, not clone)
+- `orchestrator/main.py:4007` — `_archive_and_cleanup_workspace(owner_id)` (teardown keyed to owner-job lifecycle; **no agent-liveness guard** — the reaper gap Phase 1 closes)
 - `orchestrator/database/postgres.py:3385` — `get_dispatchable_jobs` (`status IN ('created','paused')`)
 - Sibling: `docs/issues/subjob_inherits_stale_workspace_container_snapshot.md`
-- Sibling pattern (failed subjob strands parent): `docs/issues/critic_failure_leaves_parent_job_stuck_reviewing.md`
+- Sibling pattern (failed subjob strands parent / reaper reaps pod under live subjob): `docs/issues/critic_failure_leaves_parent_job_stuck_reviewing.md`

@@ -3482,10 +3482,23 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
         except (json.JSONDecodeError, ValueError):
             return ("proceed", None)
 
+    # Discriminate INHERITED from SELF-PROVISIONED. Both eventually carry a
+    # workspace_container/vm on their context — an inheriting subjob copies its
+    # parent's at spawn; a self-provisioned subjob (parent had no workspace when
+    # it was spawned) writes its OWN once its pod comes up. Only true inheritors
+    # carry the explicit inherits_parent_workspace flag, stamped by
+    # _spawn_scholar_subjob / _trigger_verification_on_complete when they copy the
+    # parent snapshot. Gating on key *presence* (as this once did) misread a
+    # self-provisioned scholar as inheriting and waited the full budget on a
+    # parent workspace that never exists, then failed. See
+    # docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
+    if not ctx.get("inherits_parent_workspace"):
+        return ("proceed", None)
+
     own_container = ctx.get("workspace_container") or {}
     own_vm = ctx.get("vm") or {}
-    # Only subjobs that inherited a shared workspace carry these keys. Lite /
-    # own-provisioned subjobs don't — leave them to the normal path.
+    # Flag set but the copied snapshot hasn't landed on context yet — nothing to
+    # resolve this tick; the branches below key off which backend was inherited.
     if not own_container and not own_vm:
         return ("proceed", None)
 
@@ -3579,6 +3592,43 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
             ),
         )
     return ("wait", None)
+
+
+async def _fail_subjob_and_unblock_parent(job: dict, message: str) -> None:
+    """Fail a subjob at dispatch time AND unblock the parent it was holding.
+
+    The dispatcher can decide a subjob will never run (e.g. it cannot inherit its
+    parent's workspace). Marking it ``failed`` is not enough: a parent held in
+    ``waiting`` by ``_spawn_scholar_subjob`` — or a delegation parent — is only
+    transitioned back to ``created`` by the completion-side unblock handlers,
+    which run inside ``complete_job``, a path a dispatch-time failure never
+    reaches. Without this the parent strands in ``waiting`` forever (secondary
+    bug in
+    docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md).
+    Mirror ``complete_job``'s terminal-subjob unblock here so any dispatch-path
+    failure is self-healing, not just today's inherit-timeout.
+    """
+    job_id = str(job["id"])
+    await postgres_db.update_job_status(
+        job_id, status="failed", error_message=message
+    )
+    # The unblock handlers classify the outcome from job['status']; the in-memory
+    # row still holds the pre-fail status, so sync it before delegating. Each
+    # handler is a no-op for the wrong subjob type (scholar_target / creation_order
+    # guards), so calling both is safe.
+    job["status"] = "failed"
+    for handler in (_handle_scholar_completion, _handle_delegation_child_completion):
+        try:
+            await handler(job, [])
+        except Exception as e:
+            logger.error(
+                "Dispatcher: subjob %s failed but could not unblock its parent "
+                "via %s: %s",
+                job_id,
+                handler.__name__,
+                e,
+                exc_info=True,
+            )
 
 
 def _apply_sticky_sudo_denial(job: dict, config_override: dict | None) -> dict | None:
@@ -4676,9 +4726,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         job_id,
                         inherit_msg,
                     )
-                    await postgres_db.update_job_status(
-                        job_id, status="failed", error_message=inherit_msg
-                    )
+                    await _fail_subjob_and_unblock_parent(job, inherit_msg)
                     continue
 
                 if _job_needs_vm(job):
@@ -10524,10 +10572,17 @@ async def _spawn_scholar_subjob(
             parent_ctx = json.loads(parent_ctx)
         except (json.JSONDecodeError, ValueError):
             parent_ctx = {}
+    # Stamp the explicit inherit flag ONLY when we actually copy the parent's
+    # workspace. When the parent has none yet (idle cluster) the scholar copies
+    # nothing, self-provisions its own pod, and MUST NOT be treated as inheriting
+    # by _resolve_subjob_inherited_workspace — else it strands both itself and the
+    # parent. See docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md.
     if parent_ctx.get("vm"):
         scholar_context["vm"] = parent_ctx["vm"]
+        scholar_context["inherits_parent_workspace"] = True
     elif parent_ctx.get("workspace_container"):
         scholar_context["workspace_container"] = parent_ctx["workspace_container"]
+        scholar_context["inherits_parent_workspace"] = True
 
     # Disable nested subjob spawning on the scholar
     scholar_override: dict[str, Any] = {
@@ -11311,10 +11366,17 @@ async def _trigger_verification_on_complete(
                 parent_ctx = json.loads(parent_ctx)
             except (json.JSONDecodeError, ValueError):
                 parent_ctx = {}
+        # A critic is spawned after the parent completes, so the parent's
+        # workspace is ready and always inherited here. Stamp the explicit flag
+        # (same discriminator the scholar uses) so the dispatch-time resolver
+        # overlays the parent's LIVE workspace instead of skipping it — the flag,
+        # not key presence, now gates the inherit path.
         if parent_ctx.get("vm"):
             context["vm"] = parent_ctx["vm"]
+            context["inherits_parent_workspace"] = True
         elif parent_ctx.get("workspace_container"):
             context["workspace_container"] = parent_ctx["workspace_container"]
+            context["inherits_parent_workspace"] = True
 
         config_override = {
             "autonomy": "full",
