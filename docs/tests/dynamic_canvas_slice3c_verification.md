@@ -36,6 +36,7 @@ does not enable the viewer or claim production-browser/edge acceptance.
 | Lazy startup and minimal thread workspace-binding query | `orchestrator/canvas_gateway.py` |
 | Explicit origin-session reads | `orchestrator/services/canvas_viewer_sessions.py` |
 | Reusable role/grant reconciler | `helm/files/canvas-viewer-role.sql` |
+| Secret-safe production operator workflow | `scripts/provision-canvas-gateway-database.sh`, `docs/operations/dynamic_canvas_gateway_database.md` |
 | Dedicated ConfigMap, credential Secret, bounded role Job and NetworkPolicy | `helm/templates/canvas-gateway/` |
 | Profiled Compose role reconciler and dedicated gateway variables | `docker-compose.yaml`, `docker-compose.local.yaml` |
 | Production/development value contract | `helm/values.yaml`, `helm/values.schema.json` |
@@ -47,6 +48,11 @@ Production viewers must set
 `canvas.livePreview.viewer.database.credentials.existingSecret` to a Secret
 separate from the main SRW application Secret. Chart-created credentials and
 automatic role provisioning are rejected under the production profile.
+The operator workflow now has an explicit read-only preflight and opt-in
+database-only or database-plus-Secret apply path. It requires explicit
+database and Kubernetes targets, reads the restricted password from a private
+file, passes Secret content through private files and a pipe, and prints no
+credential values. Helm still receives no administrator credential.
 
 Development with chart-owned Postgres may instead set
 `credentials.create=true` and `provisionRole=true`. The generated password is
@@ -71,7 +77,10 @@ The resulting role receives:
 It receives no application-schema `CREATE`, DELETE, TRUNCATE, TRIGGER,
 sequence, unrelated-relation, credential/token-column, or authoritative-state
 mutation privilege. The reconciler refuses elevated/member/owner roles and an
-installation where PUBLIC still grants `CREATE` on schema `public`.
+installation where PUBLIC still grants `CREATE` on schema `public` or on the
+application database. It now removes stale direct database grants before
+restoring only `CONNECT`; PostgreSQL's default PUBLIC `TEMPORARY` capability
+remains outside the application-schema contract.
 
 ## Verification
 
@@ -96,6 +105,15 @@ installation where PUBLIC still grants `CREATE` on schema `public`.
   render still contains no gateway resources.
 - **Static:** focused Ruff lint/format, JSON/YAML parsing, and `git diff --check`
   passed.
+
+The production operator workflow and direct-Secret helper are repository
+implemented. Both its database-only and database-plus-Secret paths were
+exercised against the migrated local k3d PostgreSQL instance using a disposable
+role and dedicated two-key Secret; verification passed and both objects were
+removed afterward. It has not been run against an external production database
+or cluster. Current local k3d remains deliberately dark and contains neither
+the restricted role nor its Secret; its development-only chart-managed path is
+covered separately by Helm rendering tests.
 
 ## Remaining launch boundary
 

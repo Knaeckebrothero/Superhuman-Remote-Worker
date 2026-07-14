@@ -139,6 +139,32 @@ async def test_restricted_gateway_role_script_and_runtime_attestation() -> None:
         )
         assert result.returncode == 0, result.stderr
 
+        # Reconciliation must also remove a stale direct database CREATE grant
+        # from a previous/operator-created contract before restoring CONNECT.
+        database_identifier = await admin.fetchval(
+            "SELECT quote_ident(current_database())"
+        )
+        await admin.execute(
+            f"GRANT CREATE ON DATABASE {database_identifier} TO {_GATEWAY_ROLE}"
+        )
+        result = subprocess.run(
+            [
+                "psql",
+                _DATABASE_URL,
+                "--no-psqlrc",
+                "--quiet",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--file",
+                str(_ROOT / "helm/files/canvas-viewer-role.sql"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        assert result.returncode == 0, result.stderr
+
         await admin.execute(f"SET ROLE {_GATEWAY_ROLE}")
         try:
             with pytest.raises(
