@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from urllib.parse import parse_qs, urlsplit
+from pathlib import Path
+import subprocess
+from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -19,6 +21,10 @@ import pytest
 from services.canvas import CanvasService, WorkspaceAppSource
 from services.canvas_ssh import RemoteWorkspaceTarget
 from services.canvas_viewer_config import CanvasViewerConfig
+from services.canvas_viewer_database import (
+    CanvasViewerDatabasePrivilegeError,
+    attest_canvas_viewer_database_privileges,
+)
 from services.canvas_viewer_sessions import (
     CanvasBootstrapExchange,
     CanvasViewerError,
@@ -28,6 +34,9 @@ import services.canvas_viewer_sessions as viewer_sessions_module
 
 
 _DATABASE_URL = os.getenv("CANVAS_TEST_DATABASE_URL", "").strip()
+_ROOT = Path(__file__).resolve().parents[1]
+_GATEWAY_ROLE = "srw_canvas_gateway_ci"
+_GATEWAY_PASSWORD = "canvas_gateway_ci_password_123"
 pytestmark = [
     pytest.mark.asyncio,
     pytest.mark.skipif(
@@ -59,10 +68,107 @@ def _config() -> CanvasViewerConfig:
     )
 
 
-def _bootstrap_token(url: str) -> str:
-    values = parse_qs(urlsplit(url).query).get("token") or []
-    assert len(values) == 1
-    return values[0]
+def _bootstrap_attachment_id(url: str, *, expected_origin: str) -> UUID:
+    """Assert the bootstrap URL contains only its non-credential locator."""
+
+    parsed = urlsplit(url)
+    assert f"{parsed.scheme}://{parsed.netloc}" == expected_origin
+    assert parsed.path == "/_canvas/bootstrap"
+    assert parsed.fragment == ""
+    assert parsed.username is None
+    assert parsed.password is None
+    values = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    assert set(values) == {"attachment_id"}
+    assert len(values["attachment_id"]) == 1
+    attachment_id = UUID(values["attachment_id"][0])
+    assert str(attachment_id) == values["attachment_id"][0]
+    assert parsed.query == f"attachment_id={attachment_id}"
+    assert "token" not in parsed.query
+    return attachment_id
+
+
+def _role_database_url() -> str:
+    parsed = urlsplit(_DATABASE_URL)
+    hostname = parsed.hostname or ""
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    if parsed.port is not None:
+        hostname = f"{hostname}:{parsed.port}"
+    netloc = f"{quote(_GATEWAY_ROLE, safe='')}:{quote(_GATEWAY_PASSWORD, safe='')}@{hostname}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
+
+
+async def _drop_gateway_test_role(conn: asyncpg.Connection) -> None:
+    exists = await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)",
+        _GATEWAY_ROLE,
+    )
+    if exists:
+        # The role name is a fixed test constant, never user input.
+        await conn.execute(f"DROP OWNED BY {_GATEWAY_ROLE}")
+        await conn.execute(f"DROP ROLE {_GATEWAY_ROLE}")
+
+
+async def test_restricted_gateway_role_script_and_runtime_attestation() -> None:
+    """Exercise the packaged grants and prove representative denials."""
+
+    admin = await asyncpg.connect(_DATABASE_URL)
+    restricted: asyncpg.Connection | None = None
+    try:
+        await _drop_gateway_test_role(admin)
+        environment = {
+            **os.environ,
+            "CANVAS_VIEWER_POSTGRES_USER": _GATEWAY_ROLE,
+            "CANVAS_VIEWER_POSTGRES_PASSWORD": _GATEWAY_PASSWORD,
+        }
+        result = subprocess.run(
+            [
+                "psql",
+                _DATABASE_URL,
+                "--no-psqlrc",
+                "--quiet",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--file",
+                str(_ROOT / "helm/files/canvas-viewer-role.sql"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        assert result.returncode == 0, result.stderr
+
+        await admin.execute(f"SET ROLE {_GATEWAY_ROLE}")
+        try:
+            with pytest.raises(
+                CanvasViewerDatabasePrivilegeError,
+                match="authenticated session role differs",
+            ):
+                await attest_canvas_viewer_database_privileges(admin)
+        finally:
+            await admin.execute("RESET ROLE")
+
+        restricted = await asyncpg.connect(_role_database_url())
+        await attest_canvas_viewer_database_privileges(restricted)
+        await restricted.fetchval("SELECT metadata FROM threads LIMIT 1")
+
+        forbidden_statements = (
+            "SELECT access_token FROM srw_sessions LIMIT 1",
+            "SELECT * FROM user_api_keys LIMIT 1",
+            "UPDATE canvases SET updated_at = updated_at WHERE false",
+            "DELETE FROM canvas_origin_sessions WHERE false",
+            "SELECT nextval('thread_messages_seq_seq')",
+            "CREATE TABLE public.canvas_gateway_forbidden(id integer)",
+        )
+        for statement in forbidden_statements:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await restricted.execute(statement)
+    finally:
+        if restricted is not None:
+            await restricted.close()
+        await _drop_gateway_test_role(admin)
+        await admin.close()
 
 
 async def test_postgres_viewer_lifecycle_concurrency_reuse_and_revocation(
@@ -76,6 +182,7 @@ async def test_postgres_viewer_lifecycle_concurrency_reuse_and_revocation(
     user_id = uuid4()
     thread_id = uuid4()
     parent_id = uuid4()
+    other_parent_id = uuid4()
     workspace_generation = uuid4()
     origin_generation = uuid4()
     listener = None
@@ -109,13 +216,18 @@ async def test_postgres_viewer_lifecycle_concurrency_reuse_and_revocation(
                     id, user_id, kc_sub, access_token, refresh_token, id_token,
                     access_expires_at, absolute_expires_at
                 ) VALUES (
-                    $1, $2, $3, 'access', 'refresh', 'identity',
+                    $1, $3, $4, 'access', 'refresh', 'identity',
+                    now() + interval '30 minutes', now() + interval '2 hours'
+                ), (
+                    $2, $3, $5, 'access', 'refresh', 'identity',
                     now() + interval '30 minutes', now() + interval '2 hours'
                 )
                 """,
                 parent_id,
+                other_parent_id,
                 user_id,
                 f"canvas-integration-{user_id}",
+                f"canvas-integration-other-{user_id}",
             )
             await conn.execute(
                 """
@@ -140,19 +252,71 @@ async def test_postgres_viewer_lifecycle_concurrency_reuse_and_revocation(
             embedding_origin="https://cockpit.platform.test",
             expected_record=record,
         )
-        token = _bootstrap_token(first_grant.bootstrap_url)
+        assert (
+            _bootstrap_attachment_id(
+                first_grant.bootstrap_url, expected_origin=first_grant.origin
+            )
+            == first_grant.attachment_id
+        )
+        assert first_grant.bootstrap_expires_at < first_grant.expires_at
+        first_start = await first_replica.begin_bootstrap(
+            attachment_id=first_grant.attachment_id,
+            host_generation=origin_generation,
+        )
 
-        # Two replicas race the same one-time credential. PostgreSQL's locked
-        # consumed-at transition admits exactly one and the loser observes the
+        # Authorization is bound to the exact parent BFF session, user, and
+        # thread. Failed probes must leave the one-time challenge available to
+        # its rightful parent.
+        for overrides, expected_status in (
+            ({"parent_session_id": other_parent_id}, 403),
+            ({"user_id": str(uuid4())}, 401),
+            ({"thread_id": str(uuid4())}, 403),
+        ):
+            authorize_args = {
+                "attachment_id": first_grant.attachment_id,
+                "user_id": str(user_id),
+                "thread_id": str(thread_id),
+                "parent_session_id": parent_id,
+                "embedding_origin": "https://cockpit.platform.test",
+                "challenge": first_start.challenge,
+                "ready_receipt": first_start.ready_receipt,
+                "bridge_nonce": first_grant.bridge_nonce,
+                **overrides,
+            }
+            with pytest.raises(CanvasViewerError) as forbidden:
+                await second_replica.authorize_bootstrap(**authorize_args)
+            assert forbidden.value.status_code == expected_status
+
+        first_authorization = await first_replica.authorize_bootstrap(
+            attachment_id=first_grant.attachment_id,
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            parent_session_id=parent_id,
+            embedding_origin="https://cockpit.platform.test",
+            challenge=first_start.challenge,
+            ready_receipt=first_start.ready_receipt,
+            bridge_nonce=first_grant.bridge_nonce,
+        )
+        assert first_authorization.challenge == first_start.challenge
+        assert first_authorization.ready_receipt == first_start.ready_receipt
+
+        # Two replicas race the same browser-bound exchange. PostgreSQL's
+        # locked consumed-at transition admits exactly one; the loser observes
         # committed state rather than creating a second origin session.
         raced = await asyncio.gather(
-            first_replica.consume_bootstrap(
-                token=token,
+            first_replica.exchange_bootstrap(
+                attachment_id=first_grant.attachment_id,
+                challenge=first_start.challenge,
+                exchange_code=first_authorization.exchange_code,
+                browser_binding=first_start.browser_binding,
                 host_generation=origin_generation,
                 existing_session_secret=None,
             ),
-            second_replica.consume_bootstrap(
-                token=token,
+            second_replica.exchange_bootstrap(
+                attachment_id=first_grant.attachment_id,
+                challenge=first_start.challenge,
+                exchange_code=first_authorization.exchange_code,
+                browser_binding=first_start.browser_binding,
                 host_generation=origin_generation,
                 existing_session_secret=None,
             ),
@@ -196,8 +360,31 @@ async def test_postgres_viewer_lifecycle_concurrency_reuse_and_revocation(
             embedding_origin="https://cockpit.platform.test",
             expected_record=record,
         )
-        reused = await first_replica.consume_bootstrap(
-            token=_bootstrap_token(second_grant.bootstrap_url),
+        assert (
+            _bootstrap_attachment_id(
+                second_grant.bootstrap_url, expected_origin=second_grant.origin
+            )
+            == second_grant.attachment_id
+        )
+        second_start = await second_replica.begin_bootstrap(
+            attachment_id=second_grant.attachment_id,
+            host_generation=origin_generation,
+        )
+        second_authorization = await second_replica.authorize_bootstrap(
+            attachment_id=second_grant.attachment_id,
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            parent_session_id=parent_id,
+            embedding_origin="https://cockpit.platform.test",
+            challenge=second_start.challenge,
+            ready_receipt=second_start.ready_receipt,
+            bridge_nonce=second_grant.bridge_nonce,
+        )
+        reused = await first_replica.exchange_bootstrap(
+            attachment_id=second_grant.attachment_id,
+            challenge=second_start.challenge,
+            exchange_code=second_authorization.exchange_code,
+            browser_binding=second_start.browser_binding,
             host_generation=origin_generation,
             existing_session_secret=exchange.session_secret,
         )
@@ -280,6 +467,9 @@ async def test_postgres_viewer_lifecycle_concurrency_reuse_and_revocation(
             await listener.close()
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM threads WHERE id = $1", thread_id)
-            await conn.execute("DELETE FROM srw_sessions WHERE id = $1", parent_id)
+            await conn.execute(
+                "DELETE FROM srw_sessions WHERE id = ANY($1::uuid[])",
+                [parent_id, other_parent_id],
+            )
             await conn.execute("DELETE FROM users WHERE id = $1", user_id)
         await pool.close()

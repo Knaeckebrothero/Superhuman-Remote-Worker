@@ -99,41 +99,53 @@ describe('Dynamic Canvas rendering trust boundary', () => {
 
   it('accepts only an exact isolated Canvas bootstrap origin and path', () => {
     const origin = 'https://7f2640cb-8584-4ab1-a68e-95b2c9274419.canvas.userland.test';
-    const bootstrap = `${origin}/_canvas/bootstrap?token=${'t'.repeat(43)}`;
+    const attachmentId = '54f4fd56-69d8-46c8-8ab7-a3349af0d784';
+    const bootstrap = `${origin}/_canvas/bootstrap?attachment_id=${attachmentId}`;
     expect(resolveCanvasViewerBootstrapUrl(
       bootstrap,
       origin,
+      attachmentId,
       '.canvas.userland.test',
       'https://cockpit.platform.test/sessions/t-1',
     )).toBe(bootstrap);
 
     const rejected = [
-      ['http://7f2640cb.canvas.userland.test/_canvas/bootstrap?token=x',
+      [`http://7f2640cb.canvas.userland.test/_canvas/bootstrap?attachment_id=${attachmentId}`,
         'http://7f2640cb.canvas.userland.test'],
-      [`${origin}/app?token=x`, origin],
-      [`${origin}/_canvas/bootstrap?token=x#leak`, origin],
-      [`${origin}/_canvas/bootstrap?token=${'t'.repeat(43)}&extra=1`, origin],
-      ['https://user@7f2640cb.canvas.userland.test/_canvas/bootstrap?token=x', origin],
-      ['https://7f2640cb.canvas.userland.test.evil.test/_canvas/bootstrap?token=x',
+      [`${origin}/app?attachment_id=${attachmentId}`, origin],
+      [`${origin}/_canvas/bootstrap?attachment_id=${attachmentId}#leak`, origin],
+      [`${origin}/_canvas/bootstrap?attachment_id=${attachmentId}&extra=1`, origin],
+      [`${origin}/_canvas/bootstrap?token=${'t'.repeat(43)}`, origin],
+      [`https://user@7f2640cb.canvas.userland.test/_canvas/bootstrap?attachment_id=${attachmentId}`, origin],
+      [`https://7f2640cb.canvas.userland.test.evil.test/_canvas/bootstrap?attachment_id=${attachmentId}`,
         'https://7f2640cb.canvas.userland.test.evil.test'],
-      ['https://nested.label.canvas.userland.test/_canvas/bootstrap?token=x',
+      [`https://nested.label.canvas.userland.test/_canvas/bootstrap?attachment_id=${attachmentId}`,
         'https://nested.label.canvas.userland.test'],
-      [`https://7f2640cb-8584-4ab1-a68e-95b2c9274419.canvas.userland.test:444/_canvas/bootstrap?token=${'t'.repeat(43)}`,
+      [`https://7f2640cb-8584-4ab1-a68e-95b2c9274419.canvas.userland.test:444/_canvas/bootstrap?attachment_id=${attachmentId}`,
         'https://7f2640cb-8584-4ab1-a68e-95b2c9274419.canvas.userland.test:444'],
-      [`${origin}/_canvas/bootstrap?token=x`, 'https://other.canvas.userland.test'],
-      ['https://cockpit.platform.test/_canvas/bootstrap?token=x',
+      [bootstrap, 'https://other.canvas.userland.test'],
+      [`https://cockpit.platform.test/_canvas/bootstrap?attachment_id=${attachmentId}`,
         'https://cockpit.platform.test'],
     ] as const;
     for (const [url, expectedOrigin] of rejected) {
       expect(resolveCanvasViewerBootstrapUrl(
         url,
         expectedOrigin,
+        attachmentId,
         '.canvas.userland.test',
         'https://cockpit.platform.test/',
       )).toBeNull();
     }
-    expect(resolveCanvasViewerBootstrapUrl(bootstrap, origin, null)).toBeNull();
-    expect(resolveCanvasViewerBootstrapUrl(bootstrap, origin, 'canvas.userland.test')).toBeNull();
+    expect(resolveCanvasViewerBootstrapUrl(bootstrap, origin, attachmentId, null)).toBeNull();
+    expect(resolveCanvasViewerBootstrapUrl(
+      bootstrap, origin, attachmentId, 'canvas.userland.test',
+    )).toBeNull();
+    expect(resolveCanvasViewerBootstrapUrl(
+      bootstrap,
+      origin,
+      '5ce49cf9-72e4-4e50-aa4f-f972f63e934d',
+      '.canvas.userland.test',
+    )).toBeNull();
   });
 
   it('uses isolated Markdown semantics with bounded math and inert untrusted resources', () => {

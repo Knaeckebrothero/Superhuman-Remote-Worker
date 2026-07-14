@@ -60,6 +60,9 @@ COPY --chown=srw:srw orchestrator/mcp/ ./
 # formatters module imported by server.py
 COPY --chown=srw:srw orchestrator/services/formatters.py ./services/formatters.py
 COPY --chown=srw:srw orchestrator/services/__init__.py ./services/__init__.py
+# Shared trusted-origin response boundary used by the optional OAuth pages.
+COPY --chown=srw:srw orchestrator/security/__init__.py ./security/__init__.py
+COPY --chown=srw:srw orchestrator/security/anti_framing.py ./security/anti_framing.py
 
 # /app and /app/services are created by COPY/WORKDIR with root ownership;
 # `USER srw` then can't write into them, which kills Tilt's live_update

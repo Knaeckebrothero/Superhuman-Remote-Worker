@@ -144,6 +144,10 @@ jobs:
                 -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
                 -summary
 
+      - name: Verify chart-created Secret contract
+        if: matrix.scenario == 'eval'
+        run: bash scripts/check-chart-created-secret.sh
+
   # ---------------------------------------------------------------------------
   # Schema negative test — proves values.schema.json rejects bad input. A
   # deliberately-invalid values file MUST make `helm template` fail. Hard gate.
@@ -448,6 +452,8 @@ jobs:
 
           if git diff --name-only "$BASE" HEAD -- \
             'src/' 'orchestrator/' 'tests/' 'config/' 'agent.py' \
+            'cockpit/angular.json' 'docker/cockpit-nginx.conf' \
+            'docker/Dockerfile.cockpit' \
             'requirements.txt' 'orchestrator/requirements.txt' 'requirements-dev.txt' \
             | grep -q .; then
             echo "python=true" >> "$GITHUB_OUTPUT"
@@ -518,11 +524,12 @@ jobs:
             orchestrator/ config/ docker/Dockerfile.orchestrator)
 
           COCKPIT=$(has_changes "$SHA_COCKPIT" \
-            cockpit/ docker/Dockerfile.cockpit)
+            cockpit/ docker/Dockerfile.cockpit docker/cockpit-nginx.conf)
 
           MCP=$(has_changes "$SHA_MCP" \
             orchestrator/mcp/ orchestrator/services/formatters.py \
-            orchestrator/services/__init__.py docker/Dockerfile.mcp)
+            orchestrator/services/__init__.py \
+            orchestrator/security/anti_framing.py docker/Dockerfile.mcp)
 
           # docker/browser-exec is COPY'd into the workspace image at build time
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
@@ -563,10 +570,10 @@ jobs:
             vm/sudo-daemon/ vm/sudo-plugin/)
 
           # Chart changes (helm/ = main chart, helm-vm-cluster/ = vm-cluster
-          # chart). BOTH must be watched: a helm-vm-cluster/-only change (e.g. a
-          # NetworkPolicy/configmap fix) otherwise sets chart=false and — with no
-          # vm-controller image rebuilt — silently skips the vm-cluster chart
-          # publish + fleet bump, so the fix never deploys.
+          # chart). Watch the chart-created Secret verifier too so changes to
+          # that CI contract cannot skip the job that executes it. Both charts
+          # must remain watched: a helm-vm-cluster/-only change otherwise skips
+          # the vm-cluster chart publish + fleet bump.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             CHART_BASE="${{ github.event.pull_request.base.sha }}"
           elif git rev-parse HEAD~1 &>/dev/null; then
@@ -574,7 +581,7 @@ jobs:
           else
             CHART_BASE=""
           fi
-          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/' 'helm-vm-cluster/')" ]; then
+          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/' 'helm-vm-cluster/' 'scripts/check-chart-created-secret.sh')" ]; then
             CHART="true"
           else
             CHART="false"

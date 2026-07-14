@@ -1,9 +1,10 @@
 """Durable authentication for isolated Dynamic Canvas viewer origins.
 
-Parent APIs use the normal BFF session and create a non-credential attachment
-plus a single-use bootstrap.  The dedicated viewer gateway consumes that
-bootstrap and authenticates later app requests with a separate, host-only
-cookie.  Plaintext bootstrap/cookie material never enters PostgreSQL.
+Parent APIs use the normal BFF session and create a non-credential attachment.
+The dedicated viewer gateway starts a browser-bound challenge, the authenticated
+parent authorizes that exact challenge, and a same-origin exchange mints a
+separate host-only viewer cookie. Plaintext challenge, binding, exchange, and
+cookie material never enters PostgreSQL.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from services.canvas import CanvasRecord, WorkspaceAppSource
@@ -29,6 +29,7 @@ from services.canvas_ssh import (
 )
 
 CANVAS_VIEWER_COOKIE = "__Host-canvas_session"
+CANVAS_BOOTSTRAP_COOKIE_PREFIX = "__Host-canvas_bootstrap_"
 _SECRET_BYTES = 32
 
 
@@ -61,9 +62,16 @@ def _secret() -> str:
 
 
 def hash_canvas_viewer_secret(purpose: str, value: str) -> str:
-    """Domain-separate stored bootstrap, cookie, and bridge secret hashes."""
+    """Domain-separate every stored Canvas viewer secret hash."""
 
-    if purpose not in {"bootstrap", "session", "bridge"}:
+    if purpose not in {
+        "binding",
+        "bridge",
+        "challenge",
+        "exchange",
+        "receipt",
+        "session",
+    }:
         raise ValueError("unknown Canvas viewer secret purpose")
     if not isinstance(value, str) or not value or len(value) > 1024:
         raise ValueError("invalid Canvas viewer secret")
@@ -76,6 +84,8 @@ class CanvasViewerAttachmentGrant:
     attachment_id: UUID
     origin: str
     bootstrap_url: str
+    bridge_nonce: str
+    bootstrap_expires_at: datetime
     expires_at: datetime
     renew_after: datetime
 
@@ -84,6 +94,8 @@ class CanvasViewerAttachmentGrant:
             "attachment_id": str(self.attachment_id),
             "origin": self.origin,
             "bootstrap_url": self.bootstrap_url,
+            "bridge_nonce": self.bridge_nonce,
+            "bootstrap_expires_at": _iso(self.bootstrap_expires_at),
             "expires_at": _iso(self.expires_at),
             "renew_after": _iso(self.renew_after),
         }
@@ -128,6 +140,38 @@ class CanvasBootstrapExchange:
     # parent BFF session. PostgreSQL still enforces the shorter renewable
     # Canvas-session expiry on every request, so retention is not authorization.
     cookie_expires_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasBootstrapStart:
+    attachment_id: UUID
+    challenge: str
+    ready_receipt: str
+    browser_binding: str
+    embedding_origin: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasBootstrapAuthorization:
+    challenge: str
+    ready_receipt: str
+    exchange_code: str
+    expires_at: datetime
+
+    def public_dict(self) -> dict[str, str]:
+        return {
+            "challenge": self.challenge,
+            "ready_receipt": self.ready_receipt,
+            "exchange_code": self.exchange_code,
+            "expires_at": _iso(self.expires_at),
+        }
+
+
+def canvas_bootstrap_cookie_name(attachment_id: UUID) -> str:
+    """Return one host-only transient-cookie name per frame attachment."""
+
+    return f"{CANVAS_BOOTSTRAP_COOKIE_PREFIX}{attachment_id}"
 
 
 def _renew_after(now: datetime, expires_at: datetime) -> datetime:
@@ -291,7 +335,6 @@ class CanvasViewerSessionService:
         now = _now()
         attachment_id = uuid4()
         bootstrap_id = uuid4()
-        bootstrap = _secret()
         bridge = _secret()
 
         async with self._db.acquire() as conn:
@@ -345,13 +388,12 @@ class CanvasViewerSessionService:
                 await conn.execute(
                     """
                     INSERT INTO canvas_view_bootstraps (
-                        id, token_hash, attachment_id,
+                        id, attachment_id,
                         expected_presentation_revision, source_fingerprint,
                         workspace_generation, origin_generation, expires_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                     """,
                     bootstrap_id,
-                    hash_canvas_viewer_secret("bootstrap", bootstrap),
                     attachment_id,
                     current.presentation_revision,
                     current.source_fingerprint,
@@ -362,7 +404,7 @@ class CanvasViewerSessionService:
 
         assert expected_record.origin_generation is not None
         origin = self._config.public_origin(expected_record.origin_generation)
-        bootstrap_url = f"{origin}/_canvas/bootstrap?token={quote(bootstrap, safe='')}"
+        bootstrap_url = f"{origin}/_canvas/bootstrap?attachment_id={attachment_id}"
         session_expiry = min(
             attachment_expiry,
             now + timedelta(seconds=self._config.session_ttl_seconds),
@@ -371,48 +413,63 @@ class CanvasViewerSessionService:
             attachment_id=attachment_id,
             origin=origin,
             bootstrap_url=bootstrap_url,
+            bridge_nonce=bridge,
+            bootstrap_expires_at=bootstrap_expiry,
             expires_at=session_expiry,
             renew_after=_renew_after(now, session_expiry),
         )
 
-    async def consume_bootstrap(
-        self,
-        *,
-        token: str,
-        host_generation: UUID,
-        existing_session_secret: str | None,
-    ) -> CanvasBootstrapExchange:
-        """Atomically consume one bootstrap after gateway metadata checks."""
+    async def begin_bootstrap(
+        self, *, attachment_id: UUID, host_generation: UUID
+    ) -> CanvasBootstrapStart:
+        """Start one browser-bound challenge without granting authorization."""
 
         self._require_enabled()
-        try:
-            token_hash = hash_canvas_viewer_secret("bootstrap", token)
-        except ValueError as exc:
-            raise CanvasViewerError(
-                401, "canvas_bootstrap_invalid", "Canvas bootstrap is invalid"
-            ) from exc
         now = _now()
-        new_secret: str | None = None
+        challenge = _secret()
+        browser_binding = _secret()
+        ready_receipt = _secret()
 
         async with self._db.acquire() as conn:
             async with conn.transaction():
+                identity = await conn.fetchrow(
+                    """
+                    SELECT a.thread_id
+                    FROM canvas_view_attachments a
+                    JOIN canvas_view_bootstraps b ON b.attachment_id = a.id
+                    WHERE a.id = $1
+                    """,
+                    attachment_id,
+                )
+                if identity is None:
+                    raise CanvasViewerError(
+                        401,
+                        "canvas_bootstrap_invalid",
+                        "Canvas bootstrap is invalid or expired",
+                    )
+                current = await self._canvas_record(
+                    conn, str(identity["thread_id"]), for_share=True
+                )
+                source = _require_app_record(current)
                 row = await conn.fetchrow(
                     """
                     SELECT b.id AS bootstrap_id, b.attachment_id,
                            b.expected_presentation_revision,
                            b.source_fingerprint, b.workspace_generation,
                            b.origin_generation, b.expires_at AS bootstrap_expires_at,
+                           b.challenge_hash, b.browser_binding_hash,
+                           b.ready_receipt_hash, b.exchange_token_hash,
+                           b.authorized_at, b.consumed_at,
                            a.user_id, a.thread_id, a.canvas_id,
                            a.parent_srw_session_id, a.embedding_origin,
                            a.cookie_mode AS attachment_cookie_mode,
                            a.expires_at AS attachment_expires_at, a.closed_at
                     FROM canvas_view_bootstraps b
                     JOIN canvas_view_attachments a ON a.id = b.attachment_id
-                    WHERE b.token_hash = $1 AND b.consumed_at IS NULL
-                      AND b.expires_at > now()
+                    WHERE b.attachment_id = $1
                     FOR UPDATE OF b, a
                     """,
-                    token_hash,
+                    attachment_id,
                 )
                 if row is None:
                     raise CanvasViewerError(
@@ -424,16 +481,320 @@ class CanvasViewerSessionService:
                 if (
                     values.get("closed_at") is not None
                     or _utc(values["attachment_expires_at"]) <= now
+                    or _utc(values["bootstrap_expires_at"]) <= now
                     or UUID(str(values["origin_generation"])) != host_generation
                     or str(values.get("embedding_origin") or "")
                     not in self._config.cockpit_origins
                     or str(values.get("attachment_cookie_mode") or "")
                     != self._config.cookie_mode
+                    or any(
+                        values.get(name) is not None
+                        for name in (
+                            "challenge_hash",
+                            "browser_binding_hash",
+                            "ready_receipt_hash",
+                            "exchange_token_hash",
+                            "authorized_at",
+                            "consumed_at",
+                        )
+                    )
+                ):
+                    raise CanvasViewerError(
+                        409,
+                        "canvas_bootstrap_unavailable",
+                        "Canvas bootstrap must be recreated",
+                    )
+                if (
+                    current.presentation_revision
+                    != int(values["expected_presentation_revision"])
+                    or current.source_fingerprint != values["source_fingerprint"]
+                    or source.workspace_generation
+                    != UUID(str(values["workspace_generation"]))
+                    or current.origin_generation != host_generation
+                ):
+                    raise CanvasViewerError(
+                        409,
+                        "canvas_bootstrap_stale",
+                        "Canvas changed before the viewer loaded",
+                    )
+                parent_id = values.get("parent_srw_session_id")
+                if parent_id is None:
+                    raise CanvasViewerError(
+                        401,
+                        "canvas_parent_session_invalid",
+                        "The Cockpit session has ended",
+                    )
+                await self._parent_session(
+                    conn, UUID(str(parent_id)), str(values["user_id"])
+                )
+                await self._authorized_thread(
+                    conn,
+                    user_id=str(values["user_id"]),
+                    thread_id=str(values["thread_id"]),
+                )
+                started = await conn.execute(
+                    """
+                    UPDATE canvas_view_bootstraps
+                    SET challenge_hash = $2, browser_binding_hash = $3,
+                        ready_receipt_hash = $4
+                    WHERE id = $1 AND challenge_hash IS NULL
+                      AND browser_binding_hash IS NULL
+                      AND ready_receipt_hash IS NULL
+                      AND exchange_token_hash IS NULL
+                      AND authorized_at IS NULL AND consumed_at IS NULL
+                    """,
+                    values["bootstrap_id"],
+                    hash_canvas_viewer_secret("challenge", challenge),
+                    hash_canvas_viewer_secret("binding", browser_binding),
+                    hash_canvas_viewer_secret("receipt", ready_receipt),
+                )
+                if started != "UPDATE 1":
+                    raise CanvasViewerError(
+                        409,
+                        "canvas_bootstrap_unavailable",
+                        "Canvas bootstrap must be recreated",
+                    )
+
+        return CanvasBootstrapStart(
+            attachment_id=attachment_id,
+            challenge=challenge,
+            ready_receipt=ready_receipt,
+            browser_binding=browser_binding,
+            embedding_origin=str(values["embedding_origin"]),
+            expires_at=_utc(values["bootstrap_expires_at"]),
+        )
+
+    async def authorize_bootstrap(
+        self,
+        *,
+        attachment_id: UUID,
+        user_id: str,
+        thread_id: str,
+        parent_session_id: UUID,
+        embedding_origin: str | None,
+        challenge: str,
+        ready_receipt: str,
+        bridge_nonce: str,
+    ) -> CanvasBootstrapAuthorization:
+        """Authorize the exact browser challenge through its current BFF."""
+
+        self._require_enabled()
+        try:
+            embedding = self._config.require_cockpit_origin(embedding_origin)
+            challenge_hash = hash_canvas_viewer_secret("challenge", challenge)
+            receipt_hash = hash_canvas_viewer_secret("receipt", ready_receipt)
+            bridge_hash = hash_canvas_viewer_secret("bridge", bridge_nonce)
+        except (CanvasViewerConfigurationError, ValueError) as exc:
+            raise CanvasViewerError(
+                401,
+                "canvas_bootstrap_invalid",
+                "Canvas bootstrap authorization is invalid",
+            ) from exc
+        now = _now()
+        exchange_code = _secret()
+
+        async with self._db.acquire() as conn:
+            async with conn.transaction():
+                parent = await self._parent_session(conn, parent_session_id, user_id)
+                await self._authorized_thread(
+                    conn, user_id=user_id, thread_id=thread_id
+                )
+                current = await self._canvas_record(conn, thread_id, for_share=True)
+                source = _require_app_record(current)
+                row = await conn.fetchrow(
+                    """
+                    SELECT b.id AS bootstrap_id, b.expected_presentation_revision,
+                           b.source_fingerprint, b.workspace_generation,
+                           b.origin_generation, b.expires_at AS bootstrap_expires_at,
+                           b.challenge_hash, b.browser_binding_hash,
+                           b.ready_receipt_hash, b.exchange_token_hash,
+                           b.authorized_at, b.consumed_at,
+                           a.bridge_nonce_hash, a.embedding_origin,
+                           a.cookie_mode AS attachment_cookie_mode,
+                           a.expires_at AS attachment_expires_at, a.closed_at
+                    FROM canvas_view_bootstraps b
+                    JOIN canvas_view_attachments a ON a.id = b.attachment_id
+                    WHERE a.id = $1 AND a.user_id = $2 AND a.thread_id = $3
+                      AND a.canvas_id = 'main' AND a.parent_srw_session_id = $4
+                    FOR UPDATE OF b, a
+                    """,
+                    attachment_id,
+                    user_id,
+                    thread_id,
+                    parent_session_id,
+                )
+                if row is None:
+                    raise CanvasViewerError(
+                        403,
+                        "canvas_bootstrap_forbidden",
+                        "Canvas bootstrap does not belong to this session",
+                    )
+                values = dict(row)
+                if (
+                    values.get("closed_at") is not None
+                    or _utc(values["attachment_expires_at"]) <= now
+                    or _utc(values["bootstrap_expires_at"]) <= now
+                    or values.get("consumed_at") is not None
+                    or values.get("authorized_at") is not None
+                    or values.get("exchange_token_hash") is not None
+                    or not values.get("browser_binding_hash")
+                    or str(values.get("embedding_origin") or "") != embedding
+                    or str(values.get("attachment_cookie_mode") or "")
+                    != self._config.cookie_mode
+                    or not secrets.compare_digest(
+                        str(values.get("challenge_hash") or ""), challenge_hash
+                    )
+                    or not secrets.compare_digest(
+                        str(values.get("ready_receipt_hash") or ""), receipt_hash
+                    )
+                    or not secrets.compare_digest(
+                        str(values.get("bridge_nonce_hash") or ""), bridge_hash
+                    )
                 ):
                     raise CanvasViewerError(
                         401,
                         "canvas_bootstrap_invalid",
-                        "Canvas bootstrap is no longer valid",
+                        "Canvas bootstrap authorization is invalid or expired",
+                    )
+                if (
+                    current.presentation_revision
+                    != int(values["expected_presentation_revision"])
+                    or current.source_fingerprint != values["source_fingerprint"]
+                    or source.workspace_generation
+                    != UUID(str(values["workspace_generation"]))
+                    or current.origin_generation
+                    != UUID(str(values["origin_generation"]))
+                ):
+                    raise CanvasViewerError(
+                        409,
+                        "canvas_bootstrap_stale",
+                        "Canvas changed before the viewer was authorized",
+                    )
+                authorized = await conn.execute(
+                    """
+                    UPDATE canvas_view_bootstraps
+                    SET exchange_token_hash = $2, authorized_at = now()
+                    WHERE id = $1 AND exchange_token_hash IS NULL
+                      AND authorized_at IS NULL AND consumed_at IS NULL
+                    """,
+                    values["bootstrap_id"],
+                    hash_canvas_viewer_secret("exchange", exchange_code),
+                )
+                if authorized != "UPDATE 1":
+                    raise CanvasViewerError(
+                        401,
+                        "canvas_bootstrap_invalid",
+                        "Canvas bootstrap authorization was already used",
+                    )
+                expires_at = min(
+                    _utc(values["bootstrap_expires_at"]),
+                    _utc(values["attachment_expires_at"]),
+                    _utc(parent["absolute_expires_at"]),
+                )
+
+        return CanvasBootstrapAuthorization(
+            challenge=challenge,
+            ready_receipt=ready_receipt,
+            exchange_code=exchange_code,
+            expires_at=expires_at,
+        )
+
+    async def exchange_bootstrap(
+        self,
+        *,
+        attachment_id: UUID,
+        challenge: str,
+        exchange_code: str,
+        browser_binding: str,
+        host_generation: UUID,
+        existing_session_secret: str | None,
+    ) -> CanvasBootstrapExchange:
+        """Consume one authorized exchange bound to this browser and host."""
+
+        self._require_enabled()
+        try:
+            challenge_hash = hash_canvas_viewer_secret("challenge", challenge)
+            exchange_hash = hash_canvas_viewer_secret("exchange", exchange_code)
+            binding_hash = hash_canvas_viewer_secret("binding", browser_binding)
+        except ValueError as exc:
+            raise CanvasViewerError(
+                401, "canvas_bootstrap_invalid", "Canvas bootstrap is invalid"
+            ) from exc
+        now = _now()
+        new_secret: str | None = None
+
+        async with self._db.acquire() as conn:
+            async with conn.transaction():
+                identity = await conn.fetchrow(
+                    """
+                    SELECT a.thread_id
+                    FROM canvas_view_attachments a
+                    JOIN canvas_view_bootstraps b ON b.attachment_id = a.id
+                    WHERE a.id = $1
+                    """,
+                    attachment_id,
+                )
+                if identity is None:
+                    raise CanvasViewerError(
+                        401,
+                        "canvas_bootstrap_invalid",
+                        "Canvas bootstrap is invalid or expired",
+                    )
+                current = await self._canvas_record(
+                    conn, str(identity["thread_id"]), for_share=True
+                )
+                source = _require_app_record(current)
+                row = await conn.fetchrow(
+                    """
+                    SELECT b.id AS bootstrap_id, b.attachment_id,
+                           b.expected_presentation_revision,
+                           b.source_fingerprint, b.workspace_generation,
+                           b.origin_generation, b.expires_at AS bootstrap_expires_at,
+                           b.challenge_hash, b.browser_binding_hash,
+                           b.exchange_token_hash, b.authorized_at, b.consumed_at,
+                           a.user_id, a.thread_id, a.canvas_id,
+                           a.parent_srw_session_id, a.embedding_origin,
+                           a.cookie_mode AS attachment_cookie_mode,
+                           a.expires_at AS attachment_expires_at, a.closed_at
+                    FROM canvas_view_bootstraps b
+                    JOIN canvas_view_attachments a ON a.id = b.attachment_id
+                    WHERE b.attachment_id = $1
+                    FOR UPDATE OF b, a
+                    """,
+                    attachment_id,
+                )
+                if row is None:
+                    raise CanvasViewerError(
+                        401,
+                        "canvas_bootstrap_invalid",
+                        "Canvas bootstrap is invalid or expired",
+                    )
+                values = dict(row)
+                if (
+                    values.get("closed_at") is not None
+                    or _utc(values["attachment_expires_at"]) <= now
+                    or _utc(values["bootstrap_expires_at"]) <= now
+                    or values.get("authorized_at") is None
+                    or values.get("consumed_at") is not None
+                    or UUID(str(values["origin_generation"])) != host_generation
+                    or str(values.get("embedding_origin") or "")
+                    not in self._config.cockpit_origins
+                    or str(values.get("attachment_cookie_mode") or "")
+                    != self._config.cookie_mode
+                    or not secrets.compare_digest(
+                        str(values.get("challenge_hash") or ""), challenge_hash
+                    )
+                    or not secrets.compare_digest(
+                        str(values.get("browser_binding_hash") or ""), binding_hash
+                    )
+                    or not secrets.compare_digest(
+                        str(values.get("exchange_token_hash") or ""), exchange_hash
+                    )
+                ):
+                    raise CanvasViewerError(
+                        401,
+                        "canvas_bootstrap_invalid",
+                        "Canvas bootstrap is invalid, expired, or already used",
                     )
                 parent_id = values.get("parent_srw_session_id")
                 if parent_id is None:
@@ -450,10 +811,6 @@ class CanvasViewerSessionService:
                     user_id=str(values["user_id"]),
                     thread_id=str(values["thread_id"]),
                 )
-                current = await self._canvas_record(
-                    conn, str(values["thread_id"]), for_share=True
-                )
-                source = _require_app_record(current)
                 if (
                     current.presentation_revision
                     != int(values["expected_presentation_revision"])
@@ -479,7 +836,7 @@ class CanvasViewerSessionService:
                     if existing_hash:
                         session_row = await conn.fetchrow(
                             """
-                            SELECT * FROM canvas_origin_sessions
+                            SELECT id FROM canvas_origin_sessions
                             WHERE session_secret_hash = $1
                               AND user_id = $2 AND thread_id = $3
                               AND canvas_id = $4 AND parent_srw_session_id = $5
@@ -502,14 +859,14 @@ class CanvasViewerSessionService:
                             self._config.cookie_mode,
                         )
 
+                expires_at = min(
+                    now + timedelta(seconds=self._config.session_ttl_seconds),
+                    _utc(parent["absolute_expires_at"]),
+                    _utc(values["attachment_expires_at"]),
+                )
                 if session_row is None:
                     new_secret = _secret()
                     session_id = uuid4()
-                    expires_at = min(
-                        now + timedelta(seconds=self._config.session_ttl_seconds),
-                        _utc(parent["absolute_expires_at"]),
-                        _utc(values["attachment_expires_at"]),
-                    )
                     await conn.execute(
                         """
                         INSERT INTO canvas_origin_sessions (
@@ -537,24 +894,8 @@ class CanvasViewerSessionService:
                         expires_at,
                     )
                 else:
-                    # Reissue the already-validated value so the gateway can
-                    # reset its browser retention bound to the immutable parent
-                    # BFF lifetime. This does not rotate or reveal a stored
-                    # secret: the plaintext came from this exact host cookie
-                    # and matched the persisted hash above.
                     new_secret = existing_session_secret
                     session_id = UUID(str(session_row["id"]))
-                    # A newly authorized attachment must not inherit a shared
-                    # session which is only seconds from expiry while Cockpit
-                    # schedules renewal against a fresh grant. Bootstrap is
-                    # already bound to the same parent/user/source identity, so
-                    # extend the short server lease now without rotating the
-                    # browser cookie.
-                    expires_at = min(
-                        now + timedelta(seconds=self._config.session_ttl_seconds),
-                        _utc(parent["absolute_expires_at"]),
-                        _utc(values["attachment_expires_at"]),
-                    )
                     await conn.execute(
                         """
                         UPDATE canvas_origin_sessions
@@ -591,7 +932,6 @@ class CanvasViewerSessionService:
                     session_id,
                 )
 
-        assert current is not None
         session = CanvasOriginSession(
             id=session_id,
             user_id=UUID(str(values["user_id"])),
@@ -630,7 +970,11 @@ class CanvasViewerSessionService:
         async with self._db.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT * FROM canvas_origin_sessions
+                SELECT id, user_id, thread_id, canvas_id,
+                       parent_srw_session_id, source_fingerprint,
+                       workspace_generation, origin_generation,
+                       embedding_origin, cookie_mode, expires_at, revoked_at
+                FROM canvas_origin_sessions
                 WHERE session_secret_hash = $1
                 """,
                 secret_hash,
@@ -933,13 +1277,17 @@ def canvas_viewer_error_detail(error: CanvasViewerError) -> dict[str, str]:
 
 
 __all__ = [
+    "CANVAS_BOOTSTRAP_COOKIE_PREFIX",
     "CANVAS_VIEWER_COOKIE",
+    "CanvasBootstrapAuthorization",
     "CanvasBootstrapExchange",
+    "CanvasBootstrapStart",
     "CanvasOriginSession",
     "CanvasViewerAttachmentGrant",
     "CanvasViewerError",
     "CanvasViewerRenewal",
     "CanvasViewerSessionService",
+    "canvas_bootstrap_cookie_name",
     "canvas_viewer_error_detail",
     "hash_canvas_viewer_secret",
 ]

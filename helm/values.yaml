@@ -351,11 +351,14 @@ canvas:
       # -- Empty while disabled. Enabled values are `psl-isolated` or, only for
       # the development profile, `development-cookie-free`.
       cookieMode: ""
-      # -- Independently registrable user-content domain, without scheme or
-      # wildcard (for example `example-userland.com`). No DNS/ingress is created.
+      # -- Dedicated, independently registrable user-content domain, without
+      # scheme or wildcard (for example `example-userland.com`). Its exact name
+      # must be the effective PSL boundary in production. No DNS/ingress is
+      # created.
       domain: ""
-      # -- Exact dotted suffix for random origins (for example
-      # `.canvas.example-userland.com`). Must fall beneath domain.
+      # -- Exact dotted suffix for random origins. Production requires this to
+      # equal `.` plus domain, yielding one-label origins covered by a normal
+      # first-level wildcard. Development may use a nested suffix.
       hostSuffix: ""
       # -- Exact trusted HTTPS Cockpit origins allowed to embed the gateway.
       cockpitOrigins: []
@@ -368,6 +371,28 @@ canvas:
       attachmentTtlSeconds: 1200
       revalidateSeconds: 15
       replicas: 1
+      # The public gateway must never inherit the orchestrator's application
+      # database credential. It connects with a dedicated login whose grants
+      # are limited to the viewer/session query surface.
+      database:
+        # -- Dedicated PostgreSQL login. Chart-managed development credentials
+        # use this fixed name so an uninstall/reinstall cannot strand older
+        # privileged roles under operator-selected names.
+        username: "srw_canvas_gateway"
+        credentials:
+          # -- Generate a dedicated Secret. Development/internal-Postgres only;
+          # production must reference an operator-managed Secret instead.
+          create: false
+          # -- Existing Secret containing only the gateway DB credential.
+          existingSecret: ""
+          usernameKey: "username"
+          passwordKey: "password"
+        # -- Reconcile the restricted login/grants with a bounded one-shot Job.
+        # Allowed only for bundled Postgres and required with credentials.create.
+        provisionRole: false
+        pool:
+          min: 1
+          max: 4
       resources:
         requests:
           memory: "128Mi"
@@ -1156,7 +1181,7 @@ workspace:
     # hostname (OpenCloud's tus data gateway resolves to the Traefik
     # ClusterIP via coredns-custom) can connect. Real deployments resolve
     # those hostnames externally and don't need this. See
-    # deployment/values-local.example.yaml for the Traefik block.
+    # deployment/values-local.yaml.example for the Traefik block.
     extraEgress: []
   # -- Pre-pull the workspace image on every node via a DaemonSet, so a
   # freshly-built tag doesn't pay a ~2-minute cold pull penalty on the first

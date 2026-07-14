@@ -160,8 +160,8 @@ ingress:
 # Workspace-port Canvas previews remain unavailable until the deployment has
 # a separate viewer domain/edge and has passed the browser security gates. The
 # chart can render an internal gateway, but intentionally creates no wildcard
-# ingress or TLS route for it. Dedicated least-privilege database credentials
-# and a gateway-only config projection are also production launch blockers.
+# ingress or TLS route for it. An enabled production viewer must reference a
+# separately provisioned, least-privilege database credential Secret.
 canvas:
   livePreview:
     enabled: false
@@ -175,6 +175,17 @@ canvas:
       cockpitOrigins: []
       rawPathVerified: false
       pslBoundaryVerified: false
+      database:
+        username: "srw_canvas_gateway"
+        credentials:
+          create: false
+          existingSecret: ""
+          usernameKey: "username"
+          passwordKey: "password"
+        provisionRole: false
+        pool:
+          min: 1
+          max: 4
       # Keep both selectors empty while disabled. Enabling requires non-empty
       # selectors for the operator-owned edge and opens only TCP/8086 from it.
       networkPolicy:

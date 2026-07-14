@@ -230,6 +230,15 @@ For external-mode databases (`internal: false`), the host/port/db come
 from `databases.<which>.externalHost/externalPort/externalDb` in values;
 only the credentials live in Vault.
 
+An enabled Dynamic Canvas viewer uses a separate PostgreSQL login and never
+receives the application `POSTGRES_*` credential. Production requires
+`canvas.livePreview.viewer.database.credentials.existingSecret` to name a
+dedicated Secret with the configured `usernameKey` and `passwordKey`; provision
+that role with only the documented Canvas viewer grants. For development with
+the bundled database, `credentials.create=true` plus `provisionRole=true`
+generates a dedicated Secret and runs the bounded role reconciler. That mode is
+rejected for a production viewer.
+
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
 - `KC_DB_PASSWORD` (internal Keycloak only) — used as the Postgres superuser password on the dedicated `srw-keycloakdb` StatefulSet *and* as the connection password the Keycloak pod presents. When pointing the bundled Keycloak at an external Postgres (`databases.keycloak.internal: false`), the same value is sent over the wire — pre-provision a `keycloak` role with this password on your managed instance.

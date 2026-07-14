@@ -189,6 +189,45 @@
                   "maximum": 15
                 },
                 "replicas": { "type": "integer", "minimum": 1, "maximum": 20 },
+                "database": {
+                  "type": "object",
+                  "properties": {
+                    "username": {
+                      "type": "string",
+                      "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+                    },
+                    "credentials": {
+                      "type": "object",
+                      "properties": {
+                        "create": { "type": "boolean" },
+                        "existingSecret": {
+                          "type": "string",
+                          "maxLength": 253,
+                          "pattern": "^$|^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$"
+                        },
+                        "usernameKey": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z0-9._-]+$"
+                        },
+                        "passwordKey": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z0-9._-]+$"
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "provisionRole": { "type": "boolean" },
+                    "pool": {
+                      "type": "object",
+                      "properties": {
+                        "min": { "type": "integer", "minimum": 1, "maximum": 16 },
+                        "max": { "type": "integer", "minimum": 1, "maximum": 16 }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "additionalProperties": false
+                },
                 "limits": {
                   "type": "object",
                   "properties": {
@@ -236,7 +275,8 @@
                       "hostSuffix",
                       "cockpitOrigins",
                       "rawPathVerified",
-                      "networkPolicy"
+                      "networkPolicy",
+                      "database"
                     ],
                     "properties": {
                       "cookieMode": {
@@ -246,6 +286,15 @@
                       "hostSuffix": { "minLength": 5 },
                       "cockpitOrigins": { "minItems": 1 },
                       "rawPathVerified": { "const": true },
+                      "database": {
+                        "required": ["username", "credentials", "provisionRole", "pool"],
+                        "properties": {
+                          "credentials": {
+                            "required": ["create", "existingSecret", "usernameKey", "passwordKey"]
+                          },
+                          "pool": { "required": ["min", "max"] }
+                        }
+                      },
                       "networkPolicy": {
                         "required": [
                           "edgeNamespaceSelector",
@@ -274,7 +323,18 @@
                   "then": {
                     "properties": {
                       "cookieMode": { "const": "psl-isolated" },
-                      "pslBoundaryVerified": { "const": true }
+                      "pslBoundaryVerified": { "const": true },
+                      "database": {
+                        "properties": {
+                          "credentials": {
+                            "properties": {
+                              "create": { "const": false },
+                              "existingSecret": { "minLength": 1 }
+                            }
+                          },
+                          "provisionRole": { "const": false }
+                        }
+                      }
                     }
                   }
                 }

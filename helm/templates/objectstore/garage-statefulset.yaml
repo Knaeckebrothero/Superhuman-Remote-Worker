@@ -23,6 +23,10 @@ metadata:
   name: {{ include "srw.fullname" . }}-garage
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "garage") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
 spec:
   serviceName: {{ include "srw.fullname" . }}-garage
   # Fixed at 1 — the single-node layout the bootstrap Job assigns supports one
