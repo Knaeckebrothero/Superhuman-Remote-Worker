@@ -47,7 +47,7 @@
 - `helm/templates/agent/network-policy.yaml` — egress carve-out to Garage:3900.
 - `helm/templates/NOTES.txt` — not-for-production warning block.
 - `helm/ci/eval-values.yaml` — enable `garage` (secrets.create path → exercises auto-gen + kubeconform).
-- `docs/issues/s3_object_store_bundled_fallback.md` — status → in-progress; link spec + this plan.
+- `docs/done/s3_object_store_bundled_fallback.md` — status → in-progress; link spec + this plan.
 
 ---
 
@@ -996,7 +996,7 @@ git commit -m "test(chart): render + validate bundled garage in the eval CI scen
 ### Task 10: Update the issue doc
 
 **Files:**
-- Modify: `docs/issues/s3_object_store_bundled_fallback.md`
+- Modify: `docs/done/s3_object_store_bundled_fallback.md`
 
 - [ ] **Step 1: Update status + link the spec/plan**
 
@@ -1013,7 +1013,7 @@ remains a separate fast-follow.
 - [ ] **Step 2: Commit**
 
 ```bash
-git add docs/issues/s3_object_store_bundled_fallback.md
+git add docs/done/s3_object_store_bundled_fallback.md
 git commit -m "docs(issue): mark bundled-s3 store in progress; link spec + plan"
 ```
 
