@@ -9,11 +9,15 @@ Source: OpenRouter's public model catalog (``openrouter.ai/api/v1/models`` — n
 auth), which publishes per-model ``pricing.prompt`` / ``pricing.completion`` /
 ``pricing.input_cache_read`` as USD-*per-token* decimal strings.
 
-Mapping: each catalog model names the OpenRouter id to price against via
-``params_json.pricing_id`` (admin-set, Admin → Models). ``pricing_id = ""`` marks
-a model explicitly unpriced (self-hosted / free) → no rate → ``cost_usd`` stays
-NULL. When unset we fall back to a light normalization of the model id; unmatched
-models are left unpriced rather than mis-priced.
+Mapping: each catalog model resolves to an OpenRouter price by its admin-set
+``params_json.pricing_id`` (Admin → Models) when present, else by the model id
+itself. Resolution (``_build_price_resolver``) tries an exact (case-insensitive)
+match on the full OpenRouter id first, then the provider-prefix-stripped suffix —
+so a bare ``gpt-5.6-terra`` auto-matches ``openai/gpt-5.6-terra`` with no admin
+mapping. A suffix shared by more than one provider is treated as ambiguous and
+left unpriced (fail closed) rather than mis-priced against the wrong provider.
+``pricing_id = ""`` marks a model explicitly unpriced (self-hosted / free) → no
+rate → ``cost_usd`` stays NULL.
 
 Effective-dated + change-only: a sync inserts a NEW ``usage_rates`` row only when
 the upstream price differs from the current newest rate for that (resource, unit),
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -80,18 +85,61 @@ def _price(v: Any) -> Optional[Decimal]:
 
 
 def _pricing_id_for(resource: str, pricing_id: Optional[str]) -> Optional[str]:
-    """Resolve the OpenRouter id to price ``resource`` against.
+    """Resolve the candidate id to price ``resource`` against.
 
     Prefers the admin-set ``params_json.pricing_id``. An explicit empty string
     means "unpriced on purpose" (self-hosted / free) → ``None``. When unset, fall
-    back to a lowercased normalization of the model id as a best-effort match;
-    admins should set ``pricing_id`` for anything that must be priced exactly.
+    back to the model id itself; the returned candidate is matched against the
+    OpenRouter catalog by :func:`_build_price_resolver` (exact full-id first, then
+    unique provider-prefix-stripped suffix), so a bare ``gpt-5.6-terra`` resolves
+    to ``openai/gpt-5.6-terra`` without an admin ``pricing_id``. Set ``pricing_id``
+    only for irregular names the suffix can't reach (e.g. ``gpt-5.3-codex-spark``
+    → ``openai/gpt-5.3-codex``) or to force-unprice (``""``).
     """
     if pricing_id is not None:
         pid = pricing_id.strip()
         return pid or None  # "" → explicitly unpriced
     norm = resource.strip().lower()
     return norm or None
+
+
+def _build_price_resolver(
+    prices: dict[str, LlmTokenPrices],
+) -> Callable[[Optional[str]], Optional[LlmTokenPrices]]:
+    """Build a resolver ``candidate id → prices``: exact full-id, then unique suffix.
+
+    Two indexes over the OpenRouter catalog:
+    - ``by_full``: lowercased full id (``openai/gpt-5.5``) → prices, so an
+      admin-set ``pricing_id`` that already carries the provider prefix — and any
+      catalog ``model_id`` that is itself a full OpenRouter id — matches exactly.
+    - ``by_suffix``: the provider-prefix-stripped suffix (``gpt-5.5``) → prices,
+      but ONLY for suffixes that are unique across the catalog. A suffix shared by
+      two providers is dropped, so an ambiguous bare name fails closed (unpriced)
+      rather than being mis-priced against the wrong provider.
+
+    This lets a bare catalog ``model_id`` (``gpt-5.6-terra``) auto-match
+    ``openai/gpt-5.6-terra`` with no admin mapping, while every existing
+    exact-match and force-unprice path is preserved unchanged.
+    """
+    by_full: dict[str, LlmTokenPrices] = {}
+    suffix_counts: Counter = Counter()
+    for full_id in prices:
+        fl = full_id.lower()
+        by_full[fl] = prices[full_id]
+        suffix_counts[fl.split("/", 1)[-1]] += 1
+    by_suffix: dict[str, LlmTokenPrices] = {}
+    for full_id in prices:
+        suffix = full_id.lower().split("/", 1)[-1]
+        if suffix_counts[suffix] == 1:  # unique → safe to match by bare suffix
+            by_suffix[suffix] = prices[full_id]
+
+    def resolve(candidate: Optional[str]) -> Optional[LlmTokenPrices]:
+        if not candidate:
+            return None
+        c = candidate.strip().lower()
+        return by_full.get(c) or by_suffix.get(c.split("/", 1)[-1])
+
+    return resolve
 
 
 async def fetch_openrouter_prices(
@@ -167,13 +215,18 @@ async def sync_llm_rates(
     if not prices:
         return 0
     ts = now or datetime.now(timezone.utc)
+    resolve = _build_price_resolver(prices)
     inserted = 0
+    priced = 0
+    unpriced = 0
     async with app_pool.acquire() as conn:
         for resource, pricing_id in models:
             pid = _pricing_id_for(resource, pricing_id)
-            price = prices.get(pid) if pid else None
+            price = resolve(pid)
             if price is None:
+                unpriced += 1
                 continue  # unmatched / self-hosted → leave unpriced (cost = NULL)
+            priced += 1
             for unit, rate in price.rates().items():
                 if await _rate_changed(conn, resource, unit, rate):
                     await conn.execute(
@@ -188,6 +241,16 @@ async def sync_llm_rates(
                         ts,
                     )
                     inserted += 1
+    # Surface how many catalog resources matched a price vs. were left unpriced, so
+    # a regression (e.g. a future suffix collision silently dropping a model to
+    # unpriced) is visible in logs rather than invisible.
+    logger.debug(
+        "openrouter pricing: %d/%d catalog resource(s) matched a price; "
+        "%d left unpriced (self-hosted, or ambiguous/absent OpenRouter id)",
+        priced,
+        priced + unpriced,
+        unpriced,
+    )
     if inserted:
         logger.info("openrouter pricing: inserted %d new usage_rates row(s)", inserted)
     return inserted
