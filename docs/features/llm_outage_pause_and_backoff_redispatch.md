@@ -2,6 +2,14 @@
 
 Status: **IMPLEMENTED + k3d E2E VERIFIED — unit-tested + lint-clean, uncommitted on `develop`**
 Date: 2026-07-01
+**Updated 2026-07-15 by `[[llm_cooldown_pause_and_resume]]`** (two coupled changes,
+both live in code): (1) `cooldown` is no longer a blanket fail-fast Non-goal — a
+cooldown whose provider-stated reset fits the pause budget is now promoted INTO this
+Tier-2 pause path; only an over-budget/multi-day wall still fails fast. (2) the duration
+ceiling / pause budget dropped **24h → 12h** (`LLM_OUTAGE_CEILING_SECONDS` 86400 →
+43200). The historical "24h" figures in the prose below refer to the original value;
+the live default is 12h. See that doc for the anchored-reset change to
+`evaluate_llm_outage` (also live here).
 Scope: worker/loop jobs (the LangGraph worker in `src/graph.py`). Persistent
 interactive sessions are out of scope for v1 (§Non-goals).
 Research provenance: six-agent sweep (4 codebase + 2 web) on 2026-07-01; key
@@ -44,10 +52,12 @@ Either way, terminal, and the checkpointed state is never resumed.
 
 ## Non-goals (v1)
 
-- **Permanent** (401/403/404/400-invalid_request), **cooldown** (`model_cooldown`
-  multi-day quota), and **billing/quota-exhaustion** (OpenAI `insufficient_quota`)
-  errors keep **failing fast** — pausing 24h on a bad key or a spend cap helps nobody.
-  Only *transient* unavailability pauses (see §Error taxonomy). `[R]`
+- **Permanent** (401/403/404/400-invalid_request) and **billing/quota-exhaustion**
+  (OpenAI `insufficient_quota`) errors keep **failing fast** — pausing on a bad key or a
+  spend cap helps nobody. **`cooldown` was v1-Non-goal but is now conditional** (updated
+  2026-07-15, `[[llm_cooldown_pause_and_resume]]`): a `model_cooldown` whose reset fits
+  the 12h budget pauses via this path; an over-budget/multi-day wall still fails fast.
+  Only *transient* unavailability (and now short cooldowns) pause (see §Error taxonomy). `[R]`
 - **Persistent interactive sessions** (`src/persistent_graph.py`) keep current behavior.
 - No cockpit change beyond surfacing the pause reason (deferred, §Deferred).
 
@@ -97,7 +107,9 @@ process"; Azure Durable Functions literally "Don't use Thread.Sleep()"). `[R]`
 
 Retriable → Tier 1 then Tier 2: connection/timeout/408, 409, `rate_limit` (429
 per-minute), 5xx, `529`, `auth_unavailable`. Fail-fast (never enters the retry
-window): `permanent`, `cooldown`, `quota_exhausted`.
+window): `permanent`, `quota_exhausted`, and an **over-budget `cooldown`**.
+(Updated 2026-07-15: a within-budget `cooldown` now enters Tier 2 directly from the
+execute node — `[[llm_cooldown_pause_and_resume]]` — rather than failing fast.)
 
 ### Tier 1 — in-process fast retries (blips)
 
@@ -301,7 +313,7 @@ an outage anyway → they no-op. No consequential re-execution. `[R]`
 | `llm_outage_backoff_base_seconds` | 30 | first Tier-2 envelope |
 | `llm_outage_backoff_cap_seconds` | 3600 | 60-min cap |
 | `llm_outage_jitter` | `full` | `full` \| `equal` |
-| `llm_outage_ceiling_seconds` | 86400 | 24-h duration ceiling (primary) |
+| `llm_outage_ceiling_seconds` | 43200 | 12-h duration ceiling (primary); also the cooldown pause cutoff (updated 2026-07-15, was 86400/24h) |
 | `llm_outage_max_attempts` | 60 | attempts backstop |
 | `llm_outage_reset_window_seconds` | 7200 | gap that resets the attempt counter — **must exceed the backoff cap** (see below) |
 | `LLM_OUTAGE_SWEEP_SECONDS` | 30 | sweeper tick |
