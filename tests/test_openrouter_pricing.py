@@ -15,6 +15,7 @@ import pytest
 
 from orchestrator.services.openrouter_pricing import (
     LlmTokenPrices,
+    _build_price_resolver,
     _catalog_pricing_pairs,
     _price,
     _pricing_id_for,
@@ -100,6 +101,43 @@ class TestPricingIdFor:
 
     def test_none_falls_back_to_normalized_id(self):
         assert _pricing_id_for("GPT-5.5", None) == "gpt-5.5"
+
+
+# --- _build_price_resolver --------------------------------------------------
+
+
+class TestBuildPriceResolver:
+    _P = LlmTokenPrices(Decimal("0.0000025"), Decimal("0.00001"))
+    _Q = LlmTokenPrices(Decimal("0.000005"), Decimal("0.00003"))
+
+    def test_exact_full_id_match(self):
+        resolve = _build_price_resolver({"openai/gpt-5.5": self._P})
+        assert resolve("openai/gpt-5.5") is self._P
+
+    def test_bare_suffix_match(self):
+        # The whole point: a bare model id resolves to the prefixed OpenRouter id.
+        resolve = _build_price_resolver({"openai/gpt-5.6-terra": self._P})
+        assert resolve("gpt-5.6-terra") is self._P
+
+    def test_case_insensitive(self):
+        resolve = _build_price_resolver({"openai/gpt-5.5": self._P})
+        assert resolve("OpenAI/GPT-5.5") is self._P
+        assert resolve("GPT-5.5") is self._P
+
+    def test_ambiguous_suffix_dropped_but_full_id_still_resolves(self):
+        # Two providers share suffix 'foo' → bare 'foo' fails closed (unpriced),
+        # but the unambiguous full ids still resolve.
+        resolve = _build_price_resolver({"openai/foo": self._P, "bar/foo": self._Q})
+        assert resolve("foo") is None
+        assert resolve("openai/foo") is self._P
+        assert resolve("bar/foo") is self._Q
+
+    def test_none_empty_and_absent(self):
+        resolve = _build_price_resolver({"openai/gpt-5.5": self._P})
+        assert resolve(None) is None
+        assert resolve("") is None
+        assert resolve("   ") is None
+        assert resolve("nonexistent") is None
 
 
 # --- fetch_openrouter_prices ------------------------------------------------
@@ -253,6 +291,60 @@ class TestSyncLlmRates:
             now=self._TS,
         )
         assert n == 0
+
+    @pytest.mark.asyncio
+    async def test_bare_model_id_auto_matches_by_suffix(self):
+        # No admin pricing_id: the bare model_id 'gpt-5.5' resolves to the
+        # prefixed OpenRouter id 'openai/gpt-5.5' via the unique-suffix index.
+        conn = FakeConn()
+        n = await sync_llm_rates(
+            FakePool(conn),
+            [("gpt-5.5", None)],
+            prices=self._PRICES,
+            now=self._TS,
+        )
+        assert n == 3
+        assert ("gpt-5.5", "prompt-token", Decimal("0.0000025")) in conn.inserts
+
+    @pytest.mark.asyncio
+    async def test_bare_pricing_id_matches_by_suffix(self):
+        # An admin pricing_id given without the provider prefix still resolves.
+        conn = FakeConn()
+        n = await sync_llm_rates(
+            FakePool(conn),
+            [("gpt-5.5", "gpt-5.5")],
+            prices=self._PRICES,
+            now=self._TS,
+        )
+        assert n == 3
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_suffix_left_unpriced(self):
+        # 'foo' is published by two providers → the bare name is ambiguous and
+        # fails closed rather than pricing against the wrong provider.
+        conn = FakeConn()
+        prices = {
+            "openai/foo": LlmTokenPrices(Decimal("0.0000025"), Decimal("0.00001")),
+            "bar/foo": LlmTokenPrices(Decimal("0.000005"), Decimal("0.00003")),
+        }
+        n = await sync_llm_rates(
+            FakePool(conn), [("foo", None)], prices=prices, now=self._TS
+        )
+        assert n == 0
+        assert conn.inserts == []
+
+    @pytest.mark.asyncio
+    async def test_empty_pricing_id_force_unprices_despite_suffix_match(self):
+        # pricing_id="" wins even though 'gpt-5.5' would otherwise suffix-match.
+        conn = FakeConn()
+        n = await sync_llm_rates(
+            FakePool(conn),
+            [("gpt-5.5", "")],
+            prices=self._PRICES,
+            now=self._TS,
+        )
+        assert n == 0
+        assert conn.inserts == []
 
     @pytest.mark.asyncio
     async def test_no_pool_is_noop(self):
