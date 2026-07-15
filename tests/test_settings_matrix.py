@@ -132,7 +132,7 @@ class TestGpt56Family:
         assert "gpt-5.6" in matrix
         assert matrix["gpt-5.6"]["temperature"] == 1.0
         assert matrix["gpt-5.6"]["multimodal"] is True
-        # Enabled 2026-07-12 — langchain#34660 only affects the completed
+        # Enabled 2026-07-15 — langchain#34660 only affects the completed
         # Responses chunk, not the incremental stream the graph aggregates.
         assert matrix["gpt-5.6"]["parallel_tool_calls"] is True
         assert matrix["gpt-5.6"]["model_max_context_tokens"] == 1000000

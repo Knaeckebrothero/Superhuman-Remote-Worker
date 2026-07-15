@@ -410,8 +410,12 @@ def _classify_llm_error(error: Exception) -> str:
     Drives the retry decision in ``create_execute_node`` so non-retriable
     failures (404 model-not-found, 401/403 auth, 400 invalid_request) fail
     the job fast instead of looping forever — see
-    docs/issues/agent_infinite_retry_on_permanent_llm_errors.md for the
-    incident this prevents.
+    docs/done/agent_infinite_retry_on_permanent_llm_errors.md for the
+    incident this prevents, and
+    docs/done/transient_408_stream_disconnect_misclassified_as_permanent.md
+    for the inverse failure (an over-eager ``permanent`` verdict destroying
+    3.5h of work) that the status gate in the text fallback guards against.
+    Both directions are real: bias for retry, but do not retry blindly.
 
     Walks the exception's ``__cause__`` chain because LangChain wraps the
     underlying provider exception. Inspection order:
