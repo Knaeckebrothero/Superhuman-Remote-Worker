@@ -721,6 +721,28 @@ class TestClassifyLlmError:
         )
         assert _classify_llm_error(err) == "transient"
 
+    def test_stringified_novel_status_with_rejection_label_is_transient(self):
+        """The generalisation that stops this being whack-a-mole: a status we
+        have never seen before (499) carrying an invalid_request_error *label*
+        and NO stream wording must still be transient. The stringified rule is
+        written for 400s and must not claim anything else — so a future
+        transport status costs no new marker and no dead job."""
+        err = Exception(
+            "Error code: 499 - {'error': {'type': 'invalid_request_error', "
+            "'message': 'client closed request'}}"
+        )
+        assert _classify_llm_error(err) == "transient"
+
+    def test_stringified_422_stays_permanent(self):
+        """422 Unprocessable Entity IS a deterministic input rejection, so it
+        stays permanent — the gate keys on input-rejection statuses, not on a
+        blanket 'retry everything that isn't 400'."""
+        err = Exception(
+            "Error code: 422 - {'error': {'type': 'invalid_request_error', "
+            "'message': 'schema validation failed'}}"
+        )
+        assert _classify_llm_error(err) == "permanent"
+
     def test_400_stream_disconnect_is_transient(self):
         """Defense-in-depth: a dropped stream surfaced as a 400 (rather than
         408) invalid_request_error is still transport, not input — retry it."""

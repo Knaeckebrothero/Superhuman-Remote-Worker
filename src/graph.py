@@ -396,6 +396,14 @@ def _is_stream_disconnect(text: str) -> bool:
     return any(marker in text for marker in _STREAM_DISCONNECT_MARKERS)
 
 
+# Statuses whose bodies are genuinely deterministic input rejections, i.e. the
+# only ones the stringified ``invalid_request_error`` rule below is allowed to
+# claim. 401/403/404 are handled by their own text rules above it; every other
+# status (408, 409, 425, 499, 5xx, …) is transport and must stay retryable even
+# when the provider stamps an input-rejection *label* on it.
+_TEXT_INPUT_REJECTION_STATUS = frozenset({"400", "422"})
+
+
 def _classify_llm_error(error: Exception) -> str:
     """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
 
@@ -553,11 +561,19 @@ def _classify_llm_error(error: Exception) -> str:
         or "too many requests" in error_str
     ):
         return "rate_limit"
-    if "error code: 408" in error_str or _is_stream_disconnect(error_str):
-        # 408 Request Timeout / dropped response stream that lost its exception
-        # class — transient transport, even when the body mislabels it
-        # invalid_request_error. Scholar subjob 35b23256 lost 3.5h of work when
-        # this exact 408 stream-disconnect was classified permanent.
+    # Gate the stringified input-rejection rule below on the status the SDK
+    # stamped into the message. It is written for "a 400 that lost its exception
+    # class", but providers reuse the ``invalid_request_error`` *label* on
+    # failures carrying a completely different status — the 408 stream-disconnect
+    # that cost scholar 35b23256 3.5h of work. Keying on the status rather than
+    # on the message wording generalises to every future transport status
+    # (409, 425, 499, 5xx, …) instead of needing a new marker each time one bites.
+    m_status = re.search(r"error code:\s*(\d{3})", error_str)
+    if m_status and m_status.group(1) not in _TEXT_INPUT_REJECTION_STATUS:
+        return "transient"
+    if _is_stream_disconnect(error_str):
+        # No status in the text, but unambiguously a dropped stream: transport,
+        # not input.
         return "transient"
     if (
         "bad_request_error" in error_str or "invalid_request_error" in error_str
