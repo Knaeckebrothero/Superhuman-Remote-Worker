@@ -237,6 +237,10 @@ from src.core.session_tool_overrides import (  # noqa: E402
     SessionToolOverrideError,
     validate_session_tool_overrides,
 )
+
+# Tool -> category, for annotating replayed history (_stamp_tool_categories).
+# Same registry the agent's live SSE frames read, so the two can't disagree.
+from src.tools.registry import TOOL_REGISTRY  # noqa: E402
 from src.utils.ssh_key import (  # noqa: E402
     InvalidSSHKeyError,
     generate_ed25519_keypair as _generate_ed25519_keypair,
@@ -21059,6 +21063,28 @@ async def get_thread_citations(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _stamp_tool_categories(messages: list[dict[str, Any]]) -> None:
+    """Annotate replayed tool calls with their registry category, in place.
+
+    The live SSE ``tool.started`` frame carries ``category`` (see graph.py's
+    ``_get_tool_category``), but the stored ``thread_messages.tool_calls`` JSONB
+    never did. Without this the cockpit's folded-chip summary buckets every
+    replayed call as "other", so one turn reads
+    "19× citations · 12× searches" while streaming and "38× steps" after a
+    reload — same turn, same data, different answer.
+
+    Derived at read time rather than persisted so that re-categorising a tool
+    doesn't need a backfill of historical rows. Unknown tools (renamed, removed,
+    or from another deployment) simply get no category and fall back to the
+    cockpit's "other" bucket, which is the honest answer.
+    """
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            category = TOOL_REGISTRY.get(tc.get("name") or "", {}).get("category")
+            if category:
+                tc["category"] = category
+
+
 @app.get("/api/persistent/threads/{thread_id}/messages")
 async def get_thread_messages_history(
     thread_id: str,
@@ -21129,6 +21155,8 @@ async def get_thread_messages_history(
             total = len(messages)
         else:
             total = await postgres_db.get_thread_message_count(thread_id)
+
+    _stamp_tool_categories(messages)
 
     return {
         "messages": messages,
