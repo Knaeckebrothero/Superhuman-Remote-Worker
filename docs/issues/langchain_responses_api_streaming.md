@@ -1,18 +1,38 @@
 # LangChain Responses API — Tool Call Bugs
 
-## Status: Partially mitigated
+## Status: Streaming/parallel-tool bugs resolved for our version; non-streaming worker failure still OPEN
+
+> **2026-07-15 update.** The streaming tool-call bugs (Bugs 1 & 2) are no longer
+> a practical problem on the `langchain-openai==1.1.12` we run, so
+> `parallel_tool_calls` was **re-enabled** for `gpt-5`/`gpt-5.6`/`codex`/
+> `codex-spark`. See [`docs/done/parallel_tool_calls_reenabled_gpt5_codex.md`](../done/parallel_tool_calls_reenabled_gpt5_codex.md)
+> and the live-test plan in [`tests/parallel_tool_calls_validation.md`](../../tests/parallel_tool_calls_validation.md).
+> **This doc stays in `issues/`** because the non-streaming worker-graph
+> empty-response failure (below) is still unresolved.
 
 ## Problem
 
-LangChain's `ChatOpenAI` Responses API has multiple bugs that break tool calling, affecting models routed through `/v1/responses` (`gpt-5.*`, `o3`, `o4`, and all Codex proxy models). The streaming bugs were known first and only affected `persistent_graph.py`. We have now also confirmed a **non-streaming** failure mode that affects the worker graph (`graph.py`) when run against the Codex proxy — see "Confirmed worker-graph failure" below.
+LangChain's `ChatOpenAI` Responses API has multiple bugs that break tool calling, affecting models routed through `/v1/responses` (`gpt-5.*`, `o3`, `o4`, and all Codex proxy models). The streaming bugs were known first and only affected `persistent_graph.py`; they are now resolved for our pinned version (see Bugs 1 & 2). We have also confirmed a **non-streaming** failure mode that affects the worker graph (`graph.py`) when run against the Codex proxy — this remains open; see "Non-streaming failure mode" below.
 
 ### Streaming bugs (affect `persistent_graph.py`)
 
-#### Bug 1 — Streamed tool call args arrive as `{}`
+#### Bug 1 — Streamed tool call args arrive as `{}` — RESOLVED for langchain-openai ≥ 1.1.12
 
-**Issue:** [langchain-ai/langchain#34660](https://github.com/langchain-ai/langchain/issues/34660) — **OPEN, unfixed.** Linked PR #35624 was closed/rejected.
+**Issue:** [langchain-ai/langchain#34660](https://github.com/langchain-ai/langchain/issues/34660) — issue still **OPEN** upstream (linked PR #35624 was closed/rejected), but the **empty-args symptom no longer applies to the version we run.**
 
-When streaming with the Responses API, `response.function_call_arguments.delta` events are never extracted into `AIMessageChunk.tool_call_chunks`. The `response.completed` chunk contains metadata but the `tool_calls` from the aggregated message are missing. Result: tool calls arrive with empty args `{}`.
+The description below was accurate at **langchain-openai 1.1.6**: `response.function_call_arguments.delta` events weren't extracted into `AIMessageChunk.tool_call_chunks`, so streamed tool-call args arrived empty (`{}`).
+
+As of **1.1.12** (our pin), the delta handler **does** extract args into `tool_call_chunks` with the correct index — `langchain_openai/chat_models/base.py:4789-4796`:
+
+```python
+elif chunk.type == "response.function_call_arguments.delta":
+    _advance(chunk.output_index)
+    tool_call_chunks.append(
+        {"type": "tool_call_chunk", "args": chunk.delta, "index": current_index}
+    )
+```
+
+The only residual of #34660 is that the terminal `response.completed` chunk still omits the aggregated `tool_calls` (`base.py:4697-4714`) — but our graph reconstructs calls from the incremental stream chunks and never depends on the completed chunk for them. The `response.completed` block is byte-identical on upstream `master`, so this is settled behaviour, not something a version bump changes. **Net: streamed parallel tool calls aggregate correctly on 1.1.12**, which is why `parallel_tool_calls` was re-enabled (2026-07-15). The `persistent_graph.py` streaming→`ainvoke` workaround (mitigation #3) is now belt-and-suspenders rather than load-bearing.
 
 #### Bug 2 — `merge_dicts()` corrupts parallel tool calls
 
@@ -53,9 +73,13 @@ References:
 
 ## Current mitigations
 
-### 1. `parallel_tool_calls: false` in settings matrix
+### 1. ~~`parallel_tool_calls: false` in settings matrix~~ — REVERTED 2026-07-15
 
-Set for `gpt-5`, `codex`, and `codex-spark` families in `config/settings_matrix.yaml`. Prevents the model from voluntarily making parallel calls in normal operation, but does not structurally block it.
+Was set for `gpt-5`, `codex`, `codex-spark` (and later `gpt-5.6`) as a soft
+suppressant while Bugs 1 & 2 were live. **Now `parallel_tool_calls: true`** for
+all four families in `config/model_config_matrix.yaml` (the file that replaced
+the old `config/settings_matrix.yaml`), since Bug 2 is fixed and Bug 1 no longer
+applies to 1.1.12. See `docs/done/parallel_tool_calls_reenabled_gpt5_codex.md`.
 
 ### 2. Chat Completions for standard OpenAI models
 
@@ -84,9 +108,11 @@ The soft `parallel_tool_calls=false` flag doesn't cover edge cases where the use
 
 ## When to revisit
 
-- **#34807 — already shipped.** After bumping to `langchain-openai>=1.1.12`, the `merge_dicts` parallel-tool-call corruption is fixed and the streaming workaround in `persistent_graph.py` can be partially relaxed. We are not removing it yet because #34660 is still open.
-- **#34660** (streamed args arrive empty) — still open, no merged fix. PR #35624 was rejected. Watch for a maintainer-assigned PR before relaxing the streaming workaround in `persistent_graph.py` further. When fixed, also re-enable `parallel_tool_calls: true` in `config/settings_matrix.yaml` for `gpt-5`/`codex` families.
+- **#34807 — shipped & closed.** The `merge_dicts` parallel-tool-call corruption is fixed (in via the `langchain-openai>=1.1.12` pin).
+- **#34660 — resolved for our version (2026-07-15).** The empty-args symptom no longer applies to 1.1.12 (see Bug 1). `parallel_tool_calls: true` is already re-enabled for `gpt-5`/`gpt-5.6`/`codex`/`codex-spark`. The GitHub issue is still nominally open (terminal `response.completed` chunk omits `tool_calls`), but that residual doesn't affect our graph. The `persistent_graph.py` streaming→`ainvoke` workaround can be removed once the live parallel-tool tests (`tests/parallel_tool_calls_validation.md`) pass; keeping it for now is harmless.
 - **#35782** (chat-completions streaming silent drop) — still open, two community PRs auto-killed by the langchain bot for not having a pre-assigned issue. To unblock this, either get an issue assignment from a maintainer and resubmit, or vendor the fix in our `ReasoningChatOpenAI` subclass. **This bug does not directly affect us today** — our streaming path uses the Responses API (not chat completions) and our worker uses non-streaming.
 - **Non-streaming failure mode in the Codex worker** — needs the raw-response capture diagnostic described in the section above before any fix can be designed.
 
-Versions as of 2026-04-11: `langchain-openai` latest on PyPI is **1.1.12** (released 2026-03-23). Repo pin bumped from `>=0.0.5` to `>=1.1.12,<2.0` to pick up the #34807 fix. `openai` SDK at 2.14.0.
+Versions as of 2026-04-11: `langchain-openai` latest on PyPI was **1.1.12** (released 2026-03-23). Repo pin bumped from `>=0.0.5` to `>=1.1.12,<2.0` to pick up the #34807 fix. `openai` SDK at 2.14.0.
+
+Versions as of 2026-07-15: installed `langchain-openai==1.1.12`, `langchain-core==1.2.28`; latest on PyPI is **1.3.5**. We remain on 1.1.12 (pin allows `<2.0`); a bump is **not** required for the parallel-tool re-enablement — #34660's `response.completed` handling is unchanged through `master`, so no newer release changes the relevant behaviour.

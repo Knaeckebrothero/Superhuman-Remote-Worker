@@ -89,6 +89,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import (  # noqa: E402
     HTMLResponse,
     JSONResponse,
+    PlainTextResponse,
     RedirectResponse,
     Response,
     StreamingResponse,
@@ -7965,6 +7966,22 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
                 await snapshot_service.delete_snapshot(job_id)
             except Exception as e:
                 logger.warning(f"Snapshot cleanup failed for deleted job {job_id}: {e}")
+
+        # Log-archive objects die with the job (retention:
+        # docs/features/job_log_archive.md). Re-fetch the row — keys may have
+        # been stamped after this handler fetched it.
+        if snapshot_service.is_available:
+            try:
+                fresh = await postgres_db.get_job(job_id) or {}
+                ctx = fresh.get("context") or {}
+                if isinstance(ctx, str):
+                    ctx = json.loads(ctx)
+                for key in ctx.get("log_archive_keys") or []:
+                    await snapshot_service.delete_blob(str(key))
+            except Exception as e:
+                logger.warning(
+                    f"Log archive cleanup failed for deleted job {job_id}: {e}"
+                )
 
         # Clean up Gitea repo/branch
         if gitea_client.is_initialized:
@@ -20670,6 +20687,23 @@ async def end_thread(
     # container is already snapshotted to S3 above, so the file tree survives
     # there either way.
     if permanent:
+        # Log-archive objects die with the thread (retention:
+        # docs/features/job_log_archive.md). Re-read metadata —
+        # _release_thread_resources above just deleted the agent pod, which
+        # stamps fresh log_archive_keys onto the row.
+        if snapshot_service.is_available:
+            try:
+                fresh = await postgres_db.get_thread(thread_id) or {}
+                fmeta = fresh.get("metadata") or {}
+                if isinstance(fmeta, str):
+                    fmeta = json.loads(fmeta)
+                for key in fmeta.get("log_archive_keys") or []:
+                    await snapshot_service.delete_blob(str(key))
+            except Exception as e:
+                logger.warning(
+                    f"Log archive cleanup failed for deleted thread {thread_id}: {e}"
+                )
+
         repo_name = ws_ctx.get("repo_name")
         if repo_name and gitea_client.is_initialized:
             await gitea_client.delete_repo(repo_name)
@@ -22918,46 +22952,13 @@ async def voice_capabilities(request: Request) -> dict:
     }
 
 
-@app.get("/api/jobs/{job_id}/logs")
-async def get_job_logs(
-    request: Request,
-    job_id: str,
-    lines: int = Query(default=100, ge=1, le=1000),
-    grep: str | None = Query(default=None),
-    level: str | None = Query(default=None),
-) -> dict[str, Any]:
-    """Read the tail of a job's log file with optional filtering.
-
-    Args:
-        job_id: Job UUID
-        lines: Number of tail lines to return (1-1000, default 100)
-        grep: Case-insensitive substring filter
-        level: Log level filter (DEBUG, INFO, WARNING, ERROR)
-    """
+def _filter_log_lines(
+    all_lines: list[str], level: str | None, grep: str | None
+) -> tuple[list[str], bool]:
+    """Apply level/grep filters to log lines (text- and JSON-format aware)."""
     import re
 
-    # Validate job_id format
-    try:
-        UUID(job_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid job_id format: {job_id}")
-
-    await require_job_access(request, postgres_db, job_id)
-
-    log_path = workspace_service.base_path / "logs" / f"job_{job_id}.log"
-    if not log_path.exists():
-        raise HTTPException(
-            status_code=404, detail=f"Log file not found for job {job_id}"
-        )
-
-    try:
-        all_lines = log_path.read_text().splitlines()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read log file: {e}")
-
     filtered = False
-
-    # Level filter: match lines starting with timestamp pattern followed by level
     if level:
         level_upper = level.upper()
         if level_upper not in ("DEBUG", "INFO", "WARNING", "ERROR"):
@@ -22965,18 +22966,118 @@ async def get_job_logs(
                 status_code=400,
                 detail=f"Invalid level: {level}. Must be DEBUG, INFO, WARNING, or ERROR",
             )
+        # Both formats occur: local dev files use the text formatter
+        # ("… - name - LEVEL - …"); archived pod logs are JSON lines
+        # ('"level": "LEVEL"'), possibly prefixed with kubelet timestamps.
         pattern = re.compile(
             rf"^\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}}\s+-\s+\S+\s+-\s+{level_upper}\s+-"
         )
-        all_lines = [line for line in all_lines if pattern.match(line)]
+        json_tokens = (f'"level": "{level_upper}"', f'"level":"{level_upper}"')
+        all_lines = [
+            line
+            for line in all_lines
+            if pattern.match(line) or any(t in line for t in json_tokens)
+        ]
         filtered = True
 
-    # Grep filter
     if grep:
         grep_lower = grep.lower()
         all_lines = [line for line in all_lines if grep_lower in line.lower()]
         filtered = True
 
+    return all_lines, filtered
+
+
+async def _read_archived_agent_log(meta: dict | str | None) -> str | None:
+    """Stitch the archived agent-pod log(s) referenced by a job/thread row.
+
+    ``log_archive_keys`` is stamped at pod deletion by the log archive
+    (docs/features/job_log_archive.md). Returns the concatenated text, or
+    ``None`` when the row has no archive or the store is unavailable.
+    """
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    keys = (meta or {}).get("log_archive_keys") or []
+    if not isinstance(keys, list) or not keys:
+        return None
+    chunks: list[str] = []
+    for key in keys:
+        data = await snapshot_service.get_blob(str(key))
+        if data:
+            chunks.append(data.decode("utf-8", "replace"))
+    return "\n".join(chunks) if chunks else None
+
+
+def _scope_archived_lines(text: str, token: str) -> list[str]:
+    """Scope a shared pod log to one job/thread by its id-tagged lines.
+
+    In-cluster lines are correlation-tagged JSON (Slice 0 of
+    centralized_logging), so substring-matching the uuid disaggregates a
+    multi-job worker-pod log. If nothing matches, the log predates tagging
+    (or ran LOG_FORMAT=text) — return it whole rather than hide it.
+    """
+    all_lines = text.splitlines()
+    matched = [line for line in all_lines if token in line]
+    return matched or all_lines
+
+
+@app.get("/api/jobs/{job_id}/logs")
+async def get_job_logs(
+    request: Request,
+    job_id: str,
+    lines: int = Query(default=100, ge=1, le=1000),
+    grep: str | None = Query(default=None),
+    level: str | None = Query(default=None),
+    raw: bool = Query(default=False),
+) -> Any:
+    """Read the tail of a job's log file with optional filtering.
+
+    Serves the live per-job file when it exists (compose/dev shared volume),
+    else falls back to the S3 log archive written at agent-pod deletion
+    (docs/features/job_log_archive.md) — logs stay readable after the reap.
+
+    Args:
+        job_id: Job UUID
+        lines: Number of tail lines to return (1-1000, default 100)
+        grep: Case-insensitive substring filter
+        level: Log level filter (DEBUG, INFO, WARNING, ERROR)
+        raw: Return the whole log as text/plain, no filtering/tailing —
+            for reading in an IDE or handing to an agent. For archived
+            logs this is the full pod log (may span multiple jobs).
+    """
+    # Validate job_id format
+    try:
+        UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid job_id format: {job_id}")
+
+    _, job = await require_job_access(request, postgres_db, job_id)
+
+    archived = False
+    log_path = workspace_service.base_path / "logs" / f"job_{job_id}.log"
+    if log_path.exists():
+        try:
+            text = log_path.read_text()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read log file: {e}")
+        all_lines = text.splitlines()
+    else:
+        archived_text = await _read_archived_agent_log(job.get("context"))
+        if archived_text is None:
+            raise HTTPException(
+                status_code=404, detail=f"Log file not found for job {job_id}"
+            )
+        archived = True
+        text = archived_text
+        all_lines = _scope_archived_lines(text, job_id)
+
+    if raw:
+        return PlainTextResponse(text)
+
+    all_lines, filtered = _filter_log_lines(all_lines, level, grep)
     total_lines = len(all_lines)
 
     # Tail N lines
@@ -22987,7 +23088,58 @@ async def get_job_logs(
         "lines": tail_lines,
         "total_lines": total_lines,
         "filtered": filtered,
-        "log_path": str(log_path),
+        "archived": archived,
+        "log_path": None if archived else str(log_path),
+    }
+
+
+@app.get("/api/persistent/threads/{thread_id}/logs")
+async def get_thread_logs(
+    request: Request,
+    thread_id: str,
+    lines: int = Query(default=100, ge=1, le=1000),
+    grep: str | None = Query(default=None),
+    level: str | None = Query(default=None),
+    raw: bool = Query(default=False),
+) -> Any:
+    """Read the archived agent-pod log for a session (auth: owner only).
+
+    Post-mortem debugging for sessions whose agent pod is gone: serves the
+    S3 archive written at pod deletion (docs/features/job_log_archive.md).
+    404s until the pod has been deleted at least once — while it is alive,
+    the log lives on the pod (``kubectl logs``).
+    """
+    try:
+        UUID(thread_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid thread_id format: {thread_id}"
+        )
+
+    _, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    text = await _read_archived_agent_log(thread.get("metadata"))
+    if text is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No archived log for this session — the agent pod may still "
+                "be running, or it was deleted before the log archive existed"
+            ),
+        )
+    if raw:
+        return PlainTextResponse(text)
+
+    all_lines = _scope_archived_lines(text, thread_id)
+    all_lines, filtered = _filter_log_lines(all_lines, level, grep)
+    total_lines = len(all_lines)
+
+    return {
+        "thread_id": thread_id,
+        "lines": all_lines[-lines:],
+        "total_lines": total_lines,
+        "filtered": filtered,
+        "archived": True,
     }
 
 

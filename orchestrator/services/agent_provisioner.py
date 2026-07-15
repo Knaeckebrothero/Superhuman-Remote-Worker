@@ -354,6 +354,13 @@ class AgentProvisioner:
         if not self._k8s_available:
             return False
 
+        # Post-mortem log preservation (docs/features/job_log_archive.md):
+        # archive the full pod log to S3 before the pod — and the log the
+        # kubelet holds for it — disappears. This is the one choke point all
+        # deletion paths share (reap, scale-down, session end, suspension,
+        # orphan cleanup). Exception-safe by contract.
+        await self._archive_pod_logs(pod_name)
+
         try:
             await asyncio.to_thread(
                 self._core_api.delete_namespaced_pod,
@@ -369,6 +376,136 @@ class AgentProvisioner:
                 return True
             logger.error("Failed to delete agent pod %s: %s", pod_name, e)
             return False
+
+    async def _archive_pod_logs(self, pod_name: str) -> None:
+        """Archive the agent container's full log to S3 before pod deletion.
+
+        Reads via the k8s API (works on crashed/OOM-killed containers — the
+        kubelet keeps the log until the pod *object* is deleted, and we are
+        the deletion point), uploads to the snapshot bucket, and stamps the
+        object keys onto the jobs/threads the pod served so the read path
+        never has to resolve pod names after the rows' agent FK nulls out.
+
+        Always exception-safe: archiving must never block pod deletion.
+        """
+        try:
+            from services.snapshot_service import snapshot_service
+
+            if not snapshot_service.is_available:
+                return
+
+            try:
+                pod = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod,
+                    name=pod_name,
+                    namespace=self._namespace,
+                )
+            except Exception as e:
+                if getattr(e, "status", None) == 404:
+                    return
+                raise
+
+            # 50 MB cap per incarnation — generous; the kubelet rotates at
+            # ~10Mi/file anyway, so anything larger never survives node-side.
+            limit_bytes = 50 * 1024 * 1024
+            logs: dict[str, str] = {}
+            try:
+                current = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod_log,
+                    name=pod_name,
+                    namespace=self._namespace,
+                    container="agent",
+                    timestamps=True,
+                    limit_bytes=limit_bytes,
+                )
+                if current:
+                    logs["current"] = current
+            except Exception as e:
+                logger.debug("Log archive: no current log for %s: %s", pod_name, e)
+            # The pre-restart incarnation holds the crash that *caused* the
+            # restart (OOMKilled traceback etc.). Most pods have none — the
+            # API errors when there is no previous container; best-effort.
+            try:
+                previous = await asyncio.to_thread(
+                    self._core_api.read_namespaced_pod_log,
+                    name=pod_name,
+                    namespace=self._namespace,
+                    container="agent",
+                    timestamps=True,
+                    previous=True,
+                    limit_bytes=limit_bytes,
+                )
+                if previous:
+                    logs["previous"] = previous
+            except Exception:
+                pass
+
+            if not logs:
+                return
+
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            keys: list[str] = []
+            for kind, text in logs.items():
+                suffix = ".previous.log" if kind == "previous" else ".log"
+                key = f"agent_logs/{pod_name}/{ts}{suffix}"
+                if await snapshot_service.put_blob(
+                    key,
+                    text.encode("utf-8", "replace"),
+                    content_type="text/plain; charset=utf-8",
+                ):
+                    keys.append(key)
+            if not keys:
+                return
+
+            await self._stamp_log_archive_keys(pod, keys)
+            logger.info("Archived agent pod logs: pod=%s keys=%s", pod_name, keys)
+        except Exception:
+            logger.exception("Log archive failed for pod %s (non-fatal)", pod_name)
+
+    async def _stamp_log_archive_keys(self, pod, keys: list) -> None:
+        """Append archive keys to the jobs/threads this pod served."""
+        if not self._db:
+            return
+        import json
+
+        keys_json = json.dumps(keys)
+        pod_name = pod.metadata.name
+        thread_id = (pod.metadata.labels or {}).get("srw.io/thread-id")
+        async with self._db.acquire() as conn:
+            if thread_id:
+                await conn.execute(
+                    """
+                    UPDATE threads
+                    SET metadata = jsonb_set(
+                            COALESCE(metadata, '{}'),
+                            '{log_archive_keys}',
+                            COALESCE(metadata->'log_archive_keys', '[]'::jsonb)
+                                || $2::jsonb)
+                    WHERE id = $1
+                    """,
+                    thread_id,
+                    keys_json,
+                )
+            # Worker pods carry no job label (one pod serves many jobs
+            # sequentially) — resolve through the agent registration while it
+            # still exists. Stamping now rather than resolving at read time:
+            # jobs.assigned_agent_id is ON DELETE SET NULL, so the job→pod
+            # link dies with the agent row.
+            await conn.execute(
+                """
+                UPDATE jobs
+                SET context = jsonb_set(
+                        COALESCE(context, '{}'),
+                        '{log_archive_keys}',
+                        COALESCE(context->'log_archive_keys', '[]'::jsonb)
+                            || $2::jsonb)
+                WHERE assigned_agent_id IN (
+                    SELECT id FROM agents WHERE hostname = $1
+                )
+                """,
+                pod_name,
+                keys_json,
+            )
 
     async def delete_agent_pod_by_thread(self, thread_id: str) -> bool:
         """Delete agent pod(s) matching a thread_id label.

@@ -1484,6 +1484,36 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
+    async def get_thread_logs(
+        self,
+        thread_id: str,
+        lines: int = 100,
+        grep: str | None = None,
+        level: str | None = None,
+    ) -> dict[str, Any]:
+        """Get the archived agent-pod log for a session with optional filtering.
+
+        Args:
+            thread_id: Thread UUID
+            lines: Number of tail lines (1-1000)
+            grep: Case-insensitive substring filter
+            level: Log level filter (DEBUG, INFO, WARNING, ERROR)
+
+        Returns:
+            Dict with lines list, total_lines, filtered flag
+        """
+        params: dict[str, Any] = {"lines": lines}
+        if grep:
+            params["grep"] = grep
+        if level:
+            params["level"] = level
+        resp = await self._client.get(
+            f"/api/persistent/threads/{thread_id}/logs", params=params
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
     async def list_llm_requests(
         self,
         job_id: str,

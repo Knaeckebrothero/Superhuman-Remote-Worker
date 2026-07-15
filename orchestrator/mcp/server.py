@@ -1494,7 +1494,9 @@ async def get_job_log(
     """Read the tail of a job's log file with optional filtering.
 
     Returns the last N lines of the log file, optionally filtered by log
-    level and/or grep pattern. Useful for diagnosing agent errors.
+    level and/or grep pattern. Useful for diagnosing agent errors. Works
+    after the agent pod is gone too: falls back to the S3 log archive
+    written at pod deletion, scoped to this job's lines.
 
     Args:
         job_id: Job UUID
@@ -1518,6 +1520,44 @@ async def get_job_log(
         return fmt.format_job_log(job_id, data)
     except Exception as e:
         return fmt.format_workspace_error("get job log", job_id, e)
+
+
+@mcp.tool
+async def get_thread_log(
+    thread_id: str,
+    lines: int = 100,
+    grep: str | None = None,
+    level: str | None = None,
+) -> str:
+    """Read the archived agent-pod log for a persistent session.
+
+    Post-mortem debugging for sessions whose agent pod has been torn down
+    (idle timeout, session end, crash + reap): the pod's full log is archived
+    to S3 at deletion and served here, scoped to this thread's lines. Returns
+    404 while the pod is still alive — the log is only archived at teardown.
+
+    Args:
+        thread_id: Thread UUID
+        lines: Number of tail lines to return (max 1000, default 100)
+        grep: Case-insensitive substring filter
+        level: Log level filter (DEBUG, INFO, WARNING, ERROR)
+
+    Returns:
+        Formatted log output with line count and filter info
+    """
+    if lines < 1:
+        lines = 1
+    elif lines > 1000:
+        lines = 1000
+
+    client = _get_client()
+    try:
+        data = await client.get_thread_logs(
+            thread_id=thread_id, lines=lines, grep=grep, level=level
+        )
+        return fmt.format_thread_log(thread_id, data)
+    except Exception as e:
+        return fmt.format_workspace_error("get thread log", thread_id, e)
 
 
 @mcp.tool

@@ -7,6 +7,7 @@ tags:
   - retention
   - debugging
 related:
+  - "[[job_log_archive]]"
   - "[[observability_and_quotas]]"
   - "[[high_availability_setup]]"
   - "[[database_architecture]]"
@@ -29,11 +30,21 @@ aliases:
 > produced them is gone — without depending on a teardown hook or on the pod
 > being reachable at teardown time.
 
-**Status:** **Slice 0 ✅ shipped + k3d-verified 2026-06-15** (structured JSON
-logging + correlation IDs + secret redaction). Slices 0.5–3 (vm-controller
-parity, Loki + Alloy + Grafana, retention, OTel) **not started** — the
-continuous-shipping pipeline itself is still the open work, so this doc stays
-in `features/`.
+**Status: PARKED 2026-07-15.** The triggering scenario — "user's job crashed,
+pods reaped, logs gone" — is solved the lean way instead: capture-at-deletion
+via the k8s API to S3, see [[job_log_archive]]. That mechanism is fine for the
+per-job case because it is *not* the SSH-dependent teardown-pull this doc
+argues against (§ "Why capture-at-deprovision is the wrong mechanism" attacks
+SSH pulls and no-teardown streams, not k8s-API reads at our own deletion
+point). This doc stays as the design of record for the **full ops pipeline**
+(orchestrator/vm-controller streams, cross-pod timelines, LogQL) — un-park it
+if cross-pod ops forensics becomes a recurring pain. Everything below is
+preserved as designed.
+**Slice 0 ✅ shipped + k3d-verified 2026-06-15** (structured JSON logging +
+correlation IDs + secret redaction) — this underpins [[job_log_archive]] too
+(job_id-tagged lines are what make per-job filtering of a shared pod log
+possible). Slices 0.5–3 (vm-controller parity, Loki + Alloy + Grafana,
+retention, OTel) **not started**.
 **Revised 2026-07-09** (design review before Slice 1): the VM backend became a
 first-class production path after this doc was written, so the vm-controller /
 second cluster is now a fourth log stream in the problem table; the pipeline

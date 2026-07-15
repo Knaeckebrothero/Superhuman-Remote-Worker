@@ -322,7 +322,7 @@ gpt-5:
   settings:
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5 supports image inputs
-    # Enabled 2026-07-12. langchain#34660 is still OPEN but only concerns the
+    # Enabled 2026-07-15. langchain#34660 is still OPEN but only concerns the
     # final `response.completed` Responses chunk lacking tool_calls; the
     # incremental function_call/args-delta stream chunks are emitted correctly
     # and the graph loop aggregates them via AIMessageChunk (verified against
@@ -362,7 +362,7 @@ gpt-5.6:
     structured_output_method: json_schema
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5.6 supports image inputs
-    # Enabled 2026-07-12 — empirically validated. Same Responses-API path as
+    # Enabled 2026-07-15 — empirically validated. Same Responses-API path as
     # gpt-5; see the gpt-5 block for why langchain#34660 doesn't block this.
     parallel_tool_calls: true
     model_max_context_tokens: 1000000  # Luna/Terra/Sol: 1M ctx, 128K max output
@@ -388,7 +388,7 @@ codex:
   settings:
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
-    # Enabled 2026-07-12. Same Responses-API/codex-proxy path as gpt-5; see the
+    # Enabled 2026-07-15. Same Responses-API/codex-proxy path as gpt-5; see the
     # gpt-5 block for why langchain#34660 doesn't block the graph loop.
     parallel_tool_calls: true
     model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
@@ -410,7 +410,7 @@ codex-spark:
   settings:
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: false  # Codex Spark is code-focused, no vision
-    # Enabled 2026-07-12. Same Responses-API/codex-proxy path as gpt-5; see the
+    # Enabled 2026-07-15. Same Responses-API/codex-proxy path as gpt-5; see the
     # gpt-5 block for why langchain#34660 doesn't block the graph loop.
     parallel_tool_calls: true
     model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
