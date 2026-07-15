@@ -2208,13 +2208,27 @@
 }
 .tool-group[open] > .tool-group-head .tool-group-chevron { transform: rotate(90deg); }
 
-.tool-group-label { font-weight: 600; color: var(--text-secondary); }
-
-.tool-group-names {
+// The chip's category count line ("24× searches · 6× thoughts"). Truncates
+// rather than wrapping: the chip is a one-row summary of hidden work, and a
+// wrapping chip would defeat the point of folding in the first place. The
+// category count is capped in TS so this rarely bites.
+.tool-group-label {
   @include m.truncate;
   flex: 1;
   min-width: 0;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+// Failures inside a folded run. The chip deliberately does NOT auto-open on
+// failure (a turn-wide chip would dump every card because one call errored) —
+// this badge is what carries it, and a just-failed call is pinned anyway.
+// NOTE: this file sits ~at the 36kB anyComponentStyle budget. Keep additions
+// minimal and do NOT raise the budget — see project_persistent_chat_style_budget.
+.tool-group-failed {
+  flex: none;
   font-size: 11px;
+  color: var(--danger);
 }
 
 .tool-group-body { padding: v.$space-xs; }

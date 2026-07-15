@@ -137,20 +137,69 @@ Each `TurnEvent` renders as its own card inside the turn bubble. No merging, no 
 - A streaming turn shows cards appearing in order with no layout shift on completion.
 - Hidden-reasoning thought cards render meaningfully (no empty bodies).
 
-### Phase 2 — smart merging
+### Phase 2 — the live edge *(SHIPPED 2026-07-15)*
 
-After Phase 1 has been in use long enough to learn what feels right:
+> **Supersedes the original Phase 2** ("smart merging": fold a short thought into
+> the tool card that follows it, nest parallel batches inside one merged card).
+> That plan assumed the problem was *card density*. Living with Phase 1 showed
+> the problem is *row count* — merging a thought into the next card still leaves
+> one row per step. Superseded rather than deferred; don't revive it without
+> re-reading the "why it failed" note below.
 
-- **Merge a short thought into the next tool card** when the thought is under a length threshold AND directly precedes a single tool AND no text comes between. The thought appears as a one-line rationale strip inside the tool card.
-- **Nest parallel tool batches** inside one merged card when multiple tools follow a single thought (e.g., parallel reads, glob + grep). The card body becomes a list of tools rather than one.
-- **Standalone thought cards** remain for: initial planning thoughts (before any tool), reflective thoughts that precede only text, and long thoughts above the length threshold.
+**The rule.** Within an assistant turn, an event is **pinned** — rendered as its
+own card — when it is:
 
-The rule:
+1. **in flight** — `tool.status` is `pending`/`running`, or `thought.status` is
+   `streaming`; or
+2. **the turn's most recent tool call**, always.
 
-1. Thought → 1 tool, under length threshold, no intervening text → **merged card**
-2. Thought → N tools (batch), under length threshold, no intervening text → **merged card with nested tools**
-3. Thought with no following tool → **standalone**
-4. Thought above length threshold → **standalone**
+Text and compaction markers never fold: text is the answer, and a compaction
+marker is too significant to hide. Everything else folds, and *contiguous
+unpinned stretches merge into a single chip* — across thoughts, which is the
+load-bearing part. A stretch shorter than `MIN_FOLD_RUN` (2) renders inline
+instead: a "1× thought" chip is the same height as the card it replaces and
+strictly less informative.
+
+**Why the old rule failed.** It only folded runs of *consecutive tool calls*, at
+a threshold of 4, and `groupEvents` broke a run at every thought. A turn that
+alternated thought → 6 tools → thought → 6 tools rendered as a dozen rows even
+though every run was individually folded. Lowering the threshold would have
+changed nothing — every run was already over it. Thoughts had to become foldable
+and runs had to survive them.
+
+**Chip label: categories, not types.** `24× searches · 20× citations · 6×
+thoughts`. A grand total *plus* per-category counts would double-count, because
+commands are tool calls. Thoughts get their own bucket. Sorted by count,
+capped at `CHIP_CATEGORY_CAP` (4) with a `+N more` tail — stated, never silently
+dropped, and opening the chip shows everything regardless. Category comes from
+`ToolCallEvent.category` (stamped from `TOOL_REGISTRY` at `graph.py:4053`);
+older history rows without it bucket as `other`. The nouns live in
+`CATEGORY_NOUNS` / `CATEGORY_NOUNS_ONE` — deliberately separate from
+`CATEGORY_LABELS`, whose gerund phrases ("Working with files") don't compose
+with a leading count. Two flat maps rather than an ICU plural rule because no
+messageformat plugin is wired into transloco, and one isn't worth a dependency
+for a count line.
+
+**Failures badge, they don't pin.** The chip carries `⚠ N failed` and does
+**not** auto-open. The old per-run fold auto-opened on any error; with a
+turn-wide chip that would dump twenty cards because one call failed. Pinning
+failures instead was considered and rejected: it muddies the pin set (otherwise
+cleanly "what is happening right now") and permanently fragments the chip over
+transient failures the agent already retried past. A *just*-failed call is
+visible anyway — it's the latest tool call, so it's pinned.
+
+**Escape hatch.** The `toolCallsExpanded` preference ("Tool calls → Expanded")
+still disables folding entirely; every event renders inline with no chip.
+
+**Ordering is preserved** — a completed call sandwiched between two in-flight
+ones renders inline, in place. Tool results land out of order, so "in flight" is
+a per-event property, never "near the end of the array".
+
+**Sequencing note.** This makes the message list *shrink* on every tool return,
+adding a live height change per tool. It deliberately shipped *after* the
+ResizeObserver scroll pin ([[cockpit_session_scroll_pin_misses_late_height_changes]],
+`84fa3e05`) — on the old enumerate-the-causes pin, every one of those shrinks
+would have been an untracked height change.
 
 ### Phase 3 — polish
 
