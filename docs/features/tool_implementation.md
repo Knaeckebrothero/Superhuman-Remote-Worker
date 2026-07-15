@@ -30,8 +30,8 @@ Two mechanisms provide tool knowledge to the agent:
 
 Lives in `src/tools/description_manager.py`.
 
-- **Per-tool registry metadata** `defer_to_workspace: True` + a one-line `short_description`, set in the tool modules. Deferred today (~12 tools): `sql_*` (3), mongodb (5), graph/neo4j (3), `get_document_info` (1) — the datasource-heavy, complex-usage ones.
-- **`apply_description_overrides(tools)`** — at load time, for any tool flagged `defer_to_workspace`, swaps the full docstring for `short_description` via `model_copy(update={"description": ...})`. Called at `agent.py:1865` (worker) and `persistent_session.py:464` (sessions).
+- **Per-tool registry metadata** `defer_to_workspace: True` + a one-line `short_description`, set in the tool modules. Deferred today (**24 tools**): citation (11), mongodb (5), `sql_*` (3), graph/neo4j (3), `web_search` (1), `get_document_info` (1) — the datasource-heavy, complex-usage ones.
+- **`apply_description_overrides(tools)`** — at load time, for any tool flagged `defer_to_workspace`, swaps the full docstring for `short_description` via `model_copy(update={"description": ...})`. Called at `agent.py:2809` (worker) and `persistent_session.py:1311` (sessions).
 - **`generate_workspace_tool_docs(...)`** — writes `tools/README.md` (index grouped by category) + `tools/<tool>.md` (full doc per tool) into the workspace. Called just before the overrides at both sites.
 - Helpers: `get_deferred_tools()`, `get_core_tools()`.
 
@@ -44,6 +44,14 @@ Tool definitions ride on **every** LLM call, so they are pure fixed overhead com
 > ⚠️ **Deferral today shortens the *description text* only. The tool stays in `bind_tools()`, so its full parameter schema is still serialized every call.** Description-shortening ≠ removing the tool from context.
 
 This is the load-bearing fact. To actually reclaim context you must **unbind** the tool, not just shorten its blurb.
+
+### The corollary: under deferral, the type *is* the documentation
+
+The same fact cuts the other way, and it is a rule worth applying everywhere:
+
+> **Prose gets stripped; types survive.** `apply_description_overrides` replaces the description and leaves `args_schema` untouched. So a constraint written in a docstring is invisible to a deferred tool's caller, while the same constraint expressed as `Literal[...]` reaches the model **at zero marginal token cost** — that schema ships on every call regardless.
+
+Any closed vocabulary (enum values, mode switches, fixed sets) therefore belongs in the signature, never in Args prose alone. `web_search` obeys this (`research/web.py:179-188`) and has never emitted a bad value. The citation tools did not, and an agent burned nine `edit_citation` calls guessing `extraction_method` — the docstring naming its five values was the one thing deferral had removed. Full write-up: `docs/issues/agent_tool_fixed_vocabularies_invisible_to_model.md`; regression cover in `tests/test_tool_vocabularies.py` (which asserts the enum survives the override).
 
 **Magnitudes are currently unmeasured on this architecture.** Before leaning on numbers, measure for real: introspect the serialized tool schemas (the OpenAI function-call format LangChain emits), tokenize, and compare full-vs-`short_description` per category on a live config (the session-71 set, or `developer`). External anchor only: Anthropic reports tool defs consuming tens-to-hundreds of K tokens in large multi-server setups — directionally why this matters, not our numbers.
 

@@ -745,22 +745,8 @@ class CitationEngine:
             log.error(f"Source not found: {source_id}")
             raise ValueError(f"Source not found: {source_id}")
 
-        try:
-            conf = Confidence(confidence)
-        except ValueError as e:
-            log.error(f"Invalid confidence value: {confidence}")
-            raise ValueError(
-                f"Invalid confidence: {confidence}. Use 'high', 'medium', or 'low'."
-            ) from e
-
-        try:
-            ExtractionMethod(extraction_method)  # Validate only
-        except ValueError as e:
-            log.error(f"Invalid extraction_method value: {extraction_method}")
-            raise ValueError(
-                f"Invalid extraction_method: {extraction_method}. "
-                "Use 'direct_quote', 'paraphrase', 'inference', 'aggregation', or 'negative'."
-            ) from e
+        conf = self._validate_confidence(confidence)
+        self._validate_extraction_method(extraction_method)
 
         self._validate_reasoning_requirement(conf, relevance_reasoning)
 
@@ -871,6 +857,40 @@ class CitationEngine:
             return
         await asyncio.wait(pending, timeout=timeout)
 
+    @staticmethod
+    def _validate_confidence(confidence: str) -> Confidence:
+        """Coerce a confidence label, raising an actionable error if invalid.
+
+        Shared by ``create_citation`` and ``edit_citation`` so the two cannot
+        drift: the edit path used to skip validation entirely and let the
+        ``::confidence_level`` cast fail in Postgres, whose error names no
+        valid values.
+        """
+        try:
+            return Confidence(confidence)
+        except ValueError as e:
+            log.error(f"Invalid confidence value: {confidence}")
+            raise ValueError(
+                f"Invalid confidence: {confidence}. Use 'high', 'medium', or 'low'."
+            ) from e
+
+    @staticmethod
+    def _validate_extraction_method(extraction_method: str) -> ExtractionMethod:
+        """Coerce an extraction-method label, raising an actionable error.
+
+        See ``_validate_confidence`` — same rationale. The message must name the
+        valid values: it is the agent's only recovery hint when a tool-schema
+        constraint isn't in play (non-agent callers, or a model that ignores it).
+        """
+        try:
+            return ExtractionMethod(extraction_method)
+        except ValueError as e:
+            log.error(f"Invalid extraction_method value: {extraction_method}")
+            raise ValueError(
+                f"Invalid extraction_method: {extraction_method}. "
+                "Use 'direct_quote', 'paraphrase', 'inference', 'aggregation', or 'negative'."
+            ) from e
+
     def _validate_reasoning_requirement(
         self,
         confidence: Confidence,
@@ -952,8 +972,20 @@ class CitationEngine:
         are cleared. Scoped to ``context.session_id`` (job_id).
 
         Raises:
-            ValueError: If the citation is not found / not owned, or no fields given.
+            ValueError: If an enum-backed field is invalid, the citation is not
+                found / not owned, or no fields given.
         """
+        # Validate before touching the DB. Without this the bad value reaches
+        # the ``::confidence_level`` / ``::extraction_method`` casts below and
+        # Postgres raises InvalidTextRepresentationError — which is not a
+        # ValueError, so it bypasses the tool layer's handler and surfaces as a
+        # raw driver string that never names the valid values. The create path
+        # has always validated; this path never did.
+        if confidence is not None:
+            self._validate_confidence(confidence)
+        if extraction_method is not None:
+            self._validate_extraction_method(extraction_method)
+
         job_uuid = self._job_uuid()
 
         # Ownership guard (job-scoped).
@@ -1187,6 +1219,17 @@ class CitationEngine:
         job_id: str | None = None,
     ) -> list[Citation]:
         """List citations with optional filters (job-scoped by default)."""
+        # Validate before the ::verification_status cast below, which would
+        # otherwise reject a bad label in Postgres with an unactionable error.
+        if verification_status is not None:
+            try:
+                VerificationStatus(verification_status)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid verification_status '{verification_status}'. "
+                    "Use: pending, verified, failed, unverified"
+                ) from e
+
         job_uuid = self._as_uuid(job_id) if job_id is not None else self._job_uuid()
         log.debug(
             f"Listing citations: job_id={job_uuid}, source_id={source_id}, "
@@ -1426,6 +1469,17 @@ class CitationEngine:
             )
         if scope not in ("content", "annotations", "all"):
             raise ValueError(f"Invalid scope '{scope}'. Use: content, annotations, all")
+        # `source_type` was the odd one out: its siblings above were checked
+        # while it flowed unvalidated into search.py's `s.type = $N::source_type`
+        # cast, failing in Postgres with an error that names no valid values.
+        if source_type is not None:
+            try:
+                SourceType(source_type)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid source_type '{source_type}'. "
+                    "Use: document, website, database, custom"
+                ) from e
 
         job_uuid = self._job_uuid()
         service = self._get_embedding_service()
