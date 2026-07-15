@@ -1523,7 +1523,7 @@ class LimitsConfig:
         30  # tool calls without progress before nudge reminder
     )
     max_tool_calls_per_phase: int = (
-        200  # max tool calls per phase before rewind (tactical) or freeze (strategic)
+        500  # max tool calls per phase before rewind (tactical) or freeze (strategic)
     )
 
 
@@ -2262,7 +2262,7 @@ def load_agent_config(
         ),
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
-        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 500),
     )
 
     context_data = data.get("context_management", {})
@@ -2495,7 +2495,7 @@ def load_agent_config_from_dict(
         ),
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
-        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 500),
     )
 
     context_data = data.get("context_management", {})
