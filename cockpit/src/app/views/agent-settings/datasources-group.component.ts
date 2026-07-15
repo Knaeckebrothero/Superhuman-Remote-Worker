@@ -1,8 +1,9 @@
-import {Component, computed, input, output, signal} from '@angular/core';
+import {Component, computed, effect, inject, input, output, signal} from '@angular/core';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
-import {Datasource, DatasourceType} from '../../core/models/api.model';
+import {ApiService} from '../../core/services/api.service';
+import {Datasource, DatasourceIndexStatus, DatasourceType} from '../../core/models/api.model';
 
 /** A user's explicit picker selection, tagged with the datasource-set identity
  *  it was made against (so a stale tag falls back to the default). */
@@ -99,6 +100,11 @@ export function allDatasourcesSelected(
                   <span class="ds-desc">Requires a sandbox or VM workspace</span>
                 } @else if (ds.description) {
                   <span class="ds-desc">{{ ds.description }}</span>
+                }
+                @if (isNotReady(ds)) {
+                  <span class="ds-indexing">
+                    {{ 'agentSettings.datasources.notReady' | transloco }}
+                  </span>
                 }
               </span>
               <span class="ds-type-badge">
@@ -224,6 +230,11 @@ export function allDatasourcesSelected(
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .ds-indexing {
+      font-size: 11px;
+      color: var(--warning, var(--text-muted));
+      white-space: normal;
+    }
     .ds-type-badge {
       font-size: 10px;
       font-weight: 500;
@@ -251,6 +262,9 @@ export function allDatasourcesSelected(
   `],
 })
 export class DatasourcesGroupComponent {
+  // Optional so the picker still renders in bare unit tests without an injector.
+  private readonly api = inject(ApiService, {optional: true});
+
   datasources = input<Datasource[]>([]);
   loading = input(false);
   disabled = input(false);
@@ -268,6 +282,21 @@ export class DatasourcesGroupComponent {
   // means "default: all eligible selected". The picker is the source of truth;
   // explicit-only resolution attaches exactly what's checked.
   private readonly selection = signal<{key: string; ids: Set<string>} | null>(null);
+
+  /** Central index status per KB datasource id (for the still-indexing warning). */
+  readonly indexStatuses = signal<Record<string, DatasourceIndexStatus>>({});
+
+  constructor() {
+    // Fetch central index status for KB rows so the picker can warn when a
+    // selected knowledge base isn't fully indexed yet. Re-runs when the eligible
+    // list changes (e.g. project switch); the signal write lands in the async
+    // HTTP callback, never synchronously inside the effect.
+    effect(() => {
+      for (const ds of this.datasources()) {
+        if (ds.type === 'kb') this.loadIndexStatus(ds.id);
+      }
+    });
+  }
 
   readonly modifiedCount = computed(() => this.getSelectedIds().length);
 
@@ -337,6 +366,20 @@ export class DatasourcesGroupComponent {
       this.selection(),
       this.isLiteBackend(),
     );
+  }
+
+  private loadIndexStatus(id: string): void {
+    this.api?.getDatasourceIndexStatus(id).subscribe((status) => {
+      if (!status) return;
+      this.indexStatuses.update((m) => ({...m, [id]: status}));
+    });
+  }
+
+  /** True when a KB datasource is in the index but not fully `ready` yet. */
+  isNotReady(ds: Datasource): boolean {
+    if (ds.type !== 'kb') return false;
+    const status = this.indexStatuses()[ds.id]?.status;
+    return !!status && status !== 'ready';
   }
 
   resetAll(): void {

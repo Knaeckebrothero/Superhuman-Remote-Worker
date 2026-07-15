@@ -424,6 +424,19 @@ class TestKbRead:
         result = _invoke(_get_tool(tools, "kb_read"), {"note": "missing"})
         assert "not found" in result
 
+    def test_not_found_surfaces_indexing_status(self):
+        # A not-yet-indexed KB must disclose it is still indexing rather than
+        # look like a genuine miss (agent could otherwise conclude "KB empty").
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.read_note.return_value = None
+        ctx.knowledge_store.get_watermark.return_value = MagicMock(
+            status="pending", indexed_commit=None, source_head=None
+        )
+        result = _invoke(_get_tool(tools, "kb_read"), {"note": "missing"})
+        assert "not found" in result
+        assert "Still indexing" in result
+        assert "pending" in result
+
 
 # =============================================================================
 # 13.7: kb_list
@@ -466,6 +479,17 @@ class TestKbList:
         assert "No knowledge notes found" in result
         assert "type=decision" in result
         assert "tag=auth" in result
+
+    def test_empty_surfaces_indexing_status(self):
+        tools, ctx = _make_tools()
+        ctx.knowledge_graph.list_notes.return_value = []
+        ctx.knowledge_store.get_watermark.return_value = MagicMock(
+            status="partial", indexed_commit="a" * 40, source_head="b" * 40
+        )
+        result = _invoke(_get_tool(tools, "kb_list"), {})
+        assert "No knowledge notes found" in result
+        assert "Still indexing" in result
+        assert "partial" in result
 
     def test_formats_with_status_icon(self):
         tools, ctx = _make_tools()
@@ -520,6 +544,34 @@ class TestKbSearch:
         tools, _ = _make_tools(ctx)
         result = _invoke(_get_tool(tools, "kb_search"), {"query": "nothing"})
         assert "No knowledge notes match" in result
+
+    def test_empty_results_surface_indexing_status(self):
+        ctx = _make_context()
+        ctx.knowledge_store.search_chunks.return_value = []
+        ctx.knowledge_store.embedding_service.model = "qwen3-embedding-8b"
+        ctx.knowledge_store.embedding_service.expected_dimensions = 4096
+        ctx.knowledge_store.get_watermark.return_value = MagicMock(
+            status="indexing", indexed_commit=None, source_head="b" * 40
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_search"), {"query": "nothing"})
+        assert "No knowledge notes match" in result
+        assert "Still indexing" in result
+        assert "indexing" in result
+
+    def test_empty_results_ready_kb_has_no_indexing_notice(self):
+        # Ready KBs must NOT raise a false "still indexing" alarm on a real miss.
+        ctx = _make_context()
+        ctx.knowledge_store.search_chunks.return_value = []
+        ctx.knowledge_store.embedding_service.model = "qwen3-embedding-8b"
+        ctx.knowledge_store.embedding_service.expected_dimensions = 4096
+        ctx.knowledge_store.get_watermark.return_value = MagicMock(
+            status="ready", indexed_commit="a" * 40, source_head="a" * 40
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_search"), {"query": "nothing"})
+        assert "No knowledge notes match" in result
+        assert "Still indexing" not in result
 
     def test_truncates_content_preview(self):
         ctx = _make_context()

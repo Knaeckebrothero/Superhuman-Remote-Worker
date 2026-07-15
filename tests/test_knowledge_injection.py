@@ -359,3 +359,34 @@ class TestBoundKnowledgeRetrieval:
 
         assert "partial — last clean @ " in block
         assert "source @ " in block
+
+    @pytest.mark.asyncio
+    async def test_zero_contribution_external_still_discloses_indexing(self):
+        # An external KB that returned no records but is still indexing must
+        # remain visible in the block — otherwise a mid-convergence KB is
+        # silently dropped and reads as "nothing here".
+        docs = _binding("docs")
+        pending = _binding("pending")
+        store = _store({docs.kb_id: [_record(docs, "deployments")]})
+
+        async def get_watermark(kb_id):
+            if kb_id == pending.kb_id:
+                return SimpleNamespace(
+                    indexed_commit=None,
+                    source_head="b" * 40,
+                    status="indexing",
+                )
+            return SimpleNamespace(indexed_commit=f"wm-{str(kb_id)[:8]}")
+
+        store.get_watermark = AsyncMock(side_effect=get_watermark)
+
+        selection = await retrieve_bound_knowledge(store, [docs, pending], "deploy")
+        block = KnowledgeStore.assemble_knowledge_block(
+            selection.notes,
+            bindings=selection.bindings,
+            external_watermarks=selection.external_watermarks,
+        )
+
+        assert "pending" in selection.external_watermarks
+        assert "[pending]" in block
+        assert "source @ " + "b" * 40 in block

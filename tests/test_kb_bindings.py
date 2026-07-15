@@ -256,6 +256,27 @@ def test_external_marker_discloses_partial_convergence_not_false_snapshot():
     assert "source @ bbbbbbbbbbbb" in result
 
 
+def test_empty_search_discloses_indexing_status_not_false_miss():
+    docs = _binding("docs")
+    context = _context([docs], graph=False)
+    context.knowledge_store.embedding_service.model = "test-embedding"
+    context.knowledge_store.embedding_service.expected_dimensions = 8
+    context.knowledge_store.search_chunks.return_value = []
+    context.knowledge_store.get_watermark.return_value = MagicMock(
+        indexed_commit=None,
+        source_head="b" * 40,
+        status="indexing",
+    )
+
+    result = _tool(_tools(context), "kb_search").invoke(
+        {"query": "deploy", "kb": "docs"}
+    )
+
+    assert "No knowledge notes match" in result
+    assert "Still indexing" in result
+    assert "[docs] indexing" in result
+
+
 def test_external_only_scope_rejects_writes():
     docs = _binding("docs")
     context = _context([docs])
