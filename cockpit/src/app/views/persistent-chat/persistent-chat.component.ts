@@ -34,11 +34,15 @@ import {
     EventGroup,
     firstSentence,
     firstTextOf,
+    FoldableEvent,
+    FoldedSummary,
     groupEvents,
     isAssistantTurn,
     isSystemTurn,
     isUserTurn,
     lastTextOf,
+    MIN_FOLD_RUN,
+    summarizeFolded,
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
@@ -188,6 +192,67 @@ const TOOL_LABELS: Record<string, string> = {
     mark_complete: 'Marking complete',
     job_complete: 'Completing job',
 };
+
+/**
+ * Terse nouns for the folded-chip count line ("24× searches · 6× thoughts").
+ * Deliberately separate from CATEGORY_LABELS below: those are gerund phrases
+ * ("Working with files") that read as a heading and don't compose with a
+ * leading count. Resolution order matches toolLabel(): i18n key
+ * `chat.categoryNouns[One].<key>` first, these maps as fallback.
+ *
+ * Singular and plural are two flat maps rather than an ICU plural rule because
+ * no messageformat plugin is wired into transloco here, and pulling one in for
+ * a count line isn't worth a dependency. Both maps must stay key-for-key with
+ * each other and with the i18n files.
+ */
+const CATEGORY_NOUNS_ONE: Record<string, string> = {
+    workspace: 'file',
+    git: 'git op',
+    shell: 'command',
+    research: 'search',
+    browser_direct: 'browser step',
+    core: 'task',
+    session_task: 'task',
+    knowledge: 'KB op',
+    citation: 'citation',
+    sql: 'query',
+    mongodb: 'query',
+    graph: 'graph op',
+    cloud: 'cloud op',
+    communication: 'message',
+    delegation: 'delegation',
+    orchestrator: 'fleet op',
+    evaluation: 'eval',
+    thought: 'thought',
+    other: 'step',
+};
+
+const CATEGORY_NOUNS: Record<string, string> = {
+    workspace: 'files',
+    git: 'git ops',
+    shell: 'commands',
+    research: 'searches',
+    browser_direct: 'browser steps',
+    core: 'tasks',
+    session_task: 'tasks',
+    knowledge: 'KB ops',
+    citation: 'citations',
+    sql: 'queries',
+    mongodb: 'queries',
+    graph: 'graph ops',
+    cloud: 'cloud ops',
+    communication: 'messages',
+    delegation: 'delegations',
+    orchestrator: 'fleet ops',
+    evaluation: 'evals',
+    // Not a tool category — reasoning gets its own bucket in the count line.
+    thought: 'thoughts',
+    // Tool calls with no category (older history rows predate the field).
+    other: 'steps',
+};
+
+/** Categories shown on a chip before the rest roll into "+N more". */
+const CHIP_CATEGORY_CAP = 4;
 
 const CATEGORY_LABELS: Record<string, string> = {
     workspace: 'Working with files',
@@ -1016,35 +1081,55 @@ export function clearDraft(threadId: string | null): void {
                       <span class="turn-headline">{{ collapsedHeadline(turn) }}</span>
                     }
                   } @else {
-                    <!-- Expanded: events rendered as cards, with consecutive
-                         tool runs grouped (#10). A run of TOOL_GROUP_THRESHOLD+
-                         tools collapses into one disclosure; shorter runs and
-                         every thought/text render individually. -->
+                    <!-- Expanded: the live edge renders as cards (anything in
+                         flight, plus the turn's latest tool call) and everything
+                         already finished folds into one chip. Text never folds. -->
                     @for (group of groupedEvents(turn); track group.id) {
-                      @if (group.kind === 'tools') {
-                        @if (foldToolRun(group.tools)) {
-                          <!-- Folded run: cornerless "N× tool calls", auto-open on error/denied.
-                               Suppressed entirely when Tool calls → Expanded (every run inline). -->
-                          <details class="tool-group" [attr.open]="toolGroupHasProblem(group.tools) ? '' : null">
+                      @if (group.kind === 'folded') {
+                        @if (foldRun(group.events)) {
+                          <!-- Folded: a category count line, not a tool list. Does NOT
+                               auto-open on failure — with a turn-wide chip that would dump
+                               every card because one call errored; the ⚠ badge carries it
+                               instead, and a just-failed call is pinned anyway. Suppressed
+                               entirely when Tool calls → Expanded (everything inline). -->
+                          <details class="tool-group">
                             <summary class="tool-group-head">
                               <app-icon size="sm" class="tool-group-chevron">chevron_right</app-icon>
-                              <span class="tool-group-label">{{ 'chat.turn.toolGroup' | transloco:{count: group.tools.length} }}</span>
-                              <span class="tool-group-names">{{ toolGroupSummary(group.tools) }}</span>
+                              <span class="tool-group-label">{{ foldedSummaryText(group.events) }}</span>
+                              @if (foldedFailedCount(group.events); as failed) {
+                                <span class="tool-group-failed">{{ 'chat.turn.foldFailed' | transloco:{count: failed} }}</span>
+                              }
                             </summary>
                             <div class="tool-group-body">
-                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: group.tools }"></ng-container>
+                              @for (event of group.events; track event.id) {
+                                @if (event.kind === 'tool_call') {
+                                  <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                                } @else if (chat.narrationMode() !== 'silent') {
+                                  <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                                }
+                              }
                             </div>
                           </details>
                         } @else {
-                          <!-- Short run: each tool inline, exactly as before. -->
-                          @for (event of group.tools; track event.id) {
-                            <div class="event-tool">
-                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
-                            </div>
+                          <!-- Tool calls → Expanded, or a run too short to be worth a chip. -->
+                          @for (event of group.events; track event.id) {
+                            @if (event.kind === 'tool_call') {
+                              <div class="event-tool">
+                                <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                              </div>
+                            } @else if (chat.narrationMode() !== 'silent') {
+                              <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                            }
                           }
                         }
                       } @else {
                         @switch (group.event.kind) {
+                          @case ('tool_call') {
+                            <!-- Pinned: in flight, or the turn's latest call. -->
+                            <div class="event-tool">
+                              <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [group.event] }"></ng-container>
+                            </div>
+                          }
                           @case ('thought') {
                             @if (chat.narrationMode() !== 'silent') {
                               <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: group.event }"></ng-container>
@@ -3031,15 +3116,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return countEvents(turn);
     }
 
-    /**
-     * Intra-turn tool grouping (Slice 3 / #10). A run of this many or more
-     * consecutive tool calls collapses into a single "N× tool calls"
-     * disclosure; shorter runs render inline. A run is broken by any
-     * thought/text, so `[tool,tool,thought,tool,tool]` stays two groups.
-     */
-    private readonly TOOL_GROUP_THRESHOLD = 4;
-
-    /** Coalesce a turn's events into render groups (consecutive tools merged). */
+    /** Coalesce a turn's events into render groups (live edge pinned, rest folded). */
     // Memoized per turn object. The reducer rebuilds the turn immutably on
     // every update, so a changed turn is a new key and the cache invalidates
     // naturally — this turns 50 rebuilds per change-detection pass into 1.
@@ -3053,11 +3130,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return groups;
     }
 
-    /**
-     * Whether this tool run renders as the folded "N× tool calls" disclosure.
-     * Folds only long runs, and only while the user hasn't opted into the
-     * always-inline "Tool calls → Expanded" display preference.
-     */
     /**
      * Render-ready view-model for a tool call, memoized per event object so the
      * shared <app-tool-card> keeps a stable input identity (OnPush) across
@@ -3074,22 +3146,68 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return view;
     }
 
-    foldToolRun(tools: ToolCallEvent[]): boolean {
-        return shouldFoldToolRun(
-            tools.length,
-            this.chatPrefs.toolCallsExpanded(),
-            this.TOOL_GROUP_THRESHOLD,
-        );
+    /**
+     * Whether a folded run renders as a chip. The "Tool calls → Expanded"
+     * preference is the escape hatch: with it on, nothing folds and every event
+     * renders inline, exactly as before.
+     */
+    foldRun(events: FoldableEvent[]): boolean {
+        return shouldFoldToolRun(events.length, this.chatPrefs.toolCallsExpanded(), MIN_FOLD_RUN);
     }
 
-    /** True if a grouped run should auto-open: any member errored or was denied. */
-    toolGroupHasProblem(tools: ToolCallEvent[]): boolean {
-        return tools.some((t) => t.status === 'error' || t.status === 'denied' || t.resultStatus === 'error');
+    /** Tool calls inside a folded run, for the expanded chip body. */
+    foldedTools(events: FoldableEvent[]): ToolCallEvent[] {
+        return events.filter((e): e is ToolCallEvent => e.kind === 'tool_call');
     }
 
-    /** Human one-liner of the distinct tools in a run ("read_file, edit_file x2"). */
-    toolGroupSummary(tools: ToolCallEvent[]): string {
-        return this.groupToolCallsHuman(tools);
+    /** Thoughts inside a folded run, for the expanded chip body. */
+    foldedThoughts(events: FoldableEvent[]): ThoughtEvent[] {
+        return events.filter((e): e is ThoughtEvent => e.kind === 'thought');
+    }
+
+    private readonly foldedSummaryCache = new WeakMap<FoldableEvent[], FoldedSummary>();
+
+    private summaryOf(events: FoldableEvent[]): FoldedSummary {
+        const cached = this.foldedSummaryCache.get(events);
+        if (cached) return cached;
+        const s = summarizeFolded(events);
+        this.foldedSummaryCache.set(events, s);
+        return s;
+    }
+
+    /**
+     * The chip's count line: "24× searches · 20× citations · 6× thoughts".
+     * Categories, not types — a grand total plus per-category counts would
+     * double-count, since commands *are* tool calls. Capped so the line stays
+     * one row; the overflow is stated rather than silently dropped, and opening
+     * the chip shows everything regardless.
+     */
+    foldedSummaryText(events: FoldableEvent[]): string {
+        this.i18n.activeLang();
+        const {parts} = this.summaryOf(events);
+        const shown = parts.slice(0, CHIP_CATEGORY_CAP);
+        const line = shown
+            .map(({category, count}) => `${count}× ${this.categoryNoun(category, count)}`)
+            .join(' · ');
+        const hidden = parts.length - shown.length;
+        return hidden > 0
+            ? `${line} · ${this.transloco.translate('chat.turn.foldMore', {count: hidden})}`
+            : line;
+    }
+
+    /** Failed/denied count in a folded run — badged on the chip. */
+    foldedFailedCount(events: FoldableEvent[]): number {
+        return this.summaryOf(events).failed;
+    }
+
+    /** Terse noun for a tool category, singular at count 1. i18n first, const map as fallback. */
+    private categoryNoun(category: string, count: number): string {
+        const one = count === 1;
+        const key = `chat.${one ? 'categoryNounsOne' : 'categoryNouns'}.${category}`;
+        const translated = this.transloco.translate(key);
+        if (translated !== key) return translated;
+        const map = one ? CATEGORY_NOUNS_ONE : CATEGORY_NOUNS;
+        return map[category] ?? map['other'];
     }
 
     /** Last text event in a turn — used for the TTS "read aloud" button. */
