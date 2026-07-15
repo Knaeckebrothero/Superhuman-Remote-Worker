@@ -59,6 +59,12 @@ GET    /api/agents                                                              
 POST   /api/agents/register                                                             internal:require_internal
 POST   /api/agents/threads                                                              internal:require_internal
 POST   /api/agents/threads/{thread_id}/abort-vm-upgrade                                 internal:require_internal
+GET    /api/agents/threads/{thread_id}/cloud-diff                                       gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-diff/apply                                 gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-diff/reject                                gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-diff/restage                               gated:require_thread_owner
+GET    /api/agents/threads/{thread_id}/cloud-diff/{file_path:path}                      gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-stage                                      internal:require_internal
 PATCH  /api/agents/threads/{thread_id}/config                                           internal:require_internal
 GET    /api/agents/threads/{thread_id}/lifecycle                                        internal:require_internal
 POST   /api/agents/threads/{thread_id}/messages                                         internal:require_internal
@@ -95,6 +101,8 @@ POST   /api/datasources/ssh-keys/generate                                       
 DELETE /api/datasources/{datasource_id}                                                 gated:require_datasource_owner
 GET    /api/datasources/{datasource_id}                                                 gated:require_datasource_access
 PUT    /api/datasources/{datasource_id}                                                 gated:require_datasource_owner
+GET    /api/datasources/{datasource_id}/index-status                                    gated:require_datasource_access
+POST   /api/datasources/{datasource_id}/reindex                                         gated:require_datasource_owner
 POST   /api/datasources/{datasource_id}/test                                            gated:require_datasource_owner
 GET    /api/experts                                                                     gated:require_approved_user
 POST   /api/experts                                                                     gated:require_approved_user
