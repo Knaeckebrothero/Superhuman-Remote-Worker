@@ -3332,6 +3332,10 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
                     args: tc.args || {},
                     status: tc.decision === 'denied' ? 'denied' : 'completed',
                     decision: tc.decision,
+                    // Keeps a replayed turn's folded chip reading
+                    // "19× citations · 12× searches" rather than "38× steps" —
+                    // the live SSE path sets this from the same registry.
+                    category: tc.category,
                     startedAt: ts,
                 };
                 turn.events.push(event);
@@ -3349,7 +3353,13 @@ interface HistoryMessage {
     id: string;
     role: string;
     content: string | null;
-    tool_calls: { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied' }[] | null;
+    /**
+     * `category` is stamped at read time by the orchestrator from TOOL_REGISTRY
+     * (main.py `_stamp_tool_categories`) — it is not stored on the row. Absent
+     * for unknown/renamed tools, in which case the folded-chip summary buckets
+     * the call as "other".
+     */
+    tool_calls: { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied'; category?: string }[] | null;
     turn_number: number | null;
     /** Set only on role='tool' rows — points to the AI message's tool_calls[].id. */
     tool_call_id?: string | null;
