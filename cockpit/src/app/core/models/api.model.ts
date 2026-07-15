@@ -247,6 +247,9 @@ export interface DatasourceIndexStatus {
   last_success_at: string | null;
   /** Bounded, credential-redacted diagnostic supplied by the orchestrator. */
   last_error: string | null;
+  /** Per-run progress counters while a KB indexes (advisory; null when idle). */
+  notes_done?: number | null;
+  notes_total?: number | null;
 }
 
 /** Tolerant summary returned by a manual incremental/full KB reindex. */

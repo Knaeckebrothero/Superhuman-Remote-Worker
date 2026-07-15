@@ -119,6 +119,8 @@ def index_status_payload(
             "last_attempt_at": None,
             "last_success_at": None,
             "last_error": None,
+            "notes_done": None,
+            "notes_total": None,
         }
     raw = asdict(watermark)
     result: dict[str, Any] = {"datasource_id": datasource_id}
@@ -130,6 +132,8 @@ def index_status_payload(
         "last_attempt_at",
         "last_success_at",
         "last_error",
+        "notes_done",
+        "notes_total",
     ):
         value = raw.get(key)
         if isinstance(value, datetime):

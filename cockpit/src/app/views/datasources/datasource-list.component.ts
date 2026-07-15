@@ -1,4 +1,6 @@
-import {Component, computed, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {timer} from 'rxjs';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {
@@ -741,6 +743,29 @@ import {UserService} from '../../core/services/user.service';
                         <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
                           {{ indexStatusLabel(indexStatus) }}
                         </app-badge>
+                        @if (indexStatus.status === 'indexing' && indexStatus.notes_total) {
+                          <span
+                            class="index-progress"
+                            [title]="
+                              'datasources.table.indexProgressTitle'
+                                | transloco
+                                  : {
+                                      done: indexStatus.notes_done ?? 0,
+                                      total: indexStatus.notes_total
+                                    }
+                            "
+                          >
+                            <span class="index-progress-count">
+                              {{ indexStatus.notes_done ?? 0 }}/{{ indexStatus.notes_total }}
+                            </span>
+                            <span class="index-progress-track">
+                              <span
+                                class="index-progress-fill"
+                                [style.width.%]="indexProgressPercent(indexStatus)"
+                              ></span>
+                            </span>
+                          </span>
+                        }
                         @if (indexStatus.last_success_at) {
                           <span
                             class="index-status-detail"
@@ -1414,6 +1439,37 @@ import {UserService} from '../../core/services/user.service';
         color: var(--danger);
       }
 
+      .index-progress {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10px;
+        color: var(--text-muted);
+      }
+
+      .index-progress-count {
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+
+      .index-progress-track {
+        position: relative;
+        width: 64px;
+        height: 4px;
+        border-radius: 2px;
+        background: var(--surface-3, rgba(127, 127, 127, 0.25));
+        overflow: hidden;
+      }
+
+      .index-progress-fill {
+        position: absolute;
+        inset: 0 auto 0 0;
+        height: 100%;
+        border-radius: 2px;
+        background: var(--info, #3b82f6);
+        transition: width 0.3s ease;
+      }
+
       /* URL cell */
       .url-cell {
         font-family: 'JetBrains Mono', monospace;
@@ -1530,6 +1586,9 @@ export class DatasourceListComponent implements OnInit {
   private readonly userService = inject(UserService);
   protected readonly viewport = inject(ViewportService);
   protected readonly capabilities = inject(CapabilitiesService);
+  private readonly destroyRef = inject(DestroyRef);
+  /** Poll cadence for a KB that is still indexing. */
+  private readonly INDEX_POLL_MS = 5000;
 
   // State signals
   readonly datasources = signal<Datasource[]>([]);
@@ -1686,6 +1745,13 @@ export class DatasourceListComponent implements OnInit {
 
   ngOnInit(): void {
     this.refresh();
+    // Live-refresh KB index status while any KB is still converging. The tick is
+    // a cheap no-op when nothing is indexing; an HTTP GET only fires for rows
+    // actually pending/indexing, and stops once they reach a terminal status
+    // (ready/partial/failed).
+    timer(this.INDEX_POLL_MS, this.INDEX_POLL_MS)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(() => this.pollActiveIndexStatuses());
   }
 
   refresh(): void {
@@ -2249,11 +2315,31 @@ export class DatasourceListComponent implements OnInit {
     return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
   }
 
+  /** Percent complete for the current indexing run (clamped 0–100). */
+  indexProgressPercent(status: DatasourceIndexStatus): number {
+    const total = status.notes_total ?? 0;
+    if (total <= 0) return 0;
+    const done = Math.min(status.notes_done ?? 0, total);
+    return Math.round((done / total) * 100);
+  }
+
   redactIndexError(value: string): string {
     return value
       .replace(/(https?:\/\/)[^/@\s]+@/gi, '$1***@')
       .replace(/\b(token|password|secret)=([^\s&]+)/gi, '$1=***')
       .slice(0, 240);
+  }
+
+  /** Re-fetch index status for KB rows still pending/indexing (poll tick). */
+  private pollActiveIndexStatuses(): void {
+    const statuses = this.indexStatuses();
+    for (const ds of this.datasources()) {
+      if (ds.type !== 'kb') continue;
+      const state = statuses[ds.id]?.status;
+      if (state === 'pending' || state === 'indexing') {
+        this.loadIndexStatus(ds.id);
+      }
+    }
   }
 
   private loadIndexStatus(id: string): void {

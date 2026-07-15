@@ -603,6 +603,47 @@ def create_kb_tools(
         )
         return f"**{label}:** {', '.join(snapshots)}"
 
+    def _index_readiness_notice(bindings: List[KnowledgeBinding]) -> str:
+        """Advisory for the zero-result branches when a bound KB is still indexing.
+
+        Covers native *and* external bindings (unlike ``_external_snapshot_marker``,
+        which is external-only). Without this, an agent querying a KB that is still
+        embedding gets an empty result indistinguishable from a genuine miss and may
+        wrongly conclude the KB is empty. Only emits for an explicit non-ready
+        watermark status; a missing watermark or lookup failure stays silent so we
+        never raise a false "indexing" alarm.
+        """
+        notices: List[str] = []
+        for binding in bindings:
+            try:
+                watermark = _run_async(ks.get_watermark(binding.kb_id))
+            except Exception as e:
+                logger.debug(
+                    "Knowledge readiness lookup skipped for %s: %s",
+                    binding.alias,
+                    e,
+                )
+                continue
+            status = getattr(watermark, "status", None)
+            if not isinstance(status, str) or status == "ready":
+                continue
+            commit = getattr(watermark, "indexed_commit", None)
+            source_head = getattr(watermark, "source_head", None)
+            clean = (
+                f"last clean @ {commit[:12]}"
+                if isinstance(commit, str) and commit
+                else "no clean commit yet"
+            )
+            attempted = (
+                f", source @ {source_head[:12]}"
+                if isinstance(source_head, str) and source_head
+                else ""
+            )
+            notices.append(f"[{binding.alias}] {status} — {clean}{attempted}")
+        if not notices:
+            return ""
+        return "⚠️ Still indexing — results may be incomplete: " + "; ".join(notices)
+
     # =========================================================================
     # Write Tools
     # =========================================================================
@@ -1115,6 +1156,9 @@ def create_kb_tools(
         try:
             matches = _matching_notes(bindings, note_slug)
             if not matches:
+                notice = _index_readiness_notice(bindings)
+                if notice:
+                    return f"Note '{note}' not found.\n\n{notice}"
                 return f"Note '{note}' not found."
             if len(matches) > 1:
                 return _ambiguous_note(note_slug, matches)
@@ -1239,7 +1283,9 @@ def create_kb_tools(
                 if status:
                     filters.append(f"status={status}")
                 filter_str = f" (filters: {', '.join(filters)})" if filters else ""
-                return f"No knowledge notes found{filter_str}."
+                base = f"No knowledge notes found{filter_str}."
+                notice = _index_readiness_notice(bindings)
+                return f"{base}\n\n{notice}" if notice else base
 
             lines = [f"**Knowledge Notes** ({len(notes)} results):", ""]
 
@@ -1307,7 +1353,9 @@ def create_kb_tools(
             )
 
             if not results:
-                return f"No knowledge notes match '{query}'."
+                base = f"No knowledge notes match '{query}'."
+                notice = _index_readiness_notice(bindings)
+                return f"{base}\n\n{notice}" if notice else base
 
             header = f"**Search Results** ({len(results)} matches for '{query}')"
             # Native single-KB compatibility header. External bindings use the
