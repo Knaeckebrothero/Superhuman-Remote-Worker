@@ -13,7 +13,7 @@ import base64
 import logging
 import mimetypes
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.tools import tool
 from src.core.workspace_backend import WorkspaceUnavailableError
@@ -1004,7 +1004,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         path: str,
         old_string: str = "",
         new_string: str = "",
-        position: Optional[str] = None,
+        position: Optional[Literal["start", "end"]] = None,
     ) -> str:
         """Edit a file by replacing text or inserting at start/end.
 
