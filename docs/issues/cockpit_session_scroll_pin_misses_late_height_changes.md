@@ -1,8 +1,8 @@
 # Session history opens with the resume card half cut off — the scroll pin enumerates *causes* of height change instead of observing height
 
-**Status:** **DIAGNOSED 2026-07-15 · design HARDENED by research 2026-07-15 · UNBUILT** — awaiting green-light. Research pass (7 agents, web + codebase) refuted four claims in the first draft of this doc; see §"What the research changed". Design is now believed sound and is backed by primary sources + in-browser measurement.
+**Status:** **RO FIX BUILT + BROWSER-VERIFIED on k3d 2026-07-15 · UNCOMMITTED.** Fix 1 (the ResizeObserver detector), Fix 2 (the handler + `pinTarget`), Fix 3 (the wheel/touch escape), Fix 6 (code shape), Fix 7 (CSS wins) and Fix 8 (the `flex: 1` SCSS comment) are implemented; hooks #1/#2/#3 deleted, #4/#5/#6 retained. **Still open: Fix 5 (the `connect()` minimal-2b waterfall)** — now a latency improvement rather than a correctness one, since the RO makes render order irrelevant — and **Fix 4's iOS `--kb-inset` listener**, which the doc always flagged as a separate ship. Verification results under §"Verification plan". Prior state: DIAGNOSED 2026-07-15 · design HARDENED by a research pass (7 agents, web + codebase) that refuted four claims in the first draft; see §"What the research changed". Design was backed by primary sources + in-browser measurement, and survived contact with the build unchanged.
 **Found:** 2026-07-14, user-reported (thread `b35a74ef`, "Reviewing Better Resavio Project Setup"). Reproduces on any **ended** session opened from the session list.
-**Severity:** **Low as reported** (cosmetic landing position) — but the reported bug is **1 of ~18** untracked height changes inside the transcript, several of which are *guaranteed visible jumps today* (see §"The real scale"). Plus the investigation surfaced a **real iOS bug the app has never had a fix for** (§Fix 4). The value is retiring the bug *class*, not the screenshot.
+**Severity:** **Low as reported** (cosmetic landing position) — but the reported bug is one of ~18 untracked height changes inside the transcript. **Of those, the ones that *grow* are real defects and the ones that only *shrink* are not** (measured — see §"The shrink/grow asymmetry"; this corrects an earlier, louder claim in this doc). Growth is still most of the list, and the resume card is a growth. Plus the investigation surfaced a **real iOS bug the app has never had a fix for** (§Fix 4). The value is retiring the bug *class*, not the screenshot.
 **Component:** cockpit `PersistentChatComponent` (`cockpit/src/app/views/persistent-chat/persistent-chat.component.ts`, 3240 lines) · `PersistentChatService.connect()` (`cockpit/src/app/core/services/persistent-chat.service.ts:724`) · `persistent-chat.component.scss:315` (`overflow-anchor: none`) · `orchestrator/main.py:21062` (history endpoint)
 **Related:** [[persistent_chat_component_style_budget]] — same kitchen-sink component; that doc tracks the *style* symptom, this one the *behavioural* symptom of the same "component owns everything" problem · [[persistent_session_history_windowing_and_compaction]] — the compaction progress block (`:1173`) is on the untracked list below · [[session_turn_rendering]] · [[shared_chat_library]] (relevant only if a second chat view ever appears)
 
@@ -108,7 +108,7 @@ A full inventory of `.messages-inner`'s subtree found the resume card is one of 
 
 | Site | What | Why it matters |
 |---|---|---|
-| `:2821` `collapseCodeBlocks()` | wraps `pre.scrollHeight > 200` in a **closed** `<details>` — ~600px → ~30px — from `ngAfterViewChecked` (`:2180`), i.e. **after** the effect's `setTimeout(0)` already pinned | **A guaranteed visible jump today, on every long code block.** Only an RO can catch it. |
+| `:2821` `collapseCodeBlocks()` | wraps `pre.scrollHeight > 200` in a **closed** `<details>` — ~600px → ~30px — from `ngAfterViewChecked` (`:2180`) | ⚠️ **The *collapse* is NOT a bug — corrected 2026-07-15, see §"The shrink/grow asymmetry".** The *expand* (user opens the `<details>`) is: **measured 744px stranded** without the RO. |
 | `:799` `chatPrefs.reasoningExpanded()` | toggles `<details class="thinking-block">` — flips **every reasoning block in the transcript at once** | Massive instantaneous height delta, zero re-pin |
 | `:949` | whole-turn collapse (`isTurnCollapsed`, `userTurnCollapsed` + auto-threshold) | untracked |
 | `:1173` `chat.compaction()` | compaction progress block + 1s tick reflowing `.compaction-pass` text | untracked ([[persistent_session_history_windowing_and_compaction]]) |
@@ -126,6 +126,32 @@ A full inventory of `.messages-inner`'s subtree found the resume card is one of 
 **RO blind spots — exactly one, and it is provably benign.** `.messages` (`:831`) has precisely two children: `.messages-inner` (`:835`, closes `:1281`) and `@if`'d `.jump-latest` (`:1286`). The pill is `position: sticky`, therefore *in-flow*, so it does add ~33px to `.messages`'s scrollHeight without touching `.messages-inner`'s box → RO does not fire. But `autoScroll` and `scrolledAway` are written from the same `nearBottom` expression in the same statement pair (`:2571-2572`), and `jumpToLatest()` writes both atomically (`:2580-2581`), so the invariant **`showJumpToLatest() ⟹ !autoScroll`** holds unconditionally. The pin is gated off exactly when the blind spot is live.
 
 Everything `absolute`/`fixed` in the messages subtree (`.code-copy-btn` scss:1795, `.compaction-segment.active::after` scss:2242) contributes zero height by design. No `contain`, no `content-visibility`, no `will-change` anywhere in the file.
+
+## The shrink/grow asymmetry — corrected 2026-07-15 by measurement
+
+**Not every untracked height change is a bug. Shrinks self-correct; only growths strand.** This doc previously claimed `collapseCodeBlocks()` was *"a guaranteed visible jump today, on every long code block"* and made it the headline acceptance criterion. **Both halves were wrong**, for two independent reasons:
+
+**1. Measured: a shrink while pinned self-corrects via browser clamping.** When content shrinks, `maxScrollTop = scrollHeight - clientHeight` shrinks with it, and the browser clamps `scrollTop` down to the new max — which *is* the bottom. Staged a real 746px `<pre>`, ran the real `collapseCodeBlocks()`:
+
+| | scrollHeight | scrollTop | fromBottom |
+|---|---|---|---|
+| tall `<pre>` injected | 2569 | 1769 | 0 |
+| after real `collapseCodeBlocks()` (−706px) | 1863 | 1063 | **0** |
+
+`scrollTop` fell 1769 → 1063 with the RO's guard vetoed. **The browser did that, not the pin.**
+
+**2. The ordering claim was backwards.** The doc said the collapse runs *"after the effect's `setTimeout(0)` already pinned"*. It doesn't: `ngAfterViewChecked` is a CD lifecycle hook running **synchronously inside `ApplicationRef.tick()`**, while a `setTimeout(0)` scheduled from an `effect()` is a **macrotask** that runs only after the entire task — tick included — completes. So `collapseCodeBlocks()` runs **before** the old pin, and the old pin therefore saw the already-collapsed height and was correct. *(Reasoned, not measured — the old code path is gone. The measurement above makes it moot either way.)*
+
+**What IS real: the expand.** A user opening the collapsed `<details>` grows content, and growth does **not** clamp — nothing drags `scrollTop` along:
+
+| | fromBottom | |
+|---|---|---|
+| expand, RO guard vetoed | **744** | stranded ❌ |
+| expand, RO live | **0** | pinned ✅ |
+
+**The general rule this establishes:** in the ~18-item inventory, entries that only ever **shrink** (`collapseCodeBlocks`'s collapse pass) were never bugs. Entries that **grow** — the resume card, `<img>` decode, webfont/KaTeX reflow, `reasoningExpanded()`, `<details>` expands, read-aloud's phase machine, the compaction block — are the real set. That trims the headline number but doesn't touch the argument: growth is the majority of the list, and the resume card is a growth.
+
+**⚠️ Testing trap discovered while proving this.** `autoScroll` cannot be held `false` while parked at the bottom. A shrink clamps `scrollTop`, the clamp fires a `scroll` event, `onMessagesScroll` (`:2560`) recomputes `nearBottom` → true → **`autoScroll = true` (`:2571`) silently resets your veto.** This invalidated the first control run (a "vetoed" growth pinned anyway, because the preceding shrink had re-armed the flag). It is correct-by-design — you *are* at the bottom — but it's the feedback edge the research flagged, it is live, and anyone A/B-testing this must stage the veto on a **growth** (no clamp ⇒ no scroll event ⇒ the flag survives).
 
 ## What the research changed
 
@@ -327,7 +353,7 @@ These are **mutually exclusive by construction** — the negation of each other.
 
 1. Opening an **ended** session lands with the **entire resume card visible** — deterministically. Verify with the thread-meta GET throttled so the *unfixed* order is forced.
 2. A session that ends **while being watched** (`threadStatus.set('ended')` at runtime — `persistent-chat.service.ts:2859`, `:2868`) mounts the resume card without leaving it below the fold. Note this is a double height change the RO catches twice: the composer *unmounts* (`:1306`, `.messages` grows) **and** the card *mounts* (`:1230`, `.messages-inner` grows).
-3. **A long code block no longer jumps.** `collapseCodeBlocks()` shrinks a `<pre>` ~600px → ~30px in `ngAfterViewChecked` *after* today's pin — this is a guaranteed visible jump today and is the cheapest proof the fix works.
+3. **Expanding a collapsed code block keeps the bottom pinned.** ⚠️ **Rewritten 2026-07-15** — this criterion originally read *"`collapseCodeBlocks()` shrinks a `<pre>` after today's pin, a guaranteed visible jump"*. **That was wrong**; see §"The shrink/grow asymmetry". The *collapse* self-corrects. The **expand** is the real defect: measured **744px stranded** below the fold without the RO, `0` with it.
 4. Toggling `chatPrefs.reasoningExpanded()` (flips every reasoning block at once) keeps the bottom pinned.
 5. **The user can scroll up during active streaming and stay there.** The wheel escape must hold while deltas arrive every frame. This is the regression the fix itself could introduce.
 6. **No regressions** in the hand-earned behaviours: multi-line draft doesn't jump up-then-down (hook #4 retained); attachment chips keep the latest turn visible; prepending older history preserves position; "Jump to latest · N new" works; Android keyboard keeps the bottom pinned.
@@ -344,6 +370,39 @@ These are **mutually exclusive by construction** — the negation of each other.
 3. **Real geometry needs a real browser.** Walk criteria 1-6 on k3d (`https://localhost/`, thread `b35a74ef`) with Tilt running, driven by Playwright — the cockpit is **zoneless**, so poke component state via `ng.getComponent(el)` rather than expecting CD from synthetic events. Force criterion 1's race with DevTools throttling on `GET /api/persistent/threads/{id}`. Longer term, [Vitest 4 browser mode](https://vitest.dev/guide/browser/) is a small step (already on `vitest@^4.0.8` + Playwright; v21 ships Vitest as the default runner).
 
 Per CLAUDE.md "Plan → Develop → Verify", all of this is local — no dev-cluster round trip.
+
+### Results — 2026-07-15, k3d + Tilt, Chromium via Playwright
+
+Driven against a real session (`3d22f7e0`, a 22841px transcript in an 803px viewport). The probe for most of these is **appending a `<div>` to `.messages-inner` with raw DOM**: it changes height while being invisible to every signal, so it *is* the bug class, and only the RO can answer it.
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Ended session lands with the resume card fully visible | ✅ `cardFullyVisible: true`, `pixelsCutOff: 0`, landed at `fromBottom: 0` |
+| 3 | ~~Tall block *shrinking* doesn't jump~~ → **expanding** a collapsed block re-pins | ⚠️ **criterion rewritten** — the shrink was never a bug (§"The shrink/grow asymmetry"). Expand: **744px stranded** vetoed → **0** live ✅ |
+| 5 | User can scroll up during streaming and stay there | ✅ parked at 20538, three 400px growths landed, stayed at 20538; following resumed on return to bottom |
+| 6 | Multi-line draft doesn't jump up-then-down (hook #4 retained) | ✅ composer 56px→154px over 6 lines, `fromBottom` **0 on all 18 sampled frames** (per-frame sampling — a before/after check cannot see a 1-frame stale paint) |
+| — | The core invariant: untracked 600px growth re-pins | ✅ grew 616, scrolled 616, `fromBottom: 0`, probe on screen |
+| 8 | `npx vitest run` green; `ng build` passes the **style** budget without a bump | ✅ 1113/1113; no `anyComponentStyle` warning. (The `bundle initial` warning is pre-existing: 399.74 kB over on baseline vs 400.41 kB with this change — a 0.67 kB delta.) |
+
+### Second run — 2026-07-15, independent re-verification (session `5432783a`, 800px viewport)
+
+Re-driven from scratch against a different ended session, to check the first run rather than trust it. **This run is what corrected criterion 3.**
+
+| # | Criterion | Result |
+|---|---|---|
+| 1 | Resume card fully visible on open | ✅ `fromBottom: 0`, `clippedBy: -16` (clears by exactly the 16px padding), `fullyVisible: true` |
+| — | **A/B on the core invariant** — raw-DOM 616px append, no signal touched | ✅ `autoScroll=true`: grew 632 → **scrolled 632** → `fromBottom 0`. `autoScroll=false`: grew 416 → **scrolled 0** → held. Same mutation, opposite guard, opposite outcome ⇒ it is the *guarded RO* doing the work, not blind pinning. |
+| 2 | **Session ends while watched** | ✅ **NOW VERIFIED** (was open). Drove the real Angular path: `threadStatus.set('active')` → card unmounts + composer mounts; pin; `threadStatus.set('ended')` → composer unmounts (`.messages` grows) **and** card mounts (`.messages-inner` grows) in one frame → `fromBottom: 0`, `clippedBy: -16`, `fullyVisible: true` |
+| 3 | Expanding a collapsed code block re-pins | ✅ staged a real 746px `<pre>` + real `collapseCodeBlocks()`; expand vetoed → **744px stranded**, expand live → **0** |
+| — | RO loop errors / console | ✅ 0 errors across every probe; no `ResizeObserver loop completed with undelivered notifications` |
+| — | Clean-up | ✅ reload leaves zero probe residue; clean open still `fromBottom: 0` |
+
+**Not yet verified — do these before calling it done:**
+- **Criterion 4** (toggling `reasoningExpanded` re-pins). The mechanism is proven by the growth A/B, but the specific trigger wasn't driven.
+- **Criterion 6's remainder**: attachment chips, prepend position-preservation, "Jump to latest · N new", Android keyboard.
+- **Safari/WebKit entirely.** `webkit` cannot launch on this Fedora host (`Host system is missing dependencies`, needs `libicu74`/`libjpeg-turbo8`) — the 9 webkit canvas-e2e failures are that, not a regression; chromium + firefox pass 18/18. Since the doc's Safari claims rest on WPT + WebKit source rather than a live Safari, and Safari has *no* scroll anchoring, WebKit is the least-covered surface here.
+
+**Note on the RO stub** (verification plan step 2): added to `test-setup.ts`, but **nothing exercises it** — `PersistentChatComponent` is never mounted in a spec, so there is no wiring assertion. The stub is insurance against a confusing `ReferenceError` for whoever mounts it first. The decisions are covered by pure unit tests (`isNearBottom`, `pinTarget`, `shouldPin`); the wiring is covered only by the browser run above.
 
 ## Sources
 

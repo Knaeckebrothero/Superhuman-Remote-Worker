@@ -309,17 +309,47 @@
         padding: 16px;
         display: flex;
         flex-direction: column;
-        // Suppress browser scroll anchoring: it fires unreliably exactly when
-        // the last child mutates (streaming turn) and fights our programmatic
-        // bottom-pinning. We own the scroll in script (autoScroll + watchdog).
+        // Suppress browser scroll anchoring: it only compensates for changes
+        // ABOVE the viewport position, so it is not a bottom-pin and cannot do
+        // this job; shipping Safari has no anchoring at all, so JS is required
+        // regardless. Leaving it on would make Chrome/FF double-compensate
+        // against our own pin while Safari compensated once. `none` buys
+        // engine-uniform behaviour. We own the scroll in script (ResizeObserver
+        // + autoScroll).
         overflow-anchor: none;
+        // Stop scroll chaining into the page; also disables pull-to-refresh on
+        // mobile, which otherwise fires while flicking up through history.
+        overscroll-behavior-y: contain;
+        // Pin explicitly. Nothing sets scroll-behavior in the cockpit today, so
+        // this is a no-op guard against a future global `smooth` silently
+        // animating every pin (CSSOM-View: the scrollTop setter uses the
+        // COMPUTED scroll-behavior). Pins would then chase a moving target
+        // during streaming and never settle. Reserve smooth for jumpToLatest.
+        scroll-behavior: auto;
         // Scrollbar theming is global (see styles.scss `html` rule); both
         // scrollbar-width and scrollbar-color inherit, so no local override here.
       }
 
       /* Centered reading column. .messages stays full-width (padding + scroll at
          the pane edge); this wrapper caps prose line length and carries the
-         inter-message gap. flex:1 lets the empty-state center vertically. */
+         inter-message gap. flex:1 lets the empty-state center vertically.
+
+         ⚠️ LOAD-BEARING FOR THE SCROLL PIN — do not add `overflow: hidden`,
+         `contain: layout`, or `min-height: 0` to this rule.
+
+         The pin's ResizeObserver watches this element for content growth. That
+         works because `min-height: auto` (the flex default) resolves to the
+         content-based automatic minimum, so the box grows with its content once
+         content exceeds the container. When content is SHORT the box is instead
+         stretched to the container height and appending does not resize it — the
+         RO does not fire — but that is exactly the regime where scrolling is
+         impossible, so the two are mutually exclusive by construction and the
+         missed fire cannot matter.
+
+         Any of the three properties above collapses the automatic minimum to 0.
+         The box then pins at the container height forever, the RO NEVER fires,
+         and content silently clips with no error. See
+         docs/issues/cockpit_session_scroll_pin_misses_late_height_changes.md §8. */
       .messages-inner {
         flex: 1;
         width: 100%;

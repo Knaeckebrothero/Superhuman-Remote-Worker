@@ -3,6 +3,7 @@ import {
     AfterViewChecked,
     Component,
     computed,
+    DestroyRef,
     effect,
     ElementRef,
     HostListener,
@@ -13,6 +14,7 @@ import {
     output,
     QueryList,
     signal,
+    viewChild,
     ViewChild,
     ViewChildren,
 } from '@angular/core';
@@ -394,6 +396,52 @@ export function shouldFoldToolRun(
     threshold: number,
 ): boolean {
     return !toolCallsExpanded && toolCount >= threshold;
+}
+
+/**
+ * Scroll-pin geometry. Extracted as pure functions because jsdom has no layout
+ * engine — every geometry read there returns 0 — so the *decisions* are unit
+ * tested here and the *wiring* is verified in a real browser. See
+ * docs/issues/cockpit_session_scroll_pin_misses_late_height_changes.md
+ * §"Verification plan".
+ */
+
+/** How close to the bottom still counts as "following". */
+export const NEAR_BOTTOM_PX = 80;
+
+/**
+ * Whether the viewport is close enough to the bottom to count as following it.
+ * 80px sits in the practitioner band (use-stick-to-bottom 70, Vercel 100,
+ * Element 200); it is the long-standing value here and is kept deliberately.
+ */
+export function isNearBottom(
+    scrollTop: number,
+    scrollHeight: number,
+    clientHeight: number,
+    threshold: number = NEAR_BOTTOM_PX,
+): boolean {
+    return scrollHeight - scrollTop - clientHeight < threshold;
+}
+
+/**
+ * The scrollTop that actually parks the viewport at the bottom.
+ *
+ * NOT `scrollHeight` — that is not a valid scrollTop. Browsers clamp it, so it
+ * looks like it works, but you write X and read back Y, and `onMessagesScroll`
+ * then recomputes `autoScroll` from the clamped value. Clamped to 0 so a
+ * shorter-than-viewport list yields a real coordinate rather than a negative.
+ */
+export function pinTarget(scrollHeight: number, clientHeight: number): number {
+    return Math.max(0, scrollHeight - clientHeight);
+}
+
+/**
+ * Whether a height change should re-pin the viewport to the bottom. Both guards
+ * matter: `autoScroll` is the user's follow intent, and `isRestoringScroll`
+ * covers the prepend path, which deliberately parks the viewport mid-list.
+ */
+export function shouldPin(autoScroll: boolean, isRestoringScroll: boolean): boolean {
+    return autoScroll && !isRestoringScroll;
 }
 
 
@@ -832,7 +880,7 @@ export function clearDraft(threadId: string | null): void {
         <!-- Centered reading column: caps prose line length while the scrollbar
              stays at the pane edge. .jump-latest is kept OUTSIDE this wrapper so
              it floats over the scroll container (sticky + align-self:center). -->
-        <div class="messages-inner">
+        <div class="messages-inner" #messagesInner>
         @for (turn of chat.visibleTurns(); track turn.id; let isLast = $last) {
           @switch (turn.kind) {
             @case ('system') {
@@ -1608,6 +1656,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
     private readonly injector = inject(Injector);
+    private readonly destroyRef = inject(DestroyRef);
 
     /**
      * The running-command card to show on (re)attach (or null). Surfaces the
@@ -1670,6 +1719,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     });
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
+    /**
+     * The scroll pin's second observation target. Signal query because it's new
+     * code; `messagesContainer` stays a decorator query because ~10 call sites
+     * read it and migrating them is out of scope. `.required` is safe — neither
+     * element sits inside an `@if`.
+     */
+    private readonly messagesInner = viewChild.required<ElementRef<HTMLDivElement>>('messagesInner');
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
     @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
     @ViewChild('cameraInput') cameraInput?: ElementRef<HTMLInputElement>;
@@ -1930,22 +1986,87 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             error: () => this.pickedSuggestions.set([]),
         });
 
-        // Auto-scroll when turns or in-flight events change. Reading both the
-        // turn list and the in-flight turn's events array keeps the effect
-        // subscribed to deltas on the active streaming turn.
-        effect(() => {
-            this.chat.turns();
-            const active = this.chat.currentStreamingTurn();
-            if (active) active.events.length;
-            this.chat.pendingPermission();
+        // ===== The scroll pin =====
+        //
+        // ONE invariant: if the user is following the bottom, keep the bottom in
+        // view — no matter what changed the height. This replaced six hand-added
+        // hooks that each patched one *known cause* (turn appended, attachment
+        // chip added, keyboard opened, ...). That list could never be complete:
+        // the resume card was 1 of ~18 untracked height changes, and every new
+        // bottom element was a latent bug until someone added hook #7. Observe
+        // the effect, don't enumerate the causes.
+        //
+        // Full rationale, measurements and the rejected alternatives (scroll
+        // anchoring, column-reverse, scroll-snap, CDK, afterRenderEffect, a
+        // MutationObserver) live in
+        // docs/issues/cockpit_session_scroll_pin_misses_late_height_changes.md.
+        afterNextRender(() => {
+            const container = this.messagesContainer.nativeElement;
+            const inner = this.messagesInner().nativeElement;
 
-            if (this.autoScroll) {
-                // Re-check at fire time: a wheel-up during this scheduled tick
-                // flips autoScroll off, and we must not stomp the user's scroll.
-                setTimeout(() => {
-                    if (this.autoScroll) this.scrollToBottom();
-                }, 0);
-            }
+            // One observer, two targets — the asymmetry is the whole point. RO
+            // reports an element's OWN box, so:
+            //   inner     -> content growth (turns, streaming deltas, <img>
+            //                decode, webfont swap, code-block collapse, the
+            //                threadStatus resume card)
+            //   container -> viewport shrink (composer autosize, Android
+            //                keyboard, sibling banners) — content growth NEVER
+            //                changes its box, it's flex:1.
+            // Observing only `container` would never fire on a new message.
+            // Both changing in one frame -> one callback, two entries -> one pin.
+            const ro = new ResizeObserver(() => {
+                // Pure DOM write: no signal reads, so there is no dependency
+                // list to forget — that is the entire point. Runs after layout,
+                // before paint (HTML "update the rendering" step 16; rAF is step
+                // 14, paint is step 22), so NEVER defer this into rAF or
+                // setTimeout: a rAF scheduled from here lands NEXT frame and the
+                // current one paints 160px stale. That IS the historic
+                // up-then-down jump, and it's what the deleted setTimeout(0)
+                // hooks were doing.
+                if (!shouldPin(this.autoScroll, this.isRestoringScroll)) return;
+                container.scrollTop = pinTarget(container.scrollHeight, container.clientHeight);
+            });
+
+            ro.observe(inner);
+            ro.observe(container);
+
+            // The dangerous race is the opposite of the obvious one: the user
+            // starts scrolling up, an RO tick lands before their scroll event,
+            // autoScroll is still true, the pin yanks them back — and their
+            // scroll event then computes at-bottom, so autoScroll stays true and
+            // they physically cannot read back during streaming. RO fires on
+            // every delta while streaming, so this gets *more* likely, not less.
+            // Wheel/touch is the only user-intent signal a layout shift cannot
+            // forge, which is why the escape can't be expressed via scroll events.
+            const onWheel = ({deltaY}: WheelEvent) => {
+                if (deltaY < 0 && container.scrollHeight > container.clientHeight) {
+                    this.autoScroll = false;
+                }
+            };
+            // Touch mirror of the wheel escape: a finger dragging DOWN scrolls
+            // the content UP (away from the bottom). Same intent signal.
+            let lastTouchY: number | null = null;
+            const onTouchStart = (e: TouchEvent) => {
+                lastTouchY = e.touches[0]?.clientY ?? null;
+            };
+            const onTouchMove = (e: TouchEvent) => {
+                const y = e.touches[0]?.clientY;
+                if (y == null || lastTouchY == null) return;
+                if (y > lastTouchY && container.scrollHeight > container.clientHeight) {
+                    this.autoScroll = false;
+                }
+                lastTouchY = y;
+            };
+            container.addEventListener('wheel', onWheel, {passive: true});
+            container.addEventListener('touchstart', onTouchStart, {passive: true});
+            container.addEventListener('touchmove', onTouchMove, {passive: true});
+
+            this.destroyRef.onDestroy(() => {
+                ro.disconnect();
+                container.removeEventListener('wheel', onWheel);
+                container.removeEventListener('touchstart', onTouchStart);
+                container.removeEventListener('touchmove', onTouchMove);
+            });
         });
 
         // The placeholder renders inside the textarea's scroll area, so a
@@ -1956,20 +2077,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         effect(() => {
             this.inputPlaceholder();
             queueMicrotask(() => this.autoResizeInput());
-        });
-
-        // Attachment chips grow the composer the same way a multi-line draft
-        // does, shrinking the .messages viewport. Re-pin to the latest turn when
-        // the queue changes (Attach button, paste, or drag-drop) so adding a
-        // file never hides the most recent history. Gated on autoScroll so a
-        // user who scrolled up to read older turns isn't yanked back down.
-        effect(() => {
-            this.chat.pendingAttachments().length;
-            if (this.autoScroll) {
-                setTimeout(() => {
-                    if (this.autoScroll) this.scrollToBottom();
-                }, 0);
-            }
         });
 
         // Track new messages that arrive while the user has scrolled up.
@@ -2144,15 +2251,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         );
     }
 
-    // With interactive-widget=resizes-content the on-screen keyboard shrinks
-    // the layout viewport, so .messages loses ~40% of its height and the
-    // newest turn slides under the fold. Re-pin while following the bottom.
-    private readonly onViewportResize = () => {
-        if (this.autoScroll) this.scrollToBottom();
-    };
-
     ngOnInit(): void {
-        window.addEventListener('resize', this.onViewportResize);
         this.capabilitiesSub = this.deviceCapabilities.getCapabilities().subscribe((caps) => {
             this.hasCamera.set(caps.hasCamera);
             this.hasAudioInput.set(caps.hasAudioInput);
@@ -2183,7 +2282,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     ngOnDestroy(): void {
         // Don't disconnect — keep session alive across navigation
-        window.removeEventListener('resize', this.onViewportResize);
         this.stopIdePolling();
         if (this.startupTickInterval) {
             clearInterval(this.startupTickInterval);
@@ -2206,15 +2304,19 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         el.style.height = 'auto';
         el.style.height = el.scrollHeight + 'px';
         // The composer and the message list are flex siblings, so the `height:auto`
-        // reset above transiently enlarges .messages and clamps its scrollTop up by
-        // ~one line (the browser never restores it when the max grows back). Re-pin
-        // to the bottom in the SAME frame — synchronously, not via setTimeout — so
-        // that clamp and the re-pin never paint separately. A deferred re-pin is what
-        // made the conversation visibly jump up-then-down on every keystroke while
-        // composing a multi-line draft (worsened by `.messages { overflow-anchor:
-        // none }`, which strips the browser's own scroll-preservation). Only re-pin
-        // when the user was already following the bottom.
-        if (this.autoScroll) {
+        // reset above transiently enlarges .messages, and the browser clamps its
+        // scrollTop up by ~one line on the shrunken scrollport — then never restores
+        // it when the max grows back. Re-pin in the SAME frame, synchronously, so the
+        // clamp and the re-pin never paint separately; a deferred re-pin is what made
+        // the conversation visibly jump up-then-down on every keystroke.
+        //
+        // The ResizeObserver structurally CANNOT replace this one, which is why it
+        // survived the cull: the enlargement is transient within a single task (the
+        // `scrollHeight` read forces layout, then the next line restores the height),
+        // so .messages ends the task at the size RO last reported. RO fires on
+        // observed *change*; it never sees a transient. Only re-pin when the user was
+        // already following the bottom.
+        if (shouldPin(this.autoScroll, this.isRestoringScroll)) {
             this.scrollToBottom();
         }
     }
@@ -2227,8 +2329,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.showSlashMenu.set(false);
         // Mobile: dismiss the on-screen keyboard now the message is on its way,
         // so the reply renders into the reclaimed height. The keyboard collapse
-        // fires a viewport resize, which re-pins to the bottom (autoScroll is
-        // set below). Desktop keeps focus for rapid follow-up messages.
+        // grows .messages, which the ResizeObserver catches and re-pins
+        // (autoScroll is set below). Desktop keeps focus for rapid follow-up.
         if (this.isMobileDevice()) {
             this.inputEl?.nativeElement?.blur();
         }
@@ -2567,7 +2669,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.loadOlderHistory();
         }
         // If user is within 80px of the bottom, re-enable auto-scroll; otherwise pause it.
-        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        const nearBottom = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
         this.autoScroll = nearBottom;
         this.scrolledAway.set(!nearBottom);
         if (nearBottom) {
@@ -2810,10 +2912,21 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         });
     }
 
+    /**
+     * Park the viewport at the bottom, now, in this frame.
+     *
+     * `behavior: 'instant'` rather than a bare `scrollTop =` assignment: per
+     * CSSOM-View the scrollTop setter scrolls with behavior 'auto', which
+     * resolves to the *computed* `scroll-behavior` — so a single global
+     * `html { scroll-behavior: smooth }` would silently animate every pin,
+     * which would then chase a moving target during streaming and never settle.
+     * The SCSS pins `scroll-behavior: auto` on .messages as the other half of
+     * that guard.
+     */
     private scrollToBottom(): void {
         const el = this.messagesContainer?.nativeElement;
         if (el) {
-            el.scrollTop = el.scrollHeight;
+            el.scrollTo({top: pinTarget(el.scrollHeight, el.clientHeight), behavior: 'instant'});
         }
     }
 
