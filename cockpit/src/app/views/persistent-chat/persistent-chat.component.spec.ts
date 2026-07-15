@@ -8,14 +8,18 @@ import {
     draftKey,
     extractClipboardFiles,
     isMicMode,
+    isNearBottom,
     isStartupBannerVisible,
     loadDraft,
+    NEAR_BOTTOM_PX,
+    pinTarget,
     pickCodeServerUrlToOpen,
     pickCurrentStartupStep,
     pickRunningCommandCard,
     readingWidthToCss,
     saveDraft,
     shouldFoldToolRun,
+    shouldPin,
     shouldSendOnEnter,
     textSizeToCss,
 } from './persistent-chat.component';
@@ -318,6 +322,92 @@ describe('shouldFoldToolRun', () => {
     it('treats the threshold as inclusive (>=); one below stays inline', () => {
         expect(shouldFoldToolRun(T, false, T)).toBe(true);
         expect(shouldFoldToolRun(T - 1, false, T)).toBe(false);
+    });
+});
+
+/**
+ * Scroll-pin geometry. These are pure on purpose: jsdom has no layout engine, so
+ * every geometry read there returns 0 and the pin cannot be tested through the
+ * DOM at all — hence the decisions are extracted and tested here.
+ *
+ * What this does NOT cover: that the ResizeObserver is actually wired to both
+ * targets, and that a height change re-pins. The component is never mounted in a
+ * spec, and jsdom couldn't answer either question anyway. Those are browser
+ * checks — see §"Verification plan" in
+ * docs/issues/cockpit_session_scroll_pin_misses_late_height_changes.md.
+ */
+describe('isNearBottom', () => {
+    // scrollHeight 1000, clientHeight 400 → bottom is scrollTop 600.
+    it('counts exactly-at-bottom as following', () => {
+        expect(isNearBottom(600, 1000, 400)).toBe(true);
+    });
+
+    it('counts within the 80px threshold as following', () => {
+        expect(isNearBottom(521, 1000, 400)).toBe(true); // 79px away
+    });
+
+    it('treats the threshold as exclusive — exactly 80px away is not following', () => {
+        expect(isNearBottom(520, 1000, 400)).toBe(false); // 80px away
+        expect(isNearBottom(521, 1000, 400)).toBe(true); // 79px away
+    });
+
+    it('is not following when scrolled well up', () => {
+        expect(isNearBottom(0, 1000, 400)).toBe(false);
+    });
+
+    it('counts a list shorter than the viewport as following', () => {
+        // Nothing to scroll: scrollHeight <= clientHeight, so we are at the bottom.
+        expect(isNearBottom(0, 300, 400)).toBe(true);
+    });
+
+    it('honours a caller-supplied threshold', () => {
+        expect(isNearBottom(500, 1000, 400, 200)).toBe(true); // 100px away
+        expect(isNearBottom(500, 1000, 400, 50)).toBe(false);
+    });
+
+    it('defaults to the documented 80px band', () => {
+        expect(NEAR_BOTTOM_PX).toBe(80);
+    });
+});
+
+describe('pinTarget', () => {
+    it('returns scrollHeight - clientHeight, NOT scrollHeight', () => {
+        // The whole bug: scrollHeight is not a valid scrollTop. Browsers clamp
+        // it, so it appears to work — but you write X and read back Y, and
+        // onMessagesScroll then recomputes autoScroll from the clamped value.
+        expect(pinTarget(1000, 400)).toBe(600);
+        expect(pinTarget(1000, 400)).not.toBe(1000);
+    });
+
+    it('clamps to 0 when the content is shorter than the viewport', () => {
+        // Would otherwise be a negative scrollTop.
+        expect(pinTarget(300, 400)).toBe(0);
+    });
+
+    it('round-trips: pinning then measuring reports as at-bottom', () => {
+        // The invariant that ties the two helpers together — a pin must leave
+        // onMessagesScroll computing autoScroll = true, or the pin fights itself.
+        const scrollHeight = 1000;
+        const clientHeight = 400;
+        const top = pinTarget(scrollHeight, clientHeight);
+        expect(isNearBottom(top, scrollHeight, clientHeight)).toBe(true);
+    });
+});
+
+describe('shouldPin', () => {
+    it('pins while the user is following the bottom', () => {
+        expect(shouldPin(true, false)).toBe(true);
+    });
+
+    it('never pins once the user has scrolled away', () => {
+        expect(shouldPin(false, false)).toBe(false);
+    });
+
+    it('never pins while restoring position after a prepend', () => {
+        // loadOlderHistory parks the viewport mid-list on purpose; a pin there
+        // would yank the user to the bottom of the history they just opened.
+        expect(shouldPin(true, true)).toBe(false);
+        expect(shouldPin(false, true)).toBe(false);
     });
 });
 
