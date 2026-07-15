@@ -675,6 +675,7 @@ async def test_thread_creation_rejects_unavailable_project_without_enumeration()
     db = MagicMock()
     db.get_project = AsyncMock(return_value={"id": project_id})
     db.get_user_role_in_project = AsyncMock(return_value=None)
+    db.get_user_settings = AsyncMock(return_value={})
     db.create_thread = AsyncMock()
 
     with (
