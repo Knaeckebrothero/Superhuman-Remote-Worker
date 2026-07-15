@@ -2852,6 +2852,53 @@ describe('PersistentChatService — usage.updated telemetry', () => {
         expect(u.reasoningEstimated).toBe(true);
     });
 
+    describe('historyToTurns — tool categories survive the replay', () => {
+        // The folded-chip summary (session_turn_rendering.md "Phase 2 — the live
+        // edge") groups by category. The live SSE `tool.started` frame carries
+        // it; history gets it stamped by the orchestrator at read time
+        // (main.py _stamp_tool_categories). If this passthrough breaks, a
+        // reloaded turn silently degrades from "19× citations · 12× searches"
+        // to "38× steps" — no error, just a worse answer than the live view.
+        const aiMsg = (toolCalls: unknown[]) => ({
+            id: 'm1',
+            role: 'ai',
+            content: null,
+            tool_calls: toolCalls,
+            turn_number: 1,
+            created_at: null,
+        });
+
+        it('carries category from the history payload onto the event', () => {
+            const turns = historyToTurns([
+                aiMsg([
+                    {name: 'cite_web', args: {}, id: 'tc1', category: 'citation'},
+                    {name: 'web_search', args: {}, id: 'tc2', category: 'research'},
+                ]),
+            ] as never);
+            const tools = (turns[0] as AssistantTurn).events.filter(isToolCall);
+            expect(tools.map((t) => t.category)).toEqual(['citation', 'research']);
+        });
+
+        it('leaves category undefined when the payload omits it', () => {
+            // Unknown/renamed tool, or an orchestrator that predates the stamp.
+            // Must stay undefined so the chip buckets it as "other" rather than
+            // guessing a category client-side.
+            const turns = historyToTurns([
+                aiMsg([{name: 'no_such_tool', args: {}, id: 'tc1'}]),
+            ] as never);
+            const tools = (turns[0] as AssistantTurn).events.filter(isToolCall);
+            expect(tools[0].category).toBeUndefined();
+        });
+
+        it('keeps category alongside a denied decision', () => {
+            const turns = historyToTurns([
+                aiMsg([{name: 'run_command', args: {}, id: 'tc1', category: 'shell', decision: 'denied'}]),
+            ] as never);
+            const tools = (turns[0] as AssistantTurn).events.filter(isToolCall);
+            expect(tools[0]).toMatchObject({status: 'denied', category: 'shell'});
+        });
+    });
+
     describe('historyToTurns — synthetic image-delivery messages', () => {
         const msg = (over: Record<string, unknown>) => ({
             id: 'x',
