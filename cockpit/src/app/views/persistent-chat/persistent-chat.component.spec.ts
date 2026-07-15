@@ -23,7 +23,7 @@ import {
     shouldSendOnEnter,
     textSizeToCss,
 } from './persistent-chat.component';
-import {AssistantTurn} from '../../core/models/turn.model';
+import {AssistantTurn, MIN_FOLD_RUN} from '../../core/models/turn.model';
 
 /**
  * Build a minimal DataTransferItem stand-in. The real DataTransferItemList
@@ -300,22 +300,24 @@ describe('extractClipboardFiles', () => {
 });
 
 describe('shouldFoldToolRun', () => {
-    const T = 4; // TOOL_GROUP_THRESHOLD
+    // MIN_FOLD_RUN. Was 4 under the old "runs of consecutive tool calls" rule;
+    // now that groupEvents pins the live edge and folds everything else, the only
+    // question left is whether a run is long enough to be worth a chip at all —
+    // and a 1-event chip is the same height as the card it hides.
+    const T = MIN_FOLD_RUN;
 
-    it('folds a long run when the Tool calls preference is Collapsed (default)', () => {
-        expect(shouldFoldToolRun(4, false, T)).toBe(true);
-        expect(shouldFoldToolRun(10, false, T)).toBe(true);
+    it('folds any run of 2+ when the Tool calls preference is Collapsed (default)', () => {
+        expect(shouldFoldToolRun(2, false, T)).toBe(true);
+        expect(shouldFoldToolRun(40, false, T)).toBe(true);
     });
 
-    it('keeps a short run inline regardless of preference', () => {
+    it('leaves a lone event inline — a 1× chip saves nothing', () => {
         expect(shouldFoldToolRun(1, false, T)).toBe(false);
-        expect(shouldFoldToolRun(3, false, T)).toBe(false);
-        expect(shouldFoldToolRun(3, true, T)).toBe(false);
+        expect(shouldFoldToolRun(0, false, T)).toBe(false);
     });
 
-    it('never folds when Tool calls is Expanded — every run renders inline', () => {
-        // The whole point of the "inline" setting: no fold control, even for 50 calls.
-        expect(shouldFoldToolRun(4, true, T)).toBe(false);
+    it('never folds when Tool calls is Expanded — the escape hatch still works', () => {
+        expect(shouldFoldToolRun(2, true, T)).toBe(false);
         expect(shouldFoldToolRun(50, true, T)).toBe(false);
     });
 

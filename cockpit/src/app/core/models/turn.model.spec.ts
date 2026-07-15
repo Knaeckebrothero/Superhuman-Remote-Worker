@@ -1,13 +1,17 @@
 import {describe, expect, it} from 'vitest';
 import {
     AssistantTurn,
+    EventGroup,
     firstSentence,
     firstTextOf,
+    FoldableEvent,
     groupEvents,
     lastTextOf,
+    summarizeFolded,
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    ToolCallStatus,
     trailingText,
 } from './turn.model';
 
@@ -15,9 +19,15 @@ function mkTurn(events: AssistantTurn['events']): AssistantTurn {
     return {kind: 'assistant', id: 't1', events, status: 'done', startedAt: 0};
 }
 const txt = (id: string, content: string): TextEvent => ({kind: 'text', id, content, status: 'done', startedAt: 0});
-const tht = (id: string): ThoughtEvent => ({kind: 'thought', id, content: '...', status: 'done', startedAt: 0});
-const tool = (id: string): ToolCallEvent =>
-    ({kind: 'tool_call', id, tool: 'read_file', args: {}, status: 'completed', startedAt: 0});
+const tht = (id: string, status: ThoughtEvent['status'] = 'done'): ThoughtEvent =>
+    ({kind: 'thought', id, content: '...', status, startedAt: 0});
+const tool = (id: string, status: ToolCallStatus = 'completed', category?: string): ToolCallEvent =>
+    ({kind: 'tool_call', id, tool: 'read_file', args: {}, status, startedAt: 0, category});
+
+/** Ids in a group, folded or single — keeps the grouping assertions readable. */
+const idsOf = (g: EventGroup): string[] =>
+    g.kind === 'folded' ? g.events.map(e => e.id) : [g.event.id];
+const shapeOf = (gs: EventGroup[]) => gs.map(g => `${g.kind}(${idsOf(g).join(',')})`);
 
 describe('firstTextOf', () => {
     it('returns the first text event, skipping leading thoughts', () => {
@@ -107,37 +117,152 @@ describe('groupEvents', () => {
         expect(groupEvents([])).toEqual([]);
     });
 
-    it('coalesces a run of consecutive tool calls into one tools group', () => {
-        const g = groupEvents([tool('b0'), tool('b1'), tool('b2')]);
-        expect(g).toHaveLength(1);
-        expect(g[0]).toMatchObject({kind: 'tools', id: 'b0'});
-        expect((g[0] as {tools: unknown[]}).tools).toHaveLength(3);
-    });
-
-    it('keeps a lone tool call as a one-member tools group', () => {
-        const g = groupEvents([tool('b0')]);
-        expect(g).toHaveLength(1);
-        expect(g[0].kind).toBe('tools');
-        expect((g[0] as {tools: unknown[]}).tools).toHaveLength(1);
-    });
-
-    it('emits thoughts and text as single groups', () => {
-        const g = groupEvents([tht('b0'), txt('b1', 'hi')]);
-        expect(g.map(x => x.kind)).toEqual(['single', 'single']);
-        expect(g[0]).toMatchObject({kind: 'single', id: 'b0'});
-    });
-
-    it('does NOT merge tool runs across an interleaved thought', () => {
+    it('MERGES tool runs across an interleaved thought — the whole point', () => {
+        // The old rule broke a run at every thought, so a turn that alternated
+        // thought/tools/thought/tools rendered as a dozen rows even though each
+        // run folded. Only the latest tool (b4) stays pinned.
         const g = groupEvents([tool('b0'), tool('b1'), tht('b2'), tool('b3'), tool('b4')]);
-        expect(g.map(x => x.kind)).toEqual(['tools', 'single', 'tools']);
-        expect((g[0] as {tools: unknown[]}).tools).toHaveLength(2);
-        expect(g[1]).toMatchObject({kind: 'single', id: 'b2'});
-        expect((g[2] as {tools: unknown[]}).tools).toHaveLength(2);
-        expect(g[2].id).toBe('b3');
+        expect(shapeOf(g)).toEqual(['folded(b0,b1,b2,b3)', 'single(b4)']);
     });
 
-    it('breaks runs on text too', () => {
-        const g = groupEvents([txt('b0', 'plan'), tool('b1'), txt('b2', 'done')]);
-        expect(g.map(x => x.kind)).toEqual(['single', 'tools', 'single']);
+    it('never folds text — it is the answer', () => {
+        // b4 is the latest tool call so it pins; b1..b3 fold between the two texts.
+        const g = groupEvents([txt('b0', 'plan'), tool('b1'), tool('b2'), tool('b3'), tool('b4'), txt('b5', 'done')]);
+        expect(shapeOf(g)).toEqual(['single(b0)', 'folded(b1,b2,b3)', 'single(b4)', 'single(b5)']);
+    });
+
+    it('never folds a compaction marker', () => {
+        const comp = {kind: 'compaction', id: 'b2', summary: 's', startedAt: 0} as const;
+        const g = groupEvents([tool('b0'), tht('b1'), comp, tool('b3'), tool('b4'), tool('b5')]);
+        expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)', 'folded(b3,b4)', 'single(b5)']);
+    });
+
+    describe('the live edge', () => {
+        it('pins every in-flight call — 5 tools at once means 5 cards', () => {
+            const g = groupEvents([
+                tool('b0'), tool('b1', 'running'), tool('b2', 'running'),
+                tool('b3', 'running'), tool('b4', 'running'), tool('b5', 'pending'),
+            ]);
+            // b0 alone is below MIN_FOLD_RUN, so it renders inline rather than chipping.
+            expect(shapeOf(g)).toEqual([
+                'single(b0)', 'single(b1)', 'single(b2)', 'single(b3)', 'single(b4)', 'single(b5)',
+            ]);
+        });
+
+        it('drops each call into the chip as it completes', () => {
+            const g = groupEvents([
+                tool('b0'), tool('b1'), tool('b2'), tool('b3', 'running'), tool('b4', 'running'),
+            ]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1,b2)', 'single(b3)', 'single(b4)']);
+        });
+
+        it('pins a streaming thought', () => {
+            // No tool call here, so nothing competes for the latest-tool pin.
+            const g = groupEvents([tht('b0'), tht('b1'), tht('b2'), tht('b3', 'streaming')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1,b2)', 'single(b3)']);
+        });
+
+        it('always pins the latest tool call, even in a finished turn', () => {
+            const g = groupEvents([tht('b0'), tool('b1'), tht('b2'), tool('b3')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1,b2)', 'single(b3)']);
+        });
+
+        it('pins only the LAST tool call, not every trailing one', () => {
+            const g = groupEvents([tool('b0'), tool('b1'), tool('b2')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)']);
+        });
+
+        it('handles out-of-order completion without reordering', () => {
+            // b1 still running while b2/b3 already returned: b1 pinned (in flight),
+            // b3 pinned (latest), b2 stranded between them — renders inline, in place.
+            const g = groupEvents([tool('b0'), tool('b1', 'running'), tool('b2'), tool('b3')]);
+            expect(shapeOf(g)).toEqual(['single(b0)', 'single(b1)', 'single(b2)', 'single(b3)']);
+        });
+
+        it('folds a thought-only turn with no tool call to pin', () => {
+            const g = groupEvents([tht('b0'), tht('b1'), tht('b2')]);
+            expect(shapeOf(g)).toEqual(['folded(b0,b1,b2)']);
+        });
+    });
+
+    it('renders a sub-threshold run inline instead of chipping it', () => {
+        // A "1× thought" chip is the same height as the card and less informative.
+        const g = groupEvents([tht('b0'), tool('b1', 'running')]);
+        expect(shapeOf(g)).toEqual(['single(b0)', 'single(b1)']);
+    });
+
+    it('ids the group by its first member so @for track stays stable', () => {
+        const g = groupEvents([tool('b0'), tht('b1'), tool('b2')]);
+        expect(g[0].id).toBe('b0');
+    });
+
+    it('collapses the screenshot case to one chip plus the live edge', () => {
+        // The reported shape: text, then thought/tools alternating forever.
+        const events = [txt('b0', 'analysis')];
+        for (let i = 1; i <= 12; i++) {
+            events.push(i % 2 ? tht(`b${i}`) : tool(`b${i}`));
+        }
+        const g = groupEvents(events);
+        expect(g.map(x => x.kind)).toEqual(['single', 'folded', 'single']);
+    });
+});
+
+describe('summarizeFolded', () => {
+    const sum = (evts: FoldableEvent[]) => summarizeFolded(evts);
+
+    it('counts by category, with thoughts as their own bucket', () => {
+        const s = sum([
+            tool('a', 'completed', 'research'), tool('b', 'completed', 'research'),
+            tool('c', 'completed', 'citation'), tht('d'),
+        ]);
+        expect(s.parts).toEqual([
+            {category: 'research', count: 2},
+            {category: 'citation', count: 1},
+            {category: 'thought', count: 1},
+        ]);
+    });
+
+    it('sorts by count, highest first', () => {
+        const s = sum([
+            tool('a', 'completed', 'shell'),
+            tool('b', 'completed', 'research'), tool('c', 'completed', 'research'),
+            tool('d', 'completed', 'research'),
+        ]);
+        expect(s.parts.map(p => p.category)).toEqual(['research', 'shell']);
+    });
+
+    it('keeps first-appearance order for ties', () => {
+        const s = sum([tool('a', 'completed', 'git'), tool('b', 'completed', 'shell')]);
+        expect(s.parts.map(p => p.category)).toEqual(['git', 'shell']);
+    });
+
+    it('buckets calls with no category as "other" (older history rows)', () => {
+        expect(sum([tool('a')]).parts).toEqual([{category: 'other', count: 1}]);
+    });
+
+    it('counts failures for the chip badge', () => {
+        const s = sum([
+            tool('a', 'completed', 'shell'), tool('b', 'error', 'shell'),
+            tool('c', 'denied', 'shell'), tht('d'),
+        ]);
+        expect(s.failed).toBe(2);
+    });
+
+    it('counts a resultStatus error even when status looks completed', () => {
+        const e: ToolCallEvent = {...tool('a', 'completed', 'shell'), resultStatus: 'error'};
+        expect(sum([e]).failed).toBe(1);
+    });
+
+    it('never counts a thought as failed', () => {
+        expect(sum([tht('a'), tht('b')]).failed).toBe(0);
+    });
+
+    it('does not double-count: parts sum to the event count', () => {
+        // The reason this is categorical and has no grand total — a total plus
+        // per-category counts would count every command twice.
+        const evts = [
+            tool('a', 'completed', 'shell'), tool('b', 'completed', 'research'), tht('c'),
+        ];
+        expect(sum(evts).parts.reduce((n, p) => n + p.count, 0)).toBe(evts.length);
     });
 });

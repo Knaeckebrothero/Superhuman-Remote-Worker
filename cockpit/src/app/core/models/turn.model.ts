@@ -286,38 +286,93 @@ export function countEvents(turn: AssistantTurn): TurnEventCounts {
 // Event grouping (render-time, Slice 3 / Phase 2 of session_turn_rendering)
 // ---------------------------------------------------------------------------
 
-/**
- * A view-time grouping of a turn's events. Consecutive tool calls are
- * coalesced into one `tools` run so the renderer can collapse long
- * sequences ("4× tool calls") without distorting the underlying event
- * stream (cf. the model contract above: "the renderer is free to merge
- * them visually without distorting the data"). Thoughts and text always
- * stand alone as `single` groups.
- */
-export type EventGroup =
-    | {kind: 'single'; id: string; event: ThoughtEvent | TextEvent | CompactionEvent}
-    | {kind: 'tools'; id: string; tools: ToolCallEvent[]};
+/** An event that may be folded away into a summary chip. */
+export type FoldableEvent = ToolCallEvent | ThoughtEvent;
 
 /**
- * Coalesce a turn's flat event list into render groups: runs of consecutive
- * tool calls become one `tools` group; every thought/text breaks the run and
- * becomes its own `single` group. So `[tool, tool, thought, tool, tool]`
- * yields `[tools(2), single(thought), tools(2)]` — never one merged group.
+ * A view-time grouping of a turn's events, built around the *live edge*: the
+ * work happening right now stays visible as cards, and everything already
+ * finished collapses into one chip.
  *
- * A group's `id` (= the first member's event id, stable across SSE replay)
- * is suitable for `@for (… ; track group.id)`.
+ * This supersedes the earlier "runs of 4+ consecutive tool calls fold" rule,
+ * which barely helped in practice — a thought between two tool batches broke
+ * the run, so a turn that alternated thought/tools/thought/tools rendered as a
+ * dozen separate rows even though every run was individually folded. Thoughts
+ * are foldable here, and a run is only broken by text, so the whole lead-up
+ * collapses to a single chip.
+ */
+export type EventGroup =
+    | {kind: 'single'; id: string; event: TurnEvent}
+    | {kind: 'folded'; id: string; events: FoldableEvent[]};
+
+/**
+ * Below this many foldable events in a row, render them as plain cards instead
+ * of a chip. A "1× thought" chip is the same height as the thought card it
+ * replaces and strictly less informative, so folding one event never pays.
+ */
+export const MIN_FOLD_RUN = 2;
+
+export function isFoldable(e: TurnEvent): e is FoldableEvent {
+    return e.kind === 'tool_call' || e.kind === 'thought';
+}
+
+/**
+ * Whether this event is still in flight. Tool results can land out of order, so
+ * this is a per-event property, not "is it near the end of the array".
+ */
+export function isEventInFlight(e: TurnEvent): boolean {
+    if (e.kind === 'tool_call') return e.status === 'pending' || e.status === 'running';
+    if (e.kind === 'thought') return e.status === 'streaming';
+    return false;
+}
+
+/**
+ * The events that must stay visible as cards:
+ *   - anything in flight — the whole point is watching work happen. Fire five
+ *     tools at once and all five show; each drops into the chip as it returns.
+ *   - the turn's most recent tool call, always, so a finished turn still shows
+ *     what it last did rather than collapsing to a bare counter.
+ */
+export function pinnedEventIds(events: TurnEvent[]): Set<string> {
+    const pinned = new Set<string>();
+    for (const e of events) {
+        if (isEventInFlight(e)) pinned.add(e.id);
+    }
+    for (let i = events.length - 1; i >= 0; i--) {
+        if (isToolCall(events[i])) {
+            pinned.add(events[i].id);
+            break;
+        }
+    }
+    return pinned;
+}
+
+/**
+ * Partition a turn's flat event list into render groups.
+ *
+ * Text and compaction never fold — text is the answer, and a compaction marker
+ * is too significant to hide. Every other event folds unless it's pinned, and
+ * contiguous unpinned stretches merge into one chip. Order is preserved, so a
+ * completed call sandwiched between two in-flight ones simply renders inline.
+ *
+ * A group's `id` (= its first member's event id, stable across SSE replay) is
+ * suitable for `@for (… ; track group.id)`.
  */
 export function groupEvents(events: TurnEvent[]): EventGroup[] {
+    const pinned = pinnedEventIds(events);
     const groups: EventGroup[] = [];
-    let run: ToolCallEvent[] = [];
+    let run: FoldableEvent[] = [];
     const flush = () => {
-        if (run.length > 0) {
-            groups.push({kind: 'tools', id: run[0].id, tools: run});
-            run = [];
+        if (run.length === 0) return;
+        if (run.length < MIN_FOLD_RUN) {
+            for (const e of run) groups.push({kind: 'single', id: e.id, event: e});
+        } else {
+            groups.push({kind: 'folded', id: run[0].id, events: run});
         }
+        run = [];
     };
     for (const e of events) {
-        if (isToolCall(e)) {
+        if (isFoldable(e) && !pinned.has(e.id)) {
             run.push(e);
         } else {
             flush();
@@ -326,4 +381,47 @@ export function groupEvents(events: TurnEvent[]): EventGroup[] {
     }
     flush();
     return groups;
+}
+
+/**
+ * Category-count summary for a folded chip: "24× searches · 20× citations ·
+ * 6× thoughts". Counting by category rather than by type is deliberate — a
+ * total plus per-category counts double-counts, because commands *are* tool
+ * calls. Thoughts get their own bucket.
+ *
+ * Category resolution is left to the caller (it needs i18n); this returns raw
+ * category keys with `'thought'` for reasoning and `'other'` for tool calls
+ * whose category is absent (older history rows).
+ */
+export interface FoldedSummaryPart {
+    /** Tool category key, or the literal 'thought' / 'other'. */
+    category: string;
+    count: number;
+}
+
+export interface FoldedSummary {
+    parts: FoldedSummaryPart[];
+    /** Calls that errored or were denied — surfaced as a chip badge. */
+    failed: number;
+}
+
+export function summarizeFolded(events: FoldableEvent[]): FoldedSummary {
+    const counts = new Map<string, number>();
+    let failed = 0;
+    for (const e of events) {
+        let key: string;
+        if (e.kind === 'thought') {
+            key = 'thought';
+        } else {
+            key = e.category || 'other';
+            if (e.status === 'error' || e.status === 'denied' || e.resultStatus === 'error') failed++;
+        }
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    // Highest count first; ties keep insertion (= first-appearance) order, which
+    // Map iteration gives us for free.
+    const parts = [...counts.entries()]
+        .map(([category, count]) => ({category, count}))
+        .sort((a, b) => b.count - a.count);
+    return {parts, failed};
 }
