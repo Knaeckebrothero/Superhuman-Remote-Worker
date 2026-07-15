@@ -231,7 +231,7 @@ limits:
     max_token_repetitions: 20   # same word/token repeated consecutively
     max_line_repetitions: 10    # same line repeated in output
   progress_stall_threshold: 30     # tool calls without progress before nudge reminder
-  max_tool_calls_per_phase: 200    # max tool calls per phase before rewind (tactical) or freeze (strategic)
+  max_tool_calls_per_phase: 500    # max tool calls per phase before rewind (tactical) or freeze (strategic)
   # Per-category audited tool-batch timeout (seconds). The batch timeout is the
   # max of categories in the batch, then clipped by graph-level hard ceilings.
   tool_category_timeouts:

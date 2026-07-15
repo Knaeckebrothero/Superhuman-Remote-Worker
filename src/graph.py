@@ -4028,8 +4028,8 @@ def create_audited_tool_node(
     _category_failures: dict = {}  # category -> set of failed tool names
 
     # Config-driven thresholds
-    _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 15
-    _HARD_CAP = config.limits.max_tool_calls_per_phase  # default 100
+    _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 30
+    _HARD_CAP = config.limits.max_tool_calls_per_phase  # default 500
 
     _TOOL_TIMEOUT_RETRIES = [0]  # tracks consecutive batch timeouts
     _TOOL_BATCH_TIMEOUT_SECONDS = 900  # absolute cap for any audited tool batch
