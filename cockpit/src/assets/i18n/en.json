@@ -1695,6 +1695,7 @@
       "indexReady": "Ready @ {{sha}}",
       "indexPartial": "Partial",
       "indexFailed": "Failed",
+      "indexProgressTitle": "{{done}} of {{total}} notes indexed",
       "lastSuccess": "Last success",
       "reindexTooltip": "Reindex",
       "fullReindexTooltip": "Full rebuild",
@@ -2127,7 +2128,8 @@
     },
     "datasources": {
       "group": "Data Sources",
-      "loading": "Loading datasources..."
+      "loading": "Loading datasources...",
+      "notReady": "Not fully indexed yet — the agent may see incomplete results."
     },
     "execution": {
       "group": "Execution",

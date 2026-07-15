@@ -175,6 +175,8 @@ def test_index_status_payload_is_credential_free_and_serializable():
         last_attempt_at=now,
         last_success_at=now,
         last_error="one note failed",
+        notes_done=3,
+        notes_total=10,
     )
 
     result = index_status_payload(str(watermark.kb_id), watermark)
@@ -183,6 +185,8 @@ def test_index_status_payload_is_credential_free_and_serializable():
     assert result["indexed_commit"] == "a" * 40
     assert result["source_head"] == "b" * 40
     assert result["last_success_at"] == now.isoformat()
+    assert result["notes_done"] == 3
+    assert result["notes_total"] == 10
     assert "repo_name" not in result
     assert "credentials" not in result
 
@@ -204,6 +208,8 @@ async def test_status_endpoint_uses_normal_visibility_gate():
         result = await get_datasource_index_status(request, datasource_id)
 
     assert result["status"] == "pending"
+    assert result["notes_done"] is None
+    assert result["notes_total"] is None
     gate.assert_awaited_once()
     get_watermark.assert_awaited_once_with(UUID(datasource_id))
 

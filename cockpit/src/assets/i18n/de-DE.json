@@ -1695,6 +1695,7 @@
       "indexReady": "Bereit @ {{sha}}",
       "indexPartial": "Teilweise",
       "indexFailed": "Fehlgeschlagen",
+      "indexProgressTitle": "{{done}} von {{total}} Notizen indiziert",
       "lastSuccess": "Letzter Erfolg",
       "reindexTooltip": "Neu indizieren",
       "fullReindexTooltip": "Vollständiger Neuaufbau",
@@ -2127,7 +2128,8 @@
     },
     "datasources": {
       "group": "Datenquellen",
-      "loading": "Datenquellen werden geladen…"
+      "loading": "Datenquellen werden geladen…",
+      "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse."
     },
     "execution": {
       "group": "Ausführung",

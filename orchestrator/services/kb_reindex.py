@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 # a no-op check one HEAD fetch + one watermark row per KB.
 SWEEP_TICK_SECONDS = int(os.getenv("KB_REINDEX_SWEEP_SECONDS", "900"))
 
+# How often (in successfully stamped notes) to persist a progress counter during
+# a run. Coarse on purpose: bounds the extra watermark writes on a large first
+# index while keeping the Cockpit progress bar visibly moving.
+_PROGRESS_BUMP_EVERY = 25
+
 # The vault root within a project's jobs repo (slice 1 dual-write target).
 KNOWLEDGE_PREFIX = "knowledge/"
 
@@ -536,6 +541,15 @@ async def _reindex_snapshot(
     indexed_map = await store.get_indexed_blob_shas(kb_id)
     upsert_paths, delete_paths = plan_reindex(indexed_map, current_map, full=full)
 
+    # Reset determinate-progress counters for this run so Cockpit can render a
+    # bar. notes_total is the per-run work set (changed notes on an incremental
+    # run, the whole vault on a full rebuild). Best-effort: never fail on it.
+    notes_total = len(upsert_paths)
+    try:
+        await store.update_index_progress(kb_id, 0, notes_total)
+    except Exception as exc:
+        logger.debug("kb_reindex[%s]: progress reset skipped: %s", kb_id, exc)
+
     upserted = skipped = errors = 0
     invalid_paths: List[str] = []
     for path in upsert_paths:
@@ -617,6 +631,14 @@ async def _reindex_snapshot(
                 note_row, current_map[path], embedding_stamp, centroid=centroid
             )
             upserted += 1
+            # Throttled determinate-progress bump (best-effort).
+            if upserted % _PROGRESS_BUMP_EVERY == 0:
+                try:
+                    await store.update_index_progress(kb_id, upserted)
+                except Exception as exc:
+                    logger.debug(
+                        "kb_reindex[%s]: progress bump skipped: %s", kb_id, exc
+                    )
         except Exception as exc:
             logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, exc)
             errors += 1
@@ -667,6 +689,13 @@ async def _reindex_snapshot(
             source_head=head,
             last_error=f"{errors} note operation(s) failed; retry scheduled",
         )
+
+    # Final progress reflects what durably landed this run so the bar doesn't
+    # stall between the last throttled bump and completion (best-effort).
+    try:
+        await store.update_index_progress(kb_id, upserted, notes_total)
+    except Exception as exc:
+        logger.debug("kb_reindex[%s]: final progress write skipped: %s", kb_id, exc)
 
     logger.info(
         "kb_reindex[%s]: %s at %s (full=%s upserted=%d deleted=%d "

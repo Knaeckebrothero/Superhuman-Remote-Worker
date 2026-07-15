@@ -372,6 +372,37 @@ class TestReindexKbIncremental:
         assert wm_kwargs["pipeline_version"] == endpoint_pipeline
 
     @pytest.mark.asyncio
+    async def test_progress_counters_reset_and_finalize(self):
+        kb = uuid.uuid4()
+        endpoint_stamp = f"{EMBEDDING_VERSION}:pf-effective-profile"
+        endpoint_pipeline = reindex_pipeline_version(endpoint_stamp, "knowledge")
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=endpoint_pipeline
+        )
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/changed.md": "OLD", "knowledge/same.md": "same1"},
+            contents={"knowledge/changed.md": _note_md("changed", "fresh insight")},
+        )
+        svc.profile_fingerprint = "pf-effective-profile"
+
+        result = await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+
+        assert result["status"] == "completed"
+        # One changed note this run: notes_total set at reset, done at finalize.
+        calls = [c.args for c in store.update_index_progress.await_args_list]
+        assert calls[0] == (kb, 0, 1)  # reset — notes_total = changed-set size
+        assert calls[-1] == (kb, 1, 1)  # finalize — 1 of 1 durably stamped
+
+    @pytest.mark.asyncio
     async def test_stamp_centroid_spans_multiple_chunks(self):
         # A genuinely multi-chunk note: the stamped centroid must be the
         # per-dimension mean of ALL the note's chunk vectors (not just the first),

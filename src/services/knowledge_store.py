@@ -138,6 +138,9 @@ class KbWatermark:
     last_success_at: Optional[datetime] = None
     last_error: Optional[str] = None
     updated_at: Optional[datetime] = None
+    # Per-run progress (advisory; migration 0012) for a determinate Cockpit bar.
+    notes_done: Optional[int] = None
+    notes_total: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: Dict[str, Any]) -> "KbWatermark":
@@ -154,6 +157,8 @@ class KbWatermark:
             last_success_at=row.get("last_success_at"),
             last_error=row.get("last_error"),
             updated_at=row.get("updated_at"),
+            notes_done=row.get("notes_done"),
+            notes_total=row.get("notes_total"),
         )
 
 
@@ -582,6 +587,36 @@ class KnowledgeStore:
             source_head,
             status,
             last_error,
+        )
+
+    async def update_index_progress(
+        self,
+        kb_id: uuid.UUID,
+        notes_done: int,
+        notes_total: Optional[int] = None,
+        *,
+        conn: Any = None,
+    ) -> None:
+        """Update the current run's progress counters on an existing watermark row.
+
+        Cockpit renders a determinate progress bar from ``notes_done``/``notes_total``
+        while a KB indexes. This is a deliberately narrow UPDATE: it never creates a
+        row and never touches ``status``/``indexed_commit`` (the status writers own
+        those), so a stray progress write can neither resurrect a deleted KB nor
+        advance the as-of commit. ``notes_total`` is only overwritten when provided.
+        """
+        executor = conn if conn is not None else self.db
+        await executor.execute(
+            """
+            UPDATE kb_index_watermark
+               SET notes_done = $2,
+                   notes_total = COALESCE($3, notes_total),
+                   updated_at = NOW()
+             WHERE kb_id = $1
+            """,
+            kb_id,
+            notes_done,
+            notes_total,
         )
 
     async def delete_kb_index(self, kb_id: uuid.UUID, *, conn: Any = None) -> None:

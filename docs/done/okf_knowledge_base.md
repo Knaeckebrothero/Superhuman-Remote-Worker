@@ -5,7 +5,7 @@ tags:
   - agent-architecture
   - git-integration
   - tool-development
-status: active
+status: done
 created: 2026-07-03
 aliases:
   - OKF knowledge base
@@ -50,6 +50,26 @@ Cockpit authoring/status flow. The automated feature suites are green; deploymen
 verification remains separate operational evidence. Origin: design discussion 2026-07-03, building on the
 substrate findings in [[knowledge_base_substrate_decision]]; refined the same day by a
 six-agent research sweep (three codebase audits, three web — sources in §12).
+
+**Index-readiness surfacing — BUILT + automated-verified 2026-07-15 (uncommitted;
+live e2e runbook `tests/okf_kb_index_readiness_validation.md`).** The follow-up that
+finishes §4's "tools show status during partial/indexing/failed" promise for the
+zero-result case and delivers the operator/agent legibility §10 implied, in three
+independently shippable changes: (1) **correctness** — `kb_search`/`kb_read`/`kb_list`
+and the passive injection path now disclose "still indexing" on an *empty* result
+when the watermark ≠ `ready` (previously the marker rendered only on non-empty
+results, so a not-yet-indexed KB read as a genuinely empty one — an agent could
+wrongly conclude "the KB has nothing"); (2) **determinate progress** — migration
+`0012` adds per-run `notes_done`/`notes_total` to `kb_index_watermark`, the
+reindexer resets/bumps/finalizes them, and the Cockpit datasource list polls (5 s)
+into a live `N/M` progress bar that reaches Ready without a manual refresh;
+(3) **warn-only at create** — the shared job/session datasource picker warns when a
+still-indexing KB is attached, with **no** dispatch gate and no agent wait (the
+fire-and-forget indexing/dispatch decoupling is deliberately kept; partial/indexing
+KBs stay queryable). Verified: 266 backend + 65 cockpit tests green, `ng build`
+clean, `0012` applied in a scratch pg15 + `vector_schema_current.sql` regenerated.
+Moved to `docs/done/` on completion; reopen (move back to `docs/features/`) if the
+live e2e fails.
 [[loop_repo_compounding_v2]] shipped the same day, which changes this doc's footing: the
 squash-merge flow, the post-merge hook point, and `retros/` (orchestrator-written notes
 with OKF frontmatter, `type: retro`) are **in production**. Anything an agent writes

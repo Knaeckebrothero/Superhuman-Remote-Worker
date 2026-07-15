@@ -208,9 +208,16 @@ async def retrieve_bound_knowledge(
 
     external_groups: List[List[Any]] = []
     watermark_by_id: Dict[uuid.UUID, Optional[str]] = {}
+    # Track externals whose watermark reports a non-ready state so a still-
+    # indexing KB is disclosed even when it contributed zero selected records.
+    # fetch_watermark() renders non-ready as "<status> — ..."; a bare commit
+    # SHA never contains " — ".
+    unready_external_ids: set[uuid.UUID] = set()
     for binding, (records, watermark) in zip(external, external_payloads):
         external_groups.append(_dedupe_records(records, binding.kb_id, seen))
         watermark_by_id[binding.kb_id] = watermark
+        if isinstance(watermark, str) and " — " in watermark:
+            unready_external_ids.add(binding.kb_id)
     external_unique = _round_robin(external_groups)
 
     if native:
@@ -245,6 +252,7 @@ async def retrieve_bound_knowledge(
         binding.alias: watermark_by_id.get(binding.kb_id)
         for binding in external
         if binding.kb_id in selected_external_ids
+        or binding.kb_id in unready_external_ids
     }
     return KnowledgeInjectionSelection(
         notes=selected,
