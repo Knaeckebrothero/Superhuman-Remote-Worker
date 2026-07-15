@@ -1,5 +1,6 @@
 import {
     AssistantTurn,
+    CompactionEvent,
     ConversationState,
     EMPTY_CONVERSATION,
     TextEvent,
@@ -124,7 +125,48 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
         case 'add_compaction': {
             // A compaction boundary banner. Idempotent by id (stable
             // `compaction-<turn>`), so SSE replay replaces rather than
-            // duplicates. activeAssistantTurnId is untouched.
+            // duplicates.
+            //
+            // Auto-compaction fires *mid-turn*, from the agent's tool-iteration
+            // loop (`_execute_turn` in src/persistent_graph.py), so the banner
+            // belongs inside the open turn at the point it fired. A top-level
+            // turn can't express that: activeAssistantTurnId keeps pointing at
+            // the turn above, so every post-compaction thought and tool call
+            // lands in that bubble and renders *above* the divider — stranding
+            // the banner at the foot of the transcript, drifting further from
+            // where it fired the longer the agent works. A reload then rebuilds
+            // the transcript through `historyToTurns`, which places the same
+            // marker inline, so the banner visibly jumped. Mirror that
+            // placement live. Between turns (manual `/compact`) there is no
+            // open turn and the top-level divider is still the right shape.
+            const event: CompactionEvent = {
+                kind: 'compaction',
+                id: action.id,
+                summary: action.summary,
+                startedAt: action.timestamp,
+            };
+            // Replay can re-deliver a frame after its turn closed, so dedupe
+            // against inline markers in *every* turn, not just the active one.
+            const ownsInline = (t: Turn) =>
+                t.kind === 'assistant' && t.events.some((e) => e.id === action.id);
+            if (state.turns.some(ownsInline)) {
+                return {
+                    ...state,
+                    turns: state.turns.map((t) =>
+                        ownsInline(t)
+                            ? {
+                                ...(t as AssistantTurn),
+                                events: (t as AssistantTurn).events.map((e) =>
+                                    e.id === action.id ? event : e,
+                                ),
+                            }
+                            : t,
+                    ),
+                };
+            }
+            if (state.activeAssistantTurnId) {
+                return updateActiveTurn(state, (t) => ({...t, events: [...t.events, event]}));
+            }
             const turn: Turn = {
                 kind: 'compaction',
                 id: action.id,
@@ -132,11 +174,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 timestamp: action.timestamp,
             };
             const idx = state.turns.findIndex((t) => t.id === action.id);
-            if (idx >= 0) {
-                const turns = [...state.turns];
-                turns[idx] = turn;
-                return {...state, turns};
-            }
+            if (idx >= 0) return {...state, turns: replaceAt(state.turns, idx, turn)};
             return {...state, turns: [...state.turns, turn]};
         }
 

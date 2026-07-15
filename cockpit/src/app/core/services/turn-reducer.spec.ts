@@ -667,7 +667,7 @@ describe('turn-reducer — replay idempotency', () => {
 });
 
 describe('turn-reducer — add_compaction', () => {
-    it('appends a compaction banner turn', () => {
+    it('appends a compaction banner turn between turns (no turn open)', () => {
         const state = play([
             {type: 'user_message', id: 'u1', content: 'hi', timestamp: 100},
             {type: 'add_compaction', id: 'compaction-3', summary: 'We did X.', timestamp: 200},
@@ -688,5 +688,59 @@ describe('turn-reducer — add_compaction', () => {
         const c = state.turns[0];
         expect(c.kind).toBe('compaction');
         if (c.kind === 'compaction') expect(c.summary).toBe('updated');
+    });
+
+    // Auto-compaction fires mid-turn. The banner must land where it fired, not
+    // trail the whole turn — post-compaction work renders inside the open turn,
+    // so a top-level divider gets stranded at the foot of the transcript and
+    // then jumps into place on reload (when historyToTurns inlines it).
+    it('lands inline at its true position when a turn is open', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1},
+            {type: 'tool_started', toolUseId: 'a', tool: 'edit_citation', args: {}, timestamp: 2},
+            {type: 'tool_completed', toolUseId: 'a', result: 'ok', timestamp: 3},
+            {type: 'add_compaction', id: 'compaction-2', summary: 'We did X.', timestamp: 4},
+            {type: 'thinking', content: 'more', timestamp: 5},
+            {type: 'tool_started', toolUseId: 'b', tool: 'edit_citation', args: {}, timestamp: 6},
+        ]);
+        // One turn only — no trailing top-level divider.
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns.find(isAssistantTurn)!;
+        expect(turn.events.map((e) => e.kind)).toEqual([
+            'tool_call',
+            'compaction',
+            'thought',
+            'tool_call',
+        ]);
+        const marker = turn.events[1];
+        expect(marker.id).toBe('compaction-2');
+        if (marker.kind === 'compaction') expect(marker.summary).toBe('We did X.');
+    });
+
+    it('replays an inline marker in place, even after its turn closed', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1},
+            {type: 'add_compaction', id: 'compaction-2', summary: 'first', timestamp: 2},
+            {type: 'token', content: 'answer', timestamp: 3},
+            {type: 'turn_completed', turnId: 't1', finishedAt: 4},
+            // Replay after the turn closed: must not spawn a second divider.
+            {type: 'add_compaction', id: 'compaction-2', summary: 'updated', timestamp: 2},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        const turn = state.turns.find(isAssistantTurn)!;
+        expect(turn.events.map((e) => e.kind)).toEqual(['compaction', 'text']);
+        const marker = turn.events[0];
+        if (marker.kind === 'compaction') expect(marker.summary).toBe('updated');
+    });
+
+    it('does not merge reasoning across a compaction boundary', () => {
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1},
+            {type: 'thinking', content: 'before', timestamp: 2},
+            {type: 'add_compaction', id: 'compaction-2', summary: 'We did X.', timestamp: 3},
+            {type: 'thinking', content: 'after', timestamp: 4},
+        ]);
+        const turn = state.turns.find(isAssistantTurn)!;
+        expect(turn.events.map((e) => e.kind)).toEqual(['thought', 'compaction', 'thought']);
     });
 });
