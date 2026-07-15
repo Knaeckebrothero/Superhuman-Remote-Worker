@@ -10,13 +10,41 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, get_args
 
 from langchain_core.tools import tool
 
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
+
+
+# Closed vocabularies, mirrored from src/citation_engine/models.py and the
+# Postgres enums in orchestrator/database/migrations/vector/0001_initial.sql.
+#
+# These MUST be Literal, not str: every citation tool is registered
+# defer_to_workspace=True, so apply_description_overrides() replaces the
+# docstring naming these values with a one-line short_description before the
+# tool is bound. The docstring does not reach the model; the args_schema does
+# (and is serialized on every call regardless). A vocabulary documented only in
+# prose is therefore invisible — see
+# docs/issues/agent_tool_fixed_vocabularies_invisible_to_model.md.
+#
+# Spelled literally rather than derived from the enums so these signatures stay
+# importable when the engine is absent (the @tool decorator evaluates
+# annotations at load time, before each tool body's availability check).
+# tests/test_citation_tool_vocabularies.py asserts they stay in sync.
+ExtractionMethodValue = Literal[
+    "direct_quote", "paraphrase", "inference", "aggregation", "negative"
+]
+ConfidenceValue = Literal["high", "medium", "low"]
+VerificationStatusValue = Literal["pending", "verified", "failed", "unverified"]
+SourceTypeValue = Literal["document", "website", "database", "custom"]
+AnnotationTypeValue = Literal["note", "highlight", "summary", "question", "critique"]
+SearchModeValue = Literal["hybrid", "keyword", "semantic"]
+SearchScopeValue = Literal["content", "annotations", "all"]
+BibliographyStyleValue = Literal["bibtex", "harvard", "ieee", "apa", "inline"]
+TagActionValue = Literal["add", "remove"]
 
 
 # Tool metadata for registry
@@ -170,6 +198,66 @@ Note: CitationEngine not available. Citation stored in stub mode only.
 Use this citation_id when writing requirements."""
 
 
+#: Postgres enum type name -> the vocabulary the caller should have been offered.
+#: Only the vector-DB enums reachable from these tools; ``AnnotationType`` is a
+#: Python-side enum and already raises a ValueError with its own message.
+_DB_ENUM_VOCABULARIES: Dict[str, tuple] = {
+    "extraction_method": get_args(ExtractionMethodValue),
+    "confidence_level": get_args(ConfidenceValue),
+    "verification_status": get_args(VerificationStatusValue),
+    "source_type": get_args(SourceTypeValue),
+}
+
+
+def _humanize_db_enum_error(exc: Exception) -> Optional[str]:
+    """Translate a Postgres enum rejection into something an agent can act on.
+
+    asyncpg raises ``InvalidTextRepresentationError`` for a bad enum label. It
+    is a ``DataError``, **not** a ``ValueError``, so it slips past the handlers
+    that return curated messages — and its text names no valid values, leaving
+    an agent to brute-force the vocabulary. Last-resort net: the tool schemas
+    and the engine's validation should both reject a bad value long before it
+    reaches Postgres.
+
+    Returns None when ``exc`` is not a recognised enum error, so callers can
+    fall through to their normal error handling.
+    """
+    match = re.search(r'invalid input value for enum (\w+): "(.*)"', str(exc))
+    if not match:
+        return None
+    enum_name, bad_value = match.group(1), match.group(2)
+    allowed = _DB_ENUM_VOCABULARIES.get(enum_name)
+    if not allowed:
+        return None
+    return (
+        f"invalid value '{bad_value}' for {enum_name}. Use one of: "
+        f"{', '.join(allowed)}."
+    )
+
+
+def _verbatim_or_none(text: str, extraction_method: str) -> Optional[str]:
+    """Return ``text`` as a verbatim quote only if the agent claims it is one.
+
+    The verifier's word-for-word check is triggered by the *presence* of
+    ``verbatim_quote`` — ``VerifyCitationTask.build_context`` emits a
+    "## Verbatim Quote" section only when it is set, and the prompt then
+    requires the text to appear in the source. Filing a paraphrase under that
+    field is what makes an otherwise-sound citation fail verification, and the
+    create tools used to do exactly that: they hardcoded
+    ``extraction_method="direct_quote"`` no matter what ``text`` really was.
+
+    For any non-quote method the field stays unset, so the citation is checked
+    for meaning against ``quote_context`` instead — which the verification
+    prompt already supports ("a close, meaning-preserving match", ~0.7 score).
+
+    The ``< 1000`` guard is pre-existing behaviour, kept as-is: an overlong
+    "quote" is treated as context rather than a quote.
+    """
+    if extraction_method != "direct_quote":
+        return None
+    return text[:500] if len(text) < 1000 else None
+
+
 def create_source_tools(context: ToolContext) -> List[Any]:
     """Create citation tools with injected context.
 
@@ -203,6 +291,8 @@ def create_source_tools(context: ToolContext) -> List[Any]:
         page: Optional[int] = None,
         section: Optional[str] = None,
         claim: Optional[str] = None,
+        extraction_method: ExtractionMethodValue = "direct_quote",
+        confidence: ConfidenceValue = "high",
     ) -> str:
         """Create a verified citation for document content.
 
@@ -213,12 +303,21 @@ def create_source_tools(context: ToolContext) -> List[Any]:
         Tip: Use search_library first to find relevant evidence across all sources,
         then cite the specific passage with this tool.
 
+        Set extraction_method honestly — it decides how the citation is verified.
+        'direct_quote' means `text` appears verbatim in the source and will be
+        checked word-for-word; anything else is checked for meaning instead. If
+        you reworded the source, say 'paraphrase' rather than letting a reworded
+        passage be checked as a quote (it will fail).
+
         Args:
-            text: Quoted text from the document (the evidence)
+            text: The evidence from the document — verbatim if extraction_method
+                is 'direct_quote', otherwise your rewording/synthesis of it
             document_path: Path to the source document
             page: Page number if applicable
             section: Section reference if applicable
             claim: The assertion being supported (defaults to summary of text)
+            extraction_method: How you got `text` from the source
+            confidence: Your self-assessment of how well the source backs the claim
 
         Returns:
             Citation ID and verification status. Use [N] format in your text.
@@ -288,10 +387,10 @@ def create_source_tools(context: ToolContext) -> List[Any]:
                 source_id=source_id,
                 quote_context=text,
                 locator=locator,
-                verbatim_quote=text[:500] if len(text) < 1000 else None,
-                relevance_reasoning=f"Direct quote from source document supporting: {effective_claim[:100]}",
-                confidence="high",
-                extraction_method="direct_quote",
+                verbatim_quote=_verbatim_or_none(text, extraction_method),
+                relevance_reasoning=f"Evidence from source document supporting: {effective_claim[:100]}",
+                confidence=confidence,
+                extraction_method=extraction_method,
             )
 
             # Format result for agent
@@ -337,6 +436,8 @@ Similarity Score: {similarity}
         title: Optional[str] = None,
         accessed_date: Optional[str] = None,
         claim: Optional[str] = None,
+        extraction_method: ExtractionMethodValue = "direct_quote",
+        confidence: ConfidenceValue = "high",
     ) -> str:
         """Create a verified citation for web content.
 
@@ -347,12 +448,21 @@ Similarity Score: {similarity}
         Tip: Use search_library first to find relevant evidence across all sources,
         then cite the specific passage with this tool.
 
+        Set extraction_method honestly — it decides how the citation is verified.
+        'direct_quote' means `text` appears verbatim in the source and will be
+        checked word-for-word; anything else is checked for meaning instead. If
+        you reworded the source, say 'paraphrase' rather than letting a reworded
+        passage be checked as a quote (it will fail).
+
         Args:
-            text: Quoted/paraphrased text from the web (the evidence)
+            text: The evidence from the web — verbatim if extraction_method is
+                'direct_quote', otherwise your rewording/synthesis of it
             url: Source URL
             title: Page title (auto-detected if not provided)
             accessed_date: Date accessed in ISO format (defaults to today)
             claim: The assertion being supported (defaults to summary of text)
+            extraction_method: How you got `text` from the source
+            confidence: Your self-assessment of how well the source backs the claim
 
         Returns:
             Citation ID and verification status. Use [N] format in your text.
@@ -403,10 +513,10 @@ Similarity Score: {similarity}
                 source_id=source_id,
                 quote_context=text,
                 locator=locator,
-                verbatim_quote=text[:500] if len(text) < 1000 else None,
+                verbatim_quote=_verbatim_or_none(text, extraction_method),
                 relevance_reasoning=f"Content from web source supporting: {effective_claim[:100]}",
-                confidence="high",
-                extraction_method="direct_quote",
+                confidence=confidence,
+                extraction_method=extraction_method,
             )
 
             # Format result
@@ -559,7 +669,8 @@ Similarity Score: {similarity}
 
     @tool
     async def list_citations(
-        source_id: Optional[int] = None, status: Optional[str] = None
+        source_id: Optional[int] = None,
+        status: Optional[VerificationStatusValue] = None,
     ) -> str:
         """List citations created by this job.
 
@@ -569,7 +680,8 @@ Similarity Score: {similarity}
 
         Args:
             source_id: Filter by source ID (optional)
-            status: Filter by verification status: pending, verified, failed (optional)
+            status: Filter by verification status: pending, verified, failed,
+                unverified (optional)
 
         Returns:
             Formatted list of citations for the current job
@@ -615,8 +727,8 @@ Similarity Score: {similarity}
         verbatim_quote: Optional[str] = None,
         quote_context: Optional[str] = None,
         relevance_reasoning: Optional[str] = None,
-        confidence: Optional[str] = None,
-        extraction_method: Optional[str] = None,
+        confidence: Optional[ConfidenceValue] = None,
+        extraction_method: Optional[ExtractionMethodValue] = None,
         locator: Optional[str] = None,
     ) -> str:
         """Edit fields of an existing citation belonging to this job.
@@ -690,6 +802,9 @@ Similarity Score: {similarity}
         except ValueError as e:
             return f"error: {str(e)}"
         except Exception as e:
+            hint = _humanize_db_enum_error(e)
+            if hint:
+                return f"error: {hint}"
             logger.error(f"Error editing citation: {e}")
             return f"error: {str(e)}"
 
@@ -697,7 +812,7 @@ Similarity Score: {similarity}
     async def annotate_source(
         source_id: int,
         content: str,
-        type: Optional[str] = "note",
+        type: AnnotationTypeValue = "note",
         page: Optional[str] = None,
     ) -> str:
         """Add a note, highlight, summary, question, or critique to a source.
@@ -743,7 +858,7 @@ Similarity Score: {similarity}
     @tool
     async def get_annotations(
         source_id: int,
-        type: Optional[str] = None,
+        type: Optional[AnnotationTypeValue] = None,
     ) -> str:
         """Get annotations for a source in the current job.
 
@@ -796,7 +911,7 @@ Similarity Score: {similarity}
     async def tag_source(
         source_id: int,
         tags: str,
-        action: Optional[str] = "add",
+        action: TagActionValue = "add",
     ) -> str:
         """Add or remove tags on a citation source.
 
@@ -823,16 +938,21 @@ Similarity Score: {similarity}
             if not tag_list:
                 return "Error: no tags provided"
 
+            # Match both actions explicitly. An unrecognised value must never
+            # fall through to "add" — that silently did the *opposite* of a
+            # remove request and still reported "Added".
             if action == "remove":
                 current_tags = await engine.remove_tags(
                     source_id=source_id, tags=tag_list
                 )
                 verb = "Removed"
-            else:
+            elif action == "add":
                 current_tags = await engine.tag_source(
                     source_id=source_id, tags=tag_list
                 )
                 verb = "Added"
+            else:
+                return f"error: invalid action '{action}'. Use 'add' or 'remove'."
 
             return (
                 f"{verb} tags on source [{source_id}]\n"
@@ -848,10 +968,10 @@ Similarity Score: {similarity}
     @tool
     async def search_library(
         query: str,
-        mode: Optional[str] = "hybrid",
+        mode: SearchModeValue = "hybrid",
         tags: Optional[str] = None,
-        source_type: Optional[str] = None,
-        scope: Optional[str] = "content",
+        source_type: Optional[SourceTypeValue] = None,
+        scope: SearchScopeValue = "content",
         top_k: Optional[int] = 10,
     ) -> str:
         """Search the source library using keyword, semantic, or hybrid retrieval.
@@ -928,7 +1048,7 @@ Similarity Score: {similarity}
 
     @tool
     async def generate_bibliography(
-        style: Optional[str] = "bibtex",
+        style: BibliographyStyleValue = "bibtex",
         citation_ids: Optional[str] = None,
         output_path: Optional[str] = None,
     ) -> str:

@@ -40,7 +40,11 @@ class TestPostgresDB:
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             db = PostgresDB()
             assert hasattr(db, "jobs")
-            assert hasattr(db, "citations")
+            assert hasattr(db, "config_overrides")
+            # No citations namespace: citations live in the vector store and are
+            # written only through CitationEngine. The old CitationsNamespace
+            # here targeted this app DB, which has no citations table.
+            assert not hasattr(db, "citations")
 
     def test_row_to_dict_with_none(self):
         """Test _row_to_dict handles None."""

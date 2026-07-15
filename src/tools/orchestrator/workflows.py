@@ -563,7 +563,9 @@ def create_workflow_tools(context: ToolContext) -> List[Any]:
         timezone: str = "UTC",
         project_id: Optional[str] = None,
         description: Optional[str] = None,
-        autonomy: str = "review",
+        autonomy: Literal[
+            "full", "review", "partial", "guided", "dependent"
+        ] = "review",
         priority: int = 5,
     ) -> str:
         """Draft a disabled automation bundle without writing it.
@@ -576,7 +578,8 @@ def create_workflow_tools(context: ToolContext) -> List[Any]:
             timezone: IANA timezone name, defaults to UTC.
             project_id: Optional project UUID. Defaults to this session's project.
             description: Optional description.
-            autonomy: Job autonomy for spawned jobs, defaults to review.
+            autonomy: Job autonomy for spawned jobs — one of: full, review,
+                partial, guided, dependent (defaults to review).
             priority: Job priority, 0-10.
         """
         bundle = {

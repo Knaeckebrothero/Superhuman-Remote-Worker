@@ -18,7 +18,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.tools import tool
 
@@ -44,6 +44,33 @@ from .gardener import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Closed vocabularies for the kb tool schemas, mirroring the frozensets in
+# services/knowledge_graph.py.
+#
+# Must be Literal, not str: these values only ever reached the model through
+# docstring prose, and prose drifts — the kb_write docstring listed nine of the
+# ten NOTE_TYPES for long enough that nobody noticed 'datasource' was missing.
+# A Literal puts the vocabulary in the args_schema, which is serialized on every
+# call anyway and cannot silently disagree with the enforcement in kb_write.
+# See docs/issues/agent_tool_fixed_vocabularies_invisible_to_model.md.
+#
+# Spelled literally (not derived from the frozensets) so they stay valid static
+# annotations; tests/test_tool_vocabularies.py asserts they stay in sync.
+NoteTypeValue = Literal[
+    "goal",
+    "plan",
+    "decision",
+    "learning",
+    "code",
+    "source",
+    "question",
+    "state",
+    "retrospective",
+    "datasource",
+]
+NoteStatusValue = Literal["active", "resolved", "superseded", "archived"]
+NoteConfidenceValue = Literal["high", "medium", "low"]
 
 # Shown by the genuinely graph-shaped tools when Neo4j is absent (slice-3 PR4c).
 # CONTRADICTS / DERIVED_FROM / ANSWERS edges and the Neo4j export have no
@@ -867,12 +894,12 @@ def create_kb_tools(
     @tool
     def kb_write(
         title: str,
-        type: str,
+        type: NoteTypeValue,
         content: str,
         description: Optional[str] = None,
         tags: Optional[List[str]] = None,
         keywords: Optional[List[str]] = None,
-        confidence: Optional[str] = None,
+        confidence: Optional[NoteConfidenceValue] = None,
         links: Optional[List[dict]] = None,
         retrieval_messages: Optional[List[str]] = None,
     ) -> str:
@@ -886,7 +913,8 @@ def create_kb_tools(
 
         Args:
             title: Note title (generates the slug ID, e.g. "chose-jwt-over-oauth")
-            type: Note type — one of: goal, plan, decision, learning, code, source, question, state, retrospective
+            type: Note type — one of: goal, plan, decision, learning, code,
+                source, question, state, retrospective, datasource
             content: Full markdown body of the note
             description: One-sentence summary for progressive-disclosure indexes.
                          Strongly recommended; derived from the content's first
@@ -1089,8 +1117,8 @@ def create_kb_tools(
         note: str,
         content: Optional[str] = None,
         append: Optional[str] = None,
-        status: Optional[str] = None,
-        confidence: Optional[str] = None,
+        status: Optional[NoteStatusValue] = None,
+        confidence: Optional[NoteConfidenceValue] = None,
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[dict]] = None,
     ) -> str:
@@ -1229,9 +1257,9 @@ def create_kb_tools(
 
     @tool
     def kb_list(
-        type: Optional[str] = None,
+        type: Optional[NoteTypeValue] = None,
         tag: Optional[str] = None,
-        status: Optional[str] = None,
+        status: Optional[NoteStatusValue] = None,
         job_id: Optional[str] = None,
         kb: Optional[str] = None,
     ) -> str:

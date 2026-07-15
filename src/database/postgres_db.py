@@ -130,8 +130,11 @@ class PostgresDB:
         self._queries: Dict[str, str] = {}  # Cache for loaded queries
 
         # Initialize namespaces
+        # (No citations namespace: citations live in the vector store and are
+        # written only through CitationEngine. The old CitationsNamespace here
+        # targeted this app DB, which has no citations table — it was dead and
+        # would have thrown had anything called it.)
         self.jobs = JobsNamespace(self)
-        self.citations = CitationsNamespace(self)
         self.config_overrides = ConfigOverridesNamespace(self)
 
         logger.info("PostgresDB initialized (not connected yet)")
@@ -1065,104 +1068,6 @@ class ConfigOverridesNamespace:
             family,
         )
         return [self.db._row_to_dict(row) for row in rows]
-
-
-class CitationsNamespace:
-    """Namespace for citation-related operations.
-
-    Provides CRUD operations for citations (if schema includes citations table).
-    """
-
-    def __init__(self, db: PostgresDB):
-        self.db = db
-
-    async def edit(
-        self,
-        citation_id: int,
-        claim: Optional[str] = None,
-        verbatim_quote: Optional[str] = None,
-        quote_context: Optional[str] = None,
-        relevance_reasoning: Optional[str] = None,
-        confidence: Optional[str] = None,
-        extraction_method: Optional[str] = None,
-        locator: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Edit fields of a citation.
-
-        When content fields (claim, verbatim_quote, quote_context) change,
-        verification_status is reset to 'pending' and verification_notes,
-        similarity_score, matched_location are cleared.
-
-        Args:
-            citation_id: Citation integer ID
-            claim: The assertion being supported
-            verbatim_quote: Exact quote from source
-            quote_context: Context around the quote
-            relevance_reasoning: Why this citation is relevant
-            confidence: Confidence level (high, medium, low)
-            extraction_method: How the citation was extracted
-            locator: Location reference (JSON)
-
-        Raises:
-            ValueError: If citation not found or no fields provided
-        """
-        # Guard: check citation exists
-        row = await self.db.fetchrow(
-            "SELECT id FROM citations WHERE id = $1", citation_id
-        )
-        if not row:
-            raise ValueError(f"Citation {citation_id} not found")
-
-        # Determine if content fields are changing
-        content_fields_changed = any(
-            v is not None for v in [claim, verbatim_quote, quote_context]
-        )
-
-        # Build dynamic UPDATE clause
-        updates = []
-        values = []
-        idx = 1
-
-        field_map = [
-            ("claim", claim, lambda v: v),
-            ("verbatim_quote", verbatim_quote, lambda v: v),
-            ("quote_context", quote_context, lambda v: v),
-            ("relevance_reasoning", relevance_reasoning, lambda v: v),
-            ("confidence", confidence, lambda v: v),
-            ("extraction_method", extraction_method, lambda v: v),
-            ("locator", locator, lambda v: json.dumps(v)),
-        ]
-
-        for col, val, transform in field_map:
-            if val is not None:
-                updates.append(f"{col} = ${idx}")
-                values.append(transform(val))
-                idx += 1
-
-        if not updates:
-            raise ValueError("No fields provided to edit")
-
-        # Reset verification fields when content changes
-        if content_fields_changed:
-            updates.append("verification_status = 'pending'")
-            updates.append("verification_notes = NULL")
-            updates.append("similarity_score = NULL")
-            updates.append("matched_location = NULL")
-
-        values.append(citation_id)
-
-        query = f"""
-            UPDATE citations
-            SET {", ".join(updates)}
-            WHERE id = ${idx}
-        """
-
-        await self.db.execute(query, *values)
-        logger.debug(f"Edited citation {citation_id}")
-
-    def edit_sync(self, citation_id: int, **kwargs) -> None:
-        """Synchronous wrapper for edit()."""
-        return PostgresDB._run_async(self.edit(citation_id, **kwargs))
 
 
 __all__ = ["PostgresDB"]

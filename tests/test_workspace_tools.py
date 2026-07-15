@@ -236,7 +236,14 @@ class TestEditFilePositionModes:
         assert content == "Line 1\nLine 2"
 
     def test_edit_file_position_invalid_fails(self, workspace_tools, workspace_manager):
-        """Test that invalid position values fail."""
+        """Test that invalid position values fail.
+
+        ``position`` is now Literal["start", "end"], so the schema rejects an
+        off-vocabulary value before the body runs — the model cannot emit it at
+        all. The body's own check remains for callers that skip the schema.
+        """
+        from pydantic import ValidationError
+
         # Create a test file
         workspace_manager.write_file("test.md", "Content")
 
@@ -244,16 +251,22 @@ class TestEditFilePositionModes:
         read_file = workspace_tools["read_file"]
         read_file.invoke({"path": "test.md"})
 
-        # Try invalid position
         edit_file = workspace_tools["edit_file"]
-        result = edit_file.invoke(
-            {
-                "path": "test.md",
-                "new_string": "New",
-                "position": "middle",  # Invalid
-            }
-        )
 
+        # Schema layer: rejected up front, file untouched.
+        with pytest.raises(ValidationError):
+            edit_file.invoke(
+                {
+                    "path": "test.md",
+                    "new_string": "New",
+                    "position": "middle",  # Invalid
+                }
+            )
+        assert workspace_manager.read_file("test.md") == "Content"
+
+        # Body layer: still a clean error, never a silent fall-through to
+        # replace mode.
+        result = edit_file.func(path="test.md", new_string="New", position="middle")
         assert "Error" in result
         assert "Invalid position" in result
 

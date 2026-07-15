@@ -20,6 +20,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from src.tools.knowledge.knowledge_tools import (
     KNOWLEDGE_TOOLS_METADATA,
@@ -64,6 +65,18 @@ def _get_tool(tools, name):
 def _invoke(tool_func, args):
     """Invoke a langchain tool with args dict."""
     return tool_func.invoke(args)
+
+
+def _invoke_unvalidated(tool_func, **kwargs):
+    """Call the tool body directly, bypassing args_schema validation.
+
+    Closed-vocabulary params (``type``, ``status``, ``confidence``) are now
+    ``Literal``-typed, so ``invoke()`` rejects an off-vocabulary value at the
+    pydantic boundary and the body never runs. That is the point — but the
+    body's own checks must still hold for callers that don't go through the
+    schema, and this reaches them.
+    """
+    return tool_func.func(**kwargs)
 
 
 def _capture_workspace():
@@ -248,6 +261,13 @@ class TestKbWrite:
         assert "slug" in result  # Still returns success
 
     def test_returns_error_on_value_error(self):
+        """A ValueError out of the graph layer surfaces as an error string.
+
+        Uses a *valid* type: the point here is the graph raising, not the
+        vocabulary. An invalid type no longer reaches the body at all — the
+        Literal rejects it at the schema boundary (see
+        TestKbWriteWithoutNeo4j::test_no_kg_invalid_type_errors).
+        """
         tools, ctx = _make_tools()
         ctx.knowledge_graph.create_note.side_effect = ValueError("Invalid note_type")
 
@@ -255,7 +275,7 @@ class TestKbWrite:
             _get_tool(tools, "kb_write"),
             {
                 "title": "T",
-                "type": "invalid",
+                "type": "decision",
                 "content": "x",
             },
         )
@@ -349,6 +369,10 @@ class TestKbUpdate:
         assert "content appended" in result
 
     def test_error_on_value_error(self):
+        """A ValueError out of the graph layer surfaces as an error string.
+
+        Uses a *valid* status — see the sibling note on kb_write.
+        """
         tools, ctx = _make_tools()
         ctx.knowledge_graph.update_note.side_effect = ValueError("Invalid status")
 
@@ -356,7 +380,7 @@ class TestKbUpdate:
             _get_tool(tools, "kb_update"),
             {
                 "note": "n1",
-                "status": "invalid",
+                "status": "resolved",
             },
         )
         assert "Error" in result
@@ -1952,12 +1976,25 @@ class TestKbWriteWithoutNeo4j:
     def test_no_kg_invalid_type_errors(self):
         # Parity with kg.create_note: an invalid note_type is a clean up-front
         # error, not a misleading "Created" after a silent DB CHECK failure.
+        # `type` is now Literal-typed, so the schema rejects it before the body
+        # runs — a stronger guarantee than the error string this used to get,
+        # and the model can no longer emit the bad value at all.
         ctx = _make_context_no_kg()
         ctx.knowledge_store.get_note_by_slug.return_value = None
         tools, _ = _make_tools(ctx)
-        result = _invoke(
+        with pytest.raises(ValidationError):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Title", "type": "bogus", "content": "body"},
+            )
+        assert not ctx.knowledge_store.upsert_note.called
+
+        # ...and the body still refuses it for callers that skip the schema.
+        result = _invoke_unvalidated(
             _get_tool(tools, "kb_write"),
-            {"title": "New Title", "type": "bogus", "content": "body"},
+            title="New Title",
+            type="bogus",
+            content="body",
         )
         assert "Error" in result
         assert not ctx.knowledge_store.upsert_note.called
@@ -1966,14 +2003,24 @@ class TestKbWriteWithoutNeo4j:
         ctx = _make_context_no_kg()
         ctx.knowledge_store.get_note_by_slug.return_value = None
         tools, _ = _make_tools(ctx)
-        result = _invoke(
+        with pytest.raises(ValidationError):
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {
+                    "title": "New Title",
+                    "type": "decision",
+                    "content": "body",
+                    "confidence": "bogus",
+                },
+            )
+        assert not ctx.knowledge_store.upsert_note.called
+
+        result = _invoke_unvalidated(
             _get_tool(tools, "kb_write"),
-            {
-                "title": "New Title",
-                "type": "decision",
-                "content": "body",
-                "confidence": "bogus",
-            },
+            title="New Title",
+            type="decision",
+            content="body",
+            confidence="bogus",
         )
         assert "Error" in result
         assert not ctx.knowledge_store.upsert_note.called
@@ -2056,8 +2103,12 @@ class TestKbUpdateWithoutNeo4j:
         ctx = _make_context_no_kg()
         ctx.knowledge_store.get_note_by_slug.return_value = _existing_note()
         tools, _ = _make_tools(ctx)
-        result = _invoke(
-            _get_tool(tools, "kb_update"), {"note": "n1", "status": "bogus"}
+        with pytest.raises(ValidationError):
+            _invoke(_get_tool(tools, "kb_update"), {"note": "n1", "status": "bogus"})
+        assert not ctx.knowledge_store.upsert_note.called
+
+        result = _invoke_unvalidated(
+            _get_tool(tools, "kb_update"), note="n1", status="bogus"
         )
         assert "Error" in result
         assert not ctx.knowledge_store.upsert_note.called
