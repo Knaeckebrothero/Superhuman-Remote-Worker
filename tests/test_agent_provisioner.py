@@ -1213,3 +1213,160 @@ class TestTailscaleSidecar:
     def test_sidecar_liveness_threshold_scales_with_timeout(self):
         ts = self._manifest_with_tailscale(dark_timeout=300)
         assert ts["livenessProbe"]["failureThreshold"] == 10  # ceil(300 / 30)
+
+
+# =============================================================================
+# _archive_pod_logs — post-mortem log archive (docs/features/job_log_archive.md)
+# =============================================================================
+
+
+def _make_snapshot_mock(available=True, put_ok=True):
+    snap = MagicMock()
+    snap.is_available = available
+    snap.put_blob = AsyncMock(return_value=put_ok)
+    return snap
+
+
+class TestArchivePodLogs:
+    """Tests for _archive_pod_logs() + the delete_agent_pod hook."""
+
+    def _wire_pod(self, p, pod, current="line1\nline2", previous=None):
+        """Wire read_namespaced_pod + read_namespaced_pod_log on the mock API."""
+        p._core_api.read_namespaced_pod.return_value = pod
+
+        def _read_log(name, namespace, container, **kwargs):
+            if kwargs.get("previous"):
+                if previous is None:
+                    raise RuntimeError("no previous container")
+                return previous
+            return current
+
+        p._core_api.read_namespaced_pod_log.side_effect = _read_log
+
+    @pytest.mark.asyncio
+    async def test_archives_and_stamps_session_pod(self):
+        p, conn = _make_provisioner()
+        pod = _make_pod(
+            "srw-agent-s-abc", thread_id="11111111-2222-3333-4444-555555555555"
+        )
+        pod.metadata.labels["srw.io/thread-id"] = "11111111-2222-3333-4444-555555555555"
+        self._wire_pod(p, pod, current="hello", previous="crashed earlier")
+        snap = _make_snapshot_mock()
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            await p._archive_pod_logs("srw-agent-s-abc")
+
+        # Both incarnations uploaded under agent_logs/<pod>/
+        keys = [c.args[0] for c in snap.put_blob.await_args_list]
+        assert len(keys) == 2
+        assert all(k.startswith("agent_logs/srw-agent-s-abc/") for k in keys)
+        assert any(k.endswith(".previous.log") for k in keys)
+
+        # Thread stamped (metadata) AND jobs stamped (context via agents join)
+        sqls = [c.args[0] for c in conn.execute.await_args_list]
+        assert any("UPDATE threads" in s for s in sqls)
+        assert any("UPDATE jobs" in s for s in sqls)
+        thread_call = next(
+            c for c in conn.execute.await_args_list if "UPDATE threads" in c.args[0]
+        )
+        assert thread_call.args[1] == "11111111-2222-3333-4444-555555555555"
+
+    @pytest.mark.asyncio
+    async def test_worker_pod_stamps_jobs_only(self):
+        p, conn = _make_provisioner()
+        pod = _make_pod("srw-agent-j-xyz")  # no thread labels
+        self._wire_pod(p, pod, current="worker log")
+        snap = _make_snapshot_mock()
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            await p._archive_pod_logs("srw-agent-j-xyz")
+
+        sqls = [c.args[0] for c in conn.execute.await_args_list]
+        assert not any("UPDATE threads" in s for s in sqls)
+        jobs_call = next(
+            c for c in conn.execute.await_args_list if "UPDATE jobs" in c.args[0]
+        )
+        # Resolves jobs through the agents registration by pod hostname
+        assert "agents" in jobs_call.args[0]
+        assert jobs_call.args[1] == "srw-agent-j-xyz"
+
+    @pytest.mark.asyncio
+    async def test_noop_when_snapshot_store_unavailable(self):
+        p, conn = _make_provisioner()
+        snap = _make_snapshot_mock(available=False)
+        with patch("services.snapshot_service.snapshot_service", snap):
+            await p._archive_pod_logs("srw-agent-j-xyz")
+        p._core_api.read_namespaced_pod.assert_not_called()
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_pod_already_gone(self):
+        p, conn = _make_provisioner()
+        err = RuntimeError("gone")
+        err.status = 404
+        p._core_api.read_namespaced_pod.side_effect = err
+        snap = _make_snapshot_mock()
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            await p._archive_pod_logs("srw-agent-j-xyz")
+        snap.put_blob.assert_not_awaited()
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_stamp_when_upload_fails(self):
+        p, conn = _make_provisioner()
+        pod = _make_pod("srw-agent-j-xyz")
+        self._wire_pod(p, pod, current="some log")
+        snap = _make_snapshot_mock(put_ok=False)
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            await p._archive_pod_logs("srw-agent-j-xyz")
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_archive_failure_never_blocks_deletion(self):
+        p, _ = _make_provisioner()
+        p._core_api.read_namespaced_pod.side_effect = RuntimeError("k8s down")
+        snap = _make_snapshot_mock()
+        with (
+            patch("services.snapshot_service.snapshot_service", snap),
+            patch(
+                "orchestrator.services.agent_provisioner.asyncio.to_thread",
+                side_effect=_fake_to_thread,
+            ),
+        ):
+            # Must not raise — and the pod delete must still go through.
+            assert await p.delete_agent_pod("srw-agent-j-xyz") is True
+        p._core_api.delete_namespaced_pod.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_agent_pod_archives_first(self):
+        p, _ = _make_provisioner()
+        p._archive_pod_logs = AsyncMock()
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await p.delete_agent_pod("srw-agent-j-xyz") is True
+        p._archive_pod_logs.assert_awaited_once_with("srw-agent-j-xyz")
+        p._core_api.delete_namespaced_pod.assert_called_once()

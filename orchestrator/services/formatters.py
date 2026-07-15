@@ -460,13 +460,16 @@ def format_todos(todos: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_job_log(job_id: str, data: dict[str, Any]) -> str:
-    """Format job log output."""
+def _format_agent_log(subject: str, data: dict[str, Any]) -> str:
+    """Shared job/thread log formatting."""
     log_lines = data.get("lines", [])
     total = data.get("total_lines", 0)
     filtered = data.get("filtered", False)
+    archived = data.get("archived", False)
 
-    header = f"Log for job {job_id}"
+    header = f"Log for {subject}"
+    if archived:
+        header += " (archived — pod is gone, served from S3)"
     if filtered:
         header += " (filtered)"
     header += f" — showing {len(log_lines)} of {total} lines"
@@ -476,6 +479,16 @@ def format_job_log(job_id: str, data: dict[str, Any]) -> str:
         lines.append(line)
 
     return "\n".join(lines)
+
+
+def format_job_log(job_id: str, data: dict[str, Any]) -> str:
+    """Format job log output."""
+    return _format_agent_log(f"job {job_id}", data)
+
+
+def format_thread_log(thread_id: str, data: dict[str, Any]) -> str:
+    """Format session (persistent thread) log output."""
+    return _format_agent_log(f"session {thread_id}", data)
 
 
 def format_llm_requests(job_id: str, data: dict[str, Any]) -> str:

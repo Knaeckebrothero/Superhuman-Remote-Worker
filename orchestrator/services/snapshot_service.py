@@ -284,6 +284,34 @@ class SnapshotService:
             logger.error("save_blob failed (key=%s): %s", key, e)
             return None
 
+    async def put_blob(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> bool:
+        """Store raw bytes at an explicit ``key``.
+
+        Unlike ``save_blob`` (content-addressed, dedup-by-hash), callers pick
+        the key — used by the job log archive, where the key encodes
+        pod + timestamp and is stamped onto job/thread rows for retrieval.
+        """
+        if not self._available or not data:
+            return False
+        try:
+            await asyncio.to_thread(
+                self._s3.put_object,
+                Bucket=self._bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type or "application/octet-stream",
+            )
+            return True
+        except Exception as e:
+            logger.error("put_blob failed (key=%s): %s", key, e)
+            return False
+
     async def get_blob(self, key: str) -> Optional[bytes]:
         """Fetch the raw bytes for a blob ``key``; ``None`` if missing/unavailable."""
         if not self._available or not key:
