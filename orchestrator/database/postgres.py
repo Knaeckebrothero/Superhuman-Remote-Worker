@@ -1906,9 +1906,21 @@ class PostgresDB:
                 attempt = int(outage.get("attempt", 0) or 0)
                 first_dt = _parse(outage.get("first_failed_at"))
                 last_dt = _parse(outage.get("last_failed_at"))
+                next_retry_dt = _parse(outage.get("next_retry_at"))
+                # Anchor the reset at the END of any scheduled wait we imposed
+                # (next_retry_at), not last_failed_at — a long cooldown pause is
+                # us deliberately sleeping, not the job running fine. MUST mirror
+                # services.completion.evaluate_llm_outage exactly (the two are
+                # kept in lockstep). Missing next_retry_at → today's behavior.
+                # docs/features/llm_cooldown_pause_and_resume.md §Design decision
+                anchor_dt = last_dt
+                if next_retry_dt is not None and (
+                    anchor_dt is None or next_retry_dt > anchor_dt
+                ):
+                    anchor_dt = next_retry_dt
                 reset = (
-                    last_dt is not None
-                    and (now_utc - last_dt).total_seconds() > reset_window_seconds
+                    anchor_dt is not None
+                    and (now_utc - anchor_dt).total_seconds() > reset_window_seconds
                 )
                 if reset:
                     attempt = 0

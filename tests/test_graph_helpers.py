@@ -12,6 +12,8 @@ from src.graph import (
     _classify_llm_error,
     _cooldown_reset_seconds,
     _cooldown_detail,
+    _cooldown_within_pause_budget,
+    _COOLDOWN_MAX_PAUSE_SECONDS,
     _extract_rate_limit_delay,
     _extract_tool_use_failed,
     _build_tool_use_failed_feedback,
@@ -1085,3 +1087,35 @@ class TestIsOutputTruncated:
         # Defensive: a non-string finish_reason must not raise.
         assert _is_output_truncated(0) is False
         assert _is_output_truncated(["length"]) is True  # str(list) contains it
+
+
+# =============================================================================
+# _cooldown_within_pause_budget — the pause-vs-fail-fast cutoff for a cooldown
+# (docs/features/llm_cooldown_pause_and_resume.md)
+# =============================================================================
+
+
+class TestCooldownWithinPauseBudget:
+    def test_none_reset_fails_fast(self):
+        # An unknown reset window can't be safely bounded → fail fast, don't pause.
+        assert _cooldown_within_pause_budget(None) is False
+
+    def test_short_codex_cooldown_pauses(self):
+        # The 2026-07-07 incident: a ~2.1h gpt-5.5 window is well within budget.
+        assert _cooldown_within_pause_budget(2.1 * 3600) is True
+
+    def test_five_hour_openai_window_pauses(self):
+        # OpenAI's ~5h usage window still pauses out rather than failing.
+        assert _cooldown_within_pause_budget(5 * 3600) is True
+
+    def test_at_budget_boundary_pauses(self):
+        # Exactly at the ceiling still pauses (<=).
+        assert _cooldown_within_pause_budget(_COOLDOWN_MAX_PAUSE_SECONDS) is True
+
+    def test_multiday_wall_fails_fast(self):
+        # The original 5.5-day cooldown must still fail fast — not park for 12h.
+        assert _cooldown_within_pause_budget(5.5 * 86400) is False
+
+    def test_budget_default_is_12h(self):
+        # Fused with the orchestrator's LLM_OUTAGE_CEILING_SECONDS (2026-07-15).
+        assert _COOLDOWN_MAX_PAUSE_SECONDS == 43_200

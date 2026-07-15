@@ -1,7 +1,7 @@
 # Cooldown-aware pause: wait out a short quota cooldown instead of failing the job
 
-Status: **PROPOSED / DESIGN — not implemented; reset-anchor decision RESOLVED 2026-07-10**
-Date: 2026-07-07 (design decision resolved 2026-07-10)
+Status: **IMPLEMENTED — unit-tested + lint-clean, uncommitted on `develop`; k3d E2E pending. All design decisions RESOLVED 2026-07-15.**
+Date: 2026-07-07 (reset-anchor resolved 2026-07-10; cutoff / fallback / deadline resolved 2026-07-15; implemented 2026-07-15)
 Scope: worker/loop jobs (the LangGraph worker in `src/graph.py`). Extends
 `[[llm_outage_pause_and_backoff_redispatch]]` — reuses its Tier-2 pause →
 scheduled re-dispatch machinery wholesale; the only new logic lives in the
@@ -38,14 +38,13 @@ loop failed after the 05:15Z success:
 | `f0b6f263-…` | 12 · DEVELOPER | `MiniMax-M3` | *unrelated* — shell command hung >60s, terminated with no LLM error (out of scope here) |
 
 Both cooldown errors reported a reset **~2.1–2.2h out** — a real provider quota
-window returned in the 429 body, an order of magnitude *under* the 24h pause
-ceiling the sibling feature already tolerates. Had these two been routed to the
-outage-pause path, each would have paused ~2h and resumed, and the loop would have
-continued unattended.
+window returned in the 429 body, comfortably **under the 12h pause ceiling**
+(§Cutoff). Had these two been routed to the outage-pause path, each would have
+paused ~2h and resumed, and the loop would have continued unattended.
 
 ## Goals
 
-- A cooldown whose **stated reset fits inside the pause budget** (≤ the 24h
+- A cooldown whose **stated reset fits inside the pause budget** (≤ the 12h
   ceiling) **pauses** the job (non-terminal) and **resumes from checkpoint** when
   the window reopens — driven by the provider's own `reset_seconds`, not a
   hardcoded wait.
@@ -54,20 +53,41 @@ continued unattended.
   unchanged.
 - **No new subsystem.** Reuse the sibling's `llm_unavailable` freeze → `/complete`
   park → outage sweeper → resume path verbatim. The `retry_after_seconds` floor
-  and 24h/60-attempt ceilings it already ships are exactly the primitives needed.
+  and the duration/attempt ceilings it already ships are exactly the primitives
+  needed.
 
 ## Non-goals
 
 - **`quota_exhausted`** (OpenAI `insufficient_quota` — a billing/spend-cap 429 with
   *no* time-based reset) keeps **failing fast**. Confirmed with the user
-  (2026-07-07): out-of-money needs a human; pausing 24h re-hitting a spend cap
+  (2026-07-07): out-of-money needs a human; pausing hours re-hitting a spend cap
   wastes pod-boots and helps nobody. This carve-out is deliberate.
 - **`permanent`** (401/403/404/400-invalid_request) keeps failing fast.
 - **Fallback-model routing** (dispatch a cooldown-benched role onto a sibling
-  model instead of pausing) — a larger, orthogonal change; the sibling doc's open
-  question *"should a loop role carry a fallback model?"* Tracked separately, not
-  in this doc.
+  model instead of pausing) — a larger, orthogonal change, spun out into its own
+  design: `[[llm_fallback_model_routing]]`. That feature would layer *above* this
+  one (try the fallback chain first; pause via this doc only when all candidate
+  models are cold), so this work is not wasted under it.
 - **Persistent interactive sessions** — same boundary as the sibling.
+
+## Cutoff — the pause budget is a single 12h ceiling (RESOLVED 2026-07-15)
+
+There is **no dedicated cooldown cutoff knob.** The pause-vs-fail-fast line reuses
+the sibling's outage duration ceiling, **`LLM_OUTAGE_CEILING_SECONDS`, lowered
+from 24h to 12h (86400 → 43200)**. One constant now means one thing everywhere:
+*"we will pause a job for at most 12h — for a transient outage or a quota cooldown
+alike — then fail loud."*
+
+Rationale (user decision): the real quota windows are bimodal — normal rolling
+windows top out ~5h (codex ~2h, OpenAI ~5h), the disaster case is multi-day
+(the original 5.5-day wall). A 12h line sits cleanly above the normal cluster and
+far below the disaster cluster: it waits out any ordinary window with margin, and
+a wall longer than half a day surfaces to an operator (who can pin a fallback or
+decide the model isn't worth waiting for).
+
+**This also lowers the transient-outage give-up ceiling from 24h to 12h** — a
+deliberate, coupled change (§Effect on the shipped transient path), not an
+accident of reuse.
 
 ## Design — threshold the cooldown by its reset window
 
@@ -79,7 +99,7 @@ already extracts `(reset_seconds, model)` from the error body. The decision:
 reset_s, cd_model = _cooldown_detail(e)
 
 if reset_s is not None
-   and reset_s <= COOLDOWN_MAX_PAUSE_SECONDS        # fits the pause budget
+   and reset_s <= LLM_OUTAGE_CEILING_SECONDS         # fits the 12h pause budget
    and checkpointer_backend() == "postgres":         # same precondition as Tier-2
     → return the llm_unavailable freeze (below), classification="cooldown",
       retry_after_seconds = reset_s
@@ -87,9 +107,9 @@ else:
     → keep today's fail-fast error (multi-day wall, unknown reset, or sqlite)
 ```
 
-`COOLDOWN_MAX_PAUSE_SECONDS` defaults to `LLM_OUTAGE_CEILING_SECONDS` (24h) — "if
-we can't wait it out inside our max pause budget, don't pause at all." One knob,
-one meaning.
+The agent-side cutoff and the orchestrator-side ceiling read the **same**
+`LLM_OUTAGE_CEILING_SECONDS` value so pause-admission and give-up never disagree
+(§Implementation map has the cross-process caveat).
 
 The freeze return is **identical to the sibling's Tier-2 freeze** (`src/graph.py:2526`),
 only the classification differs and `retry_after_seconds` is seeded from the
@@ -118,14 +138,14 @@ return {
 - The outage sweeper re-dispatches on schedule; the worker resumes from its
   Postgres checkpoint (side-effect-clean — the LLM call failed before any `tools`
   node ran).
-- The 24h duration ceiling + 60-attempt backstop already bound it: a cooldown that
+- The 12h duration ceiling + 60-attempt backstop already bound it: a cooldown that
   outlives its stated reset can't park the loop forever; past the ceiling the job
   fails **loudly with an operator alert**.
 
-Net: one branch in `src/graph.py`, a config constant, and the anchored-reset
-fix in `evaluate_llm_outage` + `next_retry_at` persistence (§Design decision).
-Sweeper and dispatch untouched — the `llm_unavailable` path is
-classification-agnostic.
+Net: one branch in `src/graph.py`, the ceiling default change, and the
+anchored-reset fix in `evaluate_llm_outage` + `next_retry_at` persistence
+(§Design decision). Sweeper and dispatch untouched — the `llm_unavailable` path
+is classification-agnostic.
 
 ## Design decision (RESOLVED 2026-07-10) — anchor the auto-reset at the end of the scheduled wait
 
@@ -142,7 +162,7 @@ this reason.
 A cooldown breaks the proxy: we deliberately schedule a wait of `reset_s`
 (2–5h) — beyond the 2h window. On re-dispatch against a still-cooling model the
 next failure lands `reset_s + ε` after the last one → the reset **spuriously
-fires**, zeroing `first_failed_at` → the 24h ceiling restarts every cycle → a
+fires**, zeroing `first_failed_at` → the 12h ceiling restarts every cycle → a
 never-clearing cooldown parks the job **indefinitely** — the exact failure the
 ceiling exists to prevent.
 
@@ -152,8 +172,8 @@ The seemingly-minimal fix — suppress the gap-reset when the current (or
 persisted prior) `classification == "cooldown"` — has a latent **false-fail**.
 `context.llm_outage` is never cleared on success; the gap-reset *is* its
 cleanup. So a long-lived job that hit a cooldown once, cleared it, ran
-productively for days, then hit a **second** cooldown would suppress the reset,
-inherit the ancient `first_failed_at`, see `elapsed ≥ 24h`, and **hard-fail
+productively for hours, then hit a **second** cooldown would suppress the reset,
+inherit the ancient `first_failed_at`, see `elapsed ≥ 12h`, and **hard-fail
 instantly** on a 2h cooldown it should have paused through. Patching that
 ("only suppress when the gap is explained by the scheduled wait") requires
 persisting the scheduled wait — at which point the anchor below is *simpler*:
@@ -186,35 +206,54 @@ parked in a wait *we* scheduled. Case analysis:
 
 | Case | Behavior |
 |---|---|
-| Still cooling at re-dispatch (fresh `model_cooldown` 429) | idle ≈ 0 → **no reset**; `attempt` climbs, `first_failed_at` holds → 24h ceiling (or 60-attempt backstop) trips after ~5–12 windows → loud fail + operator alert. Never parks. |
+| Still cooling at re-dispatch (fresh `model_cooldown` 429) | idle ≈ 0 → **no reset**; `attempt` climbs, `first_failed_at` holds → 12h ceiling (or 60-attempt backstop) trips after ~3–6 windows → loud fail + operator alert. Never parks. |
 | Provider under-reported `reset_s` (still cooling after the stated window) | the fresh 429 carries the *remaining* window → next pause is that remainder, not another full window. Self-adapting. |
-| Same job: cooldown cleared, **days of productive work**, then a second cooldown (or any failure) | idle ≈ days ≫ 2h → **reset fires** → independent outage, pauses normally. (The rejected option's false-fail case.) |
+| Same job: cooldown cleared, **hours of productive work**, then a second cooldown (or any failure) | idle ≫ 2h → **reset fires** → independent outage, pauses normally. (The rejected option's false-fail case.) |
 | Transient outage (backoff ≤ 1h cap) | reset now requires >2h idle *beyond the scheduled backoff* — a narrow, deliberate semantics correction (below). |
 
 **No separate cooldown counter, no new knob.** Once the spurious reset is gone,
 the existing `attempt` + `first_failed_at` machinery bounds cooldowns: each wait
-is floored at a full quota window (2–5h), so the 24h duration ceiling *is* the
-"give up after a few windows" bound — for free.
+is floored at a full quota window (2–5h), so the 12h duration ceiling *is* the
+"give up after ~3–6 windows" bound — for free.
 
 ### Effect on the shipped transient path (deliberate, narrow, fail-safer)
 
-Anchoring subtracts the scheduled wait for *all* classifications, which shifts
-the verified transient semantics in one band: a job that failed, waited its ≤1h
-backoff, ran productively for **<2h**, then failed again is now a
-*continuation* (no reset) where today it counts as fresh. That is the window's
-*intended* meaning ("2h of runtime = ran fine") — today's code over-resets
-because it cannot distinguish wait from runtime, which is why the sibling had
-to inflate the window to 2h in the first place.
+Two coupled changes touch the verified transient path; both are deliberate and
+both err toward *surfacing to an operator* rather than silently looping:
 
-- **Direction of error is safe:** fewer resets → ceilings accumulate → an
-  endpoint that keeps failing every <2h of runtime trips the 24h ceiling and
-  alerts an operator instead of being re-read as endless fresh outages.
+1. **Anchoring subtracts the scheduled wait for *all* classifications.** A job
+   that failed, waited its ≤1h backoff, ran productively for **<2h**, then failed
+   again is now a *continuation* (no reset) where today it counts as fresh. That
+   is the window's *intended* meaning ("2h of runtime = ran fine") — today's code
+   over-resets because it cannot distinguish wait from runtime, which is why the
+   sibling had to inflate the window to 2h in the first place.
+2. **The give-up ceiling drops 24h → 12h** (the fused cutoff, §Cutoff). A
+   transient outage that never recovers now fails loud after 12h instead of 24h.
+
+- **Direction of error is safe:** fewer resets + a lower ceiling → a chronically
+  flapping endpoint trips the ceiling and alerts an operator *sooner*, instead of
+  being re-read as endless fresh outages or parking a full extra day.
 - The `reset_window > backoff cap` invariant becomes **redundant** (the anchor
   subtracts the wait exactly). Keep the 2h default and the invariant test as
   belt-and-suspenders; no config churn.
 - The sibling's reset unit tests need updating to feed `next_retry_at` (or
-  assert the legacy fallback); its k3d E2E conclusions stand (short backoffs
-  never enter the changed band).
+  assert the legacy fallback) and to the 12h ceiling; its k3d E2E conclusions
+  stand (short backoffs never enter the changed band).
+
+## Loop semantics — a cooldown pause consumes the loop's wall-clock deadline (RESOLVED 2026-07-15, documented)
+
+Inherited from `[[llm_outage_pause_and_backoff_redispatch]]` §Loop semantics: a
+loop with a `run_until` **date** deadline keeps burning it while paused
+(`_loop_deadline_passed`, `main.py:9852`). Cooldown pauses are deliberately
+multi-hour, so this bites harder than for transient outages — a 5h cooldown pause
+on a loop with a 12h date budget silently eats ~40% of it, and the loop may stop
+on `deadline` the moment the model recovers.
+
+**Decision (user, 2026-07-15): leave as-is and document it.** The outage genuinely
+consumed wall-clock; the *iteration* budget is untouched regardless, so an
+iteration-bounded loop is unaffected. Crediting paused time back onto `run_until`
+is explicitly **deferred** — revisit only if date-bounded loops get bitten in
+practice.
 
 ## Implementation map
 
@@ -224,13 +263,19 @@ to inflate the window to 2h in the first place.
    reset_s`); otherwise the existing fail-fast (unchanged message/audit). The freeze
    construction mirrors `:2526-2566` — factor the shared shape into a small helper
    if it reads cleaner.
-2. **`src/graph.py`** — add `COOLDOWN_MAX_PAUSE_SECONDS` (env-tunable, default =
-   `LLM_OUTAGE_CEILING_SECONDS`). Keep `_COOLDOWN_MIN_RESET_SECONDS=300` as the
-   *lower* bound that still classifies a 429 as cooldown vs. per-minute rate-limit
-   (`:280`, unchanged).
-3. **`orchestrator/services/completion.py`** — `evaluate_llm_outage`: anchor the
-   reset at `max(last_failed_at, prev next_retry_at)`, falling back to
-   `last_failed_at` when the field is absent (§Design decision).
+2. **Cutoff = `LLM_OUTAGE_CEILING_SECONDS`** — the agent-side cooldown branch reads
+   the ceiling value (no new constant). **Cross-process caveat:** the ceiling lives
+   in `orchestrator/services/completion.py` (`_env_int("LLM_OUTAGE_CEILING_SECONDS",
+   43200)`); the agent runs in a different pod, so the cutoff must resolve to the
+   **same** value there — set the `43200` default in *both* code sites (or source a
+   shared `config/defaults.yaml` `limits.llm_outage_ceiling_seconds`), and if it's
+   ever overridden via env, set it on **both** the orchestrator and agent pods.
+   Keep `_COOLDOWN_MIN_RESET_SECONDS=300` (`:280`) as the *lower* bound separating
+   a cooldown from a per-minute rate-limit — unchanged.
+3. **`orchestrator/services/completion.py`** — lower the `LLM_OUTAGE_CEILING_SECONDS`
+   default `86_400 → 43_200`; in `evaluate_llm_outage`, anchor the reset at
+   `max(last_failed_at, prev next_retry_at)`, falling back to `last_failed_at` when
+   the field is absent (§Design decision).
 4. **`orchestrator/main.py` `/complete` + `orchestrator/database/postgres.py`** —
    compute the backoff before the attempt increment and persist `next_retry_at`
    into `context.llm_outage` in the same atomic write
@@ -242,12 +287,15 @@ to inflate the window to 2h in the first place.
 ## Config surface
 
 Reuses the sibling's `limits:` + env knobs (`llm_outage_backoff_*`,
-`llm_outage_ceiling_seconds`, `llm_outage_max_attempts`,
-`llm_outage_reset_window_seconds`, `LLM_OUTAGE_SWEEP_SECONDS`), plus:
+`llm_outage_max_attempts`, `llm_outage_reset_window_seconds`,
+`LLM_OUTAGE_SWEEP_SECONDS`). **Changed:**
 
-| Key | Default | Meaning |
-|---|---|---|
-| `cooldown_max_pause_seconds` | `86400` (= outage ceiling) | Longest cooldown reset we'll pause through; longer → fail fast |
+| Key | Old default | New default | Meaning |
+|---|---|---|---|
+| `llm_outage_ceiling_seconds` (`LLM_OUTAGE_CEILING_SECONDS`) | `86400` (24h) | `43200` (12h) | Max pause budget — now **doubles as the cooldown pause-vs-fail-fast cutoff**. Also lowers the transient give-up ceiling 24h→12h (deliberate, §Effect on the shipped transient path). |
+
+No new keys. (The earlier draft's `cooldown_max_pause_seconds` is dropped — fused
+into the ceiling per the 2026-07-15 decision.)
 
 ## Acceptance criteria
 
@@ -257,12 +305,12 @@ Reuses the sibling's `limits:` + env knobs (`llm_outage_backoff_*`,
 2. `next_retry_at` is floored to the cooldown's `reset_seconds` (one ~2h sleep, not
    a per-minute retry); the sweeper re-dispatches at the window; the job **resumes
    from checkpoint** and continues.
-3. A cooldown with `reset_seconds > cooldown_max_pause_seconds` (multi-day wall)
-   still **fails fast** with the model + reset-window operator message — unchanged.
+3. A cooldown with `reset_seconds > LLM_OUTAGE_CEILING_SECONDS` (12h; the multi-day
+   wall) still **fails fast** with the model + reset-window operator message.
 4. `quota_exhausted` (`insufficient_quota`) and `permanent` still fail fast.
 5. A cooldown that **outlives** its stated reset (still cooling on re-dispatch) does
    **not** reset the duration ceiling; it fails **loudly with an operator alert** at
-   24h / `MAX_ATTEMPTS`, never parking indefinitely.
+   12h / `MAX_ATTEMPTS`, never parking indefinitely.
 6. With `CHECKPOINTER_BACKEND=sqlite`, cooldown handling **no-ops to today's
    fail-fast** (no unsafe cold-start re-dispatch) — same gate as the sibling.
 7. A paused-for-cooldown loop iteration does **not** advance the loop or burn the
@@ -273,23 +321,26 @@ Reuses the sibling's `limits:` + env knobs (`llm_outage_backoff_*`,
 9. Legacy outage state without `next_retry_at` evaluates exactly as today
    (anchor falls back to `last_failed_at`); in-flight pauses across the upgrade
    don't crash or misbehave.
+10. The agent-side cutoff and orchestrator-side ceiling resolve to the **same**
+    `LLM_OUTAGE_CEILING_SECONDS`; a job admitted to pause is never then instantly
+    ceiling-failed by a disagreeing value.
 
 ## Verify plan
 
 - **Unit** (extend `tests/test_graph_helpers.py` + `tests/test_llm_outage_resilience.py`):
   cooldown within budget → `llm_unavailable` freeze with `retry_after_seconds=reset_s`;
-  cooldown over budget → fail-fast `error`; sqlite → fail-fast; the anchored-reset
-  suite from §Design decision (still-cooling re-dispatch → no reset, ceiling
-  accumulates; second cooldown after days of productive work → reset; transient
-  re-fail inside the `(2h, backoff+2h)` band → no reset, asserted as the
-  deliberate semantics change; missing `next_retry_at` → legacy behavior);
-  `quota_exhausted` still fail-fast.
+  cooldown over the 12h budget → fail-fast `error`; sqlite → fail-fast; the
+  anchored-reset suite from §Design decision (still-cooling re-dispatch → no reset,
+  ceiling accumulates; second cooldown after a productive stretch → reset; transient
+  re-fail inside the `(2h, backoff+2h)` band → no reset, asserted as the deliberate
+  semantics change; missing `next_retry_at` → legacy behavior); the ceiling default
+  is 12h; `quota_exhausted` still fail-fast.
 - **k3d E2E**: reuse the sibling's isolated-outage harness — pin a worker job to a
   model/endpoint that returns a synthetic `model_cooldown` 429 with a short
-  `reset_seconds` (shrink `cooldown_max_pause_seconds` + `llm_outage_*` in a test
+  `reset_seconds` (shrink `llm_outage_ceiling_seconds` + `llm_outage_*` in a test
   overlay), confirm `paused` → sweeper re-dispatch at the floored delay →
-  resume-from-checkpoint → completion once the stub stops cooling. Confirm the
-  over-budget reset still fails fast.
+  resume-from-checkpoint → completion once the stub stops cooling. Confirm an
+  over-budget cooldown still fails fast.
 
 ## Relationship to prior work
 
@@ -305,13 +356,52 @@ Reuses the sibling's `limits:` + env knobs (`llm_outage_backoff_*`,
   `next_retry_at` removes the wait-vs-runtime ambiguity (the reason the reset
   window had to exceed the backoff cap) for any long scheduled wait, not just
   cooldowns.
+- **Superseded-in-turn by** `[[llm_fallback_model_routing]]` *if/when built*: that
+  feature makes fallback the first response to a cooldown and this pause path the
+  last resort (all candidate models cold). Nothing here is wasted — the pause
+  substrate is what fallback falls back *to*.
 
-## Open questions
+## Implementation notes (2026-07-15)
 
-- **Cutoff value.** Default `cooldown_max_pause_seconds = 24h` (reuse the ceiling)
-  vs. a shorter dedicated bound (e.g. 12h) so a loop never sleeps more than half a
-  day on one model. The user's real cases (codex ~2h, OpenAI ~5h) fit either.
-- **Fallback model instead of pausing.** Out of scope here, but the strictly-better
-  end state for an autonomous loop: degrade a cooldown-benched role onto a sibling
-  model and keep moving, pausing only when *no* model is available. Worth its own
-  design.
+Built on `develop`, uncommitted. Files touched:
+
+- **`src/graph.py`** — `_COOLDOWN_MAX_PAUSE_SECONDS` (reads `LLM_OUTAGE_CEILING_SECONDS`,
+  default 43200, garbage-guarded) + pure `_cooldown_within_pause_budget(reset_s)`;
+  the `cooldown` branch of the execute node now emits the `llm_unavailable` freeze
+  (`classification="cooldown"`, `retry_after_seconds=reset_s`, `error_summary`,
+  `model`) when within budget **and** `checkpointer_backend()=="postgres"`, else the
+  unchanged fail-fast.
+- **`orchestrator/services/completion.py`** — `LLM_OUTAGE_CEILING_SECONDS` default
+  `86_400 → 43_200`; `evaluate_llm_outage` anchors the reset at
+  `max(last_failed_at, next_retry_at)` (falls back to `last_failed_at`).
+- **`orchestrator/database/postgres.py`** — `increment_job_llm_outage_attempt` mirrors
+  the same anchor (kept in lockstep with `evaluate_llm_outage`).
+- **`orchestrator/main.py`** — the `/complete` `llm_unavailable` pause now stamps
+  `next_retry_at` into **`context.llm_outage`** (a `jsonb_set` folded into the existing
+  freeze_data follow-up UPDATE), so the anchor survives re-dispatch (the sweeper
+  CAS-clears `freeze_data`, not `context`).
+- **Tests** — `tests/test_llm_outage_resilience.py` (anchored-reset suite: still-cooling
+  → no reset; productive-gap → reset; never-clearing → 12h ceiling; legacy fallback;
+  ceiling==43200), `tests/test_graph_helpers.py::TestCooldownWithinPauseBudget` (cutoff
+  boundaries + 12h default).
+
+**Verified locally:** `pytest` `test_llm_outage_resilience` + `test_graph_helpers` +
+`test_graph` + `test_llm_outage_sweeper` = **214 passed**; `ruff check` + `ruff format`
+clean; `py_compile` clean on all four source files.
+
+**NOT yet verified (designated for k3d E2E, per §Verify plan):** the full execute-node
+cooldown → `llm_unavailable` freeze → pause → sweeper re-dispatch → resume-from-checkpoint
+loop; the sqlite no-op gate at runtime; the `context.llm_outage.next_retry_at` `jsonb_set`
+round-trip against real Postgres (the SQL is lint-parsed, not executed locally — no local
+PG); and the cross-pod agreement of `LLM_OUTAGE_CEILING_SECONDS`. A real cooldown 429 can't
+be induced on demand — reuse the sibling's synthetic-`model_cooldown` stub harness.
+
+## Decisions locked
+
+| Question | Decision (date) |
+|---|---|
+| Reset-window vs. long-wait interaction | Anchor the reset at `max(last_failed_at, next_retry_at)`; no counter (2026-07-10) |
+| Pause cutoff value / separate knob? | Fuse into `LLM_OUTAGE_CEILING_SECONDS`, lowered to **12h**; no new knob (2026-07-15) |
+| Fallback model instead of pausing | Out of scope; spun out to `[[llm_fallback_model_routing]]` (2026-07-15) |
+| `run_until` bleed during a cooldown pause | Leave as-is, documented; crediting paused-time deferred (2026-07-15) |
+| `quota_exhausted` billing wall | Keep failing fast (2026-07-07) |
