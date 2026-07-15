@@ -13260,16 +13260,35 @@ async def complete_job(
                 _next = _now + timedelta(seconds=_delay)
                 # Persist next_retry_at + attempt INTO freeze_data so the sweeper's
                 # due-query + CAS can find and gate on it (overwrites the agent's
-                # freeze_data written earlier in this handler).
+                # freeze_data written earlier in this handler). ALSO stamp
+                # next_retry_at into context.llm_outage so the auto-reset anchors
+                # on the end of this scheduled wait rather than the last failure —
+                # without it a long cooldown pause spuriously resets the ceiling
+                # (docs/features/llm_cooldown_pause_and_resume.md §Design decision).
+                # Follow-up (not folded into the increment) because next_retry_at
+                # depends on the post-increment attempt; a crash between the two
+                # leaves next_retry_at absent → the anchor degrades to today's
+                # last_failed_at behavior, which is safe.
                 _out_fd = dict(_lfd)
                 _out_fd["next_retry_at"] = _next.isoformat()
                 _out_fd["attempt"] = _attempt
                 try:
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
-                            "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
+                            """
+                            UPDATE jobs
+                               SET freeze_data = $1::jsonb,
+                                   context = jsonb_set(
+                                       COALESCE(context, '{}'::jsonb),
+                                       '{llm_outage,next_retry_at}',
+                                       to_jsonb($3::text),
+                                       true
+                                   )
+                             WHERE id = $2::uuid
+                            """,
                             json.dumps(_out_fd),
                             job_id,
+                            _next.isoformat(),
                         )
                 except Exception as e:
                     logger.warning(

@@ -287,6 +287,33 @@ def _is_codex_proxy_error(exc: BaseException) -> bool:
 # docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
 _COOLDOWN_MIN_RESET_SECONDS = 300.0
 
+# The pause-vs-fail-fast cutoff for a quota cooldown: a cooldown whose
+# provider-stated reset fits inside this budget PAUSES + resumes from its
+# checkpoint (via the llm_unavailable outage path); a longer one (a multi-day
+# quota wall) fails fast — pausing that long helps nobody and needs an operator.
+# Shares the orchestrator's outage give-up ceiling via the same
+# LLM_OUTAGE_CEILING_SECONDS env var so pause-admission (agent-side, here) and
+# give-up (orchestrator-side) can never disagree — keep the 43_200 (12h) default
+# in sync with orchestrator/services/completion.py (a different pod reads it).
+# docs/features/llm_cooldown_pause_and_resume.md
+try:
+    _COOLDOWN_MAX_PAUSE_SECONDS = float(
+        os.getenv("LLM_OUTAGE_CEILING_SECONDS") or 43200
+    )
+except (ValueError, TypeError):
+    _COOLDOWN_MAX_PAUSE_SECONDS = 43200.0
+
+
+def _cooldown_within_pause_budget(reset_seconds: Optional[float]) -> bool:
+    """True if a quota cooldown with ``reset_seconds`` should pause (not fail fast).
+
+    A cooldown whose provider-stated reset window fits inside the pause budget is
+    waited out via the outage pause/resume path; an unknown reset (``None``) or a
+    window longer than the budget fails fast.
+    """
+    return reset_seconds is not None and reset_seconds <= _COOLDOWN_MAX_PAUSE_SECONDS
+
+
 # C2 circuit breaker: after this many CONSECUTIVE execute-node invocations that
 # exhaust their inner LLM retries with no progress, stop instead of letting the
 # outer graph loop re-enter execute forever (the deferred "Fix 3" from
@@ -2600,15 +2627,72 @@ def create_execute_node(
                     }
 
                 if classification == "cooldown":
-                    # C1: a quota cooldown (all credentials cooling down) with a
-                    # multi-day reset — retrying within the window is futile, so
-                    # fail fast with an actionable reason instead of looping (the
-                    # gpt-5.3-codex-spark incident). Re-run after the reset, or
-                    # pin a fallback model.
+                    # A quota cooldown (all credentials cooling down). If the
+                    # provider's stated reset window fits inside our pause budget
+                    # AND we're on the Postgres checkpointer (safe cross-pod
+                    # resume), PAUSE and wait it out via the llm_unavailable outage
+                    # path — the job resumes from its checkpoint when the window
+                    # reopens (retry_after_seconds floors the backoff to the true
+                    # window). Otherwise — a multi-day wall, an unknown reset, or
+                    # sqlite — fail fast with an actionable reason instead of
+                    # looping (the gpt-5.3-codex-spark incident): re-run after the
+                    # reset or pin a fallback model.
+                    # docs/features/llm_cooldown_pause_and_resume.md
                     reset_s, cd_model = _cooldown_detail(e)
                     when = (
                         f"~{reset_s / 3600:.1f}h" if reset_s else "an extended period"
                     )
+
+                    if (
+                        _cooldown_within_pause_budget(reset_s)
+                        and checkpointer_backend() == "postgres"
+                    ):
+                        cd_summary = (
+                            f"Model '{cd_model or phase_model}' in quota cooldown "
+                            f"(all credentials cooling down); resets in {when}"
+                        )
+                        logger.warning(
+                            f"[{job_id}] LLM quota cooldown on "
+                            f"'{cd_model or phase_model}' (resets in {when}) — pausing "
+                            f"for backoff re-dispatch within the "
+                            f"{_COOLDOWN_MAX_PAUSE_SECONDS / 3600:.0f}h budget (resumes "
+                            f"from checkpoint when the window reopens): {e}"
+                        )
+                        if auditor:
+                            auditor.audit_step(
+                                job_id=job_id,
+                                agent_type=config.agent_id,
+                                step_type="warning",
+                                node_name="execute",
+                                iteration=iteration,
+                                data={
+                                    "error": {
+                                        "type": "llm_error",
+                                        "message": cd_summary[:500],
+                                        "recoverable": True,
+                                        "classification": "cooldown",
+                                        "action": "pause_backoff_redispatch",
+                                        "attempts": attempt + 1,
+                                        "reset_seconds": reset_s,
+                                    }
+                                },
+                                metadata=state.get("metadata"),
+                                phase=phase_str,
+                                phase_number=phase_number,
+                            )
+                        return {
+                            "freeze_data": {
+                                "freeze_type": "llm_unavailable",
+                                "classification": "cooldown",
+                                "error_summary": cd_summary[:500],
+                                "model": cd_model or phase_model,
+                                "retry_after_seconds": reset_s,
+                            },
+                            "should_stop": True,
+                            "iteration": iteration + 1,
+                        }
+
+                    # Over budget / unknown reset / sqlite → fail fast.
                     cd_msg = (
                         f"Model '{cd_model or phase_model}' is in a quota cooldown "
                         f"(all credentials cooling down); it resets in {when}. Failed "

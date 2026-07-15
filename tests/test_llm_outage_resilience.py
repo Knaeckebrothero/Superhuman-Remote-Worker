@@ -31,15 +31,20 @@ from orchestrator.services.completion import (  # noqa: E402
 NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _outage_ctx(attempt, first_ago, last_ago):
-    """Build a context dict with a llm_outage sub-object (times = seconds ago)."""
-    return {
-        "llm_outage": {
-            "attempt": attempt,
-            "first_failed_at": (NOW - timedelta(seconds=first_ago)).isoformat(),
-            "last_failed_at": (NOW - timedelta(seconds=last_ago)).isoformat(),
-        }
+def _outage_ctx(attempt, first_ago, last_ago, next_retry_ago=None):
+    """Build a context dict with a llm_outage sub-object (times = seconds ago).
+
+    ``next_retry_ago`` (seconds before NOW that the last pause's re-dispatch was
+    scheduled) is added only when provided, so legacy-shaped state is unchanged.
+    """
+    outage = {
+        "attempt": attempt,
+        "first_failed_at": (NOW - timedelta(seconds=first_ago)).isoformat(),
+        "last_failed_at": (NOW - timedelta(seconds=last_ago)).isoformat(),
     }
+    if next_retry_ago is not None:
+        outage["next_retry_at"] = (NOW - timedelta(seconds=next_retry_ago)).isoformat()
+    return {"llm_outage": outage}
 
 
 # =============================================================================
@@ -77,7 +82,7 @@ class TestEvaluateLlmOutage:
         assert ev["attempt"] == 0
         assert ev["first_failed_at"] == NOW  # duration ceiling restarts too
 
-    def test_duration_ceiling_trips_after_24h(self):
+    def test_duration_ceiling_trips_past_ceiling(self):
         ev = evaluate_llm_outage(
             _outage_ctx(8, LLM_OUTAGE_CEILING_SECONDS + 3600, 60), NOW
         )
@@ -105,6 +110,60 @@ class TestEvaluateLlmOutage:
         ev = evaluate_llm_outage({"llm_outage": "garbage"}, NOW)
         assert ev["attempt"] == 0
         assert ev["over_ceiling"] is False
+
+    # --- anchored reset (docs/features/llm_cooldown_pause_and_resume.md) --------
+    # The reset must measure idle time from the END of any scheduled wait we
+    # imposed (next_retry_at), not from last_failed_at — else a multi-hour
+    # cooldown pause looks like "the job ran fine" and spuriously resets the
+    # ceiling, letting a never-clearing cooldown park the job forever.
+
+    def test_still_cooling_redispatch_does_not_reset(self):
+        # A cooldown pause scheduled re-dispatch 3h out; the model was still
+        # cooling, so the job re-failed ~60s after resuming. The gap since
+        # last_failed_at (3h) exceeds the 2h window, but the gap since the
+        # scheduled resume (next_retry_at, 60s) does not — so NO reset, and the
+        # duration ceiling keeps accumulating toward give-up.
+        ev = evaluate_llm_outage(
+            _outage_ctx(4, 3 * 3600 + 60, 3 * 3600, next_retry_ago=60), NOW
+        )
+        assert ev["reset"] is False
+        assert ev["attempt"] == 4
+
+    def test_second_cooldown_after_productive_gap_resets(self):
+        # The job resumed at the scheduled time and ran productively for >2h
+        # before a fresh failure: idle beyond the scheduled wait exceeds the
+        # window → an independent outage → reset (no stale first_failed_at).
+        idle = LLM_OUTAGE_RESET_WINDOW_SECONDS + 600
+        ev = evaluate_llm_outage(
+            _outage_ctx(4, 10 * 3600, 5 * 3600, next_retry_ago=idle), NOW
+        )
+        assert ev["reset"] is True
+        assert ev["attempt"] == 0
+        assert ev["first_failed_at"] == NOW
+
+    def test_legacy_state_without_next_retry_uses_last_failed_at(self):
+        # No next_retry_at (state written before this feature): fall back to
+        # today's behavior exactly — a >window gap since last_failed_at resets.
+        # Same shape as test_still_cooling_* but without the anchor → opposite
+        # verdict, which is the whole point of the graceful fallback.
+        ev = evaluate_llm_outage(_outage_ctx(4, 3 * 3600 + 60, 3 * 3600), NOW)
+        assert ev["reset"] is True
+        assert ev["attempt"] == 0
+
+    def test_never_clearing_cooldown_trips_ceiling(self):
+        # 13h of a still-cooling cooldown (each re-dispatch re-fails ~1min after
+        # resuming): with the anchor suppressing the spurious reset, the 12h
+        # duration ceiling trips → loud fail, never parks forever.
+        ev = evaluate_llm_outage(
+            _outage_ctx(6, 13 * 3600, 13 * 3600, next_retry_ago=60), NOW
+        )
+        assert ev["over_ceiling"] is True
+        assert ev["ceiling_reason"] == "duration"
+
+    def test_ceiling_default_is_12h(self):
+        # Product decision (2026-07-15): the pause budget / give-up ceiling is
+        # 12h, fused with the cooldown pause-vs-fail-fast cutoff.
+        assert LLM_OUTAGE_CEILING_SECONDS == 43_200
 
 
 # =============================================================================

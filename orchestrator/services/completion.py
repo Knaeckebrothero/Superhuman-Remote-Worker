@@ -428,9 +428,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# 24h continuous-outage duration ceiling (primary; the Temporal
-# scheduleToCloseTimeout model). After this the job fails loudly.
-LLM_OUTAGE_CEILING_SECONDS = _env_int("LLM_OUTAGE_CEILING_SECONDS", 86_400)
+# 12h continuous-outage duration ceiling (primary; the Temporal
+# scheduleToCloseTimeout model). After this the job fails loudly. Doubles as the
+# cooldown pause-vs-fail-fast cutoff (docs/features/llm_cooldown_pause_and_resume.md):
+# a quota cooldown whose provider-stated reset exceeds this fails fast instead of
+# pausing. Keep the 43_200 default in sync with src/graph.py's
+# _COOLDOWN_MAX_PAUSE_SECONDS (a different pod reads the same env var).
+LLM_OUTAGE_CEILING_SECONDS = _env_int("LLM_OUTAGE_CEILING_SECONDS", 43_200)
 # Attempts backstop — defends against pathological fast re-fail loops whose
 # short Full-Jitter draws could rack up attempts without much wall-clock.
 LLM_OUTAGE_MAX_ATTEMPTS = _env_int("LLM_OUTAGE_MAX_ATTEMPTS", 60)
@@ -526,10 +530,22 @@ def evaluate_llm_outage(ctx: dict[str, Any], now: datetime) -> dict[str, Any]:
     attempt = int(outage.get("attempt", 0) or 0)
     first_failed_at = _parse_ts(outage.get("first_failed_at"))
     last_failed_at = _parse_ts(outage.get("last_failed_at"))
+    next_retry_at = _parse_ts(outage.get("next_retry_at"))
 
+    # Measure idle time from when the job was free to run again — the END of any
+    # scheduled wait we imposed (next_retry_at) — not from the last failure. A
+    # long cooldown pause (retry_after floored to hours) is us deliberately
+    # sleeping, not the job running fine; anchoring on last_failed_at would
+    # misread it as a productive gap, spuriously reset the ceiling, and let a
+    # never-clearing cooldown park the loop forever. next_retry_at is absent on
+    # legacy state → fall back to last_failed_at (byte-for-byte today's behavior).
+    # docs/features/llm_cooldown_pause_and_resume.md §Design decision
+    anchor = last_failed_at
+    if next_retry_at is not None and (anchor is None or next_retry_at > anchor):
+        anchor = next_retry_at
     reset = (
-        last_failed_at is not None
-        and (now - last_failed_at).total_seconds() > LLM_OUTAGE_RESET_WINDOW_SECONDS
+        anchor is not None
+        and (now - anchor).total_seconds() > LLM_OUTAGE_RESET_WINDOW_SECONDS
     )
     if reset:
         attempt = 0
