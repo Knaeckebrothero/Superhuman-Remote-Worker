@@ -3347,36 +3347,50 @@ class PostgresDB:
                     merged[key] = value
             return merged
 
+        # The read-modify-write below is not atomic; two concurrent merges
+        # (e.g. rapid live config.update frames) would silently drop one.
+        # Serialize on a per-thread advisory lock, domain-salted so merges
+        # never queue behind the (potentially minutes-long) provisioning
+        # lock in thread_advisory_lock, and taken on this same connection
+        # so no second pool slot is held while waiting.
+        h = hashlib.blake2b(
+            b"config_override:" + thread_id.encode(), digest_size=8
+        ).digest()
+        lock_key = int.from_bytes(h, byteorder="big", signed=True)
+
         async with self.acquire() as conn:
-            # Read current config_override
-            row = await conn.fetchrow(
-                "SELECT metadata FROM threads WHERE id = $1", uuid_val
-            )
-            if not row:
-                return False
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
 
-            metadata = row["metadata"] or {}
-            if isinstance(metadata, str):
-                try:
-                    metadata = json_module.loads(metadata)
-                except (json_module.JSONDecodeError, TypeError):
-                    metadata = {}
+                # Read current config_override
+                row = await conn.fetchrow(
+                    "SELECT metadata FROM threads WHERE id = $1", uuid_val
+                )
+                if not row:
+                    return False
 
-            current = metadata.get("config_override") or {}
-            merged = _deep_merge(current, config_updates)
+                metadata = row["metadata"] or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json_module.loads(metadata)
+                    except (json_module.JSONDecodeError, TypeError):
+                        metadata = {}
 
-            result = await conn.execute(
-                "UPDATE threads "
-                "SET metadata = jsonb_set("
-                "    COALESCE(metadata, '{}'::jsonb), "
-                "    '{config_override}', "
-                "    $1::jsonb"
-                "), "
-                "    last_activity = CURRENT_TIMESTAMP "
-                "WHERE id = $2",
-                json_module.dumps(merged),
-                uuid_val,
-            )
+                current = metadata.get("config_override") or {}
+                merged = _deep_merge(current, config_updates)
+
+                result = await conn.execute(
+                    "UPDATE threads "
+                    "SET metadata = jsonb_set("
+                    "    COALESCE(metadata, '{}'::jsonb), "
+                    "    '{config_override}', "
+                    "    $1::jsonb"
+                    "), "
+                    "    last_activity = CURRENT_TIMESTAMP "
+                    "WHERE id = $2",
+                    json_module.dumps(merged),
+                    uuid_val,
+                )
 
         return result == "UPDATE 1"
 

@@ -547,6 +547,7 @@ async def run_persistent_loop(
     initial_turn_count: int = 0,
     get_current_tools: Optional[Callable[[], tuple]] = None,
     get_current_context: Optional[Callable[[], tuple]] = None,
+    get_current_system_prompt: Optional[Callable[[], str]] = None,
     memory_extraction_prompt: str = "",
     memory_service: Optional[Any] = None,
 ) -> None:
@@ -572,6 +573,10 @@ async def run_persistent_loop(
         get_current_tools: Optional callback returning (llm_with_tools, tools) —
             called at the start of each turn to pick up tool set changes
             (e.g. plan mode toggle).
+        get_current_system_prompt: Optional callback returning the session's
+            current system prompt — re-read each turn so a live rebuild
+            (tool-group toggle, workspace upgrade) reaches messages[0]
+            instead of only the tool binding.
         memory_extraction_prompt: Matrix-resolved prompt for the background
             memory-extraction task, threaded from session setup (MemoryConfig
             carries no prompt attribute — docs/issues/memory_bugs.md B1).
@@ -639,6 +644,22 @@ async def run_persistent_loop(
         # updated in place (update_limits) so mid-turn references stay fresh.
         if get_current_context:
             context_manager, config, auxiliary_llm = get_current_context()
+        # Live config changes rebuild session.system_prompt (tool-group
+        # toggles, workspace upgrades), but messages[0] was written once at
+        # loop start — mutate it in place (preserving message identity for
+        # persistence) so the model actually sees the rebuilt prompt.
+        if get_current_system_prompt:
+            current_prompt = get_current_system_prompt()
+            if (
+                current_prompt
+                and messages
+                and isinstance(messages[0], SystemMessage)
+                and messages[0].content != current_prompt
+            ):
+                messages[0].content = current_prompt
+                logger.info(
+                    "System prompt refreshed live (%d chars)", len(current_prompt)
+                )
 
         turn_count += 1
         turn_id = turn_count

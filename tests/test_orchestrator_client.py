@@ -8,6 +8,7 @@ import pytest
 from src.api.orchestrator_client import (
     OrchestratorClient,
     SessionGrantDenied,
+    ThreadConfigUpdateDenied,
     create_orchestrator_client_from_env,
     get_agent_ip,
     get_hostname,
@@ -295,6 +296,90 @@ class TestOrchestratorClient:
         assert not client._stop_heartbeat.is_set()
         client.stop_heartbeat()
         assert client._stop_heartbeat.is_set()
+
+
+class TestUpdateThreadConfig:
+    """update_thread_config: enriched-dict return, typed 4xx denial, and
+    None-on-transient semantics (live_session_settings.md P0.3)."""
+
+    @pytest.fixture
+    def client(self):
+        return OrchestratorClient(
+            orchestrator_url="http://localhost:8085",
+            pod_ip="10.0.0.5",
+            pod_port=8001,
+            hostname="test-agent",
+            config_name="creator",
+            pid=12345,
+        )
+
+    def _response(self, status_code, json_body=None, text=""):
+        r = MagicMock()
+        r.status_code = status_code
+        r.text = text
+        if json_body is not None:
+            r.json = MagicMock(return_value=json_body)
+        else:
+            r.json = MagicMock(side_effect=ValueError("no body"))
+        return r
+
+    @pytest.mark.asyncio
+    async def test_success_returns_enriched_override(self, client):
+        enriched = {"llm": {"model": "m", "base_url": "http://x", "api_key": "k"}}
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.patch = AsyncMock(
+                return_value=self._response(
+                    200, {"status": "updated", "config_override": enriched}
+                )
+            )
+            result = await client.update_thread_config(
+                "thread-1", {"llm": {"model": "m"}}
+            )
+        assert result == enriched
+
+    @pytest.mark.asyncio
+    async def test_4xx_raises_typed_denial_with_detail(self, client):
+        """A 422 grant denial must surface its detail — not collapse to None
+        (the old behavior let a denied model swap fall back to a local apply)."""
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.patch = AsyncMock(
+                return_value=self._response(
+                    422, {"detail": "permission_mode 'autonomous' exceeds grants"}
+                )
+            )
+            with pytest.raises(ThreadConfigUpdateDenied) as exc_info:
+                await client.update_thread_config(
+                    "thread-1", {"interactive": {"permission_mode": "autonomous"}}
+                )
+        assert exc_info.value.status_code == 422
+        assert "exceeds grants" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_4xx_without_json_body_uses_text(self, client):
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.patch = AsyncMock(
+                return_value=self._response(404, None, text="Thread not found")
+            )
+            with pytest.raises(ThreadConfigUpdateDenied) as exc_info:
+                await client.update_thread_config("thread-x", {"llm": {}})
+        assert exc_info.value.status_code == 404
+        assert "Thread not found" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_5xx_returns_none_transient(self, client):
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.patch = AsyncMock(
+                return_value=self._response(500, {"detail": "boom"})
+            )
+            result = await client.update_thread_config("thread-1", {"llm": {}})
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_network_failure_returns_none(self, client):
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.patch = AsyncMock(side_effect=ConnectionError("down"))
+            result = await client.update_thread_config("thread-1", {"llm": {}})
+        assert result is None
 
 
 class TestCreateOrchestratorClientFromEnv:

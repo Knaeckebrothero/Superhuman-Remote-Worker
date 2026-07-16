@@ -2478,9 +2478,15 @@ export class PersistentChatService {
         this._sendControl({method: 'narration.set', mode});
     }
 
-    /** Update session config (model, temperature, etc.) at runtime. */
-    updateConfig(config: Record<string, unknown>): void {
-        this._sendControl({method: 'config.update', config});
+    /** Update session config (model, temperature, etc.) at runtime.
+     *
+     * Returns the request_id sent with the frame; the agent echoes it on
+     * the matching `config.changed` ack (or `error` frame), so callers with
+     * several in-flight updates can correlate outcomes. */
+    updateConfig(config: Record<string, unknown>): string {
+        const requestId = crypto.randomUUID();
+        this._sendControl({method: 'config.update', config, request_id: requestId});
+        return requestId;
     }
 
     /** Clear conversation history (local only). */
