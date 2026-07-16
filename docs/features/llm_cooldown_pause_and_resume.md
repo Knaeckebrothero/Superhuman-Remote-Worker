@@ -1,6 +1,6 @@
 # Cooldown-aware pause: wait out a short quota cooldown instead of failing the job
 
-Status: **IMPLEMENTED — unit-tested + lint-clean, code + Helm exposure committed on `develop` (unpushed; SHAs churn pre-push); k3d E2E pending. All design decisions RESOLVED 2026-07-15.**
+Status: **IMPLEMENTED + k3d E2E VERIFIED (2026-07-16) — unit-tested + lint-clean, code + Helm exposure committed on `develop` (unpushed; SHAs churn pre-push). All design decisions RESOLVED 2026-07-15.**
 Date: 2026-07-07 (reset-anchor resolved 2026-07-10; cutoff / fallback / deadline resolved 2026-07-15; implemented 2026-07-15)
 Scope: worker/loop jobs (the LangGraph worker in `src/graph.py`). Extends
 `[[llm_outage_pause_and_backoff_redispatch]]` — reuses its Tier-2 pause →
@@ -369,6 +369,13 @@ pods follow. Verified via `helm template` (both surfaces render the key) + `helm
   feature makes fallback the first response to a cooldown and this pause path the
   last resort (all candidate models cold). Nothing here is wasted — the pause
   substrate is what fallback falls back *to*.
+- **Extended by** `[[llm_outage_subjob_resilience]]` *if/when built*: this feature
+  covers **top-level jobs only** — subjobs (scholar/critic/`spawn_subagent`
+  delegates) still divert a cooldown freeze to `pending_review` (the agent emits it,
+  but `determine_job_status`'s subjob short-circuit routes it there). k3d-observed:
+  the E2E scholar subjob went `pending_review` with `classification=cooldown`. That
+  doc wires subjobs into this pause path (the engine reuses; the work is making the
+  delegation timeout + verification sweeper not reap a paused subjob).
 
 ## Implementation notes (2026-07-15)
 
@@ -398,12 +405,36 @@ Code + the Helm exposure (below) committed on `develop` (unpushed). Files touche
 `test_graph` + `test_llm_outage_sweeper` = **214 passed**; `ruff check` + `ruff format`
 clean; `py_compile` clean on all four source files.
 
-**NOT yet verified (designated for k3d E2E, per §Verify plan):** the full execute-node
-cooldown → `llm_unavailable` freeze → pause → sweeper re-dispatch → resume-from-checkpoint
-loop; the sqlite no-op gate at runtime; the `context.llm_outage.next_retry_at` `jsonb_set`
-round-trip against real Postgres (the SQL is lint-parsed, not executed locally — no local
-PG); and the cross-pod agreement of `LLM_OUTAGE_CEILING_SECONDS`. A real cooldown 429 can't
-be induced on demand — reuse the sibling's synthetic-`model_cooldown` stub harness.
+### k3d E2E result (2026-07-16) ✅
+
+Verified on k3d `srw` against the **deployed images** (orchestrator
+`srw-orchestrator:tilt-d36e9e57…`, agent `srw-agent:tilt-5b5b5735…`) + **real
+Postgres**, using a synthetic `model_cooldown`-429 stub (the sibling's isolated-outage
+harness) pinned per-job via `config_override.llm.{base_url,api_key}` on the phase pins:
+
+- **Deployed code = this change:** orchestrator `completion.py` carries the anchor +
+  ceiling default `43_200`; the chart env `LLM_OUTAGE_CEILING_SECONDS=43200` is live on the
+  orchestrator pod (so the Helm plumbing works end-to-end).
+- **`jsonb_set` round-trip on real Postgres:** `jsonb_set(…, '{llm_outage,next_retry_at}',
+  …, true)` adds `next_retry_at` while preserving `attempt`/`first_failed_at`/
+  `last_failed_at`/`fingerprint`.
+- **Anchored reset on the deployed image:** still-cooling (next_retry_at 60s, last_failed_at
+  3h) → **no reset**, attempt held; 13h continuous → **12h duration ceiling** trips;
+  legacy (no `next_retry_at`) → resets.
+- **Within-budget cooldown — live job:** a worker job hitting the stub (reset 45s) went
+  **`paused` / `freeze_type=llm_unavailable` / `classification=cooldown` /
+  `retry_after_seconds=45`**; `next_retry_at` was persisted into `context.llm_outage` by the
+  live `/complete`; the sweeper re-dispatched → agent **resumed from checkpoint** → re-hit
+  the 429 → `attempt` climbed **1→2** with `first_failed_at` **held** (no spurious reset).
+- **Over-budget cooldown — live job:** a stub with reset `500000s` (~138.9h > 12h) →
+  job **`failed` fast** with *"resets in ~138.9h. Failed fast rather than retry-looping"*
+  (not paused). The classification fork works both ways live.
+
+**Not exercised (infra limit, same as the sibling doc):** resume-to-**completion** on a
+*recovered* model — no real model is configured on k3d, so a dumb stub can't drive an agent
+to completion; the pause → re-dispatch → resume-from-checkpoint mechanism itself is proven
+each cycle. The `sqlite` no-op gate stays unit-covered (k3d runs Postgres). Test resources
+(two stubs, the test jobs/pods) were torn down afterward.
 
 ## Decisions locked
 
