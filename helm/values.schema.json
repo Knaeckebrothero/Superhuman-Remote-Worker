@@ -230,10 +230,6 @@
                           "type": "string",
                           "maxLength": 512
                         },
-                        "usernameKey": {
-                          "type": "string",
-                          "pattern": "^[A-Za-z0-9._-]+$"
-                        },
                         "passwordKey": {
                           "type": "string",
                           "pattern": "^[A-Za-z0-9._-]+$"
@@ -313,7 +309,7 @@
                         "required": ["username", "credentials", "provisionRole", "pool"],
                         "properties": {
                           "credentials": {
-                            "required": ["create", "existingSecret", "vaultPath", "usernameKey", "passwordKey"]
+                            "required": ["create", "existingSecret", "vaultPath", "passwordKey"]
                           },
                           "pool": { "required": ["min", "max"] }
                         }

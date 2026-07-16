@@ -78,11 +78,9 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: POSTGRES_PASSWORD
+            # Role name is chart configuration, not secret material.
             - name: CANVAS_VIEWER_POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $databaseSecretName }}
-                  key: {{ $credentials.usernameKey }}
+              value: {{ $database.username | quote }}
             - name: CANVAS_VIEWER_POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:

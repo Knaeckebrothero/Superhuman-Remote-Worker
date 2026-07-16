@@ -86,7 +86,7 @@ def _fake_commands(tmp_path: Path) -> Path:
         elif [[ "$*" == *"get secret srw-canvas-gateway-db -o jsonpath={.immutable}"* ]]; then
           printf 'false'
         elif [[ "$*" == *"get secret srw-canvas-gateway-db -o go-template="* ]]; then
-          printf '%b' "${FAKE_SECRET_KEYS:-CANVAS_VIEWER_POSTGRES_USER\\nCANVAS_VIEWER_POSTGRES_PASSWORD\\n}"
+          printf '%b' "${FAKE_SECRET_KEYS:-CANVAS_VIEWER_POSTGRES_PASSWORD\\n}"
         elif [[ "$*" == *"get secret srw-canvas-gateway-db"* ]]; then
           exit 0
         else
@@ -131,7 +131,7 @@ def test_operator_apply_secret_uses_files_and_explicit_context(tmp_path: Path) -
     assert Path(environment["FAKE_ROLE_MARKER"]).exists()
     assert Path(environment["FAKE_SECRET_MARKER"]).exists()
     command_log = Path(environment["FAKE_COMMAND_LOG"]).read_text()
-    assert "--from-file=CANVAS_VIEWER_POSTGRES_USER=" in command_log
+    assert "--from-file=CANVAS_VIEWER_POSTGRES_USER=" not in command_log
     assert "--from-file=CANVAS_VIEWER_POSTGRES_PASSWORD=" in command_log
     assert "--context production-context --namespace srw" in command_log
     assert viewer_password not in command_log
@@ -156,7 +156,7 @@ def test_conflicting_existing_secret_is_rejected_before_role_change(
     )
 
     assert result.returncode != 0
-    assert "exactly two configured keys" in result.stderr
+    assert "exactly the configured password key" in result.stderr
     assert not Path(environment["FAKE_ROLE_MARKER"]).exists()
     assert not Path(environment["FAKE_SECRET_MARKER"]).exists()
     assert viewer_password not in result.stdout
