@@ -1,6 +1,8 @@
 # Outage/cooldown resilience for subjobs (scholar, critic, delegates)
 
-Status: **PROPOSED — refined 2026-07-16 (multi-agent code audit + industry survey); decisions locked 2026-07-16 (§Decisions locked); not scheduled.**
+Status: **IMPLEMENTED on develop + k3d E2E VERIFIED 2026-07-16** (§Implementation
+notes). Refined 2026-07-16 by a multi-agent code audit + industry survey;
+decisions locked same day (§Decisions locked).
 Date: 2026-07-16
 Scope: **subjobs** (`parent_job_id` set) of worker jobs — the auto-spawned pre-job
 **scholar**, post-job **critic**, and `delegate_work` **delegates**. Extends
@@ -274,6 +276,62 @@ Per user decision 2026-07-16, these are tracked as issue docs, not in this featu
   `snoozed`), not failure. Our pause already costs one attempt per window (Temporal
   `NextRetryDelay` model) — fine; consider a distinct label so dashboards don't count
   cooldown pauses as failures.
+
+## Implementation notes (2026-07-16)
+
+Implemented one-shot per the locked decision, TDD throughout (7 commits on
+develop, unpushed; SHAs churn pre-push — don't cite hashes). Unit coverage:
+~40 new tests across `test_llm_outage_resilience` (subjob routing),
+`test_llm_outage_sweeper` (sweep-fail unblock), `test_delegation_timeout_outage`
+(timer anchor), `test_delegation_resume_claim` + `test_per_job_repo` (P0.1 CAS +
+handler), `test_stale_verification_outage_exemption` (real-PG staleness SQL),
+`test_subjob_inherited_workspace` (inherit re-anchor), `test_delegation` (P0.2
+timeout carry); 435 tests green across all touched suites.
+
+**Deviation from the sketch (#6):** the rebase is implemented as a **derived
+anchor** — effective start = `max(freeze.timestamp, latest child
+llm_outage.next_retry_at)`, computed at evaluation time — rather than a
+persisted `jsonb_set` rebase. Same locked K8s reset-on-resume semantics
+(paused child's future wake parks the timer; resumed child gets a full window
+from its wake; never-resuming child terminates at wake + timeout), but with
+zero writes, no dual-leader write races, and no fire-on-resume window (a
+write-side rebase at fire time still cancels a child that resumes just before
+the rebased deadline). Children are only fetched once the naive timer expires.
+
+**k3d E2E (deployed images + real PG, synthetic `model_cooldown` 429 stub
+pinned via `config_override.llm.base_url`):**
+
+- **A. Scholar pause→resume:** scholar → `paused`/`llm_unavailable`/
+  `cooldown`/attempt=1 (NOT `pending_review`), outage sweeper reclaimed +
+  re-dispatched it, resumed on an agent, re-paused attempt=2 — and the
+  **parent stayed `waiting` throughout** (acceptance #1, #2).
+- **Live-caught integration bug, fixed during the gate:** the first A run
+  showed the parent flip `waiting → created` the moment the scholar paused —
+  `_handle_scholar_completion` runs on every `/complete` (the pause path sets
+  `job["status"]="paused"` in-memory first) and treated non-failed as
+  research-success. Fixed with a non-terminal guard (+ unit test); the critic
+  verdict handler was audited and is safe (no-verdict + not-completed → no-op);
+  delegation unblock was already safe (`all_delegation_children_terminal`).
+- **B. Ceiling-fail unblocks the parent:** scholar's `first_failed_at` pushed
+  13h back → sweeper backstop failed it loudly ("past the give-up ceiling
+  (duration…) — failed by the outage sweeper") and the parent was unblocked
+  with `scholar_failed=true` — no stranded `waiting` parent (acceptance #6).
+- **C. Delegation timer:** synthetic parent (freeze ts −3h, timeout 2h) +
+  paused child with wake +2h → deployed sweeper logged "suspended: child
+  outage wake … re-anchors the deadline (−7172s of 7200s consumed)" each tick,
+  child NOT cancelled; wake flipped to −3h (overdue) → next tick cancelled the
+  child and re-queued the parent `paused` with **`freeze_data` cleared (P0.1
+  round-trip)** + `delegation_timed_out` + results (acceptance #3 + overdue
+  guard).
+- **D. Critic staleness exemption:** 7h-stale paused critic with wake +2h
+  **survived** the 6h reap; 9h-stale critic with wake −2h was **cancelled**
+  (acceptance #4, both arms).
+
+Not exercised live: resume-to-COMPLETION (no real model on k3d — same limit as
+the top-level feature) and an agent-driven `delegate_work` round (no real model
+to call the tool; C exercised the deployed sweeper on synthetic rows).
+Acceptance #5/#7/#8 (parent-terminal resolve, memory/kb types, coincident
+error) are unit-covered.
 
 ## Relationship to prior work
 
