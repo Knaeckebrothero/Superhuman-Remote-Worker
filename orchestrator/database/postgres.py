@@ -4174,7 +4174,9 @@ class PostgresDB:
             )
         return [str(row["id"]) for row in rows]
 
-    async def cancel_stale_verification_subjobs(self, stale_hours: int = 6) -> int:
+    async def cancel_stale_verification_subjobs(
+        self, stale_hours: int = 6, outage_grace_minutes: int = 30
+    ) -> int:
         """Cancel orphaned critic/verification subjobs that can never progress.
 
         A verification subjob (``context->>'verification_target'`` set) is reaped
@@ -4186,11 +4188,23 @@ class PostgresDB:
         fallback clears a critic whose parent is *stuck* reviewing without
         killing an active one.
 
+        The staleness arm exempts a critic legitimately paused for an LLM
+        outage/cooldown: ``paused`` with a ``context.llm_outage.next_retry_at``
+        newer than ``outage_grace_minutes`` ago (the grace covers the outage
+        sweeper's claim→dispatch pickup window). A cooldown can exceed the 6h
+        horizon while well inside the 12h pause budget, and the paused row's
+        ``updated_at`` never refreshes — without the exemption the critic was
+        cancelled mid-pause. An OVERDUE wake (paused long past next_retry_at =
+        the outage sweeper broke) and the parent-terminal arm still reap.
+        docs/features/llm_outage_subjob_resilience.md (#7).
+
         See docs/done/preemption_before_first_checkpoint_replays_job_opening.md
         and critic_failure_leaves_parent_job_stuck_reviewing.md.
 
         Args:
             stale_hours: agentless-age fallback horizon for non-terminal parents.
+            outage_grace_minutes: how far past its outage wake a paused critic
+                stays exempt from the staleness reap.
 
         Returns:
             Number of subjobs cancelled.
@@ -4209,11 +4223,24 @@ class PostgresDB:
                   AND j.assigned_agent_id IS NULL
                   AND (
                         parent.status IN ('completed', 'failed', 'cancelled')
-                     OR j.updated_at
-                        < CURRENT_TIMESTAMP - make_interval(hours => $1::int)
+                     OR (
+                            j.updated_at
+                            < CURRENT_TIMESTAMP - make_interval(hours => $1::int)
+                        -- COALESCE guards the NULL case: a paused critic with
+                        -- no llm_outage state must stay reapable, and NULL
+                        -- would otherwise silently exempt it.
+                        AND NOT COALESCE(
+                            j.status = 'paused'
+                            AND (j.context->'llm_outage'->>'next_retry_at')::timestamptz
+                                > CURRENT_TIMESTAMP
+                                  - make_interval(mins => $2::int),
+                            false
+                        )
+                     )
                   )
                 """,
                 stale_hours,
+                outage_grace_minutes,
             )
 
         if result.startswith("UPDATE "):
