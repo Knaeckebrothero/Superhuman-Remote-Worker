@@ -1,8 +1,12 @@
 # Instant Landing Session ("type first, provision on send")
 
-**Status**: IMPLEMENTED + live-verified on k3d (2026-07-12, uncommitted).
-S3 assumed present platform-wide (`docs/done/s3_object_store_bundled_fallback.md`);
-platform default = virtual. See "As built" at the bottom.
+**Status**: ✅ SHIPPED — committed to develop as `e374ec07` (2026-07-12) after
+k3d live verification. S3 assumed present platform-wide
+(`docs/done/s3_object_store_bundled_fallback.md`); platform default = virtual.
+See "As built" + "Updates since ship" at the bottom. NB: statements below that
+`vm` is rejected at session create are **superseded** by
+`docs/features/session_create_on_vm.md` (`fd0525e9`, 2026-07-16) — see the
+updates section.
 **Scope**: orchestrator (default-settings chain) + cockpit (draft mode + settings UI)
 **Related**: `docs/features/no_workspace_agent_mode.md` (virtual/lite tiers),
 `docs/features/builder_to_sessions_consolidation.md` (why `/` currently
@@ -153,7 +157,9 @@ returns to a fresh draft. Attachments stay disabled until connected
    section; unset displays the resolved system default (virtual).
 2. `POST /api/persistent/threads` with no workspace override provisions the
    owner's default backend; the New Session form's explicit selector still
-   wins; `vm` still rejected at create.
+   wins; `vm` still rejected at create *(criterion relaxed 2026-07-16:
+   explicit `vm` is now creatable — see "Updates since ship"; the invariant
+   that survives is that `vm` can never be an implicit or saved default)*.
 3. Opening `/` while authenticated shows a greeting + enabled composer, zero
    clicks; landing there creates nothing server-side.
 4. Typing and sending creates a session with the user's defaults; on a
@@ -221,3 +227,28 @@ All three slices implemented as designed; deltas and findings:
   — with a cold agent pod (no warm pool locally) in well under a minute; the
   425 `/connection` console entries during startup are the normal readiness
   poll. `/sessions`, `/sessions/new`, `/sessions/:id` regressions clean.
+
+## Updates since ship (as of 2026-07-16)
+
+- **Shipped**: all three slices + the create_thread settings-fetch fix landed
+  in one commit, `e374ec07` (2026-07-12) on develop. The landing flow is the
+  live behavior of `/`.
+- **S3 prerequisite issue archived**: the bundled-fallback proposal moved to
+  `docs/done/s3_object_store_bundled_fallback.md` (`c51a4cf0`, 2026-07-14);
+  references here were repointed.
+- **VM-at-create supersedes the "vm is upgrade-only" rule**
+  (`docs/features/session_create_on_vm.md`, `fd0525e9`, 2026-07-16): the New
+  Session form's explicit VM option is now honored at create (operator-gated,
+  extended readiness budgets). The design's split survives as two constants:
+  `SESSION_CREATE_WORKSPACE_BACKENDS` (create-time allowlist, includes `vm`)
+  vs `SESSION_WORKSPACE_BACKENDS` (defaults chain + settings-PATCH set,
+  excludes `vm`). Consequence for this feature: **unchanged** — an instant
+  session can never implicitly land on a VM; the defaults chain still
+  resolves request > saved default > `virtual`, and `vm` is rejected as a
+  saved `workspace_backend` value. Pinned by
+  `test_vm_not_in_default_chain_set` in `tests/test_session_config_plumbing.py`.
+- **Draft mode survived the chat-page canvas rework**: `ChatPageComponent`
+  was rebuilt around the dynamic-canvas split pane, but the landing contract
+  is intact — the draft route still enters via `chat.enterDraftSession()`
+  and the service's `isDraftSession` first-send → `createAndConnect` path is
+  unchanged (`persistent-chat.service.ts`).

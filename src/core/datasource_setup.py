@@ -44,6 +44,90 @@ def _ds_slug_hyphen(name: str) -> str:
     return s or "unnamed"
 
 
+# Datasource type → tool category + read/write tool sets. Single source of
+# truth for BOTH trust boundaries: the orchestrator's
+# _build_datasource_tool_override (job dispatch, thread create/resume) and the
+# agent's session attach path delegate to datasource_tool_categories() below.
+# These were previously two hand-maintained copies that disagreed on
+# read-write managed connectors (agent: write tools; orchestrator: CLI-only).
+DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
+    "neo4j": {
+        "category": "graph",
+        "read": ["cypher_query", "get_database_schema"],
+        "write": ["cypher_query", "cypher_execute", "get_database_schema"],
+    },
+    "postgresql": {
+        "category": "sql",
+        "read": ["sql_query", "sql_schema"],
+        "write": ["sql_query", "sql_schema", "sql_execute"],
+    },
+    "mongodb": {
+        "category": "mongodb",
+        "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
+        "write": [
+            "mongo_query",
+            "mongo_aggregate",
+            "mongo_schema",
+            "mongo_insert",
+            "mongo_update",
+        ],
+    },
+    "webdav": {
+        "category": "webdav",
+        "read": ["webdav_list", "webdav_read", "webdav_info"],
+        "write": [
+            "webdav_list",
+            "webdav_read",
+            "webdav_info",
+            "webdav_write",
+            "webdav_delete",
+        ],
+    },
+}
+
+
+def datasource_tool_categories(
+    datasources: List[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """Map attached datasources to tool-category overrides.
+
+    Semantics (the orchestrator's, kept as the reconciled policy):
+
+    - type not attached → category stripped (``[]``) so stale tools from a
+      previously attached datasource never survive,
+    - ALL datasources of a type read-only → read tools,
+    - any read-write: webdav → write tools (it has no CLI equivalent);
+      managed connectors (postgresql/neo4j/mongodb) → ``[]`` (CLI mode —
+      process_datasources injects env vars / pg_service.conf instead of
+      creating a tool connection).
+
+    NOTE: CLI mode is currently non-functional on remote workspace backends —
+    the env vars land in the agent process while the shell runs on the
+    workspace host (docs/issues/datasource_cli_mode_dead_on_remote.md). The
+    policy is kept as-is here so both boundaries agree; making read-write
+    connectors actually usable is that issue's fix, not this map's.
+    """
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for ds in datasources:
+        ds_type = ds.get("type")
+        if ds_type:
+            by_type.setdefault(ds_type, []).append(ds)
+
+    categories: Dict[str, List[str]] = {}
+    for ds_type, tool_info in DATASOURCE_TOOL_MAP.items():
+        category = tool_info["category"]
+        ds_list = by_type.get(ds_type, [])
+        if not ds_list:
+            categories[category] = []
+        elif all(ds.get("project_read_only", False) for ds in ds_list):
+            categories[category] = list(tool_info["read"])
+        elif ds_type == "webdav":
+            categories[category] = list(tool_info["write"])
+        else:
+            categories[category] = []
+    return categories
+
+
 def process_datasources(
     ds_configs: List[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:

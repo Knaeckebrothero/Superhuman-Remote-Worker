@@ -247,6 +247,79 @@ class TestRunPersistentLoopSystemPrompt:
         assert messages[0] is existing_sys
         assert messages[0].content == "original system"
 
+    @pytest.mark.asyncio
+    async def test_live_rebuild_refreshes_messages0_in_place(self):
+        """get_current_system_prompt re-read reaches messages[0] each turn.
+
+        Live tool-group toggles rebuild session.system_prompt; without the
+        per-turn re-read the model keeps seeing the attach-time prompt until
+        the next detach/attach (live_session_settings.md P0.1).
+        """
+        existing_sys = SystemMessage(content="attach-time prompt")
+        messages: List[BaseMessage] = [existing_sys]
+
+        call_count = 0
+
+        async def _input():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "hi"
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+        llm = _make_streaming_llm(_make_llm_response())
+
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="attach-time prompt",
+            callbacks=callbacks,
+            messages=messages,
+            get_current_system_prompt=lambda: "rebuilt prompt",
+        )
+
+        # Mutated in place — same object (persistence identity), new content.
+        assert messages[0] is existing_sys
+        assert messages[0].content == "rebuilt prompt"
+
+    @pytest.mark.asyncio
+    async def test_empty_rebuilt_prompt_does_not_clobber_messages0(self):
+        """An empty re-read result must never blank the live prompt."""
+        existing_sys = SystemMessage(content="attach-time prompt")
+        messages: List[BaseMessage] = [existing_sys]
+
+        call_count = 0
+
+        async def _input():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "hi"
+            raise asyncio.CancelledError
+
+        callbacks = _make_callbacks(get_user_input=_input)
+        llm = _make_streaming_llm(_make_llm_response())
+
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="attach-time prompt",
+            callbacks=callbacks,
+            messages=messages,
+            get_current_system_prompt=lambda: "",
+        )
+
+        assert messages[0].content == "attach-time prompt"
+
 
 # ---------------------------------------------------------------------------
 # 1.3 run_persistent_loop — input handling

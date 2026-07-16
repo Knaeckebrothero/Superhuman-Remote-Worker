@@ -4082,6 +4082,112 @@ class TestHandleConfigUpdateEnrichmentGate:
         assert "_embedding_module._embedding_service = None" in src
 
 
+class TestHandleConfigUpdateAckProtocol:
+    """P0.3 of live_session_settings.md: request_id correlation, broadcast
+    ack with the applied fragment, and surfaced 4xx denial detail."""
+
+    @pytest.mark.asyncio
+    async def test_denied_model_swap_surfaces_detail_and_never_applies(
+        self, monkeypatch
+    ):
+        """A 4xx from the orchestrator (grant denial) must produce an error
+        frame carrying the detail + request_id and must NOT fall back to
+        applying the raw override locally (the old silent-escalation hole)."""
+        import src.api.persistent_app as mod
+        from src.api.orchestrator_client import ThreadConfigUpdateDenied
+
+        session = SimpleNamespace(resetup_tools_for_backend=MagicMock())
+        orchestrator_client = SimpleNamespace(
+            update_thread_config=AsyncMock(
+                side_effect=ThreadConfigUpdateDenied(422, "model 'x' exceeds grants")
+            )
+        )
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_session", session)
+        monkeypatch.setattr(mod, "_orchestrator_client", orchestrator_client)
+        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod, "_ws_send", send)
+
+        await mod._handle_config_update(
+            MagicMock(), {"llm": {"model": "x"}}, request_id="req-42"
+        )
+
+        # No local apply of any kind happened.
+        session.resetup_tools_for_backend.assert_not_called()
+        assert not hasattr(session, "_llm")
+        send.assert_awaited_once()
+        event, payload = send.await_args.args[1:]
+        assert event == "error"
+        assert payload["request_id"] == "req-42"
+        assert "exceeds grants" in payload["detail"]
+
+    @pytest.mark.asyncio
+    async def test_tools_rejection_echoes_request_id(self, monkeypatch):
+        """The fail-loud tools gate (no orchestrator) keeps its semantics and
+        now correlates: the error frame carries the caller's request_id."""
+        import src.api.persistent_app as mod
+
+        session = SimpleNamespace(resetup_tools_for_backend=MagicMock())
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_session", session)
+        monkeypatch.setattr(mod, "_orchestrator_client", None)
+        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod, "_ws_send", send)
+
+        await mod._handle_config_update(
+            MagicMock(), {"tools": {"canvas": ["get_canvas"]}}, request_id="req-7"
+        )
+
+        session.resetup_tools_for_backend.assert_not_called()
+        send.assert_awaited_once()
+        event, payload = send.await_args.args[1:]
+        assert event == "error"
+        assert payload["request_id"] == "req-7"
+
+    def test_ack_is_broadcast_with_applied_fragment(self):
+        """The success ack must fan out to every subscriber (all viewers
+        converge; the journal records it as the transcript stamp) and echo
+        the applied fragment + request_id. Source-shape pin, matching this
+        file's convention for the deep post-rebuild path."""
+        from inspect import getsource
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert '_broadcast("config.changed", ack)' in src
+        assert '"applied": _scrub_secret_values(config_override)' in src
+        assert 'ack["request_id"] = request_id' in src
+
+    def test_cosmetic_persist_runs_before_local_permission_apply(self):
+        """permission_mode is grant-gated orchestrator-side; the durable
+        PATCH must run (and be able to deny) BEFORE the runtime applies the
+        mode locally — otherwise a denied escalation still takes effect
+        in-RAM until the next attach."""
+        from inspect import getsource
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert src.index("not needs_enrichment") < src.index(
+            "_session.permission_mode = pm"
+        )
+
+    def test_scrub_secret_values_drops_api_keys_recursively(self):
+        from src.api.persistent_app import _scrub_secret_values
+
+        fragment = {
+            "llm": {"model": "m", "api_key": "sk-secret", "base_url": "http://x"},
+            "env_keys": {"EMBEDDING_API_KEY": "sk-2", "EMBEDDING_MODEL": "e"},
+            "tools": {"canvas": ["get_canvas"]},
+        }
+        scrubbed = _scrub_secret_values(fragment)
+        assert scrubbed == {
+            "llm": {"model": "m", "base_url": "http://x"},
+            "env_keys": {"EMBEDDING_MODEL": "e"},
+            "tools": {"canvas": ["get_canvas"]},
+        }
+        # Original untouched (caller-owned payload stays immutable).
+        assert fragment["llm"]["api_key"] == "sk-secret"
+
+
 class TestAttachSessionRebinds:
     """Pin the per-session rebind landmarks in ``_attach_session``.
 

@@ -232,6 +232,10 @@ from src.core.model_registry import (  # noqa: E402
 # (no_workspace_agent_mode.md §4) — importing the frozenset is cheap; the heavy
 # backend modules are lazy-imported inside the factory's functions.
 from src.core.backends.factory import LITE_BACKENDS  # noqa: E402
+
+# Datasource type → tool-category map, shared with the agent's session attach
+# path so the two boundaries can't drift (live_session_settings.md P0.2).
+from src.core.datasource_setup import datasource_tool_categories  # noqa: E402
 from src.core.session_tool_overrides import (  # noqa: E402
     SESSION_TOOL_OVERRIDE_NAMES,
     SessionToolOverrideError,
@@ -15400,69 +15404,9 @@ def _build_datasource_tool_override(
     """
     override = dict(config_override or {})
     tools_override = dict(override.get("tools", {}))
-
-    # Datasource type -> tool category + tool names
-    DS_TOOL_MAP = {
-        "neo4j": {
-            "category": "graph",
-            "read": ["cypher_query", "get_database_schema"],
-            "write": ["cypher_query", "cypher_execute", "get_database_schema"],
-        },
-        "postgresql": {
-            "category": "sql",
-            "read": ["sql_query", "sql_schema"],
-            "write": ["sql_query", "sql_schema", "sql_execute"],
-        },
-        "mongodb": {
-            "category": "mongodb",
-            "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
-            "write": [
-                "mongo_query",
-                "mongo_aggregate",
-                "mongo_schema",
-                "mongo_insert",
-                "mongo_update",
-            ],
-        },
-        "webdav": {
-            "category": "webdav",
-            "read": ["webdav_list", "webdav_read", "webdav_info"],
-            "write": [
-                "webdav_list",
-                "webdav_read",
-                "webdav_info",
-                "webdav_write",
-                "webdav_delete",
-            ],
-        },
-    }
-
-    # Group datasources by type
-    by_type: dict[str, list[dict[str, Any]]] = {}
-    for ds in datasources:
-        by_type.setdefault(ds["type"], []).append(ds)
-
-    for ds_type, tool_info in DS_TOOL_MAP.items():
-        category = tool_info["category"]
-        ds_list = by_type.get(ds_type, [])
-        if not ds_list:
-            # No datasource attached — strip the category
-            tools_override[category] = []
-            continue
-
-        # If ANY datasource of this type is read-write, use CLI mode
-        # (tools stripped). If ALL are read-only, register read-only tools.
-        all_read_only = all(ds.get("project_read_only", False) for ds in ds_list)
-
-        if all_read_only:
-            tools_override[category] = tool_info["read"]
-        elif ds_type == "webdav":
-            # WebDAV always uses tools (no good CLI)
-            tools_override[category] = tool_info["write"]
-        else:
-            # Read-write managed connectors: CLI mode, no custom tools
-            tools_override[category] = []
-
+    # Shared single source of truth with the agent's session attach path
+    # (they previously disagreed on read-write managed connectors).
+    tools_override.update(datasource_tool_categories(datasources))
     override["tools"] = tools_override
     return override
 
