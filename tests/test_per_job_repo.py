@@ -744,6 +744,7 @@ class TestDelegationOutputPathPopulation:
             db.get_delegation_children = AsyncMock(return_value=children)
             db.merge_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
+            db.claim_delegation_resume = AsyncMock(return_value=True)
             with patch(f"{MODULE}._trigger_dispatch"):
                 await orch_main._handle_delegation_child_completion(job, [])
 
@@ -752,3 +753,62 @@ class TestDelegationOutputPathPopulation:
         assert by_order[0]["output_path"] == "outputs/001-scholar-c0"
         assert by_order[0]["config_name"] == "scholar"
         assert by_order[1]["output_path"] is None
+
+
+class TestDelegationUnblockDispatcherContract:
+    """Unblock must re-queue via the CAS claim that clears freeze_data.
+
+    ``update_job_status(status="paused")`` leaves the parent's delegation
+    freeze set, and ``get_dispatchable_jobs`` requires ``freeze_data IS
+    NULL`` — the re-queued parent would be dispatcher-invisible forever.
+    Regression for docs/issues/delegation_freeze_lifecycle_gaps.md (Gap 1).
+    """
+
+    def _fixtures(self):
+        job = {"id": "child-1", "parent_job_id": "par-1", "creation_order": 0}
+        parent = {"id": "par-1", "status": "waiting", "context": {}}
+        children = [
+            {
+                "id": "child-1",
+                "creation_order": 0,
+                "status": "completed",
+                "config_name": "scholar",
+                "branch_name": "subjob/child-1/scholar",
+                "context": {},
+                "freeze_data": {},
+            }
+        ]
+        return job, parent, children
+
+    @pytest.mark.asyncio
+    async def test_unblock_requeues_via_cas_claim(self):
+        job, parent, children = self._fixtures()
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.all_delegation_children_terminal = AsyncMock(return_value=True)
+            db.get_job = AsyncMock(return_value=parent)
+            db.get_delegation_children = AsyncMock(return_value=children)
+            db.merge_job_context = AsyncMock()
+            db.update_job_status = AsyncMock()
+            db.claim_delegation_resume = AsyncMock(return_value=True)
+            with patch(f"{MODULE}._trigger_dispatch") as trig:
+                await orch_main._handle_delegation_child_completion(job, [])
+        db.claim_delegation_resume.assert_awaited_once_with("par-1")
+        # update_job_status can't clear freeze_data → must not be the writer
+        db.update_job_status.assert_not_awaited()
+        trig.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_losing_cas_skips_dispatch_trigger(self):
+        # A concurrent sibling (or the timeout sweeper) already re-queued the
+        # parent — the loser must not double-trigger or log a second resume.
+        job, parent, children = self._fixtures()
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.all_delegation_children_terminal = AsyncMock(return_value=True)
+            db.get_job = AsyncMock(return_value=parent)
+            db.get_delegation_children = AsyncMock(return_value=children)
+            db.merge_job_context = AsyncMock()
+            db.update_job_status = AsyncMock()
+            db.claim_delegation_resume = AsyncMock(return_value=False)
+            with patch(f"{MODULE}._trigger_dispatch") as trig:
+                await orch_main._handle_delegation_child_completion(job, [])
+        trig.assert_not_called()

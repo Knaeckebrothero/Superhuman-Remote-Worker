@@ -12,12 +12,27 @@ tags:
 [`llm_outage_subjob_resilience`](../features/llm_outage_subjob_resilience.md).
 Line numbers are develop @ 2026-07-16.
 
+> **2026-07-16 update: Gaps 1 + 2 CONFIRMED and FIXED on develop** (TDD, same
+> day). Gap 1 was proven live on real Postgres (testcontainers): after
+> `claim_delegation_resume`, the row kept the full delegation blob and
+> `get_dispatchable_jobs` returned nothing. Fix: the claim now clears
+> `freeze_data`, and `_handle_delegation_child_completion` re-queues via that
+> same CAS (also closing its status-check TOCTOU) instead of
+> `update_job_status` (which cannot clear a freeze). Gap 2 fix: the resume
+> tool takes an explicit `timeout` (default 7200, capped by
+> `delegation.max_timeout`) and carries it in the re-suspend freeze.
+> Regression tests: `tests/test_delegation_resume_claim.py` (real-PG
+> dispatcher-contract test), `tests/test_per_job_repo.py`
+> (TestDelegationUnblockDispatcherContract),
+> `tests/test_delegation.py` (TestResumeChildFreezeTimeout).
+> **Gap 3 remains OPEN.**
+
 These three gaps all live in the `delegate_work` parent-freeze lifecycle. They are
 independent of the outage feature but **gate its delegation slice** — in particular,
 if Gap 1 is real, a delegation parent cannot reliably resume at all, so pausing its
 children is moot until this is fixed.
 
-## Gap 1 — parent `freeze_data` never cleared on `waiting → paused` requeue (SUSPECTED LIVE BUG, unverified)
+## Gap 1 — parent `freeze_data` never cleared on `waiting → paused` requeue (CONFIRMED → FIXED, see update above)
 
 Both writers that re-queue a delegation parent flip status but leave the
 `freeze_data` delegation blob on the row:
@@ -52,7 +67,7 @@ children complete → watch dispatch). If confirmed, fix = clear/stash
 `delegation_results` context survives), plus a regression test that asserts the
 resumed parent is picked up by `get_dispatchable_jobs`.
 
-## Gap 2 — re-suspend freeze drops the `timeout` key
+## Gap 2 — re-suspend freeze drops the `timeout` key (FIXED, see update above)
 
 The initial delegation freeze carries `timeout` (tool input, default 7200s,
 cap `max_timeout` 14400 — `delegate_work.py:236-244,152-155`). The

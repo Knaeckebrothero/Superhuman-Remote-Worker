@@ -4325,7 +4325,7 @@ class PostgresDB:
             return row is not None
 
     async def claim_delegation_resume(self, job_id: str) -> bool:
-        """Atomically transition a timed-out delegation parent waiting → paused.
+        """Atomically transition a delegation parent waiting → paused.
 
         Returns True iff THIS call performed the transition (clearing the
         agent so the dispatcher re-queues it for resume). Two delegation
@@ -4333,6 +4333,13 @@ class PostgresDB:
         same elapsed timeout; this CAS (``WHERE status = 'waiting'``) ensures
         exactly one re-queues the parent, so it is never resumed twice with
         partial results. Mirrors update_job_status' assigned_agent_id → NULL.
+
+        Also clears the delegation ``freeze_data`` blob — ``get_dispatchable_jobs``
+        requires ``freeze_data IS NULL`` (partial-index contract, 0046), so a
+        kept freeze would hide the re-queued parent from the dispatcher forever
+        (docs/issues/delegation_freeze_lifecycle_gaps.md, Gap 1). Nothing reads
+        the blob back: children are re-derived from parent_job_id +
+        creation_order, and the results ride ``context.delegation_results``.
         """
         try:
             job_uuid = UUID(job_id)
@@ -4344,6 +4351,7 @@ class PostgresDB:
                 UPDATE jobs
                    SET status = 'paused',
                        assigned_agent_id = NULL,
+                       freeze_data = NULL,
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1
                    AND status = 'waiting'
