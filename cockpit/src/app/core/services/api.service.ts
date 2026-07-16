@@ -1498,6 +1498,22 @@ export class ApiService {
   }
 
     /**
+     * Get a persistent thread's detail row (title, metadata incl. the
+     * redacted `config_override` + `datasource_ids`). Used by the live
+     * settings pane to prefill current overrides.
+     */
+    getPersistentThread(threadId: string): Observable<Record<string, unknown> | null> {
+        return this.http
+            .get<Record<string, unknown>>(`${this.baseUrl}/persistent/threads/${threadId}`)
+            .pipe(
+                catchError((error) => {
+                    console.error(`Failed to get thread ${threadId}:`, error);
+                    return of(null);
+                }),
+            );
+    }
+
+    /**
      * Get IDE status for a persistent thread's workspace.
      */
     getThreadIdeStatus(threadId: string): Observable<IdeSessionStatus | null> {

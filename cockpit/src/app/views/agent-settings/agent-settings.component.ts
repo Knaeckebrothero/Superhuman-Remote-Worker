@@ -1,4 +1,5 @@
 import {Component, computed, effect, ElementRef, inject, input, output, signal, viewChild, ViewChild} from '@angular/core';
+import {TranslocoPipe} from '@jsverse/transloco';
 import {Datasource, EffectiveModels} from '../../core/models/api.model';
 import {ViewportService} from '../../core/services/viewport.service';
 import {SettingsMode} from './agent-settings.types';
@@ -35,6 +36,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
     AppTabNavComponent,
     AppTabNavItemComponent,
     AppBadgeComponent,
+    TranslocoPipe,
   ],
   template: `
     <div class="settings-root" [class.vertical]="useVerticalTabs()" [class.horizontal]="!useVerticalTabs()">
@@ -58,7 +60,9 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             }
           </app-tab-nav-item>
         }
-        <app-tab-nav-item value="advanced">Advanced</app-tab-nav-item>
+        @if (mode() !== 'live') {
+          <app-tab-nav-item value="advanced">Advanced</app-tab-nav-item>
+        }
         <app-tab-nav-item value="resolved">Resolved</app-tab-nav-item>
       </app-tab-nav>
 
@@ -89,13 +93,24 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [defaultsTools]="defaultsTools()"
             (change)="onChange()"
           />
+
+          @if (mode() === 'live') {
+            <!-- Cache-reset cost disclosure (live_session_settings.md,
+                 principle 4 / acceptance #9): static, next to the controls it
+                 applies to; cosmetic controls deliberately carry no warning. -->
+            <p class="cache-note">{{ 'agentSettings.live.cacheNote' | transloco }}</p>
+          }
+
           <app-datasources-group
             [datasources]="datasources()"
             [loading]="loadingDatasources()"
-            [disabled]="disabled()"
+            [disabled]="disabled() || mode() === 'live'"
             [isLiteBackend]="advancedAccordion?.isLiteBackend() ?? false"
             (change)="onChange()"
           />
+          @if (mode() === 'live') {
+            <p class="cache-note">{{ 'agentSettings.live.datasourcesReadOnly' | transloco }}</p>
+          }
 
           <!-- Modified count summary -->
           @if (settingsModifiedCount() > 0) {
@@ -115,18 +130,20 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
           </div>
         }
 
-        <div class="tab-panel advanced-panel" [class.tab-hidden]="activeTab() !== 'advanced'">
-          <app-advanced-accordion
-            [config]="config()"
-            [mode]="mode()"
-            [disabled]="disabled()"
-            [settingsMatrix]="settingsMatrix()"
-            [strategicModelOverride]="modelGroup?.strategicModel() ?? null"
-            [tacticalModelOverride]="modelGroup?.tacticalModel() ?? null"
-            [sessionModelOverride]="modelGroup?.sessionModel() ?? null"
-            (change)="onChange()"
-          />
-        </div>
+        @if (mode() !== 'live') {
+          <div class="tab-panel advanced-panel" [class.tab-hidden]="activeTab() !== 'advanced'">
+            <app-advanced-accordion
+              [config]="config()"
+              [mode]="mode()"
+              [disabled]="disabled()"
+              [settingsMatrix]="settingsMatrix()"
+              [strategicModelOverride]="modelGroup?.strategicModel() ?? null"
+              [tacticalModelOverride]="modelGroup?.tacticalModel() ?? null"
+              [sessionModelOverride]="modelGroup?.sessionModel() ?? null"
+              (change)="onChange()"
+            />
+          </div>
+        }
 
         <div class="tab-panel resolved-panel" [class.tab-hidden]="activeTab() !== 'resolved'">
           <pre class="config-json">{{ resolvedConfigJson() }}</pre>
@@ -193,6 +210,13 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
       color: var(--accent-color, var(--accent-color));
       padding-top: 8px;
       border-top: 1px solid var(--border-color, var(--surface-0));
+    }
+
+    .cache-note {
+      margin: -8px 0 20px;
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-muted);
     }
   `],
 })
@@ -281,7 +305,9 @@ export class AgentSettingsComponent {
     const exec = this.executionGroup?.modifiedCount() ?? 0;
     const model = this.modelGroup?.modifiedCount() ?? 0;
     const tools = this.toolsGroup?.modifiedCount() ?? 0;
-    const ds = this.datasourcesGroup?.modifiedCount() ?? 0;
+    // Live mode renders datasources read-only — their "selected" count is
+    // attachment state, not a pending modification, and would pin the badge.
+    const ds = this.mode() === 'live' ? 0 : (this.datasourcesGroup?.modifiedCount() ?? 0);
     return exec + model + tools + ds;
   });
 

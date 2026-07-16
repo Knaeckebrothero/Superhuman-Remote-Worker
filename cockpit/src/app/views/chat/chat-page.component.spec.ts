@@ -262,3 +262,90 @@ describe('ChatPageComponent Canvas route selection', () => {
     expect(component.canvasOpen()).toBe(false);
   });
 });
+
+describe('ChatPageComponent settings pane (live_session_settings.md Slice A)', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('settings takes the right pane over from the canvas and gives it back', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.state.set(presentedState(1));
+    TestBed.tick();
+    expect(component.canvasContentVisible()).toBe(true);
+
+    component.openSettings();
+    expect(component.settingsVisible()).toBe(true);
+    expect(component.canvasContentVisible()).toBe(false);
+    // Canvas stays "open" behind settings — closing settings restores it.
+    expect(component.canvasOpen()).toBe(true);
+
+    component.closeSettings();
+    expect(component.settingsVisible()).toBe(false);
+    expect(component.canvasContentVisible()).toBe(true);
+  });
+
+  it('a canvas push while settings holds the pane badges instead of stealing', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    component.openSettings();
+    expect(component.settingsVisible()).toBe(true);
+
+    canvas.state.set(presentedState(1));
+    TestBed.tick();
+
+    // Settings keeps the pane; the push is staged behind it with a badge.
+    expect(component.settingsVisible()).toBe(true);
+    expect(component.canvasContentVisible()).toBe(false);
+    expect(component.canvasOpen()).toBe(true);
+    expect(component.canvasPending()).toBe(true);
+
+    // Closing settings delivers the pending canvas and clears the badge.
+    component.closeSettings();
+    expect(component.canvasContentVisible()).toBe(true);
+    expect(component.canvasPending()).toBe(false);
+  });
+
+  it('explicitly opening the canvas reclaims the pane from settings', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    component.openSettings();
+    canvas.state.set(presentedState(1));
+    TestBed.tick();
+    expect(component.canvasPending()).toBe(true);
+
+    component.openCanvas(true);
+    expect(component.settingsOpen()).toBe(false);
+    expect(component.canvasContentVisible()).toBe(true);
+    expect(component.canvasPending()).toBe(false);
+  });
+
+  it('mobile settings takes the full screen like a focused canvas', () => {
+    const {component, viewport} = createFixture({threadId: 'thread-1'});
+    viewport.isMobile.set(true);
+    component.ngOnInit();
+    TestBed.tick();
+
+    component.openSettings();
+    expect(component.settingsFocus()).toBe(true);
+    expect(component.chatAreaHidden()).toBe(true);
+
+    component.closeSettings();
+    expect(component.chatAreaHidden()).toBe(false);
+  });
+
+  it('a thread switch resets the settings pane like the canvas', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    component.openSettings();
+
+    canvas.selectThread('thread-2');
+    TestBed.tick();
+
+    expect(component.settingsOpen()).toBe(false);
+    expect(component.canvasPending()).toBe(false);
+  });
+});

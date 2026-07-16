@@ -81,6 +81,7 @@
     "open": "Open Canvas",
     "hide": "Hide Canvas",
     "skipToCanvas": "Skip to Canvas",
+    "newContent": "New Canvas content waiting",
     "returnToChat": "Return to chat",
     "resize": "Resize chat and Canvas",
     "empty": "The agent has not presented anything yet.",
@@ -1132,6 +1133,7 @@
     "jumpToLatest": "Jump to latest · {{count}} new",
     "header": {
       "settingsTooltip": "Session settings",
+      "viewMenuTooltip": "View options",
       "filesButton": "Files",
       "filesTooltip": "Open session files in Cloud",
       "gitButton": "Git",
@@ -1181,6 +1183,24 @@
       "prepend": "Prepended",
       "write": "Written",
       "truncated": "+{{count}} more lines"
+    },
+    "settingsPane": {
+      "title": "Session settings",
+      "close": "Close settings",
+      "workspace": "Workspace",
+      "tier": {
+        "virtual": "Lite (no workspace pod)",
+        "sandbox": "Sandbox container",
+        "vm": "Virtual machine",
+        "none": "None",
+        "remote": "Remote container",
+        "docker": "Container"
+      },
+      "upgrading": "Provisioning {{tier}}…",
+      "upgradeSandbox": "Upgrade to sandbox",
+      "upgradeVm": "Upgrade to VM",
+      "workspaceHint": "Upgrades carry your files over and cannot be reversed within the session.",
+      "fixedNote": "Expert and projects are set at session creation and shown in the session list."
     },
     "settings": {
       "mode": "Mode",
@@ -2166,11 +2186,21 @@
       "group": "Execution",
       "autonomy": "Autonomy",
       "permissionMode": "Permission Mode",
+      "narration": "Narration",
       "scholar": "Scholar (pre-research)",
       "critic": "Critic (verification)",
       "projectMemory": "Project memory",
       "imageQuality": "Image Quality",
       "autonomyDefaultHint": "Controls when the agent pauses for human review"
+    },
+    "narrationModes": {
+      "auto": "Auto",
+      "verbose": "Verbose",
+      "silent": "Silent"
+    },
+    "live": {
+      "cacheNote": "Changes apply starting with the next response. Changing tools, data sources, or the model resets the conversation's prompt cache — the next response re-processes the full history, which is slower and can cost noticeably more for that turn.",
+      "datasourcesReadOnly": "Data sources are set at session creation for now — attached sources are shown for reference."
     },
     "autonomy": {
       "full": {
@@ -2291,6 +2321,7 @@
       "tactical": "Tactical",
       "subagent": "Subagent",
       "single": "Model",
+      "temperature": "Temperature",
       "reasoning": "Reasoning",
       "reasoningDefaultOption": "{{label}} (default)",
       "default": "Default",

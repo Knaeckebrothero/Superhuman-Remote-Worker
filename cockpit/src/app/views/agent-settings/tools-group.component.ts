@@ -4,8 +4,10 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {
     JOB_TOOL_CATEGORIES,
+    LIVE_TOOL_CATEGORIES,
     readConfigPath,
     SESSION_TOOL_CATEGORIES,
+    SESSION_TOOL_GROUP_NAMES,
     SettingsMode,
     ToolCategoryMeta,
 } from './agent-settings.types';
@@ -57,7 +59,7 @@ export function allToolCategoriesSelected(
               <span class="tool-toggle-name">{{ 'agentSettings.toolCategories.' + cat.key + '.label' | transloco }}@if (isCategoryBlocked(cat.key)) { <span class="tool-lock">🔒</span> }</span>
               <span class="tool-toggle-desc">{{ 'agentSettings.toolCategories.' + cat.key + '.description' | transloco }}</span>
             </span>
-            @if (isModified(cat.key)) {
+            @if (isModified(cat.key) && mode() !== 'live') {
               <button
                 class="reset-btn"
                 (click)="resetCategory(cat.key, $event)"
@@ -277,9 +279,13 @@ export class ToolsGroupComponent {
   readonly delegationMaxDepth = signal<number | null>(null);
   readonly delegationTimeout = signal<number | null>(null);
 
-  readonly categories = computed<ToolCategoryMeta[]>(() =>
-    this.mode() === 'session' ? SESSION_TOOL_CATEGORIES : JOB_TOOL_CATEGORIES
-  );
+  readonly categories = computed<ToolCategoryMeta[]>(() => {
+    // Live mode renders ONLY the four validated closed groups — the other 8
+    // session categories are silently dropped by the live config.update
+    // path's closed vocabulary and would no-op as toggles.
+    if (this.mode() === 'live') return LIVE_TOOL_CATEGORIES;
+    return this.mode() === 'session' ? SESSION_TOOL_CATEGORIES : JOB_TOOL_CATEGORIES;
+  });
 
   /** Categories the user can actually toggle (not grant-blocked). */
   readonly selectableCategories = computed<ToolCategoryMeta[]>(() =>
@@ -383,8 +389,11 @@ export class ToolsGroupComponent {
     });
 
     // Re-enabled categories (expert had them disabled, user toggled ON)
-    // → restore the defaults' tool list
-    const defaults = this.defaultsTools();
+    // → restore a full tool list. Live mode uses the closed-vocabulary
+    // mirror (enablement is keyed off empty-vs-non-empty agent-side, but the
+    // payload must survive the closed-group validation); creation modes keep
+    // the defaults.yaml lists.
+    const defaults = this.mode() === 'live' ? SESSION_TOOL_GROUP_NAMES : this.defaultsTools();
     for (const cat of this.expertDisabledCategories) {
       if (!disabled.has(cat) && defaults[cat]?.length) {
         tools[cat] = [...defaults[cat]];

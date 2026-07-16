@@ -10,8 +10,11 @@ related:
 # CLI-mode datasource access is dead on remote workspace backends
 
 **Status:** Diagnosed 2026-07-16 (live_session_settings.md P0.5 verification).
-Not fixed — this doc scopes the fix out of the live-session-settings work and
-records the evidence so it doesn't have to be re-derived.
+**Direction 1 IMPLEMENTED 2026-07-16** (hybrid decision): read-write managed
+connectors now get real connections + write tools; CLI mode is retired as a
+routing target but its machinery is kept in place for a future genuine
+CLI-forwarding feature (direction 2) — that feature is out of scope for the
+live-session-settings session and picks up from this doc.
 
 ## Summary
 
@@ -58,28 +61,45 @@ connectors (real connections + read tools) and webdav (always tools) work.
    `config.extra["_cli_datasources"]` at render time) — a false affordance
    the model acts on and fails.
 
-## Consequences
+## Consequences (as diagnosed; resolved by direction 1 below)
 
-- Read-write postgresql/neo4j/mongodb datasources are unusable in sessions
+- Read-write postgresql/neo4j/mongodb datasources were unusable in sessions
   and jobs on remote backends (always, in practice).
-- The CLI prompt block teaches the model a dead path; failed `psql`/`mongosh`
-  attempts waste turns and can loop.
+- The CLI prompt block taught the model a dead path; failed `psql`/`mongosh`
+  attempts wasted turns and could loop.
 - The live-session-settings feature scopes CLI-mode out of live mutation
   entirely (its Slice B mutates connection-backed tools only).
 
-## Fix directions (not decided here)
+## Fix directions (hybrid decided 2026-07-16)
 
-1. **Connection-backed write tools** (simplest, no new plumbing): route
-   read-write managed connectors through `create_datasource_connection` like
-   read-only ones and change the shared map's read-write branch to the write
-   tool set. Kills CLI mode deliberately; `_cli_datasources` and the prompt
-   block go away. Applies uniformly to jobs and sessions.
-2. **Real CLI forwarding**: materialize `pg_service.conf` / env exports onto
-   the workspace host at attach (via `write_home_file` + tmux setup preamble,
-   or provisioner-level secret mounts). More faithful to the original design,
-   but puts plaintext credentials on the workspace filesystem the model can
-   read — needs a threat-model pass (`feedback_internal_creds_not_in_workspace`).
-3. Hybrid: (1) now, (2) never unless a concrete CLI-only workflow demands it.
-
-Direction (1) is the obvious candidate: it restores access with code that
-already exists, and the credential never leaves the agent pod.
+1. **Connection-backed write tools** — ✅ **IMPLEMENTED 2026-07-16**:
+   - `process_datasources` routes ALL managed connectors (read-write
+     included) through `create_datasource_connection`; the CLI-mode branch is
+     gone. Read-only entries are processed first so on mixed same-type
+     attachments the read-write connection wins the type-keyed registry slot
+     (write tools must never bind to a read-only-linked connection).
+   - `datasource_tool_categories` (shared map, both boundaries) maps any-RW
+     to the write tool set instead of `[]`.
+   - `cli_ds_types` is now always empty → the `_cli_datasources` prompt
+     block never renders. The plumbing (return value, attach-path
+     application, loader template conditional, `inject_*` env helpers) is
+     deliberately KEPT as the seam for direction 2.
+   - The `datasources.md` read-write entry describes "query + write tools";
+     the PGSERVICE/cypher-shell/mongosh usage lines were removed
+     (`_format_rw_cli_entry` deleted).
+   - Tests: `tests/test_datasource_tool_categories.py`
+     (`TestProcessDatasourcesConnectionRouting`, `TestDatasourceIndexNotes`,
+     updated map tests).
+2. **Real CLI forwarding** — the remaining future feature; picks up from
+   here. Materialize `pg_service.conf` / env exports onto the workspace host
+   at attach (via `write_home_file` + tmux setup preamble, or
+   provisioner-level secret mounts). Faithful to the original design, but
+   puts plaintext credentials on the workspace filesystem the model can
+   read — needs a threat-model pass
+   (`feedback_internal_creds_not_in_workspace`). When built, it re-enables
+   the kept seam: populate `cli_ds_types` again, reintroduce proper CLI
+   usage notes, and decide the tools-vs-CLI split per type. Cleanup
+   candidates for the same change: the dead worker-side duplicates
+   `Agent._inject_datasource_index` / `_format_rw_cli_block` /
+   `_inject_typed_env_vars` (`src/agent.py:3140-3248`, no production
+   callers, kept alive only by their tests).

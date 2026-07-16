@@ -29,7 +29,9 @@ after a five-agent research pass (three codebase audits: agent runtime,
 cockpit, orchestrator; two web-research sweeps: competitor UX, dynamic-tool
 best practices). Line anchors verified on `develop` 2026-07-16.
 **P0 groundwork BUILT 2026-07-16** (all five items, unit-tested; see the
-per-item notes in the build order below). Slices A–D not started.
+per-item notes in the build order below).
+**Slice A BUILT 2026-07-16** (settings pane live on k3d; see the notes at the
+end of the Slice A section). Slices B–D not started.
 **Scope:** Cockpit (settings pane, header cleanup) + one contained
 orchestrator/agent slice (live datasources) + protocol touch-ups + a small
 owner-facing endpoint (disconnected-session editing) + a hardening slice for
@@ -230,11 +232,16 @@ selected model, not the actual one) → per-answer model attribution chips.
 3. **One settings surface.** `AgentSettingsComponent` grows a `live` mode; the
    header popover's editors are retired into it — **except quick model/mode
    access, which stays one click from the composer** (industry-universal).
-4. **Turn-boundary semantics, stated once, and coalesced.** Changes apply on
-   the next turn ("applies starting with the next response"). Agent-side,
-   multiple deltas arriving between turns are batched into **one** rebind +
-   **one** system-prompt rebuild — N toggles cost one cache invalidation, not
-   N.
+4. **Turn-boundary semantics, stated once, and coalesced — and the cost
+   disclosed.** Changes apply on the next turn ("applies starting with the
+   next response"). Agent-side, multiple deltas arriving between turns are
+   batched into **one** rebind + **one** system-prompt rebuild — N toggles
+   cost one cache invalidation, not N. The residual cost is disclosed to the
+   user in the pane (see Slice A): a tools/datasource/model change resets the
+   conversation's prompt cache, so the next response re-processes the full
+   history — slower, and on cache-priced APIs noticeably more expensive for
+   that one turn. Cosmetic edits (temperature, permission mode, narration)
+   don't touch the cache prefix and don't warn.
 5. **Config changes are visible in the transcript.** When a change takes
    effect, the agent emits a small persistent system event ("model →
    minimax-m3", "datasource *Sales DB* removed — earlier context may still
@@ -299,11 +306,16 @@ Each of these repairs something already broken and unblocks a slice:
 5. **Verify CLI-mode datasource env reachability** (gap 6). ✅ Verified:
    **CONFIRMED DEAD on remote backends** — env vars/`pg_service.conf` land on
    the agent pod; the remote tmux shell gets only `NONINTERACTIVE_ENV_EXPORT`;
-   provisioning seeds nothing; and read-write managed connectors get no tool
-   connection either, so they currently have NO access path at all (jobs and
-   sessions). Filed as `docs/issues/datasource_cli_mode_dead_on_remote.md`
-   (recommended fix: connection-backed write tools). CLI-mode is out of the
-   live-mutation scope per the plan.
+   provisioning seeds nothing; and read-write managed connectors got no tool
+   connection either, so they had NO access path at all (jobs and sessions).
+   Filed as `docs/issues/datasource_cli_mode_dead_on_remote.md`, and the
+   **fix (direction 1) was implemented the same day**: read-write managed
+   connectors now get real connections + write tools via the shared map;
+   `cli_ds_types` is always empty (the `_cli_datasources` prompt block no
+   longer renders, its plumbing kept as the seam for a future genuine
+   CLI-forwarding feature — see the issue doc). Net effect for this feature:
+   Slice B mutates connection-backed tools only, and the read-write case is
+   no longer a special "no tools" branch.
 
 ### Slice A — the settings pane (cockpit-only)
 
@@ -365,6 +377,20 @@ new `settings-pane.component.ts`:
 - Feedback: v1 = optimistic set + reconcile on ack + one shared error strip
   (what the popover does today); upgrade to per-row correlated status when
   P0.3 lands.
+- **Cache-reset cost disclosure** (principle 4): one static fine-print note
+  in the pane, paired with the turn-boundary line and placed by the controls
+  it applies to (tools group, datasources group, model control) — copy along
+  the lines of: *"Changes apply starting with the next response. Changing
+  tools, datasources, or the model resets the conversation's prompt cache —
+  the next response re-processes the full history, which is slower and can
+  cost noticeably more for that turn."* Static text, no per-toggle nag or
+  confirm dialog (coalescing already means N toggles = one invalidation).
+  Temperature, permission mode, and narration are exempt — they don't touch
+  the cache prefix (the hierarchy is tools → system → messages; inference
+  params and client-side modes aren't in it). Grounding: the provider sweep
+  measured any tool/system change as a full prefix re-ingest, ~12.5× the
+  cache-read input price for that turn on Anthropic-style pricing;
+  latency-only on self-hosted vLLM.
 - Datasources section renders the **attached set read-only** (pass attached
   rows + `disabled` — dodges the missing `setSelection` API until Slice B);
   expert and projects read-only with "set at creation" hints.
@@ -376,6 +402,47 @@ new `settings-pane.component.ts`:
 **Availability.** Connected sessions only (the control WS URL only resolves
 once an agent is bound — `_openControlWs`, `persistent-chat.service.ts:1467`).
 Disconnected editing is Slice C.
+
+**✅ BUILT 2026-07-16.** As designed, with the deltas worth knowing:
+
+- **Apply channel = host-side desired-state diff**, not per-control
+  `{path, value}` emissions. The pane (`settings-pane.component.ts`) keeps the
+  sub-groups' existing void `(change)` + `getOverrides()` contract, flattens
+  the tracked surface (llm.model/temperature/reasoning_level,
+  interactive.permission_mode/narration_mode, four tool groups as
+  enabled-booleans) and diffs against the last-applied snapshot — identical
+  wire behavior with no refactor of four sub-components, and resets can't
+  exist in live mode anyway (principle 6). Deltas debounce 400 ms into ONE
+  `config.update` per batch (principle 4's coalescing, client side too).
+  **Trap fixed during the k3d smoke**: the diff baseline must anchor to the
+  CONFIG-ONLY state after the thread fetch (never to `getOverrides()`), and
+  an apply firing before the baseline exists must reschedule — otherwise a
+  pin made while the fetch is in flight is silently absorbed as baseline.
+- Narration lives in the execution group and temperature in the model group
+  as live-only rows (the create forms don't render them); permission +
+  narration dispatch via their dedicated verbs, the rest via `config.update`.
+- Re-enable payloads use `SESSION_TOOL_GROUP_NAMES` — a cockpit mirror of the
+  closed vocabulary, drift-pinned by `tests/test_session_tool_group_mirror.py`.
+- Transcript stamps (criterion 8) render from the P0.3 broadcast ack's
+  `applied` fragment (`describeAppliedConfig`, persistent-chat.service.ts) —
+  journaled, so replays keep them.
+- Workspace tier is a pane-level row; `upgradeWorkspace(tier)` is now a
+  public service method (the `/upgrade-workspace` slash command delegates to
+  it) with progress via new `workspaceTier`/`workspaceUpgradeInProgress`
+  signals; the "type /upgrade-workspace" notice copy now points at the pane.
+- k3d-verified end-to-end: pane open → tool toggle → coalesced
+  `config.update` → grant-validated merge (`metadata.config_override.tools`
+  confirmed in DB) → rebind → broadcast `config.changed` → exactly one
+  transcript stamp; re-enable passed the closed-vocabulary validation; next
+  turn logged `System prompt refreshed live` (P0.1 live proof). This smoke
+  also discharged P0.3's owed live verification.
+- Residuals: VM upgrade button is fail-closed while grants load (shown only
+  with an explicit `vm` grant / admin-null — on the dev cluster the test
+  user's fetch resolved without it; verify grant wiring when Slice C lands);
+  mobile full-screen pane and the read-only datasources rendering are
+  unit-covered but not browser-verified; the model picker's "Default" label
+  shows the config name until the welcome frame delivers the real model
+  (pre-existing `modelName` seeding oddity).
 
 ### Slice B — live datasources (the real backend work)
 
@@ -556,36 +623,40 @@ Slice A:
 7. Datasources/expert/projects render read-only with hints; no reset-to-
    default affordances render in live mode.
 8. Every applied change produces a transcript stamp visible to all viewers.
+9. The pane shows the turn-boundary + cache-reset cost disclosure as static
+   text next to the tools/datasources/model controls; cosmetic controls
+   (temperature, permission mode, narration) carry no such warning; no
+   per-toggle nag or confirm dialog is introduced.
 
 Slice B:
-9. Adding a datasource mid-session makes its tools available on the next
-   turn, with credentials resolved orchestrator-side, never entering
-   `config_override`, and never persisted in thread metadata (only
-   `datasource_ids` persists, via the new metadata writer).
-10. Removing one closes its connections **after** any in-flight turn ends,
+10. Adding a datasource mid-session makes its tools available on the next
+    turn, with credentials resolved orchestrator-side, never entering
+    `config_override`, and never persisted in thread metadata (only
+    `datasource_ids` persists, via the new metadata writer).
+11. Removing one closes its connections **after** any in-flight turn ends,
     removes its tools from the next turn onward, rewrites `datasources.md`
     without duplication, and stamps the transcript with the removal note.
-11. A live add of a repository datasource to a lite-backend session is
+12. A live add of a repository datasource to a lite-backend session is
     rejected at the PATCH (workspace_backend passed to authorization); a
     `datasource_tools`-denied principal is rejected at the PATCH (flip-then-
     grant-check ordering).
-12. A datasource update with the orchestrator unreachable is rejected loudly,
+13. A datasource update with the orchestrator unreachable is rejected loudly,
     never applied locally.
-13. Detach/resume after live add/remove reconstructs the same set from
+14. Detach/resume after live add/remove reconstructs the same set from
     `metadata.datasource_ids`.
-14. **Pairwise state preservation** (the LibreChat regression class): for
+15. **Pairwise state preservation** (the LibreChat regression class): for
     every pair in {model, tools, datasources, permission mode}, change A then
     B and assert A survived — as automated tests.
 
 Slice C:
-15. Editing a disconnected session's config persists (redacted response,
+16. Editing a disconnected session's config persists (redacted response,
     owner-auth, audited) and takes effect at next attach; the endpoint
     refuses (or clearly flags) connected sessions.
 
 Slice D:
-16. A swap to a smaller-window model with an over-budget history compacts
+17. A swap to a smaller-window model with an over-budget history compacts
     first or rejects cleanly — never a broken next turn.
-17. A cross-provider swap with tool-bearing history passes the family
+18. A cross-provider swap with tool-bearing history passes the family
     mutation smoke tests (no 400s from IDs/thinking blocks/pairing).
 
 ## Test landscape (what exists, what's missing)
