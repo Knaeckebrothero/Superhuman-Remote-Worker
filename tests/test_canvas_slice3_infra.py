@@ -131,15 +131,19 @@ def test_public_examples_keep_live_preview_disabled() -> None:
     )
 
 
-def test_experimental_overlay_reserves_canvas_domain_without_enabling_it() -> None:
+def test_experimental_overlay_enables_dev_viewer_without_production_claims() -> None:
+    # Dev-cluster acceptance posture (2026-07-16): viewer enabled under the
+    # documented single-user development/cookie-free profile. The PSL flag
+    # stays false and the profile returns to production/psl-isolated only
+    # after the PSL boundary is verified.
     values = yaml.safe_load((ROOT / "deployment/values-experimental.yaml").read_text())
     live_preview = values["canvas"]["livePreview"]
     viewer = live_preview["viewer"]
 
-    assert live_preview["enabled"] is False
-    assert viewer["enabled"] is False
-    assert viewer["deploymentProfile"] == "production"
-    assert viewer["cookieMode"] == "psl-isolated"
+    assert live_preview["enabled"] is True
+    assert viewer["enabled"] is True
+    assert viewer["deploymentProfile"] == "development"
+    assert viewer["cookieMode"] == "development-cookie-free"
     assert viewer["domain"] == "srwcanvas.works"
     assert viewer["hostSuffix"] == ".srwcanvas.works"
     assert viewer["cockpitOrigins"] == ["https://cockpit.srw.works"]
@@ -148,8 +152,8 @@ def test_experimental_overlay_reserves_canvas_domain_without_enabling_it() -> No
         "create": False,
         "existingSecret": "",
         "vaultPath": "homelab/superhuman-remote-worker/canvas-gateway-db",
-        "usernameKey": "username",
-        "passwordKey": "password",
+        "usernameKey": "CANVAS_VIEWER_POSTGRES_USER",
+        "passwordKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
     }
     # The edge is the existing Cloudflare Tunnel connector (see
     # docs/issues/canvas_hosted_edge_use_cloudflare_tunnel.md).
@@ -176,8 +180,8 @@ def test_canvas_viewer_chart_values_are_default_off_and_fail_closed() -> None:
             "create": False,
             "existingSecret": "",
             "vaultPath": "",
-            "usernameKey": "username",
-            "passwordKey": "password",
+            "usernameKey": "CANVAS_VIEWER_POSTGRES_USER",
+            "passwordKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
         },
         "provisionRole": False,
         "pool": {"min": 1, "max": 4},
@@ -578,11 +582,11 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
     assert credential_refs == {
         "CANVAS_VIEWER_POSTGRES_USER": {
             "name": "canvas-viewer-db",
-            "key": "username",
+            "key": "CANVAS_VIEWER_POSTGRES_USER",
         },
         "CANVAS_VIEWER_POSTGRES_PASSWORD": {
             "name": "canvas-viewer-db",
-            "key": "password",
+            "key": "CANVAS_VIEWER_POSTGRES_PASSWORD",
         },
     }
 
@@ -608,9 +612,9 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
     base = ["helm", "template", "canvas-test", str(chart), "-f", str(test_values)]
     vault_path = "test/canvas-gateway-db"
 
-    # A production overlay may reserve its Vault coordinates ahead of launch.
-    # While the viewer is off this must neither contact the provider nor require
-    # the path/properties to exist.
+    # The dev overlay enables the viewer (2026-07-16, development profile), so
+    # its reserved Vault coordinates now render the gateway and its dedicated
+    # ExternalSecret — proving the credential mapping follows the gate.
     experimental_render = subprocess.run(
         [
             "helm",
@@ -627,12 +631,12 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
     experimental_objects = [
         item for item in yaml.safe_load_all(experimental_render) if item
     ]
-    assert not any(
+    assert any(
         item.get("kind") == "ExternalSecret"
         and item.get("metadata", {}).get("name") == "srw-canvas-gateway-db"
         for item in experimental_objects
     )
-    assert not any(
+    assert any(
         item.get("kind") == "Deployment"
         and item.get("metadata", {}).get("name") == "srw-canvas-gateway"
         for item in experimental_objects
@@ -753,14 +757,22 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
     assert len(external_secrets) == 1
     external_secret = external_secrets[0]
     assert "dataFrom" not in external_secret["spec"]
+    # Vault property names follow the configured key names so one convention
+    # (CANVAS_VIEWER_POSTGRES_*) holds across Vault, the Secret, and env.
     assert external_secret["spec"]["data"] == [
         {
-            "secretKey": "username",
-            "remoteRef": {"key": vault_path, "property": "username"},
+            "secretKey": "CANVAS_VIEWER_POSTGRES_USER",
+            "remoteRef": {
+                "key": vault_path,
+                "property": "CANVAS_VIEWER_POSTGRES_USER",
+            },
         },
         {
-            "secretKey": "password",
-            "remoteRef": {"key": vault_path, "property": "password"},
+            "secretKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
+            "remoteRef": {
+                "key": vault_path,
+                "property": "CANVAS_VIEWER_POSTGRES_PASSWORD",
+            },
         },
     ]
     secret_name = external_secret["spec"]["target"]["name"]
@@ -783,11 +795,11 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
     assert credential_refs == {
         "CANVAS_VIEWER_POSTGRES_USER": {
             "name": secret_name,
-            "key": "username",
+            "key": "CANVAS_VIEWER_POSTGRES_USER",
         },
         "CANVAS_VIEWER_POSTGRES_PASSWORD": {
             "name": secret_name,
-            "key": "password",
+            "key": "CANVAS_VIEWER_POSTGRES_PASSWORD",
         },
     }
 
@@ -841,8 +853,14 @@ def test_canvas_gateway_development_can_provision_restricted_internal_role() -> 
     ]
     assert len(credentials) == 1
     assert credentials[0]["kind"] == "Secret"
-    assert set(credentials[0]["stringData"]) == {"username", "password"}
-    assert credentials[0]["stringData"]["username"] == "srw_canvas_gateway"
+    assert set(credentials[0]["stringData"]) == {
+        "CANVAS_VIEWER_POSTGRES_USER",
+        "CANVAS_VIEWER_POSTGRES_PASSWORD",
+    }
+    assert (
+        credentials[0]["stringData"]["CANVAS_VIEWER_POSTGRES_USER"]
+        == "srw_canvas_gateway"
+    )
 
     role_objects = [
         item
