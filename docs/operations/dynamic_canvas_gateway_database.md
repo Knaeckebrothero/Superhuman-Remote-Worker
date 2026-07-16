@@ -86,8 +86,10 @@ operator:
 The homelab deployment uses the chart's feature-gated ESO path. Set
 `canvas.livePreview.viewer.database.credentials.vaultPath` to
 `homelab/superhuman-remote-worker/canvas-gateway-db`; when—and only when—
-`canvas.livePreview.viewer.enabled=true`, the SRW chart maps the `username` and
-`password` properties into `srw-canvas-gateway-db`. Merely configuring the path
+`canvas.livePreview.viewer.enabled=true`, the SRW chart maps the
+`CANVAS_VIEWER_POSTGRES_USER` and `CANVAS_VIEWER_POSTGRES_PASSWORD` properties
+(one naming convention with the main bundle's `AUDIT_POSTGRES_*` et al) into
+`srw-canvas-gateway-db`. Merely configuring the path
 while the gateway is disabled creates no ExternalSecret and makes no provider
 request, matching the lifecycle of other optional workloads. Populate the Vault
 path with the same password file used by the role reconciler before enabling
@@ -134,8 +136,8 @@ canvas:
           create: false
           existingSecret: ""
           vaultPath: homelab/superhuman-remote-worker/canvas-gateway-db
-          usernameKey: username
-          passwordKey: password
+          usernameKey: CANVAS_VIEWER_POSTGRES_USER
+          passwordKey: CANVAS_VIEWER_POSTGRES_PASSWORD
         provisionRole: false
 ```
 
