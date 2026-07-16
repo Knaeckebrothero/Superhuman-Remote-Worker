@@ -99,15 +99,22 @@ class TestSessionWorkspaceBackendOverride:
         )
         assert ws == {"backend": backend, "max_read_words": 5}
 
-    def test_vm_backend_rejected_at_create(self):
-        # create_thread has no VM-provisioner wiring — vm must be reached by
-        # starting lite and upgrading, not selected at creation.
-        with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_session_workspace_override(
-                {"workspace": {"backend": "vm"}}
-            )
-        assert exc.value.status_code == 400
-        assert "upgrade" in exc.value.detail.lower()
+    def test_vm_backend_accepted_at_create(self):
+        # vm is now selectable at creation (operator-gated + provisioned in
+        # create_thread). Validation lets it through with its sizing sub-dict;
+        # the permission/provisioner gate lives downstream, not here.
+        # docs/features/session_create_on_vm.md
+        ws = orch_main._validated_session_workspace_override(
+            {"workspace": {"backend": "vm", "vm": {"cpu_cores": 4, "memory": "8Gi"}}}
+        )
+        assert ws == {"backend": "vm", "vm": {"cpu_cores": 4, "memory": "8Gi"}}
+
+    def test_vm_not_in_default_chain_set(self):
+        # vm must remain a per-session opt-in, never an implicit/saved default:
+        # it is excluded from SESSION_WORKSPACE_BACKENDS (the default-chain +
+        # settings-PATCH set) but present in the create-time allowlist.
+        assert "vm" not in orch_main.SESSION_WORKSPACE_BACKENDS
+        assert "vm" in orch_main.SESSION_CREATE_WORKSPACE_BACKENDS
 
     def test_unknown_backend_rejected(self):
         with pytest.raises(orch_main.HTTPException) as exc:
@@ -130,6 +137,62 @@ class TestSessionWorkspaceBackendOverride:
             {"workspace": {"max_read_words": 10}}
         )
         assert ws == {"max_read_words": 10}
+
+
+class TestSessionReadyTimeout:
+    """VM-aware readiness budget for the session-start paths
+    (docs/features/session_create_on_vm.md)."""
+
+    def test_non_vm_uses_fast_default(self, monkeypatch):
+        monkeypatch.delenv("WS_READY_TIMEOUT_S", raising=False)
+        assert orch_main._session_ready_timeout_s("sandbox") == 180
+        assert orch_main._session_ready_timeout_s("virtual") == 180
+        assert orch_main._session_ready_timeout_s(None) == 180
+
+    def test_vm_uses_extended_budget(self, monkeypatch):
+        monkeypatch.delenv("VM_WS_READY_TIMEOUT_S", raising=False)
+        assert orch_main._session_ready_timeout_s("vm") == 960
+
+    def test_budgets_are_env_tunable(self, monkeypatch):
+        monkeypatch.setenv("WS_READY_TIMEOUT_S", "200")
+        monkeypatch.setenv("VM_WS_READY_TIMEOUT_S", "1200")
+        assert orch_main._session_ready_timeout_s("sandbox") == 200
+        assert orch_main._session_ready_timeout_s("vm") == 1200
+
+    def test_vm_budget_exceeds_non_vm(self):
+        # Nested-budget invariant: the server ready wait must outlast a cold VM
+        # boot, so vm must be strictly larger than the sandbox default.
+        assert orch_main._session_ready_timeout_s(
+            "vm"
+        ) > orch_main._session_ready_timeout_s("sandbox")
+
+
+class TestThreadWorkspaceBackend:
+    """_thread_workspace_backend extracts a thread's stored backend so the
+    resume path (_do_prepare) can size the VM budget without the config_override."""
+
+    def test_dict_metadata(self):
+        thread = {"metadata": {"config_override": {"workspace": {"backend": "vm"}}}}
+        assert orch_main._thread_workspace_backend(thread) == "vm"
+
+    def test_json_string_metadata(self):
+        import json
+
+        thread = {
+            "metadata": json.dumps(
+                {"config_override": {"workspace": {"backend": "sandbox"}}}
+            )
+        }
+        assert orch_main._thread_workspace_backend(thread) == "sandbox"
+
+    def test_missing_or_malformed_returns_none(self):
+        assert orch_main._thread_workspace_backend({}) is None
+        assert orch_main._thread_workspace_backend({"metadata": "not-json"}) is None
+        assert orch_main._thread_workspace_backend(None) is None
+        assert (
+            orch_main._thread_workspace_backend({"metadata": {"config_override": {}}})
+            is None
+        )
 
 
 class TestSessionWorkspaceBackendDefaultChain:

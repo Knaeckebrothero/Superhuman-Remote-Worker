@@ -5802,8 +5802,16 @@ async def _poll_workspace_ready(
     poll_interval: float = 2.0,
     *,
     raise_on_denied: bool = False,
+    vm_timeout: int = _vm_upgrade_poll_timeout,
 ) -> Optional[Dict[str, Any]]:
     """Poll orchestrator for workspace container readiness.
+
+    ``vm_timeout`` is the extended budget applied automatically once the poll
+    observes a VM-backed thread in flight (``vm_status`` provisioning/created):
+    a cold KubeVirt boot (CDI import + guest boot) routinely runs minutes past
+    the sandbox-container ``timeout`` default, so the deadline self-extends
+    rather than declaring a still-booting VM "not ready"
+    (docs/features/session_create_on_vm.md).
 
     Returns:
         Workspace config dict {"backend": "remote", "remote": {host, port, ...}}
@@ -5811,7 +5819,9 @@ async def _poll_workspace_ready(
     """
     import time
 
-    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    deadline = start + timeout
+    _vm_budget_applied = False
 
     while time.monotonic() < deadline:
         ws = await client.get_thread_workspace(
@@ -5826,6 +5836,20 @@ async def _poll_workspace_ready(
 
         # Check VM workspace first (takes precedence over container)
         vm_status = ws.get("vm_status")
+
+        # A VM-backed thread pays a cold KubeVirt boot far beyond the
+        # sandbox-container default. Extend the poll deadline ONCE the moment we
+        # observe the VM is in flight so a legitimate cold boot isn't declared
+        # "not ready" — self-adjusting, no caller signal needed.
+        if not _vm_budget_applied and vm_status in ("provisioning", "created"):
+            deadline = start + max(timeout, vm_timeout)
+            _vm_budget_applied = True
+            logger.info(
+                "Thread %s: VM workspace provisioning detected — extending "
+                "workspace readiness budget to %ss.",
+                thread_id,
+                max(timeout, vm_timeout),
+            )
         if vm_status == "ready" and ws.get("vm_ssh_host"):
             return {
                 "backend": "vm",

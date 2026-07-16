@@ -1707,6 +1707,39 @@ class TestPollWorkspaceReady:
         result = await _poll_workspace_ready(client, "tid", timeout=5)
         assert result["remote"]["host"] == "vm-host"
 
+    @pytest.mark.asyncio
+    async def test_vm_provisioning_extends_budget_past_base_timeout(self):
+        """A VM in flight self-extends the poll deadline to the VM budget, so a
+        cold boot that outlasts the sandbox `timeout` still attaches
+        (docs/features/session_create_on_vm.md)."""
+        call_count = 0
+
+        async def _get_workspace(tid, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # VM in flight — no ssh host yet. status stays 'none' (container
+                # never provisioned); vm_status truthy must prevent the bail.
+                return {"status": "none", "vm_status": "provisioning"}
+            return {"vm_status": "ready", "vm_ssh_host": "vm-host"}
+
+        client = AsyncMock()
+        client.get_thread_workspace = _get_workspace
+
+        with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
+            # base timeout=1 would give up after the first poll (monotonic jumps
+            # to 2, past the base deadline); the vm-detected extend to 1000 keeps
+            # polling so the second poll returns the ready VM.
+            with patch("time.monotonic", side_effect=[0, 0.5, 2, 2]):
+                result = await _poll_workspace_ready(
+                    client, "tid", timeout=1, vm_timeout=1000, poll_interval=0.01
+                )
+
+        assert result is not None
+        assert result["backend"] == "vm"
+        assert result["remote"]["host"] == "vm-host"
+        assert call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # 3.7 _poll_vm_ready()

@@ -29,6 +29,13 @@ export interface LifecycleEvent {
     thread_id: string;
     state: 'provisioning' | 'booting' | 'ready' | 'failed' | (string & {});
     reason?: string;
+    /**
+     * Workspace backend the session is starting on, tagged by the orchestrator's
+     * binding paths. Present as `'vm'` for VM-backed sessions so the startup card
+     * can show the longer "Booting VM" copy and the client can extend its
+     * readiness budget for a cold KubeVirt boot. Absent for sandbox/lite.
+     */
+    backend?: string;
 }
 
 /**
@@ -208,6 +215,7 @@ export class NotificationService {
             thread_id: data.thread_id,
             state: data.state,
             reason: data.reason,
+            backend: data.backend,
         });
     } else if (data.type === 'user_registered') {
         // Admin-only fan-out (app-side admission): a new user

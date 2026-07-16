@@ -47,6 +47,7 @@ async def provision_or_assign(
     deadlocks both for the asyncpg query timeout (~60s).
     """
     from main import (  # noqa: E402  (late import — see module docstring)
+        _backend_from_override,
         _build_datasource_tool_override,
         _build_datasources_payload,
         _endpoint_violations_detail,
@@ -55,6 +56,7 @@ async def provision_or_assign(
         _send_session_attach,
         _session_endpoint_violations,
         _session_grant_violations,
+        _session_ready_timeout_s,
         agent_provisioner,
         postgres_db,
     )
@@ -67,7 +69,14 @@ async def provision_or_assign(
         agent_pod_provisioning_in_progress,
     )
 
-    lifecycle_emit(uid, tid, "provisioning")
+    # A VM-backed session pays a cold KubeVirt boot (minutes). Tag the lifecycle
+    # events so the cockpit renders the "Booting VM (this can take a few minutes)"
+    # copy, and size the readiness wait from the backend (VM budget vs the fast
+    # sandbox default) — see docs/features/session_create_on_vm.md.
+    _is_vm = _backend_from_override(co) == "vm"
+    _vm_tag: dict[str, str] = {"backend": "vm"} if _is_vm else {}
+
+    lifecycle_emit(uid, tid, "provisioning", **_vm_tag)
     pod_ip: str | None = None
     pod_port: int = 8001
     needs_binding_wait = False  # True iff fresh-pod path took over
@@ -214,8 +223,8 @@ async def provision_or_assign(
         # agent's _attach_session finishes (the agent's /ready is gated
         # on _session_ready()'s 3-way check). Mirrors the readiness-probe
         # tail of _do_prepare.
-        lifecycle_emit(uid, tid, "booting")
-        ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
+        lifecycle_emit(uid, tid, "booting", **_vm_tag)
+        ready_timeout_s = _session_ready_timeout_s(_backend_from_override(co))
         if not await wait_for_ready(pod_ip, pod_port, ready_timeout_s):
             lifecycle_emit(uid, tid, "failed", reason="agent /ready timeout")
             return

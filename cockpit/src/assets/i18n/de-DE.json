@@ -1261,6 +1261,7 @@
         "creating": "Thread wird erstellt",
         "provisioning": "Agent wird bereitgestellt",
         "booting": "Agent-Laufzeit startet",
+        "bootingVm": "VM startet (dies kann einige Minuten dauern)",
         "connecting": "Verbindung wird hergestellt"
       }
     },
