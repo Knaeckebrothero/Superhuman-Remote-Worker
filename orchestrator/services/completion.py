@@ -300,6 +300,24 @@ ERROR_IMMUNE_FREEZE_TYPES: frozenset[str] = AUTO_REDISPATCH_FREEZE_TYPES | froze
 # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
 _PARENT_TERMINAL_BLOCKING: frozenset[str] = frozenset({"failed", "cancelled"})
 
+# Freeze types whose subjob short-circuit routes to the shared re-dispatch
+# handling instead of the pending_review fallback: the drain freeze pauses
+# directly, and the outage freezes (memory/kb/llm) fall through to their
+# type-specific branches — whose retry caps and duration ceilings are
+# row-scoped (context.memory_retry_count / context.llm_outage on the subjob's
+# own row), so they apply per-subjob unchanged. All are guarded by
+# _PARENT_TERMINAL_BLOCKING first: a paused subjob under a permanently-dead
+# parent is a silent cascade-guard wedge.
+# docs/features/llm_outage_subjob_resilience.md
+_SUBJOB_REDISPATCH_FREEZE_TYPES: frozenset[str] = frozenset(
+    {
+        "version_upgrade",
+        "memory_unavailable",
+        "kb_unavailable",
+        "llm_unavailable",
+    }
+)
+
 # Substrings that mark an error as a workspace/VM *teardown* (connectivity) blip
 # rather than a genuine mid-run failure. On completion the VM is reaped, and a
 # trailing SSH/SFTP/stat op can time out against the gone workspace; that trailing
@@ -678,12 +696,16 @@ def determine_job_status(
             return (None, None)
         # A coincident error must not mask an outcome the agent already reported.
         # Two carve-outs let the report's own branch below own the decision:
-        #  (1) a clean-boundary auto-redispatch / outage freeze on a top-level job
-        #      (drain Continue-as-New, memory/KB retry caps, LLM-outage ceiling) —
-        #      the work is checkpointed and re-dispatch resumes it. Critic subjobs
-        #      keep failing on error as before, and a stale row freeze can't shield
-        #      a crashed run (should_stop is False there → falls through to failed).
+        #  (1) a clean-boundary auto-redispatch / outage freeze (drain
+        #      Continue-as-New, memory/KB retry caps, LLM-outage ceiling) — the
+        #      work is checkpointed and re-dispatch resumes it. For a SUBJOB the
+        #      carve-out additionally requires a live parent and one of the
+        #      subjob-redispatch freeze types (a dead parent means the pause
+        #      could never resume — fail on the error as before). A stale row
+        #      freeze can't shield a crashed run (should_stop is False there →
+        #      falls through to failed).
         #      docs/done/version_upgrade_drain_masked_by_coincident_error.md
+        #      docs/features/llm_outage_subjob_resilience.md
         #  (2) a genuine completion whose only error is a post-completion
         #      workspace/VM *teardown* blip: the VM is reaped on completion and a
         #      trailing SSH/IO op then times out against the gone workspace. The
@@ -691,10 +713,16 @@ def determine_job_status(
         #      below resolves it exactly as it would with no error. A NON-teardown
         #      error (real mid-run crash) still fails, even on a completion report.
         #      docs/done/coincident_infra_error_overrides_reported_job_outcome.md
-        redispatchable = (
-            should_stop
-            and job.get("parent_job_id") is None
-            and freeze_type in ERROR_IMMUNE_FREEZE_TYPES
+        redispatchable = should_stop and (
+            (
+                job.get("parent_job_id") is None
+                and freeze_type in ERROR_IMMUNE_FREEZE_TYPES
+            )
+            or (
+                job.get("parent_job_id") is not None
+                and freeze_type in _SUBJOB_REDISPATCH_FREEZE_TYPES
+                and parent_status not in _PARENT_TERMINAL_BLOCKING
+            )
         )
         completed_despite_teardown = (
             should_stop and is_completion and is_teardown_infra_error(error_msg)
@@ -728,24 +756,29 @@ def determine_job_status(
                 fd_status,
             )
             return (fd_status, None)
-        # A drain (version_upgrade) freeze on a subjob is re-dispatchable exactly
-        # like a top-level job — but this short-circuit historically routed it to
-        # pending_review because the freeze table below is unreachable for subjobs
-        # (the "drained-critic → pending_review" gap). Pause so the dispatcher
-        # re-picks it onto a fresh-version pod. Guard the parent-terminal case: if
-        # the parent has permanently failed, the dispatcher's cascade guard will
-        # never re-dispatch the subjob (a silent paused wedge, strictly worse than
-        # the visible pending_review), so resolve terminally instead. (Outage
-        # freezes — memory/kb/llm — are deferred: their retry-cap/ceiling counters
-        # are top-level-scoped; they stay on the visible pending_review fallback
-        # until per-subjob counters are wired.)
+        # A drain (version_upgrade) or outage (memory/kb/llm) freeze on a subjob
+        # is re-dispatchable exactly like a top-level job — this short-circuit
+        # historically routed them to pending_review because the freeze table
+        # below was unreachable for subjobs. Guard the parent-terminal case
+        # first: if the parent has permanently failed, the dispatcher's cascade
+        # guard will never re-dispatch the subjob (a silent paused wedge,
+        # strictly worse than the visible pending_review), so resolve terminally
+        # instead. The drain freeze pauses here; the outage freezes fall THROUGH
+        # to the shared type-specific branches below — their retry caps and
+        # duration ceilings live on the subjob's own row
+        # (context.memory_retry_count / context.llm_outage), so they apply
+        # per-subjob unchanged.
         # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
-        if freeze_type == "version_upgrade":
+        # docs/features/llm_outage_subjob_resilience.md
+        if freeze_type in _SUBJOB_REDISPATCH_FREEZE_TYPES:
             if parent_status in _PARENT_TERMINAL_BLOCKING:
                 return ("completed" if goal_achieved else "cancelled", None)
-            return ("paused", None)
-        # No explicit status in freeze_data — infer from goal_achieved
-        return ("completed" if goal_achieved else "pending_review", None)
+            if freeze_type == "version_upgrade":
+                return ("paused", None)
+            # memory/kb/llm: shared branches below own pause-vs-fail.
+        else:
+            # No explicit status in freeze_data — infer from goal_achieved
+            return ("completed" if goal_achieved else "pending_review", None)
 
     # Unattended project-loop jobs must never land on the human-review gate:
     # the loop's advance hook fires only on TERMINAL statuses, so a
