@@ -1,0 +1,460 @@
+"""Tests for live datasource changes (live_session_settings.md Slice B).
+
+Covers the three backend surfaces:
+
+- ``PostgresDB.set_thread_datasource_ids`` — the new top-level metadata
+  writer (full-set replace; ``merge_thread_config_override`` can't touch
+  sibling keys of ``config_override``).
+- ``agent_update_thread_config`` — the internal PATCH's ``datasource_ids``
+  field: create-parity authorization (including the lite-tier/repository
+  rule against the thread's CURRENT backend), the flip-then-grant-check
+  ordering, and persist-after-checks.
+- ``PersistentSession.resetup_datasources`` — the agent-side live rewire:
+  in-place registry swap, deferred-close contract, category application
+  outside the validated tools vocabulary, repo/kb handling, index rewrite.
+
+Plus ``inject_datasource_index``'s rewrite (not re-append) semantics.
+"""
+
+import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+THREAD_ID = "11111111-2222-3333-4444-555555555555"
+
+
+# ---------------------------------------------------------------------------
+# PostgresDB.set_thread_datasource_ids
+# ---------------------------------------------------------------------------
+
+
+def _make_db(update_result="UPDATE 1"):
+    from orchestrator.database.postgres import PostgresDB
+
+    db = PostgresDB.__new__(PostgresDB)
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value=update_result)
+    pool_cm = AsyncMock()
+    pool_cm.__aenter__.return_value = conn
+    pool_cm.__aexit__.return_value = False
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=pool_cm)
+    db._pool = pool
+    return db, conn
+
+
+class TestSetThreadDatasourceIds:
+    @pytest.mark.asyncio
+    async def test_replaces_full_set_via_jsonb_set(self):
+        import json
+
+        db, conn = _make_db()
+        ok = await db.set_thread_datasource_ids(THREAD_ID, ["ds-b", "ds-a"])
+
+        assert ok is True
+        sql = conn.execute.call_args.args[0]
+        # Plain replace of the top-level key — NOT a merge: the protocol sends
+        # the desired FULL selection each time (idempotent, create parity).
+        assert "'{datasource_ids}'" in sql
+        assert "||" not in sql
+        assert json.loads(conn.execute.call_args.args[1]) == ["ds-b", "ds-a"]
+
+    @pytest.mark.asyncio
+    async def test_empty_list_detaches_all(self):
+        import json
+
+        db, conn = _make_db()
+        assert await db.set_thread_datasource_ids(THREAD_ID, []) is True
+        assert json.loads(conn.execute.call_args.args[1]) == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_thread_returns_false(self):
+        db, _ = _make_db(update_result="UPDATE 0")
+        assert await db.set_thread_datasource_ids(THREAD_ID, ["ds-a"]) is False
+
+    @pytest.mark.asyncio
+    async def test_invalid_uuid_returns_false_without_query(self):
+        db, conn = _make_db()
+        assert await db.set_thread_datasource_ids("not-a-uuid", ["ds-a"]) is False
+        conn.execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# agent_update_thread_config: the datasource_ids PATCH field
+# ---------------------------------------------------------------------------
+
+
+def _thread_row(user_id="user-1", backend="sandbox", metadata_extra=None):
+    metadata = {"config_override": {"workspace": {"backend": backend}}}
+    metadata.update(metadata_extra or {})
+    return {
+        "id": THREAD_ID,
+        "user_id": user_id,
+        "project_id": None,
+        "metadata": metadata,
+    }
+
+
+@pytest.fixture
+def patched_main(monkeypatch):
+    """orchestrator.main with the PATCH endpoint's collaborators mocked."""
+    import orchestrator.main as main
+
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=_thread_row()),
+        get_user=AsyncMock(return_value={"id": "user-1", "is_admin": False}),
+        get_datasource=AsyncMock(
+            return_value={"id": "ds-a", "type": "postgresql", "is_global": True}
+        ),
+        resolve_datasources_for_thread=AsyncMock(
+            return_value=[
+                {"type": "postgresql", "name": "PG", "project_read_only": False}
+            ]
+        ),
+        set_thread_datasource_ids=AsyncMock(return_value=True),
+        merge_thread_config_override=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(
+        main, "user_can_access_datasource", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[]))
+    grants = AsyncMock()
+    monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
+    return main, db, grants
+
+
+def _body(main, config_override=None, datasource_ids=None):
+    return main.AgentThreadConfigUpdateRequest(
+        config_override=config_override or {}, datasource_ids=datasource_ids
+    )
+
+
+class TestAgentPatchDatasourceIds:
+    @pytest.mark.asyncio
+    async def test_authorizes_against_current_workspace_backend(self, patched_main):
+        """A live add is create-like: unlike attach revalidation (which
+        deliberately passes None), the PATCH must pass the thread's current
+        backend so the lite/repository rule stays alive."""
+        main, db, _ = patched_main
+        db.get_thread.return_value = _thread_row(backend="virtual")
+        db.get_datasource.return_value = {
+            "id": "ds-repo",
+            "type": "repository",
+            "is_global": True,
+        }
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.agent_update_thread_config(
+                MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-repo"])
+            )
+        assert exc.value.status_code == 400
+        assert "repository" in exc.value.detail.lower()
+        db.set_thread_datasource_ids.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flip_reaches_grant_check_before_persist(self, patched_main):
+        """Flip-then-grant-check: the derived datasource tool categories must
+        be in the grant-checked fragment, so a datasource_tools-denied
+        principal fails at the PATCH — and nothing persists on denial."""
+        main, db, grants = patched_main
+
+        await main.agent_update_thread_config(
+            MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a"])
+        )
+
+        fragment = grants.await_args.args[0]
+        # RW postgresql resolved above → write tools in the checked fragment.
+        assert "sql_execute" in fragment["tools"]["sql"]
+        db.set_thread_datasource_ids.assert_awaited_once_with(THREAD_ID, ["ds-a"])
+
+    @pytest.mark.asyncio
+    async def test_grant_denial_prevents_persist(self, patched_main):
+        main, db, grants = patched_main
+        grants.side_effect = main.HTTPException(status_code=422, detail="denied")
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.agent_update_thread_config(
+                MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a"])
+            )
+        assert exc.value.status_code == 422
+        db.set_thread_datasource_ids.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flip_never_persists_into_config_override(self, patched_main):
+        """The sql/graph/mongodb/webdav categories are outside the validated
+        session vocabulary — they must not leak into the durable
+        config_override merge (attach re-derives them from datasource_ids)."""
+        main, db, _ = patched_main
+
+        result = await main.agent_update_thread_config(
+            MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a"])
+        )
+
+        merged = db.merge_thread_config_override.await_args.args[1]
+        assert "sql" not in (merged.get("tools") or {})
+        assert result["datasource_ids"] == ["ds-a"]
+
+    @pytest.mark.asyncio
+    async def test_ownerless_thread_normalizes_without_grant_check(self, patched_main):
+        """Ownerless/system threads keep the trusted-internal bypass (job
+        create + attach revalidation parity): dedupe only."""
+        main, db, grants = patched_main
+        db.get_thread.return_value = _thread_row(user_id=None)
+
+        result = await main.agent_update_thread_config(
+            MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a", "ds-a", "ds-b"])
+        )
+
+        grants.assert_not_awaited()
+        db.set_thread_datasource_ids.assert_awaited_once_with(
+            THREAD_ID, ["ds-a", "ds-b"]
+        )
+        assert result["datasource_ids"] == ["ds-a", "ds-b"]
+
+    @pytest.mark.asyncio
+    async def test_no_datasource_field_means_no_datasource_write(self, patched_main):
+        main, db, _ = patched_main
+
+        result = await main.agent_update_thread_config(
+            MagicMock(),
+            THREAD_ID,
+            _body(main, config_override={"llm": {"temperature": 0.5}}),
+        )
+
+        db.set_thread_datasource_ids.assert_not_awaited()
+        assert result["datasource_ids"] is None
+
+    @pytest.mark.asyncio
+    async def test_empty_list_detaches_all(self, patched_main):
+        main, db, _ = patched_main
+
+        await main.agent_update_thread_config(
+            MagicMock(), THREAD_ID, _body(main, datasource_ids=[])
+        )
+
+        db.set_thread_datasource_ids.assert_awaited_once_with(THREAD_ID, [])
+
+
+# ---------------------------------------------------------------------------
+# PersistentSession.resetup_datasources
+# ---------------------------------------------------------------------------
+
+
+def _make_session(datasource_configs=None, datasources=None, clients=None):
+    from src.api.persistent_session import PersistentSession
+    from src.core.loader import ToolsConfig
+
+    cfg = MagicMock()
+    cfg.tools = ToolsConfig(sql=["stale_sql_tool"])
+    cfg.extra = {}
+    session = PersistentSession(
+        thread_id=str(uuid.uuid4()),
+        config=cfg,
+        datasources=datasources if datasources is not None else {},
+        _datasource_clients=clients if clients is not None else {},
+        datasource_configs=datasource_configs or [],
+    )
+    session.tool_context = SimpleNamespace(datasources=session.datasources)
+    session.workspace_manager = MagicMock()
+    session.workspace_manager.source_repos = {}
+    session.resetup_tools_for_backend = MagicMock()
+    return session
+
+
+def _ds(ds_type, name, read_only=False):
+    return {"type": ds_type, "name": name, "project_read_only": read_only}
+
+
+class TestResetupDatasources:
+    def test_swaps_registry_in_place_and_returns_stale_for_deferred_close(self):
+        """ToolContext shares the dict by reference — the swap must mutate in
+        place — and the replaced connections must come back UNCLOSED (bound
+        tools hold them in closures; the caller closes after turn end)."""
+        old_conn, old_client = MagicMock(), MagicMock()
+        session = _make_session(
+            datasource_configs=[_ds("postgresql", "Old PG")],
+            datasources={"postgresql": old_conn},
+            clients={"postgresql": old_client},
+        )
+        registry_ref = session.datasources
+        new_conn = MagicMock()
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({"webdav": new_conn}, {}, []),
+        ):
+            summary = session.resetup_datasources([_ds("webdav", "Cloud")])
+
+        assert session.datasources is registry_ref
+        assert session.tool_context.datasources is registry_ref
+        assert registry_ref == {"webdav": new_conn}
+        assert summary["stale_connections"] == {"postgresql": old_conn}
+        assert summary["stale_clients"] == {"postgresql": old_client}
+        old_conn.close.assert_not_called()
+        old_client.close.assert_not_called()
+
+    def test_applies_categories_directly_to_config_tools(self):
+        """sql/graph/mongodb/webdav ride config.tools directly — the validated
+        session tools override's closed vocabulary would drop them."""
+        session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({}, {}, []),
+        ):
+            session.resetup_datasources([_ds("webdav", "Cloud")])
+
+        assert "webdav_write" in session.config.tools.webdav
+        # Removed type stripped — stale sql tools must not survive.
+        assert session.config.tools.sql == []
+        assert session.config.extra["_cli_datasources"] == []
+        session.resetup_tools_for_backend.assert_called_once()
+
+    def test_leaves_session_tool_groups_untouched(self):
+        """Pairwise preservation: a datasource change must not clobber a
+        prior live tool-group toggle (only the 4 datasource categories are
+        written)."""
+        session = _make_session()
+        session.config.tools.canvas = []  # user disabled Canvas live
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({}, {}, []),
+        ):
+            session.resetup_datasources([_ds("postgresql", "PG")])
+
+        assert session.config.tools.canvas == []
+
+    def test_summary_diff_by_type_and_name(self):
+        session = _make_session(
+            datasource_configs=[_ds("postgresql", "Keep"), _ds("webdav", "Drop")]
+        )
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({}, {}, []),
+        ):
+            summary = session.resetup_datasources(
+                [_ds("postgresql", "Keep"), _ds("mongodb", "Add")]
+            )
+
+        assert summary["added"] == ["Add"]
+        assert summary["removed"] == ["Drop"]
+
+    def test_kb_entries_skip_processing_and_flag_deferred(self):
+        session = _make_session()
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({}, {}, []),
+        ) as process:
+            summary = session.resetup_datasources(
+                [{"type": "kb", "name": "Docs KB", "datasource_id": "kb-1"}]
+            )
+
+        assert process.call_args.args[0] == []  # kb never opens a connector
+        assert summary["kb_deferred"] is True
+
+    def test_rewrites_index_with_full_new_list(self):
+        session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
+        new_list = [_ds("postgresql", "PG"), {"type": "kb", "name": "KB"}]
+        with (
+            patch(
+                "src.core.datasource_setup.process_datasources",
+                return_value=({}, {}, []),
+            ),
+            patch("src.core.datasource_setup.inject_datasource_index") as inject,
+        ):
+            session.resetup_datasources(new_list)
+
+        inject.assert_called_once_with(new_list, session.workspace_manager)
+        assert session.datasource_configs == new_list
+
+    def test_clones_added_repos_and_drops_removed_registration(self):
+        repo_old = {
+            "type": "repository",
+            "name": "Old Repo",
+            "connection_url": "https://git.example/org/old-repo.git",
+        }
+        repo_new = {
+            "type": "repository",
+            "name": "New Repo",
+            "connection_url": "https://git.example/org/new-repo.git",
+        }
+        session = _make_session(datasource_configs=[repo_old])
+        session.workspace_manager.source_repos = {"old-repo": MagicMock()}
+        with (
+            patch(
+                "src.core.datasource_setup.process_datasources",
+                return_value=({}, {}, []),
+            ),
+            patch("src.core.datasource_setup.clone_repository_datasources") as clone,
+            patch("src.core.datasource_setup.inject_datasource_index"),
+        ):
+            session.resetup_datasources([repo_new])
+
+        clone.assert_called_once_with([repo_new], session.workspace_manager)
+        # Removal keeps the clone on disk (documented) but drops the
+        # session-side registration.
+        assert "old-repo" not in session.workspace_manager.source_repos
+
+    def test_noop_before_tool_setup(self):
+        session = _make_session()
+        session.tool_context = None
+        summary = session.resetup_datasources([_ds("postgresql", "PG")])
+        assert summary["added"] == []
+        session.resetup_tools_for_backend.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# inject_datasource_index: rewrite, not re-append
+# ---------------------------------------------------------------------------
+
+
+class TestDatasourceIndexRewrite:
+    def _ws(self, existing=""):
+        ws = MagicMock()
+        if existing:
+            ws.read_file.return_value = existing
+        else:
+            ws.read_file.side_effect = FileNotFoundError
+        written = {}
+        ws.write_file.side_effect = lambda path, content: written.update(
+            {path: content}
+        )
+        return ws, written
+
+    def test_second_injection_replaces_previous_section(self):
+        from src.core.datasource_setup import inject_datasource_index
+
+        ws, written = self._ws()
+        inject_datasource_index([_ds("postgresql", "First DB")], ws)
+        ws.read_file.side_effect = None
+        ws.read_file.return_value = written["datasources.md"]
+        inject_datasource_index([_ds("mongodb", "Second DB")], ws)
+
+        content = written["datasources.md"]
+        assert content.count("## Available Datasources") == 1
+        assert "First DB" not in content
+        assert "Second DB" in content
+
+    def test_preserves_content_before_the_section(self):
+        from src.core.datasource_setup import inject_datasource_index
+
+        ws, written = self._ws(existing="# Datasources\n\nintro text\n")
+        inject_datasource_index([_ds("postgresql", "PG")], ws)
+
+        content = written["datasources.md"]
+        assert content.startswith("# Datasources\n\nintro text")
+        assert "**PG**" in content
+
+    def test_remove_all_writes_explicit_empty_state(self):
+        from src.core.datasource_setup import inject_datasource_index
+
+        ws, written = self._ws(
+            existing="intro\n\n## Available Datasources\n\n- **Gone** (postgresql)"
+        )
+        inject_datasource_index([], ws)
+
+        content = written["datasources.md"]
+        assert "Gone" not in content
+        assert "_No datasources attached._" in content

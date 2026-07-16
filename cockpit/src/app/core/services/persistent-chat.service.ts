@@ -203,9 +203,19 @@ const TOOL_GROUP_LABELS: Record<string, string> = {
     workflows: 'Automations & Loops',
 };
 
+/** The ack's datasource-change summary (names only — Slice B). */
+export interface AppliedDatasourceChange {
+    added?: string[];
+    removed?: string[];
+    kb_deferred?: boolean;
+}
+
 /** Summarize a config.changed `applied` fragment for the transcript stamp.
  *  Exported for tests. */
-export function describeAppliedConfig(applied: Record<string, unknown>): string[] {
+export function describeAppliedConfig(
+    applied: Record<string, unknown>,
+    datasources?: AppliedDatasourceChange,
+): string[] {
     const parts: string[] = [];
     const llm = applied['llm'] as Record<string, unknown> | undefined;
     if (llm?.['model']) parts.push(`model → ${llm['model']}`);
@@ -220,6 +230,15 @@ export function describeAppliedConfig(applied: Record<string, unknown>): string[
     const interactive = applied['interactive'] as Record<string, unknown> | undefined;
     if (interactive?.['permission_mode']) parts.push(`mode → ${interactive['permission_mode']}`);
     if (interactive?.['narration_mode']) parts.push(`narration → ${interactive['narration_mode']}`);
+    for (const name of datasources?.added ?? []) {
+        parts.push(`datasource "${name}" attached`);
+    }
+    for (const name of datasources?.removed ?? []) {
+        parts.push(`datasource "${name}" detached`);
+    }
+    if (datasources?.kb_deferred) {
+        parts.push('knowledge-base change applies on next resume');
+    }
     return parts;
 }
 
@@ -2504,12 +2523,25 @@ export class PersistentChatService {
 
     /** Update session config (model, temperature, etc.) at runtime.
      *
+     * `datasourceIds` (Slice B) rides the same frame as a sibling key: the
+     * desired FULL datasource selection (undefined = no change, [] = detach
+     * all) — the agent forwards it on the grant-checked internal PATCH and
+     * re-wires connections/tools at the next turn boundary.
+     *
      * Returns the request_id sent with the frame; the agent echoes it on
      * the matching `config.changed` ack (or `error` frame), so callers with
      * several in-flight updates can correlate outcomes. */
-    updateConfig(config: Record<string, unknown>): string {
+    updateConfig(config: Record<string, unknown>, datasourceIds?: string[]): string {
         const requestId = crypto.randomUUID();
-        this._sendControl({method: 'config.update', config, request_id: requestId});
+        const frame: Record<string, unknown> = {
+            method: 'config.update',
+            config,
+            request_id: requestId,
+        };
+        if (datasourceIds !== undefined) {
+            frame['datasource_ids'] = datasourceIds;
+        }
+        this._sendControl(frame);
         return requestId;
     }
 
@@ -2807,7 +2839,13 @@ export class PersistentChatService {
                 // the ack is broadcast + journaled, so every viewer — live or
                 // replaying — sees which config produced the next answers.
                 const applied = params['applied'] as Record<string, unknown> | undefined;
-                const stamp = applied ? describeAppliedConfig(applied) : [];
+                const dsChange = params['datasources'] as
+                    | AppliedDatasourceChange
+                    | undefined;
+                const stamp =
+                    applied || dsChange
+                        ? describeAppliedConfig(applied ?? {}, dsChange)
+                        : [];
                 if (stamp.length) {
                     this._systemMessage(
                         `Session settings updated: ${stamp.join(' · ')} — applies from the next response.`,

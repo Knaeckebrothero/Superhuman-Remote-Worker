@@ -271,6 +271,11 @@ class PersistentSession:
     knowledge_bindings: List[Any] = field(default_factory=list)
     # Parent clients for cleanup (e.g. MongoClient)
     _datasource_clients: Dict[str, Any] = field(default_factory=dict)
+    # Raw datasource payloads (orchestrator-shaped dicts) currently attached —
+    # the diff baseline + datasources.md input for live datasource changes
+    # (live_session_settings.md Slice B). Set at attach; replaced by
+    # resetup_datasources().
+    datasource_configs: List[Dict[str, Any]] = field(default_factory=list)
 
     # Per-tool-call approval decisions (tool_call_id -> 'approved'|'denied').
     # Populated by the WS permission_check; consumed at turn save so the
@@ -1280,6 +1285,21 @@ class PersistentSession:
                 except ValueError:
                     logger.debug(f"Tool not implemented: {name}")
 
+        if not self.tools:
+            # Floor rule (live_session_settings.md Slice B, provider research):
+            # never rebind to an EMPTY toolset when history may contain tool
+            # calls — proxies 400, Anthropic degrades to empty responses,
+            # strict chat templates crash. Structurally the session task tools
+            # are always appended above, so this only fires if every candidate
+            # failed to instantiate — keep a minimal built-in belt anyway.
+            logger.warning(
+                "Toolset resolved empty — binding minimal session task tools "
+                "(never-bind-zero floor)"
+            )
+            self.tools = load_tools(
+                ["task_add", "task_complete", "task_list"], self.tool_context
+            )
+
         # The model-facing skill menu follows tools that actually instantiated,
         # not merely configured candidates. This fails closed if a Canvas
         # adapter or persistent identity was unavailable during registration.
@@ -1359,6 +1379,152 @@ class PersistentSession:
         logger.info(
             f"Re-derived {len(self.tools)} tools after backend swap ({backend_name})"
         )
+
+    def resetup_datasources(
+        self, new_datasources: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Apply a live datasource selection change (live_session_settings.md
+        Slice B).
+
+        Rebuilds the type-keyed connection registry from the NEW full payload
+        through the same path attach takes (``process_datasources`` sorts
+        read-only first, so a read-write entry wins a mixed same-type slot and
+        multi-same-type stays correct by construction), applies the derived
+        tool categories directly to ``config.tools`` (the validated session
+        tools override's closed vocabulary silently drops sql/graph/mongodb/
+        webdav, so they must never ride ``config.update``), clones added
+        repositories, rewrites the datasources.md index, and re-derives +
+        rebinds the toolset — which also rebuilds the system prompt for the
+        per-turn ``messages[0]`` refresh (P0.1).
+
+        The REPLACED connections are NOT closed here: bound tools captured
+        them in closures at load time, so an in-flight turn's call would error
+        mid-turn. They are returned under ``stale_connections`` /
+        ``stale_clients``; the caller must close them once no turn is
+        executing (deferred-close rule — "changes apply at the next turn" in
+        both directions).
+
+        kb-type datasources are out of scope for live changes (v1): their
+        knowledge bindings wire into memory/KB machinery that ToolContext
+        holds a copy of. Existing kb entries pass through untouched; a changed
+        kb selection takes effect on the next attach.
+
+        Repository removals keep their clone + SSH key on the workspace
+        (cheap honesty — scrubbing is not a security boundary) but drop the
+        ``source_repos`` registration. A live repository ADD whose clone name
+        collides with an existing clone fails that one clone with a warning
+        (the existing clone is never touched); a resume re-resolves suffixed
+        names over the full list.
+
+        Args:
+            new_datasources: Full datasource payload for the thread, as
+                returned by ``GET /api/agents/threads/{id}/workspace``.
+
+        Returns:
+            Summary dict: ``added``/``removed`` display names (transcript
+            stamp), ``stale_connections``/``stale_clients`` (caller's
+            deferred close), ``kb_deferred`` when a kb change was skipped.
+        """
+        from ..core.datasource_setup import (
+            clone_repository_datasources,
+            datasource_tool_categories,
+            inject_datasource_index,
+            process_datasources,
+            resolve_repo_clone_names,
+        )
+
+        if not self.tool_context:
+            logger.warning("resetup_datasources called before tool setup — skipping")
+            return {
+                "added": [],
+                "removed": [],
+                "stale_connections": {},
+                "stale_clients": {},
+            }
+
+        new_configs = list(new_datasources or [])
+        old_configs = list(self.datasource_configs or [])
+
+        # The internal payload strips datasource ids, so identity for the
+        # add/remove summary is (type, name) — unique enough for display and
+        # for repository clone bookkeeping (clone names derive from names).
+        def _key(ds: Dict[str, Any]) -> str:
+            return f"{ds.get('type')}:{ds.get('name')}"
+
+        old_keys = {_key(ds) for ds in old_configs}
+        new_keys = {_key(ds) for ds in new_configs}
+        added = [ds for ds in new_configs if _key(ds) not in old_keys]
+        removed = [ds for ds in old_configs if _key(ds) not in new_keys]
+
+        kb_changed = any(ds.get("type") == "kb" for ds in added + removed)
+        if kb_changed:
+            logger.warning(
+                "kb-type datasource selection changed live — knowledge "
+                "bindings apply on the next attach, not mid-session"
+            )
+
+        non_repo = [
+            ds for ds in new_configs if ds.get("type") not in ("repository", "kb")
+        ]
+        new_conns, new_clients, cli_ds_types = process_datasources(non_repo)
+
+        stale_connections = dict(self.datasources)
+        stale_clients = dict(self._datasource_clients)
+        # ToolContext shares this dict by REFERENCE — mutate in place, never
+        # rebind, or live tools keep reading the orphaned old registry.
+        self.datasources.clear()
+        self.datasources.update(new_conns)
+        self._datasource_clients = new_clients
+
+        for category, names in datasource_tool_categories(new_configs).items():
+            setattr(self.config.tools, category, list(names))
+        self.config.extra["_cli_datasources"] = cli_ds_types
+
+        added_repos = [ds for ds in added if ds.get("type") == "repository"]
+        removed_repos = {_key(ds) for ds in removed if ds.get("type") == "repository"}
+        if added_repos and self.workspace_manager:
+            try:
+                clone_repository_datasources(added_repos, self.workspace_manager)
+            except Exception as e:
+                logger.warning("Live repository clone failed: %s", e)
+        if removed_repos and self.workspace_manager:
+            # Resolve clone names over the OLD full repo list (payload order)
+            # so collision suffixes match what attach actually registered.
+            old_repos = [ds for ds in old_configs if ds.get("type") == "repository"]
+            for ds, clone_name in zip(old_repos, resolve_repo_clone_names(old_repos)):
+                if _key(ds) in removed_repos:
+                    self.workspace_manager.source_repos.pop(clone_name, None)
+
+        self.datasource_configs = new_configs
+
+        if self.workspace_manager:
+            # inject_datasource_index rewrites (cuts the previous section), so
+            # connection names stay truthful for the next turn — including the
+            # explicit "no datasources" state after a remove-all.
+            try:
+                inject_datasource_index(new_configs, self.workspace_manager)
+            except Exception as e:
+                logger.warning("Failed to rewrite datasource index: %s", e)
+
+        self.resetup_tools_for_backend()
+
+        summary: Dict[str, Any] = {
+            "added": [ds.get("name", "unnamed") for ds in added],
+            "removed": [ds.get("name", "unnamed") for ds in removed],
+            "stale_connections": stale_connections,
+            "stale_clients": stale_clients,
+        }
+        if kb_changed:
+            summary["kb_deferred"] = True
+        logger.info(
+            "Datasources re-set up live: %d attached (%d added, %d removed), "
+            "%d connections",
+            len(new_configs),
+            len(added),
+            len(removed),
+            len(new_conns),
+        )
+        return summary
 
     def _bind_tools(self) -> None:
         """Bind tools to LLM."""
