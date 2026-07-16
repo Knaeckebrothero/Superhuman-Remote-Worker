@@ -101,6 +101,7 @@ build {
       "files/management-daemon.py",
       "files/management-daemon.service",
       "files/code-server-config.yaml",
+      "files/code-server.service",
       "files/sudo-gated.service",
       "files/sudo-gated.socket",
       "files/sudo-gated-config.yaml",

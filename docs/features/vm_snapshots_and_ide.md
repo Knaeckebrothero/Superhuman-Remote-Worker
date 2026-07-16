@@ -26,7 +26,7 @@ The goal: **click "IDE" on any job, any time, and get back the full environment 
 | Scenario | Today | With this feature |
 |----------|-------|-------------------|
 | Completed VM job (1 week old) | Gitea browse only | Restore VM from S3 snapshot, code-server in ~30s |
-| Running VM job | Code-server on live VM | Same (no change) |
+| Running VM job | **Broken** — proxy 504s (code-server absent + orchestrator off-mesh) | Code-server on the live VM via the agent tunnel — see [Live-VM IDE Access via the Agent](#live-vm-ide-access-via-the-agent) |
 | Cluster pod job (no VM) | Gitea browse only | Snapshot pod FS on completion, restore into VM for IDE |
 | Failed job debugging | Read logs, workspace.md | Restore exact environment, reproduce the failure |
 | Job resume after cluster maintenance | Fresh VM, checkpoint replay | Restore snapshotted VM, resume with full env state |
@@ -251,6 +251,8 @@ User clicks "IDE" on job_abc123
 ```
 
 #### Network Routing
+
+> **Superseded for live-VM jobs (2026-07-16).** This describes the restored-instance path and is optimistic even there: the orchestrator has **no route to mesh VMs**, so restores land in an in-cluster IDE **pod** (reachable), not a NodePort-exposed VM, and a *live* VM's code-server is reachable only through the agent. See [Live-VM IDE Access via the Agent](#live-vm-ide-access-via-the-agent).
 
 Restored VMs are on the agent cluster, same as job VMs. Code-server is accessed through the same path:
 
@@ -622,3 +624,62 @@ SNAPSHOT_MAX_SIZE_GB=10
 4. **Multi-user concurrent IDE access?** Yes, allow by default. Code-server handles multiple connections natively. Sessions are ephemeral — no conflict risk. May add cursor awareness in a future iteration.
 
 5. **Snapshot + checkpoint resume integration?** Yes — integrate both systems. When resuming a failed/paused job, the orchestrator automatically restores the S3 snapshot into a fresh VM *before* replaying the LangGraph checkpoint. This provides true "pick up where you left off" (environment + state). The resume flow becomes: find latest snapshot → provision VM → extract snapshot → inject checkpoint → start agent.
+
+---
+
+## Live-VM IDE Access via the Agent
+
+> **Added 2026-07-16** after a production `Gateway time-out (504)` clicking IDE on a *live* VM job (`4eba7f2f`, project `68137e29`, loop/VM backend). Root-cause detail in the `project_vm_ide_proxy_offmesh_unreachable` memory. **This section supersedes the "Running VM job → Same (no change)" row and the "Network Routing" note above** — the live-VM leg was never actually wired.
+
+### The gap
+
+Everything above solves IDE for **absent** environments: snapshot → restore into an **in-cluster IDE pod** the orchestrator can reach directly (`_restore_snapshot_container`; see `docs/done/ide_snapshot_restore_routed_to_vm_always_fails.md`). But a **live** VM job's workspace is a QEMU/Headscale-mesh VM holding the *current* state — you cannot substitute a restored pod, and the orchestrator (which hosts `/api/ide/{id}/proxy/`) is **not on the mesh**. `IdeProxyService._extract_pod_ip` resolves the VM branch to `vm.pod_ip or vm.ssh_host` — there is no cluster `pod_ip` for a NATS/QEMU VM, so it returns the `100.64.x.x` Tailscale `ssh_host`, the SYN black-holes, and the request hangs into a Cloudflare 504.
+
+Broken at five layers, most-fundamental first:
+
+1. **code-server isn't installed on the VM.** `agent-vm-base` stages `code-server-config.yaml` but no `provision-stage*.sh` installs the binary. Verified on the live VM: `command -v code-server` → not found, nothing on `:8080`, `curl localhost:8080` refused.
+2. **Nothing starts it for a live job** even if installed — `get_session_status` (`ide_session.py:119-127`) reports `active` off `vm.status == "ready"` alone, with no reachability/readiness check.
+3. **The orchestrator can't reach the mesh VM** (`lo`+`eth0` only; the already-known "orchestrator has no route to tailnet targets" issue — `nats_bridge.py:640-652`, `orchestrator_can_reach()` in `ssh_helpers.py`).
+4. **Wrong port** — the proxy hardcodes `:38080` (`main.py:13940`, the container port); the VM config binds `:8080`.
+5. **VM firewall + auth** — over the mesh the VM answers only `:22`; code-server's `auth: password` token isn't supplied. (Containers work because none of these hold: cluster pod IP, `:38080`, no auth, NetworkPolicy opens orchestrator→:38080.)
+
+### Design: proxy through the agent; transport chosen per resolved target
+
+Transport is a **property of the resolved workspace instance, not the job**. `_extract_pod_ip` already resolves in precedence order; the proxy picks *how* to reach whatever came back:
+
+| Resolved target | Orchestrator can reach? | Transport |
+|---|---|---|
+| Restored IDE pod (`ide_session.pod_ip`) | Yes — cluster IP | **Direct** HTTP/WS → `pod_ip:38080` (exists) |
+| Live container workspace (`workspace_container.pod_ip`) | Yes — cluster IP | **Direct** → `pod_ip:38080` (exists) |
+| Live VM, agent alive | No — mesh IP | **Via agent**: SSH `direct-tcpip` → VM `127.0.0.1:8080` (new) |
+| Live VM, agent gone | No | **Fallback**: restore-into-pod (the offline path) |
+
+For the live-VM case the **agent** is the only component that is both on the mesh (`tailscale0`) and already holds an authenticated SSH transport to the VM (`RemoteBackend`, `src/core/backends/remote.py`). It opens a request-scoped `direct-tcpip` channel to the VM's loopback code-server — the exact primitive Dynamic Canvas already uses (`orchestrator/services/canvas_ssh.py`, `CANVAS_LOOPBACK_HOST = "127.0.0.1"`), and which the VM's sshd is already configured to permit (`AllowTcpForwarding local` + `PermitOpen 127.0.0.1:*`, `provision-stage2.sh`). The orchestrator proxies to the agent's HTTP server (cluster-internal, the same path job dispatch already uses), and the agent shuttles bytes across the SSH channel.
+
+Because the channel terminates on VM loopback and access is gated by the orchestrator's existing `require_approved_user` + `user_can_access_ide_entity`, code-server runs **`auth: none`** bound to **`127.0.0.1:8080`** — the same trust model as container workspaces, and it deletes the daemon-token problem entirely.
+
+### Component changes
+
+- **Golden image** (`docker/agent-vm-base`): install code-server in `provision-stage1.sh` (pinned `.deb` + SHA256, mirroring the rclone block); rewrite `code-server-config.yaml` → `bind-addr: 127.0.0.1:8080`, `auth: none`, `agent-host` paths, folder `/home/agent-host/workspace`; `provision-stage2.sh` actually installs the config (today it is dead-lettered in `/tmp`) plus a **disabled** `code-server.service`.
+- **Management daemon** (`management-daemon.py`): start code-server on IDE request (`systemctl start`) and report readiness; on-demand keeps RAM free during headless runs.
+- **Agent** (`src/api/*`, `src/core/backends/remote.py`): an IDE-proxy endpoint that opens a `direct-tcpip` channel to `127.0.0.1:8080` and forwards HTTP + WebSocket.
+- **Orchestrator** (`ide_proxy.py`, `main.py` `ide_proxy_http`/`ide_proxy_ws`): resolution-ladder routing — for a live VM job route to the agent pod IP (from `assigned_agent_id`), not the mesh IP; stop hardcoding `:38080`.
+- **`get_session_status`** (`ide_session.py:119-127`): gate `active` on real code-server readiness (daemon/agent probe), not `vm.status == "ready"`; if live VM but agent gone → offer restore-into-pod.
+- **Stop-gap** (ship first, zero infra risk): fail-fast `502` in the proxy when the resolved target is an unreachable mesh IP (reuse `orchestrator_can_reach`) instead of hanging into a CF 504; don't advertise the live-VM IDE URL until readiness is real.
+
+### Phase 6: Live-VM IDE (checklist)
+
+- [ ] Install code-server in the VM golden image (stage1, pinned)
+- [ ] code-server config → loopback + `auth: none` + `agent-host` paths; install via stage2 + disabled systemd unit
+- [ ] Management daemon: start-on-demand + readiness signal
+- [ ] Agent IDE tunnel: `direct-tcpip` to `127.0.0.1:8080`, HTTP+WS proxy endpoint (reuse the `canvas_ssh` pattern)
+- [ ] Orchestrator proxy: resolution-ladder routing (VM → agent), port-by-backend
+- [ ] `get_session_status` readiness gate + agent-down → restore fallback
+- [ ] Stop-gap: fail-fast proxy + don't advertise until ready
+- [ ] Verify on the loop VM backend end-to-end (a live edit is visible in the browser)
+
+### Open questions
+
+- **Reuse the canvas-gateway instead of the agent?** If a canvas-gateway already reaches live VMs on the mesh for live-preview, the IDE could ride the same path and skip the agent hop. Worth confirming whether Canvas live-preview actually works on VM workspaces today (same reachability class).
+- **Concurrency**: the agent runs the job over the same SSH transport; extra `direct-tcpip` channels multiplex fine but heavy IDE traffic could contend — a second SSH connection for the tunnel is the escape hatch.
+- **Offline-path stability**: the restore-into-pod fallback is itself still stabilizing (`ide_snapshot_restore_routed_to_vm_always_fails.md` round-1 smoke; a leaked `ide-7e45c299-435` pod was still being reaped in prod logs on 2026-07-16). Confirm it is green before leaning on it as the agent-down fallback.
