@@ -20,8 +20,11 @@ Production Helm renders never receive an application-database administrator
 credential and never create this role. The operator applies the packaged
 least-privilege SQL out of band, then either points
 `canvas.livePreview.viewer.database.credentials.existingSecret` at a Secret
-containing only the restricted username and password or selects the conditional
-ESO mapping with `credentials.vaultPath`.
+containing only the restricted password or selects the conditional
+ESO mapping with `credentials.vaultPath`. The role NAME is chart
+configuration (`database.username`, delivered through the gateway's
+allowlisted ConfigMap), never secret material — the credential contract is
+one key.
 
 ## Preconditions
 
@@ -86,9 +89,10 @@ operator:
 The homelab deployment uses the chart's feature-gated ESO path. Set
 `canvas.livePreview.viewer.database.credentials.vaultPath` to
 `homelab/superhuman-remote-worker/canvas-gateway-db`; when—and only when—
-`canvas.livePreview.viewer.enabled=true`, the SRW chart maps the
-`CANVAS_VIEWER_POSTGRES_USER` and `CANVAS_VIEWER_POSTGRES_PASSWORD` properties
-(one naming convention with the main bundle's `AUDIT_POSTGRES_*` et al) into
+`canvas.livePreview.viewer.enabled=true`, the SRW chart maps the single
+`CANVAS_VIEWER_POSTGRES_PASSWORD` property (one naming convention with the
+main bundle's `AUDIT_POSTGRES_*` et al; the username comes from
+`database.username` via the gateway ConfigMap) into
 `srw-canvas-gateway-db`. Merely configuring the path
 while the gateway is disabled creates no ExternalSecret and makes no provider
 request, matching the lifecycle of other optional workloads. Populate the Vault
@@ -136,7 +140,6 @@ canvas:
           create: false
           existingSecret: ""
           vaultPath: homelab/superhuman-remote-worker/canvas-gateway-db
-          usernameKey: CANVAS_VIEWER_POSTGRES_USER
           passwordKey: CANVAS_VIEWER_POSTGRES_PASSWORD
         provisionRole: false
 ```

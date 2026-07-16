@@ -35,6 +35,11 @@ data:
   CANVAS_VIEWER_POSTGRES_HOST: {{ include "srw.postgresHost" . | quote }}
   CANVAS_VIEWER_POSTGRES_PORT: {{ include "srw.postgresPort" . | quote }}
   CANVAS_VIEWER_POSTGRES_DB: {{ include "srw.postgresDb" . | quote }}
+  # The role NAME is configuration, not secret material: it is pinned by
+  # database.username and single-sourced here so the Secret/Vault contract is
+  # one key (the password) and the login can never drift from the role the
+  # reconciler provisioned.
+  CANVAS_VIEWER_POSTGRES_USER: {{ $viewer.database.username | quote }}
   CANVAS_VIEWER_POSTGRES_MIN_CONNECTIONS: {{ $viewer.database.pool.min | int | quote }}
   CANVAS_VIEWER_POSTGRES_MAX_CONNECTIONS: {{ $viewer.database.pool.max | int | quote }}
   LOG_LEVEL: {{ .Values.logLevel | quote }}
