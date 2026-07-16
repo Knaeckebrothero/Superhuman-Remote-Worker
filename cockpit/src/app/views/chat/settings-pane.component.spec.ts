@@ -20,6 +20,8 @@ import {SettingsPaneComponent} from './settings-pane.component';
 function createPane(options: {
   override?: Record<string, unknown>;
   grants?: Record<string, unknown> | null;
+  attachedIds?: string[];
+  eligible?: Array<{id: string; type: string; name: string}>;
 } = {}) {
   const chat = {
     threadId: signal<string | null>('thread-1'),
@@ -37,9 +39,15 @@ function createPane(options: {
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
-      of({metadata: {config_override: options.override ?? {}, datasource_ids: []}}),
+      of({
+        metadata: {
+          config_override: options.override ?? {},
+          datasource_ids: options.attachedIds ?? [],
+        },
+        project_ids: [],
+      }),
     ),
-    getDatasources: vi.fn().mockReturnValue(of([])),
+    getEligibleDatasources: vi.fn().mockReturnValue(of(options.eligible ?? [])),
   };
   const capabilities = {grants: signal(options.grants ?? null)};
   const modelService = {load: vi.fn()};
@@ -59,6 +67,15 @@ function createPane(options: {
   const fakeSettings = {
     prefillFromConfig: vi.fn(),
     getOverrides: vi.fn().mockReturnValue({}),
+    // Real group defaults its selection to the attached set (via
+    // initialSelectedIds); mirror that default here.
+    getSelectedDatasourceIds: vi.fn(
+      () =>
+        (options.attachedIds ?? []).filter((id) =>
+          (options.eligible ?? []).some((ds) => ds.id === id),
+        ),
+    ),
+    resetDatasourceSelection: vi.fn(),
   };
   Object.defineProperty(component, 'settings', {value: () => fakeSettings});
   TestBed.tick(); // fire the load effect
@@ -148,6 +165,105 @@ describe('SettingsPaneComponent apply diff', () => {
     component.onSettingsChange();
     vi.runAllTimers();
     expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SettingsPaneComponent datasources (Slice B)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+
+  const PG = {id: 'ds-pg', type: 'postgresql', name: 'PG'};
+  const WEB = {id: 'ds-web', type: 'webdav', name: 'Cloud'};
+
+  it('a datasource toggle dispatches the FULL desired set, never a delta', () => {
+    const {component, chat, fakeSettings} = createPane({
+      attachedIds: ['ds-pg'],
+      eligible: [PG, WEB],
+    });
+    fakeSettings.getSelectedDatasourceIds.mockReturnValue(['ds-pg', 'ds-web']);
+
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({}, ['ds-pg', 'ds-web']);
+  });
+
+  it('attached ids the picker cannot show survive every dispatch', () => {
+    const {component, chat, fakeSettings} = createPane({
+      attachedIds: ['ds-pg', 'kb-hidden'],
+      eligible: [PG, WEB],
+    });
+    // Uncheck postgres; kb-hidden never rendered (not eligible/kb-hidden) —
+    // dropping it silently would detach it server-side.
+    fakeSettings.getSelectedDatasourceIds.mockReturnValue([]);
+
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({}, ['kb-hidden']);
+  });
+
+  it('a config-only edit sends no datasource_ids at all', () => {
+    const {component, chat, fakeSettings} = createPane({
+      attachedIds: ['ds-pg'],
+      eligible: [PG],
+    });
+    fakeSettings.getOverrides.mockReturnValue({llm: {model: 'minimax-m3'}});
+
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({llm: {model: 'minimax-m3'}});
+  });
+
+  it('pairwise preservation: model pin then datasource toggle — each dispatch carries only its own change', () => {
+    const {component, chat, fakeSettings} = createPane({
+      attachedIds: ['ds-pg'],
+      eligible: [PG, WEB],
+    });
+    fakeSettings.getOverrides.mockReturnValue({llm: {model: 'minimax-m3'}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenNthCalledWith(1, {llm: {model: 'minimax-m3'}});
+
+    fakeSettings.getSelectedDatasourceIds.mockReturnValue(['ds-pg', 'ds-web']);
+    component.onSettingsChange();
+    vi.runAllTimers();
+    // The datasource dispatch must not re-send (or reset) the model pin.
+    expect(chat.updateConfig).toHaveBeenNthCalledWith(2, {}, ['ds-pg', 'ds-web']);
+    expect(chat.updateConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it('pairwise preservation: datasource toggle then permission mode — the mode verb fires without a datasource resend', () => {
+    const {component, chat, fakeSettings} = createPane({
+      attachedIds: [],
+      eligible: [PG],
+    });
+    fakeSettings.getSelectedDatasourceIds.mockReturnValue(['ds-pg']);
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({}, ['ds-pg']);
+
+    fakeSettings.getOverrides.mockReturnValue({interactive: {permission_mode: 'autonomous'}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.setMode).toHaveBeenCalledExactlyOnceWith('autonomous');
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('unattached kb datasources are hidden from the picker; attached ones render locked', () => {
+    const KB_ATTACHED = {id: 'kb-1', type: 'kb', name: 'Docs KB'};
+    const KB_FOREIGN = {id: 'kb-2', type: 'kb', name: 'Other KB'};
+    const {component} = createPane({
+      attachedIds: ['kb-1'],
+      eligible: [PG, KB_ATTACHED, KB_FOREIGN],
+    });
+
+    expect(component.pickerDatasources().map((d) => d.id)).toEqual(['ds-pg', 'kb-1']);
+    expect(component.lockedDatasourceIds()).toEqual(['kb-1']);
   });
 });
 

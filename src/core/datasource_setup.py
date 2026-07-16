@@ -920,6 +920,12 @@ def inject_datasource_index(
     Lists every datasource with its specific named access method so the
     agent knows how to connect to each one. The system prompts point the
     agent at datasources.md for connection names.
+
+    Rewrites rather than re-appends: any existing "## Available Datasources"
+    section (historically always the trailing section — it is only ever
+    appended after workspace init) is cut before the new one is written, so
+    live datasource changes (live_session_settings.md Slice B) re-running
+    this injection never duplicate the index.
     """
     lines = ["\n\n## Available Datasources\n"]
 
@@ -1027,11 +1033,21 @@ def inject_datasource_index(
                 lines.append(f"- **{name}** ({ds_type}){_declared_ro_note(ds)}")
         lines.append("")
 
+    if not ds_configs:
+        # A live remove-all still needs the section rewritten — an agent
+        # re-reading the file must not act on connection names that no
+        # longer resolve.
+        lines.append("_No datasources attached._")
+        lines.append("")
+
     try:
         try:
             existing = workspace_manager.read_file("datasources.md")
         except (FileNotFoundError, ValueError, OSError):
             existing = ""
+        marker = existing.find("## Available Datasources")
+        if marker != -1:
+            existing = existing[:marker].rstrip("\n")
         workspace_manager.write_file("datasources.md", existing + "\n".join(lines))
         logger.info(
             "Injected datasource index (%d entries) into datasources.md",

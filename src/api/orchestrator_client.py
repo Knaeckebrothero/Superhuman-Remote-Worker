@@ -906,7 +906,10 @@ class OrchestratorClient:
             return False
 
     async def update_thread_config(
-        self, thread_id: str, config_override: dict[str, Any]
+        self,
+        thread_id: str,
+        config_override: dict[str, Any],
+        datasource_ids: Optional[list[str]] = None,
     ) -> Optional[dict[str, Any]]:
         """Persist runtime config changes for a thread.
 
@@ -914,6 +917,13 @@ class OrchestratorClient:
             thread_id: Thread UUID
             config_override: Partial config dict to deep-merge
                              (e.g. ``{"llm": {"model": "..."}}``)
+            datasource_ids: Desired FULL datasource selection (live_session_
+                            settings.md Slice B). ``None`` = no change;
+                            ``[]`` = detach all. The orchestrator authorizes,
+                            grant-checks the derived tool flip, and persists
+                            ``metadata.datasource_ids``; the caller then
+                            re-fetches ``get_thread_workspace`` for the
+                            enriched datasource payloads.
 
         Returns:
             The orchestrator-enriched ``config_override`` (with resolved
@@ -931,8 +941,11 @@ class OrchestratorClient:
         if not self._client:
             return None
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/config"
+        payload: dict[str, Any] = {"config_override": config_override}
+        if datasource_ids is not None:
+            payload["datasource_ids"] = [str(v) for v in datasource_ids]
         try:
-            r = await self._client.patch(url, json={"config_override": config_override})
+            r = await self._client.patch(url, json=payload)
             if r.status_code != 200:
                 if 400 <= r.status_code < 500:
                     try:

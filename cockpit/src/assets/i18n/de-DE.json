@@ -2160,7 +2160,8 @@
     "datasources": {
       "group": "Datenquellen",
       "loading": "Datenquellen werden geladen…",
-      "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse."
+      "notReady": "Noch nicht vollständig indiziert — der Agent sieht möglicherweise unvollständige Ergebnisse.",
+      "lockedLive": "Wissensdatenbanken können während einer Session nicht geändert werden"
     },
     "execution": {
       "group": "Ausführung",
@@ -2316,7 +2317,7 @@
     },
     "live": {
       "cacheNote": "Änderungen gelten ab der nächsten Antwort. Das Ändern von Tools, Datenquellen oder des Modells setzt den Prompt-Cache der Unterhaltung zurück — die nächste Antwort verarbeitet den gesamten Verlauf neu, was langsamer ist und für diesen Zug spürbar mehr kosten kann.",
-      "datasourcesReadOnly": "Datenquellen werden derzeit beim Erstellen der Session festgelegt — angehängte Quellen werden zur Referenz angezeigt."
+      "datasourcesLive": "Datenquellen-Änderungen gelten ab der nächsten Antwort; entfernte Verbindungen werden nach Abschluss des laufenden Zugs geschlossen. Bereits gelesene Inhalte bleiben im Kontext des Agenten."
     }
   },
   "agentList": {

@@ -104,12 +104,14 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
           <app-datasources-group
             [datasources]="datasources()"
             [loading]="loadingDatasources()"
-            [disabled]="disabled() || mode() === 'live'"
-            [isLiteBackend]="advancedAccordion?.isLiteBackend() ?? false"
+            [disabled]="disabled()"
+            [isLiteBackend]="mode() === 'live' ? liteBackend() : (advancedAccordion?.isLiteBackend() ?? false)"
+            [initialSelectedIds]="mode() === 'live' ? initialDatasourceIds() : null"
+            [lockedIds]="lockedDatasourceIds()"
             (change)="onChange()"
           />
           @if (mode() === 'live') {
-            <p class="cache-note">{{ 'agentSettings.live.datasourcesReadOnly' | transloco }}</p>
+            <p class="cache-note">{{ 'agentSettings.live.datasourcesLive' | transloco }}</p>
           }
 
           <!-- Modified count summary -->
@@ -250,6 +252,15 @@ export class AgentSettingsComponent {
   /** Available datasources. */
   datasources = input<Datasource[]>([]);
   loadingDatasources = input(false);
+  /** Live mode: the session's currently attached selection — the picker's
+   *  default when untouched (live_session_settings.md Slice B). */
+  initialDatasourceIds = input<string[] | null>(null);
+  /** Live mode: entries frozen at their current state (kb-type — knowledge
+   *  bindings only rewire on attach). */
+  lockedDatasourceIds = input<string[]>([]);
+  /** Live mode: whether the session runs a lite backend (virtual/none) — the
+   *  Advanced accordion that normally derives this is hidden in live mode. */
+  liteBackend = input(false);
   /** Expert detail loading state. */
   loadingExpert = input(false);
 
@@ -305,8 +316,9 @@ export class AgentSettingsComponent {
     const exec = this.executionGroup?.modifiedCount() ?? 0;
     const model = this.modelGroup?.modifiedCount() ?? 0;
     const tools = this.toolsGroup?.modifiedCount() ?? 0;
-    // Live mode renders datasources read-only — their "selected" count is
-    // attachment state, not a pending modification, and would pin the badge.
+    // The datasources "modified count" is really the SELECTED count. In live
+    // mode that's the session's attachment state, not a pending modification,
+    // and would permanently pin the badge — exclude it.
     const ds = this.mode() === 'live' ? 0 : (this.datasourcesGroup?.modifiedCount() ?? 0);
     return exec + model + tools + ds;
   });
@@ -342,6 +354,13 @@ export class AgentSettingsComponent {
   /** Return selected datasource IDs (not part of config_override). */
   getSelectedDatasourceIds(): string[] {
     return this.datasourcesGroup?.getSelectedIds() ?? [];
+  }
+
+  /** Drop any in-flight picker selection back to the default (live mode:
+   *  the attached set). The pane calls this on thread load so a pin made
+   *  while the fetch was in flight can't leak into the diff baseline. */
+  resetDatasourceSelection(): void {
+    this.datasourcesGroup?.resetAll();
   }
 
   /** Return current instructions content (not part of config_override). */

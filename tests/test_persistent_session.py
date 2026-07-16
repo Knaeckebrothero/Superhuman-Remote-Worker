@@ -940,7 +940,11 @@ class TestSetupTools:
             session._setup_tools(None)
 
         # Check the names passed to load_tools
-        loaded_names = mock_load.call_args[0][0]
+        loaded_names = mock_load.call_args_list[
+            0
+        ].args[
+            0
+        ]  # first call: the real toolset (a later call may be the never-bind-zero floor)
         for excluded in _EXCLUDED_TOOLS:
             assert excluded not in loaded_names
 
@@ -1003,7 +1007,11 @@ class TestSetupTools:
         ):
             session._setup_tools(None)
 
-        loaded_names = mock_load.call_args[0][0]
+        loaded_names = mock_load.call_args_list[
+            0
+        ].args[
+            0
+        ]  # first call: the real toolset (a later call may be the never-bind-zero floor)
         for name in orch_tools:
             assert name in loaded_names
         for name in catalog_tools:
@@ -1048,7 +1056,11 @@ class TestSetupTools:
         ):
             session._setup_tools(None)
 
-        loaded_names = mock_load.call_args[0][0]
+        loaded_names = mock_load.call_args_list[
+            0
+        ].args[
+            0
+        ]  # first call: the real toolset (a later call may be the never-bind-zero floor)
         assert "checkout_project_repository" in loaded_names
 
     def test_fleet_management_can_be_disabled(self):
@@ -1084,7 +1096,11 @@ class TestSetupTools:
         ):
             session._setup_tools(None)
 
-        loaded_names = mock_load.call_args[0][0]
+        loaded_names = mock_load.call_args_list[
+            0
+        ].args[
+            0
+        ]  # first call: the real toolset (a later call may be the never-bind-zero floor)
         assert "web_search" in loaded_names
         assert "task_add" in loaded_names
         assert "create_worker_job" not in loaded_names
@@ -1127,7 +1143,11 @@ class TestSetupTools:
         ):
             session._setup_tools(None)
 
-        loaded_names = mock_load.call_args[0][0]
+        loaded_names = mock_load.call_args_list[
+            0
+        ].args[
+            0
+        ]  # first call: the real toolset (a later call may be the never-bind-zero floor)
         assert "web_search" in loaded_names
         assert "create_worker_job" in loaded_names
         assert "request_workspace_upgrade" in loaded_names
@@ -1169,7 +1189,11 @@ class TestSetupTools:
         ):
             session._setup_tools(None)
 
-        loaded_names = mock_load.call_args[0][0]
+        loaded_names = mock_load.call_args_list[
+            0
+        ].args[
+            0
+        ]  # first call: the real toolset (a later call may be the never-bind-zero floor)
         assert "web_search" in loaded_names
         assert "create_worker_job" in loaded_names
         assert "list_skills" in loaded_names
@@ -1209,7 +1233,11 @@ class TestSetupTools:
         ):
             session._setup_tools(None)
 
-        loaded_names = mock_load.call_args[0][0]
+        loaded_names = mock_load.call_args_list[
+            0
+        ].args[
+            0
+        ]  # first call: the real toolset (a later call may be the never-bind-zero floor)
         assert "read_file" in loaded_names
         assert "use_skill" in loaded_names
         assert "get_canvas" not in loaded_names
@@ -1245,7 +1273,11 @@ class TestSetupTools:
         ):
             session._setup_tools(None)
 
-        loaded_names = mock_load.call_args[0][0]
+        loaded_names = mock_load.call_args_list[
+            0
+        ].args[
+            0
+        ]  # first call: the real toolset (a later call may be the never-bind-zero floor)
         assert loaded_names.count("create_worker_job") == 1
 
     def test_value_error_fallback_to_individual_loading(self):

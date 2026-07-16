@@ -381,6 +381,44 @@ class TestUpdateThreadConfig:
             result = await client.update_thread_config("thread-1", {"llm": {}})
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_datasource_ids_ride_the_patch_payload(self, client):
+        """Slice B: the desired FULL selection travels as a sibling of
+        config_override — including an EMPTY list (detach all), which must
+        not be dropped as falsy."""
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.patch = AsyncMock(
+                return_value=self._response(
+                    200, {"status": "updated", "config_override": {}}
+                )
+            )
+            await client.update_thread_config(
+                "thread-1", {}, datasource_ids=["ds-a", "ds-b"]
+            )
+            assert mock_client.patch.call_args.kwargs["json"] == {
+                "config_override": {},
+                "datasource_ids": ["ds-a", "ds-b"],
+            }
+
+            await client.update_thread_config("thread-1", {}, datasource_ids=[])
+            assert mock_client.patch.call_args.kwargs["json"] == {
+                "config_override": {},
+                "datasource_ids": [],
+            }
+
+    @pytest.mark.asyncio
+    async def test_omitted_datasource_ids_stay_off_the_wire(self, client):
+        """None = no datasource change: the key must be absent, or the
+        orchestrator would misread every config edit as a full detach."""
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.patch = AsyncMock(
+                return_value=self._response(
+                    200, {"status": "updated", "config_override": {}}
+                )
+            )
+            await client.update_thread_config("thread-1", {"llm": {}})
+        assert "datasource_ids" not in mock_client.patch.call_args.kwargs["json"]
+
 
 class TestCreateOrchestratorClientFromEnv:
     """Tests for create_orchestrator_client_from_env function."""
