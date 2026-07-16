@@ -118,7 +118,7 @@ ingress:
     additionalOrigins:
       - "https://cockpit.superhuman-remote-worker.com"
 # -----------------------------------------------------------------------------
-# Dynamic Canvas live preview (reserved production coordinates; still dark)
+# Dynamic Canvas live preview (dev-enabled 2026-07-16, development profile)
 # -----------------------------------------------------------------------------
 # srwcanvas.works is a dedicated user-content domain, separate from the trusted
 # srw.works BFF/Keycloak cookie boundary. UUID origins live directly below the
@@ -127,12 +127,14 @@ ingress:
 #
 #   https://<origin-generation>.srwcanvas.works
 #
-# The proxied `*.srwcanvas.works` DNS record and Cloudflare Universal SSL
-# certificate are live, but no Canvas gateway route is published behind them;
-# unmatched UUID hosts intentionally return the edge's 404. Do not enable the
-# gates or assert the PSL flag yet: the exact `srwcanvas.works` private PSL
-# rule has not propagated, and the production browser matrix remains a launch
-# gate. Transport decision (2026-07-14, docs/issues/
+# The proxied `*.srwcanvas.works` DNS record, Cloudflare Universal SSL, and
+# the cloudflared wildcard ingress rule to the gateway Service are live. The
+# viewer runs the development/cookie-free posture for single-user dev
+# acceptance; do NOT assert the PSL flag or return to the production profile
+# until the exact `srwcanvas.works` private PSL rule has propagated and the
+# production browser matrix passes. The restricted DB role is provisioned
+# (2026-07-16) and its credential lives at the Vault path below.
+# Transport decision (2026-07-14, docs/issues/
 # canvas_hosted_edge_use_cloudflare_tunnel.md): the wildcard rides the
 # existing Cloudflare Tunnel to the gateway Service — Cloudflare's
 # adjacent-slash normalization is an accepted, documented property of this
@@ -143,12 +145,16 @@ ingress:
 # ExternalSecret or contact the provider until viewer.enabled=true.
 canvas:
   livePreview:
-    enabled: false
+    enabled: true
     deniedPorts: []
     viewer:
-      enabled: false
-      deploymentProfile: production
-      cookieMode: psl-isolated
+      enabled: true
+      # Dev-cluster acceptance posture (2026-07-16): the development profile
+      # with cookie-free proxying is the documented single-user testing mode —
+      # it makes no production isolation claim. Flip back to
+      # production/psl-isolated only after the PSL boundary is verified.
+      deploymentProfile: development
+      cookieMode: development-cookie-free
       domain: "srwcanvas.works"
       hostSuffix: ".srwcanvas.works"
       cockpitOrigins:
