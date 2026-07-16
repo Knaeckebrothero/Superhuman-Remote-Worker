@@ -207,6 +207,52 @@ class TestContainerInheritance:
         assert "Timed out" in msg
 
     @pytest.mark.asyncio
+    async def test_resumed_subjob_budget_anchors_on_outage_wake(self, patch_get_job):
+        """An outage-paused subjob re-dispatched hours after spawn gets a fresh
+        inherit window anchored on the outage's scheduled wake
+        (context.llm_outage.next_retry_at) — keyed on created_at, a resume 3h
+        after spawn would insta-fail on any transiently non-ready parent
+        workspace (docs/features/llm_outage_subjob_resilience.md #5)."""
+        patch_get_job(
+            {
+                "status": "waiting",
+                "context": {"workspace_container": {"status": "creating"}},
+            }
+        )
+        ctx = _inherited(container=dict(STALE_CONTAINER))
+        ctx["llm_outage"] = {
+            "attempt": 2,
+            "next_retry_at": (
+                datetime.now(timezone.utc) - timedelta(seconds=30)
+            ).isoformat(),
+        }
+        job = _subjob(ctx, age_s=3 * 3600)  # spawned 3h ago, woke 30s ago
+        assert await main._resolve_subjob_inherited_workspace(job) == ("wait", None)
+
+    @pytest.mark.asyncio
+    async def test_resumed_subjob_budget_still_bounded_after_wake(self, patch_get_job):
+        """The re-anchored window is still finite — a wake long past the budget
+        times out to fail exactly like a fresh subjob would."""
+        patch_get_job(
+            {
+                "status": "waiting",
+                "context": {"workspace_container": {"status": "creating"}},
+            }
+        )
+        ctx = _inherited(container=dict(STALE_CONTAINER))
+        ctx["llm_outage"] = {
+            "attempt": 2,
+            "next_retry_at": (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=main._INHERIT_WORKSPACE_MAX_WAIT_S + 60)
+            ).isoformat(),
+        }
+        job = _subjob(ctx, age_s=6 * 3600)
+        action, msg = await main._resolve_subjob_inherited_workspace(job)
+        assert action == "fail"
+        assert "Timed out" in msg
+
+    @pytest.mark.asyncio
     async def test_parent_workspace_failed_fails_fast(self, patch_get_job):
         patch_get_job(
             {
