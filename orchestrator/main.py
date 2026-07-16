@@ -11279,6 +11279,26 @@ async def _llm_outage_sweep_once() -> tuple[int, int]:
                     )
                 except Exception as e:
                     logger.warning(f"give-up alert failed for {job_id}: {e}")
+                # A sweep-fail is a direct DB write — no /complete ever fires,
+                # so the subjob unblock handlers never run. Without this a
+                # ceiling-failed scholar strands its parent in 'waiting'
+                # forever (no scholar-parent timeout exists); a delegation
+                # parent would wait out its full timeout. Each handler no-ops
+                # for the wrong kind; critics need nothing (the unstick
+                # watchdog returns the reviewing parent to human review).
+                # docs/features/llm_outage_subjob_resilience.md (#4)
+                if job.get("parent_job_id") is not None:
+                    failed_job = {**job, "status": "failed"}
+                    unblock_actions: list[str] = []
+                    try:
+                        await _handle_scholar_completion(failed_job, unblock_actions)
+                        await _handle_delegation_child_completion(
+                            failed_job, unblock_actions
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"sweep-fail parent unblock for {job_id} failed: {e}"
+                        )
             continue
         if await postgres_db.claim_llm_outage_redispatch(job_id):
             redispatched += 1

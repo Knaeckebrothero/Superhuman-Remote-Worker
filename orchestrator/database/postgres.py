@@ -4366,13 +4366,16 @@ class PostgresDB:
 
         Read by the outage sweeper each tick: ``status='paused'``, agent freed,
         and a ``freeze_data.next_retry_at`` that has arrived. Oldest-due first so
-        a backlog drains fairly. See
+        a backlog drains fairly. ``parent_job_id``/``creation_order`` ride along
+        so the sweeper's ceiling-fail path can run the subjob unblock handlers
+        (docs/features/llm_outage_subjob_resilience.md). See
         docs/features/llm_outage_pause_and_backoff_redispatch.md.
         """
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, config_name, context, freeze_data, user_id, project_id
+                SELECT id, config_name, context, freeze_data, user_id, project_id,
+                       parent_job_id, creation_order
                 FROM jobs
                 WHERE status = 'paused'
                   AND assigned_agent_id IS NULL
