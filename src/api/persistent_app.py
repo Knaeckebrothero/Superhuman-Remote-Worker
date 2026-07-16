@@ -4755,6 +4755,26 @@ def _safe_serialize(obj: Any) -> Any:
 _repair_tool_pairing = repair_tool_pairing
 
 
+def _sanitize_restored_history(restored: list) -> list:
+    """Slice D restore rung: normalize a restored history for the bound model.
+
+    The durable config's model may have changed while the session was
+    detached (the owner-facing offline PATCH), so rows persisted under one
+    provider can be replayed under another. Reasoning shapes are already
+    flattened at persist time (``_serialize_message_row``); what survives
+    restore verbatim is tool-call ids — remap any that don't conform to the
+    bound model's accepted format. No-op (beyond the pairing re-check) when
+    the history is native to the bound model.
+    """
+    from ..core.context import sanitize_history_for_provider_boundary
+
+    model = ""
+    if _session is not None:
+        model = getattr(getattr(_session, "config", None), "llm", None)
+        model = getattr(model, "model", "") or ""
+    return sanitize_history_for_provider_boundary(restored, model)
+
+
 def _db_rows_to_lc_messages(db_messages: list) -> list:
     """Convert ``thread_messages`` rows to LangChain messages with fresh UUIDs.
 
@@ -4909,6 +4929,7 @@ async def _restore_session_messages() -> None:
             # the tool result was saved). find_safe_slice_start already
             # guaranteed the live cut never orphaned a pair.
             restored = _repair_tool_pairing(restored)
+            restored = _sanitize_restored_history(restored)
 
             if ctx_mgr and aux and restored:
                 try:
@@ -4972,6 +4993,7 @@ async def _restore_session_messages() -> None:
         # Defense-in-depth: drop any call/result orphaned by an interrupted
         # persist (full load already eliminates truncation orphans).
         restored = _repair_tool_pairing(restored)
+        restored = _sanitize_restored_history(restored)
 
         # Bound the working context the way a live turn does. Summarizes to
         # (summary + recent) when over the token budget, else passes through.
@@ -5393,6 +5415,141 @@ async def _close_datasources_after_turn(
         logger.warning("Deferred datasource close failed: %s", e)
 
 
+async def _model_swap_fit_ladder(new_config: Any) -> Optional[str]:
+    """Fit-check ladder for a model hot-swap (live_session_settings.md Slice D).
+
+    Pre-checks the history against the *candidate* model's context budget →
+    if over, compacts now (with the old model still bound — a rejection
+    leaves the session working untouched) targeting the new budget → if
+    still over the candidate's hard window, rejects the swap. Returns None
+    when the history fits (possibly after compacting), or a user-facing
+    rejection detail. Moves the overflow discovery from the user's next
+    message (where a failed compaction dead-ends the turn) to the swap
+    itself.
+
+    ``refresh_context_limits`` still handles the threshold rebind after the
+    swap is applied; this ladder is the proactive check/compact/reject in
+    front of it.
+    """
+    from ..core.context import get_token_counter
+    from ..llm.response_guards import strip_removal_markers
+
+    session = _session
+    msgs = session.messages
+    if not msgs:
+        return None
+
+    new_ctx_cfg = session._build_context_config(new_config)
+    new_model = new_config.llm.model or "gpt-4"
+    counter = get_token_counter(new_model, getattr(new_ctx_cfg, "image_tokens", None))
+
+    live_cm = getattr(session, "context_manager", None)
+    # The provider anchor (old model's real input_tokens) is biased-high — it
+    # carries the system-prompt/tool-schema overhead the bare list lacks.
+    # Same max(local, anchor) philosophy as the per-turn trigger. The anchor
+    # minus the bare count also estimates that FIXED overhead — compaction
+    # can't shrink it, so the post-compaction verdict must add it back or a
+    # window smaller than the prompt+schemas alone slips through the ladder
+    # and 413s on the next turn (live-observed: 2.2k bare history passed a
+    # 3k window while the real request measured 17.6k).
+    anchor = 0
+    if live_cm is not None:
+        anchor = getattr(live_cm.state, "last_provider_input_tokens", None) or 0
+    bare_count = counter(msgs)
+    fixed_overhead = max(0, anchor - bare_count)
+    projected = max(bare_count, anchor)
+    if projected <= new_ctx_cfg.compaction_threshold_tokens:
+        return None
+
+    hard_cap = new_ctx_cfg.model_max_context_tokens
+    if _turn_in_flight():
+        # Compacting the durable list concurrently with a running turn can
+        # drop messages the turn appends mid-await — refuse instead.
+        return (
+            "The conversation is too large for the new model and a response "
+            "is still in progress — retry the switch once the current turn "
+            "finishes."
+        )
+
+    aux = getattr(session, "auxiliary_llm", None)
+    if live_cm is None or aux is None:
+        # No compaction machinery — allow only when the history at least fits
+        # the hard window (per-turn elision can still trim the rest).
+        if projected <= hard_cap:
+            return None
+        return (
+            f"Conversation (~{projected:,} tokens) exceeds the context window "
+            f"of {new_model} ({hard_cap:,} tokens) and no summarizer is "
+            "available to compact it — the model switch was not applied."
+        )
+
+    # Compact with the old model still bound, targeting the NEW budget: roll
+    # the live manager's limits forward for the compaction call (the
+    # _record_compaction plumbing — progress frames, boundary id, stats —
+    # reads the live manager, so a scratch manager would lose them) and roll
+    # back on failure or rejection.
+    old_ctx_cfg = session._build_context_config()
+    old_model = session.config.llm.model or "gpt-4"
+    before_count = len(msgs)
+    runs_before = getattr(live_cm, "compaction_runs", 0)
+    # Manual-compact parity: make sure progress frames flow even before the
+    # first loop start (idempotent setter; getattr for test doubles).
+    _cb_setter = getattr(live_cm, "set_progress_callback", None)
+    if callable(_cb_setter):
+        _cb_setter(_loop_compaction_progress)
+    live_cm.update_limits(new_ctx_cfg, new_model)
+    try:
+        result = await live_cm.ensure_within_limits(
+            msgs,
+            aux,
+            max_summary_length=getattr(
+                session.config.context_management, "max_summary_length", 10000
+            ),
+            force=True,
+            trigger="model_swap",
+        )
+    except Exception as e:
+        live_cm.update_limits(old_ctx_cfg, old_model)
+        logger.warning(f"Pre-switch compaction failed: {e}")
+        return (
+            "The conversation is too large for the new model and compacting "
+            f"it failed ({e}) — the model switch was not applied."
+        )
+
+    # Adopt durably (the compaction is model-agnostic — it only shrinks — so
+    # it stays valid for the old model if the swap is rejected below).
+    msgs[:] = strip_removal_markers(result)
+    runs_after = getattr(live_cm, "compaction_runs", 0)
+    if (
+        isinstance(runs_before, int)
+        and isinstance(runs_after, int)
+        and runs_after > runs_before
+    ):
+        await _record_compaction(
+            extract_summary_text(msgs),
+            before_count,
+            len(msgs),
+            trigger="model_swap",
+            ws=None,
+        )
+
+    # Recount with the anchor gone (compaction invalidated it): the local
+    # count of the compacted history plus the fixed request overhead the
+    # anchor measured — the system prompt and tool schemas ride every request
+    # and no amount of history compaction shrinks them.
+    remaining = counter(msgs) + fixed_overhead
+    if remaining > hard_cap:
+        live_cm.update_limits(old_ctx_cfg, old_model)
+        return (
+            f"Conversation still measures ~{remaining:,} tokens after "
+            "compaction (including the system prompt and tool schemas) — "
+            f"more than the context window of {new_model} ({hard_cap:,} "
+            "tokens). The model switch was not applied; start a new session "
+            "to use this model."
+        )
+    return None
+
+
 async def _handle_config_update(
     ws: WebSocket,
     config_override: Dict[str, Any],
@@ -5571,6 +5728,39 @@ async def _handle_config_update(
         # Rebuild chat LLM if llm settings changed
         if llm_changed:
             new_llm = create_llm(new_config.llm, new_config.limits)
+
+            # Slice D — model hot-swap hardening. Only when the model itself
+            # changes (temperature-only llm fragments skip both rungs):
+            # 1. fit ladder: history must fit the candidate's window
+            #    (compacting first if needed) or the swap is refused;
+            # 2. provider-boundary sanitizer when the swap crosses a
+            #    family/provider line: foreign reasoning + tool-call id
+            #    formats are the #1 cross-provider session killer.
+            old_llm_cfg = _session.config.llm
+            model_swapped = bool(
+                (effective_override.get("llm") or {}).get("model")
+            ) and (new_config.llm.model != old_llm_cfg.model)
+            if model_swapped:
+                rejection = await _model_swap_fit_ladder(new_config)
+                if rejection is not None:
+                    await _send_error("Model switch rejected", detail=rejection)
+                    return
+                from ..core.context import sanitize_history_for_provider_boundary
+                from ..core.model_registry import family_of
+
+                crossed_boundary = family_of(new_config.llm.model or "") != family_of(
+                    old_llm_cfg.model or ""
+                ) or (new_config.llm.provider or "openai") != (
+                    old_llm_cfg.provider or "openai"
+                )
+                if crossed_boundary and _session.messages:
+                    # In-memory working set only — persisted thread_messages
+                    # rows stay provider-native. Pure-sync, so safe even with
+                    # a turn in flight (appends land in the same list object).
+                    _session.messages[:] = sanitize_history_for_provider_boundary(
+                        _session.messages, new_config.llm.model or ""
+                    )
+
             _session._llm = new_llm
             _session.config = new_config
             logger.info(

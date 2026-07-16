@@ -1586,14 +1586,17 @@ class PersistentSession:
                 logger.warning(f"Failed to restore {cp['path']}: {e}")
         return restored
 
-    def _build_context_config(self) -> ContextConfig:
-        """Derive the ContextConfig from the CURRENT config's limits.
+    def _build_context_config(self, config: Optional[Any] = None) -> ContextConfig:
+        """Derive the ContextConfig from a config's limits (default: current).
 
-        Shared by initial construction and hot-swap refresh so both always
-        agree on how thresholds derive from ``config.limits``.
+        Shared by initial construction, hot-swap refresh, and the model-swap
+        fit ladder (which derives the *candidate* config's thresholds before
+        the swap is applied) so all agree on how thresholds derive from
+        ``config.limits``.
         """
-        ctx = self.config.context_management
-        lim = self.config.limits
+        cfg = config if config is not None else self.config
+        ctx = cfg.context_management
+        lim = cfg.limits
         return ContextConfig(
             compaction_threshold_tokens=lim.context_threshold_tokens,
             summarization_threshold_tokens=lim.context_threshold_tokens,
