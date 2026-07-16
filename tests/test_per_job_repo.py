@@ -702,6 +702,31 @@ class TestScholarOutputPointer:
         assert captured["par-1"]["scholar_output_dir"] == "outputs/003-scholar-sch1"
         assert captured["par-1"]["scholar_completed"] is True
 
+    @pytest.mark.asyncio
+    async def test_paused_scholar_does_not_unblock_parent(self):
+        # An outage/drain-paused scholar reports /complete with a NON-terminal
+        # status (the pause path sets job["status"]="paused" in-memory before
+        # step 3b) — the parent must keep waiting for the resumed scholar's
+        # real outcome, not be unblocked as research-success. Live-caught on
+        # k3d: a cooldown-paused scholar falsely flipped its parent
+        # waiting→created. docs/features/llm_outage_subjob_resilience.md
+        scholar = {
+            "id": "sch-1",
+            "parent_job_id": "par-1",
+            "status": "paused",
+            "context": {"scholar_target": "par-1"},
+        }
+        parent = {"id": "par-1", "status": "waiting", "context": {}}
+        with patch(f"{MODULE}.postgres_db") as db:
+            db.get_job = AsyncMock(return_value=parent)
+            db.merge_job_context = AsyncMock()
+            db.update_job_status = AsyncMock()
+            with patch(f"{MODULE}._trigger_dispatch") as trig:
+                await orch_main._handle_scholar_completion(scholar, [])
+        db.merge_job_context.assert_not_awaited()
+        db.update_job_status.assert_not_awaited()
+        trig.assert_not_called()
+
 
 class TestDelegationOutputPathPopulation:
     """The resume builder must surface each child's graft_output_path as output_path."""
