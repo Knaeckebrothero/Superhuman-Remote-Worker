@@ -44,7 +44,6 @@ Required environment:
 
 Optional environment:
   CANVAS_VIEWER_POSTGRES_USER       (default: srw_canvas_gateway)
-  CANVAS_VIEWER_SECRET_USERNAME_KEY (default: CANVAS_VIEWER_POSTGRES_USER)
   CANVAS_VIEWER_SECRET_PASSWORD_KEY (default: CANVAS_VIEWER_POSTGRES_PASSWORD)
 
 Required with --apply-secret:
@@ -110,14 +109,9 @@ validate_secret_shape() {
       -o go-template='{{range $key, $_ := .data}}{{$key}}{{"\n"}}{{end}}' \
       | LC_ALL=C sort
   )"
-  expected_keys="$(
-    printf '%s\n%s\n' \
-      "$CANVAS_VIEWER_SECRET_USERNAME_KEY" \
-      "$CANVAS_VIEWER_SECRET_PASSWORD_KEY" \
-      | LC_ALL=C sort
-  )"
+  expected_keys="$CANVAS_VIEWER_SECRET_PASSWORD_KEY"
   [[ "$actual_keys" == "$expected_keys" ]] \
-    || die "the dedicated Canvas database Secret must contain exactly two configured keys"
+    || die "the dedicated Canvas database Secret must contain exactly the configured password key"
 }
 
 for argument in "$@"; do
@@ -153,17 +147,12 @@ done
   || die "PGPORT must be between 1 and 65535"
 
 CANVAS_VIEWER_POSTGRES_USER="${CANVAS_VIEWER_POSTGRES_USER:-srw_canvas_gateway}"
-CANVAS_VIEWER_SECRET_USERNAME_KEY="${CANVAS_VIEWER_SECRET_USERNAME_KEY:-CANVAS_VIEWER_POSTGRES_USER}"
 CANVAS_VIEWER_SECRET_PASSWORD_KEY="${CANVAS_VIEWER_SECRET_PASSWORD_KEY:-CANVAS_VIEWER_POSTGRES_PASSWORD}"
 
 [[ "$CANVAS_VIEWER_POSTGRES_USER" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] \
   || die "CANVAS_VIEWER_POSTGRES_USER is not a valid restricted role name"
-[[ "$CANVAS_VIEWER_SECRET_USERNAME_KEY" =~ ^[A-Za-z0-9._-]+$ ]] \
-  || die "CANVAS_VIEWER_SECRET_USERNAME_KEY is not a valid Secret data key"
 [[ "$CANVAS_VIEWER_SECRET_PASSWORD_KEY" =~ ^[A-Za-z0-9._-]+$ ]] \
   || die "CANVAS_VIEWER_SECRET_PASSWORD_KEY is not a valid Secret data key"
-[[ "$CANVAS_VIEWER_SECRET_USERNAME_KEY" != "$CANVAS_VIEWER_SECRET_PASSWORD_KEY" ]] \
-  || die "the Canvas Secret username and password keys must differ"
 
 PASSWORD_FILE="$CANVAS_VIEWER_POSTGRES_PASSWORD_FILE"
 [[ -f "$PASSWORD_FILE" && ! -L "$PASSWORD_FILE" ]] \
@@ -240,12 +229,10 @@ if [[ "$APPLY_SECRET" == true ]]; then
   ADMIN_PGPASSWORD=""
 
   TMP_DIR="$(mktemp -d)"
-  printf '%s' "$CANVAS_VIEWER_POSTGRES_USER" >"$TMP_DIR/username"
   printf '%s' "$CANVAS_VIEWER_POSTGRES_PASSWORD" >"$TMP_DIR/password"
 
   kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \
     create secret generic "$CANVAS_VIEWER_SECRET_NAME" \
-    --from-file="$CANVAS_VIEWER_SECRET_USERNAME_KEY=$TMP_DIR/username" \
     --from-file="$CANVAS_VIEWER_SECRET_PASSWORD_KEY=$TMP_DIR/password" \
     --dry-run=client -o yaml \
     | kubectl --context "$KUBE_CONTEXT" --namespace "$KUBE_NAMESPACE" \

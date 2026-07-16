@@ -413,7 +413,6 @@ canvas:
           # The path is inert while viewer.enabled=false: no provider lookup or
           # credential requirement is created until the gateway is enabled.
           vaultPath: ""
-          usernameKey: "CANVAS_VIEWER_POSTGRES_USER"
           passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
         # -- Reconcile the restricted login/grants with a bounded one-shot Job.
         # Allowed only for bundled Postgres and required with credentials.create.

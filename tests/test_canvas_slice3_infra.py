@@ -152,7 +152,6 @@ def test_experimental_overlay_enables_dev_viewer_without_production_claims() -> 
         "create": False,
         "existingSecret": "",
         "vaultPath": "homelab/superhuman-remote-worker/canvas-gateway-db",
-        "usernameKey": "CANVAS_VIEWER_POSTGRES_USER",
         "passwordKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
     }
     # The edge is the existing Cloudflare Tunnel connector (see
@@ -180,7 +179,6 @@ def test_canvas_viewer_chart_values_are_default_off_and_fail_closed() -> None:
             "create": False,
             "existingSecret": "",
             "vaultPath": "",
-            "usernameKey": "CANVAS_VIEWER_POSTGRES_USER",
             "passwordKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
         },
         "provisionRole": False,
@@ -567,7 +565,6 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
     environment_names = {entry["name"] for entry in container["env"]}
     assert environment_names == {
         "PORT",
-        "CANVAS_VIEWER_POSTGRES_USER",
         "CANVAS_VIEWER_POSTGRES_PASSWORD",
         "SSH_KEY_PATH",
     }
@@ -579,11 +576,9 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         for entry in container["env"]
         if "valueFrom" in entry
     }
+    # Only the password is secret material; the username arrives via the
+    # allowlisted gateway ConfigMap (envFrom).
     assert credential_refs == {
-        "CANVAS_VIEWER_POSTGRES_USER": {
-            "name": "canvas-viewer-db",
-            "key": "CANVAS_VIEWER_POSTGRES_USER",
-        },
         "CANVAS_VIEWER_POSTGRES_PASSWORD": {
             "name": "canvas-viewer-db",
             "key": "CANVAS_VIEWER_POSTGRES_PASSWORD",
@@ -595,6 +590,7 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         "CANVAS_VIEWER_POSTGRES_HOST",
         "CANVAS_VIEWER_POSTGRES_PORT",
         "CANVAS_VIEWER_POSTGRES_DB",
+        "CANVAS_VIEWER_POSTGRES_USER",
         "CANVAS_VIEWER_POSTGRES_MIN_CONNECTIONS",
         "CANVAS_VIEWER_POSTGRES_MAX_CONNECTIONS",
     } <= gateway_config.keys()
@@ -757,16 +753,9 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
     assert len(external_secrets) == 1
     external_secret = external_secrets[0]
     assert "dataFrom" not in external_secret["spec"]
-    # Vault property names follow the configured key names so one convention
-    # (CANVAS_VIEWER_POSTGRES_*) holds across Vault, the Secret, and env.
+    # One property: the password. The role name is chart configuration, and
+    # the Vault property name equals the Secret key name (bundle convention).
     assert external_secret["spec"]["data"] == [
-        {
-            "secretKey": "CANVAS_VIEWER_POSTGRES_USER",
-            "remoteRef": {
-                "key": vault_path,
-                "property": "CANVAS_VIEWER_POSTGRES_USER",
-            },
-        },
         {
             "secretKey": "CANVAS_VIEWER_POSTGRES_PASSWORD",
             "remoteRef": {
@@ -793,10 +782,6 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
         if "valueFrom" in entry
     }
     assert credential_refs == {
-        "CANVAS_VIEWER_POSTGRES_USER": {
-            "name": secret_name,
-            "key": "CANVAS_VIEWER_POSTGRES_USER",
-        },
         "CANVAS_VIEWER_POSTGRES_PASSWORD": {
             "name": secret_name,
             "key": "CANVAS_VIEWER_POSTGRES_PASSWORD",
@@ -853,14 +838,7 @@ def test_canvas_gateway_development_can_provision_restricted_internal_role() -> 
     ]
     assert len(credentials) == 1
     assert credentials[0]["kind"] == "Secret"
-    assert set(credentials[0]["stringData"]) == {
-        "CANVAS_VIEWER_POSTGRES_USER",
-        "CANVAS_VIEWER_POSTGRES_PASSWORD",
-    }
-    assert (
-        credentials[0]["stringData"]["CANVAS_VIEWER_POSTGRES_USER"]
-        == "srw_canvas_gateway"
-    )
+    assert set(credentials[0]["stringData"]) == {"CANVAS_VIEWER_POSTGRES_PASSWORD"}
 
     role_objects = [
         item
