@@ -3617,13 +3617,31 @@ async def _resolve_subjob_inherited_workspace(job: dict) -> tuple[str, str | Non
             ),
         )
 
-    # Still provisioning — bounded wait keyed on the subjob's age.
+    # Still provisioning — bounded wait keyed on the subjob's age, re-anchored
+    # on the outage's scheduled wake for a resumed subjob: an outage-paused
+    # subjob re-dispatched hours after spawn has long exhausted a created_at
+    # budget, and would insta-fail on any transiently non-ready parent
+    # workspace at resume. Anchor = max(created_at, llm_outage.next_retry_at)
+    # — the same next-wake philosophy as the outage reset window.
+    # docs/features/llm_outage_subjob_resilience.md (#5)
+    ref: datetime | None = None
     created_at = job.get("created_at")
-    age_s = 0.0
     if isinstance(created_at, datetime):
         ref = (
             created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
         )
+    wake_raw = (ctx.get("llm_outage") or {}).get("next_retry_at")
+    if isinstance(wake_raw, str):
+        try:
+            wake = datetime.fromisoformat(wake_raw)
+            if wake.tzinfo is None:
+                wake = wake.replace(tzinfo=timezone.utc)
+            if ref is None or wake > ref:
+                ref = wake
+        except ValueError:
+            pass
+    age_s = 0.0
+    if ref is not None:
         age_s = (datetime.now(timezone.utc) - ref).total_seconds()
     if age_s > _INHERIT_WORKSPACE_MAX_WAIT_S:
         return (
