@@ -341,7 +341,9 @@ class TestDetermineJobStatusSubjobOutage:
     def test_subjob_over_ceiling_fails_loudly(self):
         # The 12h duration ceiling lives on the SUBJOB's own row and applies
         # unchanged — an over-budget subjob outage fails, never parks.
-        job = _subjob_llm_job(_real_outage_ctx(8, LLM_OUTAGE_CEILING_SECONDS + 3600, 60))
+        job = _subjob_llm_job(
+            _real_outage_ctx(8, LLM_OUTAGE_CEILING_SECONDS + 3600, 60)
+        )
         status, err = determine_job_status(job, STOP, parent_status="waiting")
         assert status == "failed"
         assert err is not None and "unavailable" in err.lower()

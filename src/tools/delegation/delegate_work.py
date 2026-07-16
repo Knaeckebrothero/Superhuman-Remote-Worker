@@ -411,8 +411,7 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
         timeout: int = Field(
             default=7200,
             description=(
-                "Max wait time for the resumed child in seconds "
-                "(default 2h, max 4h)."
+                "Max wait time for the resumed child in seconds (default 2h, max 4h)."
             ),
         )
 
