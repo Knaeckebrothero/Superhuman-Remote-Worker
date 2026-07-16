@@ -11087,6 +11087,42 @@ async def _handle_delegation_child_completion(
     )
 
 
+def _latest_delegation_outage_wake(children: list[dict]) -> "datetime | None":
+    """Latest ``context.llm_outage.next_retry_at`` across delegation children.
+
+    The delegation timeout's pause-aware anchor: an outage-paused child's
+    scheduled wake (future while paused, recent after resume) re-anchors the
+    parent's deadline so legitimate cooldown waits are not counted as elapsed
+    delegation time. Stale wakes (from a previous round) are discarded by the
+    caller via the ``> freeze.timestamp`` comparison. Terminal children are
+    included deliberately — extending on a finished child's recent wake errs
+    in the safe (longer) direction and stays bounded by wake + timeout.
+    docs/features/llm_outage_subjob_resilience.md (#6)
+    """
+    from datetime import datetime, timezone
+
+    latest: datetime | None = None
+    for child in children:
+        ctx = child.get("context") or {}
+        if isinstance(ctx, str):
+            try:
+                ctx = json.loads(ctx)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        wake_raw = ((ctx or {}).get("llm_outage") or {}).get("next_retry_at")
+        if not isinstance(wake_raw, str):
+            continue
+        try:
+            wake = datetime.fromisoformat(wake_raw)
+        except ValueError:
+            continue
+        if wake.tzinfo is None:
+            wake = wake.replace(tzinfo=timezone.utc)
+        if latest is None or wake > latest:
+            latest = wake
+    return latest
+
+
 async def _check_delegation_timeouts() -> int:
     """Check for timed-out delegation parents and cancel their remaining children.
 
@@ -11139,6 +11175,29 @@ async def _check_delegation_timeouts() -> int:
             if elapsed < timeout:
                 continue
 
+            # The naive timer expired — but outage-paused children suspend it
+            # (docs/features/llm_outage_subjob_resilience.md #6, LOCKED: rebase
+            # semantics). Effective anchor = max(freeze.timestamp, latest child
+            # llm_outage.next_retry_at): a child paused for a cooldown carries
+            # a future wake (timer parked, up to the 12h pause budget); a child
+            # that woke at W gets a full timeout of ACTIVE time before the
+            # parent can expire (a naive skip-while-paused fires the moment the
+            # child resumes); a never-resuming paused child still terminates at
+            # wake + timeout. Derived read-side from the children's persisted
+            # context — no writes, no dual-leader write race. Children are only
+            # fetched once the naive timer has expired (cheap path above).
+            children = await postgres_db.get_delegation_children(job_id)
+            wake = _latest_delegation_outage_wake(children)
+            if wake is not None and wake > delegation_start:
+                elapsed = (datetime.now(timezone.utc) - wake).total_seconds()
+                if elapsed < timeout:
+                    logger.info(
+                        f"Delegation timeout for job {job_id} suspended: child "
+                        f"outage wake at {wake.isoformat()} re-anchors the "
+                        f"deadline ({elapsed:.0f}s of {timeout}s consumed)"
+                    )
+                    continue
+
             # Timeout reached — cancel remaining children and resume parent
             logger.warning(
                 f"Delegation timeout for job {job_id}: "
@@ -11146,7 +11205,6 @@ async def _check_delegation_timeouts() -> int:
             )
 
             # Cancel non-terminal children
-            children = await postgres_db.get_delegation_children(job_id)
             cancelled_count = 0
             for child in children:
                 child_status = child.get("status", "")
