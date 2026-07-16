@@ -8,7 +8,7 @@ import {LIVE_TOOL_CATEGORIES, SESSION_TOOL_GROUP_NAMES} from './agent-settings.t
 
 /**
  * Live-mode behavior of the shared settings surface
- * (docs/features/live_session_settings.md, Slice A): only the four validated
+ * (docs/done/2026-07-16-live-session-settings.md, Slice A): only the four validated
  * closed tool groups render, re-enables carry the closed-vocabulary lists,
  * and the live-only narration control rides the interactive fragment.
  */
