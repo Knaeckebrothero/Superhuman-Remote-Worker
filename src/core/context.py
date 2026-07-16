@@ -14,6 +14,7 @@ References:
 - LangGraph: Manage Conversation History
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -343,6 +344,172 @@ def repair_tool_pairing(messages: List[BaseMessage]) -> List[BaseMessage]:
             f"result(s), stripped {stripped_calls} orphaned tool call(s)"
         )
     return repaired
+
+
+# --- Provider-boundary history sanitizer (live_session_settings.md Slice D) ---
+
+# Reasoning/thinking content-block types that must never be replayed to a
+# provider that didn't produce them. Anthropic rejects thinking blocks whose
+# signature it can't validate (any cross-model replay); OpenAI-compatible
+# servers 400 on unknown content-part types the langchain serializer passes
+# through ("redacted_thinking", Responses-style "reasoning" blocks).
+_REASONING_BLOCK_TYPES = frozenset(
+    {"thinking", "redacted_thinking", "reasoning", "reasoning_content"}
+)
+
+# additional_kwargs keys that carry a captured reasoning channel. Stock
+# langchain-openai never serializes them outbound, but custom transports have
+# no such guarantee — and a reasoning_content + tool_calls combo crashes
+# gpt-oss chat templates server-side. Foreign reasoning carries no replay
+# value, so it is dropped at the boundary.
+_REASONING_KWARGS_KEYS = ("reasoning_content", "reasoning", "reasoning_details")
+
+# Mistral validates tool-call ids as exactly 9 alphanumerics; everything else
+# we route to accepts [a-zA-Z0-9_-] (OpenAI mints ~29-30 chars, Anthropic
+# toolu_ + 24). 40 is a conservative common bound observed across providers.
+_MISTRAL_TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9]{9}$")
+_GENERIC_TOOL_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
+
+
+def _conforming_tool_call_id(raw_id: str, target_family: str) -> str:
+    """Return ``raw_id`` unchanged when the target accepts it, else a
+    deterministic replacement derived from its hash.
+
+    Deterministic (pure function of the id) so the assistant tool_calls side
+    and the ToolMessage result side always map to the same value, and so a
+    repeated sanitizer pass is a no-op.
+    """
+    if target_family == "mistral":
+        if _MISTRAL_TOOL_ID_RE.match(raw_id):
+            return raw_id
+        return hashlib.blake2b(raw_id.encode(), digest_size=16).hexdigest()[:9]
+    if _GENERIC_TOOL_ID_RE.match(raw_id):
+        return raw_id
+    return "call_" + hashlib.blake2b(raw_id.encode(), digest_size=16).hexdigest()[:24]
+
+
+def sanitize_history_for_provider_boundary(
+    messages: List[BaseMessage], target_model: str
+) -> List[BaseMessage]:
+    """Make a history produced under one provider/family safe to replay under
+    another (live_session_settings.md Slice D — the #1 session killer).
+
+    Three transforms, then a pairing verification:
+
+    1. **Strip foreign reasoning**: thinking/reasoning content blocks are
+       removed from list-form AIMessage content (signed Anthropic thinking
+       blocks fail signature validation on any cross-model replay; unknown
+       block types 400 on OpenAI-compatible servers), and captured reasoning
+       keys are dropped from ``additional_kwargs``. ``invalid_tool_calls``
+       (failed parses) are dropped too — they serialize outbound with no
+       matching result and are pure replay risk.
+    2. **Remap tool-call ids** to the target's accepted format, consistently
+       on the assistant and tool-result sides (LiteLLM's
+       ``_sanitize_anthropic_tool_use_id`` is the reference for the class of
+       bug; Mistral's strict 9-alphanumeric format is the worst case).
+    3. **Verify pairing** via :func:`repair_tool_pairing` so a strict-pairing
+       API never sees an orphaned call or result.
+
+    Operates on the in-memory working set only — persisted ``thread_messages``
+    rows stay provider-native. Returns a new list; input messages are never
+    mutated. Idempotent: a second pass over sanitized output is a no-op.
+    """
+    from src.core.model_registry import family_of
+
+    target_family = family_of(target_model or "")
+    id_map: Dict[str, str] = {}
+
+    def _map_id(raw_id: str) -> str:
+        if not raw_id:
+            return raw_id
+        if raw_id not in id_map:
+            id_map[raw_id] = _conforming_tool_call_id(raw_id, target_family)
+        return id_map[raw_id]
+
+    out: List[BaseMessage] = []
+    stripped_blocks = 0
+    stripped_kwargs = 0
+    dropped_invalid = 0
+    for m in messages:
+        if isinstance(m, AIMessage):
+            update: Dict[str, Any] = {}
+
+            content = m.content
+            if isinstance(content, list):
+                kept = [
+                    b
+                    for b in content
+                    if not (
+                        isinstance(b, dict) and b.get("type") in _REASONING_BLOCK_TYPES
+                    )
+                ]
+                if len(kept) != len(content):
+                    stripped_blocks += len(content) - len(kept)
+                    if all(
+                        isinstance(b, dict) and b.get("type") == "text" for b in kept
+                    ):
+                        # Only plain text remains — collapse to the string form
+                        # every provider accepts.
+                        update["content"] = "".join(b.get("text", "") for b in kept)
+                    else:
+                        update["content"] = kept
+
+            ak = m.additional_kwargs or {}
+            removed_keys = [k for k in _REASONING_KWARGS_KEYS if k in ak]
+            if removed_keys:
+                stripped_kwargs += len(removed_keys)
+                update["additional_kwargs"] = {
+                    k: v for k, v in ak.items() if k not in _REASONING_KWARGS_KEYS
+                }
+
+            tool_calls = getattr(m, "tool_calls", None) or []
+            new_calls = []
+            calls_changed = False
+            for tc in tool_calls:
+                new_id = _map_id(tc.get("id") or "")
+                if new_id != (tc.get("id") or ""):
+                    calls_changed = True
+                    tc = {**tc, "id": new_id}
+                new_calls.append(tc)
+            if calls_changed:
+                update["tool_calls"] = new_calls
+
+            if getattr(m, "invalid_tool_calls", None):
+                dropped_invalid += len(m.invalid_tool_calls)
+                update["invalid_tool_calls"] = []
+
+            # A message whose content was reasoning-only ends up empty; with
+            # no tool calls left it carries nothing and some providers 400 on
+            # an empty assistant turn — drop it.
+            final_content = update.get("content", m.content)
+            if not final_content and not new_calls:
+                continue
+
+            out.append(m.model_copy(update=update) if update else m)
+
+        elif isinstance(m, ToolMessage):
+            raw_id = getattr(m, "tool_call_id", "") or ""
+            new_id = _map_id(raw_id)
+            if new_id != raw_id:
+                m = m.model_copy(update={"tool_call_id": new_id})
+            out.append(m)
+
+        else:
+            out.append(m)
+
+    remapped = sum(1 for k, v in id_map.items() if k != v)
+    if stripped_blocks or stripped_kwargs or remapped or dropped_invalid:
+        logger.info(
+            "Provider-boundary sanitize (target family=%s): stripped %d "
+            "reasoning block(s) + %d reasoning kwarg(s), remapped %d "
+            "tool-call id(s), dropped %d invalid tool call(s)",
+            target_family,
+            stripped_blocks,
+            stripped_kwargs,
+            remapped,
+            dropped_invalid,
+        )
+    return repair_tool_pairing(out)
 
 
 def _try_repair_json_object(raw: Any) -> Optional[Dict[str, Any]]:
@@ -867,6 +1034,19 @@ class ContextManager:
         # heuristics that false-fire on stray RemoveMessage markers (the
         # duplicate-banner bug, 2026-06-12).
         self.compaction_runs: int = 0
+
+    def _note_compaction_success(self) -> None:
+        """Bump the run counter and invalidate the provider-usage anchor.
+
+        The anchor (``last_provider_input_tokens``) describes a context that
+        no longer exists once a compaction lands — left in place it keeps the
+        trigger (``max(local, anchor)``) above threshold and re-fires a
+        needless second compaction on the next check until an LLM call heals
+        it (worst on a model hot-swap, where the pre-swap fit compaction is
+        followed immediately by the first post-swap turn's check).
+        """
+        self.compaction_runs += 1
+        self._state.last_provider_input_tokens = None
 
     def update_limits(self, config: ContextConfig, model: str) -> None:
         """Rebind thresholds + token counter to a new model's window, in place.
@@ -2020,7 +2200,7 @@ class ContextManager:
             if after_tokens >= before_tokens:
                 return messages
 
-            self.compaction_runs += 1
+            self._note_compaction_success()
             markers = [
                 RemoveMessage(id=m.id)
                 for m in original_conversation
@@ -2173,8 +2353,8 @@ class ContextManager:
 
         # A summary was produced and the compacted result is being returned —
         # bump the run counter (the transports' "did it actually compact this
-        # call" signal; see __init__).
-        self.compaction_runs += 1
+        # call" signal; see __init__) and drop the now-stale provider anchor.
+        self._note_compaction_success()
 
         # Record the summarized/kept boundary for the persistent transport: the
         # newest message the summary covers is original_conversation[safe_start-1]
