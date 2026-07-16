@@ -254,8 +254,10 @@ export class SettingsPaneComponent {
     readonly canUpgradeToVm = computed(() => {
         if (!['virtual', 'sandbox'].includes(this.workspaceTier())) return false;
         const g = this.capabilities.grants();
-        // Fail closed while loading; null = admin/unrestricted.
-        return g === null ? true : g?.['vm'] === true;
+        // Fail closed while loading; null = admin/unrestricted. The PDP key
+        // is `vm_workspace` (src/core/capability_grants.py) — the server-side
+        // upgrade gate enforces the same grant either way.
+        return g === null ? true : g?.['vm_workspace'] === true;
     });
 
     constructor() {

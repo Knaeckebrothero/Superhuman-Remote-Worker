@@ -14,6 +14,11 @@ Covers the three backend surfaces:
   outside the validated tools vocabulary, repo/kb handling, index rewrite.
 
 Plus ``inject_datasource_index``'s rewrite (not re-append) semantics.
+
+Slice C additions: the owner-facing disconnected-session PATCH
+(``update_thread_config``) that runs the same ``_apply_thread_config_update``
+core (redacted response, connected-session 409 gate), and the
+``session_config_updated`` audit event both endpoints now emit.
 """
 
 import uuid
@@ -115,6 +120,8 @@ def patched_main(monkeypatch):
         ),
         set_thread_datasource_ids=AsyncMock(return_value=True),
         merge_thread_config_override=AsyncMock(return_value=True),
+        record_security_event=AsyncMock(),
+        resolve_api_keys_for_job=AsyncMock(return_value={}),
     )
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "require_internal", AsyncMock())
@@ -237,6 +244,213 @@ class TestAgentPatchDatasourceIds:
         )
 
         db.set_thread_datasource_ids.assert_awaited_once_with(THREAD_ID, [])
+
+
+# ---------------------------------------------------------------------------
+# Slice C — owner-facing disconnected-session PATCH + config-change audit
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def patched_owner(patched_main, monkeypatch):
+    """patched_main plus the owner endpoint's collaborators (owner gate,
+    model-transport enrichment)."""
+    main, db, grants = patched_main
+    owner_user = {"id": "user-1", "is_admin": False, "auth_method": "oidc"}
+    require_owner = AsyncMock(
+        side_effect=lambda request, _db, tid: (owner_user, db.get_thread.return_value)
+    )
+    monkeypatch.setattr(main, "require_thread_owner", require_owner)
+
+    async def fake_inject(*, section, model_id, user_id, resolved_keys):
+        # Enrichment resolves transport; the api_key is the secret that must
+        # never reach the browser-facing response.
+        section["api_key"] = "sk-secret"
+
+    monkeypatch.setattr(main, "_inject_model_credentials", fake_inject)
+    return main, db, require_owner
+
+
+def _patch_body(main, config_override=None, datasource_ids=None):
+    return main.ThreadConfigPatchRequest(
+        config_override=config_override or {}, datasource_ids=datasource_ids
+    )
+
+
+class TestOwnerConfigPatch:
+    @pytest.mark.asyncio
+    async def test_connected_thread_rejected_409(self, patched_owner):
+        main, db, _ = patched_owner
+        row = _thread_row()
+        row.update(agent_id="agent-1", status="active")
+        db.get_thread.return_value = row
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.update_thread_config(
+                THREAD_ID,
+                _patch_body(main, {"llm": {"temperature": 0.2}}),
+                MagicMock(),
+            )
+        assert exc.value.status_code == 409
+        db.merge_thread_config_override.assert_not_awaited()
+        db.record_security_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_agent_id_on_suspended_thread_is_editable(self, patched_owner):
+        """Drain-suspend clears agent_id; a hard pod kill may not. No live
+        agent serves a suspended thread, so it must stay editable."""
+        main, db, _ = patched_owner
+        row = _thread_row()
+        row.update(agent_id="agent-dead", status="suspended")
+        db.get_thread.return_value = row
+
+        result = await main.update_thread_config(
+            THREAD_ID, _patch_body(main, {"llm": {"temperature": 0.2}}), MagicMock()
+        )
+        assert result["status"] == "updated"
+        db.merge_thread_config_override.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_response_and_persist_redacted_with_transport_sentinels(
+        self, patched_owner
+    ):
+        """A model change enriches transport exactly like the internal PATCH
+        (explicit None sentinels so the next attach's deep-merge clears the
+        previous model's transport) — but the secret never leaves: neither in
+        the response nor in the durable merge."""
+        main, db, _ = patched_owner
+
+        result = await main.update_thread_config(
+            THREAD_ID, _patch_body(main, {"llm": {"model": "minimax-m3"}}), MagicMock()
+        )
+
+        assert "api_key" not in result["config_override"]["llm"]
+        assert result["config_override"]["llm"]["base_url"] is None
+        merged = db.merge_thread_config_override.await_args.args[1]
+        assert "api_key" not in merged["llm"]
+        assert merged["llm"]["base_url"] is None
+        assert merged["llm"]["provider"] is None
+
+    @pytest.mark.asyncio
+    async def test_datasource_change_shares_create_authorization(self, patched_owner):
+        """The lite/repository rule and flip-then-grant-check come from the
+        shared core — a repo datasource on a lite thread fails here exactly
+        like at the internal endpoint."""
+        main, db, _ = patched_owner
+        db.get_thread.return_value = _thread_row(backend="virtual")
+        db.get_datasource.return_value = {
+            "id": "ds-repo",
+            "type": "repository",
+            "is_global": True,
+        }
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.update_thread_config(
+                THREAD_ID, _patch_body(main, datasource_ids=["ds-repo"]), MagicMock()
+            )
+        assert exc.value.status_code == 400
+        db.set_thread_datasource_ids.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_datasource_set_persists_and_returns(self, patched_owner):
+        main, db, _ = patched_owner
+
+        result = await main.update_thread_config(
+            THREAD_ID, _patch_body(main, datasource_ids=["ds-a"]), MagicMock()
+        )
+        db.set_thread_datasource_ids.assert_awaited_once_with(THREAD_ID, ["ds-a"])
+        assert result["datasource_ids"] == ["ds-a"]
+
+    @pytest.mark.asyncio
+    async def test_empty_body_rejected(self, patched_owner):
+        main, db, _ = patched_owner
+        with pytest.raises(main.HTTPException) as exc:
+            await main.update_thread_config(THREAD_ID, _patch_body(main), MagicMock())
+        assert exc.value.status_code == 400
+        db.merge_thread_config_override.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_owner_denial_propagates_before_any_write(self, patched_owner):
+        main, db, require_owner = patched_owner
+        require_owner.side_effect = main.HTTPException(
+            status_code=403, detail="Not your thread"
+        )
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.update_thread_config(
+                THREAD_ID,
+                _patch_body(main, {"llm": {"temperature": 0.1}}),
+                MagicMock(),
+            )
+        assert exc.value.status_code == 403
+        db.merge_thread_config_override.assert_not_awaited()
+
+
+class TestConfigChangeAudit:
+    @pytest.mark.asyncio
+    async def test_owner_patch_records_audit_event(self, patched_owner):
+        main, db, _ = patched_owner
+
+        await main.update_thread_config(
+            THREAD_ID,
+            _patch_body(
+                main, {"llm": {"model": "minimax-m3"}}, datasource_ids=["ds-a"]
+            ),
+            MagicMock(),
+        )
+
+        kwargs = db.record_security_event.await_args.kwargs
+        assert kwargs["event_type"] == "session_config_updated"
+        assert kwargs["user_id"] == "user-1"
+        assert kwargs["resource_type"] == "thread"
+        assert kwargs["resource_id"] == THREAD_ID
+        # Key paths only — never values (the enriched fragment holds secrets).
+        assert "llm.model" in kwargs["detail"]
+        assert "datasource_ids=1" in kwargs["detail"]
+        assert "minimax-m3" not in kwargs["detail"]
+        assert "sk-secret" not in kwargs["detail"]
+
+    @pytest.mark.asyncio
+    async def test_internal_patch_records_audit_event_without_user(self, patched_main):
+        main, db, _ = patched_main
+
+        await main.agent_update_thread_config(
+            MagicMock(),
+            THREAD_ID,
+            _body(main, config_override={"llm": {"temperature": 0.4}}),
+        )
+
+        kwargs = db.record_security_event.await_args.kwargs
+        assert kwargs["event_type"] == "session_config_updated"
+        assert kwargs["user_id"] is None
+        assert "llm.temperature" in kwargs["detail"]
+
+    @pytest.mark.asyncio
+    async def test_denied_update_records_no_config_audit(self, patched_main):
+        main, db, grants = patched_main
+        grants.side_effect = main.HTTPException(status_code=422, detail="denied")
+
+        with pytest.raises(main.HTTPException):
+            await main.agent_update_thread_config(
+                MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a"])
+            )
+        db.record_security_event.assert_not_awaited()
+
+
+class TestConfigChangeSummary:
+    def test_flattens_one_level_and_counts_datasources(self):
+        import orchestrator.main as main
+
+        detail = main._config_change_summary(
+            {"llm": {"model": "x", "temperature": 0.1}, "narration": "full"},
+            ["a", "b"],
+        )
+        assert detail == "keys=llm.model,llm.temperature,narration datasource_ids=2"
+
+    def test_empty_change(self):
+        import orchestrator.main as main
+
+        assert main._config_change_summary({}, None) == "empty"
 
 
 # ---------------------------------------------------------------------------
