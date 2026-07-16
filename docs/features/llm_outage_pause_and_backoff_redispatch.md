@@ -446,15 +446,17 @@ mechanism itself is proven — each cycle graceful-resumes the paused job from i
 checkpoint and re-attempts, rather than cold-starting), and the direct `quota_exhausted`
 fail-fast (same classifier path, unit-tested).
 
-**Finding — subjobs bypass outage handling.** The auto-spawned **scholar** subjob emitted
+**Finding — subjobs bypass outage handling.** ~~The auto-spawned **scholar** subjob emitted
 `freeze_type=llm_unavailable` correctly (agent code fires for subjobs too), but
 `determine_job_status`'s subjob branch (`parent_job_id is not None`,
 `completion.py`) short-circuits to `pending_review` **before** the `llm_unavailable`
 check — so scholar/critic subjobs get no pause/backoff, they surface as `pending_review`
-to the parent. Acceptable for v1 (scoped to top-level worker/loop jobs; a real outage
-pauses the parent anyway), but a **loop caveat**: if a loop role is modeled as a subjob
-it won't get outage resilience. Tracked as a follow-up (route retriable `llm_unavailable`
-before the subjob branch, or pause the subjob and let the parent inherit).
+to the parent.~~ **RESOLVED 2026-07-16 by `[[llm_outage_subjob_resilience]]`
+(IMPLEMENTED + k3d E2E verified):** subjob outage freezes now fall through to the
+shared pause/ceiling branches (parent-terminal guarded), and the delegation
+timeout / verification staleness reap / sweep-fail path / inherit budget are
+pause-aware. (The loop caveat was moot — loop role jobs are top-level and
+explicitly disable scholar/verification subjobs.)
 
 Remaining: commit + push (and, if desired, a resume-to-completion demo once a real model
 endpoint is configured on k3d).
