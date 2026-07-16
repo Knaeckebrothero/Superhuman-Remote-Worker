@@ -104,3 +104,67 @@ async def test_over_ceiling_fails_not_redispatched(wired):
     db.fail_llm_outage_job.assert_awaited_once()
     db.claim_llm_outage_redispatch.assert_not_awaited()
     trigger.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Sweep-fail parent unblock — a fail_llm_outage_job write bypasses /complete,
+# so the subjob unblock handlers must run here or a ceiling-failed scholar
+# strands its 'waiting' parent forever
+# (docs/features/llm_outage_subjob_resilience.md, design #4).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ceiling_failed_subjob_runs_parent_unblock_handlers(wired, monkeypatch):
+    db, trigger = wired
+    job = _due_job("sub-1", first_ago=LLM_OUTAGE_CEILING_SECONDS + 3600)
+    job["parent_job_id"] = "par-1"
+    job["creation_order"] = 0
+    db.list_due_llm_outage_jobs = AsyncMock(return_value=[job])
+    scholar = AsyncMock()
+    delegation = AsyncMock()
+    monkeypatch.setattr(main, "_handle_scholar_completion", scholar)
+    monkeypatch.setattr(main, "_handle_delegation_child_completion", delegation)
+
+    assert await main._llm_outage_sweep_once() == (0, 1)
+    scholar.assert_awaited_once()
+    delegation.assert_awaited_once()
+    # Handlers must see the post-fail status, not the paused sweep row —
+    # _handle_scholar_completion keys is_failure on it.
+    assert scholar.await_args.args[0]["status"] == "failed"
+    assert delegation.await_args.args[0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_ceiling_failed_toplevel_skips_subjob_handlers(wired, monkeypatch):
+    db, trigger = wired
+    db.list_due_llm_outage_jobs = AsyncMock(
+        return_value=[_due_job("j1", first_ago=LLM_OUTAGE_CEILING_SECONDS + 3600)]
+    )
+    scholar = AsyncMock()
+    delegation = AsyncMock()
+    monkeypatch.setattr(main, "_handle_scholar_completion", scholar)
+    monkeypatch.setattr(main, "_handle_delegation_child_completion", delegation)
+
+    assert await main._llm_outage_sweep_once() == (0, 1)
+    scholar.assert_not_awaited()
+    delegation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unblock_handler_error_does_not_break_sweep(wired, monkeypatch):
+    # A handler blow-up must not abort the tick — later due jobs still process.
+    db, trigger = wired
+    sub = _due_job("sub-1", first_ago=LLM_OUTAGE_CEILING_SECONDS + 3600)
+    sub["parent_job_id"] = "par-1"
+    sub["creation_order"] = 0
+    ok = _due_job("j2", first_ago=3600)
+    db.list_due_llm_outage_jobs = AsyncMock(return_value=[sub, ok])
+    monkeypatch.setattr(
+        main,
+        "_handle_scholar_completion",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    monkeypatch.setattr(main, "_handle_delegation_child_completion", AsyncMock())
+
+    assert await main._llm_outage_sweep_once() == (1, 1)
