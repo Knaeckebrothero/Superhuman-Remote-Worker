@@ -14074,6 +14074,19 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     if not pod_ip:
         raise HTTPException(status_code=503, detail="IDE session not active")
 
+    # Live VM workspaces live on the Tailscale mesh; the orchestrator pod is
+    # not a tailnet member, so proxying directly to pod_ip black-holes and the
+    # request hangs into a Cloudflare 504. Until IDE traffic for mesh VMs is
+    # routed through the agent (docs/features/vm_snapshots_and_ide.md,
+    # "Live-VM IDE Access via the Agent"), fail fast with a clear status.
+    from services.ssh_helpers import orchestrator_can_reach
+
+    if not orchestrator_can_reach(pod_ip):
+        raise HTTPException(
+            status_code=503,
+            detail="IDE is not yet available for VM-backed workspaces.",
+        )
+
     # Build upstream URL (pod_ip may include port for Docker Compose, e.g. "localhost:8081")
     host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
     upstream_url = f"http://{host}/{path}"
@@ -14155,6 +14168,13 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
         await ws.close(code=4503, reason="IDE session not active")
+        return
+
+    # See ide_proxy_http: mesh VMs are unreachable from the orchestrator pod.
+    from services.ssh_helpers import orchestrator_can_reach
+
+    if not orchestrator_can_reach(pod_ip):
+        await ws.close(code=4503, reason="IDE not available for VM workspaces")
         return
 
     await ws.accept()

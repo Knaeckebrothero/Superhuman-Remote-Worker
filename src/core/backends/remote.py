@@ -262,6 +262,37 @@ class RemoteBackend(WorkspaceBackend):
         """
         return self._exec(command, timeout=timeout)
 
+    def open_forward_channel(self, dest_host: str = "127.0.0.1", dest_port: int = 8080):
+        """Open a ``direct-tcpip`` channel to a loopback port on the workspace.
+
+        Returns a paramiko ``Channel`` (socket-like) tunnelled over the existing
+        authenticated SSH transport, for reaching a guest-loopback service that
+        is not exposed on the pod/VM network — e.g. code-server for a live-VM
+        IDE session (docs/features/vm_snapshots_and_ide.md, "Live-VM IDE Access
+        via the Agent"). The workspace sshd permits exactly this via
+        ``AllowTcpForwarding local`` + ``PermitOpen 127.0.0.1:*``.
+
+        The returned channel is a *blocking* socket; a caller on an event loop
+        must drive its ``recv``/``send`` off-thread (e.g. ``asyncio.to_thread``).
+        It is independent of the shell/SFTP state, so an IDE session and the
+        job's own workspace I/O multiplex over one transport without interfering.
+
+        Raises:
+            WorkspaceUnavailableError: if the SSH transport is not connected.
+        """
+        self._ensure_connected()
+        transport = self._ssh.get_transport() if self._ssh else None
+        if transport is None or not transport.is_active():
+            raise WorkspaceUnavailableError(
+                f"No active SSH transport to {self._host}:{self._port} "
+                "for IDE port-forward"
+            )
+        # src_addr is informational (the notional channel origin); dest_addr is
+        # the guest-loopback service we forward to.
+        return transport.open_channel(
+            "direct-tcpip", (dest_host, dest_port), ("127.0.0.1", 0)
+        )
+
     # =========================================================================
     # Lifecycle
     # =========================================================================

@@ -119,11 +119,23 @@ class IdeSessionService:
         # 1a. Check for live VM (job is still processing)
         if vm_ctx.get("status") == "ready":
             ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
-            if ssh_host:
+            if ssh_host and orchestrator_can_reach(ssh_host):
                 return {
                     "status": "active",
                     "code_server_url": _build_code_server_url(job_id),
                     "source": "live_vm",
+                }
+            if ssh_host:
+                # Mesh VM (Tailscale ssh_host) the orchestrator cannot reach
+                # directly; live-VM IDE via the agent tunnel is not wired yet
+                # (docs/features/vm_snapshots_and_ide.md, "Live-VM IDE Access
+                # via the Agent"). Surface unavailable instead of advertising a
+                # proxy URL that black-holes into a 504. Becomes "active" once
+                # the agent-routed transport lands.
+                return {
+                    "status": "unavailable",
+                    "code_server_url": None,
+                    "error": "IDE is not yet available for VM-backed workspaces.",
                 }
 
         # 1b. Check for live workspace container (job processing on container)
