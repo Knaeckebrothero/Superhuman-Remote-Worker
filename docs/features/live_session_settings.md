@@ -33,8 +33,11 @@ per-item notes in the build order below).
 **Slice A BUILT 2026-07-16** (settings pane live on k3d; see the notes at the
 end of the Slice A section).
 **Slice B BUILT 2026-07-16** (live datasources, k3d e2e-verified add → query →
-remove; see the notes at the end of the Slice B section). Slices C–D not
-started.
+remove; see the notes at the end of the Slice B section).
+**Slice C BUILT 2026-07-16** (owner-facing disconnected-session PATCH +
+config-change audit, k3d e2e-verified edit-while-ended → resume → attach
+pickup; two adjacent bugs found and fixed — see the notes at the end of the
+Slice C section). Slice D not started.
 **Scope:** Cockpit (settings pane, header cleanup) + one contained
 orchestrator/agent slice (live datasources) + protocol touch-ups + a small
 owner-facing endpoint (disconnected-session editing) + a hardening slice for
@@ -605,6 +608,66 @@ audit:
   `log_security_event` app-DB pattern (`security/access.py:107`) with
   `event_type='session_config_updated'` — it covers both this endpoint and
   the internal one.
+
+**✅ BUILT 2026-07-16.** As designed, with these notes:
+
+- **Endpoint**: `PATCH /api/persistent/threads/{thread_id}/config`
+  (`require_thread_owner`), body `{config_override?, datasource_ids?}` —
+  the `datasource_ids` key has Slice B semantics (full desired set). 400 on
+  an empty body; response = the REDACTED accepted fragment +
+  normalized `datasource_ids`.
+- **Shared core extracted**: the internal endpoint's whole
+  validate → datasource-authorize → flip-grant-check → enrich → redacted
+  merge → pm-column sync → datasource persist pipeline now lives in
+  `_apply_thread_config_update` (main.py), called by both endpoints — so the
+  owner PATCH cannot drift from the live path. Enrichment (transport `None`
+  sentinels) runs here too, deliberately: without it, an offline model swap
+  would inherit a previous swap's persisted `base_url`. Only the response
+  differs (internal: enriched plaintext for the agent; owner: redacted).
+- **Connected gate**: 409 when `agent_id` is bound AND status is live
+  (`created`/`active`/`awaiting_user`). Two live findings shaped it:
+  thread CREATE eagerly binds an agent, so even a never-attached fresh
+  thread 409s (correct — its config may be mid-resolution); and END leaves a
+  stale `agent_id` on the row, so suspended/ended states are editable
+  regardless of `agent_id` (a drainless pod kill must not wedge editing).
+- **Audit**: both endpoints now emit a `session_config_updated`
+  security event (the `log_security_event` pattern) after every persist step
+  succeeds — key paths only (`keys=llm.temperature,tools.canvas
+  datasource_ids=1`), never values (the enriched fragment holds secrets);
+  `user_id` = caller for the owner route, NULL for the internal route (the
+  recorded path distinguishes them). The endpoint-inventory manifest was
+  regenerated (`gated:require_thread_owner`).
+- **k3d e2e (thread dba52e19, 2026-07-16)**: fresh thread → PATCH 409 (agent
+  eagerly bound) → end → PATCH `{llm.temperature: 0.55, tools.canvas: []}`
+  200 with redacted echo → DB merge confirmed (existing create-time keys
+  preserved) + audit row (`user_id=d32df192…`, detail
+  `keys=llm.temperature,tools.canvas`) → resume → attach: agent built its
+  LLM with `temp=0.55` and loaded 62 tools with NO canvas tools → PATCH
+  while connected → 409. Acceptance #16 fully proven.
+- **Two adjacent bugs found live and fixed in this slice**:
+  1. `GET /api/persistent/threads[/{id}]` returned `metadata` as a JSON
+     **string** (`_redact_thread_metadata` "preserved the original
+     representation" of asyncpg's JSONB-as-string) while every Cockpit
+     consumer is typed against an object — silently nulling the settings
+     pane's config/tools prefill (Slice A), the attached-datasource default
+     on a fresh pane open (Slice B), and the REST model/temperature seeding
+     in `persistent-chat.service`. This was the actual root cause of the
+     twice-documented "model shows the config name until the welcome frame"
+     residual. Fixed: metadata now always leaves as a parsed object
+     (contract pinned by `TestRedactThreadMetadataShape`); browser-verified
+     — fresh pane open shows temp 0.55, Canvas unchecked, model
+     `gemma-4-moe` before any welcome frame.
+  2. The pane's VM-upgrade gate checked grant key `vm`, but the PDP key is
+     `vm_workspace` (`src/core/capability_grants.py`) — granted users could
+     never see the button (fail-closed; the server gate enforces the same
+     grant anyway). Fixed + browser-verified positive case with a temporary
+     DB grant. This discharges the Slice A "verify VM-grant wiring" residual.
+- **Residuals**: no Cockpit surface drives this endpoint yet — sessions
+  auto-attach on open, so the pane only exists connected; today's consumers
+  are API/MCP callers, and a sessions-list "edit settings without opening"
+  affordance is the natural v2 surface. Connected-session server-side
+  editing stays out of scope (heartbeat `config_changed` intent is the
+  extension point).
 
 ### Slice D — model hot-swap hardening (protects what's already live)
 

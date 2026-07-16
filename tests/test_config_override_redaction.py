@@ -124,3 +124,60 @@ class TestRedactConfigOverride:
         assert access.redact_config_override([{"api_key": "x", "model": "m"}]) == [
             {"model": "m"}
         ]
+
+
+class TestRedactThreadMetadataShape:
+    """``main._redact_thread_metadata`` must return metadata as a parsed
+    OBJECT — asyncpg hands JSONB back as a JSON string, and the old
+    "preserve the original representation" behavior returned that string
+    through the owner-facing thread endpoints, silently breaking every
+    Cockpit consumer typed against ``metadata?: Record<string, unknown>``
+    (settings-pane prefill, attached-datasource defaults, REST
+    model/temperature seeding)."""
+
+    def _main(self):
+        import orchestrator.main as main
+
+        return main
+
+    def test_string_metadata_returned_as_parsed_object(self):
+        import json
+
+        main = self._main()
+        md = {"config_override": {"llm": {"model": "m", "api_key": "sk-SECRET"}}}
+        out = main._redact_thread_metadata({"id": "t", "metadata": json.dumps(md)})
+        assert isinstance(out["metadata"], dict)
+        assert out["metadata"]["config_override"]["llm"]["model"] == "m"
+        assert "api_key" not in out["metadata"]["config_override"]["llm"]
+
+    def test_dict_metadata_stays_object_and_redacts(self):
+        main = self._main()
+        md = {
+            "config_override": {"llm": {"api_key": "sk-SECRET"}},
+            "datasource_ids": ["a"],
+        }
+        out = main._redact_thread_metadata({"id": "t", "metadata": md})
+        assert out["metadata"]["datasource_ids"] == ["a"]
+        assert "api_key" not in out["metadata"]["config_override"]["llm"]
+
+    def test_absent_or_unparseable_metadata_becomes_empty_object(self):
+        main = self._main()
+        assert main._redact_thread_metadata({"id": "t"})["metadata"] == {}
+        assert (
+            main._redact_thread_metadata({"id": "t", "metadata": "{not json"})[
+                "metadata"
+            ]
+            == {}
+        )
+        assert (
+            main._redact_thread_metadata({"id": "t", "metadata": None})["metadata"]
+            == {}
+        )
+
+    def test_workspace_binding_dropped(self):
+        main = self._main()
+        out = main._redact_thread_metadata(
+            {"id": "t", "metadata": {"_workspace_binding": {"x": 1}, "keep": True}}
+        )
+        assert "_workspace_binding" not in out["metadata"]
+        assert out["metadata"]["keep"] is True

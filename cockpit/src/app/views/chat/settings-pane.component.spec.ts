@@ -273,7 +273,7 @@ describe('SettingsPaneComponent workspace tier', () => {
   it('initializes the tier from thread metadata and gates upgrades', () => {
     const {component} = createPane({
       override: {workspace: {backend: 'sandbox'}},
-      grants: {vm: true},
+      grants: {vm_workspace: true},
     });
     expect(component.workspaceTier()).toBe('sandbox');
     expect(component.canUpgradeToSandbox()).toBe(false);
@@ -281,7 +281,7 @@ describe('SettingsPaneComponent workspace tier', () => {
   });
 
   it('denies the VM upgrade without the vm grant; admin (null grants) allows', () => {
-    const {component} = createPane({grants: {vm: false}});
+    const {component} = createPane({grants: {vm_workspace: false}});
     expect(component.workspaceTier()).toBe('virtual');
     expect(component.canUpgradeToSandbox()).toBe(true);
     expect(component.canUpgradeToVm()).toBe(false);
