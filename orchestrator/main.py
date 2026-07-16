@@ -10920,6 +10920,22 @@ async def _handle_scholar_completion(
     job_id = str(job["id"])
     target_id = str(parent_job_id)
     job_status = job.get("status", "")
+
+    # A NON-TERMINAL scholar report must not unblock the parent: an
+    # outage/drain-paused scholar (the /complete pause path sets
+    # job["status"]="paused" in-memory before this step) will be
+    # re-dispatched and resume from checkpoint — the parent keeps waiting
+    # for the real outcome. Historically unreachable (subjobs only received
+    # terminal statuses); live-caught on the k3d gate when a cooldown-paused
+    # scholar falsely unblocked its parent as research-success.
+    # docs/features/llm_outage_subjob_resilience.md
+    if job_status not in ("completed", "failed", "cancelled", "pending_review"):
+        logger.debug(
+            f"Scholar {job_id} reported non-terminal status {job_status!r} — "
+            f"parent {target_id} keeps waiting"
+        )
+        return
+
     is_failure = job_status in ("failed", "cancelled")
 
     parent = await postgres_db.get_job(target_id)
