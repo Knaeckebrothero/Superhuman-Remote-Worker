@@ -196,8 +196,8 @@ canvas:
           # Alternatively, set a Vault path while using externalSecrets; it is
           # synced only after viewer.enabled becomes true.
           vaultPath: ""
-          usernameKey: "username"
-          passwordKey: "password"
+          usernameKey: "CANVAS_VIEWER_POSTGRES_USER"
+          passwordKey: "CANVAS_VIEWER_POSTGRES_PASSWORD"
         provisionRole: false
         pool:
           min: 1
