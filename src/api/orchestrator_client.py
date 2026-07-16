@@ -40,6 +40,22 @@ class SessionGrantDenied(Exception):
     """
 
 
+class ThreadConfigUpdateDenied(Exception):
+    """The orchestrator rejected a live thread config update (4xx).
+
+    Carries the response ``detail`` (e.g. the capability-grant denial reason
+    from ``_enforce_session_create_grants``) so the session can surface the
+    actual cause to the user instead of a generic "update rejected". Network
+    failures and 5xx keep returning ``None`` — those are transient and the
+    caller's fallback semantics apply (live_session_settings.md P0.3).
+    """
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Thread config update denied ({status_code}): {detail}")
+
+
 class CanvasClientError(RuntimeError):
     """A model-safe failure from a delegated Dynamic Canvas request.
 
@@ -902,9 +918,15 @@ class OrchestratorClient:
         Returns:
             The orchestrator-enriched ``config_override`` (with resolved
             ``base_url``/``api_key`` for endpoint-backed models) on success,
-            or ``None`` on failure. Callers must use the returned dict —
-            not the input — when rebuilding the LLM, otherwise custom
-            endpoint requests fall through to api.openai.com.
+            or ``None`` on transient failure (network, 5xx). Callers must use
+            the returned dict — not the input — when rebuilding the LLM,
+            otherwise custom endpoint requests fall through to api.openai.com.
+
+        Raises:
+            ThreadConfigUpdateDenied: on a 4xx response — a deliberate
+                rejection (grant denial, invalid override, unknown thread)
+                whose ``detail`` must reach the user, not a transient failure
+                to retry or fall back from.
         """
         if not self._client:
             return None
@@ -912,10 +934,23 @@ class OrchestratorClient:
         try:
             r = await self._client.patch(url, json={"config_override": config_override})
             if r.status_code != 200:
+                if 400 <= r.status_code < 500:
+                    try:
+                        detail = r.json().get("detail")
+                    except Exception:
+                        detail = None
+                    if not isinstance(detail, str):
+                        detail = str(detail) if detail else (r.text or "")[:500]
+                    raise ThreadConfigUpdateDenied(r.status_code, detail)
+                logger.warning(
+                    f"Thread config update rejected: {r.status_code} - {r.text[:200]}"
+                )
                 return None
             data = r.json()
             enriched = data.get("config_override")
             return enriched if isinstance(enriched, dict) else config_override
+        except ThreadConfigUpdateDenied:
+            raise
         except Exception as e:
             logger.warning(f"Thread config update failed (non-fatal): {e}")
             return None

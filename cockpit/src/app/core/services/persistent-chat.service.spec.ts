@@ -2027,14 +2027,19 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         expect(sent).toContainEqual({method: 'narration.set', mode: 'silent'});
     });
 
-    it('updateConfig forwards the config object over the WS', async () => {
+    it('updateConfig forwards the config object over the WS with a request_id', async () => {
         const ctx = await readySession();
-        ctx.service.updateConfig({model: 'claude-sonnet-4-6', temperature: 0.3});
+        const requestId = ctx.service.updateConfig({model: 'claude-sonnet-4-6', temperature: 0.3});
         const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
         expect(sent).toContainEqual({
             method: 'config.update',
             config: {model: 'claude-sonnet-4-6', temperature: 0.3},
+            request_id: requestId,
         });
+        // The returned id is what config.changed / error frames echo back —
+        // callers correlate in-flight updates with it (P0.3).
+        expect(typeof requestId).toBe('string');
+        expect(requestId.length).toBeGreaterThan(0);
     });
 });
 

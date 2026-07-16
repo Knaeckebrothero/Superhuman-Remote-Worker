@@ -26,6 +26,7 @@ from .orchestrator_client import (
     DuplicateThreadBinding,
     OrchestratorClient,
     SessionGrantDenied,
+    ThreadConfigUpdateDenied,
     create_orchestrator_client_from_env,
 )
 from .persistent_session import (
@@ -429,6 +430,7 @@ def _ensure_persistent_loop_started(
                     _session.config,
                     _session.auxiliary_llm,
                 ),
+                get_current_system_prompt=lambda: _session.system_prompt,
                 memory_extraction_prompt=_session.memory_extraction_prompt,
                 memory_service=_session.memory_service,
             ),
@@ -1236,6 +1238,38 @@ def _apply_session_tool_group_markers(
             merged_config.pop(marker, None)
 
 
+def _apply_datasource_enrichment_to_resolved(
+    resolved_config: Optional[Dict[str, Any]],
+    ds_tool_categories: Dict[str, List[str]],
+    cli_ds_types: List[str],
+) -> None:
+    """Fold datasource-derived config into an orchestrator-resolved blob.
+
+    Hydration (``load_config_from_resolved``) deliberately skips the
+    config_override merge, so the datasource tool categories and
+    ``_cli_datasources`` applied to config_override during attach never reach
+    a hydrated session. Mutate the blob's ``agent`` dict in place instead:
+    tool categories merge into ``agent["tools"]``; ``_cli_datasources`` goes
+    at the TOP level, because ``serialize_resolved_config`` flattens
+    ``extra`` keys there and ``load_agent_config_from_dict`` folds unknown
+    top-level keys back into ``config.extra``.
+
+    No-op when ``resolved_config`` is absent or malformed.
+    """
+    if not resolved_config:
+        return
+    agent_dict = resolved_config.get("agent")
+    if not isinstance(agent_dict, dict):
+        return
+    if ds_tool_categories:
+        agent_tools = agent_dict.get("tools")
+        agent_tools = dict(agent_tools) if isinstance(agent_tools, dict) else {}
+        agent_tools.update(ds_tool_categories)
+        agent_dict["tools"] = agent_tools
+    if cli_ds_types:
+        agent_dict["_cli_datasources"] = cli_ds_types
+
+
 def _sanitize_live_session_config_override(
     config_override: Any,
 ) -> Dict[str, Any]:
@@ -1483,6 +1517,7 @@ async def _attach_session(
     kb_datasources: List[Dict[str, Any]] = []
     if datasources:
         from ..core.datasource_setup import (
+            datasource_tool_categories,
             inject_datasource_index as _inject_ds_index,
             process_datasources,
         )
@@ -1497,58 +1532,29 @@ async def _attach_session(
             non_repo_datasources
         )
 
-        # Inject datasource tool categories into config_override so the
-        # correct tools are loaded when config is resolved below
-        _ds_tool_map = {
-            "neo4j": {
-                "category": "graph",
-                "read": ["cypher_query", "get_database_schema"],
-                "write": ["cypher_query", "cypher_execute", "get_database_schema"],
-            },
-            "postgresql": {
-                "category": "sql",
-                "read": ["sql_query", "sql_schema"],
-                "write": ["sql_query", "sql_schema", "sql_execute"],
-            },
-            "mongodb": {
-                "category": "mongodb",
-                "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
-                "write": [
-                    "mongo_query",
-                    "mongo_aggregate",
-                    "mongo_schema",
-                    "mongo_insert",
-                    "mongo_update",
-                ],
-            },
-            "webdav": {
-                "category": "webdav",
-                "read": ["webdav_list", "webdav_read", "webdav_info"],
-                "write": [
-                    "webdav_list",
-                    "webdav_read",
-                    "webdav_info",
-                    "webdav_write",
-                    "webdav_delete",
-                ],
-            },
-        }
+        # Inject datasource tool categories so the correct tools are loaded
+        # when config is resolved below. Shared map with the orchestrator's
+        # _build_datasource_tool_override — the two previously disagreed on
+        # read-write managed connectors (write-tools vs CLI-only).
+        ds_tool_categories = datasource_tool_categories(datasources)
         config_override = dict(config_override or {})
         tools_override = dict(config_override.get("tools", {}))
-        attached_types = {ds["type"] for ds in datasources}
-        for ds_type, tool_info in _ds_tool_map.items():
-            cat = tool_info["category"]
-            if ds_type in attached_types:
-                ds_entry = next(d for d in datasources if d["type"] == ds_type)
-                is_ro = ds_entry.get("project_read_only", False)
-                tools_override[cat] = tool_info["read"] if is_ro else tool_info["write"]
-            else:
-                tools_override.setdefault(cat, [])
+        tools_override.update(ds_tool_categories)
         if tools_override:
             config_override["tools"] = tools_override
 
         if cli_ds_types:
             config_override.setdefault("extra", {})["_cli_datasources"] = cli_ds_types
+
+        # Hydrated attaches load the orchestrator-resolved blob below and
+        # never touch config_override — fold the same enrichment into the
+        # blob's agent dict, or a hydrated attach silently drops read-only
+        # connector tools and the CLI prompt block. The warm-pool path
+        # compensated orchestrator-side; the dedicated-pod path did not
+        # (live_session_settings.md P0.2).
+        _apply_datasource_enrichment_to_resolved(
+            resolved_config, ds_tool_categories, cli_ds_types
+        )
 
         logger.info(
             "Processed %d datasource(s) for session: %d connections, %d CLI",
@@ -2792,7 +2798,11 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             elif method == "config.update":
                 config_override = data.get("config", {})
                 if config_override:
-                    asyncio.create_task(_handle_config_update(ws, config_override))
+                    asyncio.create_task(
+                        _handle_config_update(
+                            ws, config_override, request_id=data.get("request_id")
+                        )
+                    )
 
             elif method == "compact":
                 # Manual compaction trigger (/compact command)
@@ -5326,7 +5336,30 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
         await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
 
 
-async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) -> None:
+def _scrub_secret_values(fragment: Any) -> Any:
+    """Recursively drop secret-named keys from a config fragment.
+
+    The ``config.changed`` ack echoes the applied fragment to every
+    subscriber and into the persistent event journal — an api-key-bearing
+    key (``llm.api_key``, ``env_keys.EMBEDDING_API_KEY``) must never ride
+    along, mirroring the orchestrator's redact-at-rest rule.
+    """
+    if isinstance(fragment, dict):
+        return {
+            k: _scrub_secret_values(v)
+            for k, v in fragment.items()
+            if "api_key" not in k.lower()
+        }
+    if isinstance(fragment, list):
+        return [_scrub_secret_values(v) for v in fragment]
+    return fragment
+
+
+async def _handle_config_update(
+    ws: WebSocket,
+    config_override: Dict[str, Any],
+    request_id: Optional[str] = None,
+) -> None:
     """Apply runtime config changes (model, temperature, permission mode).
 
     Deep-merges *config_override* into the session config, rebuilds the
@@ -5337,21 +5370,29 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
     or ``api_key``. We must let the orchestrator resolve credentials
     BEFORE rebuilding the LLM, otherwise endpoint-backed models silently
     route to api.openai.com with ``not-needed``.
+
+    ``request_id`` (optional, client-chosen) is echoed on the success ack
+    and on every error frame this handler emits, so a client with several
+    in-flight updates can correlate outcomes (live_session_settings.md P0.3).
     """
     global _session, _orchestrator_client, _thread_id
 
+    async def _send_error(message: str, detail: Optional[str] = None) -> None:
+        payload: Dict[str, Any] = {"message": message}
+        if detail:
+            payload["detail"] = detail
+        if request_id:
+            payload["request_id"] = request_id
+        await _ws_send(ws, "error", payload)
+
     if not _session:
-        await _ws_send(ws, "error", {"message": "No active session"})
+        await _send_error("No active session")
         return
 
     try:
         config_override = _sanitize_live_session_config_override(config_override)
         if not config_override:
-            await _ws_send(
-                ws,
-                "error",
-                {"message": "No supported session config fields were provided"},
-            )
+            await _send_error("No supported session config fields were provided")
             return
 
         import dataclasses
@@ -5398,33 +5439,28 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                     effective_override = enriched
                 else:
                     if tools_update:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": "Session tool update was rejected"},
-                        )
+                        await _send_error("Session tool update was rejected")
                         return
                     logger.warning(
                         "Orchestrator config enrichment failed; falling back to "
                         "raw override (custom endpoints may misroute)"
                     )
+            except ThreadConfigUpdateDenied as e:
+                # A deliberate 4xx (grant denial, invalid override) — surface
+                # the orchestrator's detail and never apply locally. This also
+                # closes the old fallback hole where a grant-denied model swap
+                # fell through to "apply raw override anyway".
+                await _send_error("Session config update rejected", detail=e.detail)
+                return
             except Exception:
                 if tools_update:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {"message": "Session tool update could not be authorized"},
-                    )
+                    await _send_error("Session tool update could not be authorized")
                     return
                 logger.warning("Config persistence to orchestrator failed (non-fatal)")
         elif tools_update:
             # A tool update without the authoritative orchestrator is unsafe:
             # local registry loading cannot evaluate owner capability grants.
-            await _ws_send(
-                ws,
-                "error",
-                {"message": "Session tool update could not be authorized"},
-            )
+            await _send_error("Session tool update could not be authorized")
             return
 
         base_dict = dataclasses.asdict(_session.config)
@@ -5565,11 +5601,28 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 ),
             )
 
+        # Persist updates that didn't go through the enrichment PATCH above
+        # (cosmetic-only changes like permission_mode, narration_mode,
+        # temperature-without-model edits). Runs BEFORE the local
+        # permission-mode apply: permission_mode is grant-gated
+        # orchestrator-side, so a 4xx denial here must stop the runtime
+        # from applying an escalation the durable config rejected.
+        if _orchestrator_client and _thread_id and not needs_enrichment:
+            try:
+                await _orchestrator_client.update_thread_config(
+                    _thread_id, config_override
+                )
+            except ThreadConfigUpdateDenied as e:
+                await _send_error("Session config update rejected", detail=e.detail)
+                return
+            except Exception:
+                logger.warning("Config persistence to orchestrator failed (non-fatal)")
+
         # Update permission mode if included.
         # _session may have been detached concurrently — bail out cleanly
         # instead of AttributeError'ing on assignment.
         if _session is None:
-            await _ws_send(ws, "error", {"message": "Session no longer active"})
+            await _send_error("Session no longer active")
             return
         pm = (config_override.get("interactive") or {}).get("permission_mode")
         if pm and pm in ("supervised", "auto_accept", "autonomous"):
@@ -5578,33 +5631,23 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
         if nm and nm in ("silent", "verbose", "auto"):
             _session.narration_mode = nm
 
-        # Persist updates that didn't go through the enrichment PATCH above
-        # (cosmetic-only changes like permission_mode, narration_mode,
-        # temperature-without-model edits).
-        if _orchestrator_client and _thread_id and not needs_enrichment:
-            try:
-                await _orchestrator_client.update_thread_config(
-                    _thread_id, config_override
-                )
-            except Exception:
-                logger.warning("Config persistence to orchestrator failed (non-fatal)")
-
-        # Acknowledge with resolved values
-        if _session is None:
-            return
-        await _ws_send(
-            ws,
-            "config.changed",
-            {
-                "model": new_config.llm.model,
-                "temperature": new_config.llm.temperature,
-                "permission_mode": _session.permission_mode,
-            },
-        )
+        # Acknowledge with resolved values — broadcast to every subscriber
+        # (all viewers should converge on the new config, and the frame lands
+        # in the event journal as the durable transcript record), echoing the
+        # applied fragment (secret-scrubbed) + request_id for correlation.
+        ack: Dict[str, Any] = {
+            "model": new_config.llm.model,
+            "temperature": new_config.llm.temperature,
+            "permission_mode": _session.permission_mode,
+            "applied": _scrub_secret_values(config_override),
+        }
+        if request_id:
+            ack["request_id"] = request_id
+        _broadcast("config.changed", ack)
 
     except Exception as e:
         logger.exception("Config update failed: %s", e)
-        await _ws_send(ws, "error", {"message": f"Config update failed: {e}"})
+        await _send_error(f"Config update failed: {e}")
 
 
 async def _handle_archive(ws: WebSocket) -> None:
