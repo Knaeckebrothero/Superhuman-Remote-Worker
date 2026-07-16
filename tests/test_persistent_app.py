@@ -4188,6 +4188,156 @@ class TestHandleConfigUpdateAckProtocol:
         assert fragment["llm"]["api_key"] == "sk-secret"
 
 
+class TestHandleConfigUpdateDatasources:
+    """Slice B of live_session_settings.md: the datasource_ids sibling key
+    on config.update — fail-loud authorization, payload re-fetch, and the
+    deferred-close contract."""
+
+    @pytest.mark.asyncio
+    async def test_datasource_update_without_orchestrator_fails_loud(self, monkeypatch):
+        """No orchestrator ⇒ no change: credentials only exist orchestrator-
+        side and the grant flip can't be evaluated locally."""
+        import src.api.persistent_app as mod
+
+        session = SimpleNamespace(
+            resetup_tools_for_backend=MagicMock(),
+            resetup_datasources=MagicMock(),
+        )
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_session", session)
+        monkeypatch.setattr(mod, "_orchestrator_client", None)
+        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod, "_ws_send", send)
+
+        await mod._handle_config_update(
+            MagicMock(), {}, datasource_ids=["ds-a"], request_id="req-1"
+        )
+
+        session.resetup_datasources.assert_not_called()
+        send.assert_awaited_once()
+        event, payload = send.await_args.args[1:]
+        assert event == "error"
+        assert "datasource" in payload["message"].lower()
+        assert payload["request_id"] == "req-1"
+
+    @pytest.mark.asyncio
+    async def test_empty_config_with_datasource_ids_is_a_valid_frame(self, monkeypatch):
+        """A datasource-only change sends config={} — the 'no supported
+        fields' guard must not reject it. (It then proceeds to the PATCH;
+        a denial here proves the guard was passed.)"""
+        import src.api.persistent_app as mod
+        from src.api.orchestrator_client import ThreadConfigUpdateDenied
+
+        session = SimpleNamespace(resetup_datasources=MagicMock())
+        orchestrator_client = SimpleNamespace(
+            update_thread_config=AsyncMock(
+                side_effect=ThreadConfigUpdateDenied(422, "datasource denied")
+            ),
+            get_thread_workspace=AsyncMock(),
+        )
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_session", session)
+        monkeypatch.setattr(mod, "_orchestrator_client", orchestrator_client)
+        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod, "_ws_send", send)
+
+        await mod._handle_config_update(MagicMock(), {}, datasource_ids=[])
+
+        orchestrator_client.update_thread_config.assert_awaited_once_with(
+            "thread-1", {}, datasource_ids=[]
+        )
+        event, payload = send.await_args.args[1:]
+        assert event == "error"
+        assert "datasource denied" in payload["detail"]
+        # Denied ⇒ never re-fetched, never applied.
+        orchestrator_client.get_thread_workspace.assert_not_awaited()
+        session.resetup_datasources.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_workspace_refetch_failure_stops_before_local_mutation(
+        self, monkeypatch
+    ):
+        """PATCH succeeded (durable set updated) but the enriched payload
+        fetch failed: surface the inconsistency and apply NOTHING locally —
+        the next attach converges from metadata.datasource_ids."""
+        import src.api.persistent_app as mod
+
+        session = SimpleNamespace(resetup_datasources=MagicMock())
+        orchestrator_client = SimpleNamespace(
+            update_thread_config=AsyncMock(return_value={}),
+            get_thread_workspace=AsyncMock(return_value=None),
+        )
+        send = AsyncMock()
+        monkeypatch.setattr(mod, "_session", session)
+        monkeypatch.setattr(mod, "_orchestrator_client", orchestrator_client)
+        monkeypatch.setattr(mod, "_thread_id", "thread-1")
+        monkeypatch.setattr(mod, "_ws_send", send)
+
+        await mod._handle_config_update(
+            MagicMock(), {}, datasource_ids=["ds-a"], request_id="req-9"
+        )
+
+        session.resetup_datasources.assert_not_called()
+        event, payload = send.await_args.args[1:]
+        assert event == "error"
+        assert payload["request_id"] == "req-9"
+        assert "could not be applied" in payload["message"]
+
+    def test_datasource_update_forces_enrichment_gate(self):
+        from inspect import getsource
+
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert "or ds_update" in src
+        # Payload fetch happens BEFORE any local mutation.
+        assert src.index("get_thread_workspace") < src.index(
+            "base_dict = dataclasses.asdict"
+        )
+
+    def test_resetup_owns_the_tools_reload_and_close_is_deferred(self):
+        """When datasources change, resetup_datasources() (which ends in
+        resetup_tools_for_backend) is the single tools reload — and the
+        replaced connections go to the turn-end closer, never an eager
+        close."""
+        from inspect import getsource
+
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert "_session.resetup_datasources(" in src
+        assert "_close_datasources_after_turn(" in src
+        assert "elif tools_changed:" in src
+        assert 'ack["datasources"]' in src
+
+    def test_turn_end_closer_waits_on_the_turn_flag(self):
+        from inspect import getsource
+
+        from src.api.persistent_app import _close_datasources_after_turn
+
+        src = getsource(_close_datasources_after_turn)
+        assert "_turn_in_flight()" in src
+        assert "close_datasource_connections(connections, clients)" in src
+
+    @pytest.mark.asyncio
+    async def test_close_after_turn_polls_until_turn_ends(self, monkeypatch):
+        import src.api.persistent_app as mod
+
+        flags = iter([True, False])
+        monkeypatch.setattr(mod, "_turn_in_flight", lambda: next(flags))
+        sleeps: list[float] = []
+
+        async def fake_sleep(s):
+            sleeps.append(s)
+
+        monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+        conn = MagicMock()
+        await mod._close_datasources_after_turn({"postgresql": conn}, {})
+
+        assert sleeps  # waited at least one tick while the turn ran
+        conn.close.assert_called_once()
+
+
 class TestAttachSessionRebinds:
     """Pin the per-session rebind landmarks in ``_attach_session``.
 

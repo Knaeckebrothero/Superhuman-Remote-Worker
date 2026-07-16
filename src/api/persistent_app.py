@@ -1786,6 +1786,8 @@ async def _attach_session(
         datasources=datasources_dict,
         knowledge_bindings=knowledge_bindings,
         _datasource_clients=datasource_clients,
+        # Raw payload kept as the live-change diff baseline (Slice B).
+        datasource_configs=list(datasources or []),
     )
     if project_ids:
         logger.info(f"Session scoped to {len(project_ids)} project(s): {project_ids}")
@@ -2797,10 +2799,16 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
 
             elif method == "config.update":
                 config_override = data.get("config", {})
-                if config_override:
+                # Slice B: a datasource change rides the same frame as a
+                # sibling key — the full desired selection (None = unchanged).
+                datasource_ids = data.get("datasource_ids")
+                if config_override or datasource_ids is not None:
                     asyncio.create_task(
                         _handle_config_update(
-                            ws, config_override, request_id=data.get("request_id")
+                            ws,
+                            config_override,
+                            datasource_ids=datasource_ids,
+                            request_id=data.get("request_id"),
                         )
                     )
 
@@ -5355,9 +5363,40 @@ def _scrub_secret_values(fragment: Any) -> Any:
     return fragment
 
 
+async def _close_datasources_after_turn(
+    connections: Dict[str, Any], clients: Dict[str, Any]
+) -> None:
+    """Close replaced datasource connections once no turn is executing.
+
+    Live datasource removal defers the close: bound tools captured the old
+    connections in closures at load time, so an eager close would error an
+    in-flight turn's call mid-turn instead of letting it finish — the
+    observable rule stays "changes apply at the next turn" in BOTH directions
+    (live_session_settings.md Slice B). Polls the turn flag and closes as
+    soon as the loop parks (or the session ends).
+    """
+    from ..core.datasource_setup import close_datasource_connections
+
+    try:
+        while _turn_in_flight():
+            await asyncio.sleep(0.5)
+        close_datasource_connections(connections, clients)
+        logger.info(
+            "Closed %d replaced datasource connection(s) after turn end",
+            len(connections),
+        )
+    except asyncio.CancelledError:
+        # Shutdown teardown — close immediately; nothing left in flight.
+        close_datasource_connections(connections, clients)
+        raise
+    except Exception as e:
+        logger.warning("Deferred datasource close failed: %s", e)
+
+
 async def _handle_config_update(
     ws: WebSocket,
     config_override: Dict[str, Any],
+    datasource_ids: Optional[List[str]] = None,
     request_id: Optional[str] = None,
 ) -> None:
     """Apply runtime config changes (model, temperature, permission mode).
@@ -5370,6 +5409,15 @@ async def _handle_config_update(
     or ``api_key``. We must let the orchestrator resolve credentials
     BEFORE rebuilding the LLM, otherwise endpoint-backed models silently
     route to api.openai.com with ``not-needed``.
+
+    ``datasource_ids`` (Slice B) is the desired FULL datasource selection
+    (``None`` = no change, ``[]`` = detach all). It forwards on the internal
+    PATCH — where the orchestrator authorizes it, grant-checks the derived
+    tool flip, and persists ``metadata.datasource_ids`` — then the enriched
+    datasource payloads are re-fetched via the workspace endpoint (creds
+    never ride config_override) and applied through
+    ``session.resetup_datasources``; replaced connections close only after
+    any in-flight turn ends.
 
     ``request_id`` (optional, client-chosen) is echoed on the success ack
     and on every error frame this handler emits, so a client with several
@@ -5391,7 +5439,7 @@ async def _handle_config_update(
 
     try:
         config_override = _sanitize_live_session_config_override(config_override)
-        if not config_override:
+        if not config_override and datasource_ids is None:
             await _send_error("No supported session config fields were provided")
             return
 
@@ -5418,6 +5466,7 @@ async def _handle_config_update(
             "EMBEDDING_API_KEY",
         )
         env_block = config_override.get("env_keys") or {}
+        ds_update = datasource_ids is not None
         needs_enrichment = bool(
             config_override.get("llm", {}).get("model")
             or config_override.get("auxiliary", {}).get("model")
@@ -5427,19 +5476,27 @@ async def _handle_config_update(
             # orchestrator's owner-grant validation and durable merge before
             # this runtime reloads anything locally.
             or config_override.get("tools")
+            # Datasource changes are BOTH: authorization (owner access +
+            # datasource_tools grant on the derived flip) and credentials
+            # (connection payloads only ever come from the orchestrator).
+            or ds_update
         )
         tools_update = bool(config_override.get("tools"))
         effective_override = config_override
         if _orchestrator_client and _thread_id and needs_enrichment:
             try:
                 enriched = await _orchestrator_client.update_thread_config(
-                    _thread_id, config_override
+                    _thread_id, config_override, datasource_ids=datasource_ids
                 )
                 if enriched is not None:
                     effective_override = enriched
                 else:
-                    if tools_update:
-                        await _send_error("Session tool update was rejected")
+                    if tools_update or ds_update:
+                        await _send_error(
+                            "Session datasource update was rejected"
+                            if ds_update
+                            else "Session tool update was rejected"
+                        )
                         return
                     logger.warning(
                         "Orchestrator config enrichment failed; falling back to "
@@ -5453,15 +5510,44 @@ async def _handle_config_update(
                 await _send_error("Session config update rejected", detail=e.detail)
                 return
             except Exception:
-                if tools_update:
-                    await _send_error("Session tool update could not be authorized")
+                if tools_update or ds_update:
+                    await _send_error(
+                        "Session datasource update could not be authorized"
+                        if ds_update
+                        else "Session tool update could not be authorized"
+                    )
                     return
                 logger.warning("Config persistence to orchestrator failed (non-fatal)")
-        elif tools_update:
-            # A tool update without the authoritative orchestrator is unsafe:
-            # local registry loading cannot evaluate owner capability grants.
-            await _send_error("Session tool update could not be authorized")
+        elif tools_update or ds_update:
+            # A tool/datasource update without the authoritative orchestrator
+            # is unsafe: local loading cannot evaluate owner capability grants,
+            # and datasource credentials only exist orchestrator-side.
+            await _send_error(
+                "Session datasource update could not be authorized"
+                if ds_update
+                else "Session tool update could not be authorized"
+            )
             return
+
+        # Slice B: fetch the enriched datasource payloads BEFORE any local
+        # mutation, so a fetch failure leaves the runtime consistent (the
+        # durable selection is already updated; the user retries or the next
+        # attach converges). Credentials never ride config_override — this
+        # internal endpoint re-injects them per fetch.
+        new_ds_payload: Optional[List[Dict[str, Any]]] = None
+        if ds_update:
+            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            if not isinstance(ws_info, dict):
+                await _send_error(
+                    "Session datasource update could not be applied",
+                    detail=(
+                        "The change was saved but the refreshed datasource "
+                        "payload could not be fetched; retry, or resume the "
+                        "session to converge."
+                    ),
+                )
+                return
+            new_ds_payload = ws_info.get("datasources") or []
 
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, effective_override)
@@ -5496,7 +5582,20 @@ async def _handle_config_update(
         else:
             _session.config = new_config
 
-        if tools_changed:
+        ds_summary: Optional[Dict[str, Any]] = None
+        if ds_update:
+            # resetup_datasources ends in resetup_tools_for_backend(), which
+            # also covers a tools fragment riding the same frame. Replaced
+            # connections stay open until the in-flight turn (if any) ends —
+            # bound tools captured them in closures at load time.
+            ds_summary = _session.resetup_datasources(new_ds_payload or [])
+            stale_conns = ds_summary.pop("stale_connections", {})
+            stale_clients = ds_summary.pop("stale_clients", {})
+            if stale_conns or stale_clients:
+                asyncio.create_task(
+                    _close_datasources_after_turn(stale_conns, stale_clients)
+                )
+        elif tools_changed:
             _session.resetup_tools_for_backend()
         elif llm_changed:
             _session._bind_tools()
@@ -5641,6 +5740,14 @@ async def _handle_config_update(
             "permission_mode": _session.permission_mode,
             "applied": _scrub_secret_values(config_override),
         }
+        if ds_summary is not None:
+            # Names only (no ids/credentials) — feeds the transcript stamp.
+            ack["datasources"] = {
+                "added": ds_summary.get("added", []),
+                "removed": ds_summary.get("removed", []),
+            }
+            if ds_summary.get("kb_deferred"):
+                ack["datasources"]["kb_deferred"] = True
         if request_id:
             ack["request_id"] = request_id
         _broadcast("config.changed", ack)

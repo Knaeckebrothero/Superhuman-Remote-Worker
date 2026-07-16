@@ -78,8 +78,11 @@ const APPLY_DEBOUNCE_MS = 400;
             [config]="liveConfig()"
             [disabled]="!chat.isConnected()"
             [gatedCapabilities]="capabilities.grants() ?? null"
-            [datasources]="attachedDatasources()"
+            [datasources]="pickerDatasources()"
             [loadingDatasources]="loadingThread()"
+            [initialDatasourceIds]="attachedIds()"
+            [lockedDatasourceIds]="lockedDatasourceIds()"
+            [liteBackend]="isLiteBackend()"
             (change)="onSettingsChange()"
           />
 
@@ -206,7 +209,16 @@ export class SettingsPaneComponent {
     /** Redacted config_override from thread metadata (fetched on open). */
     private readonly threadOverride = signal<Record<string, unknown>>({});
     readonly loadingThread = signal(false);
-    readonly attachedDatasources = signal<Datasource[]>([]);
+    /** The session's currently attached datasource ids (durable selection;
+     *  optimistically advanced when the pane dispatches a change). */
+    readonly attachedIds = signal<string[]>([]);
+    /** Eligible datasources shown in the picker: the create-flow eligible
+     *  union, minus unattached kb entries (not addable live — v1). */
+    readonly pickerDatasources = signal<Datasource[]>([]);
+    /** kb entries render frozen: knowledge bindings only rewire on attach. */
+    readonly lockedDatasourceIds = computed(() =>
+        this.pickerDatasources().filter((ds) => ds.type === 'kb').map((ds) => ds.id),
+    );
     /** Thread id the pane last prefilled for (re-prefill on session switch). */
     private prefilledThread: string | null = null;
     /** Desired state actually dispatched last — the diff baseline. */
@@ -234,6 +246,9 @@ export class SettingsPaneComponent {
         this.chat.workspaceTier()
         ?? (readConfigPath(this.threadOverride(), 'workspace.backend') as string)
         ?? 'virtual',
+    );
+    readonly isLiteBackend = computed(() =>
+        ['virtual', 'none'].includes(this.workspaceTier()),
     );
     readonly canUpgradeToSandbox = computed(() => this.workspaceTier() === 'virtual');
     readonly canUpgradeToVm = computed(() => {
@@ -292,25 +307,45 @@ export class SettingsPaneComponent {
                 if (tier) this.chat.workspaceTier.set(tier);
             }
 
+            const ids = ((metadata['datasource_ids'] ?? []) as string[]).map(String);
+            this.attachedIds.set(ids);
+
             // Prefill the sub-groups' baselines from the effective config
             // (tools group derives its enabled/disabled baseline here; this
-            // also clears any pins made while the fetch was in flight), then
-            // anchor the diff baseline to the CONFIG-ONLY state — never to
-            // getOverrides(), which would silently absorb a pending pin.
+            // also clears any pins made while the fetch was in flight — the
+            // datasource picker gets the same reset), then anchor the diff
+            // baseline to the CONFIG-ONLY state — never to getOverrides(),
+            // which would silently absorb a pending pin.
             this.settings()?.prefillFromConfig(this.liveConfig());
+            this.settings()?.resetDatasourceSelection();
             this.lastApplied = this.desiredState({});
 
-            const ids = (metadata['datasource_ids'] ?? []) as string[];
-            if (ids.length) {
-                this.api.getDatasources().subscribe((all) => {
-                    this.attachedDatasources.set(
-                        (all ?? []).filter((ds) => ids.includes(ds.id)),
-                    );
-                });
-            } else {
-                this.attachedDatasources.set([]);
-            }
+            // Eligible list = the create-flow union for the thread's projects
+            // (per-project failures collapse to [] in the service; attached
+            // ids missing from the picker are preserved invisibly in every
+            // dispatched set — see canonicalDatasourceIds). Unattached kb
+            // entries are hidden: knowledge bindings don't rewire live (v1).
+            const projectIds = ((thread?.['project_ids'] ?? []) as string[]).map(String);
+            this.api.getEligibleDatasources(projectIds).subscribe((eligible) => {
+                this.pickerDatasources.set(
+                    (eligible ?? []).filter(
+                        (ds) => ds.type !== 'kb' || ids.includes(ds.id),
+                    ),
+                );
+            });
         });
+    }
+
+    /** The full desired selection: the picker's checked set plus attached ids
+     *  the picker doesn't show (kb hidden entries, revoked-visibility rows,
+     *  eligible-fetch failures) — those must survive every dispatch, or an
+     *  unrelated toggle would silently detach them. Sorted for stable
+     *  comparison. */
+    private canonicalDatasourceIds(): string[] {
+        const groupIds = this.settings()?.getSelectedDatasourceIds() ?? [];
+        const pickerIds = new Set(this.pickerDatasources().map((ds) => ds.id));
+        const hidden = this.attachedIds().filter((id) => !pickerIds.has(id));
+        return [...new Set([...groupIds, ...hidden])].sort();
     }
 
     /** Flatten the pane's tracked surface into path → value. Tool groups
@@ -341,6 +376,10 @@ export class SettingsPaneComponent {
                 state[`tools.${cat.key}`] = !(Array.isArray(current) && current.length === 0);
             }
         }
+        // Canonical joined form so the diff is a plain string compare. The
+        // picker's untouched default IS the attached set, so this holds the
+        // baseline value until the user actually toggles a datasource.
+        state['datasource_ids'] = this.canonicalDatasourceIds().join(',');
         return state;
     }
 
@@ -385,7 +424,21 @@ export class SettingsPaneComponent {
             this.chat.setNarrationMode(nm as NarrationMode);
         }
 
-        if (Object.keys(fragment).length) {
+        // Datasources ride the same coalesced frame as a sibling key — the
+        // desired FULL selection (never a delta; matches create semantics).
+        let datasourceIds: string[] | undefined;
+        const dsDesired = desired['datasource_ids'] as string;
+        if (dsDesired !== previous['datasource_ids']) {
+            datasourceIds = dsDesired === '' ? [] : dsDesired.split(',');
+        }
+
+        if (datasourceIds !== undefined) {
+            this.chat.updateConfig(fragment, datasourceIds);
+            // Advance the durable-selection mirror optimistically (same
+            // policy as lastApplied); a rejection error frame leaves the
+            // server state unchanged and a pane reopen re-syncs.
+            this.attachedIds.set(datasourceIds);
+        } else if (Object.keys(fragment).length) {
             this.chat.updateConfig(fragment);
         }
         this.lastApplied = desired;

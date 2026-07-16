@@ -3394,6 +3394,51 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def set_thread_datasource_ids(
+        self, thread_id: str, datasource_ids: List[str]
+    ) -> bool:
+        """Replace ``threads.metadata.datasource_ids`` with the given full set.
+
+        ``datasource_ids`` is a top-level metadata key (sibling of
+        ``config_override`` — ``merge_thread_config_override`` can't touch it),
+        and the live-settings protocol sends the desired FULL selection each
+        time (idempotent, matching create semantics), so this is a plain
+        replace: last write wins is the correct desired-state outcome and no
+        read-modify-write lock is needed.
+
+        Args:
+            thread_id: Thread UUID as string
+            datasource_ids: Complete new selection (may be empty to detach all)
+
+        Returns:
+            True if updated, False if thread not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE threads "
+            "SET metadata = jsonb_set("
+            "    COALESCE(metadata, '{}'::jsonb), "
+            "    '{datasource_ids}', "
+            "    $1::jsonb"
+            "), "
+            "    last_activity = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query,
+                json_module.dumps([str(v) for v in datasource_ids]),
+                uuid_val,
+            )
+
+        return result == "UPDATE 1"
+
     async def get_job_progress(self, job_id: str) -> Dict[str, Any] | None:
         """Get detailed progress information for a job including ETA.
 

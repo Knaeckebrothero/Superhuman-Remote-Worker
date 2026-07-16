@@ -2180,7 +2180,8 @@
     "datasources": {
       "group": "Data Sources",
       "loading": "Loading datasources...",
-      "notReady": "Not fully indexed yet — the agent may see incomplete results."
+      "notReady": "Not fully indexed yet — the agent may see incomplete results.",
+      "lockedLive": "Knowledge bases can't be changed during a session"
     },
     "execution": {
       "group": "Execution",
@@ -2200,7 +2201,7 @@
     },
     "live": {
       "cacheNote": "Changes apply starting with the next response. Changing tools, data sources, or the model resets the conversation's prompt cache — the next response re-processes the full history, which is slower and can cost noticeably more for that turn.",
-      "datasourcesReadOnly": "Data sources are set at session creation for now — attached sources are shown for reference."
+      "datasourcesLive": "Data source changes apply from the next response; removed connections close after the current turn finishes. Content the agent already read stays in its context."
     },
     "autonomy": {
       "full": {

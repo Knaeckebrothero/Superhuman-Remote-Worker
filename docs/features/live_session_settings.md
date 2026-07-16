@@ -31,7 +31,10 @@ best practices). Line anchors verified on `develop` 2026-07-16.
 **P0 groundwork BUILT 2026-07-16** (all five items, unit-tested; see the
 per-item notes in the build order below).
 **Slice A BUILT 2026-07-16** (settings pane live on k3d; see the notes at the
-end of the Slice A section). Slices B–D not started.
+end of the Slice A section).
+**Slice B BUILT 2026-07-16** (live datasources, k3d e2e-verified add → query →
+remove; see the notes at the end of the Slice B section). Slices C–D not
+started.
 **Scope:** Cockpit (settings pane, header cleanup) + one contained
 orchestrator/agent slice (live datasources) + protocol touch-ups + a small
 owner-facing endpoint (disconnected-session editing) + a hardening slice for
@@ -523,6 +526,56 @@ when the history contains tool calls: proxies 400, Anthropic degrades to
 empty responses, strict templates crash. If the effective belt would be
 empty, keep a minimal built-in bound. (Reachable today only on `none`-backend
 sessions with all four groups off — cheap guard, real edge.)
+
+**✅ BUILT 2026-07-16.** Implemented as designed, with these notes:
+
+- **Wire shape**: `datasource_ids` rides the existing `config.update` frame
+  as a sibling key (desired FULL set; `undefined` = no change, `[]` = detach
+  all), coalescing with any config fragment into one frame → one PATCH → one
+  cache invalidation. Same key on `AgentThreadConfigUpdateRequest`; the
+  accepted normalized set comes back in the PATCH response. Persist is a new
+  `set_thread_datasource_ids` full-replace writer (idempotent desired-state,
+  so no advisory lock needed, unlike the config_override RMW).
+- **Agent apply = full registry rebuild**, not surgical per-id diff:
+  `resetup_datasources` re-runs `process_datasources` on the whole new
+  payload (the exact attach path), so multi-same-type + RO-first-sort
+  precedence stay correct by construction; the add/remove summary and repo
+  bookkeeping diff by `(type, name)` because `_build_datasources_payload`
+  strips ids. Replaced connections are returned unclosed and
+  `_close_datasources_after_turn` polls `_turn_in_flight` before closing.
+- **`inject_datasource_index` now rewrites** (cuts everything from the
+  `## Available Datasources` marker before appending the fresh section) and
+  writes an explicit `_No datasources attached._` state on remove-all.
+- **Picker**: eligible union (`GET /api/datasources/eligible` with the
+  thread's project_ids) minus unattached kb entries; attached kb render
+  checked-but-locked (`lockedIds`); the group's untouched default is the
+  ATTACHED set (`initialSelectedIds`), not all-eligible; attached ids the
+  picker can't show (hidden kb, revoked visibility, eligible-fetch failure)
+  are preserved in every dispatched set so an unrelated toggle can't silently
+  detach them.
+- **k3d e2e (session 219cd282, 2026-07-16)**: pane toggle → one frame
+  `{config, datasource_ids, request_id}` → PATCH authorized + flip
+  grant-checked → `metadata.datasource_ids` confirmed in DB → agent
+  "Connected to postgresql datasource: Slice B Smoke DB (read-write)",
+  75→78 tools, index rewritten (1 entry) → stamp `datasource "Slice B Smoke
+  DB" attached` → next turn the agent ran `sql_schema`/`sql_query` and read
+  the scratch table → toggle off → "0 attached (0 added, 1 removed)",
+  "Closed 1 replaced datasource connection(s) after turn end", 78→75 tools,
+  DB `[]`, `datasources.md` = exactly one section with the empty-state line
+  (agent read it back verbatim), stamp `datasource … detached`.
+- **Residuals**: (1) `_sendControl` is best-effort — the smoke's first toggle
+  was silently dropped by a mid-churn control WS (pre-existing transport
+  semantics, now user-visible for datasources too; a request_id-keyed
+  ack-timeout + rollback would fix it); (2) the pane's diff baseline can pick
+  up "riders" when live signals move via acks after anchoring (modelName
+  seeds as the config name until the welcome frame; the temperature ack
+  echoes the matrix-resolved value) — the riders re-assert current server
+  state so they're semantically no-ops, but they pollute stamps and burn a
+  cache invalidation; folding `config.changed` acks into `lastApplied` would
+  quiet them; (3) kb-type changes stay attach-time (locked in the picker,
+  `kb_deferred` in the ack if forced via API); (4) the lite-repo rejection
+  and grant-flip denial paths are unit-tested, not smoke-tested (no lite+repo
+  fixture on the dev cluster).
 
 ### Slice C — disconnected-session editing
 

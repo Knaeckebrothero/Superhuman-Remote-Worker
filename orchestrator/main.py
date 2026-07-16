@@ -18416,6 +18416,10 @@ async def agent_release_thread_agent(
 
 class AgentThreadConfigUpdateRequest(BaseModel):
     config_override: dict[str, Any]
+    # Live datasource change (live_session_settings.md Slice B): the desired
+    # FULL selection, matching create semantics. None = no datasource change;
+    # [] = detach all.
+    datasource_ids: list[str] | None = None
 
 
 @app.patch("/api/agents/threads/{thread_id}/config")
@@ -18451,6 +18455,54 @@ async def agent_update_thread_config(
                 config_override.pop("tools", None)
         thread_row = await postgres_db.get_thread(thread_id)
 
+        # Live datasource change (live_session_settings.md Slice B): authorize
+        # the requested full selection exactly like create does — including the
+        # lite-tier/repository rule against the thread's CURRENT workspace
+        # backend (a live add is create-like; only the attach-time
+        # revalidation deliberately passes None) — then fold the resulting
+        # datasource tool-category flip into the grant-checked fragment so a
+        # datasource_tools-denied principal fails HERE at the PATCH, not at
+        # the next attach.
+        selected_ds_ids: list[str] | None = None
+        grant_fragment = config_override
+        if body.datasource_ids is not None:
+            if thread_row is None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            requested_ids = [str(v) for v in body.datasource_ids]
+            if thread_row.get("user_id"):
+                owner = await postgres_db.get_user(str(thread_row["user_id"]))
+                if owner is None:
+                    # Same generic denial as create — no enumeration oracle.
+                    raise HTTPException(
+                        status_code=403,
+                        detail="One or more selected datasources are unavailable",
+                    )
+                selected_ds_ids = await _authorize_thread_datasource_ids(
+                    owner,
+                    requested_ids,
+                    workspace_backend=_thread_workspace_backend(thread_row),
+                )
+            else:
+                # Ownerless/system threads keep their trusted-internal bypass
+                # (normalize only), mirroring job create + attach revalidation.
+                selected_ds_ids = list(dict.fromkeys(requested_ids))
+
+            resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                datasource_ids=selected_ds_ids,
+                project_ids=await _thread_project_ids(thread_id),
+            )
+            flip = _build_datasource_tool_override(resolved_ds, None)
+            # The flip's categories (sql/graph/mongodb/webdav) are outside the
+            # validated session tools vocabulary, so layering the request's own
+            # already-validated groups on top cannot mask them.
+            grant_fragment = {
+                **config_override,
+                "tools": {
+                    **flip.get("tools", {}),
+                    **(config_override.get("tools") or {}),
+                },
+            }
+
         # Layer 2 (fail loud): a runtime config change must also fit the owner's
         # grants — reject a denied permission_mode/model with 422 instead of
         # persisting a config the session can't run (an API-direct or stale-UI
@@ -18460,7 +18512,7 @@ async def agent_update_thread_config(
         # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
         if thread_row and thread_row.get("user_id"):
             await _enforce_session_create_grants(
-                config_override,
+                grant_fragment,
                 user_id=str(thread_row["user_id"]),
                 project_ids=(
                     [str(thread_row["project_id"])]
@@ -18524,7 +18576,23 @@ async def agent_update_thread_config(
                     thread_id,
                 )
 
-        return {"status": "updated", "config_override": config_override}
+        # Persist the accepted selection only after every check above passed.
+        # The category flip is NOT merged into config_override — the closed
+        # session tools vocabulary would drop it anyway; the agent re-fetches
+        # GET /api/agents/threads/{id}/workspace and applies the categories
+        # directly to its live session config, and every attach path re-derives
+        # them from metadata.datasource_ids.
+        if selected_ds_ids is not None:
+            if not await postgres_db.set_thread_datasource_ids(
+                thread_id, selected_ds_ids
+            ):
+                raise HTTPException(status_code=404, detail="Thread not found")
+
+        return {
+            "status": "updated",
+            "config_override": config_override,
+            "datasource_ids": selected_ds_ids,
+        }
     except HTTPException:
         raise
     except Exception as e:

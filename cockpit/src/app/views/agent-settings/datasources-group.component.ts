@@ -21,14 +21,20 @@ export function datasourceSetKey(datasources: {id: string}[]): string {
     .join(',');
 }
 
-/** Active selection: the user's tagged choice, or all ids when the selection is
- *  untouched (null) or stale (made against a different datasource set). */
+/** Active selection: the user's tagged choice, or the default when the
+ *  selection is untouched (null) or stale (made against a different datasource
+ *  set). The default is all ids — except when `defaultIds` is provided (live
+ *  mode: the session's currently ATTACHED set, possibly empty). */
 export function activeDatasourceIds(
   datasources: {id: string}[],
   selection: DatasourceSelection,
+  defaultIds?: Set<string> | null,
 ): Set<string> {
   if (selection && selection.key === datasourceSetKey(datasources)) {
     return selection.ids;
+  }
+  if (defaultIds) {
+    return new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id));
   }
   return new Set(datasources.map(d => d.id));
 }
@@ -40,24 +46,29 @@ export function selectedDatasourceIds(
   datasources: Datasource[],
   selection: DatasourceSelection,
   isLiteBackend: boolean,
+  defaultIds?: Set<string> | null,
 ): string[] {
-  const active = activeDatasourceIds(datasources, selection);
+  const active = activeDatasourceIds(datasources, selection, defaultIds);
   return datasources
     .filter(d => active.has(d.id) && !(isLiteBackend && isRepositoryDatasource(d.type)))
     .map(d => d.id);
 }
 
-/** True when every selectable datasource (i.e. not lite-excluded) is selected. */
+/** True when every selectable datasource (i.e. not lite-excluded and not
+ *  locked) is selected. */
 export function allDatasourcesSelected(
   datasources: Datasource[],
   selection: DatasourceSelection,
   isLiteBackend: boolean,
+  defaultIds?: Set<string> | null,
+  lockedIds?: string[],
 ): boolean {
+  const locked = new Set(lockedIds ?? []);
   const selectable = datasources.filter(
-    d => !(isLiteBackend && isRepositoryDatasource(d.type)),
+    d => !(isLiteBackend && isRepositoryDatasource(d.type)) && !locked.has(d.id),
   );
   if (selectable.length === 0) return false;
-  const active = activeDatasourceIds(datasources, selection);
+  const active = activeDatasourceIds(datasources, selection, defaultIds);
   return selectable.every(d => active.has(d.id));
 }
 
@@ -85,19 +96,21 @@ export function allDatasourcesSelected(
             <label
               class="ds-option"
               [class.selected]="isChecked(ds)"
-              [class.ds-disabled]="isLiteExcluded(ds)"
+              [class.ds-disabled]="isLiteExcluded(ds) || isLocked(ds)"
             >
               <input
                 type="checkbox"
                 [checked]="isChecked(ds)"
                 (change)="toggle(ds.id)"
-                [disabled]="disabled() || isLiteExcluded(ds)"
+                [disabled]="disabled() || isLiteExcluded(ds) || isLocked(ds)"
               >
               <app-icon size="md" class="ds-type-icon" [class]="'ds-type-' + ds.type">{{ getTypeIcon(ds.type) }}</app-icon>
               <span class="ds-info">
                 <span class="ds-name">{{ ds.name }}</span>
                 @if (isLiteExcluded(ds)) {
                   <span class="ds-desc">Requires a sandbox or VM workspace</span>
+                } @else if (isLocked(ds)) {
+                  <span class="ds-desc">{{ 'agentSettings.datasources.lockedLive' | transloco }}</span>
                 } @else if (ds.description) {
                   <span class="ds-desc">{{ ds.description }}</span>
                 }
@@ -274,6 +287,18 @@ export class DatasourcesGroupComponent {
    * the orchestrator, so they remain selectable.
    */
   isLiteBackend = input(false);
+  /**
+   * Default selection when the user hasn't touched the picker (live mode:
+   * the session's currently attached set — possibly empty). Null keeps the
+   * create-flow default of "everything eligible selected".
+   */
+  initialSelectedIds = input<string[] | null>(null);
+  /**
+   * Entries rendered but frozen at their current state (live mode: kb-type
+   * datasources — their knowledge bindings only rewire on attach, so live
+   * changes are out of scope; live_session_settings.md Slice B).
+   */
+  lockedIds = input<string[]>([]);
 
   change = output<void>();
 
@@ -300,14 +325,25 @@ export class DatasourcesGroupComponent {
 
   readonly modifiedCount = computed(() => this.getSelectedIds().length);
 
-  /** Datasources the user can actually toggle (not lite-excluded). */
+  private defaultIds(): Set<string> | null {
+    const init = this.initialSelectedIds();
+    return init === null ? null : new Set(init);
+  }
+
+  /** Datasources the user can actually toggle (not lite-excluded, not locked). */
   readonly selectableDatasources = computed<Datasource[]>(() =>
-    this.datasources().filter(ds => !this.isLiteExcluded(ds))
+    this.datasources().filter(ds => !this.isLiteExcluded(ds) && !this.isLocked(ds))
   );
 
   /** True when every selectable datasource is currently checked. */
   readonly allSelected = computed(() =>
-    allDatasourcesSelected(this.datasources(), this.selection(), this.isLiteBackend())
+    allDatasourcesSelected(
+      this.datasources(),
+      this.selection(),
+      this.isLiteBackend(),
+      this.defaultIds(),
+      this.lockedIds(),
+    )
   );
 
   /** A repository datasource can't be used under a lite backend. */
@@ -315,15 +351,23 @@ export class DatasourcesGroupComponent {
     return this.isLiteBackend() && isRepositoryDatasource(ds.type);
   }
 
+  /** Frozen at its current state — rendered, never toggleable. */
+  isLocked(ds: Datasource): boolean {
+    return this.lockedIds().includes(ds.id);
+  }
+
   isChecked(ds: Datasource): boolean {
     return (
       !this.isLiteExcluded(ds) &&
-      activeDatasourceIds(this.datasources(), this.selection()).has(ds.id)
+      activeDatasourceIds(this.datasources(), this.selection(), this.defaultIds()).has(ds.id)
     );
   }
 
   toggle(id: string): void {
-    const next = new Set(activeDatasourceIds(this.datasources(), this.selection()));
+    if (this.lockedIds().includes(id)) return;
+    const next = new Set(
+      activeDatasourceIds(this.datasources(), this.selection(), this.defaultIds()),
+    );
     if (next.has(id)) {
       next.delete(id);
     } else {
@@ -333,14 +377,19 @@ export class DatasourcesGroupComponent {
     this.change.emit();
   }
 
-  /** Check every selectable datasource, or clear them all if already all on. */
+  /** Check every selectable datasource, or clear them all if already all on.
+   *  Locked entries keep their current state either way. */
   toggleAll(): void {
-    const selectAll = !allDatasourcesSelected(
-      this.datasources(), this.selection(), this.isLiteBackend(),
+    const selectAll = !this.allSelected();
+    const active = activeDatasourceIds(
+      this.datasources(), this.selection(), this.defaultIds(),
     );
+    const lockedKept = this.datasources()
+      .filter(d => this.isLocked(d) && active.has(d.id))
+      .map(d => d.id);
     const ids = selectAll
-      ? new Set(this.selectableDatasources().map(d => d.id))
-      : new Set<string>();
+      ? new Set([...this.selectableDatasources().map(d => d.id), ...lockedKept])
+      : new Set(lockedKept);
     this.selection.set({key: datasourceSetKey(this.datasources()), ids});
     this.change.emit();
   }
@@ -365,6 +414,7 @@ export class DatasourcesGroupComponent {
       this.datasources(),
       this.selection(),
       this.isLiteBackend(),
+      this.defaultIds(),
     );
   }
 
