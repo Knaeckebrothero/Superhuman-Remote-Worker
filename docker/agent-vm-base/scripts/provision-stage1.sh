@@ -257,5 +257,32 @@ sudo npm install -g \
 # Enable corepack so `yarn`/`pnpm` install on-demand via shims.
 sudo corepack enable
 
+# -----------------------------------------------------------------------------
+# 8. code-server (Web IDE for live-VM IDE sessions)
+#     Pinned upstream .deb + SHA256 (same pattern as rclone in section 3b).
+#     Reached only through the agent's authenticated SSH direct-tcpip channel
+#     to guest loopback — see docs/features/vm_snapshots_and_ide.md
+#     "Live-VM IDE Access via the Agent" — so it binds 127.0.0.1 with auth
+#     disabled; that config + a (disabled) systemd unit land in stage2. The
+#     .deb bundles its own Node runtime and does NOT use the system Node.js
+#     installed in section 7.
+#
+#     Version + checksum come from the GitHub release asset digest
+#     (https://api.github.com/repos/coder/code-server/releases). Bump both
+#     together; a stale checksum fails the build loudly at `sha256sum -c`.
+# -----------------------------------------------------------------------------
+
+_section "Installing code-server (pinned)"
+
+SRW_CODE_SERVER_VERSION=4.128.0
+SRW_CODE_SERVER_SHA256=c0f6e3706c4285f06bb2350274576f289262e6a9962a70e3c31c6d3ea17a29d2
+curl -fsSL "https://github.com/coder/code-server/releases/download/v${SRW_CODE_SERVER_VERSION}/code-server_${SRW_CODE_SERVER_VERSION}_amd64.deb" \
+    -o /tmp/code-server.deb
+echo "${SRW_CODE_SERVER_SHA256}  /tmp/code-server.deb" | sha256sum -c -
+# apt-get (not bare `dpkg -i`) so any .deb dependencies resolve automatically.
+sudo eatmydata apt-get install -y /tmp/code-server.deb
+rm /tmp/code-server.deb
+code-server --version
+
 _section_end
 echo "=== Stage 1 complete ==="

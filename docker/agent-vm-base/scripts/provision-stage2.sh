@@ -129,6 +129,31 @@ ORCHESTRATOR_ID=
 EOF
 
 # -----------------------------------------------------------------------------
+# 3b. code-server (Web IDE)
+#
+# The binary is installed in stage1. Here we place the loopback / auth-none
+# config and a DISABLED systemd unit. The management daemon runs
+# `systemctl start code-server` on IDE request (see docs/features/
+# vm_snapshots_and_ide.md, "Live-VM IDE Access via the Agent"); we deliberately
+# do NOT enable it, so it stays dormant during normal headless job runs.
+# -----------------------------------------------------------------------------
+
+_section "Installing code-server config + unit"
+
+sudo mkdir -p /etc/code-server
+sudo install -o root -g root -m 0644 /tmp/code-server-config.yaml /etc/code-server/config.yaml
+
+sudo install -o root -g root -m 0644 /tmp/code-server.service /etc/systemd/system/code-server.service
+sudo systemctl daemon-reload
+# Intentionally NOT `systemctl enable`d — the management daemon starts it
+# on demand and stops it when the IDE session ends.
+
+# user-data-dir / extensions-dir live outside $HOME (see config). code-server
+# runs as agent-host, so agent-host must own this tree.
+sudo mkdir -p /var/lib/code-server/extensions
+sudo chown -R agent-host:agent-host /var/lib/code-server
+
+# -----------------------------------------------------------------------------
 # 4. Sudo approval gate
 # -----------------------------------------------------------------------------
 #
