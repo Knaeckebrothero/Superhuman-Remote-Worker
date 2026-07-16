@@ -25,6 +25,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {CanvasPaneComponent} from '../canvas/canvas-pane.component';
 import {canvasSourceKey} from '../canvas/canvas-rendering';
+import {SettingsPaneComponent} from './settings-pane.component';
 
 @Component({
     selector: 'app-chat-page',
@@ -34,6 +35,7 @@ import {canvasSourceKey} from '../canvas/canvas-rendering';
         TranslocoPipe,
         PersistentChatComponent,
         CanvasPaneComponent,
+        SettingsPaneComponent,
         AppIconComponent,
         AppIconButtonComponent,
     ],
@@ -44,44 +46,58 @@ import {canvasSourceKey} from '../canvas/canvas-rendering';
         </button>
       }
       <as-split #split direction="horizontal" unit="percent"
-                [gutterSize]="canvasAreaVisible() && !viewport.isMobile() ? 8 : 0"
-                [gutterStep]="2" [disabled]="viewport.isMobile() || !canvasOpen()"
+                [gutterSize]="rightAreaVisible() && !viewport.isMobile() ? 8 : 0"
+                [gutterStep]="2" [disabled]="viewport.isMobile() || !rightPaneOpen()"
                 [restrictMove]="true" [useTransition]="false"
                 [gutterAriaLabel]="'canvas.resize' | transloco"
                 (dragEnd)="onSplitDragEnd($event)"
-                (gutterDblClick)="closeCanvas()">
+                (gutterDblClick)="closeRightPane()">
         <as-split-area [size]="chatAreaSize()" [minSize]="viewport.isMobile() ? 100 : 25"
                        [maxSize]="viewport.isMobile() ? 100 : 75"
                        [visible]="chatAreaVisible()">
           <div id="chat-panel" class="chat-panel"
                [attr.inert]="chatAreaHidden() ? '' : null"
                [attr.aria-hidden]="chatAreaHidden() ? 'true' : null">
-            <app-persistent-chat (canvasRequested)="openCanvas(true)">
+            <app-persistent-chat (canvasRequested)="openCanvas(true)"
+                                 (settingsRequested)="openSettings($event)">
               @if (canvasAvailable()) {
-                <span chatHeaderAction #canvasToggle>
+                <span chatHeaderAction #canvasToggle class="canvas-toggle-wrap">
                   <app-icon-button size="sm"
-                                   [ariaLabel]="(canvasAreaVisible() ? 'canvas.hide' : 'canvas.open') | transloco"
-                                   [tooltip]="(canvasAreaVisible() ? 'canvas.hide' : 'canvas.open') | transloco"
-                                   (clicked)="canvasAreaVisible() && !viewport.isMobile() ? closeCanvas() : openCanvas(true)">
+                                   [ariaLabel]="(canvasContentVisible() ? 'canvas.hide' : 'canvas.open') | transloco"
+                                   [tooltip]="(canvasContentVisible() ? 'canvas.hide' : 'canvas.open') | transloco"
+                                   (clicked)="canvasContentVisible() && !viewport.isMobile() ? closeCanvas() : openCanvas(true)">
                     <app-icon size="sm">dashboard_customize</app-icon>
                   </app-icon-button>
+                  @if (canvasPending()) {
+                    <span class="canvas-pending-dot"
+                          [attr.aria-label]="'canvas.newContent' | transloco"></span>
+                  }
                 </span>
               }
             </app-persistent-chat>
           </div>
         </as-split-area>
 
-        <as-split-area [size]="canvasAreaSize()" [minSize]="viewport.isMobile() ? 100 : 25"
+        <as-split-area [size]="rightAreaSize()" [minSize]="viewport.isMobile() ? 100 : 25"
                        [maxSize]="viewport.isMobile() ? 100 : 75"
-                       [visible]="canvasAreaVisible()">
+                       [visible]="rightAreaVisible()">
+          <!-- Canvas stays mounted while settings covers it — an @if would
+               destroy the renderer (iframe state, unsaved edits). -->
           <div id="canvas-panel" class="canvas-panel"
+               [style.display]="settingsOpen() ? 'none' : ''"
                [attr.inert]="canvasAreaHidden() ? '' : null"
                [attr.aria-hidden]="canvasAreaHidden() ? 'true' : null">
-            <app-canvas-pane #canvasPane [active]="canvasOpen()" [mobile]="viewport.isMobile()"
+            <app-canvas-pane #canvasPane [active]="canvasContentVisible()" [mobile]="viewport.isMobile()"
                              (closeRequested)="closeCanvas()"
                              (returnToChat)="returnToChat()"
                              (dirtyChange)="canvasDirty.set($event)" />
           </div>
+          @if (settingsOpen()) {
+            <div id="settings-panel" class="canvas-panel">
+              <app-settings-pane #settingsPane [active]="settingsOpen()"
+                                 (closeRequested)="closeSettings()" />
+            </div>
+          }
         </as-split-area>
       </as-split>
     `,
@@ -114,6 +130,29 @@ import {canvasSourceKey} from '../canvas/canvas-rendering';
       }
 
       .canvas-panel { border-left: 1px solid var(--border-color); }
+
+      app-settings-pane {
+        display: block;
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+      }
+
+      .canvas-toggle-wrap {
+        position: relative;
+        display: inline-flex;
+      }
+
+      .canvas-pending-dot {
+        position: absolute;
+        top: 0;
+        right: 0;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent-color);
+        pointer-events: none;
+      }
 
       .canvas-skip-link {
         position: absolute;
@@ -159,12 +198,22 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     readonly canvasOpen = signal(false);
     readonly canvasFocus = signal(false);
     readonly canvasDirty = signal(false);
+    /** Settings pane shown in the right split area (content-switched with the
+     *  canvas — settings wins while open; the canvas stays mounted behind it). */
+    readonly settingsOpen = signal(false);
+    /** Mobile-only: settings takes the full screen (canvasFocus analogue). */
+    readonly settingsFocus = signal(false);
+    /** A new canvas source arrived while settings held the pane — badge the
+     *  canvas toggle instead of stealing (live_session_settings.md Slice A). */
+    readonly canvasPending = signal(false);
     readonly chatPercent = signal(56);
     private previousCanvasThread: string | null = null;
     private previousCanvasSource: string | null = null;
     private canvasOpener: HTMLElement | null = null;
+    private settingsOpener: HTMLElement | null = null;
 
     private readonly pane = viewChild<CanvasPaneComponent>('canvasPane');
+    private readonly settingsPane = viewChild<SettingsPaneComponent>('settingsPane');
     private readonly split = viewChild<unknown, ElementRef<HTMLElement>>('split', {read: ElementRef});
     private readonly toggle = viewChild<unknown, ElementRef<HTMLElement>>('canvasToggle', {read: ElementRef});
 
@@ -172,21 +221,32 @@ export class ChatPageComponent implements OnInit, OnDestroy {
         const state = this.canvas.state();
         return this.canvasDirty() || (!!state?.source && state.status !== 'cleared');
     });
-    readonly chatAreaVisible = computed(() => !this.viewport.isMobile() || !this.canvasFocus());
-    readonly canvasAreaVisible = computed(
-        () => this.canvasOpen() && (!this.viewport.isMobile() || this.canvasFocus()),
+    readonly chatAreaVisible = computed(
+        () => !this.viewport.isMobile() || (!this.canvasFocus() && !this.settingsFocus()),
     );
-    readonly chatAreaHidden = computed(() => this.viewport.isMobile() && this.canvasFocus());
-    readonly canvasAreaHidden = computed(
-        () => !this.canvasOpen() || (this.viewport.isMobile() && !this.canvasFocus()),
+    /** Right split area shows either settings (priority) or the canvas. */
+    readonly rightPaneOpen = computed(() => this.settingsOpen() || this.canvasOpen());
+    readonly settingsVisible = computed(
+        () => this.settingsOpen() && (!this.viewport.isMobile() || this.settingsFocus()),
     );
+    readonly canvasContentVisible = computed(
+        () => this.canvasOpen() && !this.settingsOpen()
+            && (!this.viewport.isMobile() || this.canvasFocus()),
+    );
+    readonly rightAreaVisible = computed(
+        () => this.settingsVisible() || this.canvasContentVisible(),
+    );
+    readonly chatAreaHidden = computed(
+        () => this.viewport.isMobile() && (this.canvasFocus() || this.settingsFocus()),
+    );
+    readonly canvasAreaHidden = computed(() => !this.canvasContentVisible());
     readonly chatAreaSize = computed(() => {
-        if (this.viewport.isMobile() || !this.canvasAreaVisible()) return 100;
+        if (this.viewport.isMobile() || !this.rightAreaVisible()) return 100;
         return this.chatPercent();
     });
-    readonly canvasAreaSize = computed(() => {
+    readonly rightAreaSize = computed(() => {
         if (this.viewport.isMobile()) return 100;
-        return this.canvasAreaVisible() ? 100 - this.chatPercent() : 0;
+        return this.rightAreaVisible() ? 100 - this.chatPercent() : 0;
     });
 
     /** Instant-landing draft chat at `/` (route data, not a URL param). */
@@ -219,6 +279,9 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 this.canvasOpen.set(false);
                 this.canvasFocus.set(false);
                 this.canvasDirty.set(false);
+                this.settingsOpen.set(false);
+                this.settingsFocus.set(false);
+                this.canvasPending.set(false);
             }
             if (!source || state?.status === 'cleared') {
                 if (dirty) {
@@ -239,9 +302,46 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 // new stage mounted/announced and let the user enter it through
                 // the trusted toggle, tool card, or skip link.
                 this.canvasFocus.set(false);
+                // Settings holds the pane — badge the canvas toggle instead of
+                // stealing it (the push is ready the moment settings closes).
+                if (this.settingsOpen()) this.canvasPending.set(true);
             }
             this.configureSplitterAccessibility();
         });
+    }
+
+    /** Open the settings pane (header action / status chips). Takes the right
+     *  split area over from the canvas; the canvas stays mounted behind it. */
+    openSettings(section?: string): void {
+        if (typeof document !== 'undefined') {
+            this.settingsOpener = document.activeElement instanceof HTMLElement
+                ? document.activeElement
+                : null;
+        }
+        this.settingsOpen.set(true);
+        if (this.viewport.isMobile()) this.settingsFocus.set(true);
+        this.configureSplitterAccessibility();
+        if (section === 'model') {
+            queueMicrotask(() => this.settingsPane()?.scrollToModel());
+        }
+    }
+
+    closeSettings(): void {
+        this.settingsOpen.set(false);
+        this.settingsFocus.set(false);
+        // The canvas is visible again — its pending push is delivered.
+        if (this.canvasOpen()) this.canvasPending.set(false);
+        if (this.settingsOpener?.isConnected) {
+            const opener = this.settingsOpener;
+            queueMicrotask(() => opener.focus({preventScroll: true}));
+        }
+        this.settingsOpener = null;
+    }
+
+    /** Gutter double-click closes whichever content owns the pane. */
+    closeRightPane(): void {
+        if (this.settingsOpen()) this.closeSettings();
+        else this.closeCanvas();
     }
 
     openCanvas(focus = false): void {
@@ -251,6 +351,10 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 ? document.activeElement
                 : null;
         }
+        // Explicitly choosing the canvas reclaims the pane from settings.
+        this.settingsOpen.set(false);
+        this.settingsFocus.set(false);
+        this.canvasPending.set(false);
         this.canvasOpen.set(true);
         if (this.viewport.isMobile()) this.canvasFocus.set(true);
         this.configureSplitterAccessibility();

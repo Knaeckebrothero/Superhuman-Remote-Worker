@@ -4,7 +4,13 @@
 
 import type {EffectiveModels} from '../../core/models/api.model';
 
-export type SettingsMode = 'job' | 'session';
+/**
+ * - `job` / `session`: creation forms — overrides collected at submit time.
+ * - `live`: a running session's settings pane — pin-only (no reset-to-default
+ *   affordances; the live protocol has no clear-override op), per-change apply
+ *   via the host's state diff, and only the surface the live path honors.
+ */
+export type SettingsMode = 'job' | 'session' | 'live';
 
 /** Tool category metadata for toggle display. */
 export interface ToolCategoryMeta {
@@ -35,7 +41,44 @@ export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   { key: 'git', label: 'Git', icon: 'commit', description: 'Ability to inspect workspace version history' },
 ];
 
-/** Autonomy level options. */
+/**
+ * The four closed session tool groups — the ONLY categories the live
+ * `config.update` path validates; anything else is silently dropped at both
+ * boundaries (src/core/session_tool_overrides.py). Live mode renders exactly
+ * these; rendering the full session list would give 8 toggles that no-op.
+ */
+export const LIVE_TOOL_CATEGORIES: ToolCategoryMeta[] = SESSION_TOOL_CATEGORIES.filter(
+  (cat) => ['canvas', 'orchestrator', 'agent_catalog', 'workflows'].includes(cat.key),
+);
+
+/**
+ * Full tool-name vocabulary per closed session group — mirror of
+ * SESSION_TOOL_OVERRIDE_NAMES in src/core/session_tool_overrides.py, pinned
+ * against drift by tests/test_session_tool_group_mirror.py. Used as the
+ * payload when a live toggle re-enables a group (the agent keys enablement
+ * off empty-vs-non-empty, but the list must pass the closed-vocabulary
+ * validation, so send the canonical full set).
+ */
+export const SESSION_TOOL_GROUP_NAMES: Record<string, string[]> = {
+  orchestrator: [
+    'get_session_context',
+    'create_worker_job',
+    'list_worker_jobs',
+    'get_worker_job',
+    'get_job_workspace_file',
+    'approve_worker_job',
+    'resume_worker_job',
+    'cancel_worker_job',
+    'pause_worker_job',
+    'get_current_project',
+    'list_project_jobs',
+    'list_project_repositories',
+    'get_default_project_repository',
+  ],
+  agent_catalog: ['list_experts', 'get_expert', 'list_skills', 'search_skills', 'get_skill'],
+  workflows: ['list_automations', 'get_automation', 'list_automation_runs', 'propose_automation', 'get_project_loop', 'list_project_loop_jobs', 'explain_project_loop'],
+  canvas: ['set_canvas', 'get_canvas', 'clear_canvas'],
+};
 export const AUTONOMY_LEVELS = [
   { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
   { value: 'review', label: 'Review', description: 'Freezes at job completion for human review' },

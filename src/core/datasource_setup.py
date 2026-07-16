@@ -91,21 +91,19 @@ def datasource_tool_categories(
 ) -> Dict[str, List[str]]:
     """Map attached datasources to tool-category overrides.
 
-    Semantics (the orchestrator's, kept as the reconciled policy):
+    Semantics:
 
     - type not attached → category stripped (``[]``) so stale tools from a
       previously attached datasource never survive,
     - ALL datasources of a type read-only → read tools,
-    - any read-write: webdav → write tools (it has no CLI equivalent);
-      managed connectors (postgresql/neo4j/mongodb) → ``[]`` (CLI mode —
-      process_datasources injects env vars / pg_service.conf instead of
-      creating a tool connection).
+    - any read-write → write tools, backed by the real connection
+      process_datasources() now creates for read-write connectors too.
 
-    NOTE: CLI mode is currently non-functional on remote workspace backends —
-    the env vars land in the agent process while the shell runs on the
-    workspace host (docs/issues/datasource_cli_mode_dead_on_remote.md). The
-    policy is kept as-is here so both boundaries agree; making read-write
-    connectors actually usable is that issue's fix, not this map's.
+    History: read-write managed connectors (postgresql/neo4j/mongodb) used
+    to map to ``[]`` — "CLI mode" — which was dead on remote workspace
+    backends and left them with no access path at all
+    (docs/issues/datasource_cli_mode_dead_on_remote.md, fixed via
+    direction 1: connection-backed write tools).
     """
     by_type: Dict[str, List[Dict[str, Any]]] = {}
     for ds in datasources:
@@ -121,10 +119,8 @@ def datasource_tool_categories(
             categories[category] = []
         elif all(ds.get("project_read_only", False) for ds in ds_list):
             categories[category] = list(tool_info["read"])
-        elif ds_type == "webdav":
-            categories[category] = list(tool_info["write"])
         else:
-            categories[category] = []
+            categories[category] = list(tool_info["write"])
     return categories
 
 
@@ -133,9 +129,15 @@ def process_datasources(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     """Process datasource configs and create connections/env vars.
 
-    Supports multiple datasources of the same type by using named
-    connection profiles (pg_service.conf) or per-datasource env vars
-    (MONGO_{SLUG}_URI, NEO4J_{SLUG}_URI).
+    ALL managed connectors (postgresql, neo4j, mongodb, webdav) get a real
+    tool connection now — read-write ones included. The former CLI-mode
+    routing for read-write managed connectors (env vars / pg_service.conf,
+    no connection) was a dead path on remote workspace backends: the env
+    landed in the agent process while the shell runs on the workspace host,
+    leaving read-write datasources with no access at all. See
+    docs/issues/datasource_cli_mode_dead_on_remote.md (fix direction 1);
+    the inject_* helpers below are kept for a future real CLI-forwarding
+    feature but are no longer called from here.
 
     Repository datasources are NOT handled here — callers filter them out
     and clone via clone_repository_datasources() once the workspace backend
@@ -149,16 +151,16 @@ def process_datasources(
         Tuple of (datasources_dict, client_registry, cli_ds_types):
         - datasources_dict: Connection objects keyed by type for ToolContext
         - client_registry: Parent clients (e.g. MongoClient) for cleanup
-        - cli_ds_types: List of datasource types configured for CLI access
+        - cli_ds_types: Always empty since the CLI-mode retirement; kept in
+          the signature so callers' prompt-block plumbing (the future CLI
+          feature's seam) stays in place.
     """
     datasources_dict: Dict[str, Any] = {}
     client_registry: Dict[str, Any] = {}
     cli_ds_types: List[str] = []
 
-    # Group datasources by type for multi-source setup
-    by_type: Dict[str, List[Dict[str, Any]]] = {}
     generic_list: List[Dict[str, Any]] = []
-    read_only_list: List[Dict[str, Any]] = []
+    connector_list: List[Dict[str, Any]] = []
 
     for ds in ds_configs:
         ds_type = ds.get("type")
@@ -183,11 +185,7 @@ def process_datasources(
                 ds.get("name", "unnamed"),
             )
         else:
-            is_read_only = ds.get("project_read_only", False)
-            if not is_read_only and ds_type in ("postgresql", "neo4j", "mongodb"):
-                by_type.setdefault(ds_type, []).append(ds)
-            else:
-                read_only_list.append(ds)
+            connector_list.append(ds)
 
     # Generic datasources: inject env vars into process environment
     for ds in generic_list:
@@ -201,21 +199,15 @@ def process_datasources(
             ds.get("name", "unnamed"),
         )
 
-    # CLI-mode managed connectors: set up named connections
-    if "postgresql" in by_type:
-        inject_postgresql_services(by_type["postgresql"])
-        cli_ds_types.append("postgresql")
-
-    if "mongodb" in by_type:
-        inject_mongodb_env_vars(by_type["mongodb"])
-        cli_ds_types.append("mongodb")
-
-    if "neo4j" in by_type:
-        inject_neo4j_env_vars(by_type["neo4j"])
-        cli_ds_types.append("neo4j")
-
-    # Read-only managed connectors: create tool connections
-    for ds in read_only_list:
+    # Managed connectors: create tool connections. The registry is
+    # TYPE-keyed (last-one-wins), and datasource_tool_categories() binds
+    # write tools when ANY datasource of a type is read-write — so process
+    # read-only entries first and read-write last, ensuring the connection
+    # that wins the type slot matches the granted tool surface (write tools
+    # must never end up bound to a read-only-linked connection).
+    for ds in sorted(
+        connector_list, key=lambda d: not d.get("project_read_only", False)
+    ):
         ds_type = ds["type"]
         try:
             conn, client = create_datasource_connection(ds)
@@ -223,9 +215,10 @@ def process_datasources(
             if client:
                 client_registry[ds_type] = client
             logger.info(
-                "Connected to %s datasource: %s",
+                "Connected to %s datasource: %s (%s)",
                 ds_type,
                 ds.get("name", "unnamed"),
+                "read-only" if ds.get("project_read_only", False) else "read-write",
             )
         except Exception as e:
             logger.warning("Failed to connect to %s datasource: %s", ds_type, e)
@@ -987,7 +980,8 @@ def inject_datasource_index(
                 lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
             else:
                 lines.append(
-                    _format_rw_cli_entry(name, ds_type) + _declared_ro_note(ds)
+                    f"- **{name}** ({ds_type}, read-write) — query + write tools"
+                    + _declared_ro_note(ds)
                 )
         lines.append("")
 
@@ -1047,26 +1041,8 @@ def inject_datasource_index(
         logger.warning("Failed to inject datasource index: %s", e)
 
 
-def _format_rw_cli_entry(name: str, ds_type: str) -> str:
-    """Format a one-line CLI usage entry for a read-write managed datasource."""
-    slug = _slugify(name)
-    slug_upper = slug.upper()
-
-    if ds_type == "postgresql":
-        return (
-            f"- **{name}** (postgresql, read-write): "
-            f"`PGSERVICE={slug} psql` — credentials pre-configured"
-        )
-    elif ds_type == "neo4j":
-        return (
-            f"- **{name}** (neo4j, read-write): "
-            f'`cypher-shell --address "$NEO4J_{slug_upper}_URI" '
-            f'--username "$NEO4J_{slug_upper}_USERNAME" '
-            f'--password "$NEO4J_{slug_upper}_PASSWORD"`'
-        )
-    elif ds_type == "mongodb":
-        return (
-            f'- **{name}** (mongodb, read-write): `mongosh "$MONGO_{slug_upper}_URI"`'
-        )
-    else:
-        return f"- **{name}** ({ds_type}, read-write) — CLI via env vars"
+# NOTE: the former _format_rw_cli_entry (PGSERVICE/cypher-shell/mongosh usage
+# lines for read-write connectors) was removed with the CLI-mode retirement —
+# it advertised commands that cannot work on remote workspace backends. A
+# future real CLI-forwarding feature reintroduces it properly
+# (docs/issues/datasource_cli_mode_dead_on_remote.md, direction 2).
