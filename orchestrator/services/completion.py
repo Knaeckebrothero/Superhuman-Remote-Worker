@@ -283,8 +283,8 @@ AUTO_REDISPATCH_FREEZE_TYPES: frozenset[str] = frozenset(
 # it — whereas the bare ``if error`` short-circuit would hard-fail an otherwise
 # re-dispatchable job (observed: a deploy drain racing a SIGTERM-interrupt
 # failing loop iterations instead of pausing them). These freezes' own branches
-# still enforce their fail conditions (memory/KB retry caps, LLM-outage 24h
-# ceiling), so guarding the short-circuit does not turn a genuine give-up into a
+# still enforce their fail conditions (memory/KB retry caps, the LLM-outage
+# duration ceiling), so guarding the short-circuit does not turn a genuine give-up into a
 # pause. ``llm_unavailable`` is included alongside the auto-redispatch set (same
 # failure class — the outage sweeper re-dispatches it).
 # docs/done/version_upgrade_drain_masked_by_coincident_error.md
@@ -849,8 +849,9 @@ def determine_job_status(
         # A transient LLM outage exhausted the worker's Tier-1 in-process
         # retries. Pause (non-terminal) so the outage sweeper re-dispatches the
         # SAME job on a backoff and it resumes from its checkpoint when the
-        # endpoint recovers. After the 24h duration ceiling (or the attempts
-        # backstop) fail loudly — a broken config must not park an overnight
+        # endpoint recovers. After the duration ceiling (12h default,
+        # LLM_OUTAGE_CEILING_SECONDS) or the attempts
+        # backstop, fail loudly — a broken config must not park an overnight
         # loop iteration forever. The /complete handler owns the increment +
         # next_retry_at; here we only make the pause-vs-fail call.
         # docs/features/llm_outage_pause_and_backoff_redispatch.md
