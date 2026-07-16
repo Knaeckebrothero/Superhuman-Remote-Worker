@@ -4,7 +4,7 @@ tags:
   - agent
   - datasources
 related:
-  - "[[../features/live_session_settings]]"
+  - "[[../done/2026-07-16-live-session-settings]]"
 ---
 
 # CLI-mode datasource access is dead on remote workspace backends

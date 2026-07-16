@@ -37,7 +37,10 @@ remove; see the notes at the end of the Slice B section).
 **Slice C BUILT 2026-07-16** (owner-facing disconnected-session PATCH +
 config-change audit, k3d e2e-verified edit-while-ended → resume → attach
 pickup; two adjacent bugs found and fixed — see the notes at the end of the
-Slice C section). Slice D not started.
+Slice C section).
+**Slice D BUILT 2026-07-16** (fit ladder + boundary sanitizer + family
+mutation smokes, k3d e2e-verified reject/compact-then-swap/sanitize; see the
+notes at the end of the Slice D section). **All slices complete.**
 **Scope:** Cockpit (settings pane, header cleanup) + one contained
 orchestrator/agent slice (live datasources) + protocol touch-ups + a small
 owner-facing endpoint (disconnected-session editing) + a hardening slice for
@@ -693,6 +696,86 @@ independently of the pane:
 3. **Per-family mutation smoke tests** on local vLLM (minimax, gpt-oss,
    qwen): {tool-bearing history} × {some tools removed, all tools removed,
    model swapped}. Template strictness is the least documented layer.
+
+**✅ BUILT 2026-07-16.** All three rungs, k3d e2e-verified:
+
+- **Fit ladder** — `_model_swap_fit_ladder` (persistent_app), called from
+  `_handle_config_update` before the swap is applied, and only when the
+  model itself changes (temperature-only `llm` fragments skip it). Check:
+  `max(bare-history count with the CANDIDATE's tokenizer, provider anchor)`
+  vs the candidate's derived `context_threshold_tokens` (per-model
+  `context_window` reaches the live swap via the enrichment PATCH's
+  `model_max_context_tokens` setdefault). Over → compact **on the live
+  ContextManager** with its limits rolled forward to the candidate (rolled
+  back on failure/rejection; a scratch manager would lose the
+  `_record_compaction` plumbing — progress frames, boundary id, stats),
+  `force=True` so the progressive keep-window + emergency-truncation ladder
+  runs, `trigger="model_swap"` on the banner + summary row. Still over the
+  candidate's hard window after compaction → reject with a user-facing
+  detail; the session keeps working on the old model. A turn in flight +
+  over budget → reject (compacting the durable list concurrently with a
+  running turn can drop its appends); note `_turn_in_flight` stays true
+  through post-turn work (title gen, memory extraction), so a swap right
+  after an answer can hit this branch — retry succeeds.
+  - **Fixed-overhead accounting** (found live): the post-compaction verdict
+    is `bare count + max(0, anchor − pre-compaction bare count)` — the
+    system prompt + tool schemas ride every request and compaction can't
+    shrink them. Without it a 2.2k bare history passed a 3k window while
+    the real request measured 17.6k → 413 on the next turn.
+  - **Adjacent fix**: compaction success now clears the provider-usage
+    anchor (`ContextManager._note_compaction_success`, both success sites) —
+    the stale anchor kept the trigger floored above threshold and re-fired a
+    needless compaction on the next check after any compaction (worst
+    post-swap; also affected manual `/compact`).
+- **Boundary sanitizer** — `sanitize_history_for_provider_boundary`
+  (core/context): strips reasoning/thinking content blocks (`thinking`,
+  `redacted_thinking`, `reasoning`, `reasoning_content` — langchain-openai
+  passes `redacted_thinking` + Responses-style `reasoning` blocks through
+  to chat/completions) and reasoning `additional_kwargs`; drops
+  `invalid_tool_calls` (serialized outbound with no matching result); drops
+  assistant turns left with no content and no calls; remaps nonconforming
+  tool-call ids deterministically (blake2b) and consistently on both sides —
+  Mistral's strict `^[a-zA-Z0-9]{9}$` special-cased, `[a-zA-Z0-9_-]{1,40}`
+  everywhere else; ends in `repair_tool_pairing`. Pure-sync + idempotent;
+  in-memory working set only (persisted `thread_messages` stay
+  provider-native). Applied on swaps where `family_of` or `provider`
+  changes, and at restore (`_sanitize_restored_history`, both Path A/B,
+  after pairing repair) since Slice C's offline PATCH means restored
+  histories can be foreign to the bound model — restore rows are already
+  reasoning-flattened, so the restore rung is effectively the id remap.
+- **Family mutation smokes** — `tests/test_family_mutation_smoke.py`,
+  opt-in via `SRW_SMOKE_LLM_ENDPOINTS` (JSON endpoint list; unset → module
+  skips, CI never hits the network). Matrix per endpoint over the repo's
+  own `create_llm` transport: native tool-bearing history × {some tools
+  removed, floor-bound (prod's never-bind-zero), zero tools (the poisoned
+  case), foreign Anthropic-shaped history through the sanitizer}. **8/8
+  green live** against gemma-4-moe (self-hosted vLLM) and MiniMax-M3
+  (cloud); the harness takes any endpoint list for gpt-oss/qwen when one is
+  reachable.
+- **k3d e2e evidence** (sessions df10461f, 9eaaeafc, both deleted after):
+  gemma tool-turn history → swap to MiniMax-M3@400 rejected with
+  "~2,246 tokens after compaction — more than … (400 tokens)" and the
+  ladder's summarize→elide→emergency-truncate visible in the agent log,
+  chip stayed gemma; window restored → swap succeeded with
+  `Provider-boundary sanitize (target family=minimax-m3): … 1 reasoning
+  kwarg` + `LLM hot-swapped: model=MiniMax-M3`, and MiniMax answered
+  correctly **from the gemma-produced history** ("20"; verbatim greeting
+  recall on the second session); swap to MiniMax@3000 with only ~2.1k bare
+  history rejected with the overhead-aware "~13,831 tokens … (including the
+  system prompt and tool schemas)" message — the exact case that 413'd
+  pre-fix; compact-then-swap rung observed at gemma@3000→ (compaction
+  triggered at 2,274 tokens, then `LLM hot-swapped`).
+- **Unit tests**: `tests/test_model_swap_hardening.py` (34: sanitizer
+  reasoning/id/pairing/idempotency/no-mutation, ladder branches incl.
+  overhead rejection + rollback, anchor-clear, source pins for the
+  `_handle_config_update` wiring and both restore paths).
+- **Residuals**: the pane's model select keeps the rejected value after a
+  "Model switch rejected" error (baseline doesn't roll back; the chip shows
+  the truth — fold error acks into the diff baseline like the config.changed
+  rider fix); `_turn_in_flight` lagging the visible answer makes a
+  swap-right-after-a-turn hit the busy branch (cosmetic, retry works);
+  cross-model overhead estimate uses the old model's anchor (biased but
+  order-correct).
 
 ## Out of scope
 
