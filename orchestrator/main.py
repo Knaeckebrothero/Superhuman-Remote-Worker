@@ -11044,10 +11044,17 @@ async def _handle_delegation_child_completion(
     )
 
     # Unblock parent: waiting → paused (dispatcher picks it up via /job/resume,
-    # preserving checkpoint state from before delegation).
-    await postgres_db.update_job_status(
-        target_id, status="paused", assigned_agent_id=""
-    )
+    # preserving checkpoint state from before delegation). The CAS claim also
+    # clears the delegation freeze — get_dispatchable_jobs requires
+    # freeze_data IS NULL, so update_job_status (which cannot clear it) would
+    # leave the re-queued parent dispatcher-invisible forever
+    # (docs/issues/delegation_freeze_lifecycle_gaps.md, Gap 1).
+    if not await postgres_db.claim_delegation_resume(target_id):
+        logger.debug(
+            f"Delegation child {job_id}: parent {target_id} already re-queued "
+            "by a concurrent writer — skipping duplicate unblock"
+        )
+        return
     _trigger_dispatch()
 
     completed_count = sum(1 for c in child_results if c["status"] == "completed")

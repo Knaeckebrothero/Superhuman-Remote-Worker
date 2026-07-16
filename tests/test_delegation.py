@@ -877,3 +877,66 @@ class TestSubagentModelTier:
 
         llm = LLMConfig(model="base", subagent=_parse_phase_override({"model": "s"}))
         assert llm.has_phase_overrides() is False
+
+
+# ===========================================================================
+# TestResumeChildFreezeTimeout — re-suspend freeze must carry the timeout
+# ===========================================================================
+
+
+class TestResumeChildFreezeTimeout:
+    """The re-suspend freeze must carry a ``timeout`` key.
+
+    ``_check_delegation_timeouts`` falls back to ``freeze.get("timeout",
+    7200)`` — omitting the key silently resets a longer delegation deadline
+    to the 2h default after any child resume. Regression for
+    docs/issues/delegation_freeze_lifecycle_gaps.md (Gap 2).
+    """
+
+    def _real_context(self):
+        from src.tools.context import ToolContext
+
+        client = MagicMock()
+        client.resume_job = AsyncMock(return_value=True)
+        return ToolContext(
+            orchestrator_client=client,
+            _job_metadata={"job_id": "par-1"},
+            config={"delegation": {"enabled": True, "max_timeout": 14400}},
+        )
+
+    def _resume_tool(self, ctx):
+        from src.tools.delegation.delegate_work import create_delegation_tools
+
+        tools = create_delegation_tools(ctx)
+        return next(t for t in tools if t.name == "resume_delegation_child")
+
+    @pytest.mark.asyncio
+    async def test_resume_freeze_carries_explicit_timeout(self):
+        ctx = self._real_context()
+        tool = self._resume_tool(ctx)
+        msg = tool.func(job_id="child-1", feedback="fix X", timeout=3600)
+        assert "Resumed child" in msg
+        req = ctx.consume_freeze_request()
+        assert req is not None
+        assert req["freeze_type"] == "delegation"
+        assert req["timeout"] == 3600
+
+    @pytest.mark.asyncio
+    async def test_resume_freeze_defaults_to_7200(self):
+        ctx = self._real_context()
+        tool = self._resume_tool(ctx)
+        msg = tool.func(job_id="child-1", feedback="fix X")
+        assert "Resumed child" in msg
+        req = ctx.consume_freeze_request()
+        assert req is not None
+        assert req["timeout"] == 7200
+
+    @pytest.mark.asyncio
+    async def test_resume_timeout_capped_by_max_timeout(self):
+        ctx = self._real_context()
+        tool = self._resume_tool(ctx)
+        msg = tool.func(job_id="child-1", feedback="fix X", timeout=99999)
+        assert msg.startswith("Error")
+        assert "max_timeout" in msg
+        # No freeze requested — the parent must not suspend on bad input.
+        assert ctx.consume_freeze_request() is None
