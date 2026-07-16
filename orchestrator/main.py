@@ -7632,28 +7632,34 @@ async def _require_job_project_access(
 
 
 def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
-    """Strip credential fields from a thread's ``metadata.config_override``
-    before it leaves over REST. ``metadata`` is a JSONB column returned as a
-    JSON string; redact and re-serialize to the original representation.
+    """Parse and strip credential fields from a thread's ``metadata`` before
+    it leaves over REST.
+
+    ``metadata`` is a JSONB column asyncpg hands back as a JSON *string*.
+    This helper used to "re-serialize to the original representation", which
+    meant the owner-facing thread endpoints returned metadata as a string —
+    silently breaking every Cockpit consumer typed against
+    ``metadata?: Record<string, unknown>`` (settings-pane config/tools
+    prefill, the attached-datasource default, and the REST model/temperature
+    seeding — the long-standing "model shows the config name until the
+    welcome frame" oddity). The contract is now: metadata always leaves as a
+    parsed OBJECT (unparseable/absent → ``{}``).
     """
     thread = _redact_nested_workspace_state(thread, field="metadata")
     md = thread.get("metadata")
-    was_str = isinstance(md, str)
-    if was_str:
+    if isinstance(md, str):
         try:
             md = json.loads(md)
         except (json.JSONDecodeError, TypeError):
-            return thread  # unparseable — cannot contain our config_override
-    if isinstance(md, dict):
-        should_copy = "config_override" in md or "_workspace_binding" in md
-        if not should_copy:
-            return thread
-        thread = dict(thread)
-        md = dict(md)
-        if "config_override" in md:
-            md["config_override"] = redact_config_override(md["config_override"])
-        md.pop("_workspace_binding", None)
-        thread["metadata"] = json.dumps(md) if was_str else md
+            md = {}
+    if not isinstance(md, dict):
+        md = {}
+    thread = dict(thread)
+    md = dict(md)
+    if "config_override" in md:
+        md["config_override"] = redact_config_override(md["config_override"])
+    md.pop("_workspace_binding", None)
+    thread["metadata"] = md
     return thread
 
 
@@ -18422,6 +18428,211 @@ class AgentThreadConfigUpdateRequest(BaseModel):
     datasource_ids: list[str] | None = None
 
 
+def _config_change_summary(
+    config_override: dict[str, Any], datasource_ids: list[str] | None
+) -> str:
+    """One-line audit summary of a config change: dotted KEY paths only.
+
+    Values are deliberately omitted — the fragment can carry transport
+    secrets after enrichment, and the security_events table must never
+    hold credential material.
+    """
+    keys: list[str] = []
+    for k, v in sorted(config_override.items()):
+        if isinstance(v, dict) and v:
+            keys.extend(f"{k}.{sub}" for sub in sorted(v))
+        else:
+            keys.append(k)
+    parts = []
+    if keys:
+        parts.append("keys=" + ",".join(keys))
+    if datasource_ids is not None:
+        parts.append(f"datasource_ids={len(datasource_ids)}")
+    return " ".join(parts) or "empty"
+
+
+async def _apply_thread_config_update(
+    thread_id: str,
+    thread_row: dict[str, Any] | None,
+    config_override: dict[str, Any],
+    datasource_ids: list[str] | None,
+    *,
+    request: Request,
+    actor: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[str] | None]:
+    """Validate → authorize → enrich → persist a thread config change.
+
+    Shared core of the internal live-session PATCH
+    (``agent_update_thread_config``) and the owner-facing
+    disconnected-session PATCH (live_session_settings.md Slice C) — the two
+    callers differ only in auth, connection gating, and response redaction.
+    Authorization (datasource selection + capability grants) is keyed to the
+    THREAD OWNER in both cases, so an API caller can never exceed what the
+    live pane allows.
+
+    Returns ``(config_override, selected_datasource_ids)`` where the fragment
+    is enriched with resolved model transport (``base_url``/``api_key`` +
+    explicit ``None`` sentinels) — the internal caller returns it verbatim to
+    the agent; browser-facing callers MUST redact it. Persistence is always
+    redacted. Emits a ``session_config_updated`` security event on success
+    (``actor`` is the resolved caller for owner-facing requests, None for
+    internal ones — the recorded path distinguishes the two).
+    """
+    if "tools" in config_override:
+        # Runtime updates use the same closed group/name boundary as
+        # session creation.  Persist only the accepted session-facing
+        # subset; otherwise a globally registered tool could be smuggled
+        # through an unrelated category and instantiated by name later.
+        accepted_tools = _validated_session_tool_overrides(config_override)
+        if accepted_tools:
+            config_override["tools"] = accepted_tools
+        else:
+            config_override.pop("tools", None)
+
+    # Audit summary is computed PRE-enrichment so it names only the keys the
+    # caller actually sent (enrichment adds llm.api_key/base_url internally).
+    change_summary = _config_change_summary(config_override, datasource_ids)
+
+    # Live datasource change (live_session_settings.md Slice B): authorize
+    # the requested full selection exactly like create does — including the
+    # lite-tier/repository rule against the thread's CURRENT workspace
+    # backend (a live add is create-like; only the attach-time
+    # revalidation deliberately passes None) — then fold the resulting
+    # datasource tool-category flip into the grant-checked fragment so a
+    # datasource_tools-denied principal fails HERE at the PATCH, not at
+    # the next attach.
+    selected_ds_ids: list[str] | None = None
+    grant_fragment = config_override
+    if datasource_ids is not None:
+        if thread_row is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        requested_ids = [str(v) for v in datasource_ids]
+        if thread_row.get("user_id"):
+            owner = await postgres_db.get_user(str(thread_row["user_id"]))
+            if owner is None:
+                # Same generic denial as create — no enumeration oracle.
+                raise HTTPException(
+                    status_code=403,
+                    detail="One or more selected datasources are unavailable",
+                )
+            selected_ds_ids = await _authorize_thread_datasource_ids(
+                owner,
+                requested_ids,
+                workspace_backend=_thread_workspace_backend(thread_row),
+            )
+        else:
+            # Ownerless/system threads keep their trusted-internal bypass
+            # (normalize only), mirroring job create + attach revalidation.
+            selected_ds_ids = list(dict.fromkeys(requested_ids))
+
+        resolved_ds = await postgres_db.resolve_datasources_for_thread(
+            datasource_ids=selected_ds_ids,
+            project_ids=await _thread_project_ids(thread_id),
+        )
+        flip = _build_datasource_tool_override(resolved_ds, None)
+        # The flip's categories (sql/graph/mongodb/webdav) are outside the
+        # validated session tools vocabulary, so layering the request's own
+        # already-validated groups on top cannot mask them.
+        grant_fragment = {
+            **config_override,
+            "tools": {
+                **flip.get("tools", {}),
+                **(config_override.get("tools") or {}),
+            },
+        }
+
+    # Layer 2 (fail loud): a runtime config change must also fit the owner's
+    # grants — reject a denied permission_mode/model with 422 instead of
+    # persisting a config the session can't run (an API-direct or stale-UI
+    # escalation past the user's ceiling; the cockpit greys these out
+    # client-side). Ownerless/standalone threads (user_id NULL) aren't
+    # subject to a user's grants — skip. Admin owner bypasses.
+    # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
+    if thread_row and thread_row.get("user_id"):
+        await _enforce_session_create_grants(
+            grant_fragment,
+            user_id=str(thread_row["user_id"]),
+            project_ids=(
+                [str(thread_row["project_id"])] if thread_row.get("project_id") else []
+            ),
+        )
+
+    # Enrich endpoint-backed model swaps with base_url + api_key so the
+    # persisted override is complete. Without this, a hot-swap to a
+    # custom-endpoint model leaves the next session attach pointing at
+    # the default OpenAI base.
+    llm_section = config_override.get("llm")
+    if llm_section and llm_section.get("model"):
+        if thread_row:
+            user_id = str(thread_row["user_id"]) if thread_row.get("user_id") else None
+            project_id = (
+                str(thread_row["project_id"]) if thread_row.get("project_id") else None
+            )
+            resolved_keys = await postgres_db.resolve_api_keys_for_job(
+                user_id=user_id, project_id=project_id
+            )
+            llm_section = dict(llm_section)
+            await _inject_model_credentials(
+                section=llm_section,
+                model_id=llm_section["model"],
+                user_id=user_id,
+                resolved_keys=resolved_keys,
+            )
+            # A model swap must fully determine its transport. Any field
+            # resolution didn't set becomes an explicit None so the
+            # agent-side deep_merge CLEARS the previous model's value
+            # instead of inheriting it (e.g. swapping off an
+            # endpoint-backed model must not keep its base_url).
+            for transport_key in ("provider", "base_url", "api_key"):
+                llm_section.setdefault(transport_key, None)
+            config_override["llm"] = llm_section
+
+    # Persist WITHOUT secrets — the agent rebuilds its LLM from the enriched
+    # dict returned below, and resume re-injects from source. The explicit
+    # None transport sentinels stay in the stored copy so the deep-merge
+    # clears the previous model's transport; resume re-injection treats them
+    # as absent (see _inject_thread_dispatch_credentials).
+    ok = await postgres_db.merge_thread_config_override(
+        thread_id, redact_config_override(config_override)
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    # Keep top-level permission_mode column in sync
+    pm = (config_override.get("interactive") or {}).get("permission_mode")
+    if pm and pm in ("supervised", "auto_accept", "autonomous"):
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET permission_mode = $1 WHERE id = $2",
+                pm,
+                thread_id,
+            )
+
+    # Persist the accepted selection only after every check above passed.
+    # The category flip is NOT merged into config_override — the closed
+    # session tools vocabulary would drop it anyway; the agent re-fetches
+    # GET /api/agents/threads/{id}/workspace and applies the categories
+    # directly to its live session config, and every attach path re-derives
+    # them from metadata.datasource_ids.
+    if selected_ds_ids is not None:
+        if not await postgres_db.set_thread_datasource_ids(thread_id, selected_ds_ids):
+            raise HTTPException(status_code=404, detail="Thread not found")
+
+    # Config-change audit (live_session_settings.md Slice C): key paths only,
+    # fired after every persist step succeeded. log_security_event never
+    # raises, so a broken audit trail can't fail the update it documents.
+    await log_security_event(
+        postgres_db,
+        resource_type="thread",
+        event_type="session_config_updated",
+        user=actor,
+        resource_id=thread_id,
+        detail=change_summary,
+        request=request,
+    )
+    return config_override, selected_ds_ids
+
+
 @app.patch("/api/agents/threads/{thread_id}/config")
 async def agent_update_thread_config(
     request: Request,
@@ -18442,152 +18653,15 @@ async def agent_update_thread_config(
     """
     await require_internal(request)
     try:
-        config_override = dict(body.config_override or {})
-        if "tools" in config_override:
-            # Runtime updates use the same closed group/name boundary as
-            # session creation.  Persist only the accepted session-facing
-            # subset; otherwise a globally registered tool could be smuggled
-            # through an unrelated category and instantiated by name later.
-            accepted_tools = _validated_session_tool_overrides(config_override)
-            if accepted_tools:
-                config_override["tools"] = accepted_tools
-            else:
-                config_override.pop("tools", None)
         thread_row = await postgres_db.get_thread(thread_id)
-
-        # Live datasource change (live_session_settings.md Slice B): authorize
-        # the requested full selection exactly like create does — including the
-        # lite-tier/repository rule against the thread's CURRENT workspace
-        # backend (a live add is create-like; only the attach-time
-        # revalidation deliberately passes None) — then fold the resulting
-        # datasource tool-category flip into the grant-checked fragment so a
-        # datasource_tools-denied principal fails HERE at the PATCH, not at
-        # the next attach.
-        selected_ds_ids: list[str] | None = None
-        grant_fragment = config_override
-        if body.datasource_ids is not None:
-            if thread_row is None:
-                raise HTTPException(status_code=404, detail="Thread not found")
-            requested_ids = [str(v) for v in body.datasource_ids]
-            if thread_row.get("user_id"):
-                owner = await postgres_db.get_user(str(thread_row["user_id"]))
-                if owner is None:
-                    # Same generic denial as create — no enumeration oracle.
-                    raise HTTPException(
-                        status_code=403,
-                        detail="One or more selected datasources are unavailable",
-                    )
-                selected_ds_ids = await _authorize_thread_datasource_ids(
-                    owner,
-                    requested_ids,
-                    workspace_backend=_thread_workspace_backend(thread_row),
-                )
-            else:
-                # Ownerless/system threads keep their trusted-internal bypass
-                # (normalize only), mirroring job create + attach revalidation.
-                selected_ds_ids = list(dict.fromkeys(requested_ids))
-
-            resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                datasource_ids=selected_ds_ids,
-                project_ids=await _thread_project_ids(thread_id),
-            )
-            flip = _build_datasource_tool_override(resolved_ds, None)
-            # The flip's categories (sql/graph/mongodb/webdav) are outside the
-            # validated session tools vocabulary, so layering the request's own
-            # already-validated groups on top cannot mask them.
-            grant_fragment = {
-                **config_override,
-                "tools": {
-                    **flip.get("tools", {}),
-                    **(config_override.get("tools") or {}),
-                },
-            }
-
-        # Layer 2 (fail loud): a runtime config change must also fit the owner's
-        # grants — reject a denied permission_mode/model with 422 instead of
-        # persisting a config the session can't run (an API-direct or stale-UI
-        # escalation past the user's ceiling; the cockpit greys these out
-        # client-side). Ownerless/standalone threads (user_id NULL) aren't
-        # subject to a user's grants — skip. Admin owner bypasses.
-        # docs/issues/session_permission_mode_grant_denied_ready_timeout.md
-        if thread_row and thread_row.get("user_id"):
-            await _enforce_session_create_grants(
-                grant_fragment,
-                user_id=str(thread_row["user_id"]),
-                project_ids=(
-                    [str(thread_row["project_id"])]
-                    if thread_row.get("project_id")
-                    else []
-                ),
-            )
-
-        # Enrich endpoint-backed model swaps with base_url + api_key so the
-        # persisted override is complete. Without this, a hot-swap to a
-        # custom-endpoint model leaves the next session attach pointing at
-        # the default OpenAI base.
-        llm_section = config_override.get("llm")
-        if llm_section and llm_section.get("model"):
-            if thread_row:
-                user_id = (
-                    str(thread_row["user_id"]) if thread_row.get("user_id") else None
-                )
-                project_id = (
-                    str(thread_row["project_id"])
-                    if thread_row.get("project_id")
-                    else None
-                )
-                resolved_keys = await postgres_db.resolve_api_keys_for_job(
-                    user_id=user_id, project_id=project_id
-                )
-                llm_section = dict(llm_section)
-                await _inject_model_credentials(
-                    section=llm_section,
-                    model_id=llm_section["model"],
-                    user_id=user_id,
-                    resolved_keys=resolved_keys,
-                )
-                # A model swap must fully determine its transport. Any field
-                # resolution didn't set becomes an explicit None so the
-                # agent-side deep_merge CLEARS the previous model's value
-                # instead of inheriting it (e.g. swapping off an
-                # endpoint-backed model must not keep its base_url).
-                for transport_key in ("provider", "base_url", "api_key"):
-                    llm_section.setdefault(transport_key, None)
-                config_override["llm"] = llm_section
-
-        # Persist WITHOUT secrets — the agent rebuilds its LLM from the enriched
-        # dict returned below, and resume re-injects from source. The explicit
-        # None transport sentinels stay in the stored copy so the deep-merge
-        # clears the previous model's transport; resume re-injection treats them
-        # as absent (see _inject_thread_dispatch_credentials).
-        ok = await postgres_db.merge_thread_config_override(
-            thread_id, redact_config_override(config_override)
+        config_override, selected_ds_ids = await _apply_thread_config_update(
+            thread_id,
+            thread_row,
+            dict(body.config_override or {}),
+            body.datasource_ids,
+            request=request,
+            actor=None,
         )
-        if not ok:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-        # Keep top-level permission_mode column in sync
-        pm = (config_override.get("interactive") or {}).get("permission_mode")
-        if pm and pm in ("supervised", "auto_accept", "autonomous"):
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    "UPDATE threads SET permission_mode = $1 WHERE id = $2",
-                    pm,
-                    thread_id,
-                )
-
-        # Persist the accepted selection only after every check above passed.
-        # The category flip is NOT merged into config_override — the closed
-        # session tools vocabulary would drop it anyway; the agent re-fetches
-        # GET /api/agents/threads/{id}/workspace and applies the categories
-        # directly to its live session config, and every attach path re-derives
-        # them from metadata.datasource_ids.
-        if selected_ds_ids is not None:
-            if not await postgres_db.set_thread_datasource_ids(
-                thread_id, selected_ds_ids
-            ):
-                raise HTTPException(status_code=404, detail="Thread not found")
-
         return {
             "status": "updated",
             "config_override": config_override,
@@ -20609,6 +20683,68 @@ async def update_thread(
         raise HTTPException(status_code=400, detail="Title too long (max 200)")
     await postgres_db.update_thread_title(thread_id, title)
     return {"status": "updated", "title": title}
+
+
+class ThreadConfigPatchRequest(BaseModel):
+    config_override: dict[str, Any] = Field(default_factory=dict)
+    # Desired FULL datasource selection (create semantics): None = no change,
+    # [] = detach all. Same key as the internal agent PATCH.
+    datasource_ids: list[str] | None = None
+
+
+@app.patch("/api/persistent/threads/{thread_id}/config")
+async def update_thread_config(
+    thread_id: str, body: ThreadConfigPatchRequest, request: Request
+) -> dict[str, Any]:
+    """Edit a DISCONNECTED session's config (auth: owner only).
+
+    Slice C of live_session_settings.md. Runs the exact validate → datasource-
+    authorize → grant-check → merge core the live (internal) PATCH uses —
+    authorization stays keyed to the THREAD OWNER, so an API caller can't
+    exceed what the live settings pane allows. Changes take effect at the next
+    attach: every attach path re-resolves ``metadata.config_override`` +
+    ``datasource_ids`` and injects credentials in-flight, so no enrichment
+    round-trip to an agent is needed.
+
+    Refuses threads currently bound to an agent (409) — there is no
+    orchestrator→agent config-push channel, so an edit here would silently go
+    stale on the running session until its next attach; connected sessions
+    edit through the settings pane's ``config.update`` frame instead. Ended
+    threads are editable (they resume via POST .../resume → fresh attach).
+
+    The response ``config_override`` is the REDACTED accepted fragment — the
+    internal endpoint intentionally returns plaintext transport secrets to the
+    agent; that shape must never reach a browser-facing route.
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    # Connected = an agent is bound AND the thread is in a live state. A
+    # suspended/ended thread can carry a stale agent_id from a crash path
+    # (drain-suspend clears it, a hard pod kill may not) — no live agent
+    # serves those states, so they stay editable.
+    if thread.get("agent_id") and thread.get("status") not in ("suspended", "ended"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Session is connected to an agent — change settings from the "
+                "session's settings pane; a server-side edit would not reach "
+                "the running session until its next attach."
+            ),
+        )
+    if not body.config_override and body.datasource_ids is None:
+        raise HTTPException(status_code=400, detail="No changes provided")
+    config_override, selected_ds_ids = await _apply_thread_config_update(
+        thread_id,
+        thread,
+        dict(body.config_override or {}),
+        body.datasource_ids,
+        request=request,
+        actor=user,
+    )
+    return {
+        "status": "updated",
+        "config_override": redact_config_override(config_override),
+        "datasource_ids": selected_ds_ids,
+    }
 
 
 # =============================================================================
