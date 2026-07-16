@@ -321,6 +321,15 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CHECKPOINTER_BACKEND
+            # LLM-outage/cooldown pause budget (12h default). Must equal the value
+            # every agent pod reads via envFrom on the shared ConfigMap, so the
+            # orchestrator references the same key here (it does not envFrom).
+            # docs/features/llm_cooldown_pause_and_resume.md
+            - name: LLM_OUTAGE_CEILING_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LLM_OUTAGE_CEILING_SECONDS
             - name: WORKSPACE_PATH
               valueFrom:
                 configMapKeyRef:
