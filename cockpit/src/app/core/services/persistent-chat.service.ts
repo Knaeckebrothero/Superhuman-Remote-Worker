@@ -337,6 +337,10 @@ export class PersistentChatService {
             // the UI). isStartingSession also gates rendering on
             // sessionReady, so the card hides naturally.
             if (this.sessionReady()) return;
+            // The orchestrator tags VM-backed starts so the card shows the
+            // longer "Booting VM" copy and the readiness poll extends its
+            // budget — reasserted here so resume (no create body) is covered.
+            if (event.backend === 'vm') this.isVmSession.set(true);
             switch (event.state) {
                 case 'provisioning':
                 case 'booting':
@@ -581,6 +585,16 @@ export class PersistentChatService {
     // --- Startup progress phase (sent by orchestrator while waiting for agent) ---
     readonly startupPhase = signal<string | null>(null);
 
+    /**
+     * True when the session currently starting is VM-backed. A cold KubeVirt
+     * boot runs minutes past a sandbox start, so this drives the longer
+     * "Booting VM (this can take a few minutes)" startup copy and extends the
+     * `/connection` readiness poll budget. Set from the create body
+     * (createAndConnect) and reasserted by a `backend='vm'` lifecycle event
+     * (covers resume); cleared on a genuine thread switch.
+     */
+    readonly isVmSession = signal(false);
+
     // --- Outbox: sends the user has committed but the server hasn't accepted
     //     yet. Owned by user intent, NOT the transport lifecycle — it survives
     //     disconnect/reconnect/thread-creation so a message typed on the
@@ -742,6 +756,10 @@ export class PersistentChatService {
             // wholesale — unless we're carrying it across a create/reprovision
             // (createAndConnect), where the queued sends belong to *this* thread.
             if (!opts.carryOutbox) this.outbox.set([]);
+            // Same gate for the VM-session flag: createAndConnect sets it before
+            // calling connect(carryOutbox), so only a real switch clears it. A
+            // backend='vm' lifecycle event re-asserts it for the resume path.
+            if (!opts.carryOutbox) this.isVmSession.set(false);
             this.sessionTitle.set(null);
             this.modelName.set(null);
             this.temperature.set(0);
@@ -869,6 +887,12 @@ export class PersistentChatService {
         this.isCreating.set(true);
         this.connectionState.set('connecting');
         this.startupPhase.set('creating');
+        // A VM-backed create pays a cold KubeVirt boot — flag it up front so the
+        // startup card shows the "Booting VM" copy and connect()'s readiness
+        // poll uses the longer VM budget from the first iteration.
+        this.isVmSession.set(
+            (body?.['config_override'] as any)?.workspace?.backend === 'vm',
+        );
         try {
             const resp = await firstValueFrom(
                 this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body)
@@ -1511,10 +1535,15 @@ export class PersistentChatService {
      * stuck attach surfaces as an error instead of polling forever.
      */
     private async _pollConnectionUntilReady(threadId: string): Promise<ConnectionPayload> {
+        // Sandbox/lite sessions are ready in seconds; a cold VM boot runs
+        // minutes. Re-read isVmSession() every iteration so a `backend='vm'`
+        // lifecycle event arriving mid-poll (the resume path, where the create
+        // body didn't flag it) still extends the budget.
         const READY_TIMEOUT_MS = 180_000;
-        const deadline = Date.now() + READY_TIMEOUT_MS;
+        const VM_READY_TIMEOUT_MS = 1_020_000; // > server 960s > agent 900s
+        const start = Date.now();
         let interval = 1_000;
-        while (Date.now() < deadline) {
+        while (Date.now() - start < (this.isVmSession() ? VM_READY_TIMEOUT_MS : READY_TIMEOUT_MS)) {
             if (this.intentionalClose || this.threadId() !== threadId) {
                 throw new Error('connection cancelled');
             }

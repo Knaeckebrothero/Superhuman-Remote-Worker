@@ -274,16 +274,26 @@ async def _do_prepare(
                 _emit("failed", reason="agent failed to register")
                 return
 
-        # Readiness probe.
-        _emit("booting")
+        # Readiness probe. A VM-backed thread pays a cold KubeVirt boot far
+        # beyond the sandbox default; size the budget from the thread's stored
+        # backend and tag the lifecycle event so the cockpit shows the VM copy.
+        # (docs/features/session_create_on_vm.md)
+        from main import (  # type: ignore
+            _session_ready_timeout_s,
+            _thread_workspace_backend,
+        )
+
         thread = await db.get_thread(thread_id)
+        _backend = _thread_workspace_backend(thread)
+        _vm_tag = {"backend": "vm"} if _backend == "vm" else {}
+        _emit("booting", **_vm_tag)
         agent_id = thread["agent_id"]
         agent = await db.get_agent(str(agent_id))
         if not agent or not agent.get("pod_ip"):
             _emit("failed", reason="agent has no pod_ip")
             return
 
-        ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
+        ready_timeout_s = _session_ready_timeout_s(_backend)
         if not await wait_for_ready(
             pod_ip=agent["pod_ip"],
             pod_port=int(agent.get("pod_port", 8001)),

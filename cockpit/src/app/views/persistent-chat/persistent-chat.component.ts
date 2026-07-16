@@ -933,7 +933,7 @@ export function clearDraft(threadId: string | null): void {
           @if (currentStartupStep(); as step) {
             <div class="startup-step state-active">
               <span class="step-spinner" aria-hidden="true"></span>
-              <span class="step-label">{{ ('chat.startup.steps.' + step.key) | transloco }}</span>
+              <span class="step-label">{{ step.labelKey | transloco }}</span>
               <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
             </div>
           }
@@ -1253,7 +1253,7 @@ export function clearDraft(threadId: string | null): void {
                   } @else {
                     <app-icon size="lg" class="step-icon">{{ stepIcon(step.state) }}</app-icon>
                   }
-                  <span class="step-label">{{ ('chat.startup.steps.' + step.key) | transloco }}</span>
+                  <span class="step-label">{{ step.labelKey | transloco }}</span>
                   <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
                 </div>
               }
@@ -1952,6 +1952,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             const completedCount = order.filter(k => this.phaseDurations[k] != null).length;
             activeIdx = Math.max(completedCount, isResuming ? 1 : 0);
         }
+        const isVm = this.chat.isVmSession();
         return order.map((key, idx) => {
             const state: 'done' | 'active' | 'todo' =
                 idx < activeIdx ? 'done' : (idx === activeIdx ? 'active' : 'todo');
@@ -1961,7 +1962,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             } else if (state === 'active' && this.phaseStarts[key] != null) {
                 elapsedMs = Math.max(0, now - this.phaseStarts[key]);
             }
-            return { key, state, elapsedMs };
+            // A VM boot is the one multi-minute step; give it distinct copy so
+            // the user knows the wait is expected, not a hang.
+            const labelKey =
+                key === 'booting' && isVm
+                    ? 'chat.startup.steps.bootingVm'
+                    : 'chat.startup.steps.' + key;
+            return { key, state, elapsedMs, labelKey };
         });
     });
 

@@ -70,6 +70,18 @@ def _install_fake_main(monkeypatch, **overrides) -> types.ModuleType:
         lambda v: "session cannot start — unusable model transport: " + "; ".join(v)
     )
 
+    # Backend extraction + VM-aware readiness budget (session_create_on_vm.md).
+    # Simple stand-ins — the real ones live in main.py behind the side-effect
+    # chain this stub deliberately avoids importing.
+    def _backend_from_override(co):
+        if not isinstance(co, dict):
+            return None
+        ws = co.get("workspace")
+        return ws.get("backend") if isinstance(ws, dict) else None
+
+    stub._backend_from_override = _backend_from_override
+    stub._session_ready_timeout_s = lambda backend: 960 if backend == "vm" else 180
+
     for k, v in overrides.items():
         setattr(stub, k, v)
 
