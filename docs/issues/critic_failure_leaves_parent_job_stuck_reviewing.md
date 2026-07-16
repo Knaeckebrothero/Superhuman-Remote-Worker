@@ -203,3 +203,37 @@ Even after the critic dies, nothing un-sticks the parent. Here the critic is
    recovering, so it is deliberately treated as live). Design + rejected
    options (b)/(c): `docs/superpowers/specs/2026-07-05-reviewing-parent-unstick-watchdog-design.md`.
    The "recovery should re-provision the same tier" note above remains open.
+
+---
+
+# 2026-07-16 — new wedge variant: critic in `pending_review` defeats the watchdog
+
+**Found:** 2026-07-16 during the multi-agent audit for
+[`llm_outage_subjob_resilience`](../features/llm_outage_subjob_resilience.md).
+Line numbers are develop @ 2026-07-16.
+
+The 2026-07-05 watchdog has a gap: a critic that terminates in
+**`pending_review`** — which is exactly what any LLM outage/cooldown freeze on
+a subjob produces today (`determine_job_status` subjob fallback,
+`completion.py:747-748`) — wedges the parent in `reviewing` **indefinitely and
+silently**, because it falls between both sweeper arms:
+
+- `cancel_stale_verification_subjobs` only cancels critics in
+  `('created','paused')` (`postgres.py:4208`) — a `pending_review` critic is
+  **not cancellable**.
+- `unstick_reviewing_parents` fires only when every critic child is in
+  `('failed','cancelled')` (`postgres.py:4268-4273`) — a `pending_review`
+  critic **blocks the unstick** forever.
+
+No verdict, no notification, no timeout. The parent is manually actionable
+(approve endpoint) but nothing surfaces that the review pipeline died — same
+operator experience as the original bug.
+
+**Suggested fix:** treat a `pending_review` critic as review-pipeline-dead —
+either add `pending_review` to the sweeper's cancellable set (parent then flips
+to `pending_review` via unstick + notification on the next tick), or include it
+directly in the unstick predicate. Note
+[`llm_outage_subjob_resilience`](../features/llm_outage_subjob_resilience.md)
+removes the *outage* path into this state (outage-struck critics will
+pause+resume instead), but any other path into a `pending_review` critic still
+wedges — this fix is wanted regardless.
