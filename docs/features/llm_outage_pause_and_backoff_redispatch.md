@@ -313,7 +313,7 @@ an outage anyway → they no-op. No consequential re-execution. `[R]`
 | `llm_outage_backoff_base_seconds` | 30 | first Tier-2 envelope |
 | `llm_outage_backoff_cap_seconds` | 3600 | 60-min cap |
 | `llm_outage_jitter` | `full` | `full` \| `equal` |
-| `llm_outage_ceiling_seconds` | 43200 | 12-h duration ceiling (primary); also the cooldown pause cutoff (updated 2026-07-15, was 86400/24h) |
+| `llm_outage_ceiling_seconds` | 43200 | 12-h duration ceiling (primary); also the cooldown pause cutoff. Helm `llmOutage.ceilingSeconds` → shared ConfigMap → orchestrator + agents (updated 2026-07-15, was 86400/24h) |
 | `llm_outage_max_attempts` | 60 | attempts backstop |
 | `llm_outage_reset_window_seconds` | 7200 | gap that resets the attempt counter — **must exceed the backoff cap** (see below) |
 | `LLM_OUTAGE_SWEEP_SECONDS` | 30 | sweeper tick |

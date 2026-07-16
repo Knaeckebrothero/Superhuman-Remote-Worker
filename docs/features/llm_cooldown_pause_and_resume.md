@@ -297,6 +297,15 @@ Reuses the sibling's `limits:` + env knobs (`llm_outage_backoff_*`,
 No new keys. (The earlier draft's `cooldown_max_pause_seconds` is dropped — fused
 into the ceiling per the 2026-07-15 decision.)
 
+**Chart exposure (added 2026-07-15).** `LLM_OUTAGE_CEILING_SECONDS` is set from the
+Helm value `llmOutage.ceilingSeconds` (default 43200) into the shared ConfigMap
+(`helm/templates/configmap.yaml`). Every agent pod inherits it via `envFrom` (see
+`agent_provisioner.py` / `persistent_provisioner.py`) and the orchestrator references
+the same ConfigMap key explicitly (`helm/templates/orchestrator/deployment.yaml`, since
+it doesn't `envFrom`) — so the agent-side cutoff and the orchestrator-side ceiling read
+**one source of truth** and cannot drift (acceptance #10). Override in one place; both
+pods follow. Verified via `helm template` (both surfaces render the key) + `helm lint`.
+
 ## Acceptance criteria
 
 1. A worker/loop job hitting a `model_cooldown` 429 with `reset_seconds ≈ 2h`

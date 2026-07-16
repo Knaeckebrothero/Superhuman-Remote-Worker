@@ -45,6 +45,14 @@ data:
   # set checkpointer.backend=sqlite to fall back to the legacy pod-local store.
   CHECKPOINTER_BACKEND: {{ .Values.checkpointer.backend | default "postgres" | quote }}
 
+  # LLM-outage/cooldown pause budget (seconds; default 12h). Read by BOTH the
+  # orchestrator give-up ceiling (evaluate_llm_outage) AND every agent pod's
+  # cooldown pause-vs-fail-fast cutoff (src/graph.py _COOLDOWN_MAX_PAUSE_SECONDS)
+  # — they MUST agree, so both read this one ConfigMap key. Agents inherit via
+  # envFrom; the orchestrator references it explicitly (see
+  # orchestrator/deployment.yaml). docs/features/llm_cooldown_pause_and_resume.md
+  LLM_OUTAGE_CEILING_SECONDS: {{ .Values.llmOutage.ceilingSeconds | default 43200 | quote }}
+
   # (Citations live in the vector store — srw_vector — reached through the
   # agent's shared VECTOR_POSTGRES_* pool. No separate citation DB/role/DSN.
   # See docs/done/citation_engine_integration.md.)
