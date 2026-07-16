@@ -1261,6 +1261,7 @@
         "creating": "Creating thread",
         "provisioning": "Provisioning agent",
         "booting": "Booting agent runtime",
+        "bootingVm": "Booting VM (this can take a few minutes)",
         "connecting": "Establishing connection"
       }
     },

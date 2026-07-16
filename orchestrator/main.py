@@ -2971,6 +2971,41 @@ def _backend_from_override(config_override: Any) -> Optional[str]:
     return ws.get("backend")
 
 
+def _thread_workspace_backend(thread: Any) -> Optional[str]:
+    """Extract the selected workspace backend from a thread row's stored
+    ``metadata.config_override.workspace.backend`` (handles JSON-string metadata).
+
+    Used by the session-start paths to size the readiness budget for a VM-backed
+    thread on resume, where the caller may not carry the config_override.
+    """
+    if not isinstance(thread, dict):
+        return None
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(metadata, dict):
+        return None
+    return _backend_from_override(metadata.get("config_override"))
+
+
+def _session_ready_timeout_s(backend: Optional[str]) -> int:
+    """Readiness-probe budget for the session-start paths (``provision_or_assign``
+    and ``_do_prepare``'s ``wait_for_ready``).
+
+    A ``vm`` tier pays a cold KubeVirt CDI import + guest boot (minutes) far
+    beyond the sandbox-container default, so VM-backed sessions get a much larger
+    budget; every other tier keeps the fast default. Both are env-tunable. Sized
+    just above the agent's own VM attach-poll budget (``VM_UPGRADE_POLL_TIMEOUT``,
+    900 s) so the agent gives up first with the truthful reason.
+    """
+    if backend == "vm":
+        return int(os.environ.get("VM_WS_READY_TIMEOUT_S", "960"))
+    return int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
+
+
 def _is_lite_config_override(config_override: Any) -> bool:
     """True if ``config_override`` selects a lite (``virtual``/``none``) backend.
 
@@ -2993,6 +3028,14 @@ def _is_lite_config_override(config_override: Any) -> bool:
 # docs/features/instant_landing_session.md.
 SESSION_WORKSPACE_BACKENDS = ("sandbox", "virtual", "none")
 SESSION_DEFAULT_WORKSPACE_BACKEND = "virtual"
+
+# Backends a caller may *explicitly* select at session creation. ``vm`` is
+# creatable (operator-gated + provisioned via KubeVirt, see create_thread) but
+# deliberately NOT in SESSION_WORKSPACE_BACKENDS: it must never be an implicit
+# or saved default (a KubeVirt VM per session is expensive), so it is a
+# per-session opt-in only and is excluded from the default chain
+# (_default_session_workspace_backend) and the settings-PATCH validator.
+SESSION_CREATE_WORKSPACE_BACKENDS = SESSION_WORKSPACE_BACKENDS + ("vm",)
 
 
 def _default_session_workspace_backend(user_settings: dict[str, Any] | None) -> str:
@@ -3017,12 +3060,16 @@ def _validated_session_workspace_override(
     fragment). Returns the workspace dict for ``create_thread`` to merge, or
     ``None`` when no workspace fragment was sent.
 
-    ``create_thread`` provisions only a lite tier (no pod) or a sandbox container
-    — it has no VM-provisioner (NATS/KubeVirt) wiring — so ``vm`` is rejected
-    here: VM is reached by starting on a lite tier and upgrading
-    (``_enforce_workspace_upgrade_grants`` + the workspace-upgrade path). Unknown
-    backends are rejected too. A workspace fragment with no ``backend`` (e.g.
-    word-limit tweaks only) passes through untouched.
+    ``create_thread`` provisions a lite tier (no pod), a sandbox container, or —
+    when the caller explicitly selects it and passes the operator gate — a
+    KubeVirt ``vm`` (see the VM branch in ``create_thread``'s provisioning fork).
+    ``vm`` is accepted here but validated against
+    ``SESSION_CREATE_WORKSPACE_BACKENDS`` (not the default-chain set) so it stays
+    a per-session opt-in; the operator gate (``_check_vm_permission``) and the
+    ``vm_workspace`` PDP grant are enforced downstream in ``create_thread``.
+    Unknown backends are rejected. A workspace fragment with no ``backend`` (e.g.
+    word-limit tweaks only) passes through untouched, and the VM sizing sub-dict
+    (``vm.{cpu_cores,memory}``) rides along via the caller's merge.
 
     Raises ``HTTPException(400)`` on a disallowed/invalid backend.
     """
@@ -3030,15 +3077,7 @@ def _validated_session_workspace_override(
     if not isinstance(ws, dict) or not ws:
         return None
     backend = ws.get("backend")
-    if backend == "vm":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "VM workspaces can't be selected at session creation; start the "
-                "session on the Virtual tier and upgrade it to VM."
-            ),
-        )
-    if backend is not None and backend not in SESSION_WORKSPACE_BACKENDS:
+    if backend is not None and backend not in SESSION_CREATE_WORKSPACE_BACKENDS:
         raise HTTPException(
             status_code=400, detail=f"Invalid workspace backend '{backend}'"
         )
@@ -19408,6 +19447,20 @@ async def create_thread(
             datasource_ids=selected_thread_datasource_ids,
         )
 
+        # VM tier is operator-gated on top of the ``vm_workspace`` PDP grant that
+        # _enforce_session_create_grants runs below: the global ``vm_workspaces``
+        # kill-switch + per-user ``can_use_vm`` (admins bypass). Fail fast with a
+        # clear 503 when no VM provisioner is wired (e.g. local k3d) instead of
+        # accepting the session and hanging the attach until its ready timeout.
+        # Mirrors the session→VM upgrade gate (agent_upgrade_thread_to_vm).
+        if _backend_from_override(config_override) == "vm":
+            await _check_vm_permission(user, job_needs_vm=True)
+            if not vm_provisioner.is_available:
+                raise HTTPException(
+                    status_code=503,
+                    detail="VM provisioning is not available on this deployment",
+                )
+
         # Layer 2 (fail loud at create): the requested config must fit the
         # owner's capability grants. Reject a never-startable session with 422
         # NOW — before persisting/provisioning — instead of accepting it and
@@ -19532,8 +19585,10 @@ async def create_thread(
         # provisioning path below (no_workspace_agent_mode.md §4). The session
         # agent builds its lite backend from the mounts injected at attach.
         lite_session = _backend_from_override(config_override) in LITE_BACKENDS
+        vm_session = _backend_from_override(config_override) == "vm"
         use_k8s = (
             not lite_session
+            and not vm_session
             and container_provisioner.is_available
             and (
                 container_provisioner.in_cluster or not docker_provisioner.is_available
@@ -19543,6 +19598,56 @@ async def create_thread(
             logger.info(
                 "Thread %s: lite workspace backend — no workspace pod provisioned",
                 thread_id,
+            )
+        elif vm_session:
+            # VM tier: the workspace is a KubeVirt VM (metadata.vm), not a
+            # sandbox container. Mark it provisioning SYNCHRONOUSLY so the agent's
+            # attach-time workspace poll (_poll_workspace_ready) observes a VM in
+            # flight (vm_status truthy) and waits on the VM budget instead of
+            # bailing "no workspace provisioned". Then fire create_thread_vm
+            # fire-and-forget (mirrors the container task) with the requested
+            # sizing; the agent pod provisioned below SSHes into the VM once it
+            # reports ready. (docs/features/session_create_on_vm.md)
+            await postgres_db.merge_thread_vm_context(
+                thread_id, {"status": "provisioning"}
+            )
+            _vm_ws = (config_override.get("workspace") or {}).get("vm") or {}
+            try:
+                _vm_cpu = int(_vm_ws.get("cpu_cores") or 8)
+            except (TypeError, ValueError):
+                _vm_cpu = 8
+            _vm_mem = str(_vm_ws.get("memory") or "16Gi")
+            _vm_agent_config = request_body.config_name or user_settings.get(
+                "config_name", "persistent_defaults"
+            )
+
+            async def _provision_thread_vm(
+                tid: str, cpu: int, mem: str, cfg: str
+            ) -> None:
+                try:
+                    ok = await vm_provisioner.create_thread_vm(
+                        thread_id=tid,
+                        agent_config=cfg,
+                        cpu_cores=cpu,
+                        memory=mem,
+                    )
+                except Exception:
+                    logger.exception("Thread %s: VM provisioning request raised", tid)
+                    ok = False
+                if not ok:
+                    # No NATS/HTTP/k8s route accepted the request — record the
+                    # failure so the attach poll stops waiting and the cockpit
+                    # surfaces it (metadata.vm.status='failed' → _poll_workspace_ready
+                    # bail → session-ready timeout with the VM error).
+                    logger.error(
+                        "Thread %s: VM provisioning request was not accepted; "
+                        "marking vm failed.",
+                        tid,
+                    )
+                    await postgres_db.merge_thread_vm_context(tid, {"status": "failed"})
+
+            asyncio.create_task(
+                _provision_thread_vm(thread_id, _vm_cpu, _vm_mem, _vm_agent_config)
             )
         elif use_k8s:
             # Signal that workspace provisioning is starting so the agent
