@@ -1,6 +1,6 @@
 # Cooldown-aware pause: wait out a short quota cooldown instead of failing the job
 
-Status: **IMPLEMENTED — unit-tested + lint-clean, uncommitted on `develop`; k3d E2E pending. All design decisions RESOLVED 2026-07-15.**
+Status: **IMPLEMENTED — unit-tested + lint-clean, code + Helm exposure committed on `develop` (unpushed; SHAs churn pre-push); k3d E2E pending. All design decisions RESOLVED 2026-07-15.**
 Date: 2026-07-07 (reset-anchor resolved 2026-07-10; cutoff / fallback / deadline resolved 2026-07-15; implemented 2026-07-15)
 Scope: worker/loop jobs (the LangGraph worker in `src/graph.py`). Extends
 `[[llm_outage_pause_and_backoff_redispatch]]` — reuses its Tier-2 pause →
@@ -372,7 +372,7 @@ pods follow. Verified via `helm template` (both surfaces render the key) + `helm
 
 ## Implementation notes (2026-07-15)
 
-Built on `develop`, uncommitted. Files touched:
+Code + the Helm exposure (below) committed on `develop` (unpushed). Files touched:
 
 - **`src/graph.py`** — `_COOLDOWN_MAX_PAUSE_SECONDS` (reads `LLM_OUTAGE_CEILING_SECONDS`,
   default 43200, garbage-guarded) + pure `_cooldown_within_pause_budget(reset_s)`;
