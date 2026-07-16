@@ -22,6 +22,7 @@ from orchestrator.services.completion import (  # noqa: E402
     LLM_OUTAGE_CEILING_SECONDS,
     LLM_OUTAGE_MAX_ATTEMPTS,
     LLM_OUTAGE_RESET_WINDOW_SECONDS,
+    MEMORY_RETRY_CAP,
     determine_job_status,
     evaluate_llm_outage,
     llm_outage_backoff_seconds,
@@ -284,6 +285,116 @@ class TestDetermineJobStatusLlmUnavailable:
         # should_stop False -> job keeps running, no pause.
         status, err = determine_job_status(_llm_job({}), {"should_stop": False})
         assert status is None
+
+
+# =============================================================================
+# Subjob outage routing — scholar/critic/delegate subjobs pause like top-level
+# (docs/features/llm_outage_subjob_resilience.md)
+# =============================================================================
+
+
+def _subjob_llm_job(context):
+    job = _llm_job(context)
+    job["parent_job_id"] = "par-1"
+    return job
+
+
+class TestDetermineJobStatusSubjobOutage:
+    """Outage freezes on subjobs route through the shared type-specific
+    branches (row-scoped caps/ceilings) instead of the pending_review
+    fallback — guarded by the parent-terminal cascade rule, exactly like the
+    version_upgrade subjob precedent."""
+
+    def test_subjob_fresh_outage_pauses(self):
+        status, err = determine_job_status(
+            _subjob_llm_job({}), STOP, parent_status="waiting"
+        )
+        assert (status, err) == ("paused", None)
+
+    def test_subjob_outage_under_ceiling_pauses(self):
+        job = _subjob_llm_job(_real_outage_ctx(5, 3600, 60))
+        status, err = determine_job_status(job, STOP, parent_status="waiting")
+        assert status == "paused"
+
+    def test_subjob_reviewing_parent_is_not_terminal(self):
+        # A critic's parent sits in 'reviewing' while the critic runs — that
+        # must count as a live parent, not a terminal one.
+        status, err = determine_job_status(
+            _subjob_llm_job({}), STOP, parent_status="reviewing"
+        )
+        assert status == "paused"
+
+    def test_subjob_outage_parent_failed_resolves_cancelled(self):
+        # A paused subjob under a failed parent is a silent cascade-guard
+        # wedge — resolve terminally instead (version_upgrade precedent).
+        status, err = determine_job_status(
+            _subjob_llm_job({}), STOP, parent_status="failed"
+        )
+        assert (status, err) == ("cancelled", None)
+
+    def test_subjob_outage_parent_cancelled_resolves_cancelled(self):
+        status, err = determine_job_status(
+            _subjob_llm_job({}), STOP, parent_status="cancelled"
+        )
+        assert (status, err) == ("cancelled", None)
+
+    def test_subjob_over_ceiling_fails_loudly(self):
+        # The 12h duration ceiling lives on the SUBJOB's own row and applies
+        # unchanged — an over-budget subjob outage fails, never parks.
+        job = _subjob_llm_job(_real_outage_ctx(8, LLM_OUTAGE_CEILING_SECONDS + 3600, 60))
+        status, err = determine_job_status(job, STOP, parent_status="waiting")
+        assert status == "failed"
+        assert err is not None and "unavailable" in err.lower()
+
+    def test_subjob_attempts_backstop_fails(self):
+        job = _subjob_llm_job(_real_outage_ctx(LLM_OUTAGE_MAX_ATTEMPTS, 3600, 60))
+        status, err = determine_job_status(job, STOP, parent_status="waiting")
+        assert status == "failed"
+        assert "attempts" in err.lower()
+
+    def test_subjob_memory_unavailable_pauses_under_cap(self):
+        job = _subjob_llm_job({})
+        job["freeze_data"] = {"freeze_type": "memory_unavailable", "reason": "x"}
+        status, err = determine_job_status(job, STOP, parent_status="waiting")
+        assert (status, err) == ("paused", None)
+
+    def test_subjob_memory_unavailable_over_cap_fails(self):
+        job = _subjob_llm_job({"memory_retry_count": MEMORY_RETRY_CAP})
+        job["freeze_data"] = {"freeze_type": "memory_unavailable", "reason": "x"}
+        status, err = determine_job_status(job, STOP, parent_status="waiting")
+        assert status == "failed"
+
+    def test_subjob_outage_with_coincident_error_still_pauses(self):
+        # The redispatchable carve-out must admit a subjob outage freeze when
+        # the parent is live — a teardown blip riding the freeze report must
+        # not hard-fail the pause (docs/features/llm_outage_subjob_resilience.md).
+        result = {"should_stop": True, "error": {"message": "SSH teardown blip"}}
+        status, err = determine_job_status(
+            _subjob_llm_job({}), result, parent_status="waiting"
+        )
+        assert (status, err) == ("paused", None)
+
+    def test_subjob_outage_with_coincident_error_parent_terminal_fails(self):
+        # Dead parent → no carve-out; the error fails the subjob as before.
+        result = {"should_stop": True, "error": {"message": "boom"}}
+        status, err = determine_job_status(
+            _subjob_llm_job({}), result, parent_status="failed"
+        )
+        assert status == "failed"
+
+    def test_subjob_without_freeze_keeps_pending_review_fallback(self):
+        job = _subjob_llm_job({})
+        job["freeze_data"] = {}
+        status, err = determine_job_status(job, STOP, parent_status="waiting")
+        assert status == "pending_review"
+
+    def test_subjob_goal_achieved_without_freeze_completes(self):
+        job = _subjob_llm_job({})
+        job["freeze_data"] = {}
+        status, err = determine_job_status(
+            job, {"should_stop": True, "goal_achieved": True}, parent_status="waiting"
+        )
+        assert status == "completed"
 
 
 # =============================================================================

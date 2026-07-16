@@ -569,9 +569,12 @@ class TestVersionUpgradeFreeze:
         )
         assert status == "failed"
 
-    def test_critic_subjob_error_still_fails(self):
-        # Critic subjobs (parent_job_id set) keep failing on error — the guard is
-        # scoped to top-level jobs, so critic routing is unchanged.
+    def test_subjob_drain_freeze_with_live_parent_pauses_despite_error(self):
+        # A drain/outage freeze on a subjob rides the coincident-error
+        # carve-out when the parent is live — the freeze branch owns the
+        # decision (paused), matching top-level. Historically subjobs kept
+        # failing on error; superseded by the subjob-redispatch routing.
+        # docs/features/llm_outage_subjob_resilience.md
         from orchestrator.services.completion import determine_job_status
 
         job = {
@@ -580,7 +583,26 @@ class TestVersionUpgradeFreeze:
             "freeze_data": {"freeze_type": "version_upgrade"},
         }
         status, _ = determine_job_status(
-            job, {"should_stop": True, "error": {"message": "boom"}}
+            job,
+            {"should_stop": True, "error": {"message": "boom"}},
+            parent_status="waiting",
+        )
+        assert status == "paused"
+
+    def test_subjob_error_with_terminal_parent_still_fails(self):
+        # Dead parent → the pause could never resume (cascade guard) — the
+        # coincident error fails the subjob exactly as before.
+        from orchestrator.services.completion import determine_job_status
+
+        job = {
+            "id": "c1",
+            "parent_job_id": "p1",
+            "freeze_data": {"freeze_type": "version_upgrade"},
+        }
+        status, _ = determine_job_status(
+            job,
+            {"should_stop": True, "error": {"message": "boom"}},
+            parent_status="failed",
         )
         assert status == "failed"
 
