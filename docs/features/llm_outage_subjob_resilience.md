@@ -132,8 +132,10 @@ can't even E2E):
 
 - **P0.1** resumed delegation parents may be dispatcher-invisible (`freeze_data`
   never cleared on `waiting → paused` requeue vs. `get_dispatchable_jobs`'s
-  `freeze_data IS NULL` contract) — suspected live bug, unverified.
-- **P0.2** the re-suspend freeze drops the `timeout` key (silently resets to 7200s).
+  `freeze_data IS NULL` contract) — **CONFIRMED live on real PG and FIXED on
+  develop 2026-07-16** (claim clears freeze; unblock handler re-queues via the CAS).
+- **P0.2** the re-suspend freeze drops the `timeout` key (silently resets to
+  7200s) — **FIXED 2026-07-16** (explicit `timeout` on the resume tool, capped).
 
 ### Core routing (shared by all kinds)
 
