@@ -369,13 +369,13 @@ pods follow. Verified via `helm template` (both surfaces render the key) + `helm
   feature makes fallback the first response to a cooldown and this pause path the
   last resort (all candidate models cold). Nothing here is wasted — the pause
   substrate is what fallback falls back *to*.
-- **Extended by** `[[llm_outage_subjob_resilience]]` *if/when built*: this feature
-  covers **top-level jobs only** — subjobs (scholar/critic/`spawn_subagent`
-  delegates) still divert a cooldown freeze to `pending_review` (the agent emits it,
-  but `determine_job_status`'s subjob short-circuit routes it there). k3d-observed:
-  the E2E scholar subjob went `pending_review` with `classification=cooldown`. That
-  doc wires subjobs into this pause path (the engine reuses; the work is making the
-  delegation timeout + verification sweeper not reap a paused subjob).
+- **Extended by** `[[llm_outage_subjob_resilience]]` — **IMPLEMENTED + k3d E2E
+  VERIFIED 2026-07-16**: subjobs (scholar/critic/`delegate_work` delegates) now
+  pause+resume through this same engine instead of diverting to
+  `pending_review`. That feature made the delegation timeout, the verification
+  staleness reap, the sweep-fail path, and the inherit wait budget
+  pause-aware; per-subjob counters were already row-scoped. See its
+  Implementation notes for the live scenario results.
 
 ## Implementation notes (2026-07-15)
 
