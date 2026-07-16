@@ -53,8 +53,6 @@ import {
 import {ToolCardView} from '../../core/models/tool-card.model';
 import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
-import {ModelService} from '../../core/services/model.service';
-import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../../core/services/chat-preferences.service';
@@ -640,7 +638,8 @@ export function clearDraft(threadId: string | null): void {
                 <app-icon size="sm">more_vert</app-icon>
               </app-icon-button>
               <app-menu #headerMenu>
-                <app-menu-item (activated)="showSettings.update(v => !v)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
+                <app-menu-item (activated)="settingsRequested.emit(undefined)">{{ 'chat.header.settingsTooltip' | transloco }}</app-menu-item>
+                <app-menu-item (activated)="showViewMenu.update(v => !v)">{{ 'chat.header.viewMenuTooltip' | transloco }}</app-menu-item>
                 @if (chat.citationsByCid().size > 0) {
                   <app-menu-item (activated)="showCitations.update(v => !v)">{{ 'chat.header.citationsButton' | transloco }}</app-menu-item>
                 }
@@ -659,9 +658,14 @@ export function clearDraft(threadId: string | null): void {
                 }
               </app-menu>
             } @else {
-              <button class="settings-btn" (click)="showSettings.update(v => !v)"
-                      [class.active]="showSettings()" [title]="'chat.header.settingsTooltip' | transloco">
+              <button class="settings-btn" (click)="settingsRequested.emit(undefined)"
+                      [title]="'chat.header.settingsTooltip' | transloco">
                 <app-icon size="sm" class="settings-icon">tune</app-icon>
+              </button>
+
+              <button class="settings-btn" (click)="showViewMenu.update(v => !v)"
+                      [class.active]="showViewMenu()" [title]="'chat.header.viewMenuTooltip' | transloco">
+                <app-icon size="sm" class="settings-icon">visibility</app-icon>
               </button>
 
               @if (chat.citationsByCid().size > 0) {
@@ -708,10 +712,16 @@ export function clearDraft(threadId: string | null): void {
       @if (chat.isConnected()) {
         <div class="status-bar">
           @if (chat.modelName()) {
-            <app-badge tone="accent" size="sm">{{ chat.modelName() }}</app-badge>
+            <app-badge tone="accent" size="sm" role="button" tabindex="0"
+                       [title]="'chat.header.settingsTooltip' | transloco"
+                       (click)="settingsRequested.emit('model')"
+                       (keydown.enter)="settingsRequested.emit('model')">{{ chat.modelName() }}</app-badge>
           }
           @if (chat.temperature()) {
-            <app-badge tone="neutral" size="sm">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</app-badge>
+            <app-badge tone="neutral" size="sm" role="button" tabindex="0"
+                       [title]="'chat.header.settingsTooltip' | transloco"
+                       (click)="settingsRequested.emit('model')"
+                       (keydown.enter)="settingsRequested.emit('model')">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</app-badge>
           }
           <app-badge tone="neutral" size="sm">{{ 'chat.status.turn' | transloco:{ count: chat.turnCount() } }}</app-badge>
           @if (chat.agentSilenceSeconds() >= 30 && !chat.compaction()) {
@@ -727,33 +737,19 @@ export function clearDraft(threadId: string | null): void {
               {{ 'chat.status.cloudChanges' | transloco:{ count: chat.cloudChangesCount() } }}
             </app-badge>
           }
-          <app-badge tone="accent" size="sm">{{ chat.permissionMode() | titlecase }}</app-badge>
+          <app-badge tone="accent" size="sm" role="button" tabindex="0"
+                     [title]="'chat.header.settingsTooltip' | transloco"
+                     (click)="settingsRequested.emit(undefined)"
+                     (keydown.enter)="settingsRequested.emit(undefined)">{{ chat.permissionMode() | titlecase }}</app-badge>
         </div>
       }
 
-      <!-- Settings panel -->
-      @if (showSettings()) {
+      <!-- View menu: device-local display prefs (chatPrefs/localStorage).
+           Session config (model, temperature, mode, tools, …) lives in the
+           settings pane opened via settingsRequested — the old live rows
+           were retired with it (live_session_settings.md, Slice A). -->
+      @if (showViewMenu()) {
         <div class="settings-panel">
-          <div class="settings-row">
-            <label class="settings-label">{{ 'chat.settings.mode' | transloco }}</label>
-            <app-select size="sm" [fullWidth]="false"
-                        [value]="chat.permissionMode()"
-                        (changed)="onPermissionModeChange($event)">
-              <option value="supervised">{{ 'chat.settings.modeSupervised' | transloco }}</option>
-              <option value="auto_accept" [disabled]="!capabilities.allowsPermissionMode('auto_accept')">{{ 'chat.settings.modeAutoAccept' | transloco }}</option>
-              <option value="autonomous" [disabled]="!capabilities.allowsPermissionMode('autonomous')">{{ 'chat.settings.modeAutonomous' | transloco }}</option>
-            </app-select>
-          </div>
-          <div class="settings-row">
-            <label class="settings-label">{{ 'chat.settings.narration' | transloco }}</label>
-            <app-select size="sm" [fullWidth]="false"
-                        [value]="chat.narrationMode()"
-                        (changed)="onNarrationModeSelect($event)">
-              <option value="auto">{{ 'chat.settings.narrationAuto' | transloco }}</option>
-              <option value="verbose">{{ 'chat.settings.narrationVerbose' | transloco }}</option>
-              <option value="silent">{{ 'chat.settings.narrationSilent' | transloco }}</option>
-            </app-select>
-          </div>
           <div class="settings-row">
             <label class="settings-label">{{ 'chat.settings.reasoning' | transloco }}</label>
             <app-select size="sm" [fullWidth]="false"
@@ -771,29 +767,6 @@ export function clearDraft(threadId: string | null): void {
               <option value="expanded">{{ 'chat.settings.toolCallsExpanded' | transloco }}</option>
               <option value="collapsed">{{ 'chat.settings.toolCallsCollapsed' | transloco }}</option>
             </app-select>
-          </div>
-          <div class="settings-row">
-            <label class="settings-label">{{ 'chat.settings.model' | transloco }}</label>
-            <app-select size="sm" [fullWidth]="false"
-                        [value]="chat.modelName()"
-                        (changed)="onModelSelect($event)">
-              @if (chat.modelName() && !hasModelInList(chat.modelName()!)) {
-                <option [value]="chat.modelName()">{{ chat.modelName() }}</option>
-              }
-              @for (group of modelService.models(); track group.group) {
-                <optgroup [label]="group.group">
-                  @for (model of group.models; track model) {
-                    <option [value]="model">{{ model }}</option>
-                  }
-                </optgroup>
-              }
-            </app-select>
-          </div>
-          <div class="settings-row">
-            <label class="settings-label">{{ 'chat.settings.temperature' | transloco:{ value: chat.temperature() } }}</label>
-            <input type="range" class="settings-slider" min="0" max="2" step="0.1"
-                   [ngModel]="chat.temperature()"
-                   (ngModelChange)="onTemperatureChange($event)">
           </div>
           <div class="settings-row">
             <label class="settings-label">{{ 'chat.settings.readingWidth' | transloco }}</label>
@@ -1719,10 +1692,12 @@ export function clearDraft(threadId: string | null): void {
 })
 export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDestroy {
     readonly canvasRequested = output<void>();
+    /** Open the session settings pane (host chat-page owns it). The optional
+     *  payload names a section to focus — 'model' from the model/temp chips. */
+    readonly settingsRequested = output<string | undefined>();
     readonly chat = inject(PersistentChatService);
     readonly viewport = inject(ViewportService);
     private readonly api = inject(ApiService);
-    readonly modelService = inject(ModelService);
     private readonly transloco = inject(TranslocoService);
     private readonly i18n = inject(I18nService);
     private readonly http = inject(HttpClient);
@@ -1734,7 +1709,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly chatWidthValue = computed(() => readingWidthToCss(this.chatPrefs.readingWidth()));
     readonly chatTextSizeValue = computed(() => textSizeToCss(this.chatPrefs.textSize()));
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
-    readonly capabilities = inject(CapabilitiesService);
     readonly voiceCaps = inject(VoiceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
@@ -1819,7 +1793,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     inputText = '';
 
     // Settings panel
-    readonly showSettings = signal(false);
+    readonly showViewMenu = signal(false);
     readonly showCitations = signal(false);
 
     // Resume state
@@ -2065,9 +2039,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 this.compactionTimer = null;
             }
         });
-
-        // Load available models eagerly so the dropdown is ready
-        this.modelService.load();
 
         // Load empty-state suggestions and pick 4 at random for this mount
         this.http.get<Suggestion[]>('assets/suggestions.json').subscribe({
@@ -2861,18 +2832,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.chat.setMode('auto_accept');
     }
 
-    onPermissionModeChange(value: string | null): void {
-        if (value === 'supervised' || value === 'auto_accept' || value === 'autonomous') {
-            this.chat.setMode(value);
-        }
-    }
-
-    onNarrationModeSelect(value: string | null): void {
-        if (value === 'silent' || value === 'verbose' || value === 'auto') {
-            this.chat.setNarrationMode(value);
-        }
-    }
-
     /** Display-only: whether reasoning ("thinking") blocks open expanded by default. */
     onReasoningDefaultChange(value: string | null): void {
         if (value === 'expanded' || value === 'collapsed') {
@@ -2899,22 +2858,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (value === 'small' || value === 'medium' || value === 'large') {
             this.chatPrefs.setTextSize(value);
         }
-    }
-
-    onModelSelect(model: string | null): void {
-        if (model) {
-            this.chat.modelName.set(model);
-            this.chat.updateConfig({llm: {model}});
-        }
-    }
-
-    onTemperatureChange(temperature: number): void {
-        this.chat.temperature.set(temperature);
-        this.chat.updateConfig({llm: {temperature}});
-    }
-
-    hasModelInList(model: string): boolean {
-        return this.modelService.models().some(g => g.models.includes(model));
     }
 
     openIde(url: string): void {

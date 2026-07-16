@@ -63,7 +63,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
                 <option [value]="pm.value">{{ 'agentSettings.permissionModes.' + pm.value + '.label' | transloco }}</option>
               }
             </select>
-            @if (permissionMode() !== null) {
+            @if (permissionMode() !== null && mode() !== 'live') {
               <button type="button" class="reset-btn" (click)="permissionMode.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
                 <app-icon size="xs">close</app-icon>
               </button>
@@ -73,28 +73,50 @@ import type {GrantCatalog} from '../../core/models/api.model';
         </div>
       }
 
-      <!-- Image quality (applies to both jobs and sessions) -->
-      <div class="field-row" [class.modified]="imageQuality() !== null">
-        <label class="field-label">{{ 'agentSettings.execution.imageQuality' | transloco }}</label>
-        <div class="field-control">
-          <select
-            class="form-input"
-            [ngModel]="imageQuality() ?? resolvedImageQuality()"
-            (ngModelChange)="onImageQualityChange($event)"
-            [disabled]="disabled()"
-          >
-            @for (q of imageQualityTiers; track q.value) {
-              <option [value]="q.value">{{ 'agentSettings.imageQuality.' + q.value + '.label' | transloco }}</option>
-            }
-          </select>
-          @if (imageQuality() !== null) {
-            <button type="button" class="reset-btn" (click)="imageQuality.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
-              <app-icon size="xs">close</app-icon>
-            </button>
-          }
+      <!-- Narration mode (live sessions only — a runtime chat concept, not a
+           creation-form field; applied via the dedicated narration.set verb) -->
+      @if (mode() === 'live') {
+        <div class="field-row" [class.modified]="narrationMode() !== null">
+          <label class="field-label">{{ 'agentSettings.execution.narration' | transloco }}</label>
+          <div class="field-control">
+            <select
+              class="form-input"
+              [ngModel]="narrationMode() ?? resolvedNarrationMode()"
+              (ngModelChange)="onNarrationModeChange($event)"
+              [disabled]="disabled()"
+            >
+              @for (nm of narrationModes; track nm.value) {
+                <option [value]="nm.value">{{ 'agentSettings.narrationModes.' + nm.value | transloco }}</option>
+              }
+            </select>
+          </div>
         </div>
-        <span class="field-hint">{{ effectiveImageQualityDesc() }}</span>
-      </div>
+      }
+
+      <!-- Image quality (jobs + session creation; not in the live honored set) -->
+      @if (mode() !== 'live') {
+        <div class="field-row" [class.modified]="imageQuality() !== null">
+          <label class="field-label">{{ 'agentSettings.execution.imageQuality' | transloco }}</label>
+          <div class="field-control">
+            <select
+              class="form-input"
+              [ngModel]="imageQuality() ?? resolvedImageQuality()"
+              (ngModelChange)="onImageQualityChange($event)"
+              [disabled]="disabled()"
+            >
+              @for (q of imageQualityTiers; track q.value) {
+                <option [value]="q.value">{{ 'agentSettings.imageQuality.' + q.value + '.label' | transloco }}</option>
+              }
+            </select>
+            @if (imageQuality() !== null) {
+              <button type="button" class="reset-btn" (click)="imageQuality.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
+                <app-icon size="xs">close</app-icon>
+              </button>
+            }
+          </div>
+          <span class="field-hint">{{ effectiveImageQualityDesc() }}</span>
+        </div>
+      }
 
       <!-- Scholar toggle -->
       @if (mode() === 'job') {
@@ -317,9 +339,16 @@ export class ExecutionGroupComponent {
     return this.permissionModes.filter((p) => allowed.has(p.value) || p.value === current);
   });
 
+  readonly narrationModes = [
+    {value: 'auto'},
+    {value: 'verbose'},
+    {value: 'silent'},
+  ] as const;
+
   // User overrides (null = use default)
   readonly autonomy = signal<string | null>(null);
   readonly permissionMode = signal<string | null>(null);
+  readonly narrationMode = signal<string | null>(null);
   readonly scholar = signal<boolean | null>(null);
   readonly critic = signal<boolean | null>(null);
   readonly criticRounds = signal<number | null>(null);
@@ -332,6 +361,9 @@ export class ExecutionGroupComponent {
   );
   readonly resolvedPermissionMode = computed(() =>
     (readConfigPath(this.config(), 'interactive.permission_mode') as string) ?? 'supervised'
+  );
+  readonly resolvedNarrationMode = computed(() =>
+    (readConfigPath(this.config(), 'interactive.narration_mode') as string) ?? 'auto'
   );
   readonly resolvedScholar = computed(() =>
     (readConfigPath(this.config(), 'scholar.enabled') as boolean) ?? true
@@ -382,6 +414,7 @@ export class ExecutionGroupComponent {
     let count = 0;
     if (this.autonomy() !== null) count++;
     if (this.permissionMode() !== null) count++;
+    if (this.narrationMode() !== null) count++;
     if (this.scholar() !== null) count++;
     if (this.critic() !== null) count++;
     if (this.criticRounds() !== null) count++;
@@ -397,6 +430,11 @@ export class ExecutionGroupComponent {
 
   onPermissionModeChange(value: string): void {
     this.permissionMode.set(value === this.resolvedPermissionMode() ? null : value);
+    this.change.emit();
+  }
+
+  onNarrationModeChange(value: string): void {
+    this.narrationMode.set(value === this.resolvedNarrationMode() ? null : value);
     this.change.emit();
   }
 
@@ -453,9 +491,10 @@ export class ExecutionGroupComponent {
       const pm = this.projectMemory();
       if (pm !== null) o['memory'] = { project_scoped: pm };
     } else {
-      if (this.permissionMode() !== null) {
-        o['interactive'] = { permission_mode: this.permissionMode() };
-      }
+      const interactive: Record<string, unknown> = {};
+      if (this.permissionMode() !== null) interactive['permission_mode'] = this.permissionMode();
+      if (this.narrationMode() !== null) interactive['narration_mode'] = this.narrationMode();
+      if (Object.keys(interactive).length > 0) o['interactive'] = interactive;
     }
 
     // Image quality is a top-level knob honored by both worker and persistent
@@ -469,6 +508,7 @@ export class ExecutionGroupComponent {
   resetAll(): void {
     this.autonomy.set(null);
     this.permissionMode.set(null);
+    this.narrationMode.set(null);
     this.scholar.set(null);
     this.critic.set(null);
     this.criticRounds.set(null);

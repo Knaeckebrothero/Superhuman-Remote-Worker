@@ -39,17 +39,19 @@ class TestDatasourceToolCategories:
         assert cats["mongodb"] == []
         assert cats["webdav"] == []
 
-    def test_read_write_managed_connector_is_cli_mode(self):
-        """RW postgresql/neo4j/mongodb → no bound tools (CLI-mode policy,
-        kept as the reconciled behavior; its remote-backend deadness is
-        docs/issues/datasource_cli_mode_dead_on_remote.md)."""
-        for ds_type, category in (
-            ("postgresql", "sql"),
-            ("neo4j", "graph"),
-            ("mongodb", "mongodb"),
+    def test_read_write_managed_connector_gets_write_tools(self):
+        """RW postgresql/neo4j/mongodb → connection-backed write tools.
+        Previously ``[]`` ("CLI mode"), which was dead on remote backends
+        and left RW datasources with no access path at all
+        (docs/issues/datasource_cli_mode_dead_on_remote.md, direction 1)."""
+        for ds_type, category, write_tool in (
+            ("postgresql", "sql", "sql_execute"),
+            ("neo4j", "graph", "cypher_execute"),
+            ("mongodb", "mongodb", "mongo_insert"),
         ):
             cats = datasource_tool_categories([_ds(ds_type, read_only=False)])
-            assert cats[category] == [], ds_type
+            assert cats[category] == DATASOURCE_TOOL_MAP[ds_type]["write"], ds_type
+            assert write_tool in cats[category], ds_type
 
     def test_read_write_webdav_gets_write_tools(self):
         cats = datasource_tool_categories([_ds("webdav", read_only=False)])
@@ -58,7 +60,7 @@ class TestDatasourceToolCategories:
 
     def test_mixed_same_type_any_read_write_wins(self):
         """Multiple datasources of one type: ALL must be read-only for read
-        tools; a single RW one flips the type to the RW branch (the old
+        tools; a single RW one flips the type to write tools (the old
         agent-side copy keyed off the FIRST entry only)."""
         cats = datasource_tool_categories(
             [
@@ -66,7 +68,7 @@ class TestDatasourceToolCategories:
                 _ds("postgresql", read_only=False, name="b"),
             ]
         )
-        assert cats["sql"] == []
+        assert cats["sql"] == DATASOURCE_TOOL_MAP["postgresql"]["write"]
 
         cats = datasource_tool_categories(
             [
@@ -183,3 +185,105 @@ class TestApplyDatasourceEnrichmentToResolved:
         resolved = {"agent": {"agent_id": "a", "tools": {}}}
         _apply_datasource_enrichment_to_resolved(resolved, {"sql": []}, [])
         assert "_cli_datasources" not in resolved["agent"]
+
+
+class TestProcessDatasourcesConnectionRouting:
+    """Read-write managed connectors get real connections now — the CLI-mode
+    routing (env injection, no connection) is retired
+    (docs/issues/datasource_cli_mode_dead_on_remote.md, direction 1)."""
+
+    @pytest.fixture
+    def spies(self, monkeypatch):
+        """Spy on connection creation + the retired CLI injectors."""
+        import src.core.datasource_setup as mod
+        from unittest.mock import MagicMock
+
+        created = []
+
+        def _fake_create(ds):
+            conn = MagicMock(name=f"conn-{ds['name']}")
+            conn.ds_name = ds["name"]
+            created.append(ds)
+            return conn, None
+
+        monkeypatch.setattr(mod, "create_datasource_connection", _fake_create)
+        cli_spies = {}
+        for fn in (
+            "inject_postgresql_services",
+            "inject_mongodb_env_vars",
+            "inject_neo4j_env_vars",
+        ):
+            spy = MagicMock(name=fn)
+            monkeypatch.setattr(mod, fn, spy)
+            cli_spies[fn] = spy
+        return created, cli_spies
+
+    def test_read_write_connector_gets_connection_not_cli(self, spies):
+        from src.core.datasource_setup import process_datasources
+
+        created, cli_spies = spies
+        connections, clients, cli_types = process_datasources(
+            [_ds("postgresql", read_only=False, name="rw-db")]
+        )
+
+        assert "postgresql" in connections
+        assert [ds["name"] for ds in created] == ["rw-db"]
+        assert cli_types == []
+        for fn, spy in cli_spies.items():
+            spy.assert_not_called()
+
+    def test_read_only_connector_unchanged(self, spies):
+        from src.core.datasource_setup import process_datasources
+
+        created, _ = spies
+        connections, clients, cli_types = process_datasources(
+            [_ds("neo4j", read_only=True, name="ro-graph")]
+        )
+        assert "neo4j" in connections
+        assert cli_types == []
+
+    def test_mixed_same_type_read_write_connection_wins_registry(self, spies):
+        """The registry is TYPE-keyed last-one-wins, and the category map
+        grants write tools when ANY of a type is RW — so the RW connection
+        must win the slot regardless of input order (write tools must never
+        bind to the read-only-linked connection)."""
+        from src.core.datasource_setup import process_datasources
+
+        for order in (["rw", "ro"], ["ro", "rw"]):
+            connections, _, _ = process_datasources(
+                [
+                    _ds("postgresql", read_only=(label == "ro"), name=label)
+                    for label in order
+                ]
+            )
+            assert connections["postgresql"].ds_name == "rw", order
+
+
+class TestDatasourceIndexNotes:
+    """datasources.md must describe working access paths — the RW CLI usage
+    lines (PGSERVICE/cypher-shell/mongosh) advertised a dead path."""
+
+    def _render_index(self, ds_configs):
+        from src.core.datasource_setup import inject_datasource_index
+        from unittest.mock import MagicMock
+
+        ws = MagicMock()
+        ws.read_file.side_effect = FileNotFoundError
+        written = {}
+        ws.write_file.side_effect = lambda path, content: written.update(
+            {path: content}
+        )
+        inject_datasource_index(ds_configs, ws)
+        return written.get("datasources.md", "")
+
+    def test_read_write_database_entry_describes_tools_not_cli(self):
+        content = self._render_index(
+            [_ds("postgresql", read_only=False, name="Sales DB")]
+        )
+        assert "**Sales DB** (postgresql, read-write) — query + write tools" in content
+        for dead_hint in ("PGSERVICE", "psql", "cypher-shell", "mongosh"):
+            assert dead_hint not in content
+
+    def test_read_only_database_entry_unchanged(self):
+        content = self._render_index([_ds("neo4j", read_only=True, name="KG")])
+        assert "**KG** (neo4j, read-only) — query tools" in content

@@ -154,11 +154,29 @@ const STORAGE_KEYS = {
                 </optgroup>
               }
             </select>
-            @if (sessionModel() !== null) {
+            @if (sessionModel() !== null && mode() !== 'live') {
               <button type="button" class="reset-btn" (click)="onSessionModelChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco"><app-icon size="xs">close</app-icon></button>
             }
           </div>
         </div>
+
+        <!-- Live sessions: temperature (creation forms leave it to Advanced /
+             the family matrix; live mode surfaces it because it has always
+             been runtime-mutable and the retired header popover exposed it) -->
+        @if (mode() === 'live') {
+          <div class="field-row" [class.modified]="temperature() !== null">
+            <label class="field-label">
+              {{ 'agentSettings.model.temperature' | transloco }}
+              <span class="temp-value">{{ temperature() ?? resolvedTemperature() }}</span>
+            </label>
+            <div class="field-control">
+              <input type="range" class="form-input temp-slider" min="0" max="2" step="0.1"
+                     [ngModel]="temperature() ?? resolvedTemperature()"
+                     (ngModelChange)="onTemperatureChange($event)"
+                     [disabled]="disabled()">
+            </div>
+          </div>
+        }
 
         <!-- Session: reasoning level for the model in effect (options are
              capability-driven per family; the value rides llm.reasoning_level).
@@ -183,7 +201,7 @@ const STORAGE_KEYS = {
                   </option>
                 }
               </select>
-              @if (sessionReasoning() !== null) {
+              @if (sessionReasoning() !== null && mode() !== 'live') {
                 <button type="button" class="reset-btn" (click)="onSessionReasoningChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco"><app-icon size="xs">close</app-icon></button>
               }
             </div>
@@ -195,6 +213,15 @@ const STORAGE_KEYS = {
   styles: [`
     .settings-group {
       margin-bottom: 20px;
+    }
+    .temp-value {
+      font-weight: 400;
+      color: var(--text-muted);
+      margin-left: 6px;
+    }
+    .temp-slider {
+      padding: 0;
+      accent-color: var(--accent-color, var(--accent-color));
     }
     .group-label {
       font-size: 11px;
@@ -324,6 +351,9 @@ export class ModelGroupComponent {
   // Session mode: single model override
   readonly sessionModel = signal<string | null>(null);
 
+  // Live mode: temperature override (creation forms don't render this row)
+  readonly temperature = signal<number | null>(null);
+
   // Session mode: reasoning-level override for the model in effect. Owned here
   // (not in the Advanced accordion) so session mode has exactly one writer of
   // llm.reasoning_level; cleared on every model change so a level picked for
@@ -354,6 +384,9 @@ export class ModelGroupComponent {
   );
   readonly resolvedSessionModel = computed(() =>
     (readConfigPath(this.config(), 'llm.model') as string) ?? null
+  );
+  readonly resolvedTemperature = computed(() =>
+    (readConfigPath(this.config(), 'llm.temperature') as number) ?? 0.7
   );
   // The reasoning value in effect when the user picks nothing: a config-pinned
   // level (when the model's option set actually contains it) else the family
@@ -445,6 +478,7 @@ export class ModelGroupComponent {
     } else {
       if (this.sessionModel() !== null) count++;
       if (this.sessionReasoning() !== null) count++;
+      if (this.temperature() !== null) count++;
     }
     return count;
   });
@@ -488,6 +522,11 @@ export class ModelGroupComponent {
     this.change.emit();
   }
 
+  onTemperatureChange(value: number): void {
+    this.temperature.set(value === this.resolvedTemperature() ? null : value);
+    this.change.emit();
+  }
+
   /** Build the model-related config_override fragment. */
   getOverrides(): Record<string, unknown> {
     const llm: Record<string, unknown> = {};
@@ -504,6 +543,8 @@ export class ModelGroupComponent {
       if (m) llm['model'] = m;
       const r = this.sessionReasoning();
       if (r !== null) llm['reasoning_level'] = r;
+      const t = this.temperature();
+      if (t !== null) llm['temperature'] = t;
     }
 
     return Object.keys(llm).length > 0 ? { llm } : {};
@@ -515,6 +556,7 @@ export class ModelGroupComponent {
     this.subagentModel.set(null);
     this.sessionModel.set(null);
     this.sessionReasoning.set(null);
+    this.temperature.set(null);
   }
 
   /** Prefill from expert config (called by parent when expert changes).

@@ -2170,7 +2170,8 @@
       "critic": "Critic (Verifikation)",
       "projectMemory": "Projektgedächtnis",
       "imageQuality": "Bildqualität",
-      "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert"
+      "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert",
+      "narration": "Erzählmodus"
     },
     "autonomy": {
       "full": {
@@ -2305,7 +2306,17 @@
       "presetUnconfigured": "Mindestens einem Modell fehlt ein API-Schlüssel",
       "providerNoKey": "{{provider}} (kein API-Schlüssel)",
       "mismatchWindow": "Diese Modelle haben unterschiedliche Kontextfenster — sie teilen sich einen Verlauf und werden auf das kleinere begrenzt (~{{min}}).",
-      "mismatchMultimodal": "Eines dieser Modelle kann keine Bilder lesen — die Bildeingabe wird für beide Phasen deaktiviert."
+      "mismatchMultimodal": "Eines dieser Modelle kann keine Bilder lesen — die Bildeingabe wird für beide Phasen deaktiviert.",
+      "temperature": "Temperatur"
+    },
+    "narrationModes": {
+      "auto": "Auto",
+      "verbose": "Ausführlich",
+      "silent": "Still"
+    },
+    "live": {
+      "cacheNote": "Änderungen gelten ab der nächsten Antwort. Das Ändern von Tools, Datenquellen oder des Modells setzt den Prompt-Cache der Unterhaltung zurück — die nächste Antwort verarbeitet den gesamten Verlauf neu, was langsamer ist und für diesen Zug spürbar mehr kosten kann.",
+      "datasourcesReadOnly": "Datenquellen werden derzeit beim Erstellen der Session festgelegt — angehängte Quellen werden zur Referenz angezeigt."
     }
   },
   "agentList": {

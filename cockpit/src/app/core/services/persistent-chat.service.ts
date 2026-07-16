@@ -192,8 +192,36 @@ export interface SessionTask {
 }
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
-type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
+export type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
+
+/** Human-readable labels for the closed session tool groups (transcript stamps). */
+const TOOL_GROUP_LABELS: Record<string, string> = {
+    canvas: 'Canvas',
+    orchestrator: 'Fleet Management',
+    agent_catalog: 'Experts & Skills',
+    workflows: 'Automations & Loops',
+};
+
+/** Summarize a config.changed `applied` fragment for the transcript stamp.
+ *  Exported for tests. */
+export function describeAppliedConfig(applied: Record<string, unknown>): string[] {
+    const parts: string[] = [];
+    const llm = applied['llm'] as Record<string, unknown> | undefined;
+    if (llm?.['model']) parts.push(`model → ${llm['model']}`);
+    if (llm?.['temperature'] != null) parts.push(`temperature → ${llm['temperature']}`);
+    if (llm?.['reasoning_level']) parts.push(`reasoning → ${llm['reasoning_level']}`);
+    const tools = applied['tools'] as Record<string, unknown> | undefined;
+    for (const [group, value] of Object.entries(tools ?? {})) {
+        const label = TOOL_GROUP_LABELS[group] ?? group;
+        const enabled = Array.isArray(value) && value.length > 0;
+        parts.push(`${label} tools ${enabled ? 'enabled' : 'disabled'}`);
+    }
+    const interactive = applied['interactive'] as Record<string, unknown> | undefined;
+    if (interactive?.['permission_mode']) parts.push(`mode → ${interactive['permission_mode']}`);
+    if (interactive?.['narration_mode']) parts.push(`narration → ${interactive['narration_mode']}`);
+    return parts;
+}
 
 /**
  * Live token telemetry for the current turn, driven by per-LLM-call
@@ -535,6 +563,15 @@ export class PersistentChatService {
 
     // --- Narration state ---
     readonly narrationMode = signal<NarrationMode>('auto');
+
+    // --- Workspace tier state (live settings pane) ---
+    /** Current workspace tier when known. Initialized by the settings pane
+     *  from thread metadata (`config_override.workspace.backend`); flipped by
+     *  `workspace_upgrade.complete`. Null = not yet known. */
+    readonly workspaceTier = signal<string | null>(null);
+    /** In-flight tier upgrade (drives the pane's button/progress state);
+     *  `elapsed` updates from workspace_upgrade.progress heartbeats. */
+    readonly workspaceUpgradeInProgress = signal<{tier: string; elapsed?: number} | null>(null);
 
     // --- Turn tracking ---
     /**
@@ -2317,21 +2354,8 @@ export class PersistentChatService {
                 this._systemMessage('Undoing last file changes...');
                 return true;
             case '/upgrade-workspace': {
-                // Lite (virtual) -> sandbox|vm upgrade: provisions a real
-                // workspace, seeds it from the live object-store prefix, and
-                // hot-swaps in place so shell/git/file tools become available
-                // without dropping the conversation (workspace_tier_upgrade.md
-                // §4.2 S3 / Phase 2). `/upgrade-workspace vm` is the explicit
-                // human-intent trigger for the privileged tier — the server
-                // still gates it (can_use_vm + global kill-switch); sandbox is
-                // the default.
                 const tier = arg.trim().toLowerCase() === 'vm' ? 'vm' : 'sandbox';
-                this._sendControl({method: 'upgrade-to-workspace', target_tier: tier});
-                this._systemMessage(
-                    tier === 'vm'
-                        ? 'Provisioning a VM workspace (requires approval), please wait...'
-                        : 'Provisioning workspace, please wait...',
-                );
+                this.upgradeWorkspace(tier);
                 return true;
             }
             default:
@@ -2487,6 +2511,25 @@ export class PersistentChatService {
         const requestId = crypto.randomUUID();
         this._sendControl({method: 'config.update', config, request_id: requestId});
         return requestId;
+    }
+
+    /** Upgrade a lite (virtual) session to a real workspace tier.
+     *
+     * Provisions the workspace, seeds it from the live object-store prefix,
+     * and hot-swaps in place so shell/git/file tools become available without
+     * dropping the conversation (workspace_tier_upgrade.md §4.2 S3 /
+     * Phase 2). `vm` is the explicit human-intent trigger for the privileged
+     * tier — the server still gates it (can_use_vm + global kill-switch).
+     * Upgrade-only; progress and completion arrive via the
+     * `workspace_upgrade.*` frames (see `workspaceUpgradeInProgress`). */
+    upgradeWorkspace(tier: 'sandbox' | 'vm'): void {
+        this._sendControl({method: 'upgrade-to-workspace', target_tier: tier});
+        this.workspaceUpgradeInProgress.set({tier});
+        this._systemMessage(
+            tier === 'vm'
+                ? 'Provisioning a VM workspace (requires approval), please wait...'
+                : 'Provisioning workspace, please wait...',
+        );
     }
 
     /** Clear conversation history (local only). */
@@ -2750,7 +2793,7 @@ export class PersistentChatService {
                 this.narrationMode.set((params['mode'] as NarrationMode) || 'auto');
                 break;
 
-            case 'config.changed':
+            case 'config.changed': {
                 if (params['model']) {
                     this.modelName.set(params['model'] as string);
                 }
@@ -2760,7 +2803,18 @@ export class PersistentChatService {
                 if (params['permission_mode']) {
                     this.permissionMode.set(params['permission_mode'] as PermissionMode);
                 }
+                // Transcript stamp (live_session_settings.md, principle 5):
+                // the ack is broadcast + journaled, so every viewer — live or
+                // replaying — sees which config produced the next answers.
+                const applied = params['applied'] as Record<string, unknown> | undefined;
+                const stamp = applied ? describeAppliedConfig(applied) : [];
+                if (stamp.length) {
+                    this._systemMessage(
+                        `Session settings updated: ${stamp.join(' · ')} — applies from the next response.`,
+                    );
+                }
                 break;
+            }
 
             case 'title.updated':
                 if (params['title']) {
@@ -2950,23 +3004,25 @@ export class PersistentChatService {
 
             case 'workspace_upgrade.needed': {
                 // The agent called request_workspace_upgrade — offer the upgrade
-                // (HITL: a human accepts before anything provisions). The minimal
-                // accept path is the /upgrade-workspace slash command, which sends
-                // the same upgrade-to-workspace control message. Honor the offered
-                // tier (`vm` would need `/upgrade-workspace vm`); the tool only
-                // requests `sandbox` today.
+                // (HITL: a human accepts before anything provisions). The accept
+                // path is the Upgrade button in the session settings pane (or the
+                // /upgrade-workspace slash command); both send the same
+                // upgrade-to-workspace control message. Honor the offered tier;
+                // the tool only requests `sandbox` today.
                 const tier = (params['target_tier'] as string) || 'sandbox';
-                const accept = tier === 'vm' ? '/upgrade-workspace vm' : '/upgrade-workspace';
                 this._systemMessage(
                     `The agent requested a real workspace: `
                     + `${(params['reason'] as string) || 'shell/git tools needed'}. `
-                    + `Send ${accept} to provision a ${tier} `
+                    + `Upgrade to a ${tier} from the session settings `
                     + `(your files carry over).`,
                 );
                 break;
             }
 
             case 'workspace_upgrade.started':
+                this.workspaceUpgradeInProgress.update(
+                    p => p ?? {tier: (params['target_tier'] as string) || 'sandbox'},
+                );
                 this._systemMessage('Provisioning workspace, please wait...');
                 break;
 
@@ -2976,6 +3032,7 @@ export class PersistentChatService {
                 // The agent emits this ~once a minute while polling readiness.
                 const elapsed = params['elapsed_s'] as number | undefined;
                 const tier = (params['target_tier'] as string) || 'workspace';
+                this.workspaceUpgradeInProgress.set({tier, elapsed});
                 this._systemMessage(
                     typeof elapsed === 'number'
                         ? `Still provisioning the ${tier} workspace (${elapsed}s elapsed)…`
@@ -2990,6 +3047,8 @@ export class PersistentChatService {
                     ? ` ${seeded} file(s) carried over.`
                     : '';
                 const tier = (params['target_tier'] as string) || '';
+                if (tier) this.workspaceTier.set(tier);
+                this.workspaceUpgradeInProgress.set(null);
                 const sudoNote = tier === 'vm'
                     ? ' Running on a VM — sudo is now available.'
                     : '';
@@ -3001,6 +3060,7 @@ export class PersistentChatService {
             }
 
             case 'workspace_upgrade.failed':
+                this.workspaceUpgradeInProgress.set(null);
                 this._systemMessage(
                     `Workspace upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
                 );
@@ -3045,9 +3105,17 @@ export class PersistentChatService {
                 break;
             }
 
-            case 'error':
-                this.error.set(this.sanitizeError(params['message'] as string));
+            case 'error': {
+                // P0.3: config.update denials carry the orchestrator's detail
+                // (e.g. the capability-grant reason) — show it, not just the
+                // generic headline.
+                const detail = params['detail'] as string | undefined;
+                const message = params['message'] as string;
+                this.error.set(
+                    this.sanitizeError(detail ? `${message}: ${detail}` : message),
+                );
                 break;
+            }
         }
     }
 
