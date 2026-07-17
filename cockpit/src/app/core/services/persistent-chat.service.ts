@@ -589,8 +589,23 @@ export class PersistentChatService {
      *  `workspace_upgrade.complete`. Null = not yet known. */
     readonly workspaceTier = signal<string | null>(null);
     /** In-flight tier upgrade (drives the pane's button/progress state);
-     *  `elapsed` updates from workspace_upgrade.progress heartbeats. */
+     *  `elapsed` updates from workspace_upgrade.progress heartbeats. Only the
+     *  vm tier emits those — `_emit_vm_progress` lives inside the vm branch and
+     *  `_poll_workspace_ready` takes no progress_cb — so on the sandbox path
+     *  (the only tier request_workspace_upgrade asks for) `elapsed` stays
+     *  undefined and the spinner is silent. Fine: a sandbox is a container
+     *  spawn, not a VM cold-import. */
     readonly workspaceUpgradeInProgress = signal<{tier: string; elapsed?: number} | null>(null);
+    /** A live agent-initiated upgrade offer (workspace_upgrade.needed), or null.
+     *  Drives the inline offer card. Live-only: nothing replays it after a
+     *  reload, and re-offering then would be wrong anyway — the agent's turn is
+     *  long over and the settings pane still has the button. */
+    readonly pendingWorkspaceOffer = signal<{tier: string; reason: string} | null>(null);
+    /** True while an accepted upgrade should auto-resume the agent once it
+     *  lands. Means "the user hasn't spoken since accepting — resume for them";
+     *  any user send clears it, because they've resumed it themselves. Rendered
+     *  by the card, so the two accept buttons don't produce identical spinners. */
+    readonly continueAfterUpgrade = signal(false);
 
     // --- Turn tracking ---
     /**
@@ -1966,6 +1981,14 @@ export class PersistentChatService {
         // swallow. Only a genuine thread switch (connect() cold path) clears it.
         this.pendingPermission.set(null);
         this.compaction.set(null);
+        // The workspace-upgrade signals are per-thread and must not bleed across
+        // a switch. workspaceUpgradeInProgress especially: disconnect() closes
+        // the control WS, and the terminal workspace_upgrade.complete/.failed
+        // frames only ever arrive over that socket (_ws_send, not _broadcast),
+        // so leaving it set would spin forever against the wrong thread.
+        this.workspaceUpgradeInProgress.set(null);
+        this.pendingWorkspaceOffer.set(null);
+        this.continueAfterUpgrade.set(false);
         this.sessionTitle.set(null);
         this.modelName.set(null);
         this.temperature.set(0);
@@ -2134,6 +2157,13 @@ export class PersistentChatService {
             const hint = `[Attached files in uploads/: ${list}]`;
             sendContent = trimmed ? `${trimmed}\n\n${hint}` : hint;
         }
+
+        // The user spoke, so they've resumed the agent themselves — drop any
+        // queued auto-continuation rather than stacking a "continue where you
+        // left off" behind whatever they just said. Safe against the
+        // continuation's own send: workspace_upgrade.complete clears the flag
+        // before calling us.
+        this.continueAfterUpgrade.set(false);
 
         // Add to local conversation — content is the user's typed text
         // only; uploaded files render as separate attachment chips.
@@ -2553,8 +2583,19 @@ export class PersistentChatService {
      * Phase 2). `vm` is the explicit human-intent trigger for the privileged
      * tier — the server still gates it (can_use_vm + global kill-switch).
      * Upgrade-only; progress and completion arrive via the
-     * `workspace_upgrade.*` frames (see `workspaceUpgradeInProgress`). */
-    upgradeWorkspace(tier: 'sandbox' | 'vm'): void {
+     * `workspace_upgrade.*` frames (see `workspaceUpgradeInProgress`).
+     *
+     * `thenContinue` auto-sends a continuation once the upgrade lands, so the
+     * agent picks the work back up with shell/git live. It's an option rather
+     * than a caller-set flag because this method has three callers (the offer
+     * card, the settings pane, `/upgrade-workspace`) and must *reset* the flag
+     * for the two that don't want it — a set-then-call handler would be
+     * silently order-dependent. Clearing the offer here rather than in the card
+     * is deliberate for the same reason: accepting from the pane while the card
+     * is live has to dismiss it too. */
+    upgradeWorkspace(tier: 'sandbox' | 'vm', opts: {thenContinue?: boolean} = {}): void {
+        this.pendingWorkspaceOffer.set(null);
+        this.continueAfterUpgrade.set(opts.thenContinue === true);
         this._sendControl({method: 'upgrade-to-workspace', target_tier: tier});
         this.workspaceUpgradeInProgress.set({tier});
         this._systemMessage(
@@ -2562,6 +2603,15 @@ export class PersistentChatService {
                 ? 'Provisioning a VM workspace (requires approval), please wait...'
                 : 'Provisioning workspace, please wait...',
         );
+    }
+
+    /** Decline a live upgrade offer. Local only — the agent isn't told anything
+     *  here. The card hands the user a prefilled composer instead, because a
+     *  silent decline would leave the agent's context still claiming approval
+     *  is on the way (its tool result said a human would decide), so it would
+     *  stall or re-ask. The reason has to arrive as a real message. */
+    dismissWorkspaceOffer(): void {
+        this.pendingWorkspaceOffer.set(null);
     }
 
     /** Clear conversation history (local only). */
@@ -3042,18 +3092,23 @@ export class PersistentChatService {
 
             case 'workspace_upgrade.needed': {
                 // The agent called request_workspace_upgrade — offer the upgrade
-                // (HITL: a human accepts before anything provisions). The accept
-                // path is the Upgrade button in the session settings pane (or the
-                // /upgrade-workspace slash command); both send the same
-                // upgrade-to-workspace control message. Honor the offered tier;
-                // the tool only requests `sandbox` today.
+                // (HITL: a human accepts before anything provisions). The inline
+                // card is the accept path; the settings pane and the
+                // /upgrade-workspace slash command remain as the after-reload
+                // fallback (the card is live-only). Honor the offered tier; the
+                // tool only requests `sandbox` today.
+                //
+                // This fires mid-stream: request_freeze doesn't stop the turn on
+                // the session path, so the agent is still talking when the card
+                // appears. Last-write-wins on a second offer — only one can be
+                // live, and they can't accumulate.
                 const tier = (params['target_tier'] as string) || 'sandbox';
-                this._systemMessage(
-                    `The agent requested a real workspace: `
-                    + `${(params['reason'] as string) || 'shell/git tools needed'}. `
-                    + `Upgrade to a ${tier} from the session settings `
-                    + `(your files carry over).`,
-                );
+                const reason = (params['reason'] as string) || 'shell/git tools needed';
+                this.pendingWorkspaceOffer.set({tier, reason});
+                // Keep a line in the stream so the ask survives in scroll-back
+                // once the card resolves — but state the fact only. The card is
+                // the verb now, and it says "files carry over" itself.
+                this._systemMessage(`The agent requested a ${tier} workspace: ${reason}`);
                 break;
             }
 
@@ -3087,6 +3142,7 @@ export class PersistentChatService {
                 const tier = (params['target_tier'] as string) || '';
                 if (tier) this.workspaceTier.set(tier);
                 this.workspaceUpgradeInProgress.set(null);
+                this.pendingWorkspaceOffer.set(null);
                 const sudoNote = tier === 'vm'
                     ? ' Running on a VM — sudo is now available.'
                     : '';
@@ -3094,11 +3150,32 @@ export class PersistentChatService {
                     `Workspace ready — shell, git, and file tools are now available.`
                     + `${sudoNote}${seededNote}`,
                 );
+                // Read-and-clear before the send (mirrors consume_freeze_request)
+                // so a repeated .complete — the server short-circuits an
+                // already-satisfied tier straight to this frame — can't send the
+                // continuation twice, and so sendMessage's own cancel guard
+                // can't cancel this very send.
+                const shouldContinue = this.continueAfterUpgrade();
+                this.continueAfterUpgrade.set(false);
+                if (shouldContinue) {
+                    // Safe to send now: the agent re-derives its toolset when it
+                    // dequeues (persistent_graph "get_current_tools" at turn
+                    // start), and resetup_tools_for_backend already ran before
+                    // this frame — so the continuation cannot pick up a stale
+                    // toolset even if the agent is still mid-turn.
+                    void this.sendMessage(
+                        this.transloco.translate('chat.workspaceOffer.continueMessage'),
+                    );
+                }
                 break;
             }
 
             case 'workspace_upgrade.failed':
                 this.workspaceUpgradeInProgress.set(null);
+                // Don't fall back to re-offering: the reason is stale and the
+                // pane still has the button.
+                this.pendingWorkspaceOffer.set(null);
+                this.continueAfterUpgrade.set(false);
                 this._systemMessage(
                     `Workspace upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
                 );

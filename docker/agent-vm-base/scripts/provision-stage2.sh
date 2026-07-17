@@ -257,5 +257,42 @@ sudo -u agent-host git config --global user.email "agent@srw.local"
 sudo -u agent-host git config --global core.editor vim
 sudo -u agent-host git config --global core.pager cat
 
+# -----------------------------------------------------------------------------
+# 7. browser-exec — workspace-side browser executor
+# -----------------------------------------------------------------------------
+#
+# The agent drives this over SSH (src/tools/context.py) so Chrome's CDP stays on
+# the workspace loopback and never crosses the network. It is the agent's ONLY
+# browser path — the in-pod fallback was removed deliberately
+# (docs/issues/remove_local_browser_fallback.md) — so a workspace without
+# browser-exec cannot render at all. It fails opaquely, too: the tool returns
+# "browser-exec returned no output" and the agent concludes no renderer exists
+# anywhere, then remembers that conclusion.
+#
+# This is the same file the container workspace ships (docker/browser-exec),
+# uploaded from ../ by the Packer file provisioner rather than copied into
+# files/. It lives in stage2 because it is per-commit source, not a heavy stable
+# dep: editing it must not force the slow stage1 rebuild. Its browser-use and
+# chromium dependencies come from stage1.
+
+_section "Installing browser-exec"
+sudo install -o root -g root -m 0755 /tmp/browser-exec /usr/local/bin/browser-exec
+
+# -----------------------------------------------------------------------------
+# 8. Browser stack conformance gate
+# -----------------------------------------------------------------------------
+#
+# Shared with docker/Dockerfile.workspace — see docker/assert-browser-stack.sh
+# for why this is one shared file rather than a per-image check. Runs last so it
+# sees the finished image, and runs as agent-host (not root) because that is the
+# user the agent actually SSHes in as: it must pass on *that* PATH.
+#
+# Also installed permanently, so "can this workspace render?" is answerable in
+# five seconds on any live box instead of five weeks.
+
+_section "Asserting browser stack"
+sudo install -o root -g root -m 0755 /tmp/assert-browser-stack.sh /usr/local/bin/assert-browser-stack
+sudo -u agent-host /usr/local/bin/assert-browser-stack
+
 _section_end
 echo "=== Stage 2 complete ==="

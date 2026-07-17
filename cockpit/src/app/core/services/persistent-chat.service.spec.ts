@@ -2769,6 +2769,194 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
     });
 });
 
+describe('PersistentChatService — inline workspace upgrade offer', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    /** Connected + agent-ready, so sendMessage POSTs instead of queueing. */
+    async function readySession() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-wo');
+        fireSseOpen(ctx.sseInstances[0]);
+        fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');
+        ctx.wsInstances[0].send.mockClear();
+        ctx.mockHttp.post.mockClear();
+        return {...ctx, es: ctx.sseInstances[0]};
+    }
+
+    function offer(es: any, params: Record<string, unknown>, seq = '1:2') {
+        fireSseMessage(es, {method: 'workspace_upgrade.needed', params}, seq);
+    }
+
+    function inputCalls(ctx: any) {
+        return ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/persistent/threads/thread-wo/input'),
+        );
+    }
+
+    function sentControl(ctx: any) {
+        return ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
+    }
+
+    it('workspace_upgrade.needed raises the offer and still records a system line', async () => {
+        const ctx = await readySession();
+        offer(ctx.es, {target_tier: 'sandbox', reason: 'need to run pytest'});
+        expect(ctx.service.pendingWorkspaceOffer()).toEqual({
+            tier: 'sandbox',
+            reason: 'need to run pytest',
+        });
+        const lines = ctx.service.turns()
+            .filter((t: any) => t.kind === 'system')
+            .map((t: any) => String(t.content));
+        expect(lines.some((l: string) => l.includes('need to run pytest'))).toBe(true);
+        // The card is the verb now — the line must not send users to the pane.
+        expect(lines.some((l: string) => l.includes('session settings'))).toBe(false);
+    });
+
+    it('defaults the offered tier to sandbox when the server omits it', async () => {
+        const ctx = await readySession();
+        offer(ctx.es, {reason: 'shell needed'});
+        expect(ctx.service.pendingWorkspaceOffer()?.tier).toBe('sandbox');
+    });
+
+    it('a second offer replaces the first rather than accumulating', async () => {
+        const ctx = await readySession();
+        offer(ctx.es, {target_tier: 'sandbox', reason: 'first'});
+        offer(ctx.es, {target_tier: 'sandbox', reason: 'second'}, '1:3');
+        expect(ctx.service.pendingWorkspaceOffer()?.reason).toBe('second');
+    });
+
+    it('accepting clears the offer and sends the upgrade control message', async () => {
+        const ctx = await readySession();
+        offer(ctx.es, {target_tier: 'sandbox', reason: 'need a shell'});
+        ctx.service.upgradeWorkspace('sandbox');
+        expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
+        expect(ctx.service.workspaceUpgradeInProgress()).toEqual({tier: 'sandbox'});
+        expect(sentControl(ctx)).toContainEqual({
+            method: 'upgrade-to-workspace',
+            target_tier: 'sandbox',
+        });
+    });
+
+    it('thenContinue arms the continuation; a plain upgrade disarms it', async () => {
+        const ctx = await readySession();
+        ctx.service.upgradeWorkspace('sandbox', {thenContinue: true});
+        expect(ctx.service.continueAfterUpgrade()).toBe(true);
+        // The pane and /upgrade-workspace pass no opts — they must reset it,
+        // or a stale flag would resume the agent behind the user's back.
+        ctx.service.upgradeWorkspace('sandbox');
+        expect(ctx.service.continueAfterUpgrade()).toBe(false);
+    });
+
+    it('completing an armed upgrade sends the continuation', async () => {
+        const ctx = await readySession();
+        ctx.service.upgradeWorkspace('sandbox', {thenContinue: true});
+        fireSseMessage(ctx.es, {
+            method: 'workspace_upgrade.complete',
+            params: {target_tier: 'sandbox'},
+        }, '1:2');
+        await Promise.resolve();
+        // Transloco is mocked identity, so the raw key is the content.
+        expect(inputCalls(ctx)[0]?.[1]).toEqual({
+            content: 'chat.workspaceOffer.continueMessage',
+        });
+        expect(ctx.service.continueAfterUpgrade()).toBe(false);
+    });
+
+    it('completing an unarmed upgrade sends nothing', async () => {
+        const ctx = await readySession();
+        ctx.service.upgradeWorkspace('sandbox');
+        fireSseMessage(ctx.es, {
+            method: 'workspace_upgrade.complete',
+            params: {target_tier: 'sandbox'},
+        }, '1:2');
+        await Promise.resolve();
+        expect(inputCalls(ctx)).toHaveLength(0);
+    });
+
+    it('a repeated complete does not send the continuation twice', async () => {
+        const ctx = await readySession();
+        ctx.service.upgradeWorkspace('sandbox', {thenContinue: true});
+        const complete = () => fireSseMessage(ctx.es, {
+            method: 'workspace_upgrade.complete',
+            params: {target_tier: 'sandbox'},
+        }, '1:2');
+        complete();
+        await Promise.resolve();
+        // The server short-circuits an already-satisfied tier straight to
+        // .complete, so a second frame is reachable, not hypothetical.
+        complete();
+        await Promise.resolve();
+        expect(inputCalls(ctx)).toHaveLength(1);
+    });
+
+    it('a user message mid-provision cancels the pending continuation', async () => {
+        const ctx = await readySession();
+        ctx.service.upgradeWorkspace('sandbox', {thenContinue: true});
+        await ctx.service.sendMessage('actually, do Y instead');
+        expect(ctx.service.continueAfterUpgrade()).toBe(false);
+        fireSseMessage(ctx.es, {
+            method: 'workspace_upgrade.complete',
+            params: {target_tier: 'sandbox'},
+        }, '1:2');
+        await Promise.resolve();
+        // Only the user's own message — no "continue where you left off"
+        // stacked behind it.
+        expect(inputCalls(ctx)).toHaveLength(1);
+        expect(inputCalls(ctx)[0][1]).toEqual({content: 'actually, do Y instead'});
+    });
+
+    it('a failed upgrade clears the offer and sends nothing', async () => {
+        const ctx = await readySession();
+        offer(ctx.es, {target_tier: 'sandbox', reason: 'need a shell'});
+        ctx.service.upgradeWorkspace('sandbox', {thenContinue: true});
+        fireSseMessage(ctx.es, {
+            method: 'workspace_upgrade.failed',
+            params: {reason: 'quota exceeded'},
+        }, '1:2');
+        await Promise.resolve();
+        expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
+        expect(ctx.service.continueAfterUpgrade()).toBe(false);
+        expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+        expect(inputCalls(ctx)).toHaveLength(0);
+    });
+
+    it('dismissing the offer touches only local state', async () => {
+        const ctx = await readySession();
+        offer(ctx.es, {target_tier: 'sandbox', reason: 'need a shell'});
+        ctx.service.dismissWorkspaceOffer();
+        expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
+        expect(sentControl(ctx)).toHaveLength(0);
+        expect(inputCalls(ctx)).toHaveLength(0);
+    });
+
+    it('disconnect clears the upgrade state so it cannot bleed across threads', async () => {
+        const ctx = await readySession();
+        offer(ctx.es, {target_tier: 'sandbox', reason: 'need a shell'});
+        ctx.service.upgradeWorkspace('sandbox', {thenContinue: true});
+        ctx.service.disconnect();
+        // .complete only ever arrives over the control WS disconnect() just
+        // closed, so a surviving spinner would hang forever.
+        expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+        expect(ctx.service.pendingWorkspaceOffer()).toBeNull();
+        expect(ctx.service.continueAfterUpgrade()).toBe(false);
+    });
+});
+
 describe('PersistentChatService — usage.updated telemetry', () => {
     afterEach(() => vi.clearAllMocks());
 

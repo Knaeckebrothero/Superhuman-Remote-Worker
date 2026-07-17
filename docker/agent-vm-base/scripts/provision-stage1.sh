@@ -215,17 +215,50 @@ sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || 
 sudo python3 -m pip install --break-system-packages nats-py psutil
 
 # -----------------------------------------------------------------------------
-# 6. Playwright Chromium (replaces apt chromium-browser, which on Ubuntu Noble
-#    is a snap shim that hangs the build with no snap-store connectivity).
-#    Pin propagated from .playwright-version via the Packer var of the same
-#    name; symlink is provisioned at image build time only — runtime upgrades
-#    would dangle the symlink and are not supported.
+# 6. Playwright Chromium + browser-use (replaces apt chromium-browser, which on
+#    Ubuntu Noble is a snap shim that hangs the build with no snap-store
+#    connectivity). Pin propagated from .playwright-version via the Packer var
+#    of the same name; symlink is provisioned at image build time only —
+#    runtime upgrades would dangle the symlink and are not supported.
+#
+#    Keep in lockstep with docker/Dockerfile.workspace: the container workspace
+#    installs this same trio (playwright + browser-use + chromium) and both
+#    images are gated by docker/assert-browser-stack.sh. browser-exec itself is
+#    per-commit source and is installed in stage2, not here.
 # -----------------------------------------------------------------------------
 
-_section "Installing Playwright Chromium"
+_section "Installing Playwright Chromium + browser-use"
 : "${PLAYWRIGHT_VERSION:?PLAYWRIGHT_VERSION must be set by Packer (see .playwright-version)}"
 
-sudo python3 -m pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}"
+# browser-use is CAPPED below 0.13.0: 0.13 (2026-06-08) rewrote the browser
+# layer to pure CDP and dropped Playwright, so it no longer finds the
+# Playwright-installed Chromium under PLAYWRIGHT_BROWSERS_PATH and falls back to
+# auto-installing one via `uvx playwright install` — which fails on this image
+# ([Errno 2] No such file or directory: 'uvx'), breaking every browser_* tool.
+# 0.12.x (validated 2026-05-27) is the last Playwright-compatible line the
+# browser-exec daemon is written against. Do NOT loosen this cap without
+# upgrading docker/browser-exec to the 0.13 API.
+#
+# --ignore-installed is required HERE but not in docker/Dockerfile.workspace,
+# and the difference is the base image. The container starts from a minimal
+# ubuntu:24.04; this VM starts from the Ubuntu *cloud image*, which preinstalls
+# apt-managed Python packages for cloud-init (python3-typing-extensions,
+# python3-jwt, ...). Those ship no RECORD file, so when browser-use's dependency
+# resolver tries to upgrade them pip aborts with:
+#     ERROR: Cannot uninstall typing_extensions 4.10.0, RECORD file not found.
+#            Hint: The package was installed by debian.
+# Purging them is not an option — cloud-init depends on them. --ignore-installed
+# instead lets pip install its own copies under /usr/local/lib/python3.12/
+# dist-packages, which precedes /usr/lib/python3/dist-packages on sys.path, so
+# pip's versions win at import time while apt's stay intact for cloud-init.
+#
+# Keep playwright's pin NAMED in this same command: --ignore-installed
+# reinstalls the whole dependency tree, and browser-use depends on playwright,
+# so an unnamed playwright would be silently resolved to whatever browser-use
+# prefers instead of .playwright-version. (Verified: this command yields
+# browser-use 0.12.9 + playwright 1.59.0 on the cloud image.)
+sudo python3 -m pip install --break-system-packages --ignore-installed \
+    "playwright==${PLAYWRIGHT_VERSION}" "browser-use>=0.12.9,<0.13.0"
 # fonts-noto-core: extended Unicode/CJK coverage that --with-deps does not pull
 sudo eatmydata apt-get install -y --no-install-recommends fonts-noto-core
 sudo PLAYWRIGHT_BROWSERS_PATH=/opt/playwright eatmydata playwright install --with-deps chromium
@@ -237,6 +270,15 @@ test -n "$CHROMIUM_BIN" || { echo "ERROR: chromium binary not found under /opt/p
 sudo ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium
 echo "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright" | sudo tee -a /etc/environment
 echo "Chromium installed at $CHROMIUM_BIN (symlinked /usr/local/bin/agent-chromium)"
+
+# Assert stage1's half of the browser contract here rather than deferring it all
+# to the stage2 gate: stage1 is the expensive rebuild, so its own breakage should
+# fail in its own layer. The full contract (incl. browser-exec) is asserted by
+# docker/assert-browser-stack.sh at the end of stage2.
+python3 -c "import browser_use" \
+    || { echo "ERROR: browser-use installed but not importable — see cap note above"; exit 1; }
+/usr/local/bin/agent-chromium --headless --no-sandbox --version \
+    || { echo "ERROR: agent-chromium is present but will not run"; exit 1; }
 
 # -----------------------------------------------------------------------------
 # 7. Node.js 22 + minimal global npm packages
