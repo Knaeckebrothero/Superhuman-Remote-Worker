@@ -1321,6 +1321,17 @@
       "autoAccept": "Auto-akzeptieren",
       "stop": "Stoppen"
     },
+    "workspaceOffer": {
+      "title": "Workspace-Upgrade angefordert",
+      "detail": "Der Agent hat einen {{tier}}-Workspace angefordert.",
+      "upgradeAndContinue": "Upgraden & fortfahren",
+      "upgrade": "Upgraden",
+      "deny": "Ablehnen",
+      "denyStarter": "Kein Workspace-Upgrade — ",
+      "continueMessage": "Der Workspace ist bereit — Shell-, Git- und Datei-Tools sind jetzt verfügbar. Bitte mach dort weiter, wo du aufgehört hast.",
+      "provisioning": "{{tier}} wird bereitgestellt…",
+      "willContinue": "Wird automatisch fortgesetzt, sobald bereit."
+    },
     "approval": {
       "pendingTitle": "Bestätigung erforderlich, um dieses Tool auszuführen",
       "badge": {

@@ -209,6 +209,19 @@ COPY docker/browser-exec /usr/local/bin/browser-exec
 RUN chmod +x /usr/local/bin/browser-exec
 
 # ---------------------------------------------------------------------------
+# 2d. Browser stack conformance gate — the SAME script the VM golden image runs
+#     at the end of stage2 (docker/agent-vm-base). Shared, not duplicated: these
+#     two images are hand-maintained twins, and the VM shipped for ~5 weeks with
+#     a working Chromium that no agent could reach because browser-exec and
+#     browser-use were added here only, with nothing asserting the images agreed.
+#     See docs/issues/vm_workspace_missing_browser_exec.md. Installed permanently
+#     as well as run, so any live workspace can be interrogated in five seconds.
+# ---------------------------------------------------------------------------
+COPY docker/assert-browser-stack.sh /usr/local/bin/assert-browser-stack
+RUN chmod +x /usr/local/bin/assert-browser-stack \
+    && /usr/local/bin/assert-browser-stack
+
+# ---------------------------------------------------------------------------
 # 3. code-server (IDE)
 # ---------------------------------------------------------------------------
 RUN curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server_${CODE_SERVER_VERSION}_amd64.deb" \

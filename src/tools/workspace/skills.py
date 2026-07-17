@@ -59,10 +59,11 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
             "[scripts need a workspace] This skill bundles runnable scripts under "
             f"`skills/{skill_name}/scripts/`, but you are on a virtual filesystem "
             "with no shell, so they cannot be executed here. The guidance above "
-            "still applies without them. To run the scripts, call "
-            "`request_workspace_upgrade(reason=...)`: a human approves, a sandbox "
-            "with a shell is provisioned, your files carry over, and you can then "
-            "run the script with `run_command` on a later turn."
+            "still applies without them. To ask for the scripts to be unlocked, "
+            "call `request_workspace_upgrade(reason=...)`: a human decides, and "
+            "if they approve, a sandbox with a shell is provisioned and your "
+            "files carry over. Don't count on being resumed afterwards — ask, "
+            "then do what you can without the scripts."
         )
 
     @tool
