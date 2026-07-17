@@ -30,6 +30,7 @@ from .orchestrator_client import OrchestratorClient, create_orchestrator_client_
 from ..agent import UniversalAgent
 from ..core.loader import resolve_config_path
 from ..core.workspace import get_logs_path
+from ..core.workspace_backend import completion_error_payload
 
 logger = logging.getLogger(__name__)
 
@@ -589,7 +590,7 @@ async def _process_orchestrator_job(
     except Exception as e:
         logger.error(f"Orchestrator job {job_id} failed: {e}", exc_info=True)
         # Report error to orchestrator
-        error_result = {"error": {"message": str(e)}}
+        error_result = completion_error_payload(e)
         if _orchestrator_client:
             try:
                 await _orchestrator_client.report_completion(job_id, error_result)
@@ -1140,7 +1141,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 raise
             except Exception as e:
                 logger.error(f"Resumed job {request.job_id} failed: {e}", exc_info=True)
-                error_result = {"error": {"message": str(e)}}
+                error_result = completion_error_payload(e)
                 if _orchestrator_client:
                     try:
                         await _orchestrator_client.report_completion(
