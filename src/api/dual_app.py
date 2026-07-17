@@ -39,6 +39,7 @@ from ._session_auth import validate_session_token as _validate_session_token
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 from ..agent import UniversalAgent
 from ..core.loader import resolve_config_path
+from ..core.workspace_backend import completion_error_payload
 
 logger = logging.getLogger(__name__)
 
@@ -596,7 +597,7 @@ async def _process_orchestrator_job(
         if _orchestrator_client:
             try:
                 await _orchestrator_client.report_completion(
-                    job_id, {"error": {"message": str(e)}}
+                    job_id, completion_error_payload(e)
                 )
             except Exception:
                 logger.error(f"Failed to report error for job {job_id}")
@@ -987,7 +988,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 if _orchestrator_client:
                     try:
                         await _orchestrator_client.report_completion(
-                            request.job_id, {"error": {"message": str(e)}}
+                            request.job_id, completion_error_payload(e)
                         )
                     except Exception:
                         pass

@@ -21,6 +21,27 @@ class WorkspaceUnavailableError(Exception):
     pass
 
 
+def completion_error_payload(exc: BaseException) -> Dict[str, Any]:
+    """Build the completion-report ``error`` dict for an exception.
+
+    The orchestrator's ``/complete`` recovery arm routes purely on
+    ``error.type == "workspace_unavailable"`` — an untyped
+    ``{"message": str(e)}`` report turns a recoverable dead-workspace
+    failure into a terminal job failure plus workspace teardown. Every
+    app-layer ``except`` that reports an exception to ``/complete`` must
+    build its payload here so the classification survives.
+    docs/issues/streaming_strips_workspace_unavailable_type.md
+    """
+    is_ws = isinstance(exc, WorkspaceUnavailableError)
+    return {
+        "error": {
+            "message": str(exc),
+            "type": "workspace_unavailable" if is_ws else "job_error",
+            "recoverable": is_ws,
+        }
+    }
+
+
 class RemoteCommandTimeoutError(Exception):
     """A remote operation exceeded its wall-clock deadline.
 
