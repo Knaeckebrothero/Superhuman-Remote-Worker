@@ -81,6 +81,7 @@
     "open": "Canvas öffnen",
     "hide": "Canvas ausblenden",
     "skipToCanvas": "Zum Canvas springen",
+    "newContent": "Neuer Canvas-Inhalt verfügbar",
     "returnToChat": "Zurück zum Chat",
     "resize": "Chat und Canvas in der Größe ändern",
     "empty": "Der Agent hat noch nichts präsentiert.",
@@ -1132,6 +1133,7 @@
     "jumpToLatest": "Zum Aktuellen · {{count}} neu",
     "header": {
       "settingsTooltip": "Sitzungseinstellungen",
+      "viewMenuTooltip": "Ansichtsoptionen",
       "filesButton": "Dateien",
       "filesTooltip": "Sitzungsdateien in der Cloud öffnen",
       "gitButton": "Git",
@@ -1181,6 +1183,24 @@
       "prepend": "Vorangestellt",
       "write": "Geschrieben",
       "truncated": "+{{count}} weitere Zeilen"
+    },
+    "settingsPane": {
+      "title": "Sitzungseinstellungen",
+      "close": "Einstellungen schließen",
+      "workspace": "Arbeitsbereich",
+      "tier": {
+        "virtual": "Lite (kein Workspace-Pod)",
+        "sandbox": "Sandbox-Container",
+        "vm": "Virtuelle Maschine",
+        "none": "Keiner",
+        "remote": "Remote-Container",
+        "docker": "Container"
+      },
+      "upgrading": "{{tier}} wird bereitgestellt…",
+      "upgradeSandbox": "Auf Sandbox upgraden",
+      "upgradeVm": "Auf VM upgraden",
+      "workspaceHint": "Upgrades übernehmen Ihre Dateien und können innerhalb der Sitzung nicht rückgängig gemacht werden.",
+      "fixedNote": "Experte und Projekte werden beim Erstellen der Sitzung festgelegt und in der Sitzungsliste angezeigt."
     },
     "settings": {
       "mode": "Modus",
