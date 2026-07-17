@@ -2073,12 +2073,25 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             )
             return metadata or {}
 
+        def _backend_has(rel: str) -> bool:
+            """Probe the workspace backend, treating probe failures as absent.
+
+            The gates below used local ``Path.exists()`` checks, which are
+            always False for a remote workspace — pod handoff degenerated to
+            "always try the clone" and the resume-existing branch was dead
+            code, letting content-bearing git-less workspaces fall through to
+            initialize()'s ``rm -rf``.
+            """
+            try:
+                return self._workspace_manager.exists(rel)
+            except Exception as e:
+                logger.warning(f"Workspace probe for {rel!r} failed: {e}")
+                return False
+
         # Pod handoff: clone workspace from Gitea if resuming on a new pod
-        if (
-            resume
-            and not self._workspace_manager.path.exists()
-            and metadata.get("git_remote_url")
-        ):
+        # (no git working tree yet — G2 above already preserved and returned
+        # for any tree that has one).
+        if resume and metadata.get("git_remote_url") and not _backend_has(".git"):
             from .managers.git_manager import GitManager
 
             logger.info(f"Pod handoff: cloning workspace for job {job_id}")
@@ -2110,8 +2123,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 f"Pod handoff clone failed for job {job_id}, falling through to normal init"
             )
 
-        # Check if resuming an existing workspace
-        if resume and self._workspace_manager.path.exists():
+        # Check if resuming an existing workspace. Content probe via the
+        # backend (task_brief.md — the same probe the VM snapshot seeding
+        # uses): preserves a seeded-but-git-less workspace instead of letting
+        # the fresh-init path below wipe it.
+        if resume and _backend_has("task_brief.md"):
             logger.info(f"Resuming job {job_id} with existing workspace")
             # Verify workspace has required files (backend-aware — a local
             # Path.exists() is always False on remote workspaces and would
@@ -3157,27 +3173,27 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         }
 
         try:
-            docs_path = context.workspace_manager.get_path("documents")
-            if not docs_path.exists():
+            ws = context.workspace_manager
+            # Walk via the backend: a local Path.exists()/rglob() never sees a
+            # remote workspace, which silently disabled auto-registration on
+            # every remote-backend job. Off the event loop — SFTP descent isn't
+            # the "quick local walk" this used to be.
+            if not await asyncio.to_thread(ws.exists, "documents"):
                 return
 
-            # Collect eligible files (sync filesystem walk is quick).
-            files: List[Tuple[Path, str]] = []
-            for file_path in sorted(docs_path.rglob("*")):
-                if not file_path.is_file():
-                    continue
-
+            files: List[Tuple[str, str]] = []
+            for rel_path in await asyncio.to_thread(ws.backend.walk, "documents"):
                 # Skip documents/external/ (web content, registered by research tools)
-                try:
-                    file_path.relative_to(docs_path / "external")
-                    continue
-                except ValueError:
-                    pass  # Not under external/, proceed
-
-                if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                if rel_path.startswith("documents/external/"):
                     continue
 
-                files.append((file_path, file_path.name))
+                if Path(rel_path).suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+
+                # Workspace-relative path: matches the registry key the citation
+                # tools use, and get_or_register_doc_source materializes a local
+                # copy for the engine when the backend is remote.
+                files.append((rel_path, Path(rel_path).name))
 
             if not files:
                 return
@@ -3193,12 +3209,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             # populates context._source_registry as it goes.
             sem = asyncio.Semaphore(4)
 
-            async def _register(file_path: Path, name: str) -> bool:
+            async def _register(rel_path: str, name: str) -> bool:
                 async with sem:
                     try:
-                        await context.get_or_register_doc_source(
-                            str(file_path), name=name
-                        )
+                        await context.get_or_register_doc_source(rel_path, name=name)
                         return True
                     except Exception as e:
                         logger.debug(f"Could not register document {name}: {e}")
