@@ -1218,6 +1218,35 @@ class UniversalAgent:
                 graph_input = None
 
             self._jobs_processed += 1
+        except Exception as e:
+            # Mirror the non-streaming handler: classify the failure and yield
+            # a TYPED error state instead of letting the exception escape the
+            # generator. An escaping exception lands in the app-layer's generic
+            # `except Exception`, which reports `{"error": {"message": ...}}` —
+            # stripping the `workspace_unavailable` type the orchestrator's
+            # recovery arm routes on, so a dead-workspace job hard-fails (and
+            # its VM is torn down) instead of pause → reprovision → resume.
+            # docs/issues/streaming_strips_workspace_unavailable_type.md
+            from .core.workspace_backend import WorkspaceUnavailableError
+
+            job_id = self._current_job_id
+            is_vm_error = isinstance(e, WorkspaceUnavailableError)
+            if is_vm_error:
+                logger.error(
+                    f"Job {job_id}: VM workspace unavailable mid-stream — "
+                    f"will request recovery: {e}"
+                )
+            else:
+                logger.error(f"Job {job_id} failed mid-stream: {e}", exc_info=True)
+            yield {
+                "job_id": job_id,
+                "error": {
+                    "message": str(e),
+                    "type": "workspace_unavailable" if is_vm_error else "job_error",
+                    "recoverable": is_vm_error,
+                },
+                "should_stop": True,
+            }
         finally:
             # Drain in-flight memory captures (the fire-and-forget pre_compaction
             # extraction scheduled via capture_nowait) BEFORE tearing down
