@@ -71,7 +71,7 @@ image:
   mcp:
     tag: sha-1ccac11
   workspace:
-    tag: sha-1ccac11
+    tag: sha-16008a1
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
 # (docs/operations/orchestrator_m1_go_live.md)
