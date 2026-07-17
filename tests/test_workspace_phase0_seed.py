@@ -8,7 +8,7 @@ that only exists on the remote host), plus the Phase 0 seed behavior
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -161,6 +161,57 @@ class TestPhase0SeedCommit:
         agent = self._agent_with_git(git)
 
         agent._commit_workspace_seed("job-1")  # must not raise
+
+
+class TestDocumentAutoRegistration:
+    """Input-document auto-registration must discover files via the backend —
+    a local Path walk never sees a remote workspace, which silently disabled
+    registration on every remote-backend job."""
+
+    def _context_for(self, ws):
+        context = MagicMock()
+        context.has_workspace.return_value = True
+        context.vector_db = object()
+        context.workspace_manager = ws
+        context.get_or_register_doc_source = AsyncMock(return_value=1)
+        return context
+
+    @pytest.mark.asyncio
+    async def test_registers_relative_paths_on_remote_backend(self, tmp_path):
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        ws.write_file("documents/report.md", "content")
+        ws.write_file("documents/sub/deep.pdf", "pdf bytes")
+        ws.write_file("documents/external/page.html", "web content")  # skipped
+        ws.write_file("documents/image.png", "img")  # unsupported extension
+        agent = _bare_agent(ws)
+        context = self._context_for(ws)
+
+        await agent._register_initial_documents_background(context)
+
+        registered = sorted(
+            call.args[0] for call in context.get_or_register_doc_source.call_args_list
+        )
+        assert registered == ["documents/report.md", "documents/sub/deep.pdf"]
+
+    @pytest.mark.asyncio
+    async def test_missing_documents_dir_is_noop(self, tmp_path):
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws)
+        context = self._context_for(ws)
+
+        await agent._register_initial_documents_background(context)
+
+        context.get_or_register_doc_source.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_registration_errors_are_non_fatal(self, tmp_path):
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        ws.write_file("documents/report.md", "content")
+        agent = _bare_agent(ws)
+        context = self._context_for(ws)
+        context.get_or_register_doc_source.side_effect = RuntimeError("boom")
+
+        await agent._register_initial_documents_background(context)  # must not raise
 
 
 class TestPersistentSessionSkillGuard:
