@@ -78,6 +78,7 @@ import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
+import {ExternalImageDirective} from '../../ui/external-image';
 
 interface SlashCommand {
     command: string;
@@ -564,6 +565,7 @@ export function clearDraft(threadId: string | null): void {
         TitleCasePipe,
         RouterLink,
         MarkdownComponent,
+        ExternalImageDirective,
         CitationRefDirective,
         KatexDirective,
         SidebarToggleComponent,
@@ -1034,13 +1036,15 @@ export function clearDraft(threadId: string | null): void {
 
                   @if (isCollapsed) {
                     <!-- Collapsed: fold the lead-up (opening text, reasoning,
-                         tool calls) but keep the final answer — the prose after
-                         the last tool/thought — fully rendered as markdown (#8
-                         refinement). The chevron + count badge signal the hidden
-                         work. When the turn ends on a tool/thought (no closing
-                         prose), fall back to a one-line headline (plain text so
-                         the truncate mixin works; markdown emits block elements
-                         that defeat nowrap). -->
+                         tool calls) but keep the final answer — the trailing
+                         prose (stray finished thoughts / compaction markers
+                         after it are tolerated) — fully rendered as markdown
+                         (#8 refinement). The chevron + count badge signal the
+                         hidden work. When the turn has no closing prose (ends
+                         on a tool call, or is still thinking), fall back to a
+                         one-line headline (plain text so the truncate mixin
+                         works; markdown emits block elements that defeat
+                         nowrap). -->
                     @let answer = finalAnswer(turn);
                     @if (answer) {
                       <!-- A user can collapse a still-streaming turn (the manual

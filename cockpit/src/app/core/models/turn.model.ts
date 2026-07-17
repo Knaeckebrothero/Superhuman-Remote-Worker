@@ -210,21 +210,35 @@ export function firstTextOf(turn: AssistantTurn): TextEvent | undefined {
 }
 
 /**
- * The turn's "final answer": the trailing run of text events with no tool call
- * or thought after them — the prose the model ended the turn on. This is the
- * part worth keeping fully visible even when the turn is collapsed; collapsing
- * folds only the lead-up (opening text, reasoning, tool calls), never the
- * answer. Multiple trailing text blocks are joined with a blank line.
+ * The turn's "final answer": the trailing run of text events — the prose the
+ * model ended the turn on. This is the part worth keeping fully visible even
+ * when the turn is collapsed; collapsing folds only the lead-up (opening text,
+ * reasoning, tool calls), never the answer. Multiple trailing text blocks are
+ * joined with a blank line.
  *
- * Returns '' when the turn ends on a tool call or thought (no closing prose) or
- * has no events — callers fall back to the one-line headline in that case.
+ * Stray non-answer events AFTER the closing prose are tolerated: a finished
+ * thought (transports that only hand reasoning over post-stream broadcast it
+ * after the answer tokens — reasoning always precedes the answer at the model
+ * level) or an inline compaction marker must not blank the collapsed answer.
+ * A still-streaming thought means the model is mid-work, so the text above it
+ * is not the final answer yet; a thought BETWEEN texts likewise cuts the run
+ * (the earlier text is lead-up, not answer). Tool calls always terminate.
+ *
+ * Returns '' when the turn ends on a tool call (no closing prose), is still
+ * thinking, or has no text — callers fall back to the one-line headline.
  */
 export function trailingText(turn: AssistantTurn): string {
     const parts: string[] = [];
     for (let i = turn.events.length - 1; i >= 0; i--) {
         const e = turn.events[i];
-        if (!isText(e)) break;
-        parts.push(e.content);
+        if (isText(e)) {
+            parts.push(e.content);
+            continue;
+        }
+        const skippable =
+            (isThought(e) && e.status !== 'streaming') || e.kind === 'compaction';
+        if (parts.length === 0 && skippable) continue;
+        break;
     }
     return parts.reverse().join('\n\n').trim();
 }

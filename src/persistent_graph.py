@@ -840,6 +840,29 @@ async def _stream_response_blocks(
     return text_out, emitted_reasoning
 
 
+async def _emit_reasoning_content(response, callbacks, *, message_id) -> bool:
+    """Emit ``additional_kwargs.reasoning_content`` as a thinking frame.
+
+    Called on the ainvoke retry/fallback paths right after the response
+    arrives and BEFORE its answer text is emitted, so the reasoning precedes
+    the prose it produced (reasoning models never think after answering — a
+    trailing frame is a broadcast artifact, see
+    docs/issues/persistent_chat_reasoning_after_answer_and_replay_duplication.md).
+
+    ``reasoning_content`` is only ever set by the non-streaming capture path
+    (``_post_process_result``), which also flattens the message content to a
+    plain string — so this can never double-emit against typed reasoning
+    content blocks. Keyed to the turn's ``ai_msg_id``: ``_has_reasoning``
+    guarantees the post-stream id pin, so the frame key matches the persisted
+    row key. Returns True when a frame was emitted.
+    """
+    rc = (getattr(response, "additional_kwargs", None) or {}).get("reasoning_content")
+    if not (rc and isinstance(rc, str)):
+        return False
+    await callbacks.on_thinking(rc, message_id=message_id)
+    return True
+
+
 async def _execute_turn(
     llm_with_tools: BaseChatModel,
     tool_map: Dict[str, Any],
@@ -1248,6 +1271,18 @@ async def _execute_turn(
         # Set by the live reasoning sink below; gates the post-stream fallback
         # so each reasoning blob is emitted exactly once.
         reasoning_streamed = False
+        # True once reasoning reached the client OUTSIDE the sink this LLM
+        # call — the in-stream typed-block arms (Responses/Anthropic) and the
+        # early ainvoke-path emissions set it (sink-streamed reasoning is
+        # tracked separately via reasoning_streamed). Gates the
+        # post-stream fallback and the empty-response-retry reset. Kept
+        # separate from reasoning_streamed on purpose: reasoning_streamed
+        # also drives the response.id pin below, and pinning a msg_ id onto
+        # a LIST-content message makes langchain-core's
+        # _convert_from_v03_ai_message misread it as legacy format and ship
+        # the fabricated id in round-tripped item ids (Responses/Anthropic
+        # provider ids are round-trip-critical).
+        reasoning_emitted = False
         # Accumulate streamed reasoning text so we can derive a token estimate
         # for models that stream reasoning but report no provider reasoning-token
         # count (gemma via the vLLM router folds it into output_tokens).
@@ -1328,6 +1363,7 @@ async def _execute_turn(
                                     thinking = block.get("thinking", "")
                                     if thinking:
                                         await callbacks.on_thinking(thinking)
+                                        reasoning_emitted = True
                                 elif (
                                     isinstance(block, dict)
                                     and block.get("type") == "reasoning"
@@ -1335,6 +1371,7 @@ async def _execute_turn(
                                     reasoning = extract_reasoning_text_from_block(block)
                                     if reasoning:
                                         await callbacks.on_thinking(reasoning)
+                                        reasoning_emitted = True
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)
@@ -1382,6 +1419,12 @@ async def _execute_turn(
                         llm_with_tools.ainvoke(prepared),
                         timeout=llm_timeout,
                     )
+                    # Reasoning first: the non-streaming capture path parks it
+                    # in additional_kwargs, so emit it before the answer text.
+                    if await _emit_reasoning_content(
+                        response, callbacks, message_id=ai_msg_id
+                    ):
+                        reasoning_emitted = True
                     content = getattr(response, "content", None)
                     if content:
                         if isinstance(content, list):
@@ -1401,6 +1444,7 @@ async def _execute_turn(
                                     thinking = block.get("thinking", "")
                                     if thinking:
                                         await callbacks.on_thinking(thinking)
+                                        reasoning_emitted = True
                                 elif (
                                     isinstance(block, dict)
                                     and block.get("type") == "reasoning"
@@ -1408,6 +1452,7 @@ async def _execute_turn(
                                     reasoning = extract_reasoning_text_from_block(block)
                                     if reasoning:
                                         await callbacks.on_thinking(reasoning)
+                                        reasoning_emitted = True
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)
@@ -1494,6 +1539,12 @@ async def _execute_turn(
                         f"Streaming not supported ({err_name}), falling back to ainvoke"
                     )
                     response = await llm_with_tools.ainvoke(prepared)
+                    # Reasoning first: the non-streaming capture path parks it
+                    # in additional_kwargs, so emit it before the answer text.
+                    if await _emit_reasoning_content(
+                        response, callbacks, message_id=ai_msg_id
+                    ):
+                        reasoning_emitted = True
                     # Stream the complete response as a single chunk
                     content = getattr(response, "content", None)
                     if content:
@@ -1514,6 +1565,7 @@ async def _execute_turn(
                                     thinking = block.get("thinking", "")
                                     if thinking:
                                         await callbacks.on_thinking(thinking)
+                                        reasoning_emitted = True
                                 elif (
                                     isinstance(block, dict)
                                     and block.get("type") == "reasoning"
@@ -1521,6 +1573,7 @@ async def _execute_turn(
                                     reasoning = extract_reasoning_text_from_block(block)
                                     if reasoning:
                                         await callbacks.on_thinking(reasoning)
+                                        reasoning_emitted = True
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)
@@ -1756,7 +1809,9 @@ async def _execute_turn(
                     # Retry produced something. Replace the dead-end reasoning
                     # bubble (if one streamed live) with the retry's reasoning +
                     # answer rather than appending under the stale one.
-                    if reasoning_streamed and callbacks.on_thinking_reset is not None:
+                    if (
+                        reasoning_streamed or reasoning_emitted
+                    ) and callbacks.on_thinking_reset is not None:
                         # Drain the in-flight reasoning broadcasts first so a late
                         # delta can't repaint AFTER the reset. The streaming sink
                         # was already cleared in the finally above, so this set is
@@ -1765,8 +1820,24 @@ async def _execute_turn(
                             await asyncio.gather(
                                 *_reasoning_tasks, return_exceptions=True
                             )
-                        await callbacks.on_thinking_reset(message_id=ai_msg_id)
+                        # In-stream block frames are UNKEYED (no message_id), so
+                        # only an unkeyed reset can clear them — it removes every
+                        # still-streaming thought of the active turn, which here
+                        # is exactly attempt-1's dead-end reasoning. Sink-only
+                        # frames stay keyed to ai_msg_id as before.
+                        await callbacks.on_thinking_reset(
+                            message_id=None if reasoning_emitted else ai_msg_id
+                        )
                         reasoning_streamed = False
+                        reasoning_emitted = False
+                    # Reasoning first: a retry that went through ainvoke carries
+                    # its reasoning in additional_kwargs (flattened content), so
+                    # emit it before the answer text instead of leaving it to
+                    # the post-stream fallback (which would trail the answer).
+                    if await _emit_reasoning_content(
+                        retry, callbacks, message_id=ai_msg_id
+                    ):
+                        reasoning_emitted = True
                     response_content, _retry_reasoned = await _stream_response_blocks(
                         retry, callbacks, message_id=ai_msg_id
                     )
@@ -1814,10 +1885,13 @@ async def _execute_turn(
         _has_reasoning = bool(_reasoning and isinstance(_reasoning, str))
         if reasoning_streamed or _has_reasoning:
             response.id = ai_msg_id
-        # Fallback: emit reasoning the live sink didn't already stream (the
-        # non-streaming capture path, or any model whose deltas the tap missed).
+        # Last-resort fallback: emit reasoning that neither the live sink nor
+        # any in-stream/early emission already delivered (a plain streamed
+        # message that arrived carrying reasoning_content). The ainvoke paths
+        # emit reasoning_content early (before their text) and flip
+        # reasoning_emitted, so this can no longer trail the answer for them.
         # Now that we're past sanitize, message_id matches the persisted row.
-        if _has_reasoning and not reasoning_streamed:
+        if _has_reasoning and not reasoning_streamed and not reasoning_emitted:
             await callbacks.on_thinking(_reasoning, message_id=ai_msg_id)
         if (
             response_content

@@ -1,6 +1,7 @@
 import {describe, expect, it} from 'vitest';
 import {
     AssistantTurn,
+    CompactionEvent,
     EventGroup,
     firstSentence,
     firstTextOf,
@@ -23,6 +24,7 @@ const tht = (id: string, status: ThoughtEvent['status'] = 'done'): ThoughtEvent 
     ({kind: 'thought', id, content: '...', status, startedAt: 0});
 const tool = (id: string, status: ToolCallStatus = 'completed', category?: string): ToolCallEvent =>
     ({kind: 'tool_call', id, tool: 'read_file', args: {}, status, startedAt: 0, category});
+const comp = (id: string): CompactionEvent => ({kind: 'compaction', id, summary: 'compacted', startedAt: 0});
 
 /** Ids in a group, folded or single — keeps the grouping assertions readable. */
 const idsOf = (g: EventGroup): string[] =>
@@ -94,8 +96,36 @@ describe('trailingText', () => {
         expect(trailingText(mkTurn([txt('b0', 'doing'), tool('b1')]))).toBe('');
     });
 
-    it('returns "" when the turn ends on a thought', () => {
-        expect(trailingText(mkTurn([txt('b0', 'hi'), tht('b1')]))).toBe('');
+    it('skips a stray finished thought trailing the closing prose', () => {
+        // Transports that only hand reasoning over post-stream broadcast the
+        // thought AFTER the answer tokens — it must not blank the answer.
+        expect(trailingText(mkTurn([txt('b0', 'hi'), tht('b1')]))).toBe('hi');
+    });
+
+    it('skips multiple trailing finished/hidden thoughts', () => {
+        const t = mkTurn([tool('b0'), txt('b1', 'answer.'), tht('b2'), tht('b3', 'hidden')]);
+        expect(trailingText(t)).toBe('answer.');
+    });
+
+    it('returns "" when the trailing thought is still streaming (mid-work)', () => {
+        expect(trailingText(mkTurn([txt('b0', 'so far'), tht('b1', 'streaming')]))).toBe('');
+    });
+
+    it('skips a trailing inline compaction marker', () => {
+        expect(trailingText(mkTurn([txt('b0', 'answer.'), comp('b1')]))).toBe('answer.');
+    });
+
+    it('still cuts the run at a thought BETWEEN texts (earlier text is lead-up)', () => {
+        const t = mkTurn([txt('b0', 'lead'), tht('b1'), txt('b2', 'final.'), tht('b3')]);
+        expect(trailingText(t)).toBe('final.');
+    });
+
+    it('returns "" when a tool call follows the last text, even behind a thought', () => {
+        expect(trailingText(mkTurn([txt('b0', 'doing'), tool('b1'), tht('b2')]))).toBe('');
+    });
+
+    it('returns "" for an all-thought turn', () => {
+        expect(trailingText(mkTurn([tht('b0'), tht('b1')]))).toBe('');
     });
 
     it('returns the whole text for an all-text turn', () => {

@@ -172,6 +172,11 @@ from services.dispatch_guards import (  # noqa: E402
 )
 from services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
 from services.openrouter_pricing import llm_pricing_sync_loop  # noqa: E402
+from services.remote_image import (  # noqa: E402
+    MAX_REMOTE_IMAGE_URL_CHARS,
+    RemoteImageError,
+    fetch_remote_image,
+)
 from services.audit_partitions import (  # noqa: E402
     maintenance_loop as audit_maintenance_loop,
 )
@@ -16718,6 +16723,54 @@ async def get_source_detail(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class RemoteImageRequest(BaseModel):
+    """An exact external image URL the Cockpit user chose to load once."""
+
+    url: str = Field(min_length=1, max_length=MAX_REMOTE_IMAGE_URL_CHARS)
+
+
+@app.post("/api/media/remote-image")
+async def load_remote_image(
+    request: Request,
+    body: RemoteImageRequest,
+) -> Response:
+    """Fetch one user-reviewed public raster image through a safe boundary.
+
+    The approved-user and CSRF gates apply before any outbound network work.
+    The fetcher pins public DNS results, revalidates redirects, strips browser
+    identity, and bounds/validates the bytes. URLs and image bytes are neither
+    logged here nor persisted.
+    """
+
+    await require_approved_user(request, postgres_db)
+    try:
+        image = await fetch_remote_image(body.url)
+    except RemoteImageError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
+    extension = {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/gif": "gif",
+        "image/webp": "webp",
+    }[image.media_type]
+    return Response(
+        content=image.content,
+        media_type=image.media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": f'inline; filename="remote-image.{extension}"',
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Cross-Origin-Resource-Policy": "same-origin",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/api/jobs/{job_id}/citations")

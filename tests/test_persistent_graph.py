@@ -2710,6 +2710,59 @@ class TestEmptyResponseRetry:
         callbacks.on_token.assert_any_call("recovered")
         assert messages[-1].content == "recovered"
 
+    @pytest.mark.asyncio
+    async def test_codex_in_stream_reasoning_then_empty_resets_unkeyed_and_reorders(
+        self,
+    ):
+        """The dev-journal scenario (thread b1758f38): a Responses-API stream
+        surfaces reasoning as a typed content block (UNKEYED frame, sink never
+        fires) then dead-ends empty. The retry must clear the stale bubble via
+        an UNKEYED reset and emit its own reasoning BEFORE the answer — never
+        as a trailing post-stream frame."""
+        events = []
+
+        async def _on_thinking(content, message_id=None):
+            events.append(("thinking", content, message_id))
+
+        async def _on_token(text):
+            events.append(("token", text))
+
+        async def _on_reset(message_id=None):
+            events.append(("reset", message_id))
+
+        async def _astream(messages, **kw):
+            yield AIMessage(
+                content=[{"type": "reasoning", "summary": [{"text": "dead-end"}]}]
+            )
+
+        retry = AIMessage(
+            content="recovered answer",
+            additional_kwargs={"reasoning_content": "retry reasoning"},
+        )
+        llm = AsyncMock()
+        llm.reasoning = True
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=retry)
+
+        callbacks = _make_callbacks(
+            on_thinking=_on_thinking,
+            on_token=_on_token,
+            on_thinking_reset=_on_reset,
+        )
+        _, messages = await _run_turn(llm, callbacks)
+
+        # The full broadcast order: attempt-1's unkeyed block frame, an
+        # unkeyed reset that can actually clear it, the retry's reasoning
+        # keyed to the persisted row, then the answer. Nothing after it.
+        assert events == [
+            ("thinking", "dead-end", None),
+            ("reset", None),
+            ("thinking", "retry reasoning", messages[-1].id),
+            ("token", "recovered answer"),
+        ]
+        # reasoning_content ⇒ the row id is pinned to the turn's minted id.
+        assert messages[-1].id.startswith("msg_")
+
 
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — LLM streaming fallback
@@ -3878,6 +3931,113 @@ class TestExecuteTurnReasoning:
         )
 
         assert _STREAM_REASONING_SINK.get() is None
+
+    @pytest.mark.asyncio
+    async def test_responses_in_stream_reasoning_unkeyed_no_fallback_no_pin(self):
+        """A Responses-API stream delivers reasoning as a typed content block:
+        it is emitted once (unkeyed, before the answer), the post-stream
+        fallback stays quiet, and the provider message id is NOT pinned (the
+        id round-trips into subsequent Responses requests)."""
+        events = []
+
+        async def _on_thinking(content, message_id=None):
+            events.append(("thinking", content, message_id))
+
+        async def _on_token(text):
+            events.append(("token", text))
+
+        response = AIMessage(
+            id="resp_test",
+            content=[
+                {"type": "reasoning", "summary": [{"text": "codex thoughts"}]},
+                {"type": "text", "text": "Answer."},
+            ],
+        )
+        llm = _make_streaming_llm(response)
+        llm.reasoning = True
+
+        callbacks = _make_callbacks(on_thinking=_on_thinking, on_token=_on_token)
+        _, messages = await _run_turn(llm, callbacks)
+
+        assert events == [
+            ("thinking", "codex thoughts", None),
+            ("token", "Answer."),
+        ]
+        assert messages[-1].id == "resp_test"
+
+    @pytest.mark.asyncio
+    async def test_empty_args_retry_emits_reasoning_before_answer(self):
+        """The empty-tool-args ainvoke retry emits the retry's reasoning
+        (parked in additional_kwargs by the non-streaming capture) BEFORE its
+        answer text, keyed to the pinned row id — not as a trailing frame."""
+        events = []
+
+        async def _on_thinking(content, message_id=None):
+            events.append(("thinking", content, message_id))
+
+        async def _on_token(text):
+            events.append(("token", text))
+
+        streamed = AIMessage(content="")
+        streamed.tool_calls = [
+            {"name": "some_tool", "args": {}, "id": "call_1", "type": "tool_call"}
+        ]
+        retry = AIMessage(
+            content="Answer.",
+            additional_kwargs={"reasoning_content": "retry thoughts"},
+        )
+        llm = _make_streaming_llm(streamed)
+        llm.reasoning = {"effort": "high", "summary": "auto"}
+        llm.ainvoke = AsyncMock(return_value=retry)
+
+        callbacks = _make_callbacks(on_thinking=_on_thinking, on_token=_on_token)
+        _, messages = await _run_turn(llm, callbacks)
+
+        llm.ainvoke.assert_awaited_once()
+        assert events == [
+            ("thinking", "retry thoughts", messages[-1].id),
+            ("token", "Answer."),
+        ]
+        assert messages[-1].id.startswith("msg_")
+
+    @pytest.mark.asyncio
+    async def test_streaming_failed_fallback_emits_reasoning_before_answer(self):
+        """The streaming-not-supported ainvoke fallback emits reasoning before
+        the answer text too (fixes the pre-existing trailing-frame ordering
+        for Chat-Completions models on this path)."""
+        events = []
+
+        async def _on_thinking(content, message_id=None):
+            events.append(("thinking", content, message_id))
+
+        async def _on_token(text):
+            events.append(("token", text))
+
+        class APIConnectionError(Exception):
+            pass
+
+        async def _astream(messages, **kw):
+            raise APIConnectionError("stream unsupported")
+            yield  # pragma: no cover — makes this an async generator
+
+        fallback = AIMessage(
+            content="Answer.",
+            additional_kwargs={"reasoning_content": "fallback thoughts"},
+        )
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+        llm.ainvoke = AsyncMock(return_value=fallback)
+
+        callbacks = _make_callbacks(on_thinking=_on_thinking, on_token=_on_token)
+        _, messages = await _run_turn(llm, callbacks)
+
+        llm.ainvoke.assert_awaited_once()
+        assert events == [
+            ("thinking", "fallback thoughts", messages[-1].id),
+            ("token", "Answer."),
+        ]
+        assert messages[-1].id.startswith("msg_")
 
 
 # ---------------------------------------------------------------------------

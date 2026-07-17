@@ -19,7 +19,7 @@ const CHALLENGE = 'c'.repeat(43);
 const READY_RECEIPT = 'r'.repeat(43);
 const EXCHANGE_CODE = 'e'.repeat(43);
 
-const FRAME_ANCESTORS = "frame-ancestors 'none'";
+const COCKPIT_CSP = "frame-ancestors 'none'; img-src 'self' blob: data:";
 const X_FRAME_OPTIONS = 'DENY';
 const MIME_TYPES = new Map([
   ['.css', 'text/css; charset=utf-8'],
@@ -46,7 +46,7 @@ if (!existsSync(resolve(DIST_ROOT, 'index.html'))) {
 
 const nginx = readFileSync(NGINX_CONFIG, 'utf8');
 if (
-  !nginx.includes(`Content-Security-Policy \"${FRAME_ANCESTORS}\"`) ||
+  !nginx.includes(`Content-Security-Policy \"${COCKPIT_CSP}\"`) ||
   !nginx.includes(`X-Frame-Options \"${X_FRAME_OPTIONS}\"`)
 ) {
   throw new Error(
@@ -162,7 +162,7 @@ function html(res, status, body, headers = {}) {
   res.writeHead(status, {
     'Cache-Control': 'private, no-store',
     'Content-Type': 'text/html; charset=utf-8',
-    'Content-Security-Policy': FRAME_ANCESTORS,
+    'Content-Security-Policy': COCKPIT_CSP,
     'X-Frame-Options': X_FRAME_OPTIONS,
     'Content-Length': Buffer.byteLength(body),
     ...headers,
@@ -494,7 +494,7 @@ function serveStatic(req, res, pathname) {
     'Cache-Control': 'private, no-store',
     'Content-Length': info.size,
     'Content-Type': MIME_TYPES.get(extname(filePath)) || 'application/octet-stream',
-    'Content-Security-Policy': FRAME_ANCESTORS,
+    'Content-Security-Policy': COCKPIT_CSP,
     'X-Frame-Options': X_FRAME_OPTIONS,
   };
   res.writeHead(200, headers);
