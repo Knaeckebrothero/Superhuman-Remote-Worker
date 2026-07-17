@@ -31,6 +31,7 @@ from .core.session_task_tools import (
     get_session_task_metadata,
 )
 from .delegation import create_delegation_tools, get_delegation_metadata
+from .email import create_email_tools, get_email_metadata
 
 # Import domain tools
 from .evaluation import create_evaluation_tools, get_evaluation_metadata
@@ -76,6 +77,7 @@ TOOL_REGISTRY.update(get_graph_metadata())
 TOOL_REGISTRY.update(get_sql_metadata())
 TOOL_REGISTRY.update(get_mongodb_metadata())
 TOOL_REGISTRY.update(get_webdav_metadata())
+TOOL_REGISTRY.update(get_email_metadata())
 TOOL_REGISTRY.update(get_git_metadata())
 TOOL_REGISTRY.update(get_shell_metadata())
 TOOL_REGISTRY.update(get_evaluation_metadata())
@@ -486,6 +488,21 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded webdav tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load webdav tools: {e}")
+
+    # Email datasource tools
+    if "email" in tools_by_category:
+        if not context.has_datasource("email"):
+            logger.warning("Email tools require an email datasource in ToolContext")
+        else:
+            try:
+                email_tools = create_email_tools(context)
+                requested = set(tools_by_category["email"])
+                for tool in email_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded email tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load email tools: {e}")
 
     # Git tools
     if "git" in tools_by_category:

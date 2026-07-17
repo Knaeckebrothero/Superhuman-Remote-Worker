@@ -6,11 +6,13 @@ import {ApiService} from '../../core/services/api.service';
 import {
     CredentialFileEntry,
     Datasource,
+    DatasourceConfig,
     DatasourceCreateRequest,
     DatasourceIndexStatus,
     DatasourceTestResult,
     DatasourceType,
     DatasourceUpdateRequest,
+    EmailAccessTier,
 } from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
@@ -152,6 +154,7 @@ import {UserService} from '../../core/services/user.service';
                     <option value="neo4j">{{ 'datasources.form.optNeo4j' | transloco }}</option>
                     <option value="mongodb">{{ 'datasources.form.optMongodb' | transloco }}</option>
                     <option value="webdav">{{ 'datasources.form.optWebdav' | transloco }}</option>
+                    <option value="email">{{ 'datasources.form.optEmail' | transloco }}</option>
                   </optgroup>
                   <optgroup [label]="'datasources.form.typeGroupCredentialFiles' | transloco">
                     <option value="kubeconfig">{{ 'datasources.form.optKubeconfig' | transloco }}</option>
@@ -413,6 +416,235 @@ import {UserService} from '../../core/services/user.service';
               </div>
             }
 
+            <!-- Email (IMAP/SMTP): provider preset, credentials, tier + scoping -->
+            @if (formData.type === 'email') {
+              <app-form-field [label]="'datasources.form.emailProviderLabel' | transloco">
+                <app-select
+                  size="sm"
+                  [value]="emailForm.provider"
+                  (changed)="onEmailProviderSelect($event)"
+                  [disabled]="isSaving()"
+                >
+                  <option value="custom">{{ 'datasources.form.emailProviderCustom' | transloco }}</option>
+                  <option value="gmail">{{ 'datasources.form.emailProviderGmail' | transloco }}</option>
+                  <option value="fastmail">{{ 'datasources.form.emailProviderFastmail' | transloco }}</option>
+                  <option value="icloud">{{ 'datasources.form.emailProviderIcloud' | transloco }}</option>
+                  <option value="yahoo">{{ 'datasources.form.emailProviderYahoo' | transloco }}</option>
+                  <option value="mailbox">{{ 'datasources.form.emailProviderMailbox' | transloco }}</option>
+                  <option value="gmx">{{ 'datasources.form.emailProviderGmx' | transloco }}</option>
+                </app-select>
+              </app-form-field>
+              @if (emailForm.provider === 'fastmail') {
+                <div class="form-hint">{{ 'datasources.form.emailProviderFastmailHint' | transloco }}</div>
+              }
+              @if (emailForm.provider === 'icloud') {
+                <div class="form-hint">{{ 'datasources.form.emailProviderIcloudHint' | transloco }}</div>
+              }
+              <div class="form-hint">{{ 'datasources.form.emailOauthNotice' | transloco }}</div>
+
+              <div class="form-row">
+                <app-form-field class="flex-1" [label]="'datasources.form.usernameLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    [value]="formCredentials.username"
+                    (valueChange)="formCredentials.username = $event"
+                    [placeholder]="'datasources.form.emailUsernamePlaceholder' | transloco"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+                <app-form-field
+                  class="flex-1"
+                  [label]="'datasources.form.emailPasswordLabel' | transloco"
+                  [hint]="'datasources.form.emailAppPasswordHint' | transloco"
+                >
+                  <app-input
+                    size="sm"
+                    type="password"
+                    [value]="formCredentials.password"
+                    (valueChange)="formCredentials.password = $event"
+                    [placeholder]="'datasources.form.passwordPlaceholder' | transloco"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+              </div>
+              @if (editingId()) {
+                <div class="credential-retain-hint">
+                  {{ 'datasources.form.credentialsRetainHint' | transloco }}
+                </div>
+              }
+
+              <div class="form-row">
+                <app-form-field class="flex-1" [label]="'datasources.form.emailImapHostLabel' | transloco" [required]="true">
+                  <app-input
+                    size="sm"
+                    class="mono"
+                    [value]="emailForm.imap_host"
+                    (valueChange)="emailForm.imap_host = $event"
+                    placeholder="imap.example.com"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+                <app-form-field [label]="'datasources.form.emailImapPortLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    class="mono"
+                    [value]="emailForm.imap_port"
+                    (valueChange)="emailForm.imap_port = $event"
+                    placeholder="993"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+                <app-form-field [label]="'datasources.form.emailSecurityLabel' | transloco">
+                  <app-select
+                    size="sm"
+                    [value]="emailForm.imap_security"
+                    (changed)="onEmailSecurityChange('imap', $event)"
+                    [disabled]="isSaving()"
+                  >
+                    <option value="ssl">{{ 'datasources.form.emailSecuritySsl' | transloco }}</option>
+                    <option value="starttls">{{ 'datasources.form.emailSecurityStarttls' | transloco }}</option>
+                  </app-select>
+                </app-form-field>
+              </div>
+
+              <app-form-field
+                [label]="'datasources.form.emailAccessLabel' | transloco"
+                [hint]="emailAccessHintKey() | transloco"
+              >
+                <app-select
+                  size="sm"
+                  [value]="emailForm.access"
+                  (changed)="onEmailAccessChange($event)"
+                  [disabled]="isSaving()"
+                >
+                  <option value="read">{{ 'datasources.form.emailAccessRead' | transloco }}</option>
+                  <option value="read_write">{{ 'datasources.form.emailAccessReadWrite' | transloco }}</option>
+                  <option value="draft">{{ 'datasources.form.emailAccessDraft' | transloco }}</option>
+                  <option value="send">{{ 'datasources.form.emailAccessSend' | transloco }}</option>
+                </app-select>
+              </app-form-field>
+
+              @if (emailForm.access === 'send') {
+                <div class="form-row">
+                  <app-form-field class="flex-1" [label]="'datasources.form.emailSmtpHostLabel' | transloco" [required]="true">
+                    <app-input
+                      size="sm"
+                      class="mono"
+                      [value]="emailForm.smtp_host"
+                      (valueChange)="emailForm.smtp_host = $event"
+                      placeholder="smtp.example.com"
+                      [disabled]="isSaving()"
+                    />
+                  </app-form-field>
+                  <app-form-field [label]="'datasources.form.emailSmtpPortLabel' | transloco">
+                    <app-input
+                      size="sm"
+                      class="mono"
+                      [value]="emailForm.smtp_port"
+                      (valueChange)="emailForm.smtp_port = $event"
+                      placeholder="587"
+                      [disabled]="isSaving()"
+                    />
+                  </app-form-field>
+                  <app-form-field [label]="'datasources.form.emailSecurityLabel' | transloco">
+                    <app-select
+                      size="sm"
+                      [value]="emailForm.smtp_security"
+                      (changed)="onEmailSecurityChange('smtp', $event)"
+                      [disabled]="isSaving()"
+                    >
+                      <option value="ssl">{{ 'datasources.form.emailSecuritySsl' | transloco }}</option>
+                      <option value="starttls">{{ 'datasources.form.emailSecurityStarttls' | transloco }}</option>
+                    </app-select>
+                  </app-form-field>
+                </div>
+              }
+
+              <app-form-field
+                [label]="'datasources.form.emailFoldersLabel' | transloco"
+                [hint]="'datasources.form.emailFoldersHint' | transloco"
+                [optional]="'datasources.form.optional' | transloco"
+              >
+                <app-input
+                  size="sm"
+                  class="mono"
+                  [value]="emailForm.folders"
+                  (valueChange)="emailForm.folders = $event"
+                  [placeholder]="'datasources.form.emailFoldersPlaceholder' | transloco"
+                  [disabled]="isSaving()"
+                />
+              </app-form-field>
+              @if (emailForm.access === 'send' && !emailForm.folders.trim()) {
+                <div class="trust-notice">
+                  <app-icon size="sm">warning</app-icon>
+                  <div>{{ 'datasources.form.emailSendFoldersWarning' | transloco }}</div>
+                </div>
+              }
+
+              <div class="form-row">
+                <app-form-field
+                  class="flex-1"
+                  [label]="'datasources.form.emailDraftsFolderLabel' | transloco"
+                  [optional]="'datasources.form.optional' | transloco"
+                >
+                  <app-input
+                    size="sm"
+                    class="mono"
+                    [value]="emailForm.drafts_folder"
+                    (valueChange)="emailForm.drafts_folder = $event"
+                    placeholder="Drafts"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+                <app-form-field
+                  class="flex-1"
+                  [label]="'datasources.form.emailFromAddressLabel' | transloco"
+                  [optional]="'datasources.form.optional' | transloco"
+                >
+                  <app-input
+                    size="sm"
+                    class="mono"
+                    [value]="emailForm.from_address"
+                    (valueChange)="emailForm.from_address = $event"
+                    placeholder="user@example.com"
+                    [disabled]="isSaving()"
+                  />
+                </app-form-field>
+              </div>
+
+              <app-form-field
+                [label]="'datasources.form.emailRecipientsLabel' | transloco"
+                [hint]="'datasources.form.emailRecipientsHint' | transloco"
+                [optional]="'datasources.form.optional' | transloco"
+              >
+                <app-input
+                  size="sm"
+                  class="mono"
+                  [value]="emailForm.recipient_allowlist"
+                  (valueChange)="emailForm.recipient_allowlist = $event"
+                  [placeholder]="'datasources.form.emailRecipientsPlaceholder' | transloco"
+                  [disabled]="isSaving()"
+                />
+              </app-form-field>
+
+              @if (emailForm.access === 'send') {
+                <app-form-field
+                  [label]="'datasources.form.emailUnattendedSendLabel' | transloco"
+                  [hint]="'datasources.form.emailUnattendedSendHint' | transloco"
+                >
+                  <label class="toggle-label">
+                    <input
+                      type="checkbox"
+                      [checked]="emailForm.unattended_send"
+                      (change)="emailForm.unattended_send = $any($event.target).checked"
+                      [disabled]="isSaving()"
+                    >
+                    {{ 'datasources.form.emailUnattendedSendToggle' | transloco }}
+                  </label>
+                </app-form-field>
+              }
+            }
+
             <!-- Kubeconfig: paste/upload YAML -->
             @if (formData.type === 'kubeconfig') {
               <app-form-field [label]="'datasources.form.kubeconfigLabel' | transloco" [required]="!editingId()">
@@ -595,8 +827,14 @@ import {UserService} from '../../core/services/user.service';
             }
 
             <!-- Visibility (publish) — rendered only with the public_datasources
-                 capability; the server enforces regardless. -->
-            @if (capabilities.canPublishDatasources()) {
+                 capability; the server enforces regardless. Email is never
+                 publishable (the server rejects is_global for mailboxes). -->
+            @if (capabilities.canPublishDatasources() && formData.type === 'email') {
+              <div class="credential-retain-hint">
+                {{ 'datasources.form.emailNotPublishableHint' | transloco }}
+              </div>
+            }
+            @if (capabilities.canPublishDatasources() && formData.type !== 'email') {
               <div class="form-row">
                 <app-form-field
                   [label]="'datasources.form.visibilityLabel' | transloco"
@@ -646,7 +884,7 @@ import {UserService} from '../../core/services/user.service';
                     variant="secondary"
                     size="sm"
                     [loading]="isTesting()"
-                    [disabled]="!formData.connection_url"
+                    [disabled]="formData.type === 'email' ? !canSave() : !formData.connection_url"
                     (clicked)="testFromForm()"
                   >
                     @if (isTesting()) {
@@ -1629,6 +1867,7 @@ export class DatasourceListComponent implements OnInit {
     { labelKey: 'datasources.filter.neo4j', value: 'neo4j' },
     { labelKey: 'datasources.filter.mongodb', value: 'mongodb' },
     { labelKey: 'datasources.filter.webdav', value: 'webdav' },
+    { labelKey: 'datasources.filter.email', value: 'email' },
     { labelKey: 'datasources.filter.kubeconfig', value: 'kubeconfig' },
     { labelKey: 'datasources.filter.ssh_key', value: 'ssh_key' },
     { labelKey: 'datasources.filter.generic_file', value: 'generic_file' },
@@ -1642,9 +1881,10 @@ export class DatasourceListComponent implements OnInit {
     return this.credentialFileTypes.includes(type as DatasourceType);
   }
 
-  /** True for types that connect to something with a URL (everything except credential-files). */
+  /** True for types that connect to something with a URL (everything except
+   *  credential-files and email, whose endpoints live in credentials.imap/smtp). */
   hasConnectionUrl(): boolean {
-    return !this.isCredentialFileType();
+    return !this.isCredentialFileType() && this.formData.type !== 'email';
   }
 
   isGitBackedType(type: DatasourceType | string = this.formData.type): boolean {
@@ -1705,6 +1945,19 @@ export class DatasourceListComponent implements OnInit {
         (f) => f.target_path.trim() && f.contents.length > 0,
       );
     }
+    if (this.formData.type === 'email') {
+      // Editing without touching credentials means "keep existing" — the
+      // stored imap/smtp endpoints live inside the (redacted) credentials.
+      const wantsCredentialUpdate =
+        !!this.formCredentials.username || !!this.formCredentials.password;
+      if (this.editingId() !== null && !wantsCredentialUpdate) return true;
+      return !!(
+        this.formCredentials.username &&
+        this.formCredentials.password &&
+        this.emailForm.imap_host.trim() &&
+        (this.emailForm.access !== 'send' || this.emailForm.smtp_host.trim())
+      );
+    }
     return !!this.formData.connection_url;
   }
 
@@ -1735,6 +1988,118 @@ export class DatasourceListComponent implements OnInit {
     username: '',
     password: '',
   };
+
+  // Email (IMAP/SMTP) form state. Endpoints are credentials (redacted on
+  // read-back, "leave blank to keep"); tier/scoping is non-secret config
+  // and round-trips through ds.config on edit.
+  emailForm: {
+    provider: string;
+    imap_host: string;
+    imap_port: string;
+    imap_security: 'ssl' | 'starttls';
+    smtp_host: string;
+    smtp_port: string;
+    smtp_security: 'ssl' | 'starttls';
+    access: EmailAccessTier;
+    folders: string;
+    drafts_folder: string;
+    from_address: string;
+    recipient_allowlist: string;
+    unattended_send: boolean;
+  } = this.defaultEmailForm();
+
+  /** Host/port/security presets for the app-password-capable providers
+   *  (docs/features/email_datasource.md "Provider reality"). */
+  private readonly emailProviderPresets: Record<
+    string,
+    {
+      imap_host: string;
+      imap_port: string;
+      imap_security: 'ssl' | 'starttls';
+      smtp_host: string;
+      smtp_port: string;
+      smtp_security: 'ssl' | 'starttls';
+    }
+  > = {
+    gmail: {
+      imap_host: 'imap.gmail.com', imap_port: '993', imap_security: 'ssl',
+      smtp_host: 'smtp.gmail.com', smtp_port: '587', smtp_security: 'starttls',
+    },
+    fastmail: {
+      imap_host: 'imap.fastmail.com', imap_port: '993', imap_security: 'ssl',
+      smtp_host: 'smtp.fastmail.com', smtp_port: '587', smtp_security: 'starttls',
+    },
+    icloud: {
+      imap_host: 'imap.mail.me.com', imap_port: '993', imap_security: 'ssl',
+      smtp_host: 'smtp.mail.me.com', smtp_port: '587', smtp_security: 'starttls',
+    },
+    yahoo: {
+      imap_host: 'imap.mail.yahoo.com', imap_port: '993', imap_security: 'ssl',
+      smtp_host: 'smtp.mail.yahoo.com', smtp_port: '465', smtp_security: 'ssl',
+    },
+    mailbox: {
+      imap_host: 'imap.mailbox.org', imap_port: '993', imap_security: 'ssl',
+      smtp_host: 'smtp.mailbox.org', smtp_port: '587', smtp_security: 'starttls',
+    },
+    gmx: {
+      imap_host: 'imap.gmx.net', imap_port: '993', imap_security: 'ssl',
+      smtp_host: 'mail.gmx.net', smtp_port: '465', smtp_security: 'ssl',
+    },
+  };
+
+  private defaultEmailForm(): DatasourceListComponent['emailForm'] {
+    return {
+      provider: 'custom',
+      imap_host: '',
+      imap_port: '993',
+      imap_security: 'ssl',
+      smtp_host: '',
+      smtp_port: '587',
+      smtp_security: 'starttls',
+      access: 'draft',
+      folders: '',
+      drafts_folder: 'Drafts',
+      from_address: '',
+      recipient_allowlist: '',
+      unattended_send: false,
+    };
+  }
+
+  onEmailProviderSelect(value: string | null): void {
+    this.emailForm.provider = value || 'custom';
+    const preset = this.emailProviderPresets[this.emailForm.provider];
+    if (preset) {
+      this.emailForm.imap_host = preset.imap_host;
+      this.emailForm.imap_port = preset.imap_port;
+      this.emailForm.imap_security = preset.imap_security;
+      this.emailForm.smtp_host = preset.smtp_host;
+      this.emailForm.smtp_port = preset.smtp_port;
+      this.emailForm.smtp_security = preset.smtp_security;
+    }
+  }
+
+  onEmailAccessChange(value: string | null): void {
+    if (value === 'read' || value === 'read_write' || value === 'draft' || value === 'send') {
+      this.emailForm.access = value;
+    }
+  }
+
+  onEmailSecurityChange(which: 'imap' | 'smtp', value: string | null): void {
+    const security = value === 'starttls' ? 'starttls' : 'ssl';
+    if (which === 'imap') this.emailForm.imap_security = security;
+    else this.emailForm.smtp_security = security;
+  }
+
+  /** One-line description for the currently selected access tier. */
+  emailAccessHintKey(): string {
+    const suffixes: Record<EmailAccessTier, string> = {
+      read: 'emailAccessHintRead',
+      read_write: 'emailAccessHintReadWrite',
+      draft: 'emailAccessHintDraft',
+      send: 'emailAccessHintSend',
+    };
+    return `datasources.form.${suffixes[this.emailForm.access]}`;
+  }
 
   // Repository auth form state
   gitAuthMethod: 'token' | 'ssh' = 'token';
@@ -1794,6 +2159,18 @@ export class DatasourceListComponent implements OnInit {
     // API. The user re-enters them only if they want to change the stored
     // value — submitting blank fields leaves the secret untouched.
     this.formCredentials = { username: '', password: '' };
+    // Email: the non-secret tier/scoping config round-trips; the imap/smtp
+    // endpoints live inside the redacted credentials and stay blank.
+    this.emailForm = this.defaultEmailForm();
+    if (ds.type === 'email') {
+      const cfg = ds.config ?? {};
+      this.emailForm.access = cfg.access ?? 'draft';
+      this.emailForm.folders = (cfg.folders ?? []).join(', ');
+      this.emailForm.drafts_folder = cfg.drafts_folder ?? 'Drafts';
+      this.emailForm.from_address = cfg.from_address ?? '';
+      this.emailForm.recipient_allowlist = (cfg.recipient_allowlist ?? []).join(', ');
+      this.emailForm.unattended_send = cfg.unattended_send ?? false;
+    }
     // Repository auth: pick the right tab based on cli_hint so the user
     // sees the same auth method they'd previously configured, but the
     // SSH key field stays blank for the same "leave blank to keep" reason.
@@ -1929,6 +2306,8 @@ export class DatasourceListComponent implements OnInit {
       this.formData.type = value;
       // kb datasources are read-only by architecture (OKF org-vault policy).
       if (value === 'kb') this.formData.read_only = true;
+      // Mailboxes are private-only; the server rejects is_global for email.
+      if (value === 'email') this.formData.is_global = false;
       this.onTypeChange();
     }
   }
@@ -1972,6 +2351,7 @@ export class DatasourceListComponent implements OnInit {
       case 'neo4j':
         return 'success';
       case 'webdav':
+      case 'email':
         return 'warning';
       case 'mongodb':
         return 'neutral';
@@ -2039,9 +2419,7 @@ export class DatasourceListComponent implements OnInit {
         credentials: creds,
         cli_hint: this.formData.cli_hint || undefined,
         default_branch: this.formData.default_branch || undefined,
-        config: this.formData.type === 'kb'
-          ? {root_path: this.formData.root_path.trim()}
-          : undefined,
+        config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
         read_only: this.formData.is_global
           ? (this.formData.type === 'kb' ? true : this.formData.read_only)
@@ -2078,9 +2456,7 @@ export class DatasourceListComponent implements OnInit {
         credentials: creds,
         cli_hint: this.formData.cli_hint || undefined,
         default_branch: this.formData.default_branch || undefined,
-        config: this.formData.type === 'kb'
-          ? {root_path: this.formData.root_path.trim()}
-          : undefined,
+        config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
         read_only: this.formData.is_global
           ? (this.formData.type === 'kb' ? true : this.formData.read_only)
@@ -2120,8 +2496,10 @@ export class DatasourceListComponent implements OnInit {
         },
       });
     } else {
-      // For new datasources, save first then test
-      if (!this.formData.name || !this.formData.connection_url) return;
+      // For new datasources, save first then test (email carries its
+      // endpoints in credentials instead of a connection URL)
+      if (!this.formData.name) return;
+      if (!this.formData.connection_url && this.formData.type !== 'email') return;
       this.isSaving.set(true);
       this.formTestResult.set(null);
 
@@ -2132,9 +2510,7 @@ export class DatasourceListComponent implements OnInit {
         description: this.formData.description || undefined,
         credentials: this.buildCredentials(),
         default_branch: this.formData.default_branch || undefined,
-        config: this.formData.type === 'kb'
-          ? {root_path: this.formData.root_path.trim()}
-          : undefined,
+        config: this.buildTypeConfig(),
       };
 
       this.api.createDatasource(create).subscribe({
@@ -2263,6 +2639,7 @@ export class DatasourceListComponent implements OnInit {
       neo4j: 'hub',
       mongodb: 'eco',
       webdav: 'cloud',
+      email: 'mail',
       kubeconfig: 'rocket_launch',
       ssh_key: 'key',
       generic_file: 'description',
@@ -2358,6 +2735,33 @@ export class DatasourceListComponent implements OnInit {
     this.envVars.splice(index, 1);
   }
 
+  /** Non-secret, type-specific config for the create/update/test payloads.
+   *  `undefined` for types without config so the column stays untouched. */
+  private buildTypeConfig(): DatasourceConfig | undefined {
+    if (this.formData.type === 'kb') {
+      return {root_path: this.formData.root_path.trim()};
+    }
+    if (this.formData.type === 'email') {
+      return {
+        access: this.emailForm.access,
+        folders: this.parseListInput(this.emailForm.folders),
+        drafts_folder: this.emailForm.drafts_folder.trim() || 'Drafts',
+        from_address: this.emailForm.from_address.trim(),
+        recipient_allowlist: this.parseListInput(this.emailForm.recipient_allowlist),
+        unattended_send: this.emailForm.unattended_send,
+      };
+    }
+    return undefined;
+  }
+
+  /** Split a comma-separated text input into trimmed, non-empty entries. */
+  private parseListInput(value: string): string[] {
+    return value
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+
   private buildCredentials(): Record<string, unknown> | undefined {
     // F3: when editing, blank credentials mean "leave existing alone"
     // (the API never returns credentials, so the form can't show them
@@ -2403,6 +2807,32 @@ export class DatasourceListComponent implements OnInit {
       const file: CredentialFileEntry = { contents };
       return { files: [file] };
     }
+    if (this.formData.type === 'email') {
+      // F3 again: blank username+password on edit means "keep the stored
+      // credentials" (which carry the imap/smtp endpoints too).
+      if (isEditing && !this.formCredentials.username && !this.formCredentials.password) {
+        return undefined;
+      }
+      const creds: Record<string, unknown> = {
+        backend: 'imap_smtp',
+        username: this.formCredentials.username,
+        password: this.formCredentials.password,
+        imap: {
+          host: this.emailForm.imap_host.trim(),
+          port: Number(this.emailForm.imap_port) || 993,
+          security: this.emailForm.imap_security,
+        },
+      };
+      // SMTP is only needed (and only validated) at the send tier.
+      if (this.emailForm.access === 'send') {
+        creds['smtp'] = {
+          host: this.emailForm.smtp_host.trim(),
+          port: Number(this.emailForm.smtp_port) || 587,
+          security: this.emailForm.smtp_security,
+        };
+      }
+      return creds;
+    }
     if (this.formData.type === 'generic_file') {
       const entries: CredentialFileEntry[] = [];
       for (const f of this.genericFiles) {
@@ -2440,6 +2870,7 @@ export class DatasourceListComponent implements OnInit {
     };
     this.editingOriginal = null;
     this.formCredentials = { username: '', password: '' };
+    this.emailForm = this.defaultEmailForm();
     this.gitAuthMethod = 'token';
     this.gitSshKey = '';
     this.envVars = [];

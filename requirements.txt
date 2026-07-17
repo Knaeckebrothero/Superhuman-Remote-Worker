@@ -62,6 +62,9 @@ python-multipart>=0.0.6
 # Optional: MongoDB for LLM request archiving
 pymongo>=4.6.0
 webdavclient3>=3.14.0
+# IMAP client for the email datasource tools (src/tools/email/); SMTP send
+# uses stdlib smtplib. Zero-dependency, Apache-2.0.
+imap-tools>=1.13.0
 # System metrics for agent heartbeats
 psutil>=5.9.0
 # Optional: Claude Code delegation tool (requires Claude Code CLI)
