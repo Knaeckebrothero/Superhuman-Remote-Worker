@@ -776,6 +776,17 @@ export class PersistentChatService {
         threadId: string;
         control: CanvasSourceUpdatedControl | CanvasPresentationUpdatedControl;
     } | null = null;
+    /**
+     * Control frames issued while the control WS wasn't OPEN, tagged with the
+     * thread they were issued for. Drained by _installControlWs's onopen.
+     *
+     * Queued on the service rather than on a socket object on purpose — see
+     * _sendControl for why the socket is the wrong place to hang them.
+     */
+    private controlOutbox: {threadId: string; frame: string}[] = [];
+    /** Depth cap for `controlOutbox`. These are user clicks, so the realistic
+     *  depth is 1–2; the cap only stops a wedged socket growing it forever. */
+    private static readonly CONTROL_OUTBOX_MAX = 32;
     private intentionalClose = false;
     /**
      * Guard against double-opening the control WS while an async
@@ -1653,6 +1664,9 @@ export class PersistentChatService {
             ) return;
             this.controlWsReconnectAttempt = 0;
             this.controlWsLastMessageAt = Date.now();
+            // Drain user-issued commands first — they've been waiting on this
+            // socket. Must precede the canvas block, which early-returns.
+            this._flushControlOutbox(threadId, ws);
             const pending = this.pendingCanvasSourceUpdate;
             if (!pending || pending.threadId !== threadId) return;
             try {
@@ -1814,30 +1828,59 @@ export class PersistentChatService {
         void this._openControlWs(tid);
     }
 
-    /** Send a control-plane command. If the WS isn't open, open it; the
-     *  send goes out as soon as the connection establishes. */
+    /** Send a control-plane command. If the WS isn't open, queue the frame and
+     *  open one; the send goes out as soon as the connection establishes. */
     private _sendControl(data: Record<string, unknown>): void {
+        const frame = JSON.stringify(data);
         if (this.controlWs?.readyState === WebSocket.OPEN) {
-            this.controlWs.send(JSON.stringify(data));
-            return;
-        }
-        // Best-effort: queue by re-opening and sending on next 'open'.
-        this._ensureControlWs();
-        const ws = this.controlWs;
-        if (!ws) return;
-        const threadId = this.threadId();
-        const sendWhenOpen = () => {
-            ws.removeEventListener('open', sendWhenOpen);
-            if (
-                this.controlWs === ws &&
-                !this.intentionalClose &&
-                this.threadId() === threadId &&
-                ws.readyState === WebSocket.OPEN
-            ) {
-                ws.send(JSON.stringify(data));
+            try {
+                this.controlWs.send(frame);
+                return;
+            } catch {
+                // Socket died between the readyState read and the write. Fall
+                // through and queue rather than losing the command.
             }
-        };
-        ws.addEventListener('open', sendWhenOpen);
+        }
+        // Queue on the service, not on the socket. This used to attach a
+        // one-shot 'open' listener to `this.controlWs` — but _ensureControlWs
+        // only kicks off _openControlWs, which awaits _resolveConnection before
+        // _installControlWs assigns the new socket. So the socket readable here
+        // is still the OLD one: CLOSED (never fires 'open' again) or null (the
+        // old code returned outright). Either way the frame vanished silently,
+        // taking upgrade clicks, permission decisions and slash commands with
+        // it. Only a CONNECTING socket ever worked.
+        const threadId = this.threadId();
+        if (!threadId || this.intentionalClose) return;
+        this.controlOutbox.push({threadId, frame});
+        if (this.controlOutbox.length > PersistentChatService.CONTROL_OUTBOX_MAX) {
+            this.controlOutbox.shift();
+        }
+        this._ensureControlWs();
+    }
+
+    /** Drain frames queued for `threadId` over a freshly-opened socket.
+     *
+     * Frames tagged for any other thread are dropped rather than carried: a
+     * control verb is a command about a specific moment ("approve *this*
+     * permission"), so replaying one into another thread would act on the
+     * wrong target. Anything still unsent (socket died mid-drain) is kept for
+     * the next open. */
+    private _flushControlOutbox(threadId: string, ws: WebSocket): void {
+        if (this.controlOutbox.length === 0) return;
+        const queued = this.controlOutbox;
+        this.controlOutbox = [];
+        for (const item of queued) {
+            if (item.threadId !== threadId) continue;
+            if (ws.readyState !== WebSocket.OPEN) {
+                this.controlOutbox.push(item);
+                continue;
+            }
+            try {
+                ws.send(item.frame);
+            } catch {
+                this.controlOutbox.push(item);
+            }
+        }
     }
 
     /**
@@ -1947,6 +1990,13 @@ export class PersistentChatService {
             this.sse.close();
             this.sse = null;
         }
+        // Unlike the message outbox above, queued control frames DO get dropped
+        // here. A control verb is scoped to a moment ("approve this permission",
+        // "upgrade now"); replaying one after a thread switch would act on a
+        // target that no longer exists. The socket-level reconnect loop
+        // (onclose → _scheduleControlWsReconnect) never routes through
+        // disconnect(), so an ordinary drop-and-reconnect still delivers.
+        this.controlOutbox = [];
         const controlWs = this.controlWs;
         this.controlWs = null;
         if (controlWs) {

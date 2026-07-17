@@ -22,6 +22,12 @@ so the agent-facing output (``{dom, url, title, screenshot, tabs}`` with
 ``[N]`` element refs) is unchanged. URL validation and content-nonce wrapping
 stay on the agent side — this program only executes.
 
+``navigate`` accepts ``file://`` URLs even though browser-use blocks them
+outright: they are rendered through a loopback HTTP listener rooted at the
+workspace, so ``url`` in the reply is the served ``http://127.0.0.1:<port>/...``
+address rather than the ``file://`` one that was requested. Without this an
+agent cannot look at any mockup it writes itself. See ``LocalFileServer``.
+
 Requires browser-use + Playwright Chromium in the workspace image. Chromium
 is pinned via the explicit ``agent-chromium`` symlink (``BROWSER_EXEC_CHROMIUM``,
 created in Dockerfile.workspace / the VM base provision) rather than
@@ -38,7 +44,11 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
 
 SOCKET_PATH = os.environ.get("BROWSER_EXEC_SOCKET", "/tmp/browser-exec.sock")
 # Default under the agent-host home (not /tmp) so the workspace snapshot captures
@@ -60,6 +70,19 @@ PROFILE_DIR = os.environ.get(
 # (which isn't on the image, and which every browser-use >=0.13 CDP build reaches
 # for when it can't find a browser). See docs/features/browser_workspace_executor.md §5.1.
 CHROMIUM_PATH = os.environ.get("BROWSER_EXEC_CHROMIUM", "/usr/local/bin/agent-chromium")
+# Directory exposed to the browser when rendering a local file (see
+# LocalFileServer). Defaults to the agent's workspace; override only to widen or
+# narrow that root deliberately.
+#
+# WORKSPACE_DEFAULT resolves through $HOME, so it is only right when browser-exec
+# runs as the workspace user — which it does: the agent spawns it over its own
+# SSH session, and the orchestrator connects as ``agent-host`` on every backend
+# (orchestrator/main.py). Verified /home/agent-host/workspace on both the VM and
+# container images. Run as some other user (root, a systemd unit) $HOME/workspace
+# won't exist and each file falls back to its own directory — still renders, but
+# assets referenced above that directory would 404.
+SERVE_ROOT = os.environ.get("BROWSER_EXEC_SERVE_ROOT")
+WORKSPACE_DEFAULT = Path.home() / "workspace"
 
 # Actions that take a positional integer ``ref`` from a prior snapshot.
 VALID_ACTIONS = {
@@ -81,6 +104,128 @@ def log(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Local file rendering (file:// → loopback HTTP)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _QuietHandler(SimpleHTTPRequestHandler):
+    """SimpleHTTPRequestHandler that logs through ``log`` (stderr, prefixed).
+
+    The default handler writes access lines straight to stderr unprefixed. Route
+    them through ``log`` instead so the daemon log stays greppable — the fetches
+    a page makes (missing CSS, 404 assets) are the first thing you want when a
+    mockup renders unstyled.
+    """
+
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+        log("http " + (fmt % args))
+
+
+class LocalFileServer:
+    """Serves local files to the browser over a loopback HTTP listener.
+
+    Why this exists: browser-use's security watchdog rejects any URL without a
+    hostname *before* it consults ``allowed_domains``::
+
+        # browser_use/browser/watchdogs/security_watchdog.py
+        if parsed.scheme in ['data', 'blob']:
+            return True
+        host = parsed.hostname
+        if not host:
+            return False          # ← file:///... lands here, unconditionally
+
+    So ``file://`` is refused on every workspace backend and no setting turns it
+    off. Since every mockup an agent writes is a local file, the practical effect
+    was that agents could not look at their own work — they'd conclude no
+    renderer existed at all. See docs/issues/vm_workspace_missing_browser_exec.md.
+
+    Why serve over HTTP instead of patching the watchdog: patching a vendored
+    library's security control is fragile across upgrades, and browser-use is
+    pinned but not frozen. Navigating to a real ``http://`` URL is the supported
+    path and needs no patching.
+
+    Why the root is bounded: a page served from ``http://127.0.0.1:<port>`` shares
+    an origin with everything else under that port, so the served root is exactly
+    what a rendered page could fetch and exfiltrate. Rooting at ``/`` would let
+    any rendered HTML read the whole disk — strictly worse than ``file://``, which
+    Chrome gives an opaque origin per document. So the root is the agent's own
+    workspace: content the agent already controls, and which by policy holds no
+    internal credentials (docs feedback: creds never in the workspace). Files
+    outside the workspace fall back to their own directory.
+
+    The listener binds 127.0.0.1 inside the workspace, so it stays within the
+    same loopback boundary browser-exec exists to enforce — it is never reachable
+    from the pod/VM network.
+    """
+
+    def __init__(self) -> None:
+        self._servers: dict[str, tuple] = {}
+        self._lock = threading.Lock()
+
+    def _root_for(self, path: Path) -> Path:
+        """Widest sanctioned directory containing ``path``."""
+        for candidate in (SERVE_ROOT, WORKSPACE_DEFAULT):
+            if not candidate:
+                continue
+            try:
+                root = Path(candidate).resolve()
+            except OSError:
+                continue
+            if root.is_dir() and path.is_relative_to(root):
+                return root
+        # Outside the workspace: expose only the file's own directory, so a
+        # stray render can't turn into a filesystem-wide read.
+        return path.parent
+
+    def _port_for(self, root: Path) -> int:
+        key = str(root)
+        with self._lock:
+            existing = self._servers.get(key)
+            if existing is not None:
+                return existing[1]
+            handler = partial(_QuietHandler, directory=key)
+            # Port 0 → kernel picks a free ephemeral port; bound to loopback only.
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            port = httpd.server_address[1]
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            self._servers[key] = (httpd, port)
+            log(f"serving {root} on http://127.0.0.1:{port}/ (local file render)")
+            return port
+
+    def url_for(self, url: str) -> str:
+        """Translate a ``file://`` URL to a served ``http://`` one. Others pass through."""
+        parsed = urlparse(url)
+        if parsed.scheme != "file":
+            return url
+
+        path = Path(unquote(parsed.path)).resolve()
+        if not path.exists():
+            raise ValueError(f"local file not found: {path}")
+        if path.is_dir():
+            raise ValueError(f"refusing to render a directory: {path}")
+
+        root = self._root_for(path)
+        port = self._port_for(root)
+        served = f"http://127.0.0.1:{port}/{quote(path.relative_to(root).as_posix())}"
+        if parsed.query:
+            served += f"?{parsed.query}"
+        if parsed.fragment:
+            served += f"#{parsed.fragment}"
+        log(f"file:// is blocked by browser-use — rendering via {served}")
+        return served
+
+    def close(self) -> None:
+        with self._lock:
+            for httpd, _ in self._servers.values():
+                try:
+                    httpd.shutdown()
+                    httpd.server_close()
+                except Exception:
+                    pass
+            self._servers.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Daemon: holds the persistent browser-use session
 # ─────────────────────────────────────────────────────────────────────
 
@@ -92,6 +237,7 @@ class BrowserDaemon:
         self._session = None
         self._lock = asyncio.Lock()
         self.should_exit = False
+        self._files = LocalFileServer()
 
     async def _get_session(self):
         """Return a healthy BrowserSession, (re)starting Chromium if needed."""
@@ -255,13 +401,18 @@ class BrowserDaemon:
             try:
                 if action == "shutdown":
                     await self._close_session()
+                    self._files.close()
                     self.should_exit = True
                     return {"ok": True}
 
                 session = await self._get_session()
 
                 if action == "navigate":
-                    await session.navigate_to(args["url"])
+                    # file:// is blocked outright by browser-use's watchdog, so a
+                    # local path is rendered through a loopback HTTP listener
+                    # rooted at the workspace. Non-file URLs pass through
+                    # untouched. See LocalFileServer.
+                    await session.navigate_to(self._files.url_for(args["url"]))
                     return await self._page_state(session, args)
                 if action == "snapshot":
                     return await self._page_state(session, args)

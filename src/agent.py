@@ -764,19 +764,25 @@ class UniversalAgent:
                 job_id, metadata, resume=resume
             )
 
-            # Handle frozen job resume
+            # Handle frozen job resume. Backend-aware check: a local Path.exists()
+            # never sees the marker on remote workspaces.
             if resume:
-                frozen_path = self._workspace_manager.get_path("output/job_frozen.json")
-                if frozen_path.exists():
+                if self._workspace_manager.exists("output/job_frozen.json"):
                     logger.info(f"Resuming frozen job {job_id}")
                     # Remove the frozen marker so the graph can continue
-                    frozen_path.unlink()
+                    self._workspace_manager.delete_file("output/job_frozen.json")
                     logger.info("Removed job_frozen.json to allow continuation")
                     # NOTE: Status is set to 'processing' by the orchestrator
                     # when it dispatches/resumes the job — no DB write needed here.
 
             # Load tools for this job
             await self._setup_job_tools()
+
+            # Phase 0: commit + push the fully seeded workspace so the job's
+            # inputs (instructions, brief, documents, README) are visible in
+            # the repo before the first phase archive commit.
+            if not resume:
+                self._commit_workspace_seed(job_id)
 
             # Fail-closed guard: a memory-required job must not run "blind" if its
             # embedding-backed stores failed to initialize (e.g. the dispatch
@@ -2107,9 +2113,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Check if resuming an existing workspace
         if resume and self._workspace_manager.path.exists():
             logger.info(f"Resuming job {job_id} with existing workspace")
-            # Verify workspace has required files
-            instructions_path = self._workspace_manager.path / "instructions.md"
-            if not instructions_path.exists():
+            # Verify workspace has required files (backend-aware — a local
+            # Path.exists() is always False on remote workspaces and would
+            # clobber user-provided instructions with the template)
+            if not self._workspace_manager.exists("instructions.md"):
                 # Only write instructions if missing
                 instructions = load_instructions(
                     self.config, model=self.config.llm.model
@@ -2234,6 +2241,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._workspace_manager.write_file("task_brief.md", brief_content)
         self._agent_seed_files["task_brief.md"] = brief_content
         logger.debug("Wrote task_brief.md to workspace")
+
+        # Give the repo a meaningful landing page: replace the Gitea auto-init
+        # stub README (or write one when absent) with the job description.
+        # Project jobs and subjobs run on branches of shared repos whose README
+        # belongs to the project — a real README is never touched.
+        try:
+            self._write_job_readme(job_id, metadata)
+        except Exception as e:
+            logger.warning(f"Failed to write job README (non-fatal): {e}")
 
         # Process initial_files from config (templates seeded into the workspace)
         if self.config.workspace.initial_files:
@@ -2948,6 +2964,69 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             # Neo4j is optional: do not mark vector search/read as degraded.
             logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
 
+    # Gitea auto-inits per-job repos with a stub README of the form
+    # "# job-xxxxxxxx\n\nWorkspace for job-xxxxxxxx"; anything else is a real
+    # README that must not be replaced.
+    _GITEA_STUB_README_MARKER = "Workspace for job-"
+
+    def _write_job_readme(self, job_id: str, metadata: Dict[str, Any]) -> None:
+        """Write a human-readable README.md for per-job workspace repos.
+
+        Replaces the Gitea auto-init stub (or creates a README when absent)
+        with the job description, so the repo landing page describes the job
+        instead of just naming its id. Shared-repo READMEs (project jobs,
+        subjobs) never match the stub pattern and are left untouched.
+        """
+        ws = self._workspace_manager
+        if ws.exists("README.md"):
+            existing = ws.read_file("README.md").strip()
+            is_stub = (
+                existing.startswith("# job-")
+                and self._GITEA_STUB_README_MARKER in existing
+                and len(existing) < 300
+            )
+            if not is_stub:
+                return
+        description = (metadata.get("description") or "").strip()
+        config_name = metadata.get("config_name") or "default"
+        lines = [f"# Job {job_id[:8]}", ""]
+        if description:
+            lines += [description, ""]
+        lines += [
+            "---",
+            "",
+            f"Workspace repository for job `{job_id}` (config: `{config_name}`).",
+            "See `instructions.md` for the task instructions and `task_brief.md` "
+            "for the brief.",
+            "",
+        ]
+        content = "\n".join(lines)
+        ws.write_file("README.md", content)
+        self._agent_seed_files["README.md"] = content
+        logger.debug("Wrote job README.md to workspace")
+
+    def _commit_workspace_seed(self, job_id: str) -> None:
+        """Commit and push the seeded workspace as the Phase 0 baseline.
+
+        Runs after all seeding (instructions, task brief, documents, README,
+        bound skills) so the job's inputs are visible in the repo immediately,
+        instead of first appearing in the phase 1 archive commit.
+        """
+        git_mgr = (
+            self._workspace_manager.git_manager if self._workspace_manager else None
+        )
+        if not git_mgr or not git_mgr.is_active:
+            return
+        try:
+            committed = git_mgr.commit(
+                "[Phase 0 Seed] Workspace seeded: instructions and input files",
+                allow_empty=False,
+            )
+            if committed:
+                git_mgr.push()
+        except Exception as e:
+            logger.warning(f"[{job_id}] Phase 0 seed commit failed (non-fatal): {e}")
+
     def _deploy_instruction_files(self, loaded_tool_names: List[str]) -> None:
         """Deploy instruction files to workspace with Jinja2 rendering.
 
@@ -2965,9 +3044,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             load_instructions,
         )
 
-        # instructions.md — only deploy template if not already present (upload/inline)
-        instructions_path = self._workspace_manager.get_path("instructions.md")
-        if not instructions_path.exists():
+        # instructions.md — only deploy template if not already present (upload/inline).
+        # Must go through the backend: get_path().exists() checks the agent pod's
+        # local filesystem and is always False on remote workspaces, which used to
+        # clobber user-provided instructions with the template.
+        if not self._workspace_manager.exists("instructions.md"):
             instructions = load_instructions(self.config, model=self.config.llm.model)
             instructions = render_instruction_content(instructions, loaded_tool_names)
             self._workspace_manager.write_file("instructions.md", instructions)
