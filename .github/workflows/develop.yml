@@ -547,24 +547,47 @@ jobs:
           # Packer template that drives it, .playwright-version, the cloud-init
           # seed, or the stage1 containerDisk wrapper. Otherwise the existing
           # GHCR :latest is reused — stage2 just pulls it.
+          #
+          # docker/assert-browser-stack.sh is the SHARED browser-stack contract
+          # asserted at the end of stage2 but satisfied largely by stage1 (it
+          # requires browser_use, playwright, and agent-chromium, all installed
+          # in provision-stage1.sh). It lives here, in the STAGE1 list, so a
+          # stricter gate forces a stage1 rebuild — otherwise stage2 runs the new
+          # gate against a stale stage1 that lacks the newly-required capability
+          # and fails every build. That is exactly what happened when 9fe74797
+          # added the browser_use requirement: stage1 was never rebuilt (VM jobs
+          # were skipped on the red-test-python runs), so stage2's gate rejected
+          # the pre-browser_use stage1. Since stage2 also rebuilds whenever stage1
+          # does (VM_BASE_STAGE1 is an OR-trigger for build-agent-vm-base), gate
+          # requirements that are actually stage2-side stay covered too.
           VM_BASE_STAGE1=$(has_changes "$SHA_VM_BASE" \
             docker/agent-vm-base/scripts/provision-stage1.sh \
             docker/agent-vm-base/scripts/cleanup-stage1.sh \
             docker/agent-vm-base/stage1.pkr.hcl \
             docker/agent-vm-base/Dockerfile.containerDisk-stage1 \
             docker/agent-vm-base/cloud-init/ \
+            docker/assert-browser-stack.sh \
             .playwright-version)
 
           # Stage2 (the per-commit image) rebuilds on changes to its provisioning
           # script, Packer template, cleanup script, daemon/sudo-gate config
           # files, or the containerDisk wrapper. Sudo-gate binary changes also
           # trigger this via SUDO_GATE below.
+          #
+          # docker/browser-exec is uploaded (stage2.pkr.hcl, `../browser-exec`)
+          # and installed into the stage2 layer by provision-stage2.sh, so a
+          # change to it needs only the cheap stage2 rebuild — the same reason it
+          # is watched for the container workspace under WORKSPACE above. Missing
+          # it here would let a browser-exec fix sit unbuilt in the VM image while
+          # the container image shipped it, the same silent-drift bug the
+          # WORKSPACE comment records for a0ce92d2.
           VM_BASE=$(has_changes "$SHA_VM_BASE" \
             docker/agent-vm-base/scripts/provision-stage2.sh \
             docker/agent-vm-base/scripts/cleanup.sh \
             docker/agent-vm-base/stage2.pkr.hcl \
             docker/agent-vm-base/Dockerfile.containerDisk \
-            docker/agent-vm-base/files/)
+            docker/agent-vm-base/files/ \
+            docker/browser-exec)
 
           SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
             vm/sudo-daemon/ vm/sudo-plugin/)
