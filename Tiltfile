@@ -288,6 +288,7 @@ docker_build(
         'docker/Dockerfile.workspace',
         'docker/workspace-entrypoint.sh',
         'docker/browser-exec',
+        'docker/assert-browser-stack.sh',
     ],
     ignore=[
         '.git/',

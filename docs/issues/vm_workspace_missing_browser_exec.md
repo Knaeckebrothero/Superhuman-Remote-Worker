@@ -1,33 +1,45 @@
-# VM workspaces ship Chromium but no `browser-exec` — agents conclude "no renderer" and memory calcifies it
+# Agents cannot render their own HTML — two stacked blockers (VM lacks `browser-exec`; `file://` blocked platform-wide)
 
-> **Status**: Diagnosed 2026-07-17, **UNFIXED**. Root cause confirmed by code inspection
-> (§2); two runtime assertions still owed (§6).
+> **Status**: Diagnosed **and fixed** 2026-07-17. All claims below are now **measured on the
+> live VM**, not inferred (§6). Fix built + verified end-to-end; **uncommitted**.
 > **Found via**: job `4eba7f2f-3e24-4b52-82c3-1929ce8c6771` — "Design the UI theme and
 > complete mockup suite for Hotel Rheinland ERP", main dev cluster. A 40+-screen HTML
 > design job that has visually verified **zero** of its mockups.
-> **Severity**: High for VM-backed visual/frontend work. The RSI loop runs on VMs.
+> **Severity**: High. Blocker 1 is VM-only (the RSI loop runs on VMs); **blocker 2 affects every
+> backend**, container included.
+> **Note**: the filename under-describes this — blocker 2 has nothing to do with VMs.
 > **Related**: `docs/features/browser_workspace_executor.md`,
 > `docs/issues/remove_local_browser_fallback.md`, `project_vm_golden_image`.
 
 ## TL;DR
 
-The `browser-exec` migration wired the **container** workspace image only. The **VM** golden
-image installs Playwright Chromium and the `agent-chromium` symlink — but never `browser-use`
-or the `browser-exec` script itself. Since the in-pod fallback was removed (2026-06-11),
-`browser-exec` is the **only** browser path. Therefore **VM-backed jobs have no renderer at
-all**, and fail silently.
+Two independent bugs were stacked, and the second was hidden behind the first. Fixing only the
+one we could see would have looked like the fix did nothing.
 
-It gets worse than a missing dependency. The agent cannot distinguish *"the daemon isn't
-installed"* from *"no browser exists on this machine"*. It falls back to probing conventional
-binary names (`chromium`, `google-chrome`, `firefox`, `wkhtmltoimage`) — **none of which match
-the platform's deliberately non-standard `agent-chromium`** — concludes **"No renderer
-available"**, and the memory observer promotes that conclusion to a **0.92-confidence memory
-that has been recalled 57 times**. A transient, backend-specific infra gap calcified into a
-permanent capability belief that now steers every verification step of the job into
+**Blocker 1 — the VM has no `browser-exec` (VM-only).** The `browser-exec` migration wired the
+**container** image only. The VM golden image installs Playwright Chromium and the
+`agent-chromium` symlink — but never `browser-use` or the `browser-exec` script. Since the
+in-pod fallback was removed (2026-06-11), `browser-exec` is the **only** browser path, so
+VM-backed jobs have no renderer at all, and fail silently.
+
+It fails worse than a missing dependency: the agent cannot distinguish *"the daemon isn't
+installed"* from *"no browser exists here"*. It probes conventional binary names (`chromium`,
+`google-chrome`, `firefox`, `wkhtmltoimage`) — **none of which match the platform's deliberately
+non-standard `agent-chromium`** — concludes **"No renderer available"**, and the observer
+promotes that to a **0.92-confidence memory recalled 57 times**. A backend-specific infra gap
+calcified into a permanent capability belief that steered every verification step into
 source-only `grep` checks.
 
-Chromium is almost certainly sitting unused at `/usr/local/bin/agent-chromium` on that VM the
-entire time.
+Chromium was sitting unused at `/usr/local/bin/agent-chromium` the entire time — **confirmed
+working**: `Google Chrome for Testing 147.0.7727.15`, symlink intact, on that exact VM.
+
+**Blocker 2 — `file://` is blocked on every backend (platform-wide, newly found).** browser-use's
+security watchdog rejects any URL without a hostname *before* it consults `allowed_domains`, so
+`file:///…/mockup.html` is refused unconditionally and no setting turns it off. Every mockup an
+agent writes is a local file, and no tool serves them over HTTP — so **no SRW job on any backend
+could ever look at its own work.** Reproduced identically on a live container workspace. This was
+never VM-specific and would have survived the blocker-1 fix, merely changing the error from
+"no renderer" to "blocked by security policy".
 
 ---
 
@@ -116,6 +128,48 @@ diagnosed honestly and behaved correctly given what it could observe — it disc
 rather than faking verification, which is the graceful-degradation behavior working as
 designed. The bug is that its observation was structurally incapable of finding the truth.
 
+### 2.5 Blocker 2 — `file://` is refused before `allowed_domains` is consulted
+
+Found while verifying the blocker-1 fix: with `browser-exec` installed and Chromium working,
+navigation to a real mockup **still failed**:
+
+```
+{"error": "navigate failed: Navigation to
+           file:///home/agent-host/workspace/mockups/theme_operational_clarity.html
+           blocked by security policy"}
+```
+
+The block is not in `browser-exec` (`grep` finds no URL policy there). It is in browser-use:
+
+```python
+# browser_use/browser/watchdogs/security_watchdog.py  (0.12.9)
+if parsed.scheme in ['data', 'blob']:
+    return True
+host = parsed.hostname
+if not host:
+    return False          # ← file:///... lands here
+# If no allowed_domains specified, allow all URLs   ← never reached
+```
+
+`file:///path` parses to `hostname=None`, so it is rejected **before** the "no `allowed_domains`
+→ allow everything" branch. Only `data:` and `blob:` are exempt from the hostname requirement.
+This is therefore **not configurable**: `browser-exec` sets neither `allowed_domains` nor
+`block_ip_addresses` (`docker/browser-exec:115–121`), and it would not matter if it did.
+
+Measured consequences (live, 2026-07-17):
+
+| Probe | VM | Container |
+|---|---|---|
+| `file:///…/mockup.html` | blocked | **blocked** |
+| `http://127.0.0.1:<port>/…` | renders (275 KB screenshot + full DOM) | renders (real pixels) |
+
+The renderer was never the problem — only the scheme. And `grep` confirms **no local
+HTTP-serving convention exists anywhere in the tools** (`src/tools/research/browser_direct.py`,
+`src/tools/context.py`), so agents had no sanctioned way to reach their own files.
+
+**Why this matters more than blocker 1**: it is platform-wide and silent. Any design/frontend
+job on *any* backend could complete having never seen its own output.
+
 ## 3. How the drift happened
 
 Timeline from the design docs:
@@ -153,33 +207,90 @@ guard added in the fallback removal guards against the **local path returning** 
 - **The failure is invisible from the outside**: the agent reports honestly, the job completes,
   and the handoff carries a politely-worded limitation instead of a bug report.
 
-## 5. Fix — three layers
+## 5. Fix — as built (2026-07-17)
 
-### Layer 1 — Infra (unblocks rendering). The actual bug.
+### Layer 1a — VM image: install the missing driver + dep. **DONE.**
 
-Mirror the container's §2c stanza into the VM golden image. Exactly two additions:
+| File | Change |
+|---|---|
+| `docker/agent-vm-base/scripts/provision-stage1.sh` | `browser-use>=0.12.9,<0.13.0` alongside the playwright pin, cap rationale carried verbatim; `--ignore-installed` (see below); self-assert `import browser_use` + `agent-chromium --version` in the layer that owns them |
+| `docker/agent-vm-base/stage2.pkr.hcl` | `file` provisioner uploads `../browser-exec` and `../assert-browser-stack.sh` |
+| `docker/agent-vm-base/scripts/provision-stage2.sh` | installs `browser-exec` → `/usr/local/bin` (0755), then runs the shared gate **as `agent-host`** |
 
-1. Add `"browser-use>=0.12.9,<0.13.0"` to the pip install at
-   `provision-stage1.sh:228`. **Carry the version cap and its comment verbatim** — per
-   `Dockerfile.workspace:184–191`, browser-use 0.13 (2026-06-08) rewrote the browser layer to
-   pure CDP, dropped Playwright, no longer finds Chromium under `PLAYWRIGHT_BROWSERS_PATH`, and
-   falls back to `uvx playwright install` which fails on the image. Loosening this cap breaks
-   every `browser_*` tool. Do not let the VM copy drift on the cap.
-2. Install `docker/browser-exec` → `/usr/local/bin/browser-exec` + `chmod +x` (Packer `file`
-   provisioner; the script already lives at `docker/browser-exec`).
+Two decisions worth keeping:
 
-Chromium, the `agent-chromium` symlink, `fonts-noto-core`, and `PLAYWRIGHT_BROWSERS_PATH` are
-**already correct on the VM** — no change needed.
+- **`browser-exec` rides stage2, not stage1.** The earlier draft of this doc argued for keeping
+  the script with its pip dep in stage1 to avoid drift. That was wrong for the wrong reason: the
+  drift is prevented by the shared gate (Layer 1c), not by co-location. `browser-exec` is
+  *per-commit source* — the same category as `management-daemon.py`, which stage2 already
+  installs — and baking it into stage1 would force the slow Chromium rebuild on every edit to it.
+  The heavy stable dep (`browser-use`) stays in stage1 where it belongs.
+- **Sourced from `../browser-exec`, not copied into `files/`.** A copy would recreate the
+  hand-maintained duplication that caused this bug. Both images now install the byte-identical
+  file.
 
-Implementation notes:
-- Both additions are stage1 inputs → triggers the slow stage1 rebuild (Chromium is "the slowest
-  single step"). The `browser-exec` script alone is small enough to ride stage2, but splitting
-  the daemon from its own pip dep invites exactly the drift this issue documents. Prefer keeping
-  them together in stage1.
-- The VM comment at `provision-stage1.sh:221–222` notes the symlink is **build-time only** —
-  runtime upgrades dangle it. The fix belongs in the image, not in cloud-init.
-- **Add a build-time assertion** to both images so this drift cannot recur silently, e.g.
-  `command -v browser-exec && command -v agent-chromium && python3 -c 'import browser_use'`.
+**`--ignore-installed` is required on the VM and not in the container**, and the asymmetry is the
+base image. The container starts from a minimal `ubuntu:24.04`; the VM starts from the Ubuntu
+*cloud image*, which preinstalls apt-managed Python packages for cloud-init
+(`python3-typing-extensions`, `python3-jwt`, …). Those ship no `RECORD` file, so browser-use's
+resolver aborts:
+
+```
+ERROR: Cannot uninstall typing_extensions 4.10.0, RECORD file not found.
+       Hint: The package was installed by debian.
+```
+
+Purging them is unsafe (cloud-init depends on them). `--ignore-installed` lets pip install its
+own copies under `/usr/local/lib/python3.12/dist-packages`, which precedes
+`/usr/lib/python3/dist-packages` on `sys.path` — pip's versions win at import, apt's stay intact
+for cloud-init. **The playwright pin must stay named in the same command**, because
+`--ignore-installed` reinstalls the whole tree and browser-use depends on playwright; unnamed, it
+would silently resolve away from `.playwright-version`. Verified on the live cloud image: yields
+`browser-use 0.12.9` + `playwright 1.59.0`.
+
+Chromium, the `agent-chromium` symlink, `fonts-noto-core`, and `PLAYWRIGHT_BROWSERS_PATH` were
+**already correct on the VM** — measured, not assumed (§6). No change needed.
+
+### Layer 1b — `file://` rendering via loopback HTTP. **DONE.**
+
+`docker/browser-exec` gains `LocalFileServer`: `navigate` translates a `file://` URL into
+`http://127.0.0.1:<ephemeral>/…` served by a threaded static listener, and passes every other
+URL through untouched.
+
+Design decisions:
+
+- **Serve over HTTP rather than patch the watchdog.** Monkeypatching a vendored library's
+  security control is fragile across upgrades (browser-use is pinned but not frozen). Navigating
+  to a real `http://` URL is the supported path and needs no patching.
+- **The root is bounded to the workspace, deliberately.** A page served from
+  `http://127.0.0.1:<port>` shares an origin with everything else under that port, so the served
+  root is exactly what a rendered page could fetch and exfiltrate. Rooting at `/` would let any
+  rendered HTML read the whole disk — **strictly worse than `file://`**, which Chrome gives an
+  opaque origin per document. The root is therefore `$HOME/workspace` (the agent's own sandbox,
+  which by policy holds no internal credentials); files outside it fall back to their own
+  directory. Verified: `/tmp/outside.html` is served on a *separate* port rooted at `/tmp`, not `/`.
+- **Listeners bind 127.0.0.1 only**, staying inside the same loopback boundary browser-exec
+  exists to enforce. Verified with `ss -ltnp`.
+- `$HOME` resolution assumes browser-exec runs as the workspace user. It does — the agent spawns
+  it over its own SSH session and the orchestrator connects as `agent-host` on every backend.
+  Verified `/home/agent-host/workspace` on both the VM and container images.
+
+### Layer 1c — Shared conformance gate (stops the whole class). **DONE.**
+
+`docker/assert-browser-stack.sh`, run by **both** images: `Dockerfile.workspace` (§2d) and
+`provision-stage2.sh` (§8). Checks `browser-exec` on PATH, `browser_use` + `playwright`
+importable, `agent-chromium` executable (`test -x` also catches a dangling symlink), and that
+Chromium actually runs.
+
+**It is one shared file on purpose.** A per-image assertion would not have prevented this bug:
+adding a capability to one image and its own private check leaves the twin silently short — which
+is exactly what happened. A shared gate fails the build of whichever image lacks the capability.
+Adding to the browser stack means editing one file and expecting both builds to break until both
+install it. That failure is the feature.
+
+Validated in **both directions on the live VM**: `EXIT=1` naming exactly the two missing pieces
+before the fix, `EXIT=0` after. Also installed permanently as `assert-browser-stack`, so "can this
+workspace render?" is answerable in five seconds instead of five weeks.
 
 ### Layer 2 — Error legibility
 
@@ -216,24 +327,43 @@ render, you never try again, so you never learn otherwise). Options to consider:
 Transient infra failures must not calcify into permanent capability beliefs. This is a
 first-class RSI-loop failure mode: bad diagnoses compound silently.
 
-## 6. Verification owed
+## 6. Verification — measured, not inferred
 
-Confidence markers for the claims above:
+Both formerly-open assertions were run against the live VM
+(`agent-vm-4eba7f2f-3e24-4b52-82c3-1929ce8c6771`, via its agent pod's Tailscale sidecar →
+`agent-host@100.64.25.224`) **before** any rebuild. Every prediction held:
 
 | Claim | Status |
 |---|---|
 | VM tree has zero `browser-exec` references; container `COPY`s it | **Confirmed** (grep) |
-| VM installs Chromium + `agent-chromium`; lacks `browser-use` | **Confirmed** (`provision-stage1.sh:228–237`) |
 | `agent-chromium` absent from `src/`+`config/` | **Confirmed** (grep) |
 | browser-exec migration was container-only, no VM in scope | **Confirmed** (design doc) |
-| Job runs on a VM workspace | **Confirmed** (shell prompt) |
 | Memory content / 0.92 / 57 accesses | **Confirmed** (memory UI) |
-| Agent hit `browser-exec: command not found` specifically | **Inferred (high)** — assert with `which browser-exec` on the VM |
-| Chromium **is** present at `/usr/local/bin/agent-chromium` on that VM, i.e. "no renderer" is a false negative | **Inferred (high)** — assert with `which agent-chromium` on the VM |
+| Agent hit `browser-exec: command not found` specifically | **CONFIRMED (measured)** — `browser-exec: MISSING`, `browser_use: MISSING` |
+| Chromium **is** present at `/usr/local/bin/agent-chromium`, i.e. "no renderer" is a false negative | **CONFIRMED (measured)** — symlink intact → `/opt/playwright/chromium-1217/chrome-linux64/chrome`, runs: `Google Chrome for Testing 147.0.7727.15` |
+| Every conventional name the agent probed is genuinely absent | **CONFIRMED (measured)** — `chromium`, `chromium-browser`, `google-chrome`, `firefox`, `wkhtmltoimage` all absent |
+| `playwright`, `fonts-noto-core`, `PLAYWRIGHT_BROWSERS_PATH` already correct on the VM | **CONFIRMED (measured)** — pkg present, font installed, `/etc/environment` set |
+| `file://` blocked on the **container** too (blocker 2 is platform-wide) | **CONFIRMED (measured)** on a live workspace pod |
+| The fix actually renders | **CONFIRMED (measured)** — the exact previously-failing `file://` URL now returns a 275 KB screenshot + real DOM (*"Hotel Rheinland · Empfang · Bad Orb …"*) |
 
-Both open assertions are one SSH away on the live VM
-(`agent-vm-4eba7f2f-3e24-4b52-82c3-1929ce8c6771`). Run them **before** the golden-image rebuild —
-if `agent-chromium` is somehow absent too, the fix spec in §5 changes.
+The headline measurement: **the VM was one pip package and one script away from working, with a
+functional Chrome installed the whole time.** Every expensive, slow, fragile part of the image
+build had already succeeded.
+
+Also verified on the live VM after the fix: file outside the workspace is rooted at its own
+directory (not `/`); a missing file yields `navigate failed: local file not found: …` instead of
+an opaque error; `https://example.com` still passes through untouched; all listeners bound to
+`127.0.0.1`.
+
+### Not yet verified
+
+- **Neither image has actually been rebuilt.** The stage1/stage2/Dockerfile changes are
+  syntax-checked (`bash -n`, `packer fmt`) and every *step* was executed by hand on the live VM,
+  but no golden-image build has run end-to-end. The `--ignore-installed` fix in particular was
+  validated against the live cloud image, not a fresh Packer build.
+- The container image gate (`Dockerfile.workspace` §2d) has not been exercised by a build.
+- `browser-exec`'s new `LocalFileServer` has no unit test — the script is not importable as a
+  module and the design doc notes end-to-end needs a cluster. Verified live instead.
 
 ## 7. Secondary findings from the same job audit
 
@@ -251,18 +381,44 @@ to its own issue doc.
 | 7 | **Mega-todos make "done" a weak signal.** Each todo is a 150–250-word spec cramming ~10 requirements; `todo_complete` is a coarse pass/fail with no per-requirement check. Compounds the browser issue: no visual verification **and** no granular verification = "complete" is thinly evidenced. | Per-todo acceptance checklists with explicit per-item verification. | Medium |
 | 8 | **No budget/scope gate on a runaway-shaped job.** ~28 h and 4187+ audit entries bought ~20% of the checklist; stop-condition is all-or-nothing at 42 mockups + 7 spec docs. Nothing caps it. | Budget ceiling, or staged completion so a vertical-slice-complete handoff exists at ~15 screens instead of nothing until 42. | Medium |
 | 9 | **Possible git exit-128 on a phase commit.** Shell tail showed `__DONE_…__ 128` after the Phase 10 REVIEW commit, though a commit hash (`bcb77293`) printed. Ambiguous — may be benign. | Low confidence; worth a glance only. | Low |
+| 10 | **Sudo gate disabled in favour of a VM gate that isn't installed.** `orchestrator/main.py:2128–2129` sets `config_override["shell"]["sudo_action"] = "allow"` for VM jobs, commented *"VM has its own sudo gate — allow sudo through"*. On the live VM the gate is **absent**: `systemctl is-active sudo-gated.socket` → `inactive`, `/etc/sudo-gate/config.yaml` → absent, and `sudo -n true` succeeds unprompted. `provision-stage2.sh:171` installs the gate only `if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]` — CI ships empty placeholders when the Go/C binaries aren't built, so the section silently skips. Net: agent-side gating is turned **off** deferring to a VM-side gate that does not exist → unrestricted passwordless sudo with no approval path. | Found incidentally while probing whether sudo would hang on the live VM. Deserves its own issue. Fix candidates: fail the build (or the VM dispatch) when the gate is expected but absent; or have the orchestrator condition `sudo_action=allow` on a verified gate rather than on `backend == "vm"`. | **High (security)** |
+| 11 | **`git add -A` is explicitly forbidden in this repo** (`MEMORY.md`, DB roadmap note) yet `git_manager.py:165,205` does exactly that on every agent commit — the mechanism behind finding #1. Worth reconciling the guardrail with the code. | `src/managers/git_manager.py:165,205` | Medium |
 
 ## 8. Open questions
 
-- Are there other VM/container capability drifts of the same shape? The two images are
-  maintained as parallel twins with no assertion that they agree. A conformance test ("both
-  backends satisfy the same capability probe") would catch the whole class.
-- Does the **container** backend still render correctly today? The migration was validated
-  2026-05-27; `browser_workspace_executor.md` notes a sandbox fix that "needs a workspace image
-  rebuild to ship" (`chromium_sandbox=False` is present in `docker/browser-exec:119`, so it
-  appears shipped — worth one live assertion).
+**Answered by this pass:**
+
+- ~~Are there other VM/container capability drifts of the same shape?~~ → Partially addressed.
+  `assert-browser-stack.sh` closes the class **for the browser stack**. The general question
+  stands: the images are twins across *many* axes (node, git, datasource clients, rclone) with no
+  conformance assertion beyond the browser. The gate is a pattern to extend, not a finished job.
+- ~~Does the container backend still render correctly today?~~ → **Yes** — measured: `http://`
+  renders real pixels on a live workspace pod, `chromium_sandbox=False` is shipped. But it hits
+  blocker 2 identically, so it could not render *local files* either.
+
+**Still open:**
+
+- **Neither image has been rebuilt.** Highest-priority follow-up: a real stage1 build is the one
+  thing that would validate `--ignore-installed` against a fresh cloud image rather than a
+  5-week-old running VM. Watch for the known-fragile cold-import (`waiting_golden` park).
+- **This fix does not reach job `4eba7f2f` by itself.** A golden-image rebuild affects only new
+  VMs, and the live VM has now been hand-patched — but the **0.92-confidence / 57-access memory
+  will keep suppressing re-probing regardless**. Rescuing the remaining ~33 mockups needs the
+  memory invalidated *and* an explicit steer, not just working infra. Infra fix ≠ job fix.
+- **The payoff is model-dependent.** `gpt-5.6-sol` (this job) resolves to family `gpt-5.6`,
+  `multimodal: true` — so screenshots reach the model and the fix delivers genuine visual
+  verification. But `minimax` (M2.7) is `multimodal: false` while `minimax-m3` is `true`; VM-backed
+  RSI-loop jobs on M2.7 would get DOM inspection only. Worth confirming which the loop pins
+  before calling this "fixed for the loop".
+- **Image-token cost.** At `gpt-5.6`'s `openai_patches` budget (~3000 tok/image), screenshotting
+  33 remaining mockups × several states each is real spend on a job already at 1066 requests.
+  Argues for screenshotting key states, not every state.
 - Should visual verification be a **hard gate** for design-type jobs? Today a design job can
   complete having never rendered its own output, disclosing the limitation politely. Arguably
-  the expert config should refuse to mark such a job `goal_achieved`.
+  the expert config should refuse to mark such a job `goal_achieved`. Now actually implementable —
+  before this fix the gate would have been unsatisfiable on every backend.
 - How many other high-confidence `ERROR SOLUTION` memories encode environment absences that were
   transient? Worth an audit of the memory store for `capability unavailable`-shaped entries.
+- Should the agent layer learn the `agent-chromium` name (Layer 2), so a fallback probe can't miss
+  the one browser installed by design? Cheap, and it would have shortened this investigation from
+  weeks to minutes.

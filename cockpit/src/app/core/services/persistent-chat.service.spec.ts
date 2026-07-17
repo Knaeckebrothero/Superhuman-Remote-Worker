@@ -2769,6 +2769,147 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
     });
 });
 
+describe('PersistentChatService — control frame delivery across a reconnect', () => {
+    // readyState numerals: the mock ctor only publishes OPEN/CONNECTING.
+    const CLOSED = 3;
+
+    /** Queue a frame with no live socket, then reconnect and drain. */
+    function reconnect(service: any, wsInstances: any[], threadId: string) {
+        service._installControlWs(threadId, 'ws://reconnected');
+        const ws = wsInstances.at(-1);
+        ws.onopen();
+        return ws;
+    }
+
+    function framesOn(ws: any) {
+        return ws.send.mock.calls.map((c: any) => JSON.parse(c[0]));
+    }
+
+    it('delivers an upgrade click issued while the socket is CLOSED', () => {
+        const {service, wsInstances} = createService();
+        const dead = createMockWs();
+        dead.readyState = CLOSED;
+        service.threadId.set('thread-cx');
+        (service as any).controlWs = dead;
+
+        // The real user path: card/pane click while the socket happens to be
+        // down. This used to vanish — the frame was hung on `dead`, which never
+        // fires 'open' again, so the spinner span forever.
+        service.upgradeWorkspace('sandbox');
+        expect(dead.send).not.toHaveBeenCalled();
+
+        const ws = reconnect(service, wsInstances, 'thread-cx');
+        expect(framesOn(ws)).toContainEqual({
+            method: 'upgrade-to-workspace',
+            target_tier: 'sandbox',
+        });
+    });
+
+    it('delivers a command issued when there is no socket at all', () => {
+        const {service, wsInstances} = createService();
+        service.threadId.set('thread-cx');
+        (service as any).controlWs = null;
+
+        // The old code hit `if (!ws) return` and dropped this outright.
+        (service as any)._sendControl({method: 'approve'});
+
+        const ws = reconnect(service, wsInstances, 'thread-cx');
+        expect(framesOn(ws)).toContainEqual({method: 'approve'});
+    });
+
+    it('sends straight out on an open socket without queueing', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        live.readyState = WebSocket.OPEN;
+        service.threadId.set('thread-cx');
+        (service as any).controlWs = live;
+
+        (service as any)._sendControl({method: 'approve'});
+
+        expect(framesOn(live)).toEqual([{method: 'approve'}]);
+        expect((service as any).controlOutbox).toHaveLength(0);
+    });
+
+    it('preserves the order commands were issued in', () => {
+        const {service, wsInstances} = createService();
+        service.threadId.set('thread-cx');
+        (service as any).controlWs = null;
+
+        (service as any)._sendControl({method: 'first'});
+        (service as any)._sendControl({method: 'second'});
+
+        const ws = reconnect(service, wsInstances, 'thread-cx');
+        expect(framesOn(ws)).toEqual([{method: 'first'}, {method: 'second'}]);
+    });
+
+    it('drops a stale command tagged for another thread rather than misfiring it', () => {
+        const {service, wsInstances} = createService();
+        service.threadId.set('thread-b');
+        (service as any).controlWs = null;
+        // A leftover from thread-a reaching thread-b's socket. disconnect()
+        // normally clears these; the tag is the backstop if one survives, since
+        // replaying "approve" here would act on whatever thread-b has pending.
+        (service as any).controlOutbox = [
+            {threadId: 'thread-a', frame: JSON.stringify({method: 'approve'})},
+        ];
+
+        const ws = reconnect(service, wsInstances, 'thread-b');
+        expect(ws.send).not.toHaveBeenCalled();
+        expect((service as any).controlOutbox).toHaveLength(0);
+    });
+
+    it('does not drain over a socket opened for a different thread', () => {
+        const {service, wsInstances} = createService();
+        service.threadId.set('thread-a');
+        (service as any).controlWs = null;
+        (service as any)._sendControl({method: 'approve'});
+
+        // onopen's own ownership guard rejects the mismatched socket before the
+        // drain, so the command stays queued for thread-a's real socket.
+        const ws = reconnect(service, wsInstances, 'thread-b');
+        expect(ws.send).not.toHaveBeenCalled();
+        expect((service as any).controlOutbox).toHaveLength(1);
+    });
+
+    it('clears queued commands on disconnect so they cannot replay later', () => {
+        const {service} = createService();
+        service.threadId.set('thread-cx');
+        (service as any).controlWs = null;
+        (service as any)._sendControl({method: 'approve'});
+        expect((service as any).controlOutbox).toHaveLength(1);
+
+        service.disconnect();
+        expect((service as any).controlOutbox).toHaveLength(0);
+    });
+
+    it('caps the queue so a wedged socket cannot grow it without bound', () => {
+        const {service} = createService();
+        service.threadId.set('thread-cx');
+        (service as any).controlWs = null;
+
+        for (let i = 0; i < 40; i++) (service as any)._sendControl({method: `m${i}`});
+
+        const outbox = (service as any).controlOutbox;
+        expect(outbox).toHaveLength(32);
+        // Oldest dropped, newest kept.
+        expect(JSON.parse(outbox[outbox.length - 1].frame)).toEqual({method: 'm39'});
+    });
+
+    it('re-queues a frame when the socket dies mid-write', () => {
+        const {service, wsInstances} = createService();
+        const live = createMockWs();
+        live.readyState = WebSocket.OPEN;
+        live.send = vi.fn(() => { throw new Error('INVALID_STATE_ERR'); });
+        service.threadId.set('thread-cx');
+        (service as any).controlWs = live;
+
+        (service as any)._sendControl({method: 'approve'});
+
+        const ws = reconnect(service, wsInstances, 'thread-cx');
+        expect(framesOn(ws)).toContainEqual({method: 'approve'});
+    });
+});
+
 describe('PersistentChatService — inline workspace upgrade offer', () => {
     let originalEs: any;
     let originalWs: any;

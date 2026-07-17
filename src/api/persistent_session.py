@@ -968,8 +968,10 @@ class PersistentSession:
             try:
                 if entry.skill:
                     # Bound skill: flag-independent instructions channel → skills/<skill>/SKILL.md.
-                    target_path = self.workspace_manager.get_path(entry.path)
-                    if target_path.exists():
+                    # Backend-aware check: get_path().exists() tests the agent
+                    # pod's local filesystem and is always False on remote
+                    # workspaces, which would redeploy (clobber) on resume.
+                    if self.workspace_manager.exists(entry.path):
                         continue  # don't overwrite on session resume
                     content = self.config.extra.get("_resolved_instructions", {}).get(
                         entry.skill
@@ -986,9 +988,9 @@ class PersistentSession:
                     self.workspace_manager.write_file(entry.path, content)
                     logger.debug(f"Deployed bound skill to workspace: {entry.path}")
                     continue
-                # Skip if already present (don't overwrite on session resume)
-                target_path = self.workspace_manager.get_path(entry.file)
-                if target_path.exists():
+                # Skip if already present (don't overwrite on session resume).
+                # Backend-aware for the same reason as the skill branch above.
+                if self.workspace_manager.exists(entry.file):
                     continue
                 if file_resolver is None:
                     logger.warning(
