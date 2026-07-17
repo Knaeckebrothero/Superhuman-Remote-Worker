@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,16 @@ from security.anti_framing import TrustedParentAntiFramingMiddleware
 
 ROOT = Path(__file__).resolve().parents[1]
 FRAME_ANCESTORS_NONE = "frame-ancestors 'none'"
+
+# Only `add_header ... always;` lines, so a comment mentioning frame-ancestors
+# cannot satisfy the assertions below.
+_NGINX_ALWAYS_HEADER = re.compile(
+    r'^\s*add_header\s+(\S+)\s+"([^"]*)"\s+always;', re.MULTILINE
+)
+
+
+def _csp_directives(policy: str) -> list[str]:
+    return [directive.strip() for directive in policy.split(";") if directive.strip()]
 
 
 def _test_app() -> FastAPI:
@@ -294,11 +305,12 @@ def test_orchestrator_registers_anti_framing_inside_request_correlation() -> Non
 
 
 def test_cockpit_production_and_dev_servers_deny_framing() -> None:
-    nginx = (ROOT / "docker/cockpit-nginx.conf").read_text()
-    assert (
-        "add_header Content-Security-Policy \"frame-ancestors 'none'\" always;" in nginx
+    nginx_headers = dict(
+        _NGINX_ALWAYS_HEADER.findall((ROOT / "docker/cockpit-nginx.conf").read_text())
     )
-    assert 'add_header X-Frame-Options "DENY" always;' in nginx
+    nginx_csp = nginx_headers["Content-Security-Policy"]
+    assert FRAME_ANCESTORS_NONE in _csp_directives(nginx_csp)
+    assert nginx_headers["X-Frame-Options"] == "DENY"
 
     dockerfile = (ROOT / "docker/Dockerfile.cockpit").read_text()
     assert "COPY docker/cockpit-nginx.conf /etc/nginx/conf.d/default.conf" in dockerfile
@@ -306,10 +318,12 @@ def test_cockpit_production_and_dev_servers_deny_framing() -> None:
 
     angular = json.loads((ROOT / "cockpit/angular.json").read_text())
     headers = angular["projects"]["cockpit"]["architect"]["serve"]["options"]["headers"]
-    assert headers == {
-        "Content-Security-Policy": FRAME_ANCESTORS_NONE,
-        "X-Frame-Options": "DENY",
-    }
+    assert FRAME_ANCESTORS_NONE in _csp_directives(headers["Content-Security-Policy"])
+    assert headers["X-Frame-Options"] == "DENY"
+
+    # The dev server is the only place framing regressions get noticed early, so
+    # it must serve the same policy the container does.
+    assert headers["Content-Security-Policy"] == nginx_csp
 
 
 def test_optional_mcp_documents_use_the_same_response_boundary() -> None:
