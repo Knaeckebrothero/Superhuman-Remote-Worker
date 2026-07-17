@@ -5,6 +5,7 @@ import {
     canSendMessage,
     clearDraft,
     cloudBadgeVisible,
+    composeDenyPrefill,
     draftKey,
     extractClipboardFiles,
     isMicMode,
@@ -16,6 +17,7 @@ import {
     pickCodeServerUrlToOpen,
     pickCurrentStartupStep,
     pickRunningCommandCard,
+    pickWorkspaceOfferCard,
     readingWidthToCss,
     saveDraft,
     shouldFoldToolRun,
@@ -512,5 +514,71 @@ describe('draft persistence', () => {
         expect(() => saveDraft(null, 'x')).not.toThrow();
         expect(loadDraft(null)).toBe('');
         expect(() => clearDraft(null)).not.toThrow();
+    });
+});
+
+describe('pickWorkspaceOfferCard', () => {
+    const offer = {tier: 'sandbox', reason: 'need to run pytest'};
+
+    it('surfaces a live offer when nothing is provisioning', () => {
+        expect(pickWorkspaceOfferCard(offer, null, false)).toEqual({
+            state: 'offer',
+            tier: 'sandbox',
+            reason: 'need to run pytest',
+        });
+    });
+
+    it('surfaces provisioning when there is no offer', () => {
+        expect(pickWorkspaceOfferCard(null, {tier: 'sandbox'}, false)).toEqual({
+            state: 'provisioning',
+            tier: 'sandbox',
+            elapsed: undefined,
+            willContinue: false,
+        });
+    });
+
+    it('lets provisioning win over a still-live offer', () => {
+        // The two states must never render at once, whatever the clearing order.
+        expect(pickWorkspaceOfferCard(offer, {tier: 'sandbox'}, false)).toMatchObject({
+            state: 'provisioning',
+        });
+    });
+
+    it('returns null when there is neither', () => {
+        expect(pickWorkspaceOfferCard(null, null, false)).toBeNull();
+    });
+
+    it('passes elapsed through when the tier reports it', () => {
+        expect(pickWorkspaceOfferCard(null, {tier: 'vm', elapsed: 120}, false)).toMatchObject({
+            elapsed: 120,
+        });
+    });
+
+    it('leaves elapsed undefined on the sandbox path, which emits no heartbeats', () => {
+        expect(pickWorkspaceOfferCard(null, {tier: 'sandbox'}, true)).toMatchObject({
+            elapsed: undefined,
+        });
+    });
+
+    it('passes willContinue through so the two accept buttons differ visually', () => {
+        expect(pickWorkspaceOfferCard(null, {tier: 'sandbox'}, true)).toMatchObject({
+            willContinue: true,
+        });
+    });
+});
+
+describe('composeDenyPrefill', () => {
+    const starter = "Don't upgrade the workspace — ";
+
+    it('prefills the starter into an empty composer', () => {
+        expect(composeDenyPrefill('', starter)).toBe(starter);
+    });
+
+    it('prefills the starter over whitespace-only text', () => {
+        expect(composeDenyPrefill('   \n ', starter)).toBe(starter);
+    });
+
+    it('never clobbers what the user already typed', () => {
+        expect(composeDenyPrefill('half a thought', starter)).toBe('half a thought');
     });
 });

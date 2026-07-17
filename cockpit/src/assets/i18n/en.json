@@ -1321,6 +1321,17 @@
       "autoAccept": "Auto-accept",
       "stop": "Stop"
     },
+    "workspaceOffer": {
+      "title": "Workspace upgrade requested",
+      "detail": "The agent asked for a {{tier}} workspace.",
+      "upgradeAndContinue": "Upgrade & continue",
+      "upgrade": "Upgrade",
+      "deny": "Deny",
+      "denyStarter": "Don't upgrade the workspace — ",
+      "continueMessage": "The workspace is ready — shell, git, and file tools are now available. Please continue where you left off.",
+      "provisioning": "Provisioning {{tier}}…",
+      "willContinue": "Will continue automatically when ready."
+    },
     "approval": {
       "pendingTitle": "Approval needed to run this tool",
       "badge": {

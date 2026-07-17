@@ -400,6 +400,44 @@ export function pickRunningCommandCard(
     return runningTool;
 }
 
+/** The workspace-upgrade card to render, or null when there's nothing to show. */
+export type WorkspaceOfferCard =
+    | {state: 'provisioning'; tier: string; elapsed?: number; willContinue: boolean}
+    | {state: 'offer'; tier: string; reason: string}
+    | null;
+
+/**
+ * Pick the workspace-upgrade card state. Provisioning strictly wins over a live
+ * offer so the two can never render at once — upgradeWorkspace() clears the
+ * offer synchronously today, but the invariant shouldn't depend on that
+ * ordering holding.
+ */
+export function pickWorkspaceOfferCard(
+    offer: {tier: string; reason: string} | null,
+    inProgress: {tier: string; elapsed?: number} | null,
+    willContinue: boolean,
+): WorkspaceOfferCard {
+    if (inProgress) {
+        return {
+            state: 'provisioning',
+            tier: inProgress.tier,
+            elapsed: inProgress.elapsed,
+            willContinue,
+        };
+    }
+    if (offer) return {state: 'offer', tier: offer.tier, reason: offer.reason};
+    return null;
+}
+
+/**
+ * The composer text to show when declining an upgrade offer. Never clobbers
+ * what the user has already typed — unlike pickSuggestion, which assigns
+ * unconditionally because it only ever fires against an empty landing composer.
+ */
+export function composeDenyPrefill(existingText: string, starter: string): string {
+    return existingText.trim().length > 0 ? existingText : starter;
+}
+
 /**
  * Decide whether the IDE button should open code-server, and to which URL.
  * Returns the code-server URL only when the workspace is active; null
@@ -1276,6 +1314,49 @@ export function clearDraft(threadId: string | null): void {
           </div>
         }
 
+        <!-- Agent-initiated workspace upgrade: the offer, and the provisioning
+             it turns into. Reuses the .mile marker styles (no new SCSS). Not
+             gated on streaming — request_workspace_upgrade doesn't stop the
+             turn, so this appears while the agent is still talking. -->
+        @if (workspaceOfferCard(); as woc) {
+          <div class="mile">
+            @switch (woc.state) {
+              @case ('offer') {
+                <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
+                <div class="mile-title">{{ 'chat.workspaceOffer.detail' | transloco:{ tier: woc.tier } }}</div>
+                <div class="mile-detail">
+                  <app-icon size="sm" class="mile-detail-icon">terminal</app-icon>
+                  <span class="mile-args">{{ woc.reason }}</span>
+                </div>
+                <div class="mile-actions">
+                  <app-button variant="success" size="sm" (clicked)="upgradeAndContinue(woc.tier)">
+                    {{ 'chat.workspaceOffer.upgradeAndContinue' | transloco }}
+                  </app-button>
+                  <app-button variant="info" size="sm" (clicked)="upgradeOnly(woc.tier)">
+                    {{ 'chat.workspaceOffer.upgrade' | transloco }}
+                  </app-button>
+                  <app-button variant="danger" size="sm" (clicked)="denyOffer()">
+                    {{ 'chat.workspaceOffer.deny' | transloco }}
+                  </app-button>
+                </div>
+              }
+              @case ('provisioning') {
+                <div class="mile-label">{{ 'chat.workspaceOffer.title' | transloco }}</div>
+                <div class="mile-detail">
+                  <span class="action-spinner-sm" aria-hidden="true"></span>
+                  <span class="mile-args">
+                    {{ 'chat.workspaceOffer.provisioning' | transloco:{ tier: woc.tier } }}
+                    @if (woc.elapsed) { ({{ woc.elapsed }}s) }
+                  </span>
+                </div>
+                @if (woc.willContinue) {
+                  <div class="mile-title">{{ 'chat.workspaceOffer.willContinue' | transloco }}</div>
+                }
+              }
+            }
+          </div>
+        }
+
         <!-- Live context-compaction progress (compaction.started/progress
              frames; cleared by context.compacted / compaction.failed).
              Segmented bar for ≤20 passes, continuous bar + counter above —
@@ -1728,6 +1809,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      */
     readonly runningCommandCard = computed(() =>
         pickRunningCommandCard(this.chat.runningTool(), this.chat.turns()),
+    );
+
+    /** The workspace-upgrade offer/provisioning card, or null. */
+    readonly workspaceOfferCard = computed(() =>
+        pickWorkspaceOfferCard(
+            this.chat.pendingWorkspaceOffer(),
+            this.chat.workspaceUpgradeInProgress(),
+            this.chat.continueAfterUpgrade(),
+        ),
     );
 
     // --- Live compaction progress (docs/features/context_summarization_rework.md S3)
@@ -2788,6 +2878,39 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     pickSuggestion(s: DisplayedSuggestion): void {
         this.inputText = s.text;
+        setTimeout(() => {
+            this.inputEl?.nativeElement?.focus();
+            this.autoResizeInput();
+        });
+    }
+
+    /** Accept the offer and resume the agent once the workspace lands. */
+    upgradeAndContinue(tier: string): void {
+        this.chat.upgradeWorkspace(tier === 'vm' ? 'vm' : 'sandbox', {thenContinue: true});
+    }
+
+    /** Accept the offer and leave the agent idle; the user drives from here. */
+    upgradeOnly(tier: string): void {
+        this.chat.upgradeWorkspace(tier === 'vm' ? 'vm' : 'sandbox');
+    }
+
+    /**
+     * Decline the offer and hand the user a composer to say why.
+     *
+     * Deliberately does not send: a bare "denied" is worse than nothing, since
+     * the agent's tool result already told it a human would decide, so it needs
+     * the reason to choose what to do instead. Unlike pickSuggestion this must
+     * not clobber a half-typed message, and because inputText is a plain ngModel
+     * field the assignment fires no ngModelChange — so the draft is saved by
+     * hand or a reload eats it.
+     */
+    denyOffer(): void {
+        this.chat.dismissWorkspaceOffer();
+        this.inputText = composeDenyPrefill(
+            this.inputText,
+            this.transloco.translate('chat.workspaceOffer.denyStarter'),
+        );
+        saveDraft(this.chat.threadId(), this.inputText);
         setTimeout(() => {
             this.inputEl?.nativeElement?.focus();
             this.autoResizeInput();
