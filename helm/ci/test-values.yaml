@@ -22,6 +22,10 @@ dozzle:
 codexProxy:
   enabled: true
 
+test:
+  greenmail:
+    enabled: true
+
 agent:
   tailscale:
     enabled: true

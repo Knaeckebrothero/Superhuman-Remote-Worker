@@ -28,6 +28,7 @@ class TestDatasourceToolCategories:
             "sql": [],
             "mongodb": [],
             "webdav": [],
+            "email": [],
         }
 
     def test_read_only_managed_connector_gets_read_tools(self):
@@ -82,12 +83,63 @@ class TestDatasourceToolCategories:
         cats = datasource_tool_categories(
             [_ds("repository"), _ds("kb"), _ds("generic"), {"name": "typeless"}]
         )
-        assert cats == {"graph": [], "sql": [], "mongodb": [], "webdav": []}
+        assert cats == {
+            "graph": [],
+            "sql": [],
+            "mongodb": [],
+            "webdav": [],
+            "email": [],
+        }
 
     def test_returns_copies_not_map_references(self):
         cats = datasource_tool_categories([_ds("webdav", read_only=True)])
         cats["webdav"].append("mutated")
         assert "mutated" not in DATASOURCE_TOOL_MAP["webdav"]["read"]
+
+
+class TestEmailTierCategories:
+    """Email is tier-keyed (config.access), not binary read/write."""
+
+    def _email_ds(self, access=None, read_only=False, name="mail"):
+        ds = _ds("email", read_only=read_only, name=name)
+        if access is not None:
+            ds["config"] = {"access": access}
+        return ds
+
+    def test_tiers_are_cumulative(self):
+        read = datasource_tool_categories([self._email_ds("read")])["email"]
+        rw = datasource_tool_categories([self._email_ds("read_write")])["email"]
+        draft = datasource_tool_categories([self._email_ds("draft")])["email"]
+        send = datasource_tool_categories([self._email_ds("send")])["email"]
+        assert set(read) == {
+            "email_list_folders",
+            "email_list",
+            "email_search",
+            "email_read",
+        }
+        assert set(rw) == set(read) | {"email_move", "email_flag"}
+        assert set(draft) == set(rw) | {"email_draft"}
+        assert set(send) == set(draft) | {"email_send"}
+
+    def test_missing_config_defaults_to_draft(self):
+        cats = datasource_tool_categories([_ds("email")])
+        assert "email_draft" in cats["email"]
+        assert "email_send" not in cats["email"]
+
+    def test_project_read_only_clamps_to_read(self):
+        cats = datasource_tool_categories([self._email_ds("send", read_only=True)])
+        assert "email_read" in cats["email"]
+        assert "email_move" not in cats["email"]
+        assert "email_send" not in cats["email"]
+
+    def test_invalid_access_fails_closed_to_read(self):
+        cats = datasource_tool_categories([self._email_ds("root")])
+        assert set(cats["email"]) == {
+            "email_list_folders",
+            "email_list",
+            "email_search",
+            "email_read",
+        }
 
 
 class TestOrchestratorDelegation:

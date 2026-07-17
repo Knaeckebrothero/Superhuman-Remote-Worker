@@ -219,6 +219,12 @@ from services.cloud.reload import (  # noqa: E402
 )
 from services.cloud.ro_engage import engage_ro_mount, RoEngageRefused  # noqa: E402
 from services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
+from services.email_datasource import (  # noqa: E402
+    email_dispatch_config,
+    probe_email_connection,
+    validate_email_config,
+    validate_email_credentials,
+)
 from services import discovery as discovery_service  # noqa: E402
 from services import family_matcher  # noqa: E402
 from services import readiness as readiness_service  # noqa: E402
@@ -5552,7 +5558,7 @@ class DatasourceCreate(BaseModel):
     name: str = Field(..., description="User-provided label")
     type: str = Field(
         ...,
-        description="Datasource type: generic, repository, kb, postgresql, neo4j, mongodb, webdav, kubeconfig, ssh_key, generic_file",
+        description="Datasource type: generic, repository, kb, postgresql, neo4j, mongodb, webdav, email, kubeconfig, ssh_key, generic_file",
     )
     connection_url: str | None = Field(
         None, description="Connection string (nullable for generic)"
@@ -5571,7 +5577,11 @@ class DatasourceCreate(BaseModel):
     )
     config: dict[str, Any] | None = Field(
         None,
-        description="Non-secret type-specific config (kb: root_path)",
+        description=(
+            "Non-secret type-specific config (kb: root_path; email: access/"
+            "folders/drafts_folder/from_address/recipient_allowlist/"
+            "unattended_send)"
+        ),
     )
     is_global: bool = Field(
         False, description="Whether this datasource is visible to all users"
@@ -5597,7 +5607,11 @@ class DatasourceUpdate(BaseModel):
     default_branch: str | None = Field(None, description="New default branch")
     config: dict[str, Any] | None = Field(
         None,
-        description="New non-secret type-specific config (kb: root_path)",
+        description=(
+            "New non-secret type-specific config (kb: root_path; email: "
+            "access/folders/drafts_folder/from_address/recipient_allowlist/"
+            "unattended_send)"
+        ),
     )
     is_global: bool | None = Field(
         None,
@@ -15416,7 +15430,9 @@ def _build_datasource_tool_override(
     override = dict(config_override or {})
     tools_override = dict(override.get("tools", {}))
     # Shared single source of truth with the agent's session attach path
-    # (they previously disagreed on read-write managed connectors).
+    # (they previously disagreed on read-write managed connectors). Email is
+    # tier-keyed inside the shared map (EMAIL_TIER_TOOLS keyed by
+    # config.access, clamped by project_read_only) — no extra handling here.
     tools_override.update(datasource_tool_categories(datasources))
     override["tools"] = tools_override
     return override
@@ -15457,8 +15473,9 @@ def _build_datasources_payload(
     if not resolved_ds:
         return None
 
-    managed_types = {"postgresql", "neo4j", "mongodb", "webdav"}
+    managed_types = {"postgresql", "neo4j", "mongodb", "webdav", "email"}
     payload = []
+    email_forwarded = False
     for ds in resolved_ds:
         creds = ds.get("credentials") or {}
         if isinstance(creds, str):
@@ -15472,8 +15489,10 @@ def _build_datasources_payload(
         is_read_only = ds.get("project_read_only", False)
         ds_type = ds["type"]
 
-        # Read-only managed connectors: withhold credentials (tools hold them)
-        if ds_type in managed_types and is_read_only:
+        # Read-only managed connectors: withhold credentials (tools hold them).
+        # Email is exempt — its tools need a live IMAP login at every tier;
+        # read-only is expressed as the access floor on entry['config'] instead.
+        if ds_type in managed_types and is_read_only and ds_type != "email":
             creds = {}
 
         # External OKF KBs are centrally indexed and read-only in Slice 4 v1.
@@ -15494,6 +15513,25 @@ def _build_datasources_payload(
         if ds_type == "kb":
             entry["datasource_id"] = str(ds["id"])
             entry["config"] = _normalize_kb_config(ds.get("config"))
+        if ds_type == "email":
+            # v1: one mailbox per job/session — the agent keys connections by
+            # type, so a second email datasource would silently shadow the
+            # first (docs/features/email_datasource.md, open questions).
+            if email_forwarded:
+                logger.warning(
+                    "Skipping additional email datasource %r: only one email "
+                    "datasource per job/session is supported",
+                    ds.get("name"),
+                )
+                continue
+            email_forwarded = True
+            entry["config"] = email_dispatch_config(
+                ds.get("config"),
+                project_read_only=bool(is_read_only),
+                owner_can_autonomous_send=bool(
+                    ds.get("_owner_can_autonomous_send", False)
+                ),
+            )
         if ds.get("cli_hint"):
             entry["cli_hint"] = ds["cli_hint"]
         if ds.get("default_branch"):
@@ -15780,6 +15818,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         "neo4j",
         "mongodb",
         "webdav",
+        "email",
         "kubeconfig",
         "ssh_key",
         "generic_file",
@@ -15811,6 +15850,14 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
                 "'public_datasources' capability"
             ),
         )
+    # Mailboxes are never published — a public email datasource would hand the
+    # owner's IMAP/SMTP credentials to every user's agents, so no capability
+    # can allow it (docs/features/email_datasource.md).
+    if body.type == "email" and body.is_global:
+        raise HTTPException(
+            status_code=400,
+            detail="Email datasources cannot be published (is_global)",
+        )
     read_only = body.read_only
     if body.type == "kb":
         if read_only is False:
@@ -15827,11 +15874,27 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
     if body.type == "kb":
         connection_url = _validate_kb_repository_url(connection_url)
         datasource_config = _normalize_kb_config(body.config)
+    elif body.type == "email":
+        # The grant is only consulted when unattended_send is requested, so
+        # the common draft-tier create skips the grant-resolution round-trip.
+        wants_unattended = bool((body.config or {}).get("unattended_send"))
+        owner_has_send_grant = (
+            await postgres_db.user_can_autonomous_send(user)
+            if wants_unattended
+            else False
+        )
+        try:
+            datasource_config = validate_email_config(body.config, owner_has_send_grant)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     else:
         if body.config:
             raise HTTPException(
                 status_code=400,
-                detail="Datasource config is only supported for OKF Knowledge Bases",
+                detail=(
+                    "Datasource config is only supported for OKF Knowledge "
+                    "Bases and email datasources"
+                ),
             )
         datasource_config = dict(body.config or {})
 
@@ -15842,6 +15905,15 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.type == "kb":
         _validate_kb_repository_auth(connection_url, credentials)
+    if body.type == "email":
+        # Shape check runs BEFORE encryption at rest (create_datasource
+        # encrypts transparently); smtp block required only for access='send'.
+        try:
+            credentials = validate_email_credentials(
+                credentials, access=datasource_config["access"]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         created = await postgres_db.create_datasource(
@@ -15894,6 +15966,14 @@ async def update_datasource(
                     "'public_datasources' capability"
                 ),
             )
+    # Mailboxes are never published — a public email datasource would hand the
+    # owner's IMAP/SMTP credentials to every user's agents, so no capability
+    # can allow it (docs/features/email_datasource.md).
+    if existing_ds.get("type") == "email" and body.is_global is True:
+        raise HTTPException(
+            status_code=400,
+            detail="Email datasources cannot be published (is_global)",
+        )
     read_only = body.read_only
     if existing_ds.get("type") == "kb" and read_only is False:
         raise HTTPException(
@@ -15953,10 +16033,50 @@ async def update_datasource(
             else (existing_ds.get("credentials") or {})
         )
         _validate_kb_repository_auth(effective_url, effective_credentials)
+    elif existing_ds.get("type") == "email":
+        if datasource_config is not None:
+            wants_unattended = bool(datasource_config.get("unattended_send"))
+            owner_has_send_grant = (
+                await postgres_db.user_can_autonomous_send(user)
+                if wants_unattended
+                else False
+            )
+            try:
+                datasource_config = validate_email_config(
+                    datasource_config, owner_has_send_grant
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Validate the EFFECTIVE credential shape against the EFFECTIVE access
+        # tier (e.g. flipping access to 'send' without a stored smtp block must
+        # 400 here, not fail at first use). Runs BEFORE encryption at rest;
+        # preserved (None) credentials are checked but not rewritten.
+        effective_email_conf = (
+            datasource_config
+            if datasource_config is not None
+            else (existing_ds.get("config") or {})
+        )
+        effective_credentials = (
+            credentials
+            if credentials is not None
+            else (existing_ds.get("credentials") or {})
+        )
+        try:
+            checked_credentials = validate_email_credentials(
+                effective_credentials,
+                access=effective_email_conf.get("access", "draft"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if credentials is not None:
+            credentials = checked_credentials
     elif datasource_config:
         raise HTTPException(
             status_code=400,
-            detail="Datasource config is only supported for OKF Knowledge Bases",
+            detail=(
+                "Datasource config is only supported for OKF Knowledge Bases "
+                "and email datasources"
+            ),
         )
     try:
         success = await postgres_db.update_datasource(
@@ -16149,6 +16269,24 @@ async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any
                 )
                 client.list("/")
                 return {"status": "ok", "message": "Connected to WebDAV"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif ds_type == "email":
+            # Blocking imaplib/smtplib probe runs off the event loop (the
+            # sync sibling branches above block it — don't copy that).
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(
+                        probe_email_connection, creds, ds.get("config") or {}
+                    ),
+                    timeout=10,
+                )
+            except asyncio.TimeoutError:
+                return {
+                    "status": "error",
+                    "message": "IMAP/SMTP connectivity test timed out after 10s",
+                }
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 

@@ -23,6 +23,11 @@ CATALOG: dict[str, dict[str, Any]] = {
     # hands the publisher's stored credentials to every user's agents.
     # Spec: docs/features/public_datasources.md
     "public_datasources": {"type": "bool", "default": False, "restrict_only": True},
+    # Unattended email send: allows setting unattended_send=true on an email
+    # datasource, which skips the human send-approval freeze on email_send.
+    # Deny-by-default and re-checked fail-closed at dispatch (a revoked grant
+    # forces the flag back off). Spec: docs/features/email_datasource.md
+    "email_autonomous_send": {"type": "bool", "default": False, "restrict_only": True},
     "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
     "browser": {"type": "bool", "default": True, "restrict_only": True},
     "model_selection": {"type": "list", "default": None, "restrict_only": True},

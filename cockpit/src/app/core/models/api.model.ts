@@ -202,9 +202,16 @@ export type DatasourceType =
   | 'neo4j'
   | 'mongodb'
   | 'webdav'
+  | 'email'
   | 'kubeconfig'
   | 'ssh_key'
   | 'generic_file';
+
+/**
+ * Access tier for an ``email`` datasource (see docs/features/email_datasource.md).
+ * ``draft`` is the default: the agent composes drafts, the human sends them.
+ */
+export type EmailAccessTier = 'read' | 'read_write' | 'draft' | 'send';
 
 /**
  * A single file entry inside ``credentials.files[]`` for credential-file types.
@@ -225,6 +232,19 @@ export interface CredentialFileEntry {
 export interface DatasourceConfig {
   /** Repository-relative POSIX root containing OKF Markdown notes. */
   root_path?: string;
+  /** Email: access tier (tool-layer enforced; ``draft`` is the default). */
+  access?: EmailAccessTier;
+  /** Email: folder allowlist; empty = whole mailbox (rejected for ``send``). */
+  folders?: string[];
+  /** Email: fallback Drafts folder (SPECIAL-USE ``\\Drafts`` resolved first). */
+  drafts_folder?: string;
+  /** Email: From address used for compositions. */
+  from_address?: string;
+  /** Email: addresses/@domains allowed for new (non-reply) compositions. */
+  recipient_allowlist?: string[];
+  /** Email: skip the human send-approval freeze (needs the
+   *  ``email_autonomous_send`` grant; the server rejects it otherwise). */
+  unattended_send?: boolean;
 }
 
 export type DatasourceIndexState =

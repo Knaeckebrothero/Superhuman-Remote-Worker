@@ -286,6 +286,16 @@ codexProxy:
   image: docker.io/eceasy/cli-proxy-api:v7.2.61
 
 # -----------------------------------------------------------------------------
+# GreenMail — test-only IMAP/SMTP server for the `email` datasource. OFF by
+# default; flip on when working on email tools, then seed fixture mail with
+#   kubectl --context=k3d-srw -n srw port-forward svc/srw-greenmail 3143:3143 &
+#   python scripts/seed_greenmail.py
+# -----------------------------------------------------------------------------
+# test:
+#   greenmail:
+#     enabled: true
+
+# -----------------------------------------------------------------------------
 # Workspace PVC — single-node k3d uses local-path, which is RWO-only.
 #
 # networkPolicy.extraEgress: in-cluster Traefik hairpin — lets workspace

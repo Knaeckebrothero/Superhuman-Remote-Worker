@@ -412,6 +412,37 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
+  # GreenMail — test-only mail server for the `email` datasource
+  # ---------------------------------------------------------------------------
+  # Disposable IMAP+IMAPS+SMTP(+S) server backing the email datasource
+  # integration tests (docs/features/email_datasource.md §Testing). Auth is
+  # disabled: any user/password pair works and mailboxes are created on first
+  # use; all state is in-memory (a restart wipes it). Seed folders + fixture
+  # mails with: python scripts/seed_greenmail.py
+  # Deliberately separate from the Keycloak SMTP wiring above (Proton Bridge
+  # on the host) — that path sends real mail; this one never does.
+  greenmail:
+    image: docker.io/greenmail/standalone:2.1.11
+    container_name: srw-greenmail
+    environment:
+      GREENMAIL_OPTS: '-Dgreenmail.setup.test.all -Dgreenmail.auth.disabled -Dgreenmail.hostname=0.0.0.0'
+    ports:
+      - "${GREENMAIL_SMTP_PORT:-3025}:3025"
+      - "${GREENMAIL_IMAP_PORT:-3143}:3143"
+      - "${GREENMAIL_IMAPS_PORT:-3993}:3993"
+      # REST API — host 8081, NOT 8080 (the agent's job API binds 8080 when
+      # running bare-metal on the host).
+      - "${GREENMAIL_API_PORT:-8081}:8080"
+    healthcheck:
+      # Image is a bare JRE (no wget/curl); bash /dev/tcp probes the REST port.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   # Workspace containers (Docker Compose mode)
   # ---------------------------------------------------------------------------
   # Pre-provisioned workspaces that the locally-running orchestrator assigns

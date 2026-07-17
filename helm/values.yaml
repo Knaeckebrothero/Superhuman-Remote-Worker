@@ -1312,6 +1312,29 @@ codexProxy:
       cpu: "1000m"
 
 # =============================================================================
+# Test-only Infrastructure
+# =============================================================================
+# Throwaway services that back integration tests. Everything under `test.` is
+# OFF by default and must stay off on production overlays.
+test:
+  # -- GreenMail — disposable IMAP+IMAPS+SMTP(+S) mail server for the `email`
+  # datasource integration tests (docs/features/email_datasource.md §Testing).
+  # Auth disabled (any credentials work), state is in-memory only. Enable on
+  # local k3d / CI overlays; seed fixtures with scripts/seed_greenmail.py.
+  greenmail:
+    enabled: false
+    # Pin a concrete version — test assertions depend on server behavior
+    # (folder semantics, REST API), so don't track :latest.
+    image: docker.io/greenmail/standalone:2.1.11
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+
+# =============================================================================
 # Reloader (watches ConfigMap/Secret changes and triggers rolling restarts)
 # =============================================================================
 reloader:

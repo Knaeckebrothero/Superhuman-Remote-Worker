@@ -32,12 +32,14 @@ def test_catalog_keys_and_defaults():
         "autonomy_ceiling",
         "permission_mode",
         "public_datasources",
+        "email_autonomous_send",
     }
     assert all(spec["restrict_only"] for spec in CATALOG.values())
     assert CATALOG["vm_workspace"]["default"] is False
     assert CATALOG["shell_tools"]["default"] is False  # deny-by-default
     assert CATALOG["delegation"]["default"] is False
     assert CATALOG["public_datasources"]["default"] is False  # deny-by-default
+    assert CATALOG["email_autonomous_send"]["default"] is False  # deny-by-default
     assert CATALOG["browser"]["default"] is True  # spec-deferred allow
     assert CATALOG["datasource_tools"]["default"] is True
     assert CATALOG["model_selection"]["default"] is None
