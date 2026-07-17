@@ -228,6 +228,23 @@
     "default": "default",
     "noKey": "(no key)"
   },
+  "externalImage": {
+    "title": "External image blocked",
+    "host": "Destination: {{host}}",
+    "unknownHost": "unknown host",
+    "explanation": "Loading contacts {{host}} through the SRW server and sends that host the URL path and query shown below. Your browser will render only the returned image bytes.",
+    "parameterWarning": "This URL contains query parameters. Review them for private information before loading.",
+    "unsupported": "Only public HTTPS image URLs on port 443, without credentials or fragments, can be loaded.",
+    "copyUrl": "Copy URL",
+    "copied": "Copied",
+    "blocked": "Blocked",
+    "idle": "Load image once",
+    "loading": "Loading…",
+    "loaded": "Image loaded",
+    "error": "Try loading again",
+    "loadFailed": "SRW could not load this URL as a safe public raster image.",
+    "missingAlt": "External image"
+  },
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",

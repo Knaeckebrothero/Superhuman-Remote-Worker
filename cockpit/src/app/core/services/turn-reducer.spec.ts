@@ -432,6 +432,25 @@ describe('turn-reducer — thinking_reset (live replace)', () => {
         expect(thoughts).toHaveLength(2);
         expect(thoughts.map((t) => t.content)).toEqual(['first', 'second']);
     });
+
+    it('an UNKEYED reset removes every streaming thought of the active turn', () => {
+        // The agent sends an unkeyed reset when attempt-1's dead-end reasoning
+        // was broadcast as UNKEYED in-stream block frames (Responses/codex) —
+        // only an unkeyed reset can clear those bubbles. Done thoughts stay.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {type: 'thinking', content: 'finished lead-up', timestamp: 1050, messageId: 'a0'},
+            {type: 'token', content: 'text closes a0 to done', timestamp: 1075},
+            {type: 'thinking', content: 'unkeyed dead-end', timestamp: 1100},
+            {type: 'thinking', content: 'keyed dead-end', timestamp: 1150, messageId: 'a1'},
+            {type: 'thinking_reset', timestamp: 1200},
+        ]);
+        const turn = activeTurn(state);
+        const thoughts = turn.events.filter((e) => e.kind === 'thought') as ThoughtEvent[];
+        expect(thoughts).toHaveLength(1);
+        expect(thoughts[0].content).toBe('finished lead-up');
+        expect(thoughts[0].status).toBe('done');
+    });
 });
 
 describe('turn-reducer — tool calls', () => {

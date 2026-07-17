@@ -7,9 +7,11 @@ import localeDe from '@angular/common/locales/de';
 import {firstValueFrom} from 'rxjs';
 import {authInterceptor} from './core/interceptors/auth.interceptor';
 import {viewAsInterceptor} from './core/interceptors/view-as.interceptor';
-import {MARKED_EXTENSIONS, MARKED_OPTIONS, provideMarkdown} from 'ngx-markdown';
+import {MARKED_EXTENSIONS, MARKED_OPTIONS, SANITIZE, provideMarkdown} from 'ngx-markdown';
 import {citationExtension} from './core/markdown/citation-extension';
 import {mathExtension} from './core/markdown/math-extension';
+import {externalImageExtension} from './core/markdown/external-image-extension';
+import {sanitizeMarkdownHtml} from './core/markdown/markdown-sanitizer';
 import {SessionService} from './core/services/session.service';
 import {UserService} from './core/services/user.service';
 import {SettingsService} from './core/services/settings.service';
@@ -102,6 +104,12 @@ export const appConfig: ApplicationConfig = {
       },
       markedExtensions: [
         {
+          // Images are URL-review cards; never emit a live remote <img>.
+          provide: MARKED_EXTENSIONS,
+          multi: true,
+          useValue: externalImageExtension(),
+        },
+        {
           provide: MARKED_EXTENSIONS,
           multi: true,
           useValue: citationExtension(),
@@ -113,6 +121,10 @@ export const appConfig: ApplicationConfig = {
           useValue: mathExtension(),
         },
       ],
+      sanitize: {
+        provide: SANITIZE,
+        useValue: sanitizeMarkdownHtml,
+      },
     }),
     provideServiceWorker('ngsw-worker.js', {
       // Only register in production builds. Dev mode reloads frequently and

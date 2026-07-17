@@ -183,6 +183,7 @@ GET    /api/mcp-tokens                                                          
 POST   /api/mcp-tokens                                                                  gated:require_approved_user
 DELETE /api/mcp-tokens/{token_id}                                                       gated:require_approved_user
 GET    /api/me/active-jobs                                                              gated:require_approved_user
+POST   /api/media/remote-image                                                          gated:require_approved_user
 GET    /api/models                                                                      gated:require_approved_user
 POST   /api/models/reload                                                               admin:_require_admin
 GET    /api/notifications                                                               gated:require_approved_user
