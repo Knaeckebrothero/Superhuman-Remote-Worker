@@ -10,6 +10,31 @@ import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {DatasourceListComponent} from './datasource-list.component';
 
+function emailDatasource(overrides: Partial<Datasource> = {}): Datasource {
+  return {
+    id: 'email-1',
+    name: 'Personal Mailbox',
+    description: 'AI folder triage',
+    type: 'email',
+    connection_url: null,
+    cli_hint: null,
+    default_branch: null,
+    config: {
+      access: 'read_write',
+      folders: ['AI', 'AI/Processed'],
+      drafts_folder: 'Entwürfe',
+      from_address: 'user@example.com',
+      recipient_allowlist: ['@example.org'],
+      unattended_send: false,
+    },
+    job_id: null,
+    created_by: 'user-1',
+    created_at: '',
+    updated_at: '',
+    ...overrides,
+  };
+}
+
 function kbDatasource(overrides: Partial<Datasource> = {}): Datasource {
   return {
     id: 'kb-1',
@@ -169,6 +194,130 @@ describe('DatasourceListComponent OKF Knowledge Base support', () => {
   });
 });
 
+describe('DatasourceListComponent email support', () => {
+  it('creates a draft-tier mailbox with imap credentials and email config, no smtp', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Personal Mailbox';
+    component.onTypeSelect('email');
+    component.formCredentials = {username: 'user@example.com', password: 'app-pass'};
+    component.emailForm.imap_host = 'imap.example.com';
+    component.emailForm.folders = 'AI, AI/Processed';
+    component.emailForm.from_address = 'user@example.com';
+
+    expect(component.canSave()).toBe(true);
+    component.saveForm();
+
+    expect(api.createDatasource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'email',
+        connection_url: undefined,
+        is_global: false,
+        credentials: {
+          backend: 'imap_smtp',
+          username: 'user@example.com',
+          password: 'app-pass',
+          imap: {host: 'imap.example.com', port: 993, security: 'ssl'},
+        },
+        config: {
+          access: 'draft',
+          folders: ['AI', 'AI/Processed'],
+          drafts_folder: 'Drafts',
+          from_address: 'user@example.com',
+          recipient_allowlist: [],
+          unattended_send: false,
+        },
+      }),
+    );
+  });
+
+  it('includes the smtp block only at the send tier', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Sender Mailbox';
+    component.onTypeSelect('email');
+    component.formCredentials = {username: 'user@example.com', password: 'app-pass'};
+    component.onEmailProviderSelect('yahoo');
+    component.onEmailAccessChange('send');
+    component.emailForm.folders = 'AI';
+    component.emailForm.unattended_send = true;
+
+    component.saveForm();
+
+    const payload = api.createDatasource.mock.calls[0][0];
+    expect(payload.credentials.imap).toEqual({
+      host: 'imap.mail.yahoo.com', port: 993, security: 'ssl',
+    });
+    expect(payload.credentials.smtp).toEqual({
+      host: 'smtp.mail.yahoo.com', port: 465, security: 'ssl',
+    });
+    expect(payload.config).toEqual(
+      expect.objectContaining({access: 'send', folders: ['AI'], unattended_send: true}),
+    );
+  });
+
+  it('requires username, app password, and imap host to create', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Mailbox';
+    component.onTypeSelect('email');
+    expect(component.canSave()).toBe(false);
+    component.formCredentials = {username: 'u@e.com', password: 'pw'};
+    expect(component.canSave()).toBe(false);
+    component.emailForm.imap_host = 'imap.e.com';
+    expect(component.canSave()).toBe(true);
+    // Send tier additionally needs an SMTP host.
+    component.onEmailAccessChange('send');
+    expect(component.canSave()).toBe(false);
+    component.emailForm.smtp_host = 'smtp.e.com';
+    expect(component.canSave()).toBe(true);
+  });
+
+  it('round-trips email config on edit and keeps blank credentials untouched', () => {
+    const {api, component} = createComponent();
+    const ds = emailDatasource();
+    component.openEditForm(ds);
+
+    expect(component.emailForm.access).toBe('read_write');
+    expect(component.emailForm.folders).toBe('AI, AI/Processed');
+    expect(component.emailForm.drafts_folder).toBe('Entwürfe');
+    expect(component.emailForm.from_address).toBe('user@example.com');
+    expect(component.emailForm.recipient_allowlist).toBe('@example.org');
+    expect(component.emailForm.unattended_send).toBe(false);
+    expect(component.canSave()).toBe(true);
+
+    component.saveForm();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({
+        credentials: undefined,
+        config: {
+          access: 'read_write',
+          folders: ['AI', 'AI/Processed'],
+          drafts_folder: 'Entwürfe',
+          from_address: 'user@example.com',
+          recipient_allowlist: ['@example.org'],
+          unattended_send: false,
+        },
+      }),
+    );
+  });
+
+  it('prefills host/port/security from a provider preset', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.onTypeSelect('email');
+    component.onEmailProviderSelect('gmail');
+    expect(component.emailForm.imap_host).toBe('imap.gmail.com');
+    expect(component.emailForm.imap_port).toBe('993');
+    expect(component.emailForm.imap_security).toBe('ssl');
+    expect(component.emailForm.smtp_host).toBe('smtp.gmail.com');
+    expect(component.emailForm.smtp_port).toBe('587');
+    expect(component.emailForm.smtp_security).toBe('starttls');
+  });
+});
+
 describe('DatasourceListComponent publish confirmation tiers', () => {
   it('needs no confirmation for a private save', () => {
     const {component} = createComponent();
@@ -265,6 +414,14 @@ describe('DatasourceListComponent publish confirmation tiers', () => {
     component.openEditForm({...ds, is_global: true, read_only: false});
     expect(component.formData.is_global).toBe(true);
     expect(component.formData.read_only).toBe(false);
+  });
+
+  it('clears is_global when switching the type to email', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.is_global = true;
+    component.onTypeSelect('email');
+    expect(component.formData.is_global).toBe(false);
   });
 
   it('saveForm defers to the dialog when confirmation is needed', () => {

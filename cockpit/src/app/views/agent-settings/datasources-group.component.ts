@@ -400,6 +400,7 @@ export class DatasourcesGroupComponent {
       neo4j: 'hub',
       mongodb: 'eco',
       webdav: 'cloud',
+      email: 'mail',
       kb: 'menu_book',
     };
     return icons[type] || 'storage';

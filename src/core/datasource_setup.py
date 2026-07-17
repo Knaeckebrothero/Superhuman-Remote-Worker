@@ -44,6 +44,46 @@ def _ds_slug_hyphen(name: str) -> str:
     return s or "unnamed"
 
 
+# Cumulative email access tiers (``config.access``): each tier includes every
+# tool of the tiers below it (docs/features/email_datasource.md). Order in
+# EMAIL_TIER_ORDER is the escalation order used for clamping/maxing.
+EMAIL_TIER_ORDER: Tuple[str, ...] = ("read", "read_write", "draft", "send")
+EMAIL_TIER_TOOLS: Dict[str, List[str]] = {
+    "read": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+    ],
+    "read_write": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+    ],
+    "draft": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+        "email_draft",
+    ],
+    "send": [
+        "email_list_folders",
+        "email_list",
+        "email_search",
+        "email_read",
+        "email_move",
+        "email_flag",
+        "email_draft",
+        "email_send",
+    ],
+}
+
 # Datasource type → tool category + read/write tool sets. Single source of
 # truth for BOTH trust boundaries: the orchestrator's
 # _build_datasource_tool_override (job dispatch, thread create/resume) and the
@@ -83,7 +123,27 @@ DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
             "webdav_delete",
         ],
     },
+    # Email is tier-keyed (config.access), not binary read/write — see
+    # EMAIL_TIER_TOOLS and docs/features/email_datasource.md.
+    "email": {
+        "category": "email",
+        "tiers": EMAIL_TIER_TOOLS,
+    },
 }
+
+
+def email_effective_access(ds: Dict[str, Any]) -> str:
+    """Effective email tier: ``config.access`` (default ``draft``), clamped
+    to ``read`` by a read-only project link.
+
+    Unknown values fail closed to ``read``. The clamp never empties
+    credentials — email needs a live IMAP login at every tier
+    (docs/features/email_datasource.md, Touchpoints).
+    """
+    if ds.get("project_read_only", False):
+        return "read"
+    access = (ds.get("config") or {}).get("access", "draft")
+    return access if access in EMAIL_TIER_TOOLS else "read"
 
 
 def datasource_tool_categories(
@@ -97,7 +157,12 @@ def datasource_tool_categories(
       previously attached datasource never survive,
     - ALL datasources of a type read-only → read tools,
     - any read-write → write tools, backed by the real connection
-      process_datasources() now creates for read-write connectors too.
+      process_datasources() now creates for read-write connectors too,
+    - tier-keyed types (email): highest effective tier across attached
+      datasources of the type (the "any read-write → write" analog);
+      per-datasource tiers come from ``config.access`` clamped by
+      ``project_read_only`` (email_effective_access), and the tool layer's
+      per-call tier check is the backup gate.
 
     History: read-write managed connectors (postgresql/neo4j/mongodb) used
     to map to ``[]`` — "CLI mode" — which was dead on remote workspace
@@ -117,6 +182,12 @@ def datasource_tool_categories(
         ds_list = by_type.get(ds_type, [])
         if not ds_list:
             categories[category] = []
+        elif "tiers" in tool_info:
+            tier = max(
+                (email_effective_access(ds) for ds in ds_list),
+                key=EMAIL_TIER_ORDER.index,
+            )
+            categories[category] = list(tool_info["tiers"][tier])
         elif all(ds.get("project_read_only", False) for ds in ds_list):
             categories[category] = list(tool_info["read"])
         else:
@@ -697,6 +768,18 @@ def create_datasource_connection(
         client.list("/")
         return client, None
 
+    elif ds_type == "email":
+        # Lazy import: the email tool module ships with the email tool
+        # surface — keep this module importable without it.
+        from src.tools.email.connection import EmailConnection
+
+        config = dict(ds.get("config") or {})
+        # Normalize to the effective tier (default 'draft'; a read-only
+        # project link clamps to 'read' but credentials stay intact — email
+        # needs a live IMAP login at every tier).
+        config["access"] = email_effective_access(ds)
+        return EmailConnection(creds, config), None
+
     else:
         raise ValueError(f"Unknown datasource type: {ds_type}")
 
@@ -1029,6 +1112,24 @@ def inject_datasource_index(
             elif ds_type == "webdav":
                 access = "read-only tools" if is_ro else "read-write tools"
                 lines.append(f"- **{name}** (webdav, {access}){_declared_ro_note(ds)}")
+            elif ds_type == "email":
+                config = ds.get("config") or {}
+                account = (
+                    (ds.get("credentials") or {}).get("username")
+                    or config.get("from_address")
+                    or "unknown account"
+                )
+                folders = config.get("folders") or []
+                scope = (
+                    ", ".join(f"`{f}`" for f in folders)
+                    if folders
+                    else "entire mailbox"
+                )
+                lines.append(
+                    f"- **{name}** (email, {account}, tier "
+                    f"`{email_effective_access(ds)}`) — folders: {scope}"
+                    f"{_declared_ro_note(ds)}"
+                )
             else:
                 lines.append(f"- **{name}** ({ds_type}){_declared_ro_note(ds)}")
         lines.append("")

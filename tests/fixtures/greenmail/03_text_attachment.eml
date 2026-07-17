@@ -1,0 +1,23 @@
+Message-ID: <greenmail-fixture-003@example.com>
+Date: Wed, 08 Jul 2026 07:30:00 +0000
+From: Carol Example <carol@example.com>
+To: SRW Test <test@example.com>
+Subject: Sensor readings attached
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="greenmail-fixture-003-b1"
+
+--greenmail-fixture-003-b1
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+Attached are yesterday's sensor readings as CSV.
+
+Carol
+--greenmail-fixture-003-b1
+Content-Type: text/csv; charset=us-ascii; name="readings.csv"
+Content-Disposition: attachment; filename="readings.csv"
+Content-Transfer-Encoding: base64
+
+dGltZXN0YW1wLGNlbHNpdXMKMjAyNi0wNy0wNlQwODowMFosMjEuNAoyMDI2LTA3LTA2VDA5OjAw
+WiwyMi4xCjIwMjYtMDctMDZUMTA6MDBaLDIzLjAK
+--greenmail-fixture-003-b1--

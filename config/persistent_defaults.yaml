@@ -130,6 +130,7 @@ tools:
   graph: [ ]
   sql: [ ]
   mongodb: [ ]
+  email: [ ]
   # Not used in persistent mode
   evaluation: [ ]
   delegation: [ ]

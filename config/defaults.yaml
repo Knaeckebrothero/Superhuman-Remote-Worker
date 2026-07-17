@@ -144,6 +144,9 @@ tools:
   # WebDAV tools - WebDAV file operations (src/tools/webdav/)
   # Injected automatically via datasource system
   webdav: []
+  # Email tools - IMAP/SMTP mailbox operations (src/tools/email/)
+  # Injected automatically via datasource system
+  email: []
   # Shell tools - shell command execution (src/tools/shell/)
   shell:
     - run_command     # Execute commands, get output (stateless mode, default)

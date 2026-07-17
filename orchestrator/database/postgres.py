@@ -5838,6 +5838,38 @@ class PostgresDB:
 
         return result == "DELETE 1"
 
+    async def _stamp_email_autonomous_send(
+        self, datasources: List[Dict[str, Any]]
+    ) -> None:
+        """Dispatch-time fail-closed re-check of the email_autonomous_send grant.
+
+        ``config.unattended_send`` is validated against the owner's grant at
+        create/update, but the grant may be revoked afterwards. Stamp resolved
+        email rows with ``_owner_can_autonomous_send`` so the (sync) dispatch
+        payload builder can force the flag off without a DB round-trip; a row
+        that never got stamped reads as no-grant (fail closed).
+        """
+        for ds in datasources:
+            if ds.get("type") != "email":
+                continue
+            config = ds.get("config") or {}
+            if not config.get("unattended_send"):
+                continue
+            allowed = False
+            owner_id = ds.get("created_by")
+            if owner_id:
+                try:
+                    owner = await self.get_user(str(owner_id))
+                    if owner:
+                        allowed = await self.user_can_autonomous_send(owner)
+                except Exception:
+                    logger.exception(
+                        "email_autonomous_send owner check failed for datasource "
+                        "%s; denying unattended send",
+                        ds.get("id"),
+                    )
+            ds["_owner_can_autonomous_send"] = allowed
+
     async def resolve_datasources_for_job(
         self, job_id: str, project_id: str | None = None
     ) -> List[Dict[str, Any]]:
@@ -5878,7 +5910,7 @@ class PostgresDB:
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
-                    d.created_at, d.updated_at,
+                    d.created_by, d.created_at, d.updated_at,
                     pd.read_only AS project_read_only
                 FROM job_datasources jd
                 JOIN datasources d ON d.id = jd.datasource_id
@@ -5890,26 +5922,26 @@ class PostgresDB:
                 job_uuid,
                 project_uuid,
             )
-            if rows:
-                return [_datasource_row_to_dict(row) for row in rows]
+            if not rows:
+                # Transitional fallback: legacy clone-to-job-scoped rows (pre-0026).
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT d.id, d.name, d.description, d.type,
+                        d.connection_url, d.credentials, d.config,
+                        d.cli_hint, d.default_branch, d.read_only,
+                        d.created_by, d.created_at, d.updated_at,
+                        NULL::boolean AS project_read_only
+                    FROM datasources d
+                    WHERE d.job_id = $1
+                      AND d.type <> 'kb'
+                    ORDER BY d.type, d.name
+                    """,
+                    job_uuid,
+                )
 
-            # Transitional fallback: legacy clone-to-job-scoped rows (pre-0026).
-            legacy = await conn.fetch(
-                """
-                SELECT DISTINCT d.id, d.name, d.description, d.type,
-                    d.connection_url, d.credentials, d.config,
-                    d.cli_hint, d.default_branch, d.read_only,
-                    d.created_at, d.updated_at,
-                    NULL::boolean AS project_read_only
-                FROM datasources d
-                WHERE d.job_id = $1
-                  AND d.type <> 'kb'
-                ORDER BY d.type, d.name
-                """,
-                job_uuid,
-            )
-
-        return [_datasource_row_to_dict(row) for row in legacy]
+        resolved = [_datasource_row_to_dict(row) for row in rows]
+        await self._stamp_email_autonomous_send(resolved)
+        return resolved
 
     async def resolve_datasources_for_thread(
         self,
@@ -5958,7 +5990,7 @@ class PostgresDB:
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
-                    d.created_at, d.updated_at,
+                    d.created_by, d.created_at, d.updated_at,
                     pd.read_only AS project_read_only
                 FROM datasources d
                 LEFT JOIN project_datasources pd
@@ -5971,7 +6003,9 @@ class PostgresDB:
                 proj_uuids,
             )
 
-        return [_datasource_row_to_dict(row) for row in rows]
+        resolved = [_datasource_row_to_dict(row) for row in rows]
+        await self._stamp_email_autonomous_send(resolved)
+        return resolved
 
     # -- Job ↔ Datasource junction (N:M) --------------------------------------
 
@@ -10843,6 +10877,35 @@ class PostgresDB:
             return bool(g.get("public_datasources"))
         except Exception:
             logger.exception("public_datasources grant read failed; denying publish")
+            return False
+
+    async def user_can_autonomous_send(self, user: dict) -> bool:
+        """Effective email_autonomous_send grant (unattended email send).
+
+        Admins short-circuit to True. Mirrors user_can_publish_datasource:
+        no legacy-column fallback (new capability, deny-by-default) and the
+        fail mode is CLOSED — unattended send bypasses the human
+        send-approval freeze, so a grant-read failure must deny.
+        Spec: docs/features/email_datasource.md.
+        """
+        if user.get("is_admin"):
+            return True
+        try:
+            scoped = await self.list_grants_for_scopes(
+                user_id=str(user["id"]), project_ids=[]
+            )
+            from src.core.capability_grants import resolve_grants
+
+            g = resolve_grants(
+                user_rows=scoped["user"],
+                project_rows=scoped["project"],
+                global_rows=scoped["global"],
+            )
+            return bool(g.get("email_autonomous_send"))
+        except Exception:
+            logger.exception(
+                "email_autonomous_send grant read failed; denying unattended send"
+            )
             return False
 
     # Max-level user-scope grants for admins. Admins bypass the PDP at every

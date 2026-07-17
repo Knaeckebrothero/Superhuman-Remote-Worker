@@ -1,0 +1,27 @@
+Message-ID: <greenmail-fixture-002@example.com>
+Date: Tue, 07 Jul 2026 14:02:00 +0000
+From: =?utf-8?b?SsO2cmcgQmVpc3BpZWw=?= <joerg@example.com>
+To: SRW Test <test@example.com>
+Subject: =?utf-8?b?UsO8Y2tmcmFnZSB6dXIgQmVzdGVsbHVuZyBOci4gNDI=?=
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="greenmail-fixture-002-b1"
+
+--greenmail-fixture-002-b1
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Hallo,
+
+kurze R=C3=BCckfrage zur Bestellung Nr. 42: ist die Gr=C3=B6=C3=9Fe noch =
+=C3=A4nderbar?
+
+Danke und viele Gr=C3=BC=C3=9Fe
+J=C3=B6rg
+--greenmail-fixture-002-b1
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+<html><body><p>Hallo,</p><p>kurze <b>R=C3=BCckfrage</b> zur Bestellung Nr.=
+ 42: ist die Gr=C3=B6=C3=9Fe noch =C3=A4nderbar?</p><p>Danke und viele Gr=
+=C3=BC=C3=9Fe<br>J=C3=B6rg</p></body></html>
+--greenmail-fixture-002-b1--
