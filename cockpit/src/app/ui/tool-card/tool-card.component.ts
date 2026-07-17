@@ -10,6 +10,7 @@ import {ToolCardAction, ToolCardStatus, ToolCardView, ToolResult} from '../../co
 import {CanvasService} from '../../core/services/canvas.service';
 import {CanvasState} from '../../core/models/canvas.model';
 import {CanvasToolCardPresentationComponent} from './canvas-tool-card-presentation.component';
+import {ExternalImageDirective} from '../external-image';
 
 /** Lines of a text/code/terminal result shown before "show N more". */
 const RESULT_LINE_CAP = 200;
@@ -41,6 +42,7 @@ export function canvasToolCardContext(
     imports: [
         TranslocoPipe,
         MarkdownComponent,
+        ExternalImageDirective,
         AppIconComponent,
         AppIconButtonComponent,
         CanvasToolCardPresentationComponent,

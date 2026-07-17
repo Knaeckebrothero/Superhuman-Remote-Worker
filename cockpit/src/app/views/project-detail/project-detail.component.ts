@@ -19,6 +19,7 @@ import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {ProjectLoopComponent} from './project-loop.component';
+import {ExternalImageDirective} from '../../ui/external-image';
 import {
     Datasource,
     Expert,
@@ -56,6 +57,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     AppBadgeComponent,
     AppFormFieldComponent,
     MarkdownComponent,
+    ExternalImageDirective,
     ProjectLoopComponent,
   ],
   template: `

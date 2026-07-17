@@ -228,6 +228,23 @@
     "default": "Standard",
     "noKey": "(kein Schlüssel)"
   },
+  "externalImage": {
+    "title": "Externes Bild blockiert",
+    "host": "Ziel: {{host}}",
+    "unknownHost": "unbekannter Host",
+    "explanation": "Beim Laden kontaktiert der SRW-Server {{host}} und übermittelt diesem Host den unten angezeigten URL-Pfad samt Abfrage. Ihr Browser stellt nur die zurückgegebenen Bilddaten dar.",
+    "parameterWarning": "Diese URL enthält Abfrageparameter. Prüfen Sie diese vor dem Laden auf vertrauliche Informationen.",
+    "unsupported": "Geladen werden können nur öffentliche HTTPS-Bild-URLs auf Port 443 ohne Zugangsdaten oder Fragmente.",
+    "copyUrl": "URL kopieren",
+    "copied": "Kopiert",
+    "blocked": "Blockiert",
+    "idle": "Bild einmal laden",
+    "loading": "Wird geladen…",
+    "loaded": "Bild geladen",
+    "error": "Erneut laden",
+    "loadFailed": "SRW konnte diese URL nicht als sicheres öffentliches Rasterbild laden.",
+    "missingAlt": "Externes Bild"
+  },
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",

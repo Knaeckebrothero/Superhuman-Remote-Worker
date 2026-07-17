@@ -31,6 +31,7 @@ import {AppSelectComponent} from '../../ui/select';
 import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppIconComponent} from '../../ui/icon';
 import {AppCopyFieldComponent} from '../../ui/copy-field';
+import {ExternalImageDirective} from '../../ui/external-image';
 
 interface FrozenJobData {
   freeze_type?: string;
@@ -76,6 +77,7 @@ function relativeTime(iso: string, nowLabel: string): string {
   imports: [
     JsonPipe,
     MarkdownComponent,
+    ExternalImageDirective,
     SidebarToggleComponent,
     TranslocoPipe,
     AppChipComponent,

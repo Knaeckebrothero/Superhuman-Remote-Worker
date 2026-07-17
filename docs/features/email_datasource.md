@@ -16,9 +16,10 @@ and (gated) send.
 > **Status (2026-07-14): PROPOSED, research-hardened.** No implementation yet.
 > Reconciled against the datasource changes on develop @ `f50a1039` (the `config`/`read_only`
 > columns already exist — no migration needed) and revised after a 12-stream codebase+web
-> research pass (2026-07-13). The research digest lives in the session scratchpad; its
-> load-bearing conclusions are folded in below. Three product/security decisions were taken
-> by the owner on 2026-07-14 and are marked **[DECIDED]** inline.
+> research pass (2026-07-13). Its load-bearing conclusions are folded in below; the full
+> point-in-time digest (with exact file:line anchors and per-operation API mappings) is
+> preserved alongside as **`email_datasource_research.md`**. Three product/security decisions
+> were taken by the owner on 2026-07-14 and are marked **[DECIDED]** inline.
 
 ## Motivation
 

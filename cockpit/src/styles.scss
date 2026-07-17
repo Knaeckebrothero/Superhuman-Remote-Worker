@@ -7,6 +7,7 @@
 @use 'styles/code-highlight';     // Global PrismJS token theme for <markdown> code blocks
 @use 'styles/katex';              // Global presentation tweaks for KaTeX math in <markdown>
 @use 'styles/canvas-content';     // Sanitized Dynamic Canvas markdown typography
+@use 'styles/external-image';     // Inert click-to-load cards in untrusted Markdown
 
 // --- Theme classes (body-class swap) ---
 // Default look = senate (dark). <body class="theme-senate"> applies these tokens.
