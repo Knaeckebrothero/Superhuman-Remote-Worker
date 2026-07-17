@@ -1,6 +1,8 @@
 # Packer build artifacts
 output/
+output-stage1/
 input/*.img
+input/*.qcow2
 
 # Compiled sudo gate binaries (built by CI or locally, never committed)
 files/sudo-gated-bin

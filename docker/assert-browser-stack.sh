@@ -24,15 +24,31 @@
 # =============================================================================
 set -uo pipefail
 
+# Run from a directory every user can traverse. browser_use reads `./.env` at
+# import time (pydantic-settings), and stat'ing it from an unreadable CWD
+# raises EACCES — which reads as "browser_use not importable". Exactly that
+# failed every stage2 VM build: provision-stage2.sh invokes this gate as
+# `sudo -u agent-host` from /home/packer, which is 0750 on Ubuntu 24.04
+# (Noble made home dirs private), so agent-host could not stat `./.env`.
+cd /
+
 fail=0
 
 _check() {
     local label="$1"
     shift
-    if "$@" >/dev/null 2>&1; then
+    local out
+    # Capture rather than discard: "MISSING" with no diagnostic once cost a
+    # multi-hour investigation — an import can fail for reasons other than
+    # absence (dependency conflict, permission error), and only the output
+    # distinguishes them.
+    if out=$("$@" 2>&1); then
         printf '  ok       %s\n' "$label"
     else
         printf '  MISSING  %s\n' "$label"
+        if [ -n "$out" ]; then
+            printf '%s\n' "$out" | sed 's/^/           | /'
+        fi
         fail=1
     fi
 }
