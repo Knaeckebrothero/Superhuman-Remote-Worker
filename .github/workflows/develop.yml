@@ -538,7 +538,8 @@ jobs:
           # deployed. See docs/features/browser_workspace_executor.md.
           WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
             docker/Dockerfile.workspace docker/workspace-entrypoint.sh \
-            docker/browser-exec .playwright-version)
+            docker/browser-exec docker/assert-browser-stack.sh \
+            .playwright-version)
 
           VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
             vm/controller/)
