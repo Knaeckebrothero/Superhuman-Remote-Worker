@@ -19,7 +19,8 @@ See docs/issues/delegation_light_mode_missing.md (Phase 1).
 
 import asyncio
 import logging
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 from ...core.context import count_tokens_approximate
 
@@ -27,6 +28,10 @@ logger = logging.getLogger(__name__)
 
 # Returned when a reader finishes without emitting any text.
 _EMPTY_RESULT = "[subagent returned no content]"
+
+# Bound on the single forced-synthesis LLM call after a cap is hit, so a hung
+# provider can't keep a "finished" reader alive past its own deadline.
+_SYNTHESIS_TIMEOUT_SECONDS = 90
 
 
 async def _execute_tool_calls(
@@ -121,7 +126,10 @@ async def _final_synthesis(
         "on what you have gathered so far, write your final answer now."
     )
     try:
-        ai = await llm.ainvoke(messages + [HumanMessage(content=prompt)])
+        ai = await asyncio.wait_for(
+            llm.ainvoke(messages + [HumanMessage(content=prompt)]),
+            timeout=_SYNTHESIS_TIMEOUT_SECONDS,
+        )
         text = _message_text(ai)
         if text:
             return text
@@ -132,6 +140,24 @@ async def _final_synthesis(
     return f"[subagent stopped: hit {reason} before producing a final answer]"
 
 
+def _timeout_tool_messages(tool_calls: List[Dict[str, Any]]) -> List[Any]:
+    """Synthetic ToolMessages for calls cancelled by the wall-clock deadline.
+
+    Every tool_call on the last AIMessage must be answered before the next LLM
+    turn (the forced synthesis) — strict providers reject dangling tool_calls.
+    """
+    from langchain_core.messages import ToolMessage
+
+    return [
+        ToolMessage(
+            content="Error: cancelled — the subagent ran out of time.",
+            tool_call_id=tc.get("id"),
+            name=tc.get("name"),
+        )
+        for tc in tool_calls
+    ]
+
+
 async def run_light_subagent(
     task: str,
     context: str,
@@ -140,6 +166,7 @@ async def run_light_subagent(
     *,
     max_iterations: int = 10,
     max_tokens: int = 40000,
+    timeout_seconds: float = 0,
     port_block: str = "",
     role: str = "",
     expected_return_format: str = "",
@@ -157,6 +184,10 @@ async def run_light_subagent(
         max_iterations: Hard cap on execute↔tools turns.
         max_tokens: Approximate running-message token budget; once exceeded the
             reader is asked to synthesize and stop.
+        timeout_seconds: Wall-clock budget for the whole reader (0 = unbounded).
+            The reader must self-terminate with partial results before the
+            parent graph's tool-batch watchdog fires, or the whole batch is
+            discarded — keep this well under `tool_category_timeouts.delegation`.
         port_block: Optional port-range awareness block (server-start steering).
         role: Optional role hint for the preamble.
         expected_return_format: Optional natural-language shape for the result.
@@ -175,9 +206,31 @@ async def run_light_subagent(
 
     tools_by_name: Dict[str, Any] = {t.name: t for t in tools} if tools else {}
 
+    deadline: Optional[float] = (
+        time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
+    )
+
+    def _remaining() -> Optional[float]:
+        return None if deadline is None else deadline - time.monotonic()
+
     last_text = ""
     for _iteration in range(1, max_iterations + 1):
-        ai = await llm.ainvoke(messages)
+        remaining = _remaining()
+        if remaining is not None and remaining <= 0:
+            logger.info(
+                "light subagent hit wall-clock limit (%ss); forcing synthesis",
+                timeout_seconds,
+            )
+            return await _final_synthesis(llm, messages, last_text, reason="time limit")
+        try:
+            ai = await asyncio.wait_for(llm.ainvoke(messages), timeout=remaining)
+        except asyncio.TimeoutError:
+            logger.info(
+                "light subagent LLM turn exceeded wall-clock limit (%ss); "
+                "forcing synthesis",
+                timeout_seconds,
+            )
+            return await _final_synthesis(llm, messages, last_text, reason="time limit")
         messages.append(ai)
 
         text = _message_text(ai)
@@ -196,9 +249,25 @@ async def run_light_subagent(
             )
             return last_text or _EMPTY_RESULT
 
-        # Execute the turn's tool calls concurrently.
-        tool_messages = await _execute_tool_calls(tool_calls, tools_by_name)
-        messages.extend(tool_messages)
+        # Execute the turn's tool calls concurrently, bounded by the deadline.
+        remaining = _remaining()
+        timed_out = remaining is not None and remaining <= 0
+        if not timed_out:
+            try:
+                tool_messages = await asyncio.wait_for(
+                    _execute_tool_calls(tool_calls, tools_by_name), timeout=remaining
+                )
+                messages.extend(tool_messages)
+            except asyncio.TimeoutError:
+                timed_out = True
+        if timed_out:
+            logger.info(
+                "light subagent tool calls exceeded wall-clock limit (%ss); "
+                "forcing synthesis",
+                timeout_seconds,
+            )
+            messages.extend(_timeout_tool_messages(tool_calls))
+            return await _final_synthesis(llm, messages, last_text, reason="time limit")
 
         if count_tokens_approximate(messages) >= max_tokens:
             logger.info(

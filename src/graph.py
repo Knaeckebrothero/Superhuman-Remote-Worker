@@ -423,6 +423,65 @@ def _is_stream_disconnect(text: str) -> bool:
     return any(marker in text for marker in _STREAM_DISCONNECT_MARKERS)
 
 
+def _has_api_error_body(exc: BaseException) -> bool:
+    """True if ``exc`` carries a parseable API error body (a dict).
+
+    The openai SDK parses the error response body as JSON when it can and
+    stores the result on ``exc.body``; a non-JSON body (an nginx/LB default
+    error page, a bare text response) is left as the raw string, and a
+    closed-before-read stream leaves it ``None``. A dict body therefore means
+    the response came from the provider's API application; anything else means
+    it came from infrastructure in front of it.
+    """
+    return isinstance(getattr(exc, "body", None), dict)
+
+
+def _infra_edge_status(error: Exception) -> Optional[int]:
+    """Status code if the failing response is edge-shaped, else ``None``.
+
+    Walks the ``__cause__`` chain (LangChain wraps the provider exception) for
+    an exception carrying an HTTP ``status_code`` whose body is NOT a
+    parseable API error object — i.e. the provider's gateway/proxy answered
+    and the request never reached the API application. Used to exempt such
+    failures from the determinism fingerprint (an identical edge page across
+    pause cycles means the edge is still down, not that the request is
+    deterministic) and to compose a legible error summary.
+    """
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status_code = getattr(current, "status_code", None)
+        if isinstance(status_code, int):
+            return None if _has_api_error_body(current) else status_code
+        nxt = getattr(current, "__cause__", None)
+        current = nxt if nxt is not current else None
+    return None
+
+
+def _summarize_llm_error(error: Exception, model: Optional[str] = None) -> str:
+    """Readable one-liner for user-facing error fields.
+
+    ``str(e)`` for an edge-shaped failure IS the raw response body (the openai
+    SDK stringifies a non-JSON error body verbatim), so without this a nginx
+    HTML 404 page lands untouched in ``jobs.error_message`` and the cockpit
+    shows raw markup as the failure reason. Compose a legible summary instead;
+    every other exception passes through unchanged. The raw text still goes to
+    the audit trail for forensics.
+    """
+    status = _infra_edge_status(error)
+    if status is None:
+        return str(error)
+    snippet = re.sub(r"<[^>]+>", " ", str(error))
+    snippet = re.sub(r"\s+", " ", snippet).strip()[:200]
+    model_part = f" (model '{model}')" if model else ""
+    return (
+        f"LLM endpoint returned HTTP {status}{model_part} — non-API response "
+        f"from the provider edge (gateway/proxy); the request never reached "
+        f"the API. Detail: {snippet}"
+    )
+
+
 # Statuses whose bodies are genuinely deterministic input rejections, i.e. the
 # only ones the stringified ``invalid_request_error`` rule below is allowed to
 # claim. 401/403/404 are handled by their own text rules above it; every other
@@ -527,6 +586,15 @@ def _classify_llm_error(error: Exception) -> str:
                     # genuinely-bad key hits a different host and stays
                     # "permanent" below.
                     return "auth_unavailable"
+                if status_code == 404 and not _has_api_error_body(current):
+                    # A 404 whose body is not a parseable API error object is
+                    # the provider's *edge* (nginx/LB) answering — the request
+                    # never reached the API application. Infra, not input:
+                    # retryable. A genuine model-not-found 404 carries a JSON
+                    # error body and stays permanent. Incident: the 2026-07-17
+                    # MiniMax edge outage hard-failed two jobs on attempt 1
+                    # (docs/issues/llm_infra_404_misclassified_permanent_kills_jobs.md).
+                    return "transient"
                 return "permanent"
             if 500 <= status_code < 600:
                 return "transient"
@@ -537,8 +605,13 @@ def _classify_llm_error(error: Exception) -> str:
                 return "transient"
 
         cls_name = type(current).__name__
+        if cls_name == "NotFoundError":
+            # Same body-shape gate as the 404 status branch above — this
+            # fallback matters when a wrapped exception lost its status_code.
+            if _has_api_error_body(current):
+                return "permanent"
+            return "transient"
         if cls_name in (
-            "NotFoundError",
             "AuthenticationError",
             "PermissionDeniedError",
         ):
@@ -2572,7 +2645,7 @@ def create_execute_node(
                         )
                     return {
                         "error": {
-                            "message": str(e),
+                            "message": _summarize_llm_error(e, phase_model),
                             "type": "llm_error",
                             "recoverable": False,
                         },
@@ -2806,9 +2879,18 @@ def create_execute_node(
                     outage_freeze: Dict[str, Any] = {
                         "freeze_type": "llm_unavailable",
                         "classification": classification,
-                        "error_summary": (str(e)[:500] + auth_hint),
+                        "error_summary": (_summarize_llm_error(e)[:500] + auth_hint),
                         "model": phase_model,
                     }
+                    if _infra_edge_status(e) is not None:
+                        # An edge-shaped response repeats an identical body for
+                        # as long as the provider's gateway is down — that is
+                        # an outage signature, not a deterministic request
+                        # rejection. Exempt it from the determinism
+                        # fingerprint (completion.llm_outage_fingerprint) so
+                        # the job rides the outage ceilings like a 5xx outage
+                        # instead of failing after two identical pause cycles.
+                        outage_freeze["deterministic_exempt"] = True
                     retry_after = _extract_rate_limit_delay(e)
                     if retry_after is not None:
                         outage_freeze["retry_after_seconds"] = retry_after
@@ -4166,18 +4248,21 @@ def create_audited_tool_node(
         return min(_TOOL_BATCH_TIMEOUT_SECONDS, max(1, timeout))
 
     def _build_timeout_error_result(
-        tool_calls: List[dict], timeout_seconds: int
+        tool_calls: List[dict], timeout_seconds: int, hint: str = ""
     ) -> Dict[str, Any]:
         timeout_msgs: list[ToolMessage] = []
         for tc in tool_calls:
             call_id = tc["call_id"]
             name = tc["name"]
+            content = (
+                f"Error: tool execution timed out after {timeout_seconds}s for "
+                f"tool '{name}'."
+            )
+            if hint:
+                content += f" {hint}"
             timeout_msgs.append(
                 ToolMessage(
-                    content=(
-                        f"Error: tool execution timed out after {timeout_seconds}s for "
-                        f"tool '{name}'."
-                    ),
+                    content=content,
                     tool_call_id=call_id,
                     name=name,
                 )
@@ -4412,24 +4497,46 @@ def create_audited_tool_node(
                 f"[{job_id}] Tool batch timed out after {batch_timeout}s "
                 f"across {len(tool_calls_info)} calls"
             )
-            if _TOOL_TIMEOUT_RETRIES[0] >= 1:
-                _TOOL_TIMEOUT_RETRIES[0] = 0
-                raise WorkspaceUnavailableError(
-                    "Tool batch repeatedly timed out — workspace may be wedged"
+            # A delegation-only batch (spawn_subagent fan-out) runs in-process
+            # LLM loops, not workspace SSH ops — its latency says nothing about
+            # workspace health. Reconnecting would cancel nothing useful and
+            # escalating to WorkspaceUnavailableError fails the whole job over
+            # a slow fan-out (job 472ea457). Return timeout ToolMessages and
+            # let the LLM adapt; the SSH wedge watchdog stays armed for every
+            # other category.
+            delegation_only = bool(tool_calls_info) and all(
+                _get_tool_category(tc["name"]) == "delegation" for tc in tool_calls_info
+            )
+            if delegation_only:
+                result = _build_timeout_error_result(
+                    tool_calls_info,
+                    batch_timeout,
+                    hint=(
+                        "The subagent batch was cancelled for exceeding its "
+                        "time budget; the workspace itself is healthy. Spawn "
+                        "fewer subagents per turn or give each a narrower "
+                        "task, or continue without them."
+                    ),
                 )
+            else:
+                if _TOOL_TIMEOUT_RETRIES[0] >= 1:
+                    _TOOL_TIMEOUT_RETRIES[0] = 0
+                    raise WorkspaceUnavailableError(
+                        "Tool batch repeatedly timed out — workspace may be wedged"
+                    )
 
-            _TOOL_TIMEOUT_RETRIES[0] += 1
-            try:
-                _reconnect_workspace()
-            except Exception as e:
-                logger.error(
-                    f"[{job_id}] Tool-batch reconnect failed after timeout: {e}"
-                )
-                raise WorkspaceUnavailableError(
-                    f"Tool batch timeout recovery failed: {e}"
-                )
+                _TOOL_TIMEOUT_RETRIES[0] += 1
+                try:
+                    _reconnect_workspace()
+                except Exception as e:
+                    logger.error(
+                        f"[{job_id}] Tool-batch reconnect failed after timeout: {e}"
+                    )
+                    raise WorkspaceUnavailableError(
+                        f"Tool batch timeout recovery failed: {e}"
+                    )
 
-            result = _build_timeout_error_result(tool_calls_info, batch_timeout)
+                result = _build_timeout_error_result(tool_calls_info, batch_timeout)
         execution_time_ms = int((time.time() - start_time) * 1000)
 
         # Heartbeat visibility marker:

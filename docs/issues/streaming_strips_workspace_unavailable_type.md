@@ -5,6 +5,9 @@
 ("Design the UI theme and complete mockup suite for Hotel Rheinland ERP"), which
 died after 2 days / 10,055 audit entries with
 `SSH command failed on 100.64.25.224: ChannelException(2, 'Connect failed')`.
+Second occurrence, same signature: `37a854db-e04a-44d9-8ea2-6229190def4f`
+(Better-Resavio loop iter 15, DEVELOPER) failed 2026-07-15 with
+`SSH command failed on 100.64.25.138: ChannelException(2, 'Connect failed')`.
 
 ## Symptom
 

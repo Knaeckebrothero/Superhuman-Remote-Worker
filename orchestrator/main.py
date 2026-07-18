@@ -2635,6 +2635,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         resume_payload = {
             "job_id": job_id,
             "config_name": job.get("config_name", "default"),
+            "config_upload_id": job_context.get("config_upload_id"),
             "config_override": config_override,
             "datasources": datasources_payload,
             "project_id": str(job["project_id"]) if job.get("project_id") else None,
@@ -2656,6 +2657,23 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             logger.warning(
                 f"Dispatch: agent {agent_id} rejected resume for job {job_id}: {response.text}"
             )
+            if _resume_reject_should_requeue(response.status_code):
+                # The agent's DB 'ready' was stale — its pod is non-idle (a
+                # zombie, or still finishing prior work) and rejected with 409.
+                # Demote it out of the ready pool so the next attempt doesn't
+                # re-pick the same agent. See
+                # docs/done/worker_pod_state_zombie_on_cancel.md.
+                try:
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE agents SET status = 'working' "
+                            "WHERE id = $1::uuid AND status = 'ready'",
+                            agent_id,
+                        )
+                except Exception as demote_err:
+                    logger.warning(
+                        f"Could not demote stale agent {agent_id}: {demote_err}"
+                    )
             return False
 
         # Agent accepted — now atomically drop the keys we consumed so a future
@@ -9989,8 +10007,10 @@ async def resume_job(
     1. Validates the job exists and is not 'completed'
     2. Gets the assigned agent (or uses override agent_id from request)
     3. Validates the agent is ready or completed (not offline/working)
-    4. Sends a resume request to the agent's pod
-    5. Updates job and agent status on success
+    4. Delegates delivery to ``_resume_job_on_agent`` — the dispatcher's
+       resume path — so the job receives the full dispatch-time injection
+       (credentials/env_keys, workspace config, queued feedback); falls back
+       to queue-for-dispatch when the agent declines
 
     Returns:
         Status message indicating resume result
@@ -10116,10 +10136,6 @@ async def resume_job(
                 detail="Agent has no pod IP configured",
             )
 
-        # Build resume request payload
-        # Include full config info so agent can restore the original job configuration
-        job_config_name = job.get("config_name", "default")
-
         # Handle context - might be dict or JSON string depending on DB driver
         job_context = job.get("context") or {}
         if isinstance(job_context, str):
@@ -10128,114 +10144,48 @@ async def resume_job(
             except json.JSONDecodeError:
                 job_context = {}
 
-        # Same for config_override
-        config_override = job.get("config_override")
-        if isinstance(config_override, str):
-            try:
-                config_override = json.loads(config_override)
-            except json.JSONDecodeError:
-                config_override = None
-
-        # Resolve datasources for this job (job-specific > global fallback)
-        resolved_ds = await postgres_db.resolve_datasources_for_job(job_id)
-        _apply_cloud_storage_override(resolved_ds, job_context)
-        datasources_payload = _build_datasources_payload(resolved_ds)
-
-        # Apply datasource-driven tool override (inject/strip db tool categories)
-        if resolved_ds:
-            config_override = _build_datasource_tool_override(
-                resolved_ds, config_override
+        # Feedback travels via context so the shared resume path delivers it
+        # and clears it only after the agent accepts. The in-memory job row
+        # was fetched before this merge, so stamp the local copy too —
+        # _resume_job_on_agent reads job["context"], not the DB. Idempotent
+        # with the queue fallback below, which merges the same value.
+        if request.feedback:
+            await postgres_db.merge_job_context(
+                job_id, {"queued_feedback": request.feedback}
             )
+            job_context["queued_feedback"] = request.feedback
+            job = {**job, "context": job_context}
 
         # Restore S3 environment snapshot into the VM before resuming.
         # This gives true "pick up where you left off" (environment + state).
         # Non-blocking: if restore fails, resume proceeds without it.
-        snapshot_restored = False
         if snapshot_service.is_available:
             vm_ctx = job_context.get("vm", {}) if job_context else {}
             ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
             ssh_port = vm_ctx.get("ssh_port")
             if ssh_host and ssh_port:
                 try:
-                    snapshot_restored = (
-                        await ide_session_service.restore_snapshot_for_resume(
-                            job_id, ssh_host, int(ssh_port)
-                        )
-                    )
-                    if snapshot_restored:
+                    if await ide_session_service.restore_snapshot_for_resume(
+                        job_id, ssh_host, int(ssh_port)
+                    ):
                         logger.info(f"Snapshot restored for job {job_id} resume")
                 except Exception as e:
                     logger.warning(
                         f"Snapshot restore failed for job {job_id} resume (non-blocking): {e}"
                     )
 
-        resume_payload = {
-            "job_id": job_id,
-            "config_name": job_config_name,
-            "config_upload_id": job_context.get("config_upload_id")
-            if job_context
-            else None,
-            "config_override": config_override,
-            "datasources": datasources_payload,
-            "project_id": str(job["project_id"]) if job.get("project_id") else None,
-            "previous_status": job["status"],
-            "snapshot_restored": snapshot_restored,
-        }
-        if request and request.feedback:
-            resume_payload["feedback"] = request.feedback
-
-        # Send request to agent pod
-        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                agent_url,
-                json=resume_payload,
+        # Delegate payload build + delivery to the dispatcher's resume path so
+        # a user-triggered resume ships exactly what an auto re-dispatch ships:
+        # dispatch-time credentials (llm api_key/base_url, env_keys incl.
+        # EMBEDDING_*), VM/container workspace config, sticky sudo denial, lite
+        # mounts, queued feedback/delegation results. The fast-path used to
+        # hand-build a bare payload here, which killed jobs landing on fresh
+        # (clean-env) agent pods.
+        # docs/issues/job_resume_direct_path_skips_credential_injection.md
+        if not await _resume_job_on_agent(job, agent):
+            return await _queue_for_dispatch(
+                "Agent did not accept the direct resume; job queued for auto-dispatch"
             )
-
-        if response.status_code not in (200, 202):
-            if _resume_reject_should_requeue(response.status_code):
-                # The agent's DB 'ready' was stale — its pod is non-idle (a
-                # zombie, or still finishing prior work) and rejected the resume
-                # with 409. Demote it out of the ready pool and re-queue instead
-                # of surfacing a 502 to the user. See
-                # docs/done/worker_pod_state_zombie_on_cancel.md.
-                logger.warning(
-                    f"Agent {agent_id} rejected resume for job {job_id} (409, "
-                    f"stale 'ready'); demoting and re-queuing: {response.text}"
-                )
-                try:
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE agents SET status = 'working' "
-                            "WHERE id = $1::uuid AND status = 'ready'",
-                            agent_id,
-                        )
-                except Exception as demote_err:
-                    logger.warning(
-                        f"Could not demote stale agent {agent_id}: {demote_err}"
-                    )
-                return await _queue_for_dispatch(
-                    "Agent was not ready, job re-queued for auto-dispatch"
-                )
-            raise HTTPException(
-                status_code=502,
-                detail=f"Agent rejected resume request: {response.text}",
-            )
-
-        # Update job status and assign to agent (if using override)
-        await postgres_db.update_job_status(
-            job_id=job_id,
-            status="processing",
-            assigned_agent_id=agent_id,
-        )
-
-        # Update agent status via heartbeat simulation
-        await postgres_db.heartbeat(
-            agent_id=agent_id,
-            status="working",
-            current_job_id=job_id,
-        )
 
         # Parent resumed — trigger dispatch so paused children become dispatchable
         _trigger_dispatch()

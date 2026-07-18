@@ -140,6 +140,7 @@ def _make_light_spawn(context: ToolContext, light_config: Dict[str, Any]):
     sem = asyncio.Semaphore(max_parallel)
     max_iterations = int(light_config.get("max_iterations", 10) or 10)
     max_tokens = int(light_config.get("max_tokens", 40000) or 40000)
+    timeout_seconds = float(light_config.get("timeout_seconds", 240) or 0)
     allow_writes = bool(light_config.get("allow_writes", False))
 
     async def _spawn(
@@ -188,6 +189,7 @@ def _make_light_spawn(context: ToolContext, light_config: Dict[str, Any]):
                     llm=reader_llm,
                     max_iterations=max_iterations,
                     max_tokens=max_tokens,
+                    timeout_seconds=timeout_seconds,
                     port_block=env.port_block,
                     role=role,
                     expected_return_format=expected_return_format,

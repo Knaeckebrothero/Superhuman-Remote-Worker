@@ -249,7 +249,10 @@ limits:
     git: 120
     knowledge: 120
     communication: 120
-    delegation: 120
+    # Delegation batches run whole in-process subagent loops (spawn_subagent),
+    # not SSH ops — must exceed delegation.light.timeout_seconds plus queueing
+    # slack (fan-out > max_parallel runs in waves), or deep fan-outs get killed.
+    delegation: 600
     orchestrator: 120
     canvas: 120
     workflows: 120
@@ -420,6 +423,12 @@ delegation:
     max_iterations: 10       # Per-reader ReAct loop cap
     max_tokens: 40000        # Per-reader token budget
     max_parallel: 3          # Max concurrent readers per turn
+    # Per-reader wall-clock budget (0 = unbounded). Readers self-terminate with
+    # partial results at this deadline. Must stay well under
+    # tool_category_timeouts.delegation or the parent batch watchdog discards
+    # the whole fan-out (job 472ea457: 3-way fan-out vs 120s watchdog → job
+    # failed as "workspace may be wedged").
+    timeout_seconds: 240
     allow_writes: false      # Readers read-and-distill by default (no merge)
 
 # Autonomy level — controls when the agent pauses for human review
