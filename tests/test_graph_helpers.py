@@ -15,6 +15,8 @@ from src.graph import (
     _cooldown_within_pause_budget,
     _COOLDOWN_MAX_PAUSE_SECONDS,
     _extract_rate_limit_delay,
+    _infra_edge_status,
+    _summarize_llm_error,
     _extract_tool_use_failed,
     _build_tool_use_failed_feedback,
     _is_tool_error,
@@ -572,6 +574,60 @@ def _make_sdk_error(class_name: str, status_code, *, body=None, message="", url=
     return err
 
 
+# The verbatim body nginx served during the 2026-07-17 MiniMax edge outage —
+# the openai SDK leaves a non-JSON body as this raw string on ``exc.body`` and
+# stringifies the exception to it verbatim.
+NGINX_404 = (
+    "<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n"
+    "<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n"
+    "</body>\r\n</html>"
+)
+
+
+class TestInfraEdgeHelpers:
+    """_infra_edge_status / _summarize_llm_error — edge-shaped failures
+    (non-API body from a gateway/proxy in front of the provider)."""
+
+    def test_edge_status_for_html_body(self):
+        err = _make_sdk_error("NotFoundError", 404, body=NGINX_404, message=NGINX_404)
+        assert _infra_edge_status(err) == 404
+
+    def test_no_edge_status_for_api_error_body(self):
+        err = _make_sdk_error("NotFoundError", 404, body={"error": {"message": "x"}})
+        assert _infra_edge_status(err) is None
+
+    def test_no_edge_status_without_status_code(self):
+        assert _infra_edge_status(Exception("Connection refused")) is None
+
+    def test_edge_status_walks_cause_chain(self):
+        inner = _make_sdk_error("NotFoundError", 404, body=NGINX_404, message=NGINX_404)
+        outer = Exception("wrapped by langchain")
+        outer.__cause__ = inner
+        assert _infra_edge_status(outer) == 404
+
+    def test_summarize_composes_readable_message(self):
+        err = _make_sdk_error("NotFoundError", 404, body=NGINX_404, message=NGINX_404)
+        msg = _summarize_llm_error(err, "MiniMax-M3")
+        assert "HTTP 404" in msg
+        assert "MiniMax-M3" in msg
+        assert "provider edge" in msg
+        assert "<html>" not in msg
+        assert "\r" not in msg
+
+    def test_summarize_without_model_omits_model_clause(self):
+        err = _make_sdk_error("NotFoundError", 404, body=NGINX_404, message=NGINX_404)
+        assert "model" not in _summarize_llm_error(err).split("Detail:")[0]
+
+    def test_summarize_passthrough_for_non_edge_errors(self):
+        err = _make_sdk_error(
+            "BadRequestError",
+            400,
+            body={"error": {"type": "invalid_request_error", "message": "bad"}},
+            message="Error code: 400 - bad",
+        )
+        assert _summarize_llm_error(err, "some-model") == "Error code: 400 - bad"
+
+
 class TestClassifyLlmError:
     """Tests for the permanent/rate_limit/transient classifier that gates
     the inner retry loop in create_execute_node. Regression coverage for
@@ -582,6 +638,39 @@ class TestClassifyLlmError:
         err = _make_sdk_error(
             "NotFoundError",
             404,
+            body={
+                "error": {
+                    "message": "Model 'x' not found",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_404_html_edge_body_is_transient(self):
+        """An nginx/LB default page means the request never reached the API
+        application — an infra outage, not model-not-found. Regression for
+        the 2026-07-17 MiniMax edge outage that hard-failed two jobs on
+        attempt 1."""
+        err = _make_sdk_error("NotFoundError", 404, body=NGINX_404, message=NGINX_404)
+        assert _classify_llm_error(err) == "transient"
+
+    def test_404_missing_body_is_transient(self):
+        """A 404 whose body was never read (closed stream) is ambiguous —
+        bias for retry; the outage ceilings bound a wrong guess."""
+        err = _make_sdk_error("NotFoundError", 404, message="Error code: 404")
+        assert _classify_llm_error(err) == "transient"
+
+    def test_notfound_class_fallback_html_body_is_transient(self):
+        """A wrapped exception that lost its status_code takes the class-name
+        fallback — it must apply the same body-shape gate."""
+        err = _make_sdk_error("NotFoundError", None, body=NGINX_404, message=NGINX_404)
+        assert _classify_llm_error(err) == "transient"
+
+    def test_notfound_class_fallback_dict_body_stays_permanent(self):
+        err = _make_sdk_error(
+            "NotFoundError",
+            None,
             body={
                 "error": {
                     "message": "Model 'x' not found",
@@ -889,8 +978,15 @@ class TestClassifyLlmError:
         assert _classify_llm_error(ConnectionError("connect refused")) == "transient"
 
     def test_walks_cause_chain(self):
-        """LangChain wraps provider exceptions — classifier must unwrap."""
-        inner = _make_sdk_error("NotFoundError", 404)
+        """LangChain wraps provider exceptions — classifier must unwrap.
+
+        The inner 404 carries a JSON error body (a bodyless 404 is now an
+        edge-shaped failure and deliberately transient)."""
+        inner = _make_sdk_error(
+            "NotFoundError",
+            404,
+            body={"error": {"message": "Model 'x' not found"}},
+        )
         outer = Exception("LangChain wrapper")
         outer.__cause__ = inner
         assert _classify_llm_error(outer) == "permanent"
