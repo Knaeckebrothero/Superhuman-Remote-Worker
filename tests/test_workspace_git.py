@@ -458,13 +458,20 @@ class TestProjectWorkspacePrepopulatedRoot:
             ws.initialize_project_workspace()
         assert ws._initialized is False
 
-    def test_missing_origin_raises_accurate_error(self, temp_base, no_clone):
+    def test_missing_origin_attaches_and_sets_origin(self, temp_base, no_clone):
+        """An unset/unreadable origin is not an identity conflict — `git remote
+        get-url` can fail transiently on a fresh session (seen live on k3d),
+        and failing here would lose the pre-seeded work. Attach and restore
+        push connectivity by setting origin to the jobs-repo URL."""
         _seed_repo(temp_base, origin_url=None)
 
-        ws = self._make_ws(temp_base)
-        with pytest.raises(RuntimeError, match="does not match project jobs repo"):
-            ws.initialize_project_workspace()
-        assert ws._initialized is False
+        ws = self._make_ws(temp_base, branch="job/test-job")
+        ws.initialize_project_workspace()
+
+        assert ws._initialized is True
+        assert ws.git_manager is not None
+        assert (temp_base / "task_brief.md").exists()
+        assert ws.git_manager.remote_url("origin") == JOBS_URL
 
     def test_nonempty_root_without_git_raises_before_clone(self, temp_base, no_clone):
         (temp_base / "task_brief.md").write_text("seeded content, no git")
