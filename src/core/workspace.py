@@ -570,21 +570,39 @@ class WorkspaceManager:
 
         git_mgr = GitManager(self._workspace_path, backend=self._backend)
         origin = git_mgr.remote_url("origin")
-        if origin and _normalize_repo_url(origin) == _normalize_repo_url(expected_url):
-            # Refresh origin so credentials rotated since the original clone
-            # land in the repo config before any push.
-            git_mgr.add_remote("origin", expected_url)
-            logger.info(
-                "Reusing existing jobs-repo clone at workspace root "
-                "(pre-initialized workspace, e.g. scholar-provisioned pod)"
+        if origin and _normalize_repo_url(origin) != _normalize_repo_url(expected_url):
+            # A PRESENT-but-different origin is a genuine identity conflict:
+            # pushing would land this job's work in a foreign repo. Fail loud.
+            raise RuntimeError(
+                f"Workspace root holds a git repo whose origin "
+                f"({GitManager._mask_url_static(origin)}) does not match "
+                f"project jobs repo '{repo_name}' — refusing to clone over "
+                "it or push into it."
             )
-            return git_mgr
-        raise RuntimeError(
-            f"Workspace root holds a git repo whose origin "
-            f"({GitManager._mask_url_static(origin) if origin else 'unset'}) "
-            f"does not match project jobs repo '{repo_name}' — refusing to "
-            "clone over it or push into it."
+        if not origin:
+            # Unset/unreadable origin is NOT a conflict: `git remote get-url`
+            # can fail transiently on a fresh session, and killing the job
+            # here would lose the pre-seeded work (the exact failure F29
+            # guards against). Log the raw git result for diagnosis, then
+            # reuse the repo — add_remote below restores push connectivity.
+            probe = git_mgr._run_git(["remote", "get-url", "origin"])
+            logger.warning(
+                "Existing jobs repo at workspace root has no readable origin "
+                "(rc=%s, stdout=%r, stderr=%r) — attaching and setting origin "
+                "to the project jobs repo '%s'",
+                probe.returncode,
+                GitManager._mask_url_static(probe.stdout.strip())[-200:],
+                GitManager._mask_url_static(probe.stderr.strip())[-200:],
+                repo_name,
+            )
+        # Refresh origin so credentials rotated since the original clone
+        # land in the repo config before any push.
+        git_mgr.add_remote("origin", expected_url)
+        logger.info(
+            "Reusing existing jobs-repo clone at workspace root "
+            "(pre-initialized workspace, e.g. scholar-provisioned pod)"
         )
+        return git_mgr
 
     def _clone_auxiliary_repos(self) -> None:
         """Clone source/reference repositories into repos/ subdirectory."""
