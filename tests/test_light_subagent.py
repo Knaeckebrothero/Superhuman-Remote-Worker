@@ -236,3 +236,95 @@ class TestRunLightSubagent:
         assert "source reader" in preamble
         assert "8100-8199" in preamble
         assert "a bulleted list" in preamble
+
+
+class SlowScriptedLLM(ScriptedLLM):
+    """ScriptedLLM with a per-call delay before each response."""
+
+    def __init__(self, responses, delays):
+        super().__init__(responses)
+        self._delays = list(delays)
+
+    async def ainvoke(self, messages):
+        delay = self._delays.pop(0) if self._delays else 0
+        if delay:
+            await asyncio.sleep(delay)
+        return await super().ainvoke(messages)
+
+
+@tool
+async def sleepy_tool(text: str) -> str:
+    """Sleep long, then echo."""
+    await asyncio.sleep(5.0)
+    return f"slow: {text}"
+
+
+class TestWallClockDeadline:
+    """The reader self-terminates at timeout_seconds with partial results.
+
+    Covers the job-472ea457 failure mode: a deep reader outliving the parent
+    graph's delegation batch watchdog must instead synthesize and return.
+    """
+
+    @pytest.mark.asyncio
+    async def test_slow_llm_turn_is_cut_off_and_synthesized(self):
+        """An LLM turn that overruns the deadline is cancelled → synthesis."""
+        # The first call is cancelled mid-sleep, so it never consumes a
+        # scripted response — the queue holds only the synthesis reply.
+        llm = SlowScriptedLLM(
+            [AIMessage(content="PARTIAL SYNTH")],
+            delays=[5.0, 0],
+        )
+        out = await run_light_subagent("x", "", tools=[], llm=llm, timeout_seconds=0.1)
+        assert out == "PARTIAL SYNTH"
+        # The synthesis turn names the reason.
+        assert "time limit" in llm.calls[-1][-1].content
+
+    @pytest.mark.asyncio
+    async def test_slow_tool_calls_cut_off_with_paired_tool_messages(self):
+        """A tool turn that overruns is cancelled; every pending tool_call gets
+        a synthetic ToolMessage before synthesis (strict-provider pairing)."""
+        llm = ScriptedLLM([_tool_call("sleepy_tool"), AIMessage(content="TOOLSYNTH")])
+        out = await run_light_subagent(
+            "x", "", tools=[sleepy_tool], llm=llm, timeout_seconds=0.2
+        )
+        assert out == "TOOLSYNTH"
+        # Synthesis turn saw a ToolMessage answering the cancelled call.
+        synth_turn = llm.calls[-1]
+        paired = [
+            m
+            for m in synth_turn
+            if isinstance(m, ToolMessage) and m.tool_call_id == "call_1"
+        ]
+        assert len(paired) == 1
+        assert "ran out of time" in paired[0].content
+
+    @pytest.mark.asyncio
+    async def test_zero_timeout_means_unbounded(self):
+        """timeout_seconds=0 (the pure-harness default) adds no deadline."""
+        llm = ScriptedLLM([_tool_call(), AIMessage(content="done")])
+        out = await run_light_subagent(
+            "x", "", tools=[echo_tool], llm=llm, timeout_seconds=0
+        )
+        assert out == "done"
+
+    @pytest.mark.asyncio
+    async def test_hung_synthesis_falls_back_to_last_text(self, monkeypatch):
+        """Even the forced-synthesis call is bounded; on overrun the reader
+        still returns the last text it produced instead of hanging."""
+        from src.tools.delegation import light_runner
+
+        monkeypatch.setattr(light_runner, "_SYNTHESIS_TIMEOUT_SECONDS", 0.05)
+        llm = SlowScriptedLLM(
+            [
+                AIMessage(
+                    content="partial finding", tool_calls=_tool_call().tool_calls
+                ),
+                AIMessage(content="never returned"),
+            ],
+            delays=[0, 5.0],  # loop turn instant, synthesis turn hangs
+        )
+        out = await run_light_subagent(
+            "x", "", tools=[echo_tool], llm=llm, max_iterations=1
+        )
+        assert out == "partial finding"

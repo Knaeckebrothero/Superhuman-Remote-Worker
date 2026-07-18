@@ -411,6 +411,15 @@ MINIMAX_400 = (
     "'request_id': '06a12d1aed49504c11643e132559ac86'}"
 )
 
+# Summary of an edge-shaped failure (nginx HTML 404, 2026-07-17 MiniMax
+# incident) as composed by the agent's _summarize_llm_error. Contains a 4xx
+# token, so only the deterministic_exempt flag keeps it out of the fingerprint.
+NGINX_404_SUMMARY = (
+    "LLM endpoint returned HTTP 404 — non-API response from the provider edge "
+    "(gateway/proxy); the request never reached the API. "
+    "Detail: 404 Not Found 404 Not Found nginx"
+)
+
 
 class TestLlmOutageFingerprint:
     def test_deterministic_400_fingerprints(self):
@@ -460,6 +469,17 @@ class TestLlmOutageFingerprint:
             is None
         )
 
+    def test_deterministic_exempt_returns_none(self):
+        # Without the flag this summary WOULD fingerprint (contains a 4xx
+        # token) — the flag is what lets an infra-edge outage keep pausing.
+        assert llm_outage_fingerprint({"error_summary": NGINX_404_SUMMARY}) is not None
+        assert (
+            llm_outage_fingerprint(
+                {"error_summary": NGINX_404_SUMMARY, "deterministic_exempt": True}
+            )
+            is None
+        )
+
 
 class TestDeterminismFailFast:
     def _job_with_fp(self, fp, summary):
@@ -497,3 +517,16 @@ class TestDeterminismFailFast:
             self._job_with_fp(None, "Connection error."), STOP
         )
         assert status == "paused"
+
+    def test_repeat_identical_edge_page_with_exempt_keeps_pausing(self):
+        # Infra-edge freezes (non-API body, e.g. an nginx 404 page) set
+        # deterministic_exempt: the identical summary across pause cycles
+        # means the provider's gateway is still down, not that the request
+        # is deterministic — replaying the 2026-07-17 ~10-min outage must
+        # keep pausing instead of failing on the second cycle.
+        fp = llm_outage_fingerprint({"error_summary": NGINX_404_SUMMARY})
+        job = self._job_with_fp(fp, NGINX_404_SUMMARY)
+        job["freeze_data"]["deterministic_exempt"] = True
+        status, err = determine_job_status(job, STOP)
+        assert status == "paused"
+        assert err is None

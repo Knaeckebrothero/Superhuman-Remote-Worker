@@ -512,7 +512,16 @@ def llm_outage_fingerprint(fd: dict[str, Any]) -> str | None:
 
     Normalization strips long ids (request ids, tool_call ids, uuids) and all
     digits so two cycles of the same rejection hash identically.
+
+    ``deterministic_exempt`` (set by the agent when the failing response was
+    edge-shaped — a non-API body such as an nginx 404 page) opts the freeze
+    out entirely: an identical edge page across pause cycles means the
+    provider's gateway is still down, not that the request is deterministic,
+    so the job must keep riding the outage ceilings like a 5xx outage. See
+    docs/issues/llm_infra_404_misclassified_permanent_kills_jobs.md.
     """
+    if fd.get("deterministic_exempt"):
+        return None
     src = str(fd.get("error_summary") or fd.get("reason") or "")
     if not src:
         return None
