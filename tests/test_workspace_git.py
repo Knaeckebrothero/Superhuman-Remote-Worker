@@ -7,6 +7,7 @@ default .gitignore patterns without relying on config.
 
 import pytest
 import shutil
+import subprocess
 import tempfile
 import sys
 from pathlib import Path
@@ -381,3 +382,94 @@ class TestWorkspaceGitGracefulDegradation:
         # Can still write files
         ws.write_file("test.txt", "content")
         assert ws.read_file("test.txt") == "content"
+
+
+JOBS_URL = "http://srw:token-a@srw-gitea:3000/srw/proj-jobs.git"
+JOBS_URL_ROTATED = "http://srw:token-b@srw-gitea:3000/srw/proj-jobs.git"
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _seed_repo(root: Path, origin_url: str | None) -> None:
+    """Create a real git repo with one commit at root — simulates a workspace
+    a scholar subjob already initialized on the parent's shared pod."""
+    _git(root, "init")
+    _git(root, "config", "user.email", "scholar@test.local")
+    _git(root, "config", "user.name", "Scholar")
+    (root / "task_brief.md").write_text("research notes")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "scholar research")
+    if origin_url:
+        _git(root, "remote", "add", "origin", origin_url)
+
+
+class TestProjectWorkspacePrepopulatedRoot:
+    """First dispatch onto a pre-populated workspace root (scholar-provisioned
+    shared pod, inherited subjob workspace) must reuse a matching jobs-repo
+    clone instead of failing the clone as a phantom reachability problem."""
+
+    def _make_ws(self, temp_base, branch=None):
+        return WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=True,
+                branch_name=branch,
+                repositories=[
+                    {"role": "jobs", "name": "proj-jobs", "repo_url": JOBS_URL}
+                ],
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+
+    @pytest.fixture
+    def no_clone(self, monkeypatch):
+        """Fail the test if GitManager.clone runs — these paths must not clone."""
+
+        def _fail_clone(*a, **k):
+            pytest.fail("GitManager.clone must not run on a pre-populated root")
+
+        monkeypatch.setattr(GitManager, "clone", _fail_clone)
+
+    def test_reuses_matching_clone_without_recloning(self, temp_base, no_clone):
+        # Same repo, different (rotated) credentials — must still match.
+        _seed_repo(temp_base, origin_url=JOBS_URL_ROTATED)
+
+        ws = self._make_ws(temp_base, branch="job/test-job")
+        ws.initialize_project_workspace()
+
+        assert ws._initialized is True
+        assert ws.git_manager is not None
+        # Pre-existing (scholar) content preserved
+        assert (temp_base / "task_brief.md").exists()
+        # Job branch created on the existing repo
+        assert ws.git_manager.current_branch() == "job/test-job"
+        # Origin refreshed to the current credential-bearing URL
+        assert ws.git_manager.remote_url("origin") == JOBS_URL
+
+    def test_mismatched_origin_raises_accurate_error(self, temp_base, no_clone):
+        _seed_repo(temp_base, origin_url="http://srw-gitea:3000/other/elsewhere.git")
+
+        ws = self._make_ws(temp_base)
+        with pytest.raises(RuntimeError, match="does not match project jobs repo"):
+            ws.initialize_project_workspace()
+        assert ws._initialized is False
+
+    def test_missing_origin_raises_accurate_error(self, temp_base, no_clone):
+        _seed_repo(temp_base, origin_url=None)
+
+        ws = self._make_ws(temp_base)
+        with pytest.raises(RuntimeError, match="does not match project jobs repo"):
+            ws.initialize_project_workspace()
+        assert ws._initialized is False
+
+    def test_nonempty_root_without_git_raises_before_clone(self, temp_base, no_clone):
+        (temp_base / "task_brief.md").write_text("seeded content, no git")
+
+        ws = self._make_ws(temp_base)
+        with pytest.raises(RuntimeError, match="is not empty"):
+            ws.initialize_project_workspace()
+        assert ws._initialized is False

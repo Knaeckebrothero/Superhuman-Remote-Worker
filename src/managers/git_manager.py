@@ -585,6 +585,22 @@ class GitManager:
         except Exception:
             return False
 
+    def remote_url(self, name: str = "origin") -> Optional[str]:
+        """Return the URL of a named remote, or None when unset/unreadable.
+
+        Args:
+            name: Remote name (default: "origin")
+        """
+        if not self.is_active:
+            return None
+        try:
+            result = self._run_git(["remote", "get-url", name])
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
     def add_remote(self, name: str, url: str) -> bool:
         """Add or update a git remote.
 
