@@ -93,6 +93,33 @@ def _seed(dsn: str) -> dict:
             "metrics": {"token_usage": {}},
         }
     )
+    # codex/Responses-API shape: token_usage empty, counts only in the
+    # LangChain-normalized usage_metadata (job c3fc9128 regression).
+    w.insert_llm_request(
+        {
+            "job_id": job,
+            "agent_type": "universal",
+            "call_type": "codex",
+            "model": "gpt-5.6-sol",
+            "iteration": 3,
+            "timestamp": now,
+            "latency_ms": 5,
+            "request": {"messages": [], "message_count": 0},
+            "response": {"content": "hi", "tool_calls": []},
+            "metadata": None,
+            "auxiliary_metadata": None,
+            "metrics": {
+                "token_usage": {},
+                "usage_metadata": {
+                    "input_tokens": 15869,
+                    "output_tokens": 461,
+                    "total_tokens": 16330,
+                    "input_token_details": {"cache_read": 0},
+                    "output_token_details": {"reasoning": 89},
+                },
+            },
+        }
+    )
     # tool pre/post (stitch target)
     tpre = w.insert_audit_pre(
         {
@@ -345,10 +372,19 @@ async def test_list_llm_requests_token_usage_and_status(seeded):
     s = await _store(seeded["dsn"])
     try:
         lst = await s.list_llm_requests(seeded["job"])
-        assert lst["total"] == 2
+        assert lst["total"] == 3
         main = next(e for e in lst["entries"] if e["call_type"] == "main")
         assert main["token_usage"] == {"total_tokens": 9}  # surfaced from metrics
         assert main["tool_calls"] == [{"name": "read_file"}]
+        # Responses-API row: empty token_usage falls back to the normalized
+        # usage_metadata, re-keyed to the Chat Completions names the formatter
+        # and Cockpit debug view read.
+        codex = next(e for e in lst["entries"] if e["call_type"] == "codex")
+        assert codex["token_usage"] == {
+            "prompt_tokens": 15869,
+            "completion_tokens": 461,
+            "total_tokens": 16330,
+        }
         # status filter reads from metadata (where archive_error folds it).
         errs = await s.list_llm_requests(seeded["job"], status="error")
         assert errs["total"] == 1
