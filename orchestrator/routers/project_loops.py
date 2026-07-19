@@ -115,10 +115,11 @@ async def start_project_loop(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    # Planner scheduling: the template additionally needs exactly one
+    # Campaign scheduling: the template additionally needs exactly one
     # single-role critic checkpoint followed (cyclically) by a single-role
     # execution slot, and any cap overrides must sit under the hard ceilings.
-    # Fail loud at start — a doomed planner loop must not degrade silently.
+    # Fail loud at start — a doomed campaign-scheduled loop must not degrade
+    # silently.
     campaign_caps: dict[str, int] | None = None
     if body.scheduling == "campaign":
         from services.project_loops import (

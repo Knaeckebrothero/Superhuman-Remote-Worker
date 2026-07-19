@@ -207,24 +207,24 @@ def planner_slots(role_sequence: list[Any]) -> tuple[int, int]:
         roles = normalize_stage(entry)
         if "critic" in roles and len(roles) > 1:
             raise ValueError(
-                "planner scheduling requires the critic to be a single-role "
+                "campaign scheduling requires the critic to be a single-role "
                 f"checkpoint stage, not a fan-out member (stage {i}: {roles})"
             )
     if len(critic_slots) != 1:
         raise ValueError(
-            "planner scheduling requires exactly one 'critic' stage in "
+            "campaign scheduling requires exactly one 'critic' stage in "
             f"role_sequence (found {len(critic_slots)})"
         )
     if len(role_sequence) < 2:
         raise ValueError(
-            "planner scheduling requires at least one non-critic stage — the "
+            "campaign scheduling requires at least one non-critic stage — the "
             "execution slot after the critic checkpoint"
         )
     critic_slot = critic_slots[0]
     execution_slot = (critic_slot + 1) % len(role_sequence)
     if len(normalize_stage(role_sequence[execution_slot])) > 1:
         raise ValueError(
-            "planner scheduling requires the stage after the critic (the "
+            "campaign scheduling requires the stage after the critic (the "
             "execution slot a plan expands) to be single-role, got fan-out "
             f"stage {role_sequence[execution_slot]!r}"
         )

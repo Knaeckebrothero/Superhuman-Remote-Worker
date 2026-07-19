@@ -43,8 +43,17 @@ barrier.
 
 Transitionally, a pre-0063 writer may still leave a width-1 turn tracked only
 by the display pointer (``current_job_id`` set, ``current_stage_jobs`` empty);
-the sweeper adopts that row into ``current_stage_jobs`` so the unified advance
-drives it, deferring the actual sweep to the next tick.
+the sweeper adopts that row into ``current_stage_jobs`` (guarded — a stale
+read during a rolling deploy backs off rather than grafting a finished job
+into a newer turn) so the unified advance drives it, deferring the actual
+sweep to the next tick.
+
+A listed member can also be a GHOST: ``DELETE /api/jobs/{job_id}`` row-deletes
+an in-flight loop job, leaving its id in ``current_stage_jobs`` with no
+backing row. The sweeper treats a ghost as terminal — it can never finish to
+trip the barrier — and if every member of a stage is a ghost, clears the
+stage outright so the loop isn't wedged forever waiting on a barrier that can
+never fire.
 
 Mirrors ``cron_dispatcher_loop``'s structure (tick + shutdown-aware wait).
 
@@ -127,16 +136,25 @@ async def _sweep_tick(db: Any, advance_fn: AdvanceFn) -> int:
             # Transitional (a pre-0063 writer raced the deploy): a width-1
             # turn tracked only by the display pointer. Adopt it into the
             # barrier set so the unified advance can drive it; it is swept
-            # as a normal stage next tick.
-            logger.warning(
-                "project loop %s: adopting legacy width-1 pointer %s into "
-                "current_stage_jobs",
-                str(loop.get("id"))[:8],
-                str(cur)[:8],
-            )
-            await db.update_project_loop(
-                str(loop["id"]), current_stage_jobs=[str(cur)]
-            )
+            # as a normal stage next tick. Guarded: during a rolling deploy an
+            # old replica can fully advance the loop between our list-read and
+            # this write, so a stale read must not graft a finished job into a
+            # newer turn's membership — that would fire the barrier under the
+            # NEW running job and double-spawn (the exact incident class this
+            # branch exists to kill).
+            if await db.adopt_project_loop_pointer_turn(str(loop["id"]), str(cur)):
+                logger.warning(
+                    "project loop %s: adopting legacy width-1 pointer %s into "
+                    "current_stage_jobs",
+                    str(loop.get("id"))[:8],
+                    str(cur)[:8],
+                )
+            else:
+                logger.debug(
+                    "project loop %s: legacy pointer adopt lost the guard — "
+                    "row moved on",
+                    str(loop.get("id"))[:8],
+                )
             continue
 
         # Both columns empty: a torn advance (write-back lost) or a crash
@@ -166,21 +184,56 @@ async def _sweep_stage(
 ) -> int:
     """Backstop for a loop with a turn in flight (any width).
 
-    While any member is still running, the members' completion hooks fire the
-    barrier — nothing to do. Once EVERY member is terminal, the last member's
-    hook should have claimed the barrier and rotated; if the loop still lists
-    them in-flight, that hook was missed. Re-run the advance for one member —
-    the atomic barrier claim (``claim_project_loop_stage_barrier``) makes this
-    idempotent: whichever of the real hook / this backstop commits first
-    rotates, the other no-ops. No age gate needed (the barrier is the guard).
+    While any SURVIVING member is still running, the members' completion
+    hooks fire the barrier — nothing to do. Once every survivor is terminal,
+    the last member's hook should have claimed the barrier and rotated; if
+    the loop still lists them in-flight, that hook was missed. Re-run the
+    advance for one surviving member — the atomic barrier claim
+    (``claim_project_loop_stage_barrier``) makes this idempotent: whichever
+    of the real hook / this backstop commits first rotates, the other
+    no-ops. No age gate needed (the barrier is the guard).
+
+    A member can also be a GHOST: ``DELETE /api/jobs/{job_id}`` row-deletes an
+    in-flight loop job; the FK nulls the display mirror ``current_job_id``
+    but the id stays listed in ``current_stage_jobs``.
+    ``get_loop_stage_member_statuses`` omits rows that no longer exist, so a
+    ghost never shows up in ``statuses`` — treat it as terminal (this mirrors
+    ``_advance_loop_member``'s "failed" default for a missing member, and the
+    barrier's own NOT EXISTS predicate, which likewise only ever sees rows
+    that exist). If EVERY member is a ghost, no survivor is left to ever trip
+    the barrier — clear the stage directly so the next tick's
+    ``_heal_wedged_loop`` re-points the loop at its newest surviving stage.
+
     Returns 1 if a recovery advance ran, else 0.
     """
     statuses = await db.get_loop_stage_member_statuses(stage_ids)
-    states = [statuses.get(mid) for mid in stage_ids]
-    if any(s is None or s not in _TERMINAL for s in states):
-        return 0  # still in flight — the members' hooks will fire the barrier
+    survivors = [mid for mid in stage_ids if mid in statuses]
+    if any(statuses[mid] not in _TERMINAL for mid in survivors):
+        return 0  # a surviving member is still in flight — its hook will fire the barrier
 
-    rep = await db.get_job(stage_ids[-1])
+    if not survivors:
+        # Every listed member has been deleted — the barrier's claim needs at
+        # least one existing member row, so this turn can never rotate on its
+        # own. Guarded on the exact membership we read; a stale read (a
+        # concurrent rotate already re-pointed the loop, or a member that
+        # still exists) matches no row and backs off.
+        if await db.clear_project_loop_ghost_stage(str(loop["id"]), stage_ids):
+            logger.warning(
+                "project loop %s: stage (%d jobs) are ALL ghosts (deleted) — "
+                "barrier can never fire; cleared so the next tick re-points "
+                "at the newest surviving stage",
+                str(loop.get("id"))[:8],
+                len(stage_ids),
+            )
+        else:
+            logger.debug(
+                "project loop %s: all-ghost stage clear lost the guard — "
+                "row moved on",
+                str(loop.get("id"))[:8],
+            )
+        return 0
+
+    rep = await db.get_job(survivors[-1])
     if not rep:
         return 0
     logger.warning(

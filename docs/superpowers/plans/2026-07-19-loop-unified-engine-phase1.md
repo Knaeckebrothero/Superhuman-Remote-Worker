@@ -22,8 +22,8 @@
 ## Deploy Notes (read before the k3d/live rollout, not needed for coding tasks)
 
 - Migration 0063 must run before the new orchestrator serves traffic (standard boot ordering already guarantees this).
-- During a rolling deploy an old replica can still advance a **campaign** loop through the old path; a backfilled width-1 row hitting the OLD parallel path skips the campaign step for that one advance. Recommendation: pause running loops for the deploy window, or accept the one-advance degradation (dev currently runs at most one loop).
-- A width-1 turn written by an old replica *after* the migration ran leaves a legacy-shaped row (pointer set, stage set empty). The sweeper's new adopt branch (Task 6) self-heals it within one tick.
+- During a rolling deploy an old replica can still advance a **campaign** loop through the old path; a backfilled width-1 row hitting the OLD parallel path skips the campaign step for that one advance. Pausing running loops for the deploy window is the RECOMMENDED procedure (accept the one-advance degradation only if you can't pause; dev currently runs at most one loop) — the guarded adopt below prevents the separate duplicate-turn case.
+- A width-1 turn written by an old replica *after* the migration ran leaves a legacy-shaped row (pointer set, stage set empty). The sweeper's guarded `adopt_project_loop_pointer_turn` (Task 6) self-heals it within one tick; the guard no-ops if a concurrent old-replica advance already re-pointed the loop, so a stale read can never graft a finished job into a newer turn's membership.
 
 ---
 
