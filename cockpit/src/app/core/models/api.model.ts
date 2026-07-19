@@ -994,11 +994,11 @@ export interface ProjectLoop {
   last_error: string | null;
   stop_reason: string | null;
   /**
-   * Execution-slot scheduling: 'rotation' (default — one job per turn) or
-   * 'planner' (the checkpoint critic may expand the execution slot into a
+   * Execution-slot scheduling: 'standard' (default — one job per turn) or
+   * 'campaign' (the checkpoint critic may expand the execution slot into a
    * multi-stage campaign). Start-time only. loop_campaign_scheduling.md.
    */
-  scheduling?: 'rotation' | 'planner';
+  scheduling?: 'standard' | 'campaign';
   /** The live campaign on a planner loop (null between campaigns). */
   campaign?: LoopCampaign | null;
   /** Disposed campaigns, newest last (bounded server-side). */
@@ -1023,11 +1023,11 @@ export interface ProjectLoopStartRequest {
   goal_override?: string | null;
   max_consecutive_failures?: number;
   /**
-   * 'planner' lets the checkpoint critic file multi-job campaigns; requires
+   * 'campaign' lets the checkpoint critic file multi-job campaigns; requires
    * exactly one single-role critic step followed by a single-role step
    * (validated server-side; mirrored in plannerIneligibility client-side).
    */
-  scheduling?: 'rotation' | 'planner';
+  scheduling?: 'standard' | 'campaign';
 }
 
 /**

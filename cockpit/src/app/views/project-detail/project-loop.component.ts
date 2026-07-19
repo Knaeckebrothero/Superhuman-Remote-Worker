@@ -234,8 +234,8 @@ export function buildRoleSequence(
                 <div><span class="k">Model</span><span class="v">{{ l.model || 'project default' }}</span></div>
                 <div><span class="k">Workspace</span><span class="v">{{ l.workspace_backend === 'vm' ? 'VM (root)' : (l.workspace_backend || 'sandbox') }}</span></div>
                 <div><span class="k">Sequence</span><span class="v">{{ fmtSequence(l.role_sequence) }}</span></div>
-                @if (l.scheduling === 'planner') {
-                  <div><span class="k">Scheduling</span><span class="v">Planner — critic schedules campaigns</span></div>
+                @if (l.scheduling === 'campaign') {
+                  <div><span class="k">Scheduling</span><span class="v">Campaign — critic schedules campaigns</span></div>
                 }
                 @if (l.remaining_iterations !== null) {
                   <div><span class="k">Iterations left</span><span class="v">{{ l.remaining_iterations }}</span></div>
@@ -243,7 +243,7 @@ export function buildRoleSequence(
                 @if (l.run_until) {
                   <div><span class="k">Runs until</span><span class="v">{{ l.run_until | date: 'short' }}</span></div>
                 }
-                @if (l.current_stage_jobs?.length) {
+                @if ((l.current_stage_jobs?.length ?? 0) > 1) {
                   <div><span class="k">Stage jobs</span><span class="v mono">{{ stageJobsShort(l) }}</span></div>
                 } @else if (l.current_job_id) {
                   <div><span class="k">Current job</span><span class="v mono">{{ l.current_job_id.slice(0, 8) }}</span></div>
@@ -467,14 +467,14 @@ export function buildRoleSequence(
 
             <app-form-field
               label="Scheduling"
-              hint="Planner lets the critic invest several jobs into one initiative (a campaign, up to 5 stages) instead of exactly one job per turn."
+              hint="Campaign lets the critic invest several jobs into one initiative (a campaign, up to 5 stages) instead of exactly one job per turn."
             >
               <app-select [value]="fScheduling()" (changed)="fScheduling.set($event ?? '')">
-                <option value="">Rotation — one job per step (default)</option>
-                <option value="planner">Planner — critic schedules campaigns</option>
+                <option value="">Standard — one stage per turn (default)</option>
+                <option value="campaign">Campaign — critic schedules campaigns</option>
               </app-select>
             </app-form-field>
-            @if (fScheduling() === 'planner' && plannerProblem()) {
+            @if (fScheduling() === 'campaign' && plannerProblem()) {
               <p class="loop-msg" data-testid="planner-problem">{{ plannerProblem() }}</p>
             }
 
@@ -655,7 +655,7 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
   readonly fMaxHours = signal('');
   readonly fAcceptance = signal('');
   readonly fUserPrompt = signal('');
-  // Execution-slot scheduling: '' = rotation (default), 'planner' = the
+  // Execution-slot scheduling: '' = standard (default), 'campaign' = the
   // checkpoint critic may file multi-job campaigns. Start-time only.
   readonly fScheduling = signal('');
   // Cycle builder: 'preset' uses a ready-made rotation; 'custom' lets the user
@@ -882,7 +882,7 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
       this.message.set('Add at least one expert to the cycle.');
       return;
     }
-    if (this.fScheduling() === 'planner') {
+    if (this.fScheduling() === 'campaign') {
       const problem = this.plannerProblem();
       if (problem) {
         this.message.set(problem);
@@ -898,7 +898,7 @@ export class ProjectLoopComponent implements OnInit, OnDestroy {
       user_prompt: this.fUserPrompt().trim() || null,
       max_consecutive_failures: 3,
     };
-    if (this.fScheduling() === 'planner') body.scheduling = 'planner';
+    if (this.fScheduling() === 'campaign') body.scheduling = 'campaign';
     const maxIter = parseInt(this.fMaxIterations(), 10);
     if (Number.isFinite(maxIter) && maxIter > 0) body.max_iterations = maxIter;
     const hours = parseFloat(this.fMaxHours());
