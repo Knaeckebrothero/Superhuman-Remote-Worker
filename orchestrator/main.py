@@ -12041,16 +12041,17 @@ async def _writeback_loop_stage(
     last_error: str | None,
     campaign: Any = _WB_UNSET,
 ) -> dict[str, Any] | None:
-    """Point a loop at a freshly-spawned stage.
+    """Point a loop at a freshly-spawned turn.
 
-    One job → ``current_job_id`` (the single-role path; ``current_stage_jobs``
-    cleared to []). Multiple jobs → ``current_stage_jobs`` holds the members and
-    ``current_job_id`` stays NULL — the barrier tracks them until the last one
-    finishes. Mirrors the counters the single-role advance always wrote.
+    Every turn is barrier-tracked: ``current_stage_jobs`` holds the members
+    (width 1 included) and the atomic barrier drains it when the last one
+    finishes. ``current_job_id`` is a display-only mirror — the member's id
+    for a width-1 turn (cockpit links, MCP formatters), NULL for fan-out
+    turns. Mirrors the counters the advance always wrote.
 
-    ``campaign`` (planner loops) rides the SAME row update as the pointer, so
-    the queue-cursor/status mutation and the stage pointer can never tear
-    apart from each other (docs/features/loop_campaign_scheduling.md).
+    ``campaign`` (campaign-mode loops) rides the SAME row update as the
+    pointer, so the queue-cursor/status mutation and the stage pointer can
+    never tear apart from each other (docs/features/loop_campaign_scheduling.md).
     """
     ids = [str(j["id"]) for j in jobs]
     common = dict(
@@ -12062,12 +12063,11 @@ async def _writeback_loop_stage(
     )
     if campaign is not _WB_UNSET:
         common["campaign"] = campaign
-    if len(ids) == 1:
-        return await postgres_db.update_project_loop(
-            loop_id, current_job_id=ids[0], current_stage_jobs=[], **common
-        )
     return await postgres_db.update_project_loop(
-        loop_id, current_job_id=None, current_stage_jobs=ids, **common
+        loop_id,
+        current_job_id=(ids[0] if len(ids) == 1 else None),
+        current_stage_jobs=ids,
+        **common,
     )
 
 
