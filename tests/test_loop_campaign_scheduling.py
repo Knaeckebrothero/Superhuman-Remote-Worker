@@ -864,6 +864,27 @@ async def test_intake_happy_path_stores_normalized_plan():
 
 
 @pytest.mark.asyncio
+async def test_intake_accepts_member_when_display_pointer_absent():
+    # Pins the membership gate against a pointer-equality revert: the job IS
+    # a stage member while the display-only current_job_id disagrees (null).
+    from main import LoopPlanRequest, file_loop_plan
+
+    job = _critic_job(None)
+    loop = _loop(
+        project_id=None, current_job_id=None, current_stage_jobs=[CRITIC_JOB_ID]
+    )
+    db = _intake_db(job, loop)
+    with _intake_patches(db):
+        out = await file_loop_plan(
+            MagicMock(), CRITIC_JOB_ID, LoopPlanRequest(plan=_plan())
+        )
+    assert out["status"] == "accepted"
+    db.merge_job_context.assert_awaited_once()
+    stored = db.merge_job_context.call_args.args[1]["loop_plan"]
+    assert stored["stages"] == [{"role": "developer"}, {"role": "developer"}]
+
+
+@pytest.mark.asyncio
 async def test_intake_gating_chain():
     from main import LoopPlanRequest, file_loop_plan
 
@@ -884,7 +905,9 @@ async def test_intake_gating_chain():
             await file_loop_plan(req, CRITIC_JOB_ID, plan)
     assert e.value.status_code == 409
 
-    # Not the in-flight job → 409.
+    # Not the in-flight job → 409, pinning the membership-gate detail (the
+    # old pointer-equality gate also raised 409 here, just for the wrong
+    # reason — assert the message so a revert to pointer-equality is caught).
     with _intake_patches(
         _intake_db(
             job, _loop(current_job_id=None, current_stage_jobs=[str(uuid.uuid4())])
@@ -893,6 +916,7 @@ async def test_intake_gating_chain():
         with pytest.raises(HTTPException) as e:
             await file_loop_plan(req, CRITIC_JOB_ID, plan)
     assert e.value.status_code == 409
+    assert "not one of the loop's in-flight jobs" in e.value.detail
 
     # Non-critic role → 403.
     dev = _member_job("c-1", 0)
