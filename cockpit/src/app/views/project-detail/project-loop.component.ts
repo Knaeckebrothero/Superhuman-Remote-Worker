@@ -105,19 +105,19 @@ export function plannerIneligibility(
     (Array.isArray(e) ? e : [e]).map((r) => r.trim()).filter(Boolean),
   );
   if (stages.some((s) => s.includes('critic') && s.length > 1)) {
-    return 'Planner scheduling needs the critic as its own step, not inside a parallel step.';
+    return 'Campaign scheduling needs the critic as its own step, not inside a parallel step.';
   }
   const criticSteps = stages.filter((s) => s.length === 1 && s[0] === 'critic');
   if (criticSteps.length !== 1) {
-    return `Planner scheduling needs exactly one critic step in the cycle (found ${criticSteps.length}).`;
+    return `Campaign scheduling needs exactly one critic step in the cycle (found ${criticSteps.length}).`;
   }
   if (stages.length < 2) {
-    return 'Planner scheduling needs at least one other step after the critic.';
+    return 'Campaign scheduling needs at least one other step after the critic.';
   }
   const criticIndex = stages.findIndex((s) => s.length === 1 && s[0] === 'critic');
   const execution = stages[(criticIndex + 1) % stages.length];
   if (execution.length > 1) {
-    return 'Planner scheduling needs the step after the critic to be a single role — that step is what a campaign expands.';
+    return 'Campaign scheduling needs the step after the critic to be a single role — that step is what a campaign expands.';
   }
   return null;
 }

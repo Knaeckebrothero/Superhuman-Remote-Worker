@@ -912,8 +912,8 @@ export type ProjectLoopStatus =
   | 'failed';
 
 /**
- * A multi-job campaign a planner loop's checkpoint critic filed via
- * `loop_plan`. Lives in `project_loops.campaign` (JSONB); shape is what
+ * A multi-job campaign a campaign-scheduled loop's checkpoint critic filed
+ * via `loop_plan`. Lives in `project_loops.campaign` (JSONB); shape is what
  * `_advance_planner_campaign` writes (orchestrator/main.py).
  * See docs/features/loop_campaign_scheduling.md.
  */
@@ -999,7 +999,7 @@ export interface ProjectLoop {
    * multi-stage campaign). Start-time only. loop_campaign_scheduling.md.
    */
   scheduling?: 'standard' | 'campaign';
-  /** The live campaign on a planner loop (null between campaigns). */
+  /** The live campaign on a campaign-scheduled loop (null between campaigns). */
   campaign?: LoopCampaign | null;
   /** Disposed campaigns, newest last (bounded server-side). */
   campaign_history?: LoopCampaignHistoryEntry[];

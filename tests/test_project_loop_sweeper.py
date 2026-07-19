@@ -116,6 +116,8 @@ def _db(
     *,
     stage_heal_wins: bool = True,
     barrier_wins: bool = True,
+    ghost_clear_wins: bool = True,
+    adopt_wins: bool = True,
 ):
     """Fake of the DB methods the sweeper touches. ``jobs`` newest-first."""
     db = AsyncMock()
@@ -125,6 +127,8 @@ def _db(
     db.get_newest_loop_stage.return_value = _newest_stage(jobs)
     db.heal_project_loop_stage.return_value = stage_heal_wins
     db.claim_project_loop_stage_barrier.return_value = barrier_wins
+    db.clear_project_loop_ghost_stage.return_value = ghost_clear_wins
+    db.adopt_project_loop_pointer_turn.return_value = adopt_wins
     db.get_loop_stage_member_statuses.side_effect = lambda ids: {
         str(i): by_id[str(i)]["status"] for i in ids if str(i) in by_id
     }
@@ -379,6 +383,66 @@ class TestSweepStage:
             == 1
         )
 
+    @pytest.mark.asyncio
+    async def test_ghost_member_treated_terminal_advances_on_survivor(self):
+        # A DELETE /api/jobs/{id} row-deleted one member; its id stays listed
+        # in current_stage_jobs but no longer resolves. The ghost is treated
+        # as terminal (mirrors _advance_loop_member's "failed" default), and
+        # the surviving terminal member drives the recovery advance.
+        ghost_id = str(uuid.uuid4())
+        survivor = _job(9, "developer", status="completed", seq_index=2, remaining=25)
+        stage_ids = [ghost_id, survivor["id"]]
+        db = _db([self._stage_loop(stage_ids)], [survivor])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 1
+        advance.assert_awaited_once_with(survivor, {}, [])
+        db.clear_project_loop_ghost_stage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ghost_member_with_running_survivor_skips(self):
+        # Ghost alongside a survivor that's still running: the stage stays
+        # open (its own completion hook will fire the barrier) — no advance,
+        # and no ghost-clear (a survivor still exists).
+        ghost_id = str(uuid.uuid4())
+        survivor = _job(9, "developer", status="processing", seq_index=2, remaining=25)
+        stage_ids = [ghost_id, survivor["id"]]
+        db = _db([self._stage_loop(stage_ids)], [survivor])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 0
+        advance.assert_not_awaited()
+        db.clear_project_loop_ghost_stage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_all_ghost_stage_cleared_for_heal(self):
+        # Every listed member has been deleted — the barrier can never fire
+        # (its predicate needs an existing member row). Clear the stage so
+        # the next tick's heal re-points the loop at its newest surviving
+        # stage, instead of wedging forever.
+        stage_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        db = _db([self._stage_loop(stage_ids)], [])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 0
+        db.clear_project_loop_ghost_stage.assert_awaited_once_with(
+            LOOP_ID, stage_ids
+        )
+        advance.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_all_ghost_clear_lost_guard_backs_off(self):
+        # A concurrent replica already cleared (or re-pointed) the loop; the
+        # guarded UPDATE matches no row. Back off quietly — no advance, no
+        # crash.
+        stage_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        db = _db(
+            [self._stage_loop(stage_ids)], [], ghost_clear_wins=False
+        )
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 0
+        db.clear_project_loop_ghost_stage.assert_awaited_once_with(
+            LOOP_ID, stage_ids
+        )
+        advance.assert_not_awaited()
+
 
 class TestSweepTick:
     @pytest.mark.asyncio
@@ -402,16 +466,34 @@ class TestSweepTick:
     @pytest.mark.asyncio
     async def test_legacy_pointer_only_row_is_adopted_into_membership(self):
         # Transitional: a pre-0063 writer left a width-1 turn tracked only by
-        # current_job_id. The sweeper adopts it; no advance this tick.
+        # current_job_id. The sweeper adopts it (guarded); no advance this tick.
         job = _job(9, "developer", status="completed", seq_index=2, remaining=25)
         db = _db([_loop(current_job_id=job["id"])], [job])
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
-        db.update_project_loop.assert_awaited_once_with(
-            LOOP_ID, current_stage_jobs=[job["id"]]
+        db.adopt_project_loop_pointer_turn.assert_awaited_once_with(
+            LOOP_ID, job["id"]
         )
+        db.update_project_loop.assert_not_awaited()
         advance.assert_not_awaited()
         db.heal_project_loop_stage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_adopt_lost_guard_no_advance(self):
+        # A concurrent old-replica advance re-pointed the loop between the
+        # sweeper's list-read and the adopt write — the guarded UPDATE
+        # matches no row. No advance, no crash, no fallback write.
+        job = _job(9, "developer", status="completed", seq_index=2, remaining=25)
+        db = _db(
+            [_loop(current_job_id=job["id"])], [job], adopt_wins=False
+        )
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 0
+        db.adopt_project_loop_pointer_turn.assert_awaited_once_with(
+            LOOP_ID, job["id"]
+        )
+        db.update_project_loop.assert_not_awaited()
+        advance.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unhealable_loop_is_skipped(self):

@@ -898,7 +898,7 @@ async def test_intake_gating_chain():
             await file_loop_plan(req, CRITIC_JOB_ID, plan)
     assert e.value.status_code == 400
 
-    # Rotation-scheduled loop → 409.
+    # Standard-scheduled loop → 409.
     job = _critic_job(None)
     with _intake_patches(_intake_db(job, _loop(scheduling="standard"))):
         with pytest.raises(HTTPException) as e:

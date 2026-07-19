@@ -11673,6 +11673,69 @@ class PostgresDB:
             )
         return result.endswith(" 1")
 
+    async def clear_project_loop_ghost_stage(
+        self, loop_id: str, member_job_ids: List[str]
+    ) -> bool:
+        """Release a turn whose EVERY member row has been deleted (ghosts).
+
+        The barrier claim can never fire for such a turn — its predicate
+        needs at least one existing member row — so the loop would sit
+        wedged forever. Clearing both pointer columns restores the single
+        torn-advance signature the sweeper's heal recovers from (next tick
+        re-points at the newest surviving stage).
+
+        Guarded on the exact membership we read, running status, and a
+        DB-authoritative re-check that no listed member exists — a stale
+        sweeper read (concurrent rotate already re-pointed the loop, or a
+        member that still exists) matches no row and backs off.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE project_loops
+                SET current_stage_jobs = '[]'::jsonb,
+                    current_job_id = NULL,
+                    updated_at = now()
+                WHERE id = $1
+                  AND status = 'running'
+                  AND current_stage_jobs = $2::jsonb
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jobs j
+                      WHERE j.id::text IN (
+                          SELECT jsonb_array_elements_text(
+                              project_loops.current_stage_jobs
+                          )
+                      )
+                  )
+                """,
+                UUID(loop_id),
+                json.dumps([str(j) for j in member_job_ids]),
+            )
+        return result.endswith(" 1")
+
+    async def adopt_project_loop_pointer_turn(self, loop_id: str, job_id: str) -> bool:
+        """Transitional (pre-0063 writers): adopt a pointer-only width-1 turn
+        into the barrier membership — iff the row still looks exactly like
+        that legacy shape (same pointer, empty membership, running loop).
+
+        A concurrent old-replica advance that re-points the loop between the
+        sweeper's read and this write makes it a no-op, so a stale read can
+        never graft a finished job into a newer turn's membership (which
+        would fire the barrier under the running job and double-spawn).
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE project_loops "
+                "SET current_stage_jobs = jsonb_build_array($2::text), "
+                "updated_at = now() "
+                "WHERE id = $1 AND current_job_id = $3 AND status = 'running' "
+                "AND current_stage_jobs = '[]'::jsonb",
+                UUID(loop_id),
+                str(job_id),
+                UUID(job_id),
+            )
+        return result.endswith(" 1")
+
     async def fetch_next_due_cron_automation(self, conn) -> Dict[str, Any] | None:
         """Pessimistically claim the next due cron automation under SKIP LOCKED.
 
