@@ -12577,7 +12577,7 @@ async def _rotate_loop_to_next_stage(
     roles = loop.get("role_sequence") or ["scholar", "critic", "developer"]
 
     campaign_update: Any = _WB_UNSET
-    if (loop.get("scheduling") or "rotation") == "planner" and completed_job:
+    if (loop.get("scheduling") or "standard") == "campaign" and completed_job:
         handled, campaign_update = await _advance_planner_campaign(
             loop,
             completed_job=completed_job,
@@ -13020,11 +13020,11 @@ async def file_loop_plan(
     loop = await postgres_db.get_project_loop(loop_id)
     if not loop:
         raise HTTPException(status_code=404, detail="Loop not found")
-    if (loop.get("scheduling") or "rotation") != "planner":
+    if (loop.get("scheduling") or "standard") != "campaign":
         raise HTTPException(
             status_code=409,
-            detail="This loop uses rotation scheduling — plans are only "
-            "accepted on planner-scheduled loops",
+            detail="This loop uses standard scheduling — plans are only "
+            "accepted on campaign-scheduled loops",
         )
     if loop.get("status") != "running":
         raise HTTPException(

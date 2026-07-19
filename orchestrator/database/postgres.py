@@ -11299,7 +11299,7 @@ class PostgresDB:
         run_until: datetime | None = None,
         max_consecutive_failures: int = 3,
         workspace_backend: str | None = None,
-        scheduling: str = "rotation",
+        scheduling: str = "standard",
         campaign_caps: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Insert a project_loop control row in 'running' status.
@@ -11309,8 +11309,8 @@ class PostgresDB:
         too). The caller (router) validates the budget before calling.
         ``workspace_backend`` (optional) is the per-loop workspace tier override
         injected into every spawned job's config_override (mirrors ``model``).
-        ``scheduling`` / ``campaign_caps`` (0050) opt the loop into planner-mode
-        campaign scheduling; both are start-time-only and validated by the
+        ``scheduling`` / ``campaign_caps`` (0050) opt the loop into
+        campaign-mode scheduling; both are start-time-only and validated by the
         router (docs/features/loop_campaign_scheduling.md).
         """
         roles = role_sequence or ["scholar", "critic", "developer"]

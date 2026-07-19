@@ -59,11 +59,11 @@ class ProjectLoopStart(BaseModel):
     # Optional per-loop workspace tier for every spawned job (mirrors `model`).
     # Blank/None = default sandbox; "vm" gives every role a root VM.
     workspace_backend: str | None = Field(None, max_length=20)
-    # Execution-slot scheduling: 'rotation' (default, byte-identical to
-    # pre-campaign behavior) or 'planner' (the checkpoint critic may expand the
+    # Scheduling mode: 'standard' (default — the role_sequence stage list,
+    # one stage per turn) or 'campaign' (the checkpoint critic may expand the
     # execution slot into a multi-stage campaign via a filed plan). Start-time
-    # only. docs/features/loop_campaign_scheduling.md.
-    scheduling: str = Field("rotation", pattern="^(rotation|planner)$")
+    # only. docs/features/loop_unified_engine.md.
+    scheduling: str = Field("standard", pattern="^(standard|campaign)$")
     # Optional per-loop campaign guardrail overrides ({max_stages,
     # max_extensions, abort_failures}); values above the config hard ceilings
     # are rejected, not clamped — fail loud at start.
@@ -120,7 +120,7 @@ async def start_project_loop(
     # execution slot, and any cap overrides must sit under the hard ceilings.
     # Fail loud at start — a doomed planner loop must not degrade silently.
     campaign_caps: dict[str, int] | None = None
-    if body.scheduling == "planner":
+    if body.scheduling == "campaign":
         from services.project_loops import (
             planner_slots,
             validate_campaign_caps,
@@ -135,7 +135,7 @@ async def start_project_loop(
     elif body.campaign_caps is not None:
         raise HTTPException(
             status_code=400,
-            detail="campaign_caps only applies to scheduling='planner'",
+            detail="campaign_caps only applies to scheduling='campaign'",
         )
 
     # Workspace tier override (mirrors `model`). Normalise blank → None; reject

@@ -652,9 +652,9 @@ def build_loop_kickoff(
         "as tried/rejected so nobody repeats it.",
     ]
 
-    # Planner-scheduled loops (docs/features/loop_campaign_scheduling.md):
+    # Campaign-scheduled loops (docs/features/loop_campaign_scheduling.md):
     # campaign context for members, planner duties for the checkpoint critic.
-    if (loop.get("scheduling") or "rotation") == "planner":
+    if (loop.get("scheduling") or "standard") == "campaign":
         stamps = extra_context or {}
         if stamps.get("loop_campaign_id") is not None:
             campaign = loop.get("campaign") or {}
@@ -760,15 +760,15 @@ async def create_loop_job(
     # and the full loop protocol as the kickoff message, carried through the
     # "Opening Message" channel (context["kickoff_message"]). Both land together
     # in the agent's task_brief.md; only the description shows as the job title.
-    # Planner loops: the checkpoint critic gets the campaign-filing tool via
+    # Campaign loops: the checkpoint critic gets the campaign-filing tool via
     # an additive category override (tools.loop doesn't exist in any bundled
     # config, so the deep-merge adds it without touching the expert's other
     # tool lists). Campaign members — even critic-flavored sub-critics — and
-    # rotation loops never get it; the intake endpoint re-gates server-side
+    # standard loops never get it; the intake endpoint re-gates server-side
     # (defense in depth, mirroring phase-restricted tools).
     is_campaign_member = bool((extra_context or {}).get("loop_campaign_id"))
     if (
-        (loop.get("scheduling") or "rotation") == "planner"
+        (loop.get("scheduling") or "standard") == "campaign"
         and role == "critic"
         and not is_campaign_member
     ):

@@ -116,7 +116,7 @@ def create_loop_plan_tools(context: ToolContext) -> List[Any]:
             return (
                 f"Error: could not reach the orchestrator ({e}). The plan was "
                 "NOT filed — retry, or record your selection as a KB verdict "
-                "note so the loop can fall back to rotation."
+                "note so the loop can fall back to standard scheduling."
             )
 
         if resp.status_code != 200:
