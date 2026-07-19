@@ -324,10 +324,9 @@ def _format_loop(loop: Dict[str, Any]) -> List[str]:
     ):
         if loop.get(key):
             lines.append(f"  {label}: {loop[key]}")
-    if loop.get("current_stage_jobs"):
-        lines.append(
-            f"  Current stage jobs: {', '.join(map(str, loop['current_stage_jobs']))}"
-        )
+    stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
+    if len(stage_ids) > 1:
+        lines.append(f"  Current stage jobs: {', '.join(stage_ids)}")
     if loop.get("role_sequence"):
         lines.append(f"  Role sequence: {_truncate(loop['role_sequence'], limit=240)}")
     if loop.get("seq_index") is not None:
@@ -419,11 +418,9 @@ def _explain_loop(loop: Dict[str, Any], jobs: List[Dict[str, Any]]) -> str:
     lines = [
         f"Project loop {loop.get('id', 'unknown')} is {status}.",
     ]
-    if loop.get("current_stage_jobs"):
-        lines.append(
-            "Current parallel stage jobs: "
-            + ", ".join(map(str, loop["current_stage_jobs"]))
-        )
+    stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
+    if len(stage_ids) > 1:
+        lines.append("Current parallel stage jobs: " + ", ".join(stage_ids))
     elif loop.get("current_job_id"):
         lines.append(f"Current job: {loop['current_job_id']}")
     if loop.get("remaining_iterations") is not None:
