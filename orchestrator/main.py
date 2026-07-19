@@ -12558,11 +12558,11 @@ async def _rotate_loop_to_next_stage(
 ) -> None:
     """Rotate a loop past the just-finished stage and spawn the next one.
 
-    Shared by the single-role advance and the parallel-stage last finisher:
-    ticks the KB-convergence TTL on a cycle wrap, spawns the next stage (1 or N
-    jobs), and points the loop at it (``current_job_id`` or
-    ``current_stage_jobs``). On a spawn failure the loop is marked failed — a
-    running loop with no in-flight job/stage would never advance.
+    Called by the barrier winner (``_advance_loop_member``): ticks the
+    KB-convergence TTL on a cycle wrap, spawns the next stage (1 or N jobs),
+    and points the loop at it (``current_job_id`` or ``current_stage_jobs``).
+    On a spawn failure the loop is marked failed — a running loop with no
+    in-flight job/stage would never advance.
 
     Planner-scheduled loops (docs/features/loop_campaign_scheduling.md) get a
     campaign step first: a checkpoint critic's filed plan expands the execution
@@ -12681,16 +12681,16 @@ async def _advance_project_loop(
     result: dict[str, Any],
     actions: list[str],
 ) -> None:
-    """Advance a project self-improvement loop when its current job completes.
+    """Advance a project self-improvement loop when one of its in-flight
+    turn's jobs completes.
 
-    If the completed job belongs to a *running* loop and is that loop's
-    in-flight job, decrement the budget, check stop conditions (budget /
-    deadline / consecutive-failure cap), and either stop the loop or rotate to
-    the next role and spawn the next job. Idempotent on ``current_job_id`` so a
-    re-delivered completion can't double-advance. Loop jobs run bare, so this is
-    the only completion hook that fires for them.
-
-    Design: docs/features/project_self_improvement_loop.md.
+    Every turn is a barrier-tracked set of jobs in ``current_stage_jobs``
+    (width 1 included) — the engine's ONLY advance path
+    (docs/features/loop_unified_engine.md). Membership is the idempotency
+    guard: a stale or re-delivered completion hook for a job outside the
+    current turn is a no-op, and the atomic barrier claim inside
+    ``_advance_loop_member`` guarantees exactly one rotate per turn. Loop
+    jobs run bare, so this is the only completion hook that fires for them.
     """
     ctx = job.get("context")
     if isinstance(ctx, str):
@@ -12706,89 +12706,13 @@ async def _advance_project_loop(
     if not loop or loop.get("status") != "running":
         return  # paused / stopped / terminal — leave the current job, don't advance
 
-    # A parallel (fan-out) stage is in flight when current_stage_jobs is
-    # non-empty. Its members advance the loop through the barrier — NOT the
-    # single-job current_job_id path below (which is NULL for a fan-out stage).
     stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
-    if stage_ids:
-        if str(job["id"]) not in stage_ids:
-            return  # not a member of the in-flight stage
-        await _advance_loop_parallel_member(
-            job, result, actions, loop=loop, ctx=ctx or {}
-        )
-        return
-
-    if str(job["id"]) != str(loop.get("current_job_id") or ""):
-        return  # cheap pre-check: only the in-flight job advances the loop
-
-    # Atomic claim: nulls current_job_id iff it still equals this job on a
-    # running loop. Guarantees exactly one advance even if the completion hook
-    # and the safety-net sweeper fire concurrently for the same terminal job
-    # (the loser gets False here and backs off). Uses the pre-claim `loop`
-    # snapshot below for seq_index / remaining — the claim only nulls the job.
-    if not await postgres_db.claim_project_loop_advance(str(loop_id), str(job["id"])):
-        return  # another caller already claimed this advance
-
-    failed = bool(result.get("error")) or job.get("status") == "failed"
-    consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if failed else 0
-    last_error = (result.get("error") or "job failed") if failed else None
-
-    # Per-job artifact handling: squash-merge the branch onto `main`, flag F29 /
-    # merge-failed, trigger the post-merge KB reindex, write the retro. Shared
-    # with each parallel-stage member. Best-effort; never blocks the advance.
-    await _merge_and_retro_loop_job(
-        job,
-        ctx=ctx,
-        loop=loop,
-        loop_id=loop_id,
-        actions=actions,
-        failed=failed,
-        last_error=last_error,
-    )
-    # Any loop role may have filed `user-question` KB notes — surface them to
-    # the owner's notification bell (best-effort, never blocks the advance).
-    await _notify_loop_user_questions(loop, job)
-
-    remaining = loop.get("remaining_iterations")
-    next_remaining = (remaining - 1) if remaining is not None else None
-
-    stop_reason = _loop_stop_reason(
-        loop, next_remaining=next_remaining, consecutive=consecutive
-    )
-    if stop_reason:
-        await postgres_db.update_project_loop(
-            str(loop_id),
-            status=("failed" if stop_reason == "failures" else "completed"),
-            remaining_iterations=next_remaining,
-            consecutive_failures=consecutive,
-            last_error=last_error,
-            stop_reason=stop_reason,
-            current_job_id=None,
-        )
-        actions.append(f"project loop {str(loop_id)[:8]} stopped ({stop_reason})")
-        return
-
-    # Rotate to the next stage and spawn it (1 or N jobs). The completed job +
-    # its decoded context feed the planner campaign step (no-op for
-    # rotation-scheduled loops); the parallel-member path below deliberately
-    # passes neither — campaign plans are only ever read off single-role
-    # completions (the checkpoint critic and campaign members are single-role
-    # by grammar).
-    await _rotate_loop_to_next_stage(
-        loop,
-        seq_index_completed=int(loop.get("seq_index") or 0),
-        base_total=int(loop.get("total_jobs_run") or 0),
-        next_remaining=next_remaining,
-        consecutive=consecutive,
-        last_error=last_error,
-        actions=actions,
-        completed_job=job,
-        completed_ctx=ctx or {},
-        completed_failed=failed,
-    )
+    if str(job["id"]) not in stage_ids:
+        return  # not a member of the in-flight turn
+    await _advance_loop_member(job, result, actions, loop=loop, ctx=ctx or {})
 
 
-async def _advance_loop_parallel_member(
+async def _advance_loop_member(
     job: dict[str, Any],
     result: dict[str, Any],
     actions: list[str],
@@ -12796,17 +12720,23 @@ async def _advance_loop_parallel_member(
     loop: dict[str, Any],
     ctx: dict[str, Any],
 ) -> None:
-    """Advance a loop when a member of its in-flight PARALLEL stage completes.
+    """Advance a loop when a member of its in-flight turn completes.
 
     Each member merges + retros itself immediately (its artifact handling is
     independent), then hits the barrier: ``claim_project_loop_stage_barrier``
-    drains the stage and returns True to exactly ONE caller — the member that
-    finishes last. Only that caller aggregates the stage outcome (a stage
-    counts as a failure only if EVERY member failed; one success resets the
-    consecutive counter), checks the stop conditions, and rotates to the next
-    stage. Every earlier finisher just does its own merge and backs off.
+    drains the turn and returns True to exactly ONE caller — the member that
+    finishes last (trivially, the job itself on a width-1 turn). Only that
+    caller aggregates the turn outcome (a turn counts as a failure only if
+    EVERY member failed; one success resets the consecutive counter), checks
+    the stop conditions, and rotates to the next stage. Every earlier
+    finisher just does its own merge and backs off.
 
-    docs/features/loop_parallel_stages.md (Phase 1).
+    The barrier winner's job + decoded context feed the campaign step inside
+    ``_rotate_loop_to_next_stage``. Campaign-relevant jobs (the checkpoint
+    critic and campaign members) only ever occupy width-1 turns by planner
+    grammar, so the winner IS the campaign job whenever it matters; for a
+    fan-out turn the campaign step falls through as a no-op.
+    docs/features/loop_unified_engine.md (Phase 1).
     """
     loop_id = str(loop["id"])
     stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
@@ -12814,9 +12744,8 @@ async def _advance_loop_parallel_member(
     failed = bool(result.get("error")) or job.get("status") == "failed"
     member_error = (result.get("error") or "job failed") if failed else None
 
-    # Per-member artifact handling. The F29 execution-role check inside is a
-    # no-op here — parallel stages are validated analysis-only, so an `empty`
-    # merge (KB-only work) is expected, not lost work.
+    # Per-member artifact handling: squash-merge, F29 flags, retro. Best
+    # effort — never blocks the barrier.
     await _merge_and_retro_loop_job(
         job,
         ctx=ctx,
@@ -12826,21 +12755,27 @@ async def _advance_loop_parallel_member(
         failed=failed,
         last_error=member_error,
     )
-    # Surface this member's `user-question` KB notes (mirrors the single-role
-    # path; every member passes here regardless of who wins the barrier).
+    # Surface this member's `user-question` KB notes (every member passes
+    # here regardless of who wins the barrier).
     await _notify_loop_user_questions(loop, job)
 
     # Barrier: only the last member to go terminal claims the rotate.
     if not await postgres_db.claim_project_loop_stage_barrier(loop_id, str(job["id"])):
         return  # an earlier finisher, a lost co-last race, or a stray hook
 
-    # Last out. Aggregate the stage outcome from the members' final statuses
+    # Last out. Aggregate the turn outcome from the members' final statuses
     # (captured from the pre-drain membership snapshot).
     statuses = await postgres_db.get_loop_stage_member_statuses(stage_ids)
     member_states = [statuses.get(mid, "failed") for mid in stage_ids]
     all_failed = bool(member_states) and all(s == "failed" for s in member_states)
     consecutive = (int(loop.get("consecutive_failures") or 0) + 1) if all_failed else 0
-    last_error = "all stage jobs failed" if all_failed else None
+    # A width-1 turn keeps the member's specific error (the pre-unification
+    # single-role behavior); a fan-out aggregate can only say everything failed.
+    last_error = (
+        (member_error if len(stage_ids) == 1 else "all stage jobs failed")
+        if all_failed
+        else None
+    )
 
     remaining = loop.get("remaining_iterations")
     next_remaining = (remaining - 1) if remaining is not None else None
@@ -12870,6 +12805,9 @@ async def _advance_loop_parallel_member(
         consecutive=consecutive,
         last_error=last_error,
         actions=actions,
+        completed_job=job,
+        completed_ctx=ctx,
+        completed_failed=failed,
     )
 
 
