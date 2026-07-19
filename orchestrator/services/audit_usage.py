@@ -68,16 +68,21 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 # Pull the token counts server-side as TEXT (``->>``), independent of any jsonb
 # codec on the read pool. The fallback order per dimension is applied in Python
-# (:func:`_first_int`): worker's metrics.token_usage first, then session's
+# (:func:`_first_int`): worker's metrics.token_usage first, then the
+# LangChain-normalized metrics.usage_metadata, then session's
 # metadata.*_tokens. metrics is NOT NULL DEFAULT '{}'; metadata may be NULL.
+#
+# usage_metadata (um_*) is the ONLY home for token counts on the Responses API
+# (codex/gpt-5.x worker jobs): those rows carry token_usage = {} AND a NULL
+# metadata, so without the um_* fallbacks they resolved to 0/0 and were dropped
+# as "nothing to meter" — no codex worker job ever reached the ledger (job
+# c3fc9128, 07-18: 206 requests / ~17.3M tokens skipped).
 #
 # Cached prompt tokens have three homes, tried in order (:func:`_first_int`):
 #   1. m_cached      — metrics.token_usage.prompt_tokens_details.cached_tokens
 #                      (worker, Chat Completions: minimax/gemma/etc.)
 #   2. m_cached_norm — metrics.usage_metadata.input_token_details.cache_read
-#                      (worker, LangChain-normalized — the ONLY home for the
-#                      Responses API / codex/gpt-5.x, whose response_metadata
-#                      carries no token_usage)
+#                      (worker, Responses API — see above)
 #   3. md_cached     — metadata.cached_tokens (session/persistent turns)
 # Codex cached tokens showed 0 in the By-Model view because only (1) was read.
 #
@@ -94,6 +99,10 @@ SELECT id, job_id, agent_type, call_type, model, timestamp,
                                                    AS m_cached,
        metrics->'usage_metadata'->'input_token_details'->>'cache_read'
                                                    AS m_cached_norm,
+       metrics->'usage_metadata'->>'input_tokens'   AS um_input,
+       metrics->'usage_metadata'->>'output_tokens'  AS um_output,
+       metrics->'usage_metadata'->'output_token_details'->>'reasoning'
+                                                   AS um_reasoning,
        metadata->>'input_tokens'                    AS md_input,
        metadata->>'output_tokens'                   AS md_output,
        metadata->>'cached_tokens'                   AS md_cached
@@ -217,8 +226,10 @@ async def materialize_llm_usage_from_audit(
     new_cursor = since_ts
     for r in aged:
         new_cursor = r["timestamp"]  # advance over every aged row, priced or not
-        prompt = _first_int(r["m_prompt"], r["m_input"], r["md_input"])
-        completion = _first_int(r["m_completion"], r["m_output"], r["md_output"])
+        prompt = _first_int(r["m_prompt"], r["m_input"], r["um_input"], r["md_input"])
+        completion = _first_int(
+            r["m_completion"], r["m_output"], r["um_output"], r["md_output"]
+        )
         if not prompt and not completion:
             continue  # health check / audio / errored call — nothing to meter
         cached = min(
@@ -227,7 +238,7 @@ async def materialize_llm_usage_from_audit(
         uncached_prompt = prompt - cached
         is_session = (r["agent_type"] or "") == _SESSION_AGENT_TYPE
         user_id, project_id = owners.get(r["job_id"], (None, None))
-        reasoning = _first_int(r["m_reasoning"])
+        reasoning = _first_int(r["m_reasoning"], r["um_reasoning"])
         details: dict[str, Any] = {
             "model": str(r["model"]),
             "llm_request_id": r["id"],

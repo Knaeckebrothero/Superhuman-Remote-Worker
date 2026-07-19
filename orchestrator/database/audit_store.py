@@ -53,6 +53,28 @@ def _to_iso_utc(timestamp: Any) -> str:
     return str(timestamp)
 
 
+def _normalize_token_usage(token_usage: Any, usage_metadata: Any) -> Dict[str, Any]:
+    """Token counts in Chat Completions keys, whichever home they were born in.
+
+    Responses-API rows (codex/gpt-5.x) carry ``token_usage = {}`` — their counts
+    live only in LangChain's normalized ``usage_metadata`` — so re-key that as
+    the fallback; otherwise every codex request lists as ``tokens=[?/?/?]``.
+    """
+    if isinstance(token_usage, dict) and token_usage:
+        return token_usage
+    if isinstance(usage_metadata, dict) and usage_metadata:
+        return {
+            k: usage_metadata[src]
+            for k, src in (
+                ("prompt_tokens", "input_tokens"),
+                ("completion_tokens", "output_tokens"),
+                ("total_tokens", "total_tokens"),
+            )
+            if usage_metadata.get(src) is not None
+        }
+    return {}
+
+
 # Filter category -> step_types.
 FILTER_MAPPINGS: Dict[str, List[str]] = {
     "all": [],
@@ -601,7 +623,8 @@ class AuditStore:
                 lim_n = len(params) + 2
                 rows = await conn.fetch(
                     f"SELECT id, job_id, timestamp, model, iteration, response, "
-                    f"metrics->'token_usage' AS token_usage, call_type, "
+                    f"metrics->'token_usage' AS token_usage, "
+                    f"metrics->'usage_metadata' AS usage_metadata, call_type, "
                     f"metadata->>'status' AS status, metadata->'error' AS error "
                     f"FROM llm_requests WHERE {where} "
                     f"ORDER BY timestamp, id OFFSET ${off_n} LIMIT ${lim_n}",
@@ -616,7 +639,9 @@ class AuditStore:
                     "job_id": str(r["job_id"]),
                     "timestamp": _to_iso_utc(r["timestamp"]),
                     "model": r["model"],
-                    "token_usage": r["token_usage"] or {},
+                    "token_usage": _normalize_token_usage(
+                        r["token_usage"], r["usage_metadata"]
+                    ),
                     "call_type": r["call_type"] or "main",
                 }
                 if r["iteration"] is not None:

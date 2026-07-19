@@ -49,6 +49,9 @@ def _row(
     m_reasoning=None,
     m_cached=None,
     m_cached_norm=None,
+    um_input=None,
+    um_output=None,
+    um_reasoning=None,
     md_input=None,
     md_output=None,
     md_cached=None,
@@ -68,6 +71,9 @@ def _row(
         "m_reasoning": m_reasoning,
         "m_cached": m_cached,
         "m_cached_norm": m_cached_norm,
+        "um_input": um_input,
+        "um_output": um_output,
+        "um_reasoning": um_reasoning,
         "md_input": md_input,
         "md_output": md_output,
         "md_cached": md_cached,
@@ -267,6 +273,42 @@ class TestMaterialize:
         assert by_unit["prompt-token"] == 400
         assert by_unit["cached-prompt-token"] == 600
         assert by_unit["completion-token"] == 40
+
+    @pytest.mark.asyncio
+    async def test_codex_worker_row_tokens_only_in_usage_metadata(self):
+        # Real codex/gpt-5.x WORKER-job shape (job c3fc9128, 07-18): the
+        # Responses API leaves metrics.token_usage = {} and metadata NULL —
+        # every count lives ONLY in LangChain-normalized metrics.usage_metadata
+        # (input_tokens / output_tokens / output_token_details.reasoning, with
+        # cached already covered by m_cached_norm). Before the um_* fallbacks
+        # these rows resolved to 0/0 and were silently dropped as "nothing to
+        # meter" — no codex job ever reached the ledger.
+        audit = FakePool(
+            AuditConn(
+                [
+                    _row(
+                        13,
+                        model="gpt-5.6-sol",
+                        um_input="223567",
+                        um_output="838",
+                        um_reasoning="376",
+                        m_cached_norm="7680",
+                    )
+                ]
+            )
+        )
+        app = FakePool(AppConn(jobs={JOB: (USER, PROJ)}))
+        ledger = FakeLedger()
+        res = await materialize_llm_usage_from_audit(
+            audit, app, ledger, min_age_s=0, now=NOW
+        )
+        assert res["materialized"] == 3
+        by_unit = {e.unit: e for e in ledger.events}
+        assert by_unit["prompt-token"].quantity == 215887  # 223567 - 7680 cached
+        assert by_unit["cached-prompt-token"].quantity == 7680
+        assert by_unit["completion-token"].quantity == 838
+        assert by_unit["prompt-token"].details["reasoning_tokens"] == 376
+        assert by_unit["prompt-token"].ref_kind == "job"
 
     @pytest.mark.asyncio
     async def test_cached_from_session_metadata(self):
