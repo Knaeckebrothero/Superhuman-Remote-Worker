@@ -285,7 +285,11 @@ async def stop_project_loop(request: Request, project_id: str) -> dict[str, Any]
     if not loop:
         raise HTTPException(status_code=404, detail="No active loop for this project")
     return await postgres_db.update_project_loop(
-        str(loop["id"]), status="stopped", stop_reason="user", current_job_id=None
+        str(loop["id"]),
+        status="stopped",
+        stop_reason="user",
+        current_job_id=None,
+        current_stage_jobs=[],
     )
 
 
