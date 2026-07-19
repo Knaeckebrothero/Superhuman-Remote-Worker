@@ -11515,24 +11515,6 @@ class PostgresDB:
             )
         return [self._project_loop_row_to_dict(r) for r in rows]
 
-    async def claim_project_loop_advance(self, loop_id: str, job_id: str) -> bool:
-        """Atomically claim the advance for (loop, its current terminal job).
-
-        Nulls ``current_job_id`` iff it still equals ``job_id`` on a running
-        loop, returning True only for the single caller that wins the race.
-        This makes ``_advance_project_loop`` safe to invoke concurrently from
-        the completion hook and the safety-net sweeper — the loser sees no
-        matching row and backs off, so the next job is spawned exactly once.
-        """
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE project_loops SET current_job_id = NULL, updated_at = now() "
-                "WHERE id = $1 AND current_job_id = $2 AND status = 'running'",
-                UUID(loop_id),
-                UUID(job_id),
-            )
-        return result.endswith(" 1")
-
     async def heal_project_loop_pointer(
         self,
         loop_id: str,
@@ -11554,8 +11536,9 @@ class PostgresDB:
 
         Guarded on ``current_job_id IS NULL AND status='running'`` so
         concurrent sweeper replicas heal exactly once — the loser matches no
-        row and backs off (mirrors ``claim_project_loop_advance``) — AND on
-        the wedge being at least ``min_wedge_age_seconds`` old. The age gate
+        row and backs off (the same no-match-backs-off pattern as
+        ``claim_project_loop_stage_barrier``) — AND on the wedge being at
+        least ``min_wedge_age_seconds`` old. The age gate
         is what separates a *torn* advance from an advance *in flight*: every
         healthy advance also traverses ``current_job_id=NULL`` between its
         claim and its write-back (the claim stamps ``updated_at=now()``), and
