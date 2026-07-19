@@ -11515,60 +11515,6 @@ class PostgresDB:
             )
         return [self._project_loop_row_to_dict(r) for r in rows]
 
-    async def heal_project_loop_pointer(
-        self,
-        loop_id: str,
-        job_id: str,
-        *,
-        seq_index: int,
-        total_jobs_run: int,
-        remaining_iterations: int | None,
-        min_wedge_age_seconds: float = 600.0,
-    ) -> bool:
-        """Atomically re-point a wedged loop at its newest spawned job.
-
-        The torn-advance recovery (see
-        docs/issues/loop_advance_nonatomic_wedges_loop.md): an interrupted
-        ``_advance_project_loop`` can commit the claim (``current_job_id=NULL``)
-        and the next job's insert but lose the write-back, stranding the loop
-        in ``running`` with no pointer. This re-points it and reconciles the
-        counters the lost write-back would have set.
-
-        Guarded on ``current_job_id IS NULL AND status='running'`` so
-        concurrent sweeper replicas heal exactly once — the loser matches no
-        row and backs off (the same no-match-backs-off pattern as
-        ``claim_project_loop_stage_barrier``) — AND on the wedge being at
-        least ``min_wedge_age_seconds`` old. The age gate
-        is what separates a *torn* advance from an advance *in flight*: every
-        healthy advance also traverses ``current_job_id=NULL`` between its
-        claim and its write-back (the claim stamps ``updated_at=now()``), and
-        healing inside that window re-arms the claim and double-spawns the
-        next iteration (observed live: duplicate iter-14 critics). Evaluated
-        on the DB clock so a stale Python-side read can't sneak past it.
-
-        Also guarded on ``current_stage_jobs = '[]'`` so a parallel fan-out
-        stage in flight (current_job_id NULL by design, members listed in
-        current_stage_jobs) is never mistaken for a torn single-role advance
-        and collapsed onto one job — the sweeper routes those to the
-        stage-aware path (``heal_project_loop_stage`` / barrier) instead.
-        """
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE project_loops SET current_job_id = $2, seq_index = $3, "
-                "total_jobs_run = $4, remaining_iterations = $5, "
-                "updated_at = now() "
-                "WHERE id = $1 AND current_job_id IS NULL AND status = 'running' "
-                "AND current_stage_jobs = '[]'::jsonb "
-                "AND updated_at < now() - make_interval(secs => $6)",
-                UUID(loop_id),
-                UUID(job_id),
-                seq_index,
-                total_jobs_run,
-                remaining_iterations,
-                float(min_wedge_age_seconds),
-            )
-        return result.endswith(" 1")
-
     async def claim_project_loop_stage_barrier(
         self, loop_id: str, member_job_id: str
     ) -> bool:
@@ -11682,35 +11628,44 @@ class PostgresDB:
         loop_id: str,
         member_job_ids: List[str],
         *,
+        current_job_id: str | None,
         seq_index: int,
         total_jobs_run: int,
         remaining_iterations: int | None,
         min_wedge_age_seconds: float = 600.0,
     ) -> bool:
-        """Restore a torn parallel stage's in-flight membership.
+        """Restore a torn turn's in-flight membership (width 1 included).
 
-        The fan-out analogue of ``heal_project_loop_pointer``: an advance that
-        spawned a parallel next-stage's jobs but lost its write-back leaves the
-        loop wedged with ``current_job_id IS NULL AND current_stage_jobs='[]'``
-        while the spawned members run on. This re-points ``current_stage_jobs``
-        at the still-running members so the barrier can fire when they finish,
-        and reconciles the counters the lost write-back would have set.
+        The torn-advance recovery (docs/issues/loop_advance_nonatomic_wedges_loop.md):
+        an advance that spawned the next turn's jobs — or drained the barrier —
+        but lost its write-back leaves the loop wedged with
+        ``current_job_id IS NULL AND current_stage_jobs='[]'``. This re-points
+        ``current_stage_jobs`` at the members so the barrier can fire,
+        restores the width-1 display mirror (``current_job_id`` — pass None
+        for a fan-out turn), and reconciles the counters the lost write-back
+        would have set.
 
-        Guarded identically to ``heal_project_loop_pointer`` — NULL pointer,
-        empty stage set, running status, and a DB-clock age gate — so a live
-        advance's transient window (or a concurrent replica) can't be mistaken
-        for a tear and double-restored.
+        Guarded on ``current_job_id IS NULL AND status='running'`` and an
+        empty stage set so concurrent sweeper replicas heal exactly once —
+        the loser matches no row and backs off — AND on the wedge being at
+        least ``min_wedge_age_seconds`` old on the DB clock. The age gate is
+        what separates a *torn* advance from an advance *in flight*: every
+        healthy advance also traverses the both-cleared state between its
+        barrier claim and its write-back, and healing inside that window
+        re-arms the claim and double-spawns the next turn (observed live:
+        duplicate iter-14 critics).
         """
         async with self.acquire() as conn:
             result = await conn.execute(
                 "UPDATE project_loops SET current_stage_jobs = $2::jsonb, "
-                "seq_index = $3, total_jobs_run = $4, remaining_iterations = $5, "
-                "updated_at = now() "
+                "current_job_id = $3, seq_index = $4, total_jobs_run = $5, "
+                "remaining_iterations = $6, updated_at = now() "
                 "WHERE id = $1 AND current_job_id IS NULL AND status = 'running' "
                 "AND current_stage_jobs = '[]'::jsonb "
-                "AND updated_at < now() - make_interval(secs => $6)",
+                "AND updated_at < now() - make_interval(secs => $7)",
                 UUID(loop_id),
                 json.dumps([str(j) for j in member_job_ids]),
+                UUID(current_job_id) if current_job_id else None,
                 seq_index,
                 total_jobs_run,
                 remaining_iterations,
