@@ -1181,7 +1181,7 @@ CREATE TABLE public.project_loops (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     workspace_backend text,
     current_stage_jobs jsonb DEFAULT '[]'::jsonb NOT NULL,
-    scheduling text DEFAULT 'rotation'::text NOT NULL,
+    scheduling text DEFAULT 'standard'::text NOT NULL,
     campaign jsonb,
     campaign_history jsonb DEFAULT '[]'::jsonb NOT NULL,
     campaign_caps jsonb,
@@ -1190,7 +1190,7 @@ CREATE TABLE public.project_loops (
     CONSTRAINT project_loop_campaign_is_object CHECK (((campaign IS NULL) OR (jsonb_typeof(campaign) = 'object'::text))),
     CONSTRAINT project_loop_has_budget CHECK (((max_iterations IS NOT NULL) OR (run_until IS NOT NULL))),
     CONSTRAINT project_loop_role_sequence_nonempty CHECK (((jsonb_typeof(role_sequence) = 'array'::text) AND (jsonb_array_length(role_sequence) >= 1))),
-    CONSTRAINT project_loop_scheduling_known CHECK ((scheduling = ANY (ARRAY['rotation'::text, 'planner'::text]))),
+    CONSTRAINT project_loop_scheduling_known CHECK ((scheduling = ANY (ARRAY['standard'::text, 'campaign'::text]))),
     CONSTRAINT project_loop_stage_jobs_is_array CHECK ((jsonb_typeof(current_stage_jobs) = 'array'::text)),
     CONSTRAINT project_loop_workspace_backend_valid CHECK (((workspace_backend IS NULL) OR (workspace_backend = ANY (ARRAY['sandbox'::text, 'vm'::text, 'virtual'::text, 'none'::text])))),
     CONSTRAINT project_loops_status_check CHECK ((status = ANY (ARRAY['running'::text, 'paused'::text, 'stopped'::text, 'completed'::text, 'failed'::text])))
@@ -1219,6 +1219,13 @@ COMMENT ON COLUMN public.project_loops.role_sequence IS 'Ordered JSONB array of 
 
 
 --
+-- Name: COLUMN project_loops.current_job_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_loops.current_job_id IS 'Display-only mirror of the in-flight turn when its width is 1 (cockpit links, MCP formatters). NULL for fan-out turns and between turns. The engine''s advance/heal correctness keys on current_stage_jobs, never on this column. docs/features/loop_unified_engine.md.';
+
+
+--
 -- Name: COLUMN project_loops.stop_reason; Type: COMMENT; Schema: public; Owner: -
 --
 
@@ -1236,14 +1243,14 @@ COMMENT ON COLUMN public.project_loops.workspace_backend IS 'Optional per-loop w
 -- Name: COLUMN project_loops.current_stage_jobs; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.project_loops.current_stage_jobs IS 'In-flight members of a parallel (fan-out) role_sequence stage — the jobs the loop barriers on before rotating. Empty for single-role stages, which use current_job_id instead. Populated by the advance/start spawn; drained to [] by the atomic last-member barrier. docs/features/loop_parallel_stages.md.';
+COMMENT ON COLUMN public.project_loops.current_stage_jobs IS 'In-flight members of the loop''s current turn — the jobs the loop barriers on before rotating, width 1 included (the unified engine''s only advance path). Populated by the advance/start spawn; drained to [] by the atomic last-member barrier, which also nulls current_job_id so the torn-advance signature stays current_job_id IS NULL AND current_stage_jobs = ''[]''. docs/features/loop_unified_engine.md.';
 
 
 --
 -- Name: COLUMN project_loops.scheduling; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.project_loops.scheduling IS 'Execution-slot scheduling mode: rotation (fixed one-job slot, the default — byte-identical to pre-0050 behavior) or planner (a checkpoint Critic may expand the slot into a multi-stage campaign via a filed plan). Start-time-only. docs/features/loop_campaign_scheduling.md.';
+COMMENT ON COLUMN public.project_loops.scheduling IS 'Scheduling mode: standard (the role_sequence stage list, one stage per turn — subsumes the old rotation mode and its fan-out stages) or campaign (a checkpoint Critic may expand the execution slot into a multi-stage campaign via a filed plan; formerly planner). Start-time-only. docs/features/loop_unified_engine.md.';
 
 
 --
