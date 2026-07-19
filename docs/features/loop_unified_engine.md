@@ -37,6 +37,8 @@ Decisions locked:
 
 Implements, in user-configurable form, the control-plane assessment's top P0 (typed selection→mission→outcome handoff + refuse-to-advance on missing output — `docs/issues/loop_control_plane_assessment.md`) and closes findings **F15** (budget unit), **F23** (handoff by similarity luck), and **F32** (outcome-blind advance) for the brief-carried path; see [[loop_review]].
 
+**Phase 1 implemented on develop (2026-07-19)** — unified engine live in code: every turn barrier-tracked (width 1 included; `current_job_id` = display mirror), campaign advance threaded through the barrier, legacy rotate path + `claim_project_loop_advance` + pointer heal deleted, modes renamed `standard`/`campaign` (migration 0063). Phase-1 k3d smoke (sequential + campaign) pending. Phases 2–7 not started; their schema lands in later migrations (0064+), not 0063 as originally sketched.
+
 ## Motivation
 
 Three independent pressures point at the same redesign:
