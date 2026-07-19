@@ -58,7 +58,7 @@ def _loop(**over) -> dict:
         "max_iterations": 30,
         "remaining_iterations": 20,
         "current_job_id": CRITIC_JOB_ID,
-        "current_stage_jobs": [],
+        "current_stage_jobs": [CRITIC_JOB_ID],
         "campaign": None,
         "campaign_history": [],
         "campaign_caps": None,
@@ -885,7 +885,11 @@ async def test_intake_gating_chain():
     assert e.value.status_code == 409
 
     # Not the in-flight job → 409.
-    with _intake_patches(_intake_db(job, _loop(current_job_id=str(uuid.uuid4())))):
+    with _intake_patches(
+        _intake_db(
+            job, _loop(current_job_id=None, current_stage_jobs=[str(uuid.uuid4())])
+        )
+    ):
         with pytest.raises(HTTPException) as e:
             await file_loop_plan(req, CRITIC_JOB_ID, plan)
     assert e.value.status_code == 409
