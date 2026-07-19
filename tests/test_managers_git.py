@@ -941,7 +941,8 @@ class TestGitManagerBackendClone:
         cmd = first_call[0][0]
         assert "git clone" in cmd
         assert "/home/agent/workspace" in cmd
-        assert first_call.kwargs["timeout"] == 120
+        # Full single-call wait window (shell hard cap) — see clone-wait fix
+        assert first_call.kwargs["timeout"] == 600
 
     def test_clone_with_remote_cwd(self):
         """clone() with remote_cwd clones into subdirectory."""
@@ -1007,6 +1008,136 @@ class TestGitManagerBackendClone:
         # The actual shell_run call DOES contain the real URL (needed for clone)
         cmd = backend.shell_run.call_args[0][0]
         assert "secret-token" in cmd  # Real URL passed to git
+
+
+_STILL_RUNNING_OUTPUT = (
+    "Exit code: -1\n"
+    "--- still running ---\n"
+    "Command on tab 'git' is still running after 600s — that is the maximum "
+    "wait for one call, not an error, and it may still be producing output.\n"
+    "--- terminal state ---\n"
+    "Cloning into '/home/agent-host/workspace'...\n"
+    "Receiving objects:  33% (9695/29378), 5.89 MiB | 1.03 MiB/s"
+)
+
+_COLLIDING_OUTPUT = (
+    "Tab 'git' has a previous command still running; your new command was "
+    "NOT executed.\n"
+    "Wait for it to finish before sending another command here — read the tab "
+    "to monitor its progress.\n"
+    "--- terminal state ---\n"
+    "Receiving objects:  60% (17866/29378), 22.28 MiB | 2.43 MiB/s"
+)
+
+_PROBE_OK = "Exit code: 0\n--- stdout ---\n/home/agent-host/workspace/.git"
+_CONFIG_OK = "Exit code: 0\n(no output)"
+
+
+class _FakeTime:
+    """Deterministic stand-in for the time module: sleep() advances the clock."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_time(monkeypatch):
+    import src.managers.git_manager as git_manager_module
+
+    fake = _FakeTime()
+    monkeypatch.setattr(git_manager_module, "time", fake, raising=False)
+    return fake
+
+
+class TestGitManagerBackendCloneWaitsForCompletion:
+    """A slow-but-healthy clone must be waited out, never abandoned.
+
+    Repro of job 65ba6be8: the jobs-repo clone outlived the shell_run wait,
+    the shell reported "still running" (explicitly not an error), and clone()
+    treated it as a failure while retries collided with the busy tab.
+    """
+
+    def test_clone_waits_out_still_running_and_attaches(self, fake_time):
+        """still-running result -> poll the tab, attach once the clone lands."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.side_effect = [
+            _STILL_RUNNING_OUTPUT,  # initial clone call hits the wait cap
+            _COLLIDING_OUTPUT,  # probe 1: tab still busy cloning
+            _PROBE_OK,  # probe 2: clone finished, repo present
+            _CONFIG_OK,  # git config user.email
+            _CONFIG_OK,  # git config user.name
+        ]
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git", Path("/tmp/ws"), backend=backend
+        )
+
+        assert mgr is not None
+        assert backend.shell_run.call_count == 5
+        clone_call = backend.shell_run.call_args_list[0]
+        assert "git clone" in clone_call[0][0]
+        for probe_call in backend.shell_run.call_args_list[1:3]:
+            assert "rev-parse" in probe_call[0][0]
+            assert probe_call.kwargs["tab_name"] == "git"
+
+    def test_clone_tab_busy_on_entry_waits_and_attaches(self, fake_time):
+        """Busy tab on entry (a retry landing mid-clone) -> wait, then attach."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.side_effect = [
+            _COLLIDING_OUTPUT,  # clone command NOT executed: tab already cloning
+            _PROBE_OK,  # probe: the in-flight clone finished successfully
+            _CONFIG_OK,
+            _CONFIG_OK,
+        ]
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git", Path("/tmp/ws"), backend=backend
+        )
+
+        assert mgr is not None
+
+    def test_clone_still_running_then_failed_returns_none(self, fake_time):
+        """If the awaited clone dies without leaving a repo, report failure."""
+        backend = _make_mock_backend()
+        backend.shell_run.side_effect = [
+            _STILL_RUNNING_OUTPUT,
+            "Exit code: 128\n--- stdout ---\n"
+            "fatal: not a git repository: '/home/agent-host/workspace/.git'",
+        ]
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git", Path("/tmp/ws"), backend=backend
+        )
+
+        assert mgr is None
+        assert backend.shell_run.call_count == 2
+
+    def test_clone_wait_gives_up_at_deadline(self, fake_time):
+        """A tab that never frees up bounds the wait at the overall deadline."""
+        backend = _make_mock_backend()
+
+        def _never_finishes(*args, **kwargs):
+            if backend.shell_run.call_count == 1:
+                return _STILL_RUNNING_OUTPUT
+            return _COLLIDING_OUTPUT
+
+        backend.shell_run.side_effect = _never_finishes
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git", Path("/tmp/ws"), backend=backend
+        )
+
+        assert mgr is None
+        assert backend.shell_run.call_count > 2
+        assert fake_time.now >= 1800
 
 
 class TestGitManagerBackendCommit:

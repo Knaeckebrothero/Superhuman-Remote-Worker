@@ -18,10 +18,27 @@ import posixpath
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
+
+# A jobs-repo clone can outlive a single shell_run wait (hard-capped at 600s
+# in shell_manager.HARD_TIMEOUT_CAP_SECONDS); the shell then reports the
+# command as "still running" — explicitly not an error. clone() keeps waiting
+# on the tab up to the overall deadline and verifies the on-disk result,
+# instead of abandoning a healthy transfer and colliding retries into the
+# busy tab (job 65ba6be8).
+_CLONE_SHELL_TIMEOUT_SECONDS = 600
+_CLONE_WAIT_DEADLINE_SECONDS = 1800
+_CLONE_POLL_INTERVAL_SECONDS = 10.0
+
+# Fixed markers from shell_manager's STILL_RUNNING_*/COLLIDING_COMMAND
+# templates. Neither matches the blocked-on-interactive-prompt template,
+# which is a genuine failure (a credential prompt means bad auth).
+_STILL_RUNNING_MARKER = "--- still running ---"
+_COLLIDING_MARKER = "previous command still running"
 
 
 class GitManager:
@@ -798,13 +815,20 @@ class GitManager:
                     remote_target = backend.root
 
                 cmd = f"git clone {shlex.quote(url)} {shlex.quote(remote_target)}"
-                output = backend.shell_run(cmd, timeout=120, tab_name="git")
+                output = backend.shell_run(
+                    cmd, timeout=_CLONE_SHELL_TIMEOUT_SECONDS, tab_name="git"
+                )
 
-                # Parse exit code
                 first_line = output.split("\n", 1)[0].strip()
                 if not first_line.startswith("Exit code: 0"):
-                    logger.warning(f"git clone failed for {masked}: {output}")
-                    return None
+                    if cls._clone_in_flight(output):
+                        if not cls._wait_for_remote_clone(
+                            backend, remote_target, masked
+                        ):
+                            return None
+                    else:
+                        logger.warning(f"git clone failed for {masked}: {output}")
+                        return None
 
                 mgr = cls(target_path, backend=backend, remote_cwd=remote_cwd)
                 mgr._run_git(["config", "user.email", "agent@workspace.local"])
@@ -819,6 +843,57 @@ class GitManager:
 
         # --- Local subprocess path (no backend) ---
 
+        return cls._clone_local(url, target_path, masked)
+
+    @staticmethod
+    def _clone_in_flight(output: str) -> bool:
+        """True when shell_run reports the clone alive, not failed: either the
+        wait cap expired mid-transfer, or the tab was already busy (a retry
+        landing while an earlier clone still runs) and the command was never
+        executed."""
+        first_line = output.split("\n", 1)[0].strip()
+        if first_line.startswith("Exit code: -1") and _STILL_RUNNING_MARKER in output:
+            return True
+        return _COLLIDING_MARKER in output and "NOT executed" in output
+
+    @classmethod
+    def _wait_for_remote_clone(cls, backend, remote_target: str, masked: str) -> bool:
+        """Wait for an in-flight clone on the 'git' tab to finish, then verify.
+
+        Polls with a probe that the busy tab rejects until the clone exits;
+        once it runs, the probe's answer — is there a git repo at the target —
+        is ground truth for whether the clone (whoever started it) succeeded.
+        """
+        probe = f"git -C {shlex.quote(remote_target)} rev-parse --git-dir"
+        deadline = time.monotonic() + _CLONE_WAIT_DEADLINE_SECONDS
+        logger.info(
+            f"Clone of {masked} still transferring; waiting up to "
+            f"{_CLONE_WAIT_DEADLINE_SECONDS}s for it to finish"
+        )
+        while time.monotonic() < deadline:
+            time.sleep(_CLONE_POLL_INTERVAL_SECONDS)
+            output = backend.shell_run(probe, timeout=60, tab_name="git")
+            if cls._clone_in_flight(output):
+                continue
+            first_line = output.split("\n", 1)[0].strip()
+            if first_line.startswith("Exit code: 0"):
+                logger.info(f"In-flight clone of {masked} completed")
+                return True
+            logger.warning(
+                f"Awaited clone of {masked} finished without a usable repo: {output}"
+            )
+            return False
+        logger.warning(
+            f"Gave up on clone of {masked} after {_CLONE_WAIT_DEADLINE_SECONDS}s "
+            "— the git tab never freed up"
+        )
+        return False
+
+    @classmethod
+    def _clone_local(
+        cls, url: str, target_path: Path, masked: str
+    ) -> Optional["GitManager"]:
+        """Clone via a local git subprocess (no backend)."""
         if shutil.which("git") is None:
             logger.warning("Cannot clone: git not available")
             return None

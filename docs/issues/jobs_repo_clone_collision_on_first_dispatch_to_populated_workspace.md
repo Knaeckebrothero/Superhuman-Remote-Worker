@@ -80,3 +80,6 @@ reachability red herring). Plus `GitManager.remote_url()` accessor. Tests in
 - Memory/topic: `scholar-shared-workspace-clone-collision`.
 - `docs/issues/scholar_selfprovisioned_workspace_misclassified_as_inherited.md`
   — the same scholar-provisions-parent flow tripping a different guard.
+- `docs/issues/jobs_repo_clone_timeout_abandons_healthy_transfer.md` — a
+  SECOND failure mode behind the same error text (healthy clone abandoned at
+  the shell wait cap); job `65ba6be8` hit it after this fix was live.
