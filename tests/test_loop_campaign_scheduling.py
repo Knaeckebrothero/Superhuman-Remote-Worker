@@ -51,7 +51,7 @@ def _loop(**over) -> dict:
     base = {
         "id": LOOP_ID,
         "status": "running",
-        "scheduling": "planner",
+        "scheduling": "campaign",
         "role_sequence": [["scholar", "product-qa"], "critic", "developer"],
         "seq_index": 1,  # the critic slot just completed
         "total_jobs_run": 10,
@@ -337,7 +337,7 @@ async def test_rotation_loop_never_enters_planner_branch():
     with _patched_main(db, spawn):
         with patch("main._advance_planner_campaign", exploding):
             await _rotate_loop_to_next_stage(
-                _loop(scheduling="rotation"),
+                _loop(scheduling="standard"),
                 seq_index_completed=1,
                 base_total=10,
                 next_remaining=19,
@@ -879,7 +879,7 @@ async def test_intake_gating_chain():
 
     # Rotation-scheduled loop → 409.
     job = _critic_job(None)
-    with _intake_patches(_intake_db(job, _loop(scheduling="rotation"))):
+    with _intake_patches(_intake_db(job, _loop(scheduling="standard"))):
         with pytest.raises(HTTPException) as e:
             await file_loop_plan(req, CRITIC_JOB_ID, plan)
     assert e.value.status_code == 409
@@ -958,7 +958,7 @@ async def test_start_rejects_planner_with_invalid_template():
 
     body = ProjectLoopStart(
         max_iterations=10,
-        scheduling="planner",
+        scheduling="campaign",
         role_sequence=["scholar", "developer"],  # no critic checkpoint
     )
     with ExitStack() as stack:
@@ -1019,7 +1019,7 @@ def _bare_loop(**over) -> dict:
         "project_id": None,
         "owner_id": None,
         "goal": "Build a thing",
-        "scheduling": "planner",
+        "scheduling": "campaign",
         "role_sequence": [["scholar", "product-qa"], "critic", "developer"],
         "remaining_iterations": 20,
         "campaign": None,
@@ -1044,7 +1044,7 @@ class TestLoopPlanToolInjection:
         db = _spawn_db()
         await create_loop_job(
             db,
-            _bare_loop(scheduling="rotation"),
+            _bare_loop(scheduling="standard"),
             role="critic",
             iteration=10,
             seq_index=1,
@@ -1113,7 +1113,7 @@ class TestPlannerKickoffBlocks:
         from services.project_loops import build_loop_kickoff
 
         text = build_loop_kickoff(
-            _bare_loop(scheduling="rotation"), role="critic", iteration=10
+            _bare_loop(scheduling="standard"), role="critic", iteration=10
         )
         assert "PLANNER DUTIES" not in text
         assert "CAMPAIGN CONTEXT" not in text
