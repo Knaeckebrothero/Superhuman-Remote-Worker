@@ -1,48 +1,50 @@
 """Safety-net sweeper for project self-improvement loops.
 
 A project loop advances via the ``_advance_project_loop`` completion hook when
-its current job reaches a terminal state. If that hook is ever missed — the
-agent process dies after marking the job terminal but before the completion
-callback lands, or the advance itself throws inside the fan-out — the loop would
-wedge: ``status='running'`` with a terminal ``current_job`` that never advances.
+every job in its in-flight turn reaches a terminal state; the turn's
+membership — width 1 included — is tracked in ``current_stage_jobs``, and the
+barrier (``claim_project_loop_stage_barrier``) is the only path that drains it
+and rotates to the next turn. If the hook is ever missed — the agent process
+dies after marking a job terminal but before the completion callback lands, or
+the advance itself throws — the loop wedges: ``status='running'`` with a
+terminal member still listed in ``current_stage_jobs``.
 
 This sweeper is the backstop. Each tick it scans running loops and, for any
-whose current job is already terminal, re-runs the advance. The advance is
-atomic and idempotent (``claim_project_loop_advance`` nulls ``current_job_id``
-under a conditional UPDATE), so a sweep that races a late completion hook is a
-no-op for the loser — the next job is spawned exactly once.
+whose in-flight turn is already fully terminal, re-runs the advance for one
+member. The barrier claim is atomic and idempotent, so a sweep that races a
+late completion hook is a no-op for the loser — the turn rotates exactly once.
 
-The sweeper also heals the *torn advance*: the advance runs as three separate
-transactions (claim → create next job → re-point), so an interrupt after the
-claim strands the loop in ``status='running'`` with ``current_job_id=NULL``
-(see docs/issues/loop_advance_nonatomic_wedges_loop.md for the live incident).
+The sweeper also heals the *torn advance*: an advance that spawned the next
+turn's jobs, or drained the barrier, but lost its write-back leaves the loop
+wedged with BOTH pointer columns empty —
+``current_job_id IS NULL AND current_stage_jobs='[]'`` — the single wedge
+signature, regardless of the turn's width
+(docs/issues/loop_advance_nonatomic_wedges_loop.md for the live incident).
 Crucially, that same state is also the *normal transient window of every
-healthy advance* — the claim nulls the pointer seconds before the write-back
-restores it — so a NULL pointer alone is NOT evidence of a tear. Healing
-inside a live advance re-arms the claim and double-spawns the next iteration
-(observed: duplicate iter-14 critics, 12 s apart, two replicas). The
-discriminator is age: the claim stamps ``updated_at=now()`` and a healthy
-advance re-points within seconds, so the heal only fires when the NULL state
-is older than ``PROJECT_LOOP_HEAL_GRACE_SECONDS`` (checked in Python against
-the row, and authoritatively re-checked on the DB clock inside the guarded
-UPDATE). Recovery then re-points the loop at its newest spawned job and
-reconciles the counters the lost write-back would have set, deriving them
-from the job's own ``context.loop_iteration`` stamp (spawn-time truth):
-``total_jobs_run = N``, ``seq_index = (N-1) % len(role_sequence)`` (the start
-endpoint spawns iteration 1 at index 0 and the sequence is immutable after
-start), and ``remaining_iterations = max_iterations - (N-1)`` (seeded equal
-at create, decremented once per completed advance). The healed pointer then
-flows into the normal terminal-advance path above — same tick if the job
-already finished, via the completion hook if it is still running.
+healthy advance* — the barrier claim clears both columns seconds before the
+write-back restores them — so seeing it once is NOT evidence of a tear.
+Healing inside a live advance re-arms the claim and double-spawns the next
+iteration (observed: duplicate iter-14 critics, 12 s apart, two replicas). The
+discriminator is age: a healthy advance re-points within seconds, so the heal
+only fires when the both-cleared state is older than
+``PROJECT_LOOP_HEAL_GRACE_SECONDS`` (checked in Python against the row, and
+authoritatively re-checked on the DB clock inside the guarded UPDATE).
+Recovery restores the loop's newest spawned turn as barrier membership (plus
+the width-1 display mirror when it's a single job) and reconciles the
+counters the lost write-back would have set, deriving them from a member's
+own ``context.loop_iteration`` stamp (spawn-time truth): ``total_jobs_run =
+N``, ``seq_index = (N-1) % len(role_sequence)`` (the start endpoint spawns
+iteration 1 at index 0 and the sequence is immutable after start), and
+``remaining_iterations = max_iterations - (N-1)`` (seeded equal at create,
+decremented once per completed advance). The restored turn then advances only
+if every member is already terminal (the rotate itself was lost — re-run it
+now); otherwise the members' own completion hooks (or the next tick) fire the
+barrier.
 
-Parallel (fan-out) stages add one shape: while ``current_stage_jobs`` is
-non-empty the loop is barriered on those members, so the sweep only steps in
-once every member is terminal (a missed barrier hook) and re-runs the advance
-for one — the atomic barrier claim makes that idempotent. A *torn* parallel
-advance drains the set in one shot, so it lands on the same NULL-pointer /
-empty-set signature as a single-role tear; the heal tells them apart by the
-newest stage's width and whether its members are still running (restore the
-barrier) or all terminal (re-point + rotate). docs/features/loop_parallel_stages.md.
+Transitionally, a pre-0063 writer may still leave a width-1 turn tracked only
+by the display pointer (``current_job_id`` set, ``current_stage_jobs`` empty);
+the sweeper adopts that row into ``current_stage_jobs`` so the unified advance
+drives it, deferring the actual sweep to the next tick.
 
 Mirrors ``cron_dispatcher_loop``'s structure (tick + shutdown-aware wait).
 
@@ -106,50 +108,52 @@ async def project_loop_sweeper_loop(
 
 
 async def _sweep_tick(db: Any, advance_fn: AdvanceFn) -> int:
-    """Re-run the advance for any running loop whose current job is terminal.
+    """Recover any running loop whose in-flight turn stalled.
 
     Returns the number of loops recovered this tick.
     """
     recovered = 0
     for loop in await db.list_running_project_loops():
-        # A parallel (fan-out) stage is in flight when current_stage_jobs is
-        # non-empty. It advances through the barrier, not current_job_id — the
-        # backstop here only fires when every member is already terminal (a
-        # missed barrier hook). The barrier claim makes the re-run idempotent.
+        # The in-flight turn is barrier-tracked in current_stage_jobs (width 1
+        # included). The backstop only steps in once every member is terminal
+        # (a missed barrier hook); the atomic claim makes the re-run idempotent.
         stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
         if stage_ids:
-            recovered += await _sweep_parallel_stage(db, loop, stage_ids, advance_fn)
+            recovered += await _sweep_stage(db, loop, stage_ids, advance_fn)
             continue
 
         cur = loop.get("current_job_id")
-        job = None
-        if not cur:
-            # Torn advance: the claim nulled the pointer but the write-back
-            # never landed. Re-point at the newest spawned job/stage so the
-            # normal terminal-advance path below (or the completion hook, if the
-            # job is still running) can take over.
-            job = await _heal_wedged_loop(db, loop)
-            if job is None:
-                continue
-            cur = str(job["id"])
+        if cur:
+            # Transitional (a pre-0063 writer raced the deploy): a width-1
+            # turn tracked only by the display pointer. Adopt it into the
+            # barrier set so the unified advance can drive it; it is swept
+            # as a normal stage next tick.
+            logger.warning(
+                "project loop %s: adopting legacy width-1 pointer %s into "
+                "current_stage_jobs",
+                str(loop.get("id"))[:8],
+                str(cur)[:8],
+            )
+            await db.update_project_loop(
+                str(loop["id"]), current_stage_jobs=[str(cur)]
+            )
+            continue
 
-        if job is None:
-            job = await db.get_job(str(cur))
+        # Both columns empty: a torn advance (write-back lost) or a crash
+        # before the first spawn. The heal restores membership; it returns a
+        # job only when the restored turn is already fully terminal, meaning
+        # the rotate itself was lost — re-run it now.
+        job = await _heal_wedged_loop(db, loop)
         if not job:
             continue
-        if job.get("status") not in _TERMINAL:
-            continue  # in-flight; the completion hook will advance it
-
         logger.warning(
-            "project loop %s: current job %s is terminal (%s) but loop still "
-            "running — recovering via advance (missed completion hook)",
+            "project loop %s: healed turn is fully terminal — recovering via "
+            "barrier advance (lost rotate)",
             str(loop.get("id"))[:8],
-            str(cur)[:8],
-            job.get("status"),
         )
         try:
-            # result={} → _advance_project_loop derives failure from job.status,
-            # so terminal-success and terminal-failure are both handled right.
+            # result={} → the advance derives failure from job.status, so
+            # terminal-success and terminal-failure are both handled right.
             await advance_fn(job, {}, [])
             recovered += 1
         except Exception:
@@ -157,10 +161,10 @@ async def _sweep_tick(db: Any, advance_fn: AdvanceFn) -> int:
     return recovered
 
 
-async def _sweep_parallel_stage(
+async def _sweep_stage(
     db: Any, loop: dict[str, Any], stage_ids: list[str], advance_fn: AdvanceFn
 ) -> int:
-    """Backstop for a loop with a parallel (fan-out) stage in flight.
+    """Backstop for a loop with a turn in flight (any width).
 
     While any member is still running, the members' completion hooks fire the
     barrier — nothing to do. Once EVERY member is terminal, the last member's
@@ -180,7 +184,7 @@ async def _sweep_parallel_stage(
     if not rep:
         return 0
     logger.warning(
-        "project loop %s: parallel stage (%d jobs) all terminal but not rotated "
+        "project loop %s: stage (%d jobs) all terminal but not rotated "
         "— recovering via barrier advance (missed completion hook)",
         str(loop.get("id"))[:8],
         len(stage_ids),
@@ -266,36 +270,33 @@ def _wedge_age_seconds(loop: dict[str, Any]) -> float | None:
 
 
 async def _heal_wedged_loop(db: Any, loop: dict[str, Any]) -> dict[str, Any] | None:
-    """Re-point a running loop whose pointer is NULL and stage set is empty.
+    """Restore membership for a running loop with both pointer columns empty.
 
-    Both signatures collapse here: a torn single-role advance and a torn
-    parallel advance leave the same row state (current_job_id NULL,
-    current_stage_jobs '[]') — membership is drained in one shot, so there is no
-    partial-shrink to distinguish. The newest STAGE (all jobs sharing the max
-    loop_iteration) is the discriminator:
+    That state is either the transient window of a live advance (young — see
+    the age gate) or a torn advance whose write-back was lost. The newest
+    STAGE (all jobs sharing the max ``loop_iteration``) is what the lost
+    write-back would have pointed the loop at; restore it as the barrier
+    membership (width 1 included, with the display mirror for a single
+    member):
 
-      * width 1 (single-role stage) → re-point ``current_job_id`` at it (as
-        before); the caller advances if it is terminal, else the completion
-        hook does.
-      * width N, some member still running (torn during the next stage's spawn)
-        → restore ``current_stage_jobs`` so the barrier can fire when they
-        finish. Returns None (the members / next tick drive the rotate).
-      * width N, all terminal (torn after the last-out barrier drained the set
-        but before the rotate) → re-point ``current_job_id`` at a representative
-        so the normal single-job advance rotates.
+      * some member still running → the barrier fires when they finish;
+        returns None (nothing to advance now).
+      * all members terminal (the rotate itself was lost) → returns a
+        representative so the caller re-runs the advance; the atomic barrier
+        claim makes the re-run idempotent.
 
-    Returns the job row to advance on, or None (deferred / restored / not ours).
     Guarded by the age gate + the DB-side heal guards so a live advance's
-    transient NULL window is never mistaken for a tear.
+    transient window is never mistaken for a tear (the double-spawn
+    incident, docs/issues/loop_advance_nonatomic_wedges_loop.md).
     """
     loop_id = str(loop.get("id"))
     age = _wedge_age_seconds(loop)
     if age is not None and age < HEAL_GRACE_SECONDS:
-        # Freshly-nulled pointer = the claim of a live advance, not a tear.
-        # Healing now would re-arm the claim and double-spawn the iteration.
+        # Freshly-cleared pointers = the claim of a live advance, not a tear.
+        # Healing now would re-arm the claim and double-spawn the turn.
         logger.debug(
-            "project loop %s: current_job_id is NULL but only %.0fs old — "
-            "advance likely in flight, deferring heal",
+            "project loop %s: pointers cleared but only %.0fs old — advance "
+            "likely in flight, deferring heal",
             loop_id[:8],
             age,
         )
@@ -310,67 +311,40 @@ async def _heal_wedged_loop(db: Any, loop: dict[str, Any]) -> dict[str, Any] | N
             ctx = {}
     derived = _derive_loop_counters(loop, ctx or {}) if members else None
     if not derived:
-        # A running loop should always have an in-flight job (start/advance set
-        # one). No job (crash between loop create and first spawn) or an
-        # unreadable iteration stamp — nothing to re-point at safely.
+        # A running loop should always have an in-flight turn (start/advance
+        # set one). No job at all, or an unreadable iteration stamp — nothing
+        # to re-point at safely.
         logger.warning(
-            "project loop %s is running with no current_job_id — needs attention",
+            "project loop %s is running with no in-flight turn — needs attention",
             loop_id[:8],
         )
         return None
 
     seq_index, total_jobs_run, remaining = derived
-    role_label = (ctx or {}).get("loop_role") or members[0].get("config_name")
-
-    # Parallel stage torn with members still running: restore the barrier set.
-    if len(members) > 1:
-        non_terminal = [m for m in members if m.get("status") not in _TERMINAL]
-        if non_terminal:
-            if not await db.heal_project_loop_stage(
-                loop_id,
-                [str(m["id"]) for m in members],
-                seq_index=seq_index,
-                total_jobs_run=total_jobs_run,
-                remaining_iterations=remaining,
-                min_wedge_age_seconds=HEAL_GRACE_SECONDS,
-            ):
-                return None
-            logger.warning(
-                "project loop %s: healed torn advance — restored parallel stage "
-                "(%d members, %d still running; seq_index %s, remaining %s)",
-                loop_id[:8],
-                len(members),
-                len(non_terminal),
-                seq_index,
-                remaining,
-            )
-            return None  # members' hooks / next tick fire the barrier
-
-    # Single-role stage, or a parallel stage whose members are all terminal (the
-    # rotate was lost): re-point current_job_id at a representative so the normal
-    # single-job advance rotates.
-    rep = members[0]
-    if not await db.heal_project_loop_pointer(
+    member_ids = [str(m["id"]) for m in members]
+    if not await db.heal_project_loop_stage(
         loop_id,
-        str(rep["id"]),
+        member_ids,
+        current_job_id=(member_ids[0] if len(member_ids) == 1 else None),
         seq_index=seq_index,
         total_jobs_run=total_jobs_run,
         remaining_iterations=remaining,
         min_wedge_age_seconds=HEAL_GRACE_SECONDS,
     ):
-        # Another replica healed first, or the DB-side age guard saw a fresher
-        # row than our read (an advance re-claimed meanwhile) — not ours.
+        # Another replica healed first, or the DB-side age guard saw a
+        # fresher row than our read — not ours.
         return None
 
+    non_terminal = [m for m in members if m.get("status") not in _TERMINAL]
     logger.warning(
-        "project loop %s: healed torn advance — re-pointed at %s job %s "
-        "(iteration %s, seq_index %s, remaining %s%s)",
+        "project loop %s: healed torn advance — restored %d-member turn "
+        "(%d still running; seq_index %s, remaining %s)",
         loop_id[:8],
-        role_label,
-        str(rep["id"])[:8],
-        total_jobs_run,
+        len(members),
+        len(non_terminal),
         seq_index,
         remaining,
-        f"; {len(members)}-job stage all terminal" if len(members) > 1 else "",
     )
-    return rep
+    if non_terminal:
+        return None  # members' completion hooks / next tick fire the barrier
+    return members[0]  # all terminal: the rotate was lost — advance now

@@ -1,15 +1,20 @@
 """Tests for the project-loop safety-net sweeper, including torn-advance heal.
 
-The sweeper recovers two wedge shapes (docs/issues/loop_advance_nonatomic_wedges_loop.md):
+The sweeper recovers ONE wedge shape (docs/issues/loop_advance_nonatomic_wedges_loop.md):
+``current_job_id IS NULL AND current_stage_jobs='[]'`` — both pointer columns
+empty, regardless of the in-flight turn's width (width 1 included). That
+shape is either a torn advance whose write-back was lost (heal restores the
+turn's membership, plus the width-1 display mirror, then advances only if
+every member is already terminal) or the transient window every healthy
+advance also passes through between its barrier claim and its write-back (the
+age gate tells them apart). Separately, a turn already tracked in
+``current_stage_jobs`` (any width) is barrier-backstopped: act only once every
+member is terminal, idempotently via the atomic barrier claim. A legacy
+width-1 row tracked only by the display pointer (``current_job_id`` set,
+``current_stage_jobs`` empty — a pre-0063 writer) is adopted into membership
+rather than healed or advanced in the same tick.
 
-1. Missed completion hook — loop running, ``current_job_id`` points at a
-   terminal job → re-run the advance (original behavior).
-2. Torn advance — the advance's claim committed (``current_job_id=NULL``) but
-   the write-back was lost → re-point at the newest spawned job, reconcile the
-   counters from its spawn-time context stamps, then advance (same tick if the
-   job is terminal, via the completion hook otherwise).
-
-The DB is faked at the four methods the sweeper touches; ``advance_fn`` is a
+The DB is faked at the methods the sweeper touches; ``advance_fn`` is a
 recorded stub (the advance itself is covered by the orchestrator's own tests).
 Counter-derivation invariants come from the start endpoint (iteration 1 spawns
 role_sequence[0], seq_index 0) and ``create_project_loop`` (remaining seeded
@@ -29,7 +34,7 @@ from services.project_loop_sweeper import (
     HEAL_GRACE_SECONDS,
     _derive_loop_counters,
     _heal_wedged_loop,
-    _sweep_parallel_stage,
+    _sweep_stage,
     _sweep_tick,
 )
 
@@ -109,7 +114,6 @@ def _db(
     loops: list[dict],
     jobs: list[dict],
     *,
-    heal_wins: bool = True,
     stage_heal_wins: bool = True,
     barrier_wins: bool = True,
 ):
@@ -119,7 +123,6 @@ def _db(
     by_id = {str(j["id"]): j for j in jobs}
     db.get_job.side_effect = lambda job_id: by_id.get(str(job_id))
     db.get_newest_loop_stage.return_value = _newest_stage(jobs)
-    db.heal_project_loop_pointer.return_value = heal_wins
     db.heal_project_loop_stage.return_value = stage_heal_wins
     db.claim_project_loop_stage_barrier.return_value = barrier_wins
     db.get_loop_stage_member_statuses.side_effect = lambda ids: {
@@ -187,20 +190,55 @@ class TestDeriveLoopCounters:
 
 
 class TestHealWedgedLoop:
+    """Both pointer columns empty → restore the newest stage as membership."""
+
     @pytest.mark.asyncio
-    async def test_heals_and_returns_job(self):
+    async def test_width1_terminal_restores_membership_and_returns_job(self):
         orphan = _job(10, "scholar")
         db = _db([_loop()], [orphan])
         healed = await _heal_wedged_loop(db, _loop())
         assert healed is orphan
-        db.heal_project_loop_pointer.assert_awaited_once_with(
+        db.heal_project_loop_stage.assert_awaited_once_with(
             LOOP_ID,
-            orphan["id"],
+            [orphan["id"]],
+            current_job_id=orphan["id"],
             seq_index=0,
             total_jobs_run=10,
             remaining_iterations=24,
             min_wedge_age_seconds=HEAL_GRACE_SECONDS,
         )
+
+    @pytest.mark.asyncio
+    async def test_width1_running_restores_membership_without_advance(self):
+        orphan = _job(10, "scholar", status="processing")
+        db = _db([_loop()], [orphan])
+        assert await _heal_wedged_loop(db, _loop()) is None
+        db.heal_project_loop_stage.assert_awaited_once()
+        kwargs = db.heal_project_loop_stage.await_args.kwargs
+        assert kwargs["current_job_id"] == orphan["id"]
+
+    @pytest.mark.asyncio
+    async def test_fanout_all_terminal_returns_representative(self):
+        a = _job(2, "scholar", seq_index=0, remaining=7)
+        b = _job(2, "product-qa", seq_index=0, remaining=7)
+        db = _db([_loop()], [b, a])
+        healed = await _heal_wedged_loop(db, _loop())
+        assert healed is not None and healed["id"] in {a["id"], b["id"]}
+        args, kwargs = db.heal_project_loop_stage.await_args
+        assert set(args[1]) == {a["id"], b["id"]}
+        assert kwargs["current_job_id"] is None  # fan-out: no display mirror
+        assert kwargs["seq_index"] == 0
+        assert kwargs["total_jobs_run"] == 2
+        assert kwargs["remaining_iterations"] == 7
+
+    @pytest.mark.asyncio
+    async def test_fanout_some_running_restores_and_defers(self):
+        a = _job(2, "scholar", status="completed", seq_index=0, remaining=7)
+        b = _job(2, "product-qa", status="processing", seq_index=0, remaining=7)
+        db = _db([_loop()], [b, a])
+        assert await _heal_wedged_loop(db, _loop()) is None
+        args, _ = db.heal_project_loop_stage.await_args
+        assert set(args[1]) == {a["id"], b["id"]}  # FULL membership restored
 
     @pytest.mark.asyncio
     async def test_json_string_context_decoded(self):
@@ -213,7 +251,7 @@ class TestHealWedgedLoop:
     async def test_no_jobs_no_heal(self):
         db = _db([_loop()], [])
         assert await _heal_wedged_loop(db, _loop()) is None
-        db.heal_project_loop_pointer.assert_not_awaited()
+        db.heal_project_loop_stage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_underivable_context_no_heal(self):
@@ -221,35 +259,31 @@ class TestHealWedgedLoop:
         orphan["context"] = {}
         db = _db([_loop()], [orphan])
         assert await _heal_wedged_loop(db, _loop()) is None
-        db.heal_project_loop_pointer.assert_not_awaited()
+        db.heal_project_loop_stage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_lost_guard_backs_off(self):
-        # Concurrent replica healed first — this one must not advance.
         orphan = _job(10, "scholar")
-        db = _db([_loop()], [orphan], heal_wins=False)
+        db = _db([_loop()], [orphan], stage_heal_wins=False)
         assert await _heal_wedged_loop(db, _loop()) is None
 
 
 class TestHealAgeGate:
-    """A NULL pointer is only a tear once it's OLD — every healthy advance
-    also traverses running+NULL between its claim and its write-back, and
-    healing inside that window double-spawns the iteration (the live iter-14
-    incident, docs/issues/loop_advance_nonatomic_wedges_loop.md)."""
+    """Empty pointers are only a tear once they're OLD — every healthy
+    advance also traverses the both-cleared state between its barrier claim
+    and its write-back (the live iter-14 double-spawn incident)."""
 
     @pytest.mark.asyncio
-    async def test_fresh_null_pointer_is_deferred_silently(self):
-        # updated_at = seconds ago → the claim of an advance in flight.
+    async def test_fresh_wedge_is_deferred_silently(self):
         orphan = _job(10, "scholar")
         loop = _loop(updated_at=datetime.now(timezone.utc) - timedelta(seconds=5))
         db = _db([loop], [orphan])
         assert await _heal_wedged_loop(db, loop) is None
-        # Deferred before touching the DB at all — no stage lookup, no heal.
         db.get_newest_loop_stage.assert_not_awaited()
-        db.heal_project_loop_pointer.assert_not_awaited()
+        db.heal_project_loop_stage.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stale_null_pointer_heals(self):
+    async def test_stale_wedge_heals(self):
         orphan = _job(10, "scholar")
         loop = _loop(updated_at=datetime.now(timezone.utc) - timedelta(hours=12))
         db = _db([loop], [orphan])
@@ -257,8 +291,6 @@ class TestHealAgeGate:
 
     @pytest.mark.asyncio
     async def test_naive_timestamp_treated_as_utc(self):
-        # asyncpg normally returns tz-aware datetimes; a naive one must not
-        # crash the comparison and reads as UTC.
         orphan = _job(10, "scholar")
         naive_now = datetime.now(timezone.utc).replace(tzinfo=None)
         fresh = _loop(updated_at=naive_now - timedelta(seconds=5))
@@ -270,56 +302,116 @@ class TestHealAgeGate:
 
     @pytest.mark.asyncio
     async def test_unknown_age_defers_to_db_guard(self):
-        # No readable updated_at → attempt the heal; the SQL age guard
-        # (DB clock) is authoritative and its verdict is respected.
         orphan = _job(10, "scholar")
         loop = _loop(updated_at=None)
-        db = _db([loop], [orphan], heal_wins=False)
+        db = _db([loop], [orphan], stage_heal_wins=False)
         assert await _heal_wedged_loop(db, loop) is None
-        db.heal_project_loop_pointer.assert_awaited_once()
+        db.heal_project_loop_stage.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_sweep_tick_skips_fresh_wedge_without_advance(self):
-        orphan = _job(10, "scholar")  # completed — would advance if healed
+        orphan = _job(10, "scholar")
         loop = _loop(updated_at=datetime.now(timezone.utc))
         db = _db([loop], [orphan])
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
         advance.assert_not_awaited()
-        db.heal_project_loop_pointer.assert_not_awaited()
+        db.heal_project_loop_stage.assert_not_awaited()
+
+
+class TestSweepStage:
+    """Backstop for a loop with a turn in flight (any width): act only once
+    every member is terminal (a missed barrier), idempotently (via the barrier)."""
+
+    def _stage_loop(self, member_ids, **over):
+        return _loop(
+            current_job_id=(member_ids[0] if len(member_ids) == 1 else None),
+            current_stage_jobs=list(member_ids),
+            **over,
+        )
+
+    @pytest.mark.asyncio
+    async def test_width1_terminal_member_advances(self):
+        job = _job(9, "developer", status="failed", seq_index=2, remaining=25)
+        db = _db([self._stage_loop([job["id"]])], [job])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 1
+        advance.assert_awaited_once_with(job, {}, [])
+        db.heal_project_loop_stage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_width1_running_member_untouched(self):
+        job = _job(9, "developer", status="processing", seq_index=2, remaining=25)
+        db = _db([self._stage_loop([job["id"]])], [job])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 0
+        advance.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fanout_all_terminal_advances_via_barrier(self):
+        a = _job(2, "scholar", seq_index=0, remaining=7)
+        b = _job(2, "product-qa", seq_index=0, remaining=7)
+        db = _db([self._stage_loop([a["id"], b["id"]])], [b, a])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 1
+        advance.assert_awaited_once()
+        assert advance.await_args.args[0]["id"] in {a["id"], b["id"]}
+
+    @pytest.mark.asyncio
+    async def test_fanout_member_still_running_skips(self):
+        a = _job(2, "scholar", status="completed", seq_index=0, remaining=7)
+        b = _job(2, "product-qa", status="processing", seq_index=0, remaining=7)
+        db = _db([self._stage_loop([a["id"], b["id"]])], [b, a])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 0
+        advance.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_mixed_terminal_states_still_advance(self):
+        a = _job(2, "scholar", status="failed", seq_index=0, remaining=7)
+        b = _job(2, "product-qa", status="completed", seq_index=0, remaining=7)
+        db = _db([self._stage_loop([a["id"], b["id"]])], [b, a])
+        advance = AsyncMock()
+        assert (
+            await _sweep_stage(
+                db, self._stage_loop([a["id"], b["id"]]), [a["id"], b["id"]], advance
+            )
+            == 1
+        )
 
 
 class TestSweepTick:
     @pytest.mark.asyncio
-    async def test_normal_terminal_advance_still_works(self):
-        # Original behavior: pointer set, job terminal → advance.
-        job = _job(9, "developer", status="failed")
-        db = _db([_loop(current_job_id=job["id"])], [job])
-        advance = AsyncMock()
-        assert await _sweep_tick(db, advance) == 1
-        advance.assert_awaited_once_with(job, {}, [])
-        db.heal_project_loop_pointer.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_torn_advance_terminal_orphan_heals_then_advances(self):
-        # The incident: wedged loop + completed orphan → heal + advance, one tick.
         orphan = _job(10, "scholar")
         db = _db([_loop()], [orphan])
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 1
-        db.heal_project_loop_pointer.assert_awaited_once()
+        db.heal_project_loop_stage.assert_awaited_once()
         advance.assert_awaited_once_with(orphan, {}, [])
 
     @pytest.mark.asyncio
     async def test_torn_advance_running_orphan_heals_without_advance(self):
-        # Orphan still in flight: fix the pointer now, let the completion
-        # hook advance it when it finishes.
         orphan = _job(10, "scholar", status="processing")
         db = _db([_loop()], [orphan])
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
-        db.heal_project_loop_pointer.assert_awaited_once()
+        db.heal_project_loop_stage.assert_awaited_once()
         advance.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_legacy_pointer_only_row_is_adopted_into_membership(self):
+        # Transitional: a pre-0063 writer left a width-1 turn tracked only by
+        # current_job_id. The sweeper adopts it; no advance this tick.
+        job = _job(9, "developer", status="completed", seq_index=2, remaining=25)
+        db = _db([_loop(current_job_id=job["id"])], [job])
+        advance = AsyncMock()
+        assert await _sweep_tick(db, advance) == 0
+        db.update_project_loop.assert_awaited_once_with(
+            LOOP_ID, current_stage_jobs=[job["id"]]
+        )
+        advance.assert_not_awaited()
+        db.heal_project_loop_stage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unhealable_loop_is_skipped(self):
@@ -331,26 +423,18 @@ class TestSweepTick:
     @pytest.mark.asyncio
     async def test_lost_heal_race_does_not_advance(self):
         orphan = _job(10, "scholar")
-        db = _db([_loop()], [orphan], heal_wins=False)
+        db = _db([_loop()], [orphan], stage_heal_wins=False)
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
         advance.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_advance_exception_contained(self):
-        job = _job(9, "developer", status="failed")
-        db = _db([_loop(current_job_id=job["id"])], [job])
+        job = _job(9, "developer", status="failed", seq_index=2, remaining=25)
+        loop = _loop(current_job_id=job["id"], current_stage_jobs=[job["id"]])
+        db = _db([loop], [job])
         advance = AsyncMock(side_effect=RuntimeError("boom"))
         assert await _sweep_tick(db, advance) == 0  # logged, not raised
-
-    @pytest.mark.asyncio
-    async def test_in_flight_pointer_untouched(self):
-        job = _job(9, "developer", status="processing")
-        db = _db([_loop(current_job_id=job["id"])], [job])
-        advance = AsyncMock()
-        assert await _sweep_tick(db, advance) == 0
-        advance.assert_not_awaited()
-        db.heal_project_loop_pointer.assert_not_awaited()
 
 
 class TestDeriveLoopCountersStamps:
@@ -388,95 +472,3 @@ class TestDeriveLoopCountersStamps:
             "loop_seq_index": "oops",
         }
         assert _derive_loop_counters(_loop(), ctx) == (0, 10, 24)
-
-
-class TestSweepParallelStage:
-    """Backstop for a loop with a fan-out stage in flight: act only once every
-    member is terminal (a missed barrier), and idempotently (via the barrier)."""
-
-    def _stage_loop(self, member_ids):
-        return _loop(
-            role_sequence=[list(PARALLEL_ROLES[0]), "critic", "developer"],
-            seq_index=0,
-            current_job_id=None,
-            current_stage_jobs=list(member_ids),
-        )
-
-    @pytest.mark.asyncio
-    async def test_all_terminal_advances_via_barrier(self):
-        a = _job(2, "scholar", seq_index=0, remaining=7)
-        b = _job(2, "product-qa", seq_index=0, remaining=7)
-        loop = self._stage_loop([a["id"], b["id"]])
-        db = _db([loop], [b, a])  # newest-first ordering is irrelevant here
-        advance = AsyncMock()
-        assert await _sweep_tick(db, advance) == 1
-        # Advances on a member (the barrier claim makes the re-run idempotent).
-        advance.assert_awaited_once()
-        assert advance.await_args.args[0]["id"] in {a["id"], b["id"]}
-
-    @pytest.mark.asyncio
-    async def test_member_still_running_skips(self):
-        a = _job(2, "scholar", status="completed", seq_index=0, remaining=7)
-        b = _job(2, "product-qa", status="processing", seq_index=0, remaining=7)
-        loop = self._stage_loop([a["id"], b["id"]])
-        db = _db([loop], [b, a])
-        advance = AsyncMock()
-        assert await _sweep_tick(db, advance) == 0
-        advance.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_failed_and_completed_members_still_advance(self):
-        # Mixed terminal states are still "all terminal" → rotate.
-        a = _job(2, "scholar", status="failed", seq_index=0, remaining=7)
-        b = _job(2, "product-qa", status="completed", seq_index=0, remaining=7)
-        db = _db([self._stage_loop([a["id"], b["id"]])], [b, a])
-        advance = AsyncMock()
-        assert (
-            await _sweep_parallel_stage(
-                db, self._stage_loop([a["id"], b["id"]]), [a["id"], b["id"]], advance
-            )
-            == 1
-        )
-
-
-class TestHealTornParallelStage:
-    """A torn parallel advance lands on the same NULL-pointer / empty-set
-    signature as a single-role tear; the heal disambiguates by the newest
-    stage's width + member statuses."""
-
-    @pytest.mark.asyncio
-    async def test_all_terminal_repoints_at_representative(self):
-        # Tear A: last-out barrier drained the set, then crashed before rotate.
-        # Both members terminal → re-point current_job_id at one, advance rotates.
-        a = _job(2, "scholar", seq_index=0, remaining=7)
-        b = _job(2, "product-qa", seq_index=0, remaining=7)
-        db = _db([_loop()], [b, a])  # newest-first; both share iteration 2
-        healed = await _heal_wedged_loop(db, _loop())
-        assert healed is not None and healed["id"] in {a["id"], b["id"]}
-        db.heal_project_loop_pointer.assert_awaited_once()
-        _, kwargs = db.heal_project_loop_pointer.await_args
-        assert kwargs["seq_index"] == 0
-        assert kwargs["total_jobs_run"] == 2
-        assert kwargs["remaining_iterations"] == 7
-        db.heal_project_loop_stage.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_some_running_restores_barrier_set(self):
-        # Tear B: next stage spawned but write-back lost; members still running.
-        # Restore current_stage_jobs (ALL members) so the barrier can fire.
-        a = _job(2, "scholar", status="completed", seq_index=0, remaining=7)
-        b = _job(2, "product-qa", status="processing", seq_index=0, remaining=7)
-        db = _db([_loop()], [b, a])
-        assert await _heal_wedged_loop(db, _loop()) is None
-        db.heal_project_loop_stage.assert_awaited_once()
-        args, kwargs = db.heal_project_loop_stage.await_args
-        assert set(args[1]) == {a["id"], b["id"]}  # full membership restored
-        assert kwargs["seq_index"] == 0
-        db.heal_project_loop_pointer.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_restore_lost_race_returns_none(self):
-        a = _job(2, "scholar", status="completed", seq_index=0, remaining=7)
-        b = _job(2, "product-qa", status="processing", seq_index=0, remaining=7)
-        db = _db([_loop()], [b, a], stage_heal_wins=False)
-        assert await _heal_wedged_loop(db, _loop()) is None
