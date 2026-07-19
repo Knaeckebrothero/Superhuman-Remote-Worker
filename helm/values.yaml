@@ -847,13 +847,17 @@ gitea:
   image: gitea/gitea:1.22-rootless
   storageClass: ""
   storageSize: "5Gi"
+  # Gitea serves every jobs-repo clone the agents make, and pack generation is
+  # CPU-bound: a 250m limit throttled clones to ~1-2 MiB/s, slow enough that
+  # large project repos outlived the agent-side clone wait. Requests stay small;
+  # the limits are burst headroom for pack-objects and the web UI.
   resources:
     requests:
-      memory: "128Mi"
-      cpu: "50m"
+      memory: "256Mi"
+      cpu: "100m"
     limits:
-      memory: "512Mi"
-      cpu: "250m"
+      memory: "1Gi"
+      cpu: "2"
 
 keycloak:
   # -- Whether the system uses Keycloak/OIDC at all. Set false only for unauthenticated dev.
