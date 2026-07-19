@@ -12745,7 +12745,11 @@ async def _advance_loop_member(
     member_error = (result.get("error") or "job failed") if failed else None
 
     # Per-member artifact handling: squash-merge, F29 flags, retro. Best
-    # effort — never blocks the barrier.
+    # effort — never blocks the barrier. Runs BEFORE the barrier claim below,
+    # so a hook+sweeper race can re-run it for the same member; that's fine —
+    # it's best-effort and idempotent (squash-merge no-ops when the branch is
+    # already merged) — while the rotate itself stays exactly-once behind the
+    # barrier.
     await _merge_and_retro_loop_job(
         job,
         ctx=ctx,
