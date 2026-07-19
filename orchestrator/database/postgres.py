@@ -11603,15 +11603,18 @@ class PostgresDB:
         longer contains it) — matches no row and backs off.
 
         Membership is immutable for the stage's life (this is the only writer
-        that empties it, in one shot), so the post-rotate state is the same
-        single signature the torn-advance sweeper already reasons about:
+        that empties it, in one shot, also nulling the width-1 display mirror
+        ``current_job_id``), so the post-rotate state is the same single
+        signature the torn-advance sweeper reasons about:
         ``current_job_id IS NULL AND current_stage_jobs = '[]'``.
         """
         async with self.acquire() as conn:
             result = await conn.execute(
                 """
                 UPDATE project_loops
-                SET current_stage_jobs = '[]'::jsonb, updated_at = now()
+                SET current_stage_jobs = '[]'::jsonb,
+                    current_job_id = NULL,
+                    updated_at = now()
                 WHERE id = $1
                   AND status = 'running'
                   AND jsonb_array_length(current_stage_jobs) > 0
