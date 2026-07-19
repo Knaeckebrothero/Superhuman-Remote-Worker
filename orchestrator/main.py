@@ -12814,32 +12814,23 @@ async def _advance_loop_member(
 async def _resume_project_loop(loop_id: str) -> dict[str, Any] | None:
     """Resume a paused project loop.
 
-    Sets status back to ``running``. If the in-flight job already reached a
-    terminal state while the loop was paused (so the advance that would have
-    fired was suppressed), re-run that advance now so the rotation continues;
-    otherwise the still-running job advances the loop naturally on completion.
+    Sets status back to ``running``. The barrier is gated on
+    ``status='running'``, so any member of the in-flight turn that went
+    terminal while the loop was paused didn't advance it. Re-run the advance
+    for each already-terminal member so the barrier can fire (the sweeper
+    would eventually catch this too); members still running advance the loop
+    naturally on completion.
     """
     loop = await postgres_db.update_project_loop(loop_id, status="running")
     if not loop:
         return None
-    cur = loop.get("current_job_id")
     stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
     if stage_ids:
-        # A parallel stage was in flight when paused. Its barrier is gated on
-        # status='running', so any member that went terminal while paused
-        # didn't advance. Re-run the advance for one already-terminal member so
-        # the barrier can fire (the sweeper would eventually catch this too);
-        # members still running advance naturally on completion.
         for mid in stage_ids:
             mjob = await postgres_db.get_job(mid)
             if mjob and mjob.get("status") in ("completed", "failed", "cancelled"):
                 await _advance_project_loop(mjob, {}, [])
         loop = await postgres_db.get_project_loop(loop_id)
-    elif cur:
-        cur_job = await postgres_db.get_job(str(cur))
-        if cur_job and cur_job.get("status") in ("completed", "failed", "cancelled"):
-            await _advance_project_loop(cur_job, {}, [])
-            loop = await postgres_db.get_project_loop(loop_id)
     return loop
 
 
@@ -12968,9 +12959,11 @@ async def file_loop_plan(
         raise HTTPException(
             status_code=409, detail=f"Loop is {loop.get('status')}, not running"
         )
-    if str(loop.get("current_job_id") or "") != str(job["id"]):
+    stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
+    if str(job["id"]) not in stage_ids:
         raise HTTPException(
-            status_code=409, detail="Job is not the loop's in-flight job"
+            status_code=409,
+            detail="Job is not one of the loop's in-flight jobs",
         )
     if ctx.get("loop_role") != "critic":
         raise HTTPException(

@@ -263,3 +263,24 @@ class TestUnifiedAdvance:
         assert kw["completed_job"] is job
         assert kw["completed_ctx"]["loop_role"] == "critic"
         assert kw["completed_failed"] is False
+
+
+class TestResume:
+    @pytest.mark.asyncio
+    async def test_resume_readvances_only_terminal_members(self):
+        done = _job(status="completed")
+        running = _job(status="processing")
+        loop = _loop(current_stage_jobs=[done["id"], running["id"]])
+        db = AsyncMock()
+        db.update_project_loop.return_value = loop
+        db.get_project_loop.return_value = loop
+        by_id = {done["id"]: done, running["id"]: running}
+        db.get_job.side_effect = lambda jid: by_id.get(str(jid))
+        adv = AsyncMock()
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main._advance_project_loop", adv))
+            from main import _resume_project_loop
+
+            await _resume_project_loop(LOOP_ID)
+        adv.assert_awaited_once_with(done, {}, [])
