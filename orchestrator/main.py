@@ -153,6 +153,7 @@ from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
 from routers import canvases_router, internal_canvases_router  # noqa: E402
 from routers import project_loops_router  # noqa: E402
+from routers import shared_browser_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
@@ -7279,6 +7280,7 @@ app.include_router(automations_router)
 app.include_router(canvases_router)
 app.include_router(internal_canvases_router)
 app.include_router(project_loops_router)
+app.include_router(shared_browser_router)
 app.include_router(sessions_router)
 
 
