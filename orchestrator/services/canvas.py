@@ -162,6 +162,7 @@ class CanvasCapabilities(_StrictFrozenModel):
     can_pop_out: bool = False
     can_take_control: bool = False
     can_create_viewer_session: bool = False
+    can_stream_browser: bool = False
 
 
 class PublicWorkspaceFileSource(_StrictFrozenModel):
