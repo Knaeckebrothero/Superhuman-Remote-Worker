@@ -42,11 +42,14 @@ import base64
 import json
 import os
 import re
+import secrets
 import socket
 import struct
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -96,6 +99,7 @@ VALID_ACTIONS = {
     "scroll",
     "screenshot",
     "back",
+    "stream_info",
     "shutdown",
 }
 
@@ -184,6 +188,130 @@ def validate_user_nav(url: str, files) -> str:
     if _NAV_K8S_INTERNAL_RE.search(hostname):
         raise ValueError(f"Blocked K8s internal hostname: {hostname}")
     return url
+
+# Agent actions refused while the user holds the baton. Reads (snapshot,
+# screenshot) always pass; stream_info/shutdown are lifecycle, not driving.
+MUTATING_ACTIONS = {"navigate", "click", "type", "select", "scroll", "back"}
+
+
+class StreamHub:
+    """Shared-browser stream state: viewers, baton, browser generation.
+
+    Owned by the daemon; the single authority for who is driving. See
+    docs/features/shared_browser.md (Piece 1).
+    """
+
+    def __init__(self) -> None:
+        self.baton = "agent"
+        self.generation = None
+        self.token = None
+        self.viewers: dict = {}
+        self._next_viewer_id = 0
+        self._auto_release = None
+        self.state_extra = {"url": None, "title": None, "loading": False}
+        self.viewport = {
+            "width": STREAM_MAX_WIDTH,
+            "height": STREAM_MAX_HEIGHT,
+        }
+        self.on_state_change = None
+
+    def mint_generation(self, initial_baton=None) -> None:
+        """Mint a new browser identity and hello token."""
+        self.generation = str(uuid.uuid4())
+        self.token = secrets.token_hex(32)
+        if initial_baton in ("agent", "user"):
+            self.baton = initial_baton
+
+    def clear_generation(self) -> None:
+        self.generation = None
+        self.token = None
+
+    def state_payload(self) -> dict:
+        return {
+            "generation": self.generation,
+            "baton": self.baton,
+            "viewport": self.viewport,
+            **self.state_extra,
+        }
+
+    def take_baton(self) -> None:
+        self._set_baton("user")
+
+    def release_baton(self) -> None:
+        self._set_baton("agent")
+
+    def _set_baton(self, holder: str) -> None:
+        if self.baton != holder:
+            self.baton = holder
+            self._notify()
+
+    def _notify(self) -> None:
+        if self.on_state_change is not None:
+            self.on_state_change()
+
+    def add_viewer(self, queue) -> int:
+        if self._auto_release is not None:
+            self._auto_release.cancel()
+            self._auto_release = None
+        viewer_id = self._next_viewer_id
+        self._next_viewer_id += 1
+        self.viewers[viewer_id] = queue
+        return viewer_id
+
+    def remove_viewer(self, viewer_id) -> None:
+        self.viewers.pop(viewer_id, None)
+        if not self.viewers and self.baton == "user":
+            loop = asyncio.get_running_loop()
+            self._auto_release = loop.call_later(
+                BATON_GRACE_S, self._release_after_grace
+            )
+
+    def _release_after_grace(self) -> None:
+        self._auto_release = None
+        self.release_baton()
+
+    def broadcast(self, frame: bytes) -> None:
+        """Fan a pre-encoded frame to viewers; drop oldest for laggards."""
+        for queue in self.viewers.values():
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                pass
+
+    def shutdown_viewers(self, code: str) -> None:
+        """Tell every viewer the browser is gone and stop its writer."""
+        error_frame = encode_stream_frame(
+            T_ERROR,
+            json.dumps({"code": code, "message": "browser ended"}).encode(),
+        )
+        for queue in list(self.viewers.values()):
+            # Viewer queues are bounded. Reserve room for both the terminal
+            # ERROR and the close sentinel instead of risking a full queue
+            # swallowing the sentinel.
+            while queue.maxsize > 0 and queue.qsize() > queue.maxsize - 2:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            try:
+                queue.put_nowait(error_frame)
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                # The stream server uses maxsize=4, but keep shutdown safe for
+                # any smaller custom queue by prioritising the close sentinel.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
 
 
 def log(msg: str) -> None:
@@ -326,6 +454,7 @@ class BrowserDaemon:
         self._lock = asyncio.Lock()
         self.should_exit = False
         self._files = LocalFileServer()
+        self.hub = StreamHub()
 
     async def _get_session(self):
         """Return a healthy BrowserSession, (re)starting Chromium if needed."""
@@ -365,6 +494,8 @@ class BrowserDaemon:
             except Exception:
                 pass
             self._session = None
+        self.hub.clear_generation()
+        self.hub.shutdown_viewers("browser_gone")
 
     # ── action handlers (mirror browser_direct.py helpers) ──
 
@@ -406,6 +537,9 @@ class BrowserDaemon:
         except Exception:
             pass
 
+        self.hub.state_extra["url"] = result["url"]
+        self.hub.state_extra["title"] = result["title"]
+        result["baton"] = self.hub.baton
         return result
 
     async def _click(self, session, ref: int) -> None:
@@ -483,6 +617,19 @@ class BrowserDaemon:
         if action not in VALID_ACTIONS:
             return {"error": f"unknown action: {action!r}"}
 
+        # While the user drives, refuse mutating agent actions up front:
+        # never spawn Chromium and never take the action lock.
+        if action in MUTATING_ACTIONS and self.hub.baton == "user":
+            return {
+                "error": "user_is_driving",
+                "url": self.hub.state_extra.get("url"),
+                "message": (
+                    "The user is currently driving the shared browser. "
+                    "Read-only actions (snapshot, screenshot) still work; "
+                    "ask the user to release control before taking actions."
+                ),
+            }
+
         # Serialize: browser-use sessions are not concurrency-safe, and the
         # agent issues actions one at a time anyway.
         async with self._lock:
@@ -495,6 +642,15 @@ class BrowserDaemon:
 
                 session = await self._get_session()
 
+                if action == "stream_info":
+                    if self.hub.generation is None:
+                        self.hub.mint_generation(args.get("initial_baton"))
+                    return {
+                        "generation": self.hub.generation,
+                        "token": self.hub.token,
+                        "port": STREAM_PORT,
+                        "baton": self.hub.baton,
+                    }
                 if action == "navigate":
                     # file:// is blocked outright by browser-use's watchdog, so a
                     # local path is rendered through a loopback HTTP listener
@@ -506,10 +662,15 @@ class BrowserDaemon:
                     return await self._page_state(session, args)
                 if action == "screenshot":
                     shot = await session.take_screenshot()
+                    url = await session.get_current_page_url()
+                    title = await session.get_current_page_title()
+                    self.hub.state_extra["url"] = url
+                    self.hub.state_extra["title"] = title
                     return {
-                        "url": await session.get_current_page_url(),
-                        "title": await session.get_current_page_title(),
+                        "url": url,
+                        "title": title,
                         "screenshot": base64.b64encode(shot).decode(),
+                        "baton": self.hub.baton,
                     }
                 if action == "click":
                     await self._click(session, int(args["ref"]))
