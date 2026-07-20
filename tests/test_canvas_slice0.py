@@ -463,6 +463,7 @@ def test_get_route_returns_204_for_absent_and_revalidates_present_state(
         "can_pop_out": False,
         "can_take_control": False,
         "can_create_viewer_session": False,
+        "can_stream_browser": False,
     }
 
     not_modified = client.get(
