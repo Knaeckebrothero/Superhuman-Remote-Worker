@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from security.access import require_internal, require_thread_owner
 from services.canvas import (
+    BrowserSource,
     CanvasCapabilities,
     CanvasEditError,
     CanvasPreconditionFailed,
@@ -54,6 +55,8 @@ from services.canvas_viewer_sessions import (
     CanvasViewerSessionService,
     canvas_viewer_error_detail,
 )
+from services.browser_stream_broker import workspace_ready
+from services.browser_stream_config import browser_stream_config
 
 router = APIRouter(
     prefix="/api/persistent/threads/{thread_id}/canvases",
@@ -492,6 +495,15 @@ async def _represent(
                         can_pop_out=True,
                         can_create_viewer_session=True,
                     )
+    elif isinstance(record.source, BrowserSource):
+        # Metadata-only capability gate. The stream endpoint revalidates the
+        # live daemon identity and the concrete browser generation.
+        if browser_stream_config().enabled and workspace_ready(thread):
+            status = "ready"
+            capabilities = CanvasCapabilities(
+                can_pop_out=True,
+                can_stream_browser=True,
+            )
     return build_public_canvas_representation(
         record,
         status=status,
