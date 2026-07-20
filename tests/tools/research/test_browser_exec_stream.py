@@ -69,3 +69,57 @@ class TestFramingCodec:
         )
         assert header2 == header
         assert jpeg2 == jpeg
+
+
+class _StubFiles:
+    def url_for(self, url):
+        if url.startswith("file://"):
+            return "http://127.0.0.1:45678/mock.html"
+        return url
+
+
+class TestValidateUserNav:
+    def test_https_passes(self):
+        assert (
+            BE.validate_user_nav("https://example.com/x", _StubFiles())
+            == "https://example.com/x"
+        )
+
+    def test_schemeless_gets_https(self):
+        assert (
+            BE.validate_user_nav("example.com", _StubFiles())
+            == "https://example.com"
+        )
+
+    def test_javascript_blocked(self):
+        with pytest.raises(ValueError):
+            BE.validate_user_nav("javascript:alert(1)", _StubFiles())
+
+    def test_data_blocked(self):
+        with pytest.raises(ValueError):
+            BE.validate_user_nav("data:text/html,<b>x</b>", _StubFiles())
+
+    def test_metadata_host_blocked(self):
+        with pytest.raises(ValueError):
+            BE.validate_user_nav(
+                "http://metadata.google.internal/", _StubFiles()
+            )
+
+    def test_k8s_internal_blocked(self):
+        with pytest.raises(ValueError):
+            BE.validate_user_nav(
+                "http://orchestrator.default.svc.cluster.local/",
+                _StubFiles(),
+            )
+
+    def test_file_translated_then_allowed(self):
+        assert (
+            BE.validate_user_nav(
+                "file:///home/agent-host/workspace/mock.html", _StubFiles()
+            )
+            == "http://127.0.0.1:45678/mock.html"
+        )
+
+    def test_empty_rejected(self):
+        with pytest.raises(ValueError):
+            BE.validate_user_nav("   ", _StubFiles())
