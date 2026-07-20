@@ -1,8 +1,13 @@
 """Broker helper tests: codec mirror, readiness, and SSH resolution."""
 
 import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI, WebSocket
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from services import browser_stream_broker as broker
 
@@ -121,3 +126,160 @@ class TestExecStreamInfo:
         }
         with pytest.raises(broker.BrowserStreamUnavailable):
             asyncio.run(broker.exec_stream_info(thread))
+
+
+def _ws_app():
+    app = FastAPI()
+
+    @app.websocket("/stream/{thread_id}")
+    async def stream(ws: WebSocket, thread_id: str):
+        from main import postgres_db
+
+        await broker.relay_browser_stream(ws, thread_id, db=postgres_db)
+
+    return app
+
+
+def _connect_and_capture_close(client, url) -> int:
+    try:
+        with client.websocket_connect(url) as ws:
+            ws.receive_bytes()
+        return 1000
+    except WebSocketDisconnect as exc:
+        return exc.code
+
+
+class TestRelayAuthGates:
+    def test_disabled_closes_4404(self, monkeypatch):
+        monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
+        app = _ws_app()
+        monkeypatch.setattr("main.postgres_db", object(), raising=False)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4404
+
+    def test_unauthenticated_closes_4401(self, monkeypatch):
+        monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+
+        async def no_user(ws, db):
+            return None
+
+        monkeypatch.setattr(broker, "resolve_ws_user", no_user)
+        app = _ws_app()
+        monkeypatch.setattr("main.postgres_db", object(), raising=False)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4401
+
+    def test_stale_generation_closes_4409(self, monkeypatch):
+        monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+
+        async def fake_user(ws, db):
+            return {"id": "u1", "is_approved": True}
+
+        async def fake_info(thread, **kwargs):
+            return {"generation": "g-new", "token": "tok", "port": 38801}
+
+        async def fake_record(db, thread_id):
+            return SimpleNamespace(source=SimpleNamespace(browser_generation="g-old"))
+
+        thread = {
+            "id": "t1",
+            "user_id": "u1",
+            "metadata": {
+                "workspace_container": {
+                    "status": "ready",
+                    "ssh_host": "h",
+                    "ssh_port": 22,
+                }
+            },
+        }
+
+        class FakeDB:
+            async def get_thread(self, thread_id):
+                return dict(thread)
+
+        monkeypatch.setattr(broker, "resolve_ws_user", fake_user)
+        monkeypatch.setattr(broker, "exec_stream_info", fake_info)
+        monkeypatch.setattr(broker, "_get_canvas_record", fake_record)
+        app = _ws_app()
+        monkeypatch.setattr("main.postgres_db", FakeDB(), raising=False)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4409
+
+
+class TestRelayHappyPath:
+    def test_relays_state_frame_and_sends_hello(self, monkeypatch):
+        monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+        written = []
+
+        class FakeSSHReader:
+            def __init__(self):
+                state = broker.encode_stream_frame(
+                    broker.T_STATE,
+                    b'{"baton":"user"}',
+                )
+                self._chunks = [state[:4], state[4:]]
+
+            async def readexactly(self, size):
+                if not self._chunks:
+                    await asyncio.sleep(3600)
+                chunk = self._chunks.pop(0)
+                assert len(chunk) == size
+                return chunk
+
+        class FakeSSHWriter:
+            def write(self, data):
+                written.append(bytes(data))
+
+            async def drain(self):
+                pass
+
+        @asynccontextmanager
+        async def fake_open(**kwargs):
+            yield FakeSSHReader(), FakeSSHWriter()
+
+        async def fake_user(ws, db):
+            return {"id": "u1", "is_approved": True}
+
+        async def fake_info(thread, **kwargs):
+            return {"generation": "g1", "token": "tok", "port": 38801}
+
+        async def fake_record(db, thread_id):
+            return SimpleNamespace(source=SimpleNamespace(browser_generation="g1"))
+
+        thread = {
+            "id": "t1",
+            "user_id": "u1",
+            "metadata": {
+                "workspace_container": {
+                    "status": "ready",
+                    "ssh_host": "h",
+                    "ssh_port": 22,
+                }
+            },
+        }
+
+        class FakeDB:
+            async def get_thread(self, thread_id):
+                return dict(thread)
+
+            async def merge_thread_workspace_context(self, thread_id, updates):
+                return True
+
+        monkeypatch.setattr(broker, "resolve_ws_user", fake_user)
+        monkeypatch.setattr(broker, "exec_stream_info", fake_info)
+        monkeypatch.setattr(broker, "_get_canvas_record", fake_record)
+        monkeypatch.setattr(broker, "_resolve_target", lambda thread: object())
+        monkeypatch.setattr(broker, "_resolve_key_path", lambda: "/tmp/key")
+        monkeypatch.setattr(broker, "_open_loopback", fake_open)
+        app = _ws_app()
+        monkeypatch.setattr("main.postgres_db", FakeDB(), raising=False)
+
+        with TestClient(app).websocket_connect("/stream/t1") as ws:
+            first = ws.receive_bytes()
+            assert first[0] == broker.T_STATE
+            assert first[1:] == b'{"baton":"user"}'
+            ws.send_bytes(bytes([broker.T_CONTROL]) + b'{"op":"take_baton"}')
+
+        assert written[0][4] == broker.T_HELLO
+        assert b'"token": "tok"' in written[0] or b'"token":"tok"' in written[0]
+        assert any(frame[4] == broker.T_CONTROL for frame in written[1:])
