@@ -14090,6 +14090,15 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     )
 
 
+@app.websocket("/api/persistent/threads/{thread_id}/browser/stream")
+async def shared_browser_stream_ws(ws: WebSocket, thread_id: str):
+    """Relay shared-browser frames/input through the pinned SSH transport."""
+
+    from services.browser_stream_broker import relay_browser_stream
+
+    await relay_browser_stream(ws, thread_id, db=postgres_db)
+
+
 @app.websocket("/api/ide/{job_id}/proxy/{path:path}")
 async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
     """Reverse proxy WebSocket connections to code-server in a workspace pod."""
