@@ -42,6 +42,7 @@ import base64
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -96,6 +97,53 @@ VALID_ACTIONS = {
     "back",
     "shutdown",
 }
+
+# ─────────────────────────────────────────────────────────────────────
+# Shared-browser streaming (docs/features/shared_browser.md, Piece 1)
+# ─────────────────────────────────────────────────────────────────────
+
+# Loopback-only stream listener. Covered by sshd `PermitOpen 127.0.0.1:*`;
+# never reachable from the pod/VM network — same posture as live-app ports.
+STREAM_PORT = int(os.environ.get("BROWSER_EXEC_STREAM_PORT", "38801"))
+STREAM_QUALITY = int(os.environ.get("BROWSER_EXEC_STREAM_QUALITY", "60"))
+STREAM_MAX_WIDTH = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_WIDTH", "1280"))
+STREAM_MAX_HEIGHT = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_HEIGHT", "720"))
+STREAM_EVERY_NTH = int(os.environ.get("BROWSER_EXEC_STREAM_EVERY_NTH", "2"))
+BATON_GRACE_S = float(os.environ.get("BROWSER_EXEC_BATON_GRACE", "30"))
+
+# Framing: [4-byte BE length][1-byte type][payload]; length covers type+payload.
+T_HELLO, T_FRAME, T_STATE, T_INPUT, T_CONTROL, T_ERROR = 1, 2, 3, 4, 5, 6
+MAX_STREAM_FRAME = 8 * 1024 * 1024
+
+
+def encode_stream_frame(ftype: int, payload: bytes) -> bytes:
+    if len(payload) + 1 > MAX_STREAM_FRAME:
+        raise ValueError(f"stream frame too large: {len(payload) + 1}")
+    return struct.pack(">IB", len(payload) + 1, ftype) + payload
+
+
+async def read_stream_frame(reader) -> tuple[int, bytes]:
+    """Read one framed message from an asyncio StreamReader."""
+    head = await reader.readexactly(4)
+    (length,) = struct.unpack(">I", head)
+    if not 1 <= length <= MAX_STREAM_FRAME:
+        raise ValueError(f"bad stream frame length: {length}")
+    body = await reader.readexactly(length)
+    return body[0], body[1:]
+
+
+def encode_frame_payload(header: dict, jpeg: bytes) -> bytes:
+    """FRAME payload: [2-byte BE header length][header JSON][raw JPEG]."""
+    header_json = json.dumps(header).encode()
+    return struct.pack(">H", len(header_json)) + header_json + jpeg
+
+
+def decode_frame_payload(payload: bytes) -> tuple[dict, bytes]:
+    (header_length,) = struct.unpack(">H", payload[:2])
+    return (
+        json.loads(payload[2 : 2 + header_length].decode()),
+        payload[2 + header_length :],
+    )
 
 
 def log(msg: str) -> None:
