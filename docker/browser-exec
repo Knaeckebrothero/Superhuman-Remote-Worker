@@ -609,6 +609,47 @@ class BrowserDaemon:
             await page.evaluate("() => { window.history.back(); }")
             await asyncio.sleep(0.5)
 
+    # ── shared-browser streaming hooks ──
+
+    async def ensure_screencast(self) -> None:
+        """Start the CDP screencast if viewers exist.
+
+        Filled in by ScreencastCdp in the next task.
+        """
+
+    async def stop_screencast(self) -> None:
+        """Stop the CDP screencast. Filled in by the next task."""
+
+    async def dispatch_user_input(self, event: dict) -> None:
+        """Inject viewer input via CDP. Filled in by the next task."""
+
+    async def user_control_nav(self, op: str, url=None) -> None:
+        """Run one viewer navigation mutation under the daemon action lock."""
+        if self.hub.baton != "user":
+            return
+        async with self._lock:
+            session = await self._get_session()
+            if op == "navigate":
+                await session.navigate_to(
+                    validate_user_nav(url or "", self._files)
+                )
+            elif op == "back":
+                await self._back(session)
+            elif op == "reload":
+                page = await session.get_current_page()
+                if page is not None:
+                    await page.evaluate("() => { location.reload(); }")
+            try:
+                self.hub.state_extra["url"] = (
+                    await session.get_current_page_url()
+                )
+                self.hub.state_extra["title"] = (
+                    await session.get_current_page_title()
+                )
+            except Exception:
+                pass
+        self.hub._notify()
+
     async def handle(self, req: dict) -> dict:
         """Dispatch one request to the live session. Always returns a dict."""
         action = req.get("action")
@@ -707,6 +748,169 @@ class BrowserDaemon:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Stream server (loopback TCP side-channel for the shared browser)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _queue_stream_frame(queue, frame) -> None:
+    """Enqueue one outbound frame, dropping the oldest item if necessary."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        queue.put_nowait(frame)
+    except asyncio.QueueFull:
+        pass
+
+
+async def _handle_stream_conn(daemon, reader, writer) -> None:
+    hub = daemon.hub
+    try:
+        frame_type, payload = await asyncio.wait_for(
+            read_stream_frame(reader), timeout=5.0
+        )
+        hello = json.loads(payload.decode()) if frame_type == T_HELLO else {}
+    except Exception:
+        writer.close()
+        return
+
+    if not hub.token or hello.get("token") != hub.token:
+        try:
+            writer.write(
+                encode_stream_frame(
+                    T_ERROR,
+                    json.dumps(
+                        {
+                            "code": "unauthorized",
+                            "message": "invalid stream hello token",
+                        }
+                    ).encode(),
+                )
+            )
+            await writer.drain()
+        except Exception:
+            pass
+        writer.close()
+        return
+
+    queue = asyncio.Queue(maxsize=4)
+    viewer_id = hub.add_viewer(queue)
+    tasks = []
+    log(
+        f"stream viewer {viewer_id} connected "
+        f"({len(hub.viewers)} total)"
+    )
+    try:
+        queue.put_nowait(
+            encode_stream_frame(
+                T_STATE, json.dumps(hub.state_payload()).encode()
+            )
+        )
+        await daemon.ensure_screencast()
+
+        async def pump_out():
+            while True:
+                frame = await queue.get()
+                if frame is None:
+                    break
+                writer.write(frame)
+                await writer.drain()
+
+        async def pump_in():
+            while True:
+                frame_type, payload = await read_stream_frame(reader)
+                if frame_type not in (T_INPUT, T_CONTROL):
+                    continue
+                message = json.loads(payload.decode())
+                if frame_type == T_INPUT:
+                    if hub.baton == "user":
+                        await daemon.dispatch_user_input(message)
+                    continue
+
+                op = message.get("op")
+                if op == "take_baton":
+                    hub.take_baton()
+                elif op == "release_baton":
+                    hub.release_baton()
+                elif op in ("navigate", "back", "reload"):
+                    try:
+                        await daemon.user_control_nav(
+                            op, message.get("url")
+                        )
+                    except ValueError as exc:
+                        _queue_stream_frame(
+                            queue,
+                            encode_stream_frame(
+                                T_ERROR,
+                                json.dumps(
+                                    {
+                                        "code": "navigation_rejected",
+                                        "message": str(exc),
+                                    }
+                                ).encode(),
+                            ),
+                        )
+
+        tasks = [
+            asyncio.create_task(pump_out()),
+            asyncio.create_task(pump_in()),
+        ]
+        done, _ = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in done:
+            try:
+                task.result()
+            except (asyncio.CancelledError, asyncio.IncompleteReadError):
+                pass
+            except Exception as exc:
+                log(f"stream viewer {viewer_id} pump ended: {exc}")
+    except Exception as exc:
+        log(f"stream viewer {viewer_id} setup ended: {exc}")
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        hub.remove_viewer(viewer_id)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        log(
+            f"stream viewer {viewer_id} disconnected "
+            f"({len(hub.viewers)} total)"
+        )
+        if not hub.viewers:
+            await daemon.stop_screencast()
+
+
+async def start_stream_server(daemon):
+    """Bind the loopback-only listener and wire STATE broadcasting."""
+
+    def broadcast_state():
+        daemon.hub.broadcast(
+            encode_stream_frame(
+                T_STATE, json.dumps(daemon.hub.state_payload()).encode()
+            )
+        )
+
+    daemon.hub.on_state_change = broadcast_state
+    server = await asyncio.start_server(
+        lambda reader, writer: _handle_stream_conn(
+            daemon, reader, writer
+        ),
+        "127.0.0.1",
+        STREAM_PORT,
+    )
+    log(f"stream listener on 127.0.0.1:{STREAM_PORT}")
+    return server
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Daemon server (unix socket, newline-delimited JSON: one req/resp per conn)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -758,9 +962,19 @@ async def _serve() -> int:
         os.chmod(SOCKET_PATH, 0o600)
     except OSError:
         pass
+    try:
+        stream_server = await start_stream_server(daemon)
+    except Exception:
+        server.close()
+        await server.wait_closed()
+        raise
     log(f"listening on {SOCKET_PATH}")
-    async with server:
-        await stop_event.wait()
+    try:
+        async with server:
+            await stop_event.wait()
+    finally:
+        stream_server.close()
+        await stream_server.wait_closed()
     log("shutting down")
     try:
         os.unlink(SOCKET_PATH)

@@ -7,6 +7,7 @@ The daemon file has no .py extension and must stay stdlib-importable
 import asyncio
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -223,3 +224,106 @@ class TestBatonRefusal:
         daemon.hub.mint_generation("user")
         response = asyncio.run(daemon.handle({"action": "bogus"}))
         assert "unknown action" in response["error"]
+
+
+class TestStreamListener:
+    @staticmethod
+    async def _client(port):
+        return await asyncio.open_connection("127.0.0.1", port)
+
+    @staticmethod
+    async def _send(writer, frame_type, obj):
+        writer.write(
+            BE.encode_stream_frame(frame_type, json.dumps(obj).encode())
+        )
+        await writer.drain()
+
+    @staticmethod
+    async def _recv(reader):
+        frame_type, payload = await asyncio.wait_for(
+            BE.read_stream_frame(reader), timeout=2
+        )
+        return frame_type, json.loads(payload.decode())
+
+    def _daemon(self, monkeypatch, port):
+        monkeypatch.setattr(BE, "STREAM_PORT", port)
+        daemon = BE.BrowserDaemon()
+        daemon.hub.mint_generation("user")
+        return daemon
+
+    def test_bad_token_gets_error_and_close(self, monkeypatch):
+        async def run():
+            daemon = self._daemon(monkeypatch, 38899)
+            server = await BE.start_stream_server(daemon)
+            try:
+                reader, writer = await self._client(38899)
+                await self._send(
+                    writer,
+                    BE.T_HELLO,
+                    {"token": "wrong", "min_protocol": 1},
+                )
+                frame_type, error = await self._recv(reader)
+                assert frame_type == BE.T_ERROR
+                assert error["code"] == "unauthorized"
+                assert await reader.read(1) == b""
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(run())
+
+    def test_good_token_gets_state_then_baton_flip_broadcast(
+        self, monkeypatch
+    ):
+        async def run():
+            daemon = self._daemon(monkeypatch, 38898)
+            server = await BE.start_stream_server(daemon)
+            try:
+                reader, writer = await self._client(38898)
+                await self._send(
+                    writer,
+                    BE.T_HELLO,
+                    {"token": daemon.hub.token, "min_protocol": 1},
+                )
+                frame_type, state = await self._recv(reader)
+                assert (frame_type, state["baton"]) == (BE.T_STATE, "user")
+                assert state["generation"] == daemon.hub.generation
+                await self._send(
+                    writer, BE.T_CONTROL, {"op": "release_baton"}
+                )
+                frame_type, state = await self._recv(reader)
+                assert (frame_type, state["baton"]) == (BE.T_STATE, "agent")
+                response = await daemon.handle({"action": "bogus"})
+                assert "unknown action" in response["error"]
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(run())
+
+    def test_disconnect_removes_viewer(self, monkeypatch):
+        async def run():
+            daemon = self._daemon(monkeypatch, 38897)
+            server = await BE.start_stream_server(daemon)
+            try:
+                reader, writer = await self._client(38897)
+                await self._send(
+                    writer,
+                    BE.T_HELLO,
+                    {"token": daemon.hub.token, "min_protocol": 1},
+                )
+                await self._recv(reader)
+                assert len(daemon.hub.viewers) == 1
+                writer.close()
+                await writer.wait_closed()
+                await asyncio.sleep(0.1)
+                assert len(daemon.hub.viewers) == 0
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(run())
