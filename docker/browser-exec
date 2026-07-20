@@ -41,6 +41,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -144,6 +145,45 @@ def decode_frame_payload(payload: bytes) -> tuple[dict, bytes]:
         json.loads(payload[2 : 2 + header_length].decode()),
         payload[2 + header_length :],
     )
+
+# Vendored from src/tools/research/browser_security.py (the daemon cannot
+# import agent code): same schemes/hosts policy for viewer-driven navigation.
+_NAV_BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata.goog"}
+_NAV_K8S_INTERNAL_RE = re.compile(
+    r"\.(cluster\.local|svc|svc\.cluster\.local|pod|pod\.cluster\.local)$",
+    re.IGNORECASE,
+)
+
+
+def validate_user_nav(url: str, files) -> str:
+    """Validate a viewer-typed URL.
+
+    file:// renders via LocalFileServer (agent parity), then the resulting URL
+    passes the same checks as agent navigation.
+    """
+    if not url or not url.strip():
+        raise ValueError("URL cannot be empty")
+    url = url.strip()
+    if urlparse(url).scheme == "file":
+        url = files.url_for(url)
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if not scheme:
+        url = f"https://{url}"
+        parsed = urlparse(url)
+        scheme = "https"
+    if scheme in {"javascript", "data", "file"}:
+        raise ValueError(f"Blocked scheme: {scheme}://")
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported scheme: {scheme}://")
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError("URL has no hostname")
+    if hostname in _NAV_BLOCKED_HOSTNAMES:
+        raise ValueError(f"Blocked hostname: {hostname}")
+    if _NAV_K8S_INTERNAL_RE.search(hostname):
+        raise ValueError(f"Blocked K8s internal hostname: {hostname}")
+    return url
 
 
 def log(msg: str) -> None:
