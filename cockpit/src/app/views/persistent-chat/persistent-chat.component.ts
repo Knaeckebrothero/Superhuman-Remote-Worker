@@ -30,6 +30,7 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {
     AssistantTurn,
+    collapsedAnswer,
     countEvents,
     EventGroup,
     firstSentence,
@@ -46,7 +47,6 @@ import {
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
-    trailingText,
     Turn,
     TurnEvent,
 } from '../../core/models/turn.model';
@@ -3293,13 +3293,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     /**
-     * The turn's final answer — the trailing prose after the last tool/thought.
-     * Stays fully visible when the turn is collapsed (only the lead-up folds).
-     * Empty when the turn ends on a tool/thought, in which case the collapsed
-     * view falls back to {@link collapsedHeadline}.
+     * The turn's final answer — the trailing prose, recovered even when a
+     * closing tool pass (e.g. the model registering citations after writing its
+     * reply) trails it. Stays fully visible when the turn is collapsed (only the
+     * lead-up folds). Empty only when the turn ends mid-work or has no text, in
+     * which case the collapsed view falls back to {@link collapsedHeadline}.
      */
     finalAnswer(turn: AssistantTurn): string {
-        return trailingText(turn);
+        return collapsedAnswer(turn);
     }
 
     /**

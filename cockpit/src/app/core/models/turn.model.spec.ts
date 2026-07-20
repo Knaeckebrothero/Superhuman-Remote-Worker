@@ -1,6 +1,7 @@
 import {describe, expect, it} from 'vitest';
 import {
     AssistantTurn,
+    collapsedAnswer,
     CompactionEvent,
     EventGroup,
     firstSentence,
@@ -139,6 +140,56 @@ describe('trailingText', () => {
     it('keeps only the final text run, folding earlier interleaved text', () => {
         const t = mkTurn([txt('b0', 'lead'), tool('b1'), txt('b2', 'mid'), tool('b3'), txt('b4', 'final.')]);
         expect(trailingText(t)).toBe('final.');
+    });
+});
+
+describe('collapsedAnswer', () => {
+    it('returns the closing prose when the turn ends on text', () => {
+        const t = mkTurn([txt('b0', 'plan'), tool('b1'), txt('b2', 'Here is the result.')]);
+        expect(collapsedAnswer(t)).toBe('Here is the result.');
+    });
+
+    it('recovers the answer when a completed citation pass trails the text', () => {
+        // The model writes its answer, then registers citations — the turn ends
+        // on cite_web tool calls, so trailingText() is empty. The answer must
+        // still surface instead of collapsing to a one-line opening headline.
+        const t = mkTurn([
+            txt('b0', 'I will build the pack.'),
+            tool('b1'),
+            txt('b2', 'Done — here is the finished pack.'),
+            tool('b3', 'completed', 'citation'),
+            tool('b4', 'completed', 'citation'),
+        ]);
+        expect(collapsedAnswer(t)).toBe('Done — here is the finished pack.');
+    });
+
+    it('joins the trailing text run behind the trailing tool calls', () => {
+        const t = mkTurn([txt('b0', 'First.'), txt('b1', 'Second.'), tool('b2', 'completed', 'citation')]);
+        expect(collapsedAnswer(t)).toBe('First.\n\nSecond.');
+    });
+
+    it('recovers the answer regardless of the trailing tool category', () => {
+        // Not just citations — a closing verification run_command, a final save,
+        // etc.; history rows may also lack a stamped category entirely.
+        const t = mkTurn([txt('b0', 'The file is valid.'), tool('b1')]);
+        expect(collapsedAnswer(t)).toBe('The file is valid.');
+    });
+
+    it('returns "" while a trailing tool call is still running (mid-work)', () => {
+        expect(collapsedAnswer(mkTurn([txt('b0', 'working'), tool('b1', 'running')]))).toBe('');
+    });
+
+    it('returns "" while a trailing thought is still streaming (mid-work)', () => {
+        expect(collapsedAnswer(mkTurn([txt('b0', 'so far'), tht('b1', 'streaming')]))).toBe('');
+    });
+
+    it('returns "" when the turn has no text at all', () => {
+        expect(collapsedAnswer(mkTurn([tool('b0', 'completed', 'citation'), tht('b1')]))).toBe('');
+    });
+
+    it('cuts the run at a tool BETWEEN texts (earlier text is lead-up)', () => {
+        const t = mkTurn([txt('b0', 'lead'), tool('b1'), txt('b2', 'final.'), tool('b3', 'completed', 'citation')]);
+        expect(collapsedAnswer(t)).toBe('final.');
     });
 });
 
