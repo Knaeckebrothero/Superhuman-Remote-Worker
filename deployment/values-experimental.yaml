@@ -144,6 +144,8 @@ ingress:
 # Vault path may be declared while dark, but the chart does not render its
 # ExternalSecret or contact the provider until viewer.enabled=true.
 canvas:
+  sharedBrowser:
+    enabled: true
   livePreview:
     enabled: true
     deniedPorts: []

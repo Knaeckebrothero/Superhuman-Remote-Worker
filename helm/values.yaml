@@ -325,6 +325,10 @@ cockpit:
 # Dynamic Canvas
 # =============================================================================
 canvas:
+  # Shared browser (docs/features/shared_browser.md): stream the workspace
+  # Chromium into the Canvas. Dark by default; the dev profile enables it.
+  sharedBrowser:
+    enabled: false
   livePreview:
     # -- Master capability gate for workspace-port live preview. The proxy,
     # isolated viewer origin, and browser acceptance gates must all fail closed

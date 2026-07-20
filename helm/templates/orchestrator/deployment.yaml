@@ -131,6 +131,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CANVAS_LIVE_PREVIEW_DENIED_PORTS
+            - name: CANVAS_SHARED_BROWSER_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_SHARED_BROWSER_ENABLED
             # Browser viewer control plane. The positive capability requires
             # both Canvas gates plus the validated deployment attestations;
             # default values remain false/empty.

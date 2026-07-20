@@ -103,6 +103,8 @@ data:
   # operator-owned edge and verified deployment attestations remain required.
   CANVAS_LIVE_PREVIEW_ENABLED: {{ ternary "true" "false" .Values.canvas.livePreview.enabled | quote }}
   CANVAS_LIVE_PREVIEW_DENIED_PORTS: {{ join "," .Values.canvas.livePreview.deniedPorts | quote }}
+  # Workspace-Chromium screencast/input relay. Dark by default.
+  CANVAS_SHARED_BROWSER_ENABLED: {{ ternary "true" "false" .Values.canvas.sharedBrowser.enabled | quote }}
   # Browser-facing viewer gate and isolation attestations. These stay present
   # but disabled/empty in ordinary installs so both the API capability and the
   # separate gateway fail closed.

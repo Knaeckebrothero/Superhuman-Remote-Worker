@@ -123,6 +123,12 @@
     "canvas": {
       "type": "object",
       "properties": {
+        "sharedBrowser": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        },
         "livePreview": {
           "type": "object",
           "properties": {
