@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -127,6 +128,42 @@ class TestExecStreamInfo:
         with pytest.raises(broker.BrowserStreamUnavailable):
             asyncio.run(broker.exec_stream_info(thread))
 
+    def test_timeout_kills_and_reaps_ssh_process(self, monkeypatch):
+        state = {"killed": False, "waited": False}
+
+        class Proc:
+            returncode = None
+
+            async def communicate(self):
+                await asyncio.sleep(3600)
+
+            def kill(self):
+                state["killed"] = True
+
+            async def wait(self):
+                state["waited"] = True
+
+        async def fake_exec(*cmd, **kwargs):
+            return Proc()
+
+        monkeypatch.setattr(broker.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(broker, "STREAM_INFO_TIMEOUT_S", 0.01)
+        thread = {
+            "metadata": {
+                "workspace_container": {
+                    "status": "ready",
+                    "ssh_host": "h",
+                    "ssh_port": 22,
+                }
+            }
+        }
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(broker.exec_stream_info(thread))
+
+        assert error.value.status == 504
+        assert state == {"killed": True, "waited": True}
+
 
 def _ws_app():
     app = FastAPI()
@@ -210,6 +247,7 @@ class TestRelayHappyPath:
     def test_relays_state_frame_and_sends_hello(self, monkeypatch):
         monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
         written = []
+        activity_touched = threading.Event()
 
         class FakeSSHReader:
             def __init__(self):
@@ -263,6 +301,7 @@ class TestRelayHappyPath:
                 return dict(thread)
 
             async def merge_thread_workspace_context(self, thread_id, updates):
+                activity_touched.set()
                 return True
 
         monkeypatch.setattr(broker, "resolve_ws_user", fake_user)
@@ -278,6 +317,7 @@ class TestRelayHappyPath:
             first = ws.receive_bytes()
             assert first[0] == broker.T_STATE
             assert first[1:] == b'{"baton":"user"}'
+            assert activity_touched.wait(timeout=1)
             ws.send_bytes(bytes([broker.T_CONTROL]) + b'{"op":"take_baton"}')
 
         assert written[0][4] == broker.T_HELLO
