@@ -249,6 +249,15 @@ class TestStreamListener:
         monkeypatch.setattr(BE, "STREAM_PORT", port)
         daemon = BE.BrowserDaemon()
         daemon.hub.mint_generation("user")
+
+        async def no_op(*_args, **_kwargs):
+            return None
+
+        # Listener protocol tests stay host-only. The real adapter is exercised
+        # by docker/check-browser-stream.py inside the workspace image.
+        daemon.ensure_screencast = no_op
+        daemon.stop_screencast = no_op
+        daemon.dispatch_user_input = no_op
         return daemon
 
     def test_bad_token_gets_error_and_close(self, monkeypatch):
