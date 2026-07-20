@@ -53,9 +53,7 @@ class TestFramingCodec:
     def test_oversize_read_rejected(self):
         async def run():
             reader = asyncio.StreamReader()
-            reader.feed_data(
-                (BE.MAX_STREAM_FRAME + 100).to_bytes(4, "big") + b"\x02"
-            )
+            reader.feed_data((BE.MAX_STREAM_FRAME + 100).to_bytes(4, "big") + b"\x02")
             reader.feed_eof()
             await BE.read_stream_frame(reader)
 
@@ -65,9 +63,7 @@ class TestFramingCodec:
     def test_frame_payload_roundtrip(self):
         header = {"generation": "g1", "w": 1280, "h": 720, "ts": 1.5}
         jpeg = b"\xff\xd8fakejpeg"
-        header2, jpeg2 = BE.decode_frame_payload(
-            BE.encode_frame_payload(header, jpeg)
-        )
+        header2, jpeg2 = BE.decode_frame_payload(BE.encode_frame_payload(header, jpeg))
         assert header2 == header
         assert jpeg2 == jpeg
 
@@ -88,8 +84,7 @@ class TestValidateUserNav:
 
     def test_schemeless_gets_https(self):
         assert (
-            BE.validate_user_nav("example.com", _StubFiles())
-            == "https://example.com"
+            BE.validate_user_nav("example.com", _StubFiles()) == "https://example.com"
         )
 
     def test_javascript_blocked(self):
@@ -102,9 +97,7 @@ class TestValidateUserNav:
 
     def test_metadata_host_blocked(self):
         with pytest.raises(ValueError):
-            BE.validate_user_nav(
-                "http://metadata.google.internal/", _StubFiles()
-            )
+            BE.validate_user_nav("http://metadata.google.internal/", _StubFiles())
 
     def test_k8s_internal_blocked(self):
         with pytest.raises(ValueError):
@@ -146,6 +139,24 @@ class TestStreamHub:
             "title",
             "loading",
         }
+
+    def test_page_state_change_notifies_viewers_once(self):
+        hub = BE.StreamHub()
+        notifications = []
+        hub.on_state_change = lambda: notifications.append(hub.state_payload())
+
+        hub.update_page_state(
+            url="https://example.com/",
+            title="Example",
+        )
+        hub.update_page_state(
+            url="https://example.com/",
+            title="Example",
+        )
+
+        assert len(notifications) == 1
+        assert notifications[0]["url"] == "https://example.com/"
+        assert notifications[0]["title"] == "Example"
 
     def test_broadcast_drops_oldest_for_laggards(self):
         async def run():
@@ -194,9 +205,7 @@ class TestBatonRefusal:
         daemon = BE.BrowserDaemon()
         daemon.hub.mint_generation("user")
         daemon.hub.state_extra["url"] = "https://example.com/form"
-        response = asyncio.run(
-            daemon.handle({"action": "click", "args": {"ref": 1}})
-        )
+        response = asyncio.run(daemon.handle({"action": "click", "args": {"ref": 1}}))
         assert response["error"] == "user_is_driving"
         assert response["url"] == "https://example.com/form"
         assert "release control" in response["message"]
@@ -225,6 +234,79 @@ class TestBatonRefusal:
         response = asyncio.run(daemon.handle({"action": "bogus"}))
         assert "unknown action" in response["error"]
 
+    def test_take_baton_waits_for_inflight_agent_action(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+            daemon.hub.mint_generation("agent")
+            action_started = asyncio.Event()
+            allow_action_to_finish = asyncio.Event()
+
+            class Session:
+                async def navigate_to(self, url):
+                    action_started.set()
+                    await allow_action_to_finish.wait()
+
+            async def get_session():
+                return Session()
+
+            async def page_state(session, args):
+                return {"url": args["url"]}
+
+            daemon._get_session = get_session
+            daemon._page_state = page_state
+            action = asyncio.create_task(
+                daemon.handle(
+                    {
+                        "action": "navigate",
+                        "args": {"url": "https://example.com/"},
+                    }
+                )
+            )
+            await action_started.wait()
+
+            takeover = asyncio.create_task(daemon.take_user_baton())
+            await asyncio.sleep(0)
+            assert daemon.hub.baton == "agent"
+            assert not takeover.done()
+
+            allow_action_to_finish.set()
+            await action
+            await takeover
+            assert daemon.hub.baton == "user"
+
+        asyncio.run(run())
+
+    def test_agent_action_rechecks_baton_after_waiting_for_lock(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+            daemon.hub.mint_generation("agent")
+            session_touched = False
+
+            async def get_session():
+                nonlocal session_touched
+                session_touched = True
+                raise AssertionError("stale agent action must not touch the browser")
+
+            daemon._get_session = get_session
+            await daemon._lock.acquire()
+            action = asyncio.create_task(
+                daemon.handle(
+                    {
+                        "action": "navigate",
+                        "args": {"url": "https://example.com/"},
+                    }
+                )
+            )
+            await asyncio.sleep(0)
+            daemon.hub.take_baton()
+            daemon._lock.release()
+
+            response = await action
+            assert response["error"] == "user_is_driving"
+            assert session_touched is False
+
+        asyncio.run(run())
+
 
 class TestStreamListener:
     @staticmethod
@@ -233,9 +315,7 @@ class TestStreamListener:
 
     @staticmethod
     async def _send(writer, frame_type, obj):
-        writer.write(
-            BE.encode_stream_frame(frame_type, json.dumps(obj).encode())
-        )
+        writer.write(BE.encode_stream_frame(frame_type, json.dumps(obj).encode()))
         await writer.drain()
 
     @staticmethod
@@ -283,9 +363,7 @@ class TestStreamListener:
 
         asyncio.run(run())
 
-    def test_good_token_gets_state_then_baton_flip_broadcast(
-        self, monkeypatch
-    ):
+    def test_good_token_gets_state_then_baton_flip_broadcast(self, monkeypatch):
         async def run():
             daemon = self._daemon(monkeypatch, 38898)
             server = await BE.start_stream_server(daemon)
@@ -299,9 +377,7 @@ class TestStreamListener:
                 frame_type, state = await self._recv(reader)
                 assert (frame_type, state["baton"]) == (BE.T_STATE, "user")
                 assert state["generation"] == daemon.hub.generation
-                await self._send(
-                    writer, BE.T_CONTROL, {"op": "release_baton"}
-                )
+                await self._send(writer, BE.T_CONTROL, {"op": "release_baton"})
                 frame_type, state = await self._recv(reader)
                 assert (frame_type, state["baton"]) == (BE.T_STATE, "agent")
                 response = await daemon.handle({"action": "bogus"})

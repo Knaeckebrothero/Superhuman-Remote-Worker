@@ -32,6 +32,17 @@ class BrowserStreamUnavailable(Exception):
         self.detail = detail
 
 
+async def _kill_and_reap(process) -> None:
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await process.wait()
+    except Exception:
+        logger.debug("Could not reap browser-exec SSH process", exc_info=True)
+
+
 def encode_stream_frame(frame_type: int, payload: bytes) -> bytes:
     if len(payload) + 1 > MAX_STREAM_FRAME:
         raise ValueError(f"stream frame too large: {len(payload) + 1}")
@@ -124,8 +135,11 @@ async def exec_stream_info(thread: dict, *, initial_baton: str | None = None) ->
             process.communicate(), timeout=STREAM_INFO_TIMEOUT_S
         )
     except asyncio.TimeoutError as exc:
-        process.kill()
+        await _kill_and_reap(process)
         raise BrowserStreamUnavailable(504, "browser start timed out") from exc
+    except asyncio.CancelledError:
+        await _kill_and_reap(process)
+        raise
     if process.returncode != 0:
         tail = stderr.decode(errors="replace")[-300:]
         raise BrowserStreamUnavailable(502, f"browser-exec unreachable: {tail}")
@@ -329,7 +343,6 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
 
             async def touch_activity() -> None:
                 while True:
-                    await asyncio.sleep(config.activity_interval_seconds)
                     try:
                         await db.merge_thread_workspace_context(thread_id, {})
                     except Exception:
@@ -338,6 +351,7 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
                             thread_id,
                             exc_info=True,
                         )
+                    await asyncio.sleep(config.activity_interval_seconds)
 
             tasks = [
                 asyncio.create_task(ws_to_tcp()),
