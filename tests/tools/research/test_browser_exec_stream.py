@@ -123,3 +123,103 @@ class TestValidateUserNav:
     def test_empty_rejected(self):
         with pytest.raises(ValueError):
             BE.validate_user_nav("   ", _StubFiles())
+
+
+class TestStreamHub:
+    def test_mint_generation_sets_identity_and_initial_baton(self):
+        hub = BE.StreamHub()
+        assert hub.baton == "agent"
+        hub.mint_generation("user")
+        assert hub.baton == "user"
+        assert hub.generation and hub.token and len(hub.token) == 64
+
+    def test_state_payload_shape(self):
+        hub = BE.StreamHub()
+        hub.mint_generation()
+        state = hub.state_payload()
+        assert set(state) >= {
+            "generation",
+            "baton",
+            "viewport",
+            "url",
+            "title",
+            "loading",
+        }
+
+    def test_broadcast_drops_oldest_for_laggards(self):
+        async def run():
+            hub = BE.StreamHub()
+            queue = asyncio.Queue(maxsize=2)
+            hub.add_viewer(queue)
+            for frame in (b"f1", b"f2", b"f3"):
+                hub.broadcast(frame)
+            assert queue.qsize() == 2
+            assert await queue.get() == b"f2"
+            assert await queue.get() == b"f3"
+
+        asyncio.run(run())
+
+    def test_auto_release_after_last_viewer_leaves(self, monkeypatch):
+        monkeypatch.setattr(BE, "BATON_GRACE_S", 0.05)
+
+        async def run():
+            hub = BE.StreamHub()
+            hub.mint_generation("user")
+            viewer_id = hub.add_viewer(asyncio.Queue(maxsize=4))
+            hub.remove_viewer(viewer_id)
+            assert hub.baton == "user"
+            await asyncio.sleep(0.15)
+            assert hub.baton == "agent"
+
+        asyncio.run(run())
+
+    def test_reconnect_cancels_auto_release(self, monkeypatch):
+        monkeypatch.setattr(BE, "BATON_GRACE_S", 0.05)
+
+        async def run():
+            hub = BE.StreamHub()
+            hub.mint_generation("user")
+            viewer_id = hub.add_viewer(asyncio.Queue(maxsize=4))
+            hub.remove_viewer(viewer_id)
+            hub.add_viewer(asyncio.Queue(maxsize=4))
+            await asyncio.sleep(0.15)
+            assert hub.baton == "user"
+
+        asyncio.run(run())
+
+
+class TestBatonRefusal:
+    def test_mutating_action_refused_while_user_drives(self):
+        daemon = BE.BrowserDaemon()
+        daemon.hub.mint_generation("user")
+        daemon.hub.state_extra["url"] = "https://example.com/form"
+        response = asyncio.run(
+            daemon.handle({"action": "click", "args": {"ref": 1}})
+        )
+        assert response["error"] == "user_is_driving"
+        assert response["url"] == "https://example.com/form"
+        assert "release control" in response["message"]
+
+    def test_refusal_never_touches_the_browser(self):
+        daemon = BE.BrowserDaemon()
+        daemon.hub.mint_generation("user")
+
+        async def boom():
+            raise AssertionError("session must not be touched for a refusal")
+
+        daemon._get_session = boom
+        response = asyncio.run(
+            daemon.handle(
+                {
+                    "action": "navigate",
+                    "args": {"url": "https://x.dev"},
+                }
+            )
+        )
+        assert response["error"] == "user_is_driving"
+
+    def test_unknown_action_beats_baton_check(self):
+        daemon = BE.BrowserDaemon()
+        daemon.hub.mint_generation("user")
+        response = asyncio.run(daemon.handle({"action": "bogus"}))
+        assert "unknown action" in response["error"]
