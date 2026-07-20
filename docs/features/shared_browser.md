@@ -3,41 +3,104 @@ tags:
   - feature
   - cockpit
   - browser
+  - canvas
   - observability
   - agent-tool
 aliases:
   - shared browser window
   - browser livestream
   - agent browser viewer
+  - browser in canvas
 related:
-  - "[[vm_snapshots_and_ide]]"
+  - "[[dynamic_canvas]]"
+  - "[[browser_workspace_executor]]"
   - "[[sessions]]"
   - "[[notify_user_tool]]"
 ---
 
-# Feature: Shared Browser Window
+# Feature: Shared Browser
 
-Design document for letting the user watch — and optionally take control of — the agent's live browser session from the cockpit.
+Design document for the shared browser: the user watches — and drives — the
+same live Chromium the agent's browser tools use, from inside the Dynamic
+Canvas. Either side can open it: the agent presents its browser to the user, or
+the user opens it directly from the canvas, browses to a page, and hands it to
+the agent.
 
-**Status:** Design phase.
+**Status:** DESIGNED 2026-07-20, not implemented. This revision supersedes the
+earlier draft of this document, which was written against the removed
+cross-pod CDP-`:9222` architecture (see "What changed" below). Scope decisions
+are locked: full shared browser in one feature (view + user-drive + handoff),
+explicit control baton, auto-start on open, orchestrator-brokered transport.
+This document is the authority for browser identity, streaming, and control
+leases; `dynamic_canvas.md` Slice 5 is the hosting half.
 
 ## Motivation
 
-The agent runs in a black box. The user has several windows into what it's doing:
+The agent runs in a black box. The user has several windows into what it's
+doing — files (IDE/Gitea), shell, conversation — but the **browser is a blind
+spot**. The agent navigates pages, fills forms, and verifies its own work
+visually; the user sees a tool call and a text snapshot, never the page.
 
-- **Files** — via Gitea browse and the Web IDE (`vm_snapshots_and_ide.md`)
-- **Shell / processes** — via the persistent shell and IDE terminal
-- **Conversation / reasoning** — via the chat history and audit trail
+This gap matters four ways:
 
-But the **browser is a blind spot**. The agent navigates pages, fills forms, runs JavaScript, downloads files, and verifies its own work visually — and the user sees none of it. They see a tool call (`browser_navigate(url=...)`) and a text snapshot of the result, but never the actual page.
+1. **Stuck states are invisible.** Cookie banners, CAPTCHAs, geo-blocks, login
+   walls — obvious to a human glancing at a screen, opaque in a tool log. The
+   agent loops on them before giving up.
+2. **Verification is unverifiable.** When the agent claims "the page rendered
+   correctly," the user has to take its word for it.
+3. **Frontend work is impossible to review live.** The user should be able to
+   *watch* the agent click around the UI it is building.
+4. **Page hand-off is impossible.** The user cannot say "here, *this* page" —
+   today they paste a URL into chat and hope the agent's fresh navigation
+   reaches the same state (login walls and session state usually break this).
+   With a shared browser the user opens the page themselves — logged in,
+   scrolled to the right spot — and the agent picks up *that* browser, cookies
+   and all.
 
-This gap matters in three concrete ways:
+Point 4 is the reason both open directions are first-class: agent-opens (show
+the user) and user-opens (show the agent).
 
-1. **Stuck states are invisible.** Cookie banners, CAPTCHAs, geo-blocks, login walls, A/B test variants the agent didn't expect — these are obvious to a human glancing at a screen and opaque from a tool log. The agent often loops on them for several phases before giving up.
-2. **Verification is unverifiable.** When the agent claims "the page rendered correctly" or "the form was submitted," the user has to take its word for it. There's no equivalent of "show me what you see."
-3. **Frontend work is impossible to review live.** When the agent is building a web UI (the cockpit-design use case), the user can pull the repo and run it locally — but that breaks the whole "agent does the work, I review it" loop. They should be able to *watch* the agent click around its own UI.
+## What changed since the first draft
 
-A shared browser window closes the gap. The cockpit gets a new component that shows the agent's live browser, and (in a second pass) lets the user take the wheel.
+The original version of this document assumed `src/tools/research/browser.py`
+launching Chromium with `--remote-debugging-port=9222`, reachable cross-pod.
+That architecture was removed on 2026-06-11
+(`docs/issues/remove_local_browser_fallback.md`,
+`docs/features/browser_workspace_executor.md`): the only browser today is a
+headless Chromium owned by the **`browser-exec` daemon inside the workspace**
+(container pod or VM), driven over SSH, with CDP confined to the workspace —
+no cross-pod CDP, no debugging port on the pod network. Port 9222 declarations
+in `container_provisioner.py` are vestigial and unreachable (Chrome binds CDP
+to `127.0.0.1`).
+
+Two more things changed:
+
+- **The Dynamic Canvas shipped** (Slices 0–3). The host surface for the shared
+  browser is the canvas `browser` source in sessions — already stubbed in
+  `cockpit/src/app/core/models/canvas.model.ts` (`BrowserCanvasSource`) and
+  reserved as Slice 5 in `dynamic_canvas.md` — not a new "Browser" tab in the
+  job detail view. The job view is a future extension.
+- **User-initiated open is promoted to first-class.** The first draft treated
+  the feature as observability (agent opens, user watches, user may take
+  over). The locked scope adds the reverse flow as a launch requirement: an
+  "Open browser" button in the canvas that needs no agent involvement.
+
+Everything in "Industry Context" below survives unchanged; the transport and
+broker sections are rewritten.
+
+## Decisions (locked 2026-07-20)
+
+| Question | Decision |
+|---|---|
+| Scope of first build | Full shared browser: view + user-drive + handoff in one feature, built in five landable steps |
+| Host surface | Dynamic Canvas `browser` source in sessions (persistent threads); job view later |
+| Which browser | The **same** workspace Chromium the agent's tools use (one browser, two drivers) — never a second instance |
+| Control arbitration | Explicit baton (single-controller lease). Visible holder, instant user takeover, agent *actions* refused while user drives, agent *reads* always allowed |
+| Baton authority | Lives in the `browser-exec` daemon, next to the browser — race-free, HA-replica-proof |
+| Cold start | "Open browser" always available on full-backend sessions; click auto-provisions workspace + spawns browser with staged progress. Lite backends: disabled with tooltip |
+| Transport | Orchestrator-brokered: cockpit ↔ new binary WS on the orchestrator ↔ pinned SSH `direct-tcpip` ↔ workspace **loopback** TCP listener. CDP never leaves the workspace |
+| Viewport | Fixed (daemon default, 1280×720 unless configured), letterbox-scaled in the cockpit; no live resize in v1 |
+| Rollout | Dark-shipped behind `canvas.sharedBrowser.enabled` (default off), dev profile on — same pattern as the live-app viewer |
 
 ## Industry Context
 
@@ -47,413 +110,411 @@ A shared browser window closes the gap. The cockpit gets a new component that sh
 |--------|---------|-----------|-------------|-------|
 | **Browserless** | Live view via CDP screencast | WebSocket (JPEG frames) | Yes — input events relayed via CDP | Their commercial "live URL" feature; the de-facto reference design |
 | **Steel.dev** | Session viewer with screencast | WebSocket | Yes | Open-source equivalent of Browserless live view |
-| **Selenium Grid + noVNC** | Headed Chromium in container with Xvfb + x11vnc + noVNC | WebSocket (VNC protocol) | Yes — VNC native input | Battle-tested but heavy: needs display server, headed browser, three extra processes |
-| **Kasm Workspaces** | Full-desktop streaming via KasmVNC | WebSocket (custom VNC fork) | Yes | Streams entire desktop, not just browser; overkill for our use case |
-| **Playwright Trace Viewer** | Post-hoc replay from `.trace.zip` files | None (offline) | No — replay only | Great for debugging, useless for live observation |
-| **Chrome DevTools Remote** | CDP frontend hosted at `chrome://inspect` | Direct CDP over WebSocket | Yes (full DevTools) | What CDP was designed for, but the UX is "DevTools," not "shared window" |
-| **VNC-only (raw)** | Direct VNC client to a headed browser container | TCP (VNC) | Yes | Not browser-native, requires VNC client outside the cockpit |
-| **Cursor / Devin** | Static screenshots in chat | HTTP (image upload) | No | Snapshots embedded in conversation; not live |
-| **OpenAI Operator** | Built-in browser viewer in ChatGPT UI | Proprietary streaming | "Take control" handoff | Closed source; the UX is the gold standard for this category |
-| **Tandem Browser** | Shared Electron browser, agent gets own tab/workspace | MCP / local HTTP | Yes — separation, not mutual exclusion | Contention solved by tab isolation, not pause/resume |
-| **Browserbase (rrweb → CDP)** | Originally DOM-mutation replay (rrweb); rebuilt on CDP | WebSocket | N/A (recording) | **Switched away from rrweb** because it silently mis-rendered iframes, shadow DOM, canvas, and video — "looked correct while lying about what actually happened" |
-| **rrweb** | Client-side DOM mutation capture | JSON events | Replay only | Cheap to store, but verification-hostile: replays can drift from reality |
+| **Selenium Grid + noVNC** | Headed Chromium with Xvfb + x11vnc + noVNC | WebSocket (VNC) | Yes | Battle-tested but heavy: display server + three extra processes |
+| **Kasm Workspaces** | Full-desktop streaming via KasmVNC | WebSocket (custom VNC fork) | Yes | Streams the entire desktop; overkill |
+| **Playwright Trace Viewer** | Post-hoc replay from trace files | None (offline) | No | Debugging, not live observation |
+| **Cursor / Devin** | Static screenshots in chat | HTTP | No | Today's SRW pattern too |
+| **OpenAI Operator** | Built-in browser viewer | Proprietary streaming | "Take control" handoff | The UX gold standard for this category |
+| **Tandem Browser** | Shared browser, agent gets own tab | MCP / local HTTP | Yes — tab isolation, not mutual exclusion | Contention solved by separation |
+| **Browserbase (rrweb → CDP)** | DOM-replay rebuilt on CDP screencast | WebSocket | N/A (recording) | **Abandoned rrweb** — replays silently diverged from reality on iframes/shadow DOM/canvas/video |
 
 ### Key Takeaways
 
-1. **CDP screencast is the modern default.** Browserless, Steel.dev, Vercel Labs `agent-browser`, and Browserbase all use it. It's native to Chromium, requires no extra processes, works with headless mode, and is designed exactly for this purpose. `Page.startScreencast` emits base64 JPEG (or PNG) frames over the existing CDP WebSocket; `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` handle input relay.
+1. **CDP screencast is the modern default.** Native to Chromium, headless-
+   compatible, zero extra processes. `Page.startScreencast` emits base64 JPEG
+   frames; `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` handle input.
+2. **rrweb is disqualified** for a verification use case — replays can look
+   fine while lying about what rendered (Browserbase's migration story).
+3. **VNC is the legacy path** — needs Xvfb + x11vnc + websockify per
+   workspace.
+4. **CDP screencast has mandatory built-in backpressure.** Every frame must be
+   acknowledged with `Page.screencastFrameAck` before the next arrives — the
+   source can never outrun the consumer that acks. (Our design acks after
+   handing the frame to bounded per-viewer queues; see Piece 1.)
+5. **The hard part is not the viewer — it's the handoff.** Mutual exclusion
+   (our baton) or tab isolation (Tandem). For intervention use cases (CAPTCHA
+   rescue, "fix this form"), mutual exclusion on the agent's active page is
+   the right default; tab isolation is a possible future collaborative mode.
+6. **Streaming bandwidth is fine at our scale.** Quality 60, ~5 fps, 1280×720
+   is roughly 50–200 KB/s per viewer during active page changes, near zero on
+   a static page.
+7. **In-process CDP access already exists.** browser-use's `BrowserSession`
+   exposes its own CDP client (`session.cdp_client` /
+   `get_or_create_cdp_session(...)`), and `browser-exec` already round-trips
+   CDP in-process for `take_screenshot` (`Page.captureScreenshot`). Screencast
+   is the streaming sibling of proven code. (The first draft's takeaway —
+   "CDP is enabled on :9222" — is obsolete; see "What changed".)
 
-2. **rrweb is disqualified for our use case.** DOM-mutation capture is cheaper to store and transports as JSON, but Browserbase's rebuild story is definitive: rrweb can produce replays that look fine but don't match what the browser actually rendered — nested iframes, shadow DOM, canvas, and video push it past its limits. For a feature whose entire purpose is "verify what the agent actually saw," that failure mode is disqualifying.
+## Architecture
 
-3. **VNC is the legacy path.** It works, but it requires running a headed browser inside Xvfb with x11vnc and noVNC alongside — three extra processes per workspace. The upside is that it captures the entire viewport including OS-level dialogs (file pickers, native print prompts).
-
-4. **CDP screencast has mandatory built-in backpressure.** Every frame must be acknowledged with `Page.screencastFrameAck` before the next is sent. We don't need to design our own flow control — if the client lags, frames naturally stop arriving. Our broker must ack correctly (after the frame is sent to the cockpit, not before).
-
-5. **Direct CDP beats Playwright-relayed CDP.** browser-use documented significant latency wins by connecting to Chromium CDP directly rather than routing through Playwright's Node.js relay, which adds a second network hop. Our broker should open its own CDP WebSocket, not borrow Playwright's session.
-
-6. **The hard part is not the viewer — it's the handoff.** Operator's "take control" UX is hard to copy. The agent and user fighting over the same browser tab causes race conditions. Systems solve this two ways: **mutual exclusion** (pause the agent while the user drives) or **tab isolation** (give the agent and user separate tabs and never contend). Tandem Browser uses the latter.
-
-7. **Streaming bandwidth is the limiting factor at scale, not the design challenge for a single user.** CDP screencast at quality 60, 5 fps, 1280×720 is roughly 50–200 KB/s — entirely fine for one user watching one agent. The cockpit doesn't need to be optimized for hundreds of concurrent viewers.
-
-8. **CDP is already enabled in our stack.** `src/tools/research/browser.py:90-101` launches Chromium with `--remote-debugging-port=9222` in remote workspaces. We don't need to add a screencast-capable browser — we already have one.
-
-## Design
-
-### Approach: CDP Screencast (Primary)
-
-The agent's browser is already running with CDP enabled on port 9222 inside the workspace container. The cockpit gets a new component that:
-
-1. Asks the orchestrator to open a streaming WebSocket to the agent's browser
-2. Renders the JPEG frames it receives onto a `<canvas>`
-3. (Phase 2) Captures user input on the canvas and relays it back
-
-The orchestrator proxies the connection — it terminates the cockpit's WebSocket, opens its own connection to the agent pod's CDP port, and brokers messages between them. This keeps the existing auth model (Keycloak token at the cockpit ↔ orchestrator boundary, MCP/internal auth at the orchestrator ↔ agent boundary) and avoids exposing CDP to the public internet.
-
-```
-Cockpit (Angular)                    Orchestrator                    Agent Workspace
-┌────────────────────┐               ┌────────────────┐              ┌──────────────┐
-│ SharedBrowser      │  WebSocket    │ /api/jobs/{id}/│  WebSocket   │ Chromium     │
-│ Component          │ ◄───────────► │ browser/stream │ ◄──────────► │ CDP :9222    │
-│  - <canvas>        │  (auth: KC)   │                │  (internal)  │              │
-│  - input handlers  │               │ Frame router   │              │ Page.start   │
-│  - control toggle  │               │ Auth + ratelmt │              │ Screencast   │
-└────────────────────┘               └────────────────┘              └──────────────┘
-```
-
-### Why CDP Screencast (vs noVNC and rrweb)
-
-| Concern | CDP Screencast | noVNC | rrweb |
-|---------|---------------|-------|-------|
-| Already enabled in our workspace? | Yes (browser.py:90) | No — needs Xvfb + x11vnc + noVNC | No — needs client-side injection |
-| Extra processes per workspace | 0 | 3 (Xvfb, x11vnc, websockify) | 0 |
-| Headless-compatible | Yes | No — requires headed browser | Yes |
-| Transport | JPEG/PNG over WebSocket | VNC protocol over WebSocket | JSON DOM events over WebSocket |
-| Input relay | CDP `Input.dispatch*Event` | Native VNC input | Custom event re-dispatch |
-| **Fidelity to what the browser rendered** | **Pixel-perfect** | **Pixel-perfect** | **Unreliable** — nested iframes, shadow DOM, canvas, video can silently diverge from reality |
-| File pickers / native dialogs | Not visible | Visible | Not visible |
-| Multi-tab support | Native (one WS per target) | Single display, all tabs visible | Per-tab |
-| Built-in backpressure | Yes (`screencastFrameAck`) | Yes (VNC framebuffer updates) | No — must implement |
-| Implementation cost | Cockpit component + orchestrator proxy | All of the above + workspace image rebuild + headed mode | Cockpit component + rrweb agent injection |
-
-**Decision: CDP screencast.** rrweb is cheaper but cannot be trusted for a verification use case — Browserbase's migration story is the cautionary tale. noVNC works but requires standing up a display server and headed browser per workspace. CDP screencast is already wired up, natively backpressured, and pixel-accurate.
-
-The one thing noVNC offers that screencast doesn't is OS-level dialog visibility (file pickers, native print). If this becomes a problem, a future "headed mode under Xvfb, still streamed via CDP screencast" hybrid is viable — see "What We Lose By Going Headless" below.
-
-### Component: `SharedBrowserComponent` (Cockpit)
-
-A new standalone Angular component, lazy-loaded into the job detail view as a tab next to "Logs" / "Files" / "IDE":
+One Chromium, two drivers, one new pipe:
 
 ```
-cockpit/src/app/features/job/shared-browser/
-├── shared-browser.component.ts
-├── shared-browser.component.html
-├── shared-browser.component.scss
-└── shared-browser.service.ts   # WebSocket client + frame decode
+┌─ workspace pod/VM ─────────────────────────────────────────┐
+│  Chromium ←— in-process CDP —→ browser-exec daemon         │
+│    • Page.startScreencast → JPEG frames                    │
+│    • Input.dispatch*Event ← user input                     │
+│    • BATON (single-controller lease) lives here            │
+│    • browser generation identity lives here                │
+│    └─ NEW stream listener on 127.0.0.1:<port> only         │
+└──────────────────────┬─────────────────────────────────────┘
+              SSH direct-tcpip (existing pinned pool —
+              same pattern as the canvas live-app gateway)
+┌──────────────────────┴─────────────────────────────────────┐
+│  orchestrator: stream broker                               │
+│    • WS  /api/persistent/threads/{tid}/browser/stream      │
+│    • POST /api/persistent/threads/{tid}/browser/open       │
+│    • stateless byte relay + auth + activity marking        │
+└──────────────────────┬─────────────────────────────────────┘
+                cockpit binary WebSocket (thread auth)
+┌──────────────────────┴─────────────────────────────────────┐
+│  cockpit: canvas 'browser' renderer (fills existing stub)  │
+│    • <canvas> frame painter • URL bar + back/reload        │
+│    • baton pill + toggle    • reconnect / cold-start UI    │
+└────────────────────────────────────────────────────────────┘
 ```
 
-**State (signals):**
-- `connectionState: 'idle' | 'connecting' | 'connected' | 'error'`
-- `controlMode: 'observe' | 'control'`
-- `currentUrl: string | null`
-- `viewportSize: { width, height }`
-- `frameRate: number` (for stats display)
+No new pod-network ports, no new services, no new database tables. The only
+mutable state outside existing systems (canvas presentation state, workspace
+bindings) is the baton + generation, held by the daemon that owns the browser.
 
-**UI:**
-- Header: current URL (read-only), "Connect" / "Disconnect" button, "Take control" toggle, FPS indicator
-- Body: `<canvas>` element sized to the viewport, with the latest frame rendered
-- Footer: brief status text (e.g., "Observing — agent has control" / "You have control — agent paused")
+### Piece 1 — `browser-exec` streaming mode
 
-**Frame rendering:** Each incoming JPEG frame is decoded via `createImageBitmap()` and drawn to the canvas. Skip frames if the previous bitmap hasn't finished decoding to avoid backlog under slow networks.
+`docker/browser-exec` today is a strict one-JSON-request-one-response daemon
+on a unix socket, with every action serialized under one asyncio lock. It
+gains a streaming side-channel:
 
-### Orchestrator Endpoint
+**Loopback stream listener.** A TCP listener bound to `127.0.0.1:<port>`
+(default 38801, env `BROWSER_EXEC_STREAM_PORT`). Loopback-only means it is
+covered by the existing sshd `PermitOpen 127.0.0.1:*` policy and never
+appears on the pod network — the same posture as canvas live-app ports. The
+existing unix-socket action path is unchanged; agent tools are unaffected.
 
-```
-GET /api/jobs/{job_id}/browser/stream    (WebSocket upgrade)
-```
+**Framing protocol** (both directions on the TCP stream): `[4-byte big-endian
+length][1-byte type][payload]`. Types:
 
-**Auth:** Bearer token (Keycloak) or MCP token, same as all other orchestrator endpoints. The orchestrator validates that the requesting user owns the job (or is a project member).
+| Type | Direction | Payload | Purpose |
+|---|---|---|---|
+| `HELLO` | in | JSON `{token, min_protocol}` | First message. Token authenticates the broker (see below); daemon replies `STATE`. Wrong/missing token → connection closed |
+| `FRAME` | out | `[2-byte BE header length][header JSON {generation, w, h, ts}][raw JPEG bytes]` | One screencast frame |
+| `STATE` | out | JSON `{generation, url, title, loading, baton, viewport}` | Sent on connect and on every change (navigation, title, baton flip) |
+| `INPUT` | in | JSON mouse/key/wheel event (CDP-shaped) | Honored only while `baton == "user"` |
+| `CONTROL` | in | JSON `{op: "take_baton" \| "release_baton" \| "navigate" \| "back" \| "reload", ...}` | Viewer commands |
+| `ERROR` | out | JSON `{code, message}` | e.g. `navigation_rejected`, `browser_gone` |
 
-**Lifecycle:**
+**Stream lifecycle.** The screencast CDP session
+(`session.get_or_create_cdp_session` → `Page.startScreencast`, JPEG, quality/
+size from env, see "Quality tuning") runs as an independent asyncio task that
+**never takes the daemon's action lock** — agent tool calls and streaming
+proceed concurrently (multiple CDP sessions on one target are supported; the
+screenshot path proves in-process CDP works). Each frame is handed to a
+**bounded per-viewer send queue** (drop-oldest for laggards, so one slow
+viewer never stalls the others), and `screencastFrameAck` is sent after that
+hand-off — CDP's backpressure therefore caps frame production at what the
+daemon itself can process, while per-viewer drops absorb slow links. With
+**zero viewers connected the screencast is stopped** (no CPU/bandwidth spent
+on an unwatched browser). If the active CDP target changes (navigation,
+popup), the screencast re-attaches to the new active target.
 
-1. Cockpit connects with `Sec-WebSocket-Protocol: srw-browser-stream-v1`
-2. Orchestrator validates auth + job ownership
-3. Orchestrator looks up the agent pod IP from `agents.last_known_ip` (already tracked for heartbeats)
-4. Orchestrator opens a WebSocket to the agent's browser broker endpoint (see below)
-5. Orchestrator sends a "start" message: `{op: 'start', quality: 60, max_fps: 5}`
-6. Frames flow agent → orchestrator → cockpit as binary WebSocket messages
-7. Input events flow cockpit → orchestrator → agent as JSON messages
-8. On disconnect, orchestrator sends a "stop" message and tears down both WebSockets
+**Hello token.** The daemon mints a random token per browser generation and
+returns it (with the generation and port) from a new `stream_info` action on
+the existing unix-socket protocol; the orchestrator obtains it by running
+`browser-exec stream_info` over the authenticated SSH channel. Defense-in-
+depth on an already-loopback listener, and it doubles as the generation
+check.
 
-**Why proxy through the orchestrator instead of direct connection?**
+**Browser generation.** A UUID minted whenever the daemon starts (or
+restarts) its Chromium. It appears in `STATE`/`FRAME` and in the canvas
+source pointer. Per the `dynamic_canvas.md` Slice-5 contract, a stored
+pointer must never silently follow a *different* browser: if the generation
+behind a canvas pointer is gone (daemon restarted, workspace re-provisioned),
+viewers get an explicit **ended** state with a one-click restart that mints a
+new generation and updates the canvas source — reconnects to the *same*
+generation are silent, attaching to a *new* one is always an explicit user
+action. The daemon keeps using its existing dedicated profile dir
+(`user_data_dir`), satisfying the dedicated-profile requirement.
 
-- **Auth.** The agent pod has no Keycloak integration; the orchestrator does. Putting auth at the agent boundary would mean reimplementing it.
-- **Network.** Agent pods are on the cluster internal network. Direct cockpit-to-pod connections require either an Ingress per pod (operationally painful) or a tunnel (which is what the orchestrator already is).
-- **Lifecycle coupling.** The orchestrator already knows when an agent pod is created, suspended, restored, or destroyed. It can cleanly close the stream on lifecycle transitions.
-- **Rate limiting and audit.** Centralized policy lives at the orchestrator, not duplicated across agents.
+**The baton (single-controller lease).** Daemon-held state:
+`baton ∈ {agent, user}`.
 
-### Agent-Side Broker
+- Initial holder: whoever opened the browser — `user` when the user's `open`
+  started it, `agent` when the agent's first tool call did.
+- `CONTROL take_baton` flips to `user` instantly (no agent consent — an
+  in-flight agent action completes or fails naturally; everything after is
+  refused). `release_baton` flips back to `agent`.
+- While `baton == user`: **mutating** actions arriving on the unix-socket
+  action path (`navigate`, `click`, `type`, `select`, `scroll`, `back`,
+  `close`) return a structured refusal
+  `{"error": "user_is_driving", "url": <current>, "message": ...}` instead of
+  executing. **Read-only** actions (`snapshot`, `screenshot`, state queries)
+  always succeed — the agent can look at the page the user is showing it.
+- While `baton == agent`: `INPUT` messages are dropped (the viewer UI doesn't
+  send them; dropping guards against races).
+- **Auto-release:** if no viewer connection exists for 30 s while
+  `baton == user`, the baton reverts to `agent` — a closed laptop can never
+  wedge the agent. (A 30 s grace, not instant, so the cockpit's reconnect
+  backoff and token re-mint don't cause spurious flips.)
+- Baton changes are broadcast in `STATE` so all viewers agree, and are
+  visible to the agent via the refusal payload and a `baton` field added to
+  read-action responses.
 
-A new minimal endpoint on the agent's existing API server (`agent.py`, port 8080):
+**User navigation safety.** `CONTROL navigate` runs the **same URL
+validation** the agent's `browser_navigate` applies
+(`src/tools/research/browser_security.py` policy, enforced daemon-side).
+The browser runs inside the workspace's network identity; user-driving must
+not become a side door around the SSRF/egress policy the agent path already
+enforces. Rejected navigations return `ERROR navigation_rejected` and the
+URL bar shows why.
 
-```
-GET /browser/stream    (WebSocket upgrade, internal auth only)
-```
+### Piece 2 — Orchestrator broker
 
-The broker is a thin adapter between the orchestrator's protocol and Chromium's CDP:
+Two endpoints on the orchestrator (new module, e.g.
+`orchestrator/routers/shared_browser.py` +
+`orchestrator/services/browser_stream_broker.py`), both gated on
+`CANVAS_SHARED_BROWSER_ENABLED` and standard thread ownership auth:
 
-```python
-# Pseudo-code in src/api/browser_stream.py
-import os, base64, json, asyncio
+**`POST /api/persistent/threads/{tid}/browser/open`** — the one recovery and
+cold-start path (idempotent):
 
-# Configurable at the workspace level — mirrors vercel-labs/agent-browser naming
-STREAM_FORMAT = os.getenv("SRW_BROWSER_STREAM_FORMAT", "jpeg")
-STREAM_QUALITY = int(os.getenv("SRW_BROWSER_STREAM_QUALITY", "60"))
-STREAM_MAX_WIDTH = int(os.getenv("SRW_BROWSER_STREAM_MAX_WIDTH", "1280"))
-STREAM_MAX_HEIGHT = int(os.getenv("SRW_BROWSER_STREAM_MAX_HEIGHT", "720"))
-STREAM_EVERY_NTH = int(os.getenv("SRW_BROWSER_STREAM_EVERY_NTH", "2"))  # ~5fps
+1. Reject lite backends (`virtual`/`none`) with a typed capability error.
+2. Ensure the session workspace exists (`ensure_session_workspace`) —
+   the auto-start decision.
+3. Over SSH: spawn/ping the `browser-exec` daemon, ensure the stream
+   listener is up, read the hello token, and if no browser generation exists
+   yet, start one (about:blank, or an optional `{"url": ...}` request field —
+   validated the same as any navigation), passing the **initial baton
+   holder** (`user` for the cockpit button, `agent` for `set_canvas`) with
+   the start command.
+4. Set the canvas presentation source to
+   `{type: "browser", generation: <uuid>}` through the **existing canvas
+   control plane**, so the pane opens/switches via the normal
+   invalidation → reconcile flow, the standard canvas tool-card/history
+   behavior applies, and `clear_canvas` works unmodified.
+5. Return `{generation, viewport}`.
 
-async def browser_stream(websocket):
-    # Connect directly to Chromium CDP — NOT through Playwright's CDPSession.
-    # browser-use documented meaningful latency wins by avoiding the Playwright
-    # Node relay for high-frequency CDP traffic.
-    target_id = await find_active_target_id()
-    cdp = await connect_cdp(f"ws://localhost:9222/devtools/page/{target_id}")
+Called by the cockpit button (initial holder → `user`) and by the agent's
+`set_canvas(source_type="browser")` server-side handling (initial holder →
+`agent`). Also the fall-through target when a reconnecting viewer discovers
+the generation is gone and the user clicks restart.
 
-    await cdp.send("Page.startScreencast", {
-        "format": STREAM_FORMAT,
-        "quality": STREAM_QUALITY,
-        "maxWidth": STREAM_MAX_WIDTH,
-        "maxHeight": STREAM_MAX_HEIGHT,
-        "everyNthFrame": STREAM_EVERY_NTH,
-    })
+**`GET /api/persistent/threads/{tid}/browser/stream`** (WebSocket) — the
+relay:
 
-    async def cdp_to_client():
-        async for msg in cdp:
-            if msg.method == "Page.screencastFrame":
-                # Send frame first, then ack. CDP won't send the next frame
-                # until it receives the ack — this is the protocol's built-in
-                # backpressure. If the cockpit WebSocket is slow, frames stop
-                # arriving naturally; no buffer needed on our side.
-                payload = {
-                    "type": "frame",
-                    "data": msg.params.data,  # already base64
-                    "metadata": msg.params.metadata,  # deviceWidth, deviceHeight, scale, offsetTop
-                }
-                await websocket.send_text(json.dumps(payload))
-                await cdp.send("Page.screencastFrameAck", {
-                    "sessionId": msg.params.sessionId,
-                })
-            elif msg.method == "Page.frameNavigated":
-                # Active URL changed — tell the cockpit for the header display
-                await websocket.send_text(json.dumps({
-                    "type": "url_changed",
-                    "url": msg.params.frame.url,
-                }))
+1. Authenticate the upgrade the way the existing orchestrator WS proxy does
+   (cookie-resolved user + thread ownership, `ide_proxy_ws` pattern). The
+   cockpit applies its standard backoff-reconnect on drops; distinct 44xx
+   close codes signal disabled/unauthenticated/ended-generation states.
+2. Open `PinnedSSHTransportPool.open_loopback_connection(workspace,
+   BROWSER_EXEC_STREAM_PORT)` — the exact mechanism the canvas live-app
+   gateway uses for long-lived byte streaming, host-key-pinned and
+   generation-checked, working identically for container pods and VMs.
+3. Send `HELLO`, then relay both directions. WS messages are binary and
+   carry `[1-byte type][payload]` — the TCP framing minus the length prefix
+   (WebSocket messages are already delimited). The broker strips/adds the
+   length prefix and otherwise never parses payloads — a stateless relay
+   with auth.
+4. While at least one stream WS is attached, periodically mark **workspace
+   activity** (the same marker the idle-sweeper reads) so watching a page
+   cannot get the workspace reaped mid-view.
 
-    async def client_to_cdp():
-        async for raw in websocket:
-            msg = json.loads(raw)
-            if msg["type"] == "input":
-                await relay_input_event(cdp, msg)  # Phase 2 only
-            elif msg["type"] == "stop":
-                break
+HA note: each viewer WS is served by whichever replica accepted it; each
+opens its own SSH channel; the daemon fans out. No cross-replica coordination
+— the shared state (baton, generation) lives daemon-side.
 
-    try:
-        await asyncio.gather(cdp_to_client(), client_to_cdp())
-    finally:
-        await cdp.send("Page.stopScreencast")
-        await cdp.close()
-```
+The IDE proxy (`ide_proxy_ws`) is the in-repo proof that the orchestrator can
+bridge binary WebSockets; its transport (direct pod-IP, fails on VMs) is
+deliberately **not** copied — the SSH pool is the loopback-preserving,
+VM-compatible path.
 
-**Frame metadata matters.** Vercel Labs `agent-browser` issue #632 documents a real bug: when CDP downscales a frame to fit `maxWidth`/`maxHeight`, the frame metadata still reports the original `deviceWidth`/`deviceHeight`. If the cockpit sizes its canvas backing store to the metadata dimensions and draws the downscaled JPEG into it, the result is blurry — especially on portrait/HiDPI viewports. We forward both the raw bytes and the full metadata, and the cockpit is responsible for reading the actual image dimensions from the decoded bitmap, not trusting the metadata blindly.
+### Piece 3 — Cockpit renderer
 
-**Target selection:** The agent maintains the "current" browser target (the page Playwright is driving). The broker connects to that target. When the agent navigates or opens a new tab via `browser_navigate`, the active target may change — the broker should resubscribe.
+Fills the already-stubbed `browser` canvas source
+(`BrowserCanvasSource` in `canvas.model.ts`, currently falling through to
+`unsupported`):
 
-**Concurrency note:** Multiple CDP clients can attach to the same target simultaneously. Playwright keeps its own CDP session for driving the browser; the screencast session is independent and doesn't interfere. This is specifically why we can have a screencast subscriber without pausing the agent's tool calls in Phase 1.
+- `canvas-rendering.ts` `selectCanvasRenderer()`: `browser` source +
+  `capabilities.can_stream_browser === true` → new `'browser'` renderer
+  (fail-closed otherwise, like the `app` renderer).
+- New `CanvasBrowserRendererComponent` +  pane-local
+  `CanvasBrowserController` (sibling of `CanvasViewerController`): owns the
+  stream WS, decodes `FRAME` payloads via `createImageBitmap()`, paints onto
+  a `<canvas>` sized to the fixed viewport and letterbox-scaled with CSS.
+  Skip-if-still-decoding to avoid backlog.
+- **Browser toolbar** (headless Chromium has no chrome, so we render our
+  own): URL bar (shows `STATE.url`, editable → `CONTROL navigate`),
+  back/reload buttons, page title, loading indicator, and the **baton pill**
+  — "You're driving" / "Agent is driving" with a single Take/Release toggle.
+- **Input capture** while holding the baton: mouse down/up/move (move
+  throttled), wheel, keydown/keyup with modifier state — translated to
+  CDP-shaped `INPUT` messages through a unit-tested `coordinateMapper` (see
+  below). Ignored/not sent while the agent drives.
+- **"Open browser" affordances**: a button in the canvas empty state and an
+  always-present toolbar icon (visible when the capability allows). Clicking
+  while other content is staged switches the canvas source (standard
+  single-main-canvas semantics). Staged cold-start progress: "Starting
+  workspace… → Starting browser… → connected". On lite backends the button is
+  disabled with an explanatory tooltip. Failure → explicit error state with
+  retry.
+- **Reconnect**: WS drop → "Reconnecting…" overlay with backoff; if the
+  daemon reports/implies a dead generation → **ended** state with a restart
+  button (→ `open`). The popout window and main tab may both attach (frames
+  fan out); input flows only from the baton holder's user, which is the same
+  user in v1.
+- **Hidden-pane pause**: the chat page keeps the canvas mounted when hidden
+  behind the settings pane; the renderer detaches its stream while not
+  visible (per the `dynamic_canvas.md` host contract that Slice 5 pauses
+  host-owned streaming) and re-attaches on reveal — combined with the
+  daemon's zero-viewer stop, an unwatched browser costs nothing.
+- i18n: en + de strings, matching the existing canvas translation coverage.
 
-### Phase 1: View-Only
+**Coordinate mapping** (the most error-prone part; unchanged from the first
+draft, still fully applicable): `Input.dispatchMouseEvent` expects CSS pixels
+relative to the browser viewport. The cockpit canvas renders at arbitrary
+display size while the viewport is fixed (e.g. 1280×720) and the JPEG may be
+CDP-downscaled. Every event maps
+`cdp_x = canvas_x * (viewport_css_width / canvas_display_width)` (same for
+Y); the canvas backing store is sized from the **decoded bitmap**, never from
+frame metadata (vercel-labs/agent-browser #632: metadata reports
+pre-downscale dimensions — trusting it yields blur and offset clicks).
+Keyboard needs explicit modifier-state tracking. One `coordinateMapper()`
+helper, unit-tested across viewport/display ratios.
 
-The first deliverable is **observation only** — no input relay. This unblocks 80% of the value (the user can see what the agent sees) without the complexity of the user/agent control handoff.
+### Piece 4 — Agent surface (deliberately tiny)
 
-**Scope:**
-- Cockpit component renders frames
-- Orchestrator proxy
-- Agent broker streams frames
-- "Take control" button is present but disabled, with a tooltip explaining it's coming
+- `set_canvas` advertises `source_type: "browser"` when the capability holds
+  (non-lite backend + feature flag), resolving `browser_id: "current"` at
+  tool-call time to the concrete generation per the Slice-5 contract. The
+  server-side handling shares the `open` path.
+- Browser action tools surface the daemon's `user_is_driving` refusal as a
+  clear tool result ("The user is currently driving the shared browser
+  (currently on <url>). Ask them to release control, or work with read-only
+  snapshots.") — prompt-visible, no schema change.
+- No push notification to the agent on baton flips in v1; the agent learns
+  from refusals, read-response `baton` fields, or the user's message. (An
+  agent-visible baton event and agent-initiated "please take over and solve
+  this CAPTCHA" requests are the designed Phase-3 follow-up; the `CONTROL`
+  vocabulary leaves room via an `initiated_by` field.)
 
-**Out of scope for Phase 1:** input relay, agent pause/resume coordination, multi-tab switching.
+The hand-off needs no machinery beyond this: the user browses to a page,
+optionally releases the baton, and tells the agent what to do; the agent's
+next `browser_snapshot` reads the same Chromium — same DOM, same cookies,
+same login state.
 
-### Phase 2: Take Control
+## Quality / bandwidth tuning
 
-In Phase 2, the user can click a "Take control" button to start sending input events. This requires solving the user/agent contention problem.
-
-**Control handoff protocol:**
-
-1. User clicks "Take control" → cockpit sends `{op: 'request_control'}` to orchestrator
-2. Orchestrator calls `POST /api/jobs/{id}/browser/pause` on the agent
-3. Agent pauses all browser tool calls (the next browser tool invocation blocks until the user releases control)
-4. Orchestrator confirms control granted; cockpit enables input handlers
-5. User interacts → cockpit sends `{op: 'input', type: 'mouse'|'key'|'wheel', ...}` events
-6. Orchestrator relays to agent broker, which forwards to CDP via `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent`
-7. User clicks "Release control" → cockpit sends `{op: 'release_control'}`
-8. Orchestrator calls `POST /api/jobs/{id}/browser/resume`
-9. Agent's blocked browser tool call (if any) returns and execution continues
-
-**Why pause the agent during user control?**
-
-Without pausing, the agent might call `browser_click(selector="#submit")` while the user is mid-form-fill. The two streams of CDP commands collide and produce inconsistent state. The cleanest model is mutual exclusion: either the agent or the user is driving, never both.
-
-**Alternative model — tab isolation (Tandem Browser pattern):** Rather than pause/resume, a different solution is to give the agent and the user their own browser tabs and let them work in parallel on separate targets. The user "takes control" of a specific tab, not the whole browser; the agent keeps driving its own tab uninterrupted. This avoids contention entirely, but it only helps when the user's goal is to work *alongside* the agent — not when they want to intervene in what the agent is currently doing (e.g., solve a CAPTCHA on the agent's active tab). For our primary use cases (observation, CAPTCHA rescue, verification), mutual exclusion is the better default, with tab isolation reserved for a future collaborative mode once the basics work.
-
-**Coordinate mapping.** This is the single most error-prone part of Phase 2 and deserves its own attention:
-
-- `Input.dispatchMouseEvent` expects coordinates in **CSS pixels relative to the viewport**, not device pixels, not image pixels.
-- The cockpit canvas may be rendered at an arbitrary size (e.g., 800px wide) while the actual browser viewport is 1280 CSS px wide and the streamed frame was downscaled to fit `maxWidth`.
-- Every click event must be mapped: `cdp_x = canvas_x * (viewport_css_width / canvas_display_width)`, and the same for Y.
-- `deviceScaleFactor` (from the frame metadata) adds another layer if we ever support HiDPI passthrough — but for the initial version we can assume `deviceScaleFactor=1` at the CDP level and let the cockpit handle any visual HiDPI rendering on its end.
-- Keyboard events are simpler since they carry key codes, not coordinates — but watch out for modifier key state synchronization (the cockpit must track Shift/Ctrl/Alt/Meta state and include it in every event).
-
-A `coordinateMapper(canvasEl, frameMetadata)` helper in `shared-browser.service.ts` centralizes this logic so the component never touches raw coordinates.
-
-**Audit:** When the user takes control, the orchestrator writes a record to MongoDB audit trail (`agent_audit` collection): `{event: 'user_browser_control', job_id, user_id, started_at, ended_at, action_count}`. Agents reading their own audit trail will see "user took control of the browser for 4 minutes between 14:02 and 14:06" and can factor that into their reasoning.
-
-### Phase 3 (Future): Control Hints From Agent
-
-The most powerful pattern is the agent *asking* for help:
-
-```
-agent: "I'm hitting a CAPTCHA on this page. Could you solve it for me?"
-       [calls request_user_browser_control(reason="CAPTCHA on login page")]
-       → cockpit shows a notification + auto-opens the shared browser tab
-       → user solves CAPTCHA, releases control
-       → agent continues
-```
-
-This mirrors the `notify_user` / `ask_user` pattern from `notify_user_tool.md` and `email_and_mobile.md`. It's the most useful version of this feature, but it depends on Phase 2 being in place.
-
-Out of scope for this design doc — flagged here so the protocol in Phase 2 leaves room for it (specifically: the `request_control` message needs to support an `initiated_by: 'user' | 'agent'` field).
-
-### Quality / Bandwidth Tuning
-
-CDP screencast parameters are configurable per deployment via environment variables (matching the `vercel-labs/agent-browser` convention):
+Consumed by `browser-exec` (env on the workspace, settable via chart):
 
 | Env var | Default | Rationale |
 |---------|---------|-----------|
-| `SRW_BROWSER_STREAM_FORMAT` | `jpeg` | PNG is lossless but 3–5× larger. Browserbase uses PNG for their recording pipeline and re-encodes to H.264 asynchronously — overkill for live view. JPEG is universally supported and fast |
-| `SRW_BROWSER_STREAM_QUALITY` | 60 | Sweet spot for text legibility vs bandwidth |
-| `SRW_BROWSER_STREAM_MAX_WIDTH` | 1280 | Matches the cockpit's typical browser viewport |
-| `SRW_BROWSER_STREAM_MAX_HEIGHT` | 720 | 16:9 |
-| `SRW_BROWSER_STREAM_EVERY_NTH` | 2 | ~5 fps if Chromium renders at 10 fps; smooth enough for observation |
+| `BROWSER_EXEC_STREAM_PORT` | 38801 | Loopback-only listener port |
+| `BROWSER_EXEC_STREAM_FORMAT` | `jpeg` | PNG is 3–5× larger for no live-view benefit |
+| `BROWSER_EXEC_STREAM_QUALITY` | 60 | Text legibility vs bandwidth sweet spot |
+| `BROWSER_EXEC_STREAM_MAX_WIDTH` | 1280 | Matches the fixed viewport |
+| `BROWSER_EXEC_STREAM_MAX_HEIGHT` | 720 | 16:9 |
+| `BROWSER_EXEC_STREAM_EVERY_NTH` | 2 | ~5 fps; smooth enough for observation |
 
-The cockpit may also override via query string on the WebSocket URL (e.g., `?quality=80&maxWidth=1600`), so a user on a fast connection can negotiate higher quality or drop quality on a slow one. No need for runtime adaptive bitrate in v1.
+Estimated bandwidth at defaults: 50–200 KB/s per viewer during active page
+changes, near zero on a static page (screencast only emits on change).
+Configurable because hard-coded caps are exactly how agent-browser #632
+produced unfixable blur on portrait/HiDPI viewports.
 
-**Why env vars over hard-coding:** issue #632 in `vercel-labs/agent-browser` is the cautionary tale — their hard-coded 720p cap forced severe downscaling on portrait/HiDPI viewports, producing a blurry stream with no way for users to fix it. Configurability is cheap up-front and avoids that class of bug entirely.
+## What we lose by going headless
 
-**Estimated bandwidth at defaults:** 50–200 KB/s during active page changes, near zero on a static page (screencast only emits frames when the viewport changes).
+CDP screencast captures the rendered viewport only — not native file pickers,
+print dialogs, Chromium-level auth/certificate prompts, WebAuthn/OS dialogs,
+or the built-in PDF viewer surface. For scripted agent flows this is mostly
+fine; the known gaps are PDF-heavy pages (workaround: download instead of
+view) and auth challenges that escape to native UI. Escape hatch if evidence
+demands it: headed Chromium under Xvfb **still transported via CDP
+screencast** (one extra process, not a VNC stack). The code must not couple
+"screencast" to "headless" anywhere.
 
-### What We Lose By Going Headless
-
-CDP screencast captures what the browser renders into its viewport. It does **not** capture:
-
-- **Native file pickers** (the OS-provided "choose file" dialog)
-- **Native print dialogs**
-- **Browser-level modals** outside the page viewport (Chromium's built-in auth prompts, proxy auth, certificate warnings)
-- **OS-level alerts** (WebAuthn/FIDO prompts, screen sharing permission dialogs)
-- **PDF viewer UI** (Chromium's built-in PDF viewer renders to a native surface, not the page)
-
-For most of our agent's work this is fine — Playwright intercepts file choosers via `page.on('filechooser')`, and the agent rarely hits native auth prompts in scripted flows. But there are two known gaps worth naming:
-
-1. **PDF-heavy jobs.** When the agent navigates to a PDF, Chromium's built-in PDF viewer is partially outside the CDP screencast surface (depends on headless mode flags). Users watching the stream may see a blank page instead of the PDF. Workaround: the agent downloads the PDF instead of viewing it in-browser.
-2. **CAPTCHA/auth challenges that escape into native UI.** Rare, but they happen (especially WebAuthn). These are invisible in our stream.
-
-**Escape hatch:** If the gap becomes painful, we can switch Chromium to headed mode under Xvfb while *still using CDP screencast* (not VNC) for transport. This gives us the OS-dialog visibility of a full desktop stream with the simplicity of the CDP protocol. It requires adding Xvfb to the workspace image — one extra process, not three — and is a reasonable Phase 3 evolution if we see real-world use cases hitting the limit. The current design should leave room for it (specifically: don't couple "CDP screencast" to "headless mode" in the code).
-
-### What Could Go Wrong
+## Risks
 
 | Risk | Mitigation |
 |------|-----------|
-| Chromium not running when user clicks "Connect" | Browser starts lazily on first agent tool call. If no browser is running, orchestrator returns 409 with message "Agent has not opened the browser yet" |
-| Agent navigates while user is observing | Active target changes — broker resubscribes to new target. Brief gap in stream is acceptable |
-| CDP port not exposed (local dev backend) | Feature is disabled for local backends; cockpit shows "Browser sharing not available in local mode" |
-| User loses connection mid-control (Phase 2) | Orchestrator detects WebSocket close, automatically calls `/browser/resume` to unblock agent. Timeout safety: 5 minutes max control session if no activity |
-| Agent and user both modify state in Phase 2 | Pause/resume protocol prevents this by design |
-| Sensitive content visible in screencast (passwords, tokens) | Same as the IDE feature — the user *is* the job owner, this is their data. Same auth boundary applies |
-| Bandwidth abuse | Per-job rate limit at orchestrator: max 1 active stream per job, max 5 stream-minutes per minute across all jobs per user |
-| Frame backlog under slow client | CDP's own `screencastFrameAck` handles this — if the cockpit stops acking via the broker, CDP stops sending. No buffering on the orchestrator side |
-| **HiDPI / portrait viewport blur** (vercel-labs #632) | Forward raw frame bytes + full metadata; cockpit reads actual image dimensions from the decoded bitmap rather than trusting metadata. Canvas backing store sized to actual image, CSS display size independent |
-| **Viewport resize during stream corrupts frames** (Browserless) | Disable the cockpit's resize handler while connected. If the user resizes the browser window, restart the screencast session rather than changing viewport mid-stream |
-| **Agent creates new browser context instead of reusing** (Browserless gotcha) | Our broker connects to the *active* CDP target and doesn't create new contexts. Agent code that does `browser.new_context()` would stream the wrong target — document this as an invariant in `src/tools/research/browser.py` |
-| **Coordinate mapping bug — click lands in wrong place** (Phase 2) | Centralized `coordinateMapper()` helper in one place, unit-tested with several viewport/canvas ratios. Manual QA with real sites before enabling for users |
-| **Sites serve different content to headless Chromium** | Known limitation, not browser-share-specific. If it becomes a problem, Xvfb+headed escape hatch is available (see "What We Lose By Going Headless") |
-| **Agent opens a download / native dialog the user can't see** | Out-of-scope for the stream; agent's audit log already captures download events. Consider surfacing a "agent downloaded X" hint in the cockpit header as future polish |
+| browser-use 0.12.9 CDP API differs from the inspected 0.11.9 surface | Pre-flight task in Step A: verify `session.cdp_client` / `get_or_create_cdp_session` + screencast on the real workspace image before building on it |
+| Screencast work starves agent actions in the daemon | Streaming task never takes the action lock; zero-viewer stop; CDP ack-backpressure caps frame production |
+| Slow viewer stalls the stream for everyone | Ack after fan-out with per-viewer send queues; drop frames for laggards rather than blocking the ack |
+| User input collides with agent actions | Baton enforced at the daemon — the only place with a total order over both input paths |
+| Closed tab wedges the agent | 30 s no-viewer auto-release to `agent` |
+| Canvas pointer silently follows a new browser | Generation pinning: same-generation reconnects silent, new generation = explicit ended → restart action |
+| Workspace idle-reaper kills the pod mid-view | Attached stream marks workspace activity |
+| User navigation bypasses egress/SSRF policy | Daemon applies the same `browser_security` validation to `CONTROL navigate` as to agent navigation |
+| Coordinate mapping bugs (wrong-place clicks) | Single `coordinateMapper()`, unit-tested across ratios; bitmap-derived dimensions, never metadata |
+| Viewport resize mid-stream corrupts frames | Fixed viewport in v1; display scaling is CSS-only |
+| Stream endpoint auth/abuse | Thread-ownership auth + short-lived minted tokens; per-thread cap on concurrent viewer connections (e.g. 3); feature flag default-off |
+| Sensitive page content in frames | Same boundary as the IDE/canvas: the viewer is the session owner; no new audience |
+| VM workspaces behave differently than pods | Transport is the SSH pool used by canvas for both; conformance gate runs against the workspace image used by both |
 
-## Implementation Plan
+## Build order
 
-### Phase 1 — View-Only
+Five landable steps — each leaves the tree green and shippable:
 
-#### Files to Create
+- **A — Daemon streaming mode.** Pre-flight CDP API verification on the real
+  image; stream listener + framing + screencast task + baton + hello token +
+  generation; extend the `assert-browser-stack.sh`-style conformance gate
+  (spawn daemon, attach, assert frames, inject click, assert page change,
+  assert baton refusal).
+- **B — Orchestrator broker.** `open` + stream WS + SSH relay + capability
+  flag + activity marking; helm `canvas.sharedBrowser.enabled` →
+  `CANVAS_SHARED_BROWSER_ENABLED`; canvas source plumbing.
+- **C — Cockpit view-only.** Renderer + controller + frame painting +
+  toolbar (read-only URL, title, loading) + open button + cold-start staged
+  progress + lite-backend gating.
+- **D — Drive + baton.** Input capture + `coordinateMapper` + baton
+  pill/toggle + editable URL bar/back/reload + agent-side refusal surfacing
+  + `set_canvas` browser advertisement.
+- **E — Polish + enablement.** Reconnect/ended/restart states, popout
+  fan-out, de translations, docs, dev-profile enablement, live k3d smoke
+  with a verification record in `docs/tests/` (pattern of Slices 1–3).
 
-| File | Purpose |
-|------|---------|
-| `src/api/browser_stream.py` | Agent-side CDP-to-WebSocket broker |
-| `orchestrator/services/browser_proxy.py` | Orchestrator-side WebSocket proxy + auth + rate limiting |
-| `cockpit/src/app/features/job/shared-browser/shared-browser.component.ts` | Angular component |
-| `cockpit/src/app/features/job/shared-browser/shared-browser.component.html` | Template |
-| `cockpit/src/app/features/job/shared-browser/shared-browser.component.scss` | Styles |
-| `cockpit/src/app/features/job/shared-browser/shared-browser.service.ts` | WebSocket client + frame decode |
-| `tests/test_browser_stream.py` | Broker unit tests with mocked CDP |
+## Testing
 
-#### Files to Modify
+1. **Unit:** framing codec (Python + TS mirror tests), baton state machine,
+   `coordinateMapper`, renderer selection (`browser` case, capability
+   fail-closed).
+2. **Container conformance (podman, real workspace image):** the Step-A gate
+   — daemon spawn, stream attach, frames arrive, input round-trip changes
+   the page, refusals while user drives, zero-viewer screencast stop,
+   generation change on daemon restart.
+3. **Service suites:** orchestrator WS auth/relay against a fake stream
+   peer; open-endpoint idempotence + lite rejection; cockpit vitest for
+   renderer states, toolbar, and mapper math.
+4. **Live k3d smoke (gate for dev enablement):** open via button on a cold
+   session → navigate → agent `browser_snapshot` sees the page → agent
+   drives while user watches → take control → agent refusal → release →
+   agent continues. Recorded in `docs/tests/`.
 
-| File | Change |
-|------|--------|
-| `agent.py` | Mount the `browser_stream` WebSocket route on the existing API server |
-| `src/tools/research/browser.py` | Expose helper to find the active CDP target ID for the broker |
-| `orchestrator/main.py` | Add `GET /api/jobs/{job_id}/browser/stream` WebSocket route |
-| `orchestrator/database/postgres.py` | Add `get_agent_endpoint(job_id)` helper if not present (for the proxy to find the agent pod) |
-| `cockpit/src/app/features/job/job-detail.component.ts` | Add "Browser" tab next to existing tabs, lazy-load the new component |
+## Out of scope for v1 (future extensions)
 
-#### Implementation Order
+- **Agent-initiated control requests** ("please solve this CAPTCHA") — the
+  most valuable follow-up; protocol leaves room (`initiated_by`).
+- **Job detail view surface** — same broker, different host UI.
+- **Multi-tab UI** — v1 follows the active target only; no tab strip.
+- **Tab-isolation collaborative mode** (Tandem pattern), multi-user viewers,
+  recording/replay, iframe-embeddable share links, headed-under-Xvfb,
+  MCP `view_agent_browser` — unchanged from the first draft's list.
+- **Live viewport resize / HiDPI passthrough.**
+- **Explicit "stop browser" button** — closing the pane just detaches
+  viewers (zero-viewer stop already saves the CPU); the browser remains for
+  the agent, and workspace lifecycle owns final teardown.
 
-1. **Agent broker** — Implement `browser_stream.py`, test against a locally running Chromium with CDP. Verify frames flow over WebSocket.
-2. **Orchestrator proxy** — Implement the proxy endpoint with auth. Test end-to-end: cockpit dev tools → orchestrator → agent → frames received.
-3. **Cockpit component** — Build the component, render frames to canvas. Wire it into the job detail view.
-4. **Polish** — Connection state UI, error handling, FPS indicator, "browser not running" empty state.
-5. **Audit logging** — Log stream open/close events to MongoDB audit trail.
+## Open questions
 
-### Phase 2 — Take Control
-
-#### Files to Create
-
-| File | Purpose |
-|------|---------|
-| `tests/test_browser_control_handoff.py` | Test the pause/resume protocol end-to-end |
-
-#### Files to Modify
-
-| File | Change |
-|------|--------|
-| `src/api/browser_stream.py` | Handle `op: 'input'` messages, dispatch via CDP `Input.*` |
-| `agent.py` | Add `POST /browser/pause` and `POST /browser/resume` endpoints |
-| `src/tools/research/browser.py` | Add a `_user_control_lock` checked at the start of every browser tool call |
-| `orchestrator/main.py` | Add `POST /api/jobs/{job_id}/browser/pause` and `/resume` |
-| `orchestrator/services/browser_proxy.py` | Relay input events bidirectionally |
-| `cockpit/.../shared-browser.component.ts` | Enable input handlers when in `control` mode, send events |
-| `cockpit/.../shared-browser.component.html` | Enable the "Take control" button |
-
-## Open Questions
-
-1. **Where does the "Browser" tab live in the cockpit?** Job detail view is the obvious answer for jobs, but persistent threads also use the browser. Probably needs to live in both (`pages/job-detail` and `simple/persistent-chat`).
-
-2. **Should the agent see when the user is watching?** A subtle "user is observing" hint in the agent's context could be valuable — it might encourage the agent to be more deliberate. Or it might cause overthinking. Worth a small experiment after Phase 1 ships.
-
-3. **Headed mode for visual fidelity?** CDP screencast in headless mode renders correctly but some sites detect headless mode and serve different content (e.g., bot challenges). If this becomes a problem, switching to headed mode under Xvfb is a future option — and at that point we'd already be most of the way to noVNC anyway. Defer until we see evidence it's needed.
-
-4. **Multi-tab support.** The first version connects to the active target. If the agent opens multiple tabs (rare today), the user only sees the active one. Adding a tab strip in the cockpit is a Phase 3 polish item.
-
-5. **Recording.** Should we save the stream as a video for post-hoc review? Playwright already has trace files for that purpose (`playwright trace`), and recording every stream is expensive. Probably no.
-
-## Future Extensions
-
-- **Agent-initiated control requests** (Phase 3 above) — The most valuable evolution.
-- **Persistent thread integration** — When the agent is in persistent/interactive mode, the shared browser becomes a real-time collaboration surface, not just an observability tool.
-- **Tab-isolation collaborative mode** — A second Phase 2 variant (Tandem Browser pattern) where the user gets their own tab in the agent's browser, operating in parallel without pausing the agent. Useful for "follow along while the agent researches" use cases.
-- **Headed-mode-under-Xvfb escape hatch** — If native dialogs / PDF viewer / WebAuthn gaps become painful, run Chromium headed under Xvfb while still transporting frames via CDP screencast (not VNC). Adds one process, not three.
-- **Multi-viewer support** — Project members watching the same agent browser. Trivial extension of the proxy (fan out frames to N WebSocket clients per agent connection). Each viewer independently acks frames back to its own broker session.
-- **Iframe-embeddable viewer** (Steel.dev pattern) — Extract the cockpit's shared browser component as a standalone embeddable webapp served by the orchestrator, reachable via a signed short-lived URL. Enables read-only share links ("look at what my agent just did") and MCP exposure without coupling to the full cockpit.
-- **Browser session export** — Capture the current browser state (cookies, localStorage, open tabs) into a snapshot, similar to the VM snapshot feature in `vm_snapshots_and_ide.md`. Useful for resuming work after a job completes.
-- **MCP exposure** — A `view_agent_browser` MCP tool that returns a current screenshot, for use in Claude Code and external integrations. Cheaper than live streaming and fits the polling model of MCP better.
-- **Post-hoc recording** — CDP screencast frames can be re-encoded asynchronously into HLS/fMP4 for session replay (Browserbase's approach). Explicitly out of scope for v1 — Playwright trace files cover the debugging use case — but the frame transport we're building is the raw input a recording pipeline would consume.
+1. Should baton flips be pushed into the agent's context as an event (vs.
+   discovered via refusals)? Deferred — decide with Phase-3 design.
+2. Exact viewer-connection cap and whether it needs to be configurable.
+3. Whether `open` with a URL should also be exposed as a deep-link (e.g.
+   paste a URL into chat and click "open in shared browser").
 
 ## References
 
-Research informing this design (see conversation history for full annotated notes):
-
 - [Browserless — Screen Recording & LiveURL docs](https://docs.browserless.io/baas/interactive-browser-sessions/screencasting)
-- [Browserbase — "This week we fixed the worst part of Browserbase"](https://www.browserbase.com/blog/session-recordings) (rrweb → CDP screencast migration story)
+- [Browserbase — rrweb → CDP screencast migration story](https://www.browserbase.com/blog/session-recordings)
 - [Steel.dev — Human-in-the-Loop Controls](https://docs.steel.dev/overview/sessions-api/human-in-the-loop)
 - [browser-use — "Closer to the Metal: Leaving Playwright for CDP"](https://browser-use.com/posts/playwright-to-cdp)
 - [vercel-labs/agent-browser — Issue #632 (HiDPI stream resolution)](https://github.com/vercel-labs/agent-browser/issues/632)
-- [Chrome DevTools Protocol — Page domain (`startScreencast`, `screencastFrameAck`)](https://chromedevtools.github.io/devtools-protocol/tot/Page/)
-- [Chrome DevTools Protocol — Input domain (`dispatchMouseEvent` coordinate system)](https://chromedevtools.github.io/devtools-protocol/tot/Input/)
-- [Tandem Browser — shared human-AI browser with tab-isolation pattern](https://github.com/hydro13/tandem-browser)
-- [rrweb — record and replay the web](https://www.rrweb.io/)
+- [CDP — Page domain (`startScreencast`, `screencastFrameAck`)](https://chromedevtools.github.io/devtools-protocol/tot/Page/)
+- [CDP — Input domain (`dispatchMouseEvent` coordinates)](https://chromedevtools.github.io/devtools-protocol/tot/Input/)
+- [Tandem Browser — tab-isolation pattern](https://github.com/hydro13/tandem-browser)

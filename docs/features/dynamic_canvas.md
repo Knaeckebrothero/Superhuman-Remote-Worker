@@ -2676,6 +2676,10 @@ these checkpoints.
 
 ### Slice 5 — Shared browser
 
+Design locked 2026-07-20 in `shared_browser.md` (browser-exec in-process CDP
+screencast, orchestrator SSH-brokered stream, canvas-hosted renderer, and a
+first-class user-initiated "Open browser" flow). Not implemented.
+
 - stable browser generation and broker contract from `shared_browser.md`;
 - `browser` source adapter and renderer;
 - View-only first, then explicit take-control handoff.
@@ -2872,8 +2876,9 @@ architecture choice hidden in the file-stage scope.
 
 ## Relationship to Adjacent Features
 
-- **`shared_browser.md`** — will supply the planned Slice-5 live
-  source/renderer. Canvas owns where it appears; Shared Browser owns concrete
+- **`shared_browser.md`** — supplies the planned Slice-5 live
+  source/renderer (design locked 2026-07-20). Canvas owns where it appears;
+  Shared Browser owns concrete
   browser generations, dedicated
   profiles, transport, and the single-controller handoff. Canvas must not
   depend directly on experimental CDP screencast details.
