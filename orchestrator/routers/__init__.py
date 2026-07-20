@@ -11,10 +11,12 @@ from routers.automations import router as automations_router
 from routers.canvases import internal_router as internal_canvases_router
 from routers.canvases import router as canvases_router
 from routers.project_loops import router as project_loops_router
+from routers.shared_browser import router as shared_browser_router
 
 __all__ = [
     "automations_router",
     "canvases_router",
     "internal_canvases_router",
     "project_loops_router",
+    "shared_browser_router",
 ]
