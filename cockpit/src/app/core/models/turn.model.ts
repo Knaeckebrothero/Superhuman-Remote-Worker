@@ -244,6 +244,47 @@ export function trailingText(turn: AssistantTurn): string {
 }
 
 /**
+ * The prose to show for a COLLAPSED turn.
+ *
+ * Prefers {@link trailingText} — the answer the model closed the turn on. When
+ * that's empty because the turn ended on *tool calls* rather than prose, recover
+ * the answer anyway: skip the trailing completed tool calls (and finished
+ * thoughts / compaction markers) and return the last contiguous run of text
+ * blocks behind them.
+ *
+ * This is the "answer, then a closing tool pass" case. Its most common shape is
+ * a citation pass — the model writes its reply with inline [N] markers, then
+ * calls cite_web/cite_document to register each one (see
+ * docs/features/session_turn_rendering.md) — but a trailing verification
+ * `run_command` or a final `save_file` produces the same shape, so this is
+ * category-agnostic rather than citation-specific (history rows may not even
+ * carry a stamped category). Without it, a collapsed turn ending on such a pass
+ * would drop to the one-line opening headline and hide the actual answer.
+ *
+ * In-flight work still yields '' (→ headline): a running tool or a streaming
+ * thought at the tail means the turn isn't finished, so the text above it is
+ * lead-up, not a final answer, and must not be surfaced as one. Returns '' when
+ * the turn has no text at all.
+ */
+export function collapsedAnswer(turn: AssistantTurn): string {
+    const closing = trailingText(turn);
+    if (closing) return closing;
+    const parts: string[] = [];
+    for (let i = turn.events.length - 1; i >= 0; i--) {
+        const e = turn.events[i];
+        if (isText(e)) {
+            parts.push(e.content);
+            continue;
+        }
+        if (parts.length > 0) break; // reached the lead-up before the answer run
+        if (isEventInFlight(e)) break; // still working → no final answer yet
+        // else: a completed tool call / finished thought / compaction marker
+        // trailing the answer — skip it and keep looking back for the prose.
+    }
+    return parts.reverse().join('\n\n').trim();
+}
+
+/**
  * First sentence of a (possibly markdown) block, for a one-line headline.
  * Drops leading markdown markers, collapses whitespace, cuts at the first
  * sentence terminator at/after a sensible minimum length, and caps the
