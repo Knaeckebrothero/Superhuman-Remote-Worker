@@ -422,9 +422,7 @@ class TestSweepStage:
         db = _db([self._stage_loop(stage_ids)], [])
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
-        db.clear_project_loop_ghost_stage.assert_awaited_once_with(
-            LOOP_ID, stage_ids
-        )
+        db.clear_project_loop_ghost_stage.assert_awaited_once_with(LOOP_ID, stage_ids)
         advance.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -433,14 +431,10 @@ class TestSweepStage:
         # guarded UPDATE matches no row. Back off quietly — no advance, no
         # crash.
         stage_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
-        db = _db(
-            [self._stage_loop(stage_ids)], [], ghost_clear_wins=False
-        )
+        db = _db([self._stage_loop(stage_ids)], [], ghost_clear_wins=False)
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
-        db.clear_project_loop_ghost_stage.assert_awaited_once_with(
-            LOOP_ID, stage_ids
-        )
+        db.clear_project_loop_ghost_stage.assert_awaited_once_with(LOOP_ID, stage_ids)
         advance.assert_not_awaited()
 
 
@@ -471,9 +465,7 @@ class TestSweepTick:
         db = _db([_loop(current_job_id=job["id"])], [job])
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
-        db.adopt_project_loop_pointer_turn.assert_awaited_once_with(
-            LOOP_ID, job["id"]
-        )
+        db.adopt_project_loop_pointer_turn.assert_awaited_once_with(LOOP_ID, job["id"])
         db.update_project_loop.assert_not_awaited()
         advance.assert_not_awaited()
         db.heal_project_loop_stage.assert_not_awaited()
@@ -484,14 +476,10 @@ class TestSweepTick:
         # sweeper's list-read and the adopt write — the guarded UPDATE
         # matches no row. No advance, no crash, no fallback write.
         job = _job(9, "developer", status="completed", seq_index=2, remaining=25)
-        db = _db(
-            [_loop(current_job_id=job["id"])], [job], adopt_wins=False
-        )
+        db = _db([_loop(current_job_id=job["id"])], [job], adopt_wins=False)
         advance = AsyncMock()
         assert await _sweep_tick(db, advance) == 0
-        db.adopt_project_loop_pointer_turn.assert_awaited_once_with(
-            LOOP_ID, job["id"]
-        )
+        db.adopt_project_loop_pointer_turn.assert_awaited_once_with(LOOP_ID, job["id"])
         db.update_project_loop.assert_not_awaited()
         advance.assert_not_awaited()
 
