@@ -150,6 +150,7 @@ tools:
   # Shell tools - shell command execution (src/tools/shell/)
   shell:
     - run_command     # Execute commands, get output (stateless mode, default)
+    - cancel_command  # Abort a stuck/hung command (Ctrl+C), freeing the tab
     - shell_read      # Read more output from scrollback when needed
   # Evaluation tools - verdict tools for critic agents (src/tools/evaluation/)
   # Enable in critic config to give reviewer agents approve/return capabilities.

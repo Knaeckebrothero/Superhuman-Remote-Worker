@@ -504,6 +504,14 @@ class WorkspaceBackend(ABC):
         """
         raise NotImplementedError("Shell operations not supported by this backend")
 
+    def shell_cancel(self, tab_name: str = "default") -> str:
+        """Send Ctrl+C to a tab to abort a stuck/hung command.
+
+        Returns:
+            Human-readable status of the cancel/reset.
+        """
+        raise NotImplementedError("Shell operations not supported by this backend")
+
     def shell_list_tabs(self) -> List[Dict[str, Any]]:
         """Return metadata for all tabs."""
         raise NotImplementedError("Shell operations not supported by this backend")

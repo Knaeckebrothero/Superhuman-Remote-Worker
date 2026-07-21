@@ -1749,6 +1749,98 @@ class TestRemoteBackendShellSend:
         assert "Sent" in result
 
 
+class TestRemoteBackendShellCancel:
+    """RemoteBackend.shell_cancel() sends Ctrl+C to free a wedged tab.
+
+    Regression coverage for job 9b760af1: a hung foreground command left the
+    stateless 'default' tab busy (pending_sentinel set) with no way to abort.
+    The ladder is: idle no-op -> up to two C-c sends -> reset the tab.
+    """
+
+    def _setup_exec_mock(self, mock_ssh, output: str = "", exit_code: int = 0):
+        _wire_exec_channel(
+            mock_ssh,
+            _WindowedChannel(stdout_data=output.encode("utf-8"), exit_code=exit_code),
+        )
+
+    def _init(self, remote_backend):
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        self._setup_exec_mock(mock_ssh)
+        with patch("time.sleep"):
+            backend._init_shell()
+        return backend, mock_ssh
+
+    def test_noop_when_tab_idle(self, remote_backend):
+        """Already at a prompt: no C-c is sent, stale sentinel is cleared."""
+        backend, mock_ssh = self._init(remote_backend)
+        backend._tabs["default"].pending_sentinel = "__DONE_stale__"
+        with patch("time.sleep"), patch.object(
+            backend, "_tmux_send_keys"
+        ) as send, patch.object(
+            backend, "_tmux_capture", side_effect=[["agent@host:/workspace$"]]
+        ):
+            result = backend.shell_cancel("default")
+        send.assert_not_called()
+        assert backend._tabs["default"].pending_sentinel is None
+        assert "nothing" in result.lower()
+
+    def test_single_ctrl_c_frees_tab(self, remote_backend):
+        """One C-c returns the prompt: sentinel cleared, tab reported free."""
+        backend, mock_ssh = self._init(remote_backend)
+        backend._tabs["default"].pending_sentinel = "__DONE_run__"
+        with patch("time.sleep"), patch.object(
+            backend, "_tmux_send_keys"
+        ) as send, patch.object(
+            backend,
+            "_tmux_capture",
+            side_effect=[["running pytest ..."], ["agent@host:/workspace$"]],
+        ):
+            result = backend.shell_cancel("default")
+        send.assert_called_once_with("default", "C-c", enter=False)
+        assert backend._tabs["default"].pending_sentinel is None
+        assert "free" in result.lower()
+
+    def test_double_tap_frees_tab(self, remote_backend):
+        """Some programs need two C-c; the second frees the tab."""
+        backend, mock_ssh = self._init(remote_backend)
+        backend._tabs["default"].pending_sentinel = "__DONE_run__"
+        with patch("time.sleep"), patch.object(
+            backend, "_tmux_send_keys"
+        ) as send, patch.object(
+            backend,
+            "_tmux_capture",
+            side_effect=[["busy 1"], ["busy 2"], ["agent@host:/workspace$"]],
+        ):
+            result = backend.shell_cancel("default")
+        assert send.call_count == 2
+        assert backend._tabs["default"].pending_sentinel is None
+        assert "free" in result.lower()
+
+    def test_reset_fallback_when_unresponsive(self, remote_backend):
+        """Process ignores SIGINT: fall back to closing + reopening the tab."""
+        backend, mock_ssh = self._init(remote_backend)
+        backend._tabs["default"].pending_sentinel = "__DONE_hung__"
+        with patch("time.sleep"), patch.object(
+            backend, "_tmux_send_keys"
+        ) as send, patch.object(
+            backend, "_tmux_capture", side_effect=[["busy 1"], ["busy 2"], ["busy 3"]]
+        ), patch.object(backend, "shell_close_tab") as close, patch.object(
+            backend, "shell_ensure_tab"
+        ) as ensure:
+            result = backend.shell_cancel("default")
+        assert send.call_count == 2
+        close.assert_called_once_with("default")
+        ensure.assert_called_once_with("default")
+        assert "reset" in result.lower()
+
+    def test_nonexistent_tab_raises(self, remote_backend):
+        """Cancelling an unknown tab raises KeyError like the other shell ops."""
+        backend, mock_ssh = self._init(remote_backend)
+        with pytest.raises(KeyError, match="not found"):
+            backend.shell_cancel("ghost")
+
+
 class TestRemoteBackendShellRead:
     """Tests for RemoteBackend.shell_read() and shell_read_with_offset()."""
 

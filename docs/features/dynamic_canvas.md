@@ -13,6 +13,7 @@ aliases:
   - shared stage
 related:
   - "[[shared_browser]]"
+  - "[[canvas_office_documents]]"
   - "[[agent_skills]]"
   - "[[dynamic_canvas_slice1_verification]]"
   - "[[dynamic_canvas_slice2_verification]]"

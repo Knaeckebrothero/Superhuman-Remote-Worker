@@ -89,6 +89,7 @@ tools:
     - research_topic
   shell:
     - run_command
+    - cancel_command
   git:
     - git_log
     - git_show

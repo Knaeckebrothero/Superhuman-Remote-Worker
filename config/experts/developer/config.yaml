@@ -50,6 +50,7 @@ tools:
     - get_document_info
   shell:
     - run_command
+    - cancel_command
     - shell_read
   core:
     - next_phase_todos

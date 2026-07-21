@@ -109,6 +109,7 @@ class _FakeShellBackend:
         self.runs = []  # (command, tab_name, working_dir)
         self.tabs = []  # tab names ensured/opened
         self.closed = []
+        self.cancelled = []  # tab names cancelled
 
     def shell_run(self, command, timeout=None, tab_name="default", working_dir=None):
         self.runs.append((command, tab_name, working_dir))
@@ -120,6 +121,10 @@ class _FakeShellBackend:
     def shell_close_tab(self, name):
         self.closed.append(name)
         return f"closed {name}"
+
+    def shell_cancel(self, name="default"):
+        self.cancelled.append(name)
+        return f"cancelled {name}"
 
     def shell_list_tabs(self):
         return [{"name": n} for n in self.tabs]
@@ -146,6 +151,14 @@ class TestSubdirBackendShell:
         sub.shell_ensure_tab("build")
         assert fake.runs[-1][1] == "r0__default"
         assert "r0__build" in fake.tabs
+
+    def test_cancel_is_namespaced(self):
+        """shell_cancel must route through the tab prefix, not __getattr__
+        passthrough (which would C-c the parent's un-prefixed tab)."""
+        fake = _FakeShellBackend()
+        sub = SubdirBackend(fake, "wt", shell_tab_prefix="r0__")
+        sub.shell_cancel("default")
+        assert fake.cancelled == ["r0__default"]
 
     def test_list_tabs_filters_and_strips(self):
         fake = _FakeShellBackend()
