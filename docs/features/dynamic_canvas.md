@@ -90,7 +90,11 @@ after the Fedora-native launch hit an ABI mismatch. This is not
 evidence for live TLS, the deployed Python gateway, real CHIPS/PSL behavior,
 Safari/iOS/PWA, the hosted edge, or an
 enabled k3d live-app flow. Those external browser/edge gates remain Slice-3
-launch work; multi-port/streaming apps and Slices 4–6 remain planned.
+launch work; multi-port/streaming apps and the user-facing portions of Slices
+4–6 remain planned. The default-off Slice-5 shared-browser backend pipe is now
+implemented and repository-verified, including a real-Chromium container
+conformance run, but its Cockpit renderer, agent surface, VM attestation, and
+live k3d release gate remain outstanding.
 A cookie-free hosted black-box verifier now checks Cockpit/deep routes,
 API/IDE, Keycloak, the deployed PWA shell hash, the authoritative PRIVATE PSL
 rule, and opt-in raw-path/rate boundaries without printing URLs, response
@@ -111,8 +115,10 @@ See the
 The Dynamic Canvas is a shared, persistent presentation surface attached to a
 persistent thread. It sits beside chat. The implemented user-facing surface
 displays workspace files; a one-port live application surface is implemented
-behind disabled launch gates. Multi-port applications and the agent's browser
-remain planned source types.
+behind disabled launch gates. Multi-port applications remain planned. The
+agent's browser now has a default-off backend source/stream foundation, but no
+Cockpit renderer or agent-facing Canvas workflow, so it is not yet a usable
+source type.
 
 The important architectural decision is:
 
@@ -414,24 +420,25 @@ prefix. Prefix stripping remains deferred because `X-Forwarded-Prefix` is
 non-standard and rewriting `Location` cannot repair absolute paths embedded in
 HTML/JavaScript.
 
-### `browser` (planned Slice 5)
+### `browser` (backend source implemented; agent/Cockpit surfaces planned)
 
-This planned source points at a browser session available to the current agent
-runtime.
+The stored source now points at one concrete browser generation:
 
 ```json
 {
   "type": "browser",
-  "browser_id": "current"
+  "browser_generation": "5f0a9f5e-0000-4000-8000-000000000001"
 }
 ```
 
-The Canvas will not implement CDP streaming itself. Its Slice-5 adapter will
-select the trusted `SharedBrowserComponent`, which uses the authenticated
-screencast/control channel from `shared_browser.md`. `browser_id = current`
-will be accepted only at tool-call time and resolve immediately to a concrete
-opaque browser **generation**. The stored pointer must never follow whichever
-browser happens to become current later.
+The implemented open endpoint resolves the live daemon identity and stages
+this pointer through the existing Canvas control plane. The Canvas does not
+implement CDP streaming itself: its planned Slice-5 renderer will use the
+authenticated screencast/control channel from `shared_browser.md`.
+`browser_id = current` remains a planned agent-tool input; when it lands, it
+must resolve immediately to the same concrete opaque browser **generation**.
+The stored pointer never follows whichever browser happens to become current
+later.
 
 ### Deferred source types
 
@@ -626,7 +633,7 @@ registers renderers for untrusted or user-authored content.
 | Mermaid | Dedicated renderer with strict/sandbox security mode | Net-new and deferred |
 | `workspace_port` | Default-off isolated-origin iframe in Slice 3 | Through the app |
 | `workspace_app` | Planned multi-port isolated-origin iframe in Slice 4 | Through the app |
-| `browser` | Planned `SharedBrowserComponent` in Slice 5 | Shared Browser control lease |
+| `browser` | Backend stream/source implemented; Cockpit `SharedBrowserComponent` planned in Slice 5 | Shared Browser control baton |
 
 Renderer rules:
 
@@ -899,7 +906,8 @@ For a one-port live application (**implemented but dark-shipped Slice 3**):
 The `.srw/canvas.yaml`/`workspace_app` route-manifest workflow is planned Slice
 4. It is not an alternative available to agents in the current schema.
 
-For a shared browser (**planned Slice 5**):
+For a shared browser (**agent-facing workflow planned in Slice 5; backend pipe
+implemented**):
 
 ```text
 1. Navigate the agent browser to the relevant state.
@@ -2143,15 +2151,15 @@ rate, and send with an exact `targetOrigin`. Unknown messages fail closed and
 the bridge needs a teardown handshake. Agent-authored data is never silently
 promoted to a trusted user message; Cockpit confirms it in host chrome.
 
-### Browser source (planned Slice 5)
+### Browser source (backend implemented; renderer/tool integration planned)
 
-- Reuse the shared-browser authorization and ownership protocol.
+- The backend reuses the shared-browser authorization and ownership protocol.
 - Canvas consumes a stable stream/control adapter; it never exposes the CDP
   debugging endpoint or makes experimental CDP screencast details part of its
-  public source contract.
-- Use a dedicated browser profile and concrete browser generation. A user
-  takeover obtains a server-side single-controller lease and pauses agent input;
-  multiple CDP clients are technically possible but must not race controls.
+  public source contract. The Cockpit adapter remains Plan 2.
+- The daemon uses its dedicated browser profile and a concrete generation. A
+  user takeover obtains the daemon-owned single-controller baton and pauses
+  mutating agent actions; all transitions are serialized with browser actions.
 - Native dialogs, downloads, and credential boundaries follow the browser
   feature's policy rather than being redefined by Canvas.
 
@@ -2169,7 +2177,8 @@ Different source types have different durability:
   revoke direct channels/origin sessions and show `unavailable`.
   Never follow the same port into a new workspace generation automatically; the
   agent restarts the services and republishes.
-- **Browser (planned Slice 5):** pointer persists, browser session may not.
+- **Browser (backend implemented; UI planned):** pointer persists, browser
+  session may not.
   Availability follows the browser broker/runtime capability, not the workspace
   storage backend alone. Show a clear ended or reconnect state; never silently
   select a different browser.
@@ -2181,7 +2190,7 @@ Validate source capability rather than assuming it from a backend name:
 | `workspace_file` | readable thread workspace; writable for edit mode |
 | `workspace_port` | active SSH-reachable, shell-capable workspace and permitted loopback port; implemented behind Slice-3 gates |
 | `workspace_app` | the same plus a validated route manifest; planned Slice 4 |
-| `browser` | active authorized browser generation and stream broker; planned Slice 5 |
+| `browser` | active authorized browser generation and stream broker; backend implemented, renderer/tool flow planned |
 
 A durable virtual workspace can display files but cannot host a new server
 process until the existing user-approved workspace upgrade completes. A
@@ -2213,7 +2222,7 @@ revocation, thread switch, workspace generation change, or clear.
 | Live UI notification | `_broadcast` → `thread_events` → SSE vocabulary, after the ordered-writer fix |
 | Workspace targeting | thread-upload SSH resolution + agent `WorkspaceBackend` behavior as a contract reference |
 | HTTP/WebSocket forwarding | IDE proxy workspace-resolution patterns only, not its buffering/auth implementation |
-| Browser stream/control | `shared_browser.md` design/runtime work |
+| Browser stream/control | Implemented Plan-1 daemon/broker foundation from `shared_browser.md` |
 | Chat/canvas split | `ChatPageComponent` + installed `angular-split` |
 | Markdown rendering | installed Marked/ngx-markdown + math extension, with a separate Canvas parser |
 | Code editing | installed Monaco + loader patterns, after extracting lifecycle-safe shared loading |
@@ -2239,7 +2248,7 @@ revocation, thread switch, workspace generation change, or clear.
   request-scoped, revocation-aware, strict ordinary-HTTP forwarding in Slice
   3B. The manifest route table and streaming SSE/WebSocket multiplexer remain.
 - Canvas skill and capability-aware scope.
-- Browser renderer adapter once shared-browser streaming exists.
+- Browser renderer adapter over the implemented shared-browser stream.
 
 ## Implementation Slices
 
@@ -2678,13 +2687,32 @@ these checkpoints.
 
 Design locked 2026-07-20 in `shared_browser.md` (browser-exec in-process CDP
 screencast, orchestrator SSH-brokered stream, canvas-hosted renderer, and a
-first-class user-initiated "Open browser" flow). Not implemented.
+first-class user-initiated "Open browser" flow).
 
-- stable browser generation and broker contract from `shared_browser.md`;
-- `browser` source adapter and renderer;
-- View-only first, then explicit take-control handoff.
-- Dedicated profile, single-controller lease, automation pause, and
-  reconnect/ended-browser lifecycle states.
+**Current state (2026-07-21): backend foundation implemented; Slice 5 remains
+incomplete and non-user-facing.** Plan 1 delivered:
+
+- the `browser-exec` loopback stream, stable browser generation, in-process
+  CDP screencast/input adapter, daemon-owned single-controller baton, agent
+  mutation refusal, navigation validation, fan-out, and lifecycle handling;
+- fail-closed orchestrator config, owner-authorized open endpoint,
+  generation-pinned SSH/WebSocket relay, viewer cap, activity marking, Canvas
+  `can_stream_browser` capability, and default-off Helm wiring;
+- host-side service coverage plus a Podman conformance gate that passed
+  against real Chromium in the rebuilt container workspace image.
+
+Plan 2 still needs to deliver:
+
+- the Cockpit `browser` renderer, controller, toolbar, open button, reconnect
+  and ended-generation states, and explicit take/release UI;
+- agent `set_canvas(browser)` advertisement/handling and clear
+  `user_is_driving` refusal surfacing;
+- active-target reattachment, VM image/routing/binding attestation, and live
+  k3d acceptance with a `docs/tests/` record.
+
+The precise current boundary, protocol, and verification record are in
+`shared_browser.md` and
+`docs/superpowers/plans/2026-07-20-shared-browser-pipe.md`.
 
 ### Slice 6 — Expansion based on evidence
 
@@ -2876,10 +2904,10 @@ architecture choice hidden in the file-stage scope.
 
 ## Relationship to Adjacent Features
 
-- **`shared_browser.md`** — supplies the planned Slice-5 live
-  source/renderer (design locked 2026-07-20). Canvas owns where it appears;
-  Shared Browser owns concrete
-  browser generations, dedicated
+- **`shared_browser.md`** — supplies the implemented Slice-5 backend
+  generation/transport/control foundation and the planned renderer contract
+  (design locked 2026-07-20; backend verified 2026-07-21). Canvas owns where
+  it appears; Shared Browser owns concrete browser generations, dedicated
   profiles, transport, and the single-controller handoff. Canvas must not
   depend directly on experimental CDP screencast details.
 - **`agent_skills.md`** — supplies model-invoked bundled-skill discovery and
