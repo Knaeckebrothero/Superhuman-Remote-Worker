@@ -63,6 +63,10 @@ _GONE_ERRNOS = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN}
 _EXEC_MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 _EXEC_POLL_SECONDS = 0.05
 
+# shell_cancel: seconds to wait after a Ctrl+C before re-checking whether the
+# tab returned to a prompt. Two attempts, then fall back to a tab reset.
+_CANCEL_SETTLE_SECONDS = 0.5
+
 # Transport-level keepalive + SFTP channel timeout: without these, a
 # blackholed connection (network partition, silently-dead VM) hangs SFTP
 # reads/writes forever while holding _sftp_lock, wedging ALL file ops.
@@ -1368,6 +1372,56 @@ class RemoteBackend(WorkspaceBackend):
         self._tmux_send_keys(tab_name, text, enter=enter)
         self._tabs[tab_name].last_activity = datetime.now(timezone.utc)
         return f"Sent to '{tab_name}'"
+
+    def shell_cancel(self, tab_name: str = "default") -> str:
+        """Send Ctrl+C to a shell tab to abort a stuck/hung command.
+
+        Mirrors the manual ``shell_execute(keys=True, command="C-c")`` recovery
+        path, but as a first-class action for the stateless tool set (whose
+        ``run_command`` has no keys mode). Ladder, each step re-checking whether
+        the shell returned to a prompt (``prompt_is_ready``): idle -> no-op;
+        otherwise up to two C-c sends; if the process still ignores SIGINT, reset
+        the tab (close + reopen). Always leaves the tab runnable.
+
+        The interrupted command's completion sentinel never prints, so we clear
+        ``pending_sentinel`` here rather than waiting for the colliding-command
+        guard to clear it on the next ``shell_run``.
+        """
+        self._ensure_shell()
+        if tab_name not in self._tabs:
+            raise KeyError(
+                f"Tab '{tab_name}' not found. Available: "
+                f"{', '.join(self._tabs.keys())}"
+            )
+        tab = self._tabs[tab_name]
+
+        with self._sync_lock:
+            # Nothing running — already back at a prompt.
+            if prompt_is_ready(self._tmux_capture(tab_name)):
+                tab.pending_sentinel = None
+                return f"Tab '{tab_name}': nothing to cancel (already at a prompt)."
+
+            # Up to two Ctrl+C attempts (some REPLs/programs need a second).
+            for _ in range(2):
+                self._tmux_send_keys(tab_name, "C-c", enter=False)
+                time.sleep(_CANCEL_SETTLE_SECONDS)
+                if prompt_is_ready(self._tmux_capture(tab_name)):
+                    tab.pending_sentinel = None
+                    tab.last_activity = datetime.now(timezone.utc)
+                    return (
+                        f"Sent Ctrl+C to tab '{tab_name}'; the command was "
+                        f"interrupted and the tab is free."
+                    )
+
+        # Still stuck (process ignoring SIGINT). Reset the tab outside the lock:
+        # close + reopen yields a fresh _RemoteTab (pending_sentinel cleared by
+        # construction) and leaves the tab immediately usable.
+        self.shell_close_tab(tab_name)
+        self.shell_ensure_tab(tab_name)
+        return (
+            f"Tab '{tab_name}' did not respond to Ctrl+C; the shell tab was "
+            f"reset (shell-local state and background jobs were cleared)."
+        )
 
     def shell_read(
         self,

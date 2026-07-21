@@ -54,6 +54,7 @@ tools:
     - create_directory
   shell:
     - run_command
+    - cancel_command
     - shell_read
   core:
     - next_phase_todos

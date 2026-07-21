@@ -150,10 +150,12 @@ NONINTERACTIVE_ENV_EXPORT = (
 # read it as "not finished" (distinct from success 0 and generic failure 1).
 # This is NOT an error — the process keeps running on its tab.
 #
-# Guidance here is mode-NEUTRAL: it must be valid even for the least-capable tool
-# set (stateless run_command + shell_read, which cannot send keys, abort, or use
-# other tabs). Tool-specific options (C-c, extra tabs) are taught by the
-# persistent shell_execute tool's own docstring, not baked in here.
+# Guidance here is mode-NEUTRAL: it must be valid for every shell tool set. The
+# stateless set (run_command + shell_read) cannot send keys or use other tabs,
+# but it DOES have a dedicated cancel_command tool to abort a wedged tab — the
+# run_command tool layer appends that pointer to these results (shell_tools.py),
+# keeping this backend text tool-agnostic. Persistent-mode options (C-c via
+# shell_execute keys mode, extra tabs) are taught by that tool's own docstring.
 STILL_RUNNING_TEMPLATE = (
     "Exit code: -1\n"
     "--- still running ---\n"
@@ -439,6 +441,14 @@ class ShellManager:
             if blocked:
                 return blocked
         return self._backend.shell_send(name, text, enter=enter)
+
+    def cancel(self, name: str = "default") -> str:
+        """Send Ctrl+C to a tab to abort a stuck/hung command.
+
+        Delegates to the backend's C-c ladder (interrupt, retry, then tab
+        reset). Backing method for the stateless ``cancel_command`` tool.
+        """
+        return self._backend.shell_cancel(name)
 
     def read(
         self,

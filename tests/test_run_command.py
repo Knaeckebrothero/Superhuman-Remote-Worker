@@ -12,7 +12,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.tools.shell.shell_manager import STILL_RUNNING_TEMPLATE, ShellManager
+from src.tools.shell.shell_manager import (
+    COLLIDING_COMMAND_TEMPLATE,
+    STILL_RUNNING_TEMPLATE,
+    ShellManager,
+)
 from src.tools.shell.shell_tools import create_shell_tools
 
 
@@ -80,6 +84,35 @@ class TestModeToggle:
         tool_names = {t.name for t in tools}
         assert "run_command" in tool_names
         assert "shell_execute" not in tool_names
+
+
+class TestCancelCommand:
+    """cancel_command exposes a Ctrl+C/abort for the stateless tool set."""
+
+    def _get_cancel(self, manager):
+        context = _make_context(manager, mode="stateless")
+        tools = create_shell_tools(context)
+        return next(t for t in tools if t.name == "cancel_command")
+
+    def test_present_in_stateless_mode(self, manager):
+        context = _make_context(manager, mode="stateless")
+        names = {t.name for t in create_shell_tools(context)}
+        assert "cancel_command" in names
+
+    def test_absent_in_persistent_mode(self, manager):
+        context = _make_context(manager, mode="persistent")
+        names = {t.name for t in create_shell_tools(context)}
+        assert "cancel_command" not in names
+
+    def test_delegates_to_manager_cancel(self, manager, backend):
+        backend.shell_cancel.return_value = (
+            "Sent Ctrl+C to tab 'default'; the command was interrupted "
+            "and the tab is free."
+        )
+        tool = self._get_cancel(manager)
+        result = tool.invoke({})
+        backend.shell_cancel.assert_called_once_with("default")
+        assert "free" in result.lower()
 
 
 class TestRunCommand:
@@ -169,6 +202,35 @@ class TestRunCommand:
         result = tool.invoke({"command": "ssh host"})
         assert "requires interactive input" in result
         assert "non-interactive" in result
+
+    def test_still_running_suggests_cancel(self, manager, backend):
+        """A still-running result points the model at cancel_command."""
+        backend.shell_run.return_value = STILL_RUNNING_TEMPLATE.format(
+            tab="default", elapsed=120, quiet=30, terminal_state="(empty)"
+        )
+        tool = self._get_run_command(manager)
+        result = tool.invoke({"command": "pytest tests/"})
+        assert "cancel_command" in result
+
+    def test_colliding_command_suggests_cancel(self, manager, backend):
+        """A wedged tab (previous command still running) points at cancel_command."""
+        backend.shell_run.return_value = COLLIDING_COMMAND_TEMPLATE.format(
+            tab="default", terminal_state="(empty)"
+        )
+        tool = self._get_run_command(manager)
+        result = tool.invoke({"command": "ps -ef"})
+        assert "cancel_command" in result
+
+    def test_interactive_prompt_suggests_cancel(self, manager, backend):
+        """A stateless agent stuck at a prompt is told it can cancel_command."""
+        backend.shell_run.return_value = (
+            "Interactive prompt detected (password prompt). The command is "
+            "waiting for input on tab 'default'.\n"
+            "--- terminal state ---\nPassword:"
+        )
+        tool = self._get_run_command(manager)
+        result = tool.invoke({"command": "ssh host"})
+        assert "cancel_command" in result
 
     def test_error_pattern_warning(self, manager, backend):
         backend.shell_run.return_value = (
