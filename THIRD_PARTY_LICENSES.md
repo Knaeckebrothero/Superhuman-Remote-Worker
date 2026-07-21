@@ -213,7 +213,7 @@ _No bundled dependency ships a NOTICE file._
 | [is-promise](https://www.npmjs.com/package/is-promise) | 4.0.0 | MIT | ALLOW |
 | [is-unicode-supported](https://www.npmjs.com/package/is-unicode-supported) | 2.1.0 | MIT | ALLOW |
 | [js-tokens](https://www.npmjs.com/package/js-tokens) | 4.0.0 | MIT | ALLOW |
-| [js-yaml](https://www.npmjs.com/package/js-yaml) | 4.1.1 | MIT | ALLOW |
+| [js-yaml](https://www.npmjs.com/package/js-yaml) | 4.3.0 | MIT | ALLOW |
 | [json-parse-even-better-errors](https://www.npmjs.com/package/json-parse-even-better-errors) | 2.3.1 | MIT | ALLOW |
 | [json-schema-traverse](https://www.npmjs.com/package/json-schema-traverse) | 1.0.0 | MIT | ALLOW |
 | [jsonc-parser](https://www.npmjs.com/package/jsonc-parser) | 3.3.1 | MIT | ALLOW |
