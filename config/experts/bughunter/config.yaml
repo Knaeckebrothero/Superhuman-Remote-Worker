@@ -48,6 +48,7 @@ tools:
     - job_complete
   shell:
     - run_command
+    - cancel_command
     - shell_execute
     - shell_read
   git:

@@ -204,6 +204,14 @@ TMUX_SPECIAL_KEYS = frozenset(
 )
 
 # Tool metadata for registry
+# Appended to run_command results when the single stateless tab is wedged
+# (still-running, colliding, or blocked on a prompt). run_command has no keys
+# mode, so cancel_command is the model's only in-band escape from a hung tab.
+_CANCEL_HINT = (
+    "\n\nNote: if this command is stuck or you did not expect it to run this "
+    "long, call cancel_command to abort it and free the tab."
+)
+
 SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "run_command": {
         "module": "shell.shell_tools",
@@ -211,6 +219,14 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Execute a shell command and return its output",
         "category": "shell",
         "short_description": "Run a shell command and get output.",
+        "phases": ["strategic", "tactical"],
+    },
+    "cancel_command": {
+        "module": "shell.shell_tools",
+        "function": "cancel_command",
+        "description": "Abort a stuck/hung command by sending Ctrl+C to the shell tab",
+        "category": "shell",
+        "short_description": "Cancel a stuck shell command (Ctrl+C).",
         "phases": ["strategic", "tactical"],
     },
     "shell_execute": {
@@ -376,8 +392,8 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             wait to check progress — do NOT poll in a tight loop. The tab is busy
             until the command finishes, so re-issuing it (or any other command)
             is rejected. If the output stays completely unchanged for a long
-            time, the command may be stuck — reconsider the approach rather than
-            polling forever.
+            time, the command may be stuck — call cancel_command to abort it and
+            free the tab, rather than polling forever.
 
         INTERACTIVE INPUT: run_command cannot answer prompts (password, y/n).
         Use a non-interactive form instead:
@@ -440,13 +456,20 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
             # Still-running (soft/hard no-change timeout) is NOT an error — the
             # command keeps running. Pass it through so the model can poll with
-            # shell_read or re-run with a higher timeout.
+            # shell_read, re-run with a higher timeout, or cancel_command it.
             if "--- still running ---" in output:
                 output = _apply_tail(output, tail)
-                return _truncate_output(output, max_output_chars, "output")
+                output = _truncate_output(output, max_output_chars, "output")
+                return output + _CANCEL_HINT
+
+            # Colliding: the single stateless tab is busy with a previous
+            # command, so this one never ran. cancel_command is the way out.
+            if "previous command still running" in output:
+                output = _truncate_output(output, max_output_chars, "output")
+                return output + _CANCEL_HINT
 
             # Genuine interactive prompt: stateless run_command can't answer it,
-            # so steer the model toward a non-interactive form.
+            # so steer the model toward a non-interactive form (or cancel it).
             if "Interactive prompt detected" in output:
                 return (
                     f"Error: Command requires interactive input, which "
@@ -454,6 +477,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                     f"Use a non-interactive form instead (sshpass, -y flags, "
                     f"`yes |`, etc.).\n"
                     f"{output}"
+                    f"{_CANCEL_HINT}"
                 )
 
             output = _apply_tail(output, tail)
@@ -673,8 +697,33 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 tab_header = "[Shells: ?]"
             return f"{tab_header}\nError: {e}"
 
+    @tool
+    def cancel_command() -> str:
+        """Abort a stuck or hung command by sending Ctrl+C to the shell.
+
+        Use this when a run_command reported "still running" and you did NOT
+        expect the command to be long, when a command is hung / not returning,
+        or when the tab is stuck on an interactive prompt you cannot answer.
+        run_command uses a single shell tab, so a wedged command blocks every
+        later command (including your own recovery attempts) until it is
+        cancelled — this is how you get unstuck instead of giving up.
+
+        Sends Ctrl+C to the tab (retrying once); if the process ignores the
+        interrupt, resets the tab as a last resort. Afterwards the tab is free
+        to run new commands. Safe to call when nothing is running (it says so).
+
+        Returns:
+            A short status: whether the command was interrupted, there was
+            nothing to cancel, or the tab had to be reset.
+        """
+        try:
+            sm.ensure_tab("default")
+            return sm.cancel("default")
+        except (ValueError, KeyError) as e:
+            return f"Error: {e}"
+
     if mode == "persistent":
         return [shell_execute, shell_read, srw_cloud_status]
     else:
         # Stateless mode (default)
-        return [run_command, shell_read, srw_cloud_status]
+        return [run_command, cancel_command, shell_read, srw_cloud_status]

@@ -173,6 +173,9 @@ class SubdirBackend:
     def shell_close_tab(self, name: str) -> str:
         return self._parent.shell_close_tab(self._tab(name))
 
+    def shell_cancel(self, name: str = "default", *args, **kwargs):
+        return self._parent.shell_cancel(self._tab(name), *args, **kwargs)
+
     def shell_list_tabs(self) -> List[dict]:
         # Show only this reader's tabs, with the namespace prefix stripped.
         tabs = self._parent.shell_list_tabs()

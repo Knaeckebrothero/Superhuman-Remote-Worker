@@ -54,6 +54,7 @@ tools:
     - browse_website
   shell:
     - run_command
+    - cancel_command
     - shell_read
   git:
     - git_log

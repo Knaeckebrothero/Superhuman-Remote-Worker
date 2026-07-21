@@ -35,6 +35,7 @@ def make_backend(**overrides):
     backend.shell_list_tabs.return_value = [{"name": "default", "type": "shell"}]
     backend.shell_format_tab_header.return_value = "[Shells: default]"
     backend.shell_is_alive.return_value = True
+    backend.shell_cancel.return_value = "cancelled"
     for key, value in overrides.items():
         setattr(backend, key, value)
     return backend
@@ -117,6 +118,11 @@ class TestDelegation:
     def test_send_without_enter_delegates(self, manager, backend):
         manager.send("default", "C-c", enter=False)
         backend.shell_send.assert_called_once_with("default", "C-c", enter=False)
+
+    def test_cancel_delegates(self, manager, backend):
+        result = manager.cancel("default")
+        backend.shell_cancel.assert_called_once_with("default")
+        assert result == "cancelled"
 
     def test_read_delegates(self, manager, backend):
         text, metadata = manager.read("default", lines=10, since_cursor=True)
