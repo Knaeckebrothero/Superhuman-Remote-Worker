@@ -209,7 +209,9 @@ async def _sweep_stage(
     statuses = await db.get_loop_stage_member_statuses(stage_ids)
     survivors = [mid for mid in stage_ids if mid in statuses]
     if any(statuses[mid] not in _TERMINAL for mid in survivors):
-        return 0  # a surviving member is still in flight — its hook will fire the barrier
+        return (
+            0  # a surviving member is still in flight — its hook will fire the barrier
+        )
 
     if not survivors:
         # Every listed member has been deleted — the barrier's claim needs at
@@ -227,8 +229,7 @@ async def _sweep_stage(
             )
         else:
             logger.debug(
-                "project loop %s: all-ghost stage clear lost the guard — "
-                "row moved on",
+                "project loop %s: all-ghost stage clear lost the guard — row moved on",
                 str(loop.get("id"))[:8],
             )
         return 0

@@ -108,7 +108,9 @@ def _advance_db(loop: dict, jobs: list[dict], *, barrier: bool = True) -> AsyncM
 def _advance_patches(stack: ExitStack, db: AsyncMock, *, rotate: AsyncMock | None):
     stack.enter_context(patch("main.postgres_db", db))
     stack.enter_context(
-        patch("main._merge_and_retro_loop_job", AsyncMock(return_value=("skipped", None)))
+        patch(
+            "main._merge_and_retro_loop_job", AsyncMock(return_value=("skipped", None))
+        )
     )
     stack.enter_context(patch("main._notify_loop_user_questions", AsyncMock()))
     if rotate is not None:
@@ -127,9 +129,7 @@ class TestUnifiedAdvance:
             from main import _advance_project_loop
 
             await _advance_project_loop(job, {}, [])
-        db.claim_project_loop_stage_barrier.assert_awaited_once_with(
-            LOOP_ID, job["id"]
-        )
+        db.claim_project_loop_stage_barrier.assert_awaited_once_with(LOOP_ID, job["id"])
         kw = rotate.await_args.kwargs
         assert kw["completed_job"] is job
         assert kw["completed_ctx"]["loop_id"] == LOOP_ID

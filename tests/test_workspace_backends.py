@@ -1775,10 +1775,12 @@ class TestRemoteBackendShellCancel:
         """Already at a prompt: no C-c is sent, stale sentinel is cleared."""
         backend, mock_ssh = self._init(remote_backend)
         backend._tabs["default"].pending_sentinel = "__DONE_stale__"
-        with patch("time.sleep"), patch.object(
-            backend, "_tmux_send_keys"
-        ) as send, patch.object(
-            backend, "_tmux_capture", side_effect=[["agent@host:/workspace$"]]
+        with (
+            patch("time.sleep"),
+            patch.object(backend, "_tmux_send_keys") as send,
+            patch.object(
+                backend, "_tmux_capture", side_effect=[["agent@host:/workspace$"]]
+            ),
         ):
             result = backend.shell_cancel("default")
         send.assert_not_called()
@@ -1789,12 +1791,14 @@ class TestRemoteBackendShellCancel:
         """One C-c returns the prompt: sentinel cleared, tab reported free."""
         backend, mock_ssh = self._init(remote_backend)
         backend._tabs["default"].pending_sentinel = "__DONE_run__"
-        with patch("time.sleep"), patch.object(
-            backend, "_tmux_send_keys"
-        ) as send, patch.object(
-            backend,
-            "_tmux_capture",
-            side_effect=[["running pytest ..."], ["agent@host:/workspace$"]],
+        with (
+            patch("time.sleep"),
+            patch.object(backend, "_tmux_send_keys") as send,
+            patch.object(
+                backend,
+                "_tmux_capture",
+                side_effect=[["running pytest ..."], ["agent@host:/workspace$"]],
+            ),
         ):
             result = backend.shell_cancel("default")
         send.assert_called_once_with("default", "C-c", enter=False)
@@ -1805,12 +1809,14 @@ class TestRemoteBackendShellCancel:
         """Some programs need two C-c; the second frees the tab."""
         backend, mock_ssh = self._init(remote_backend)
         backend._tabs["default"].pending_sentinel = "__DONE_run__"
-        with patch("time.sleep"), patch.object(
-            backend, "_tmux_send_keys"
-        ) as send, patch.object(
-            backend,
-            "_tmux_capture",
-            side_effect=[["busy 1"], ["busy 2"], ["agent@host:/workspace$"]],
+        with (
+            patch("time.sleep"),
+            patch.object(backend, "_tmux_send_keys") as send,
+            patch.object(
+                backend,
+                "_tmux_capture",
+                side_effect=[["busy 1"], ["busy 2"], ["agent@host:/workspace$"]],
+            ),
         ):
             result = backend.shell_cancel("default")
         assert send.call_count == 2
@@ -1821,13 +1827,17 @@ class TestRemoteBackendShellCancel:
         """Process ignores SIGINT: fall back to closing + reopening the tab."""
         backend, mock_ssh = self._init(remote_backend)
         backend._tabs["default"].pending_sentinel = "__DONE_hung__"
-        with patch("time.sleep"), patch.object(
-            backend, "_tmux_send_keys"
-        ) as send, patch.object(
-            backend, "_tmux_capture", side_effect=[["busy 1"], ["busy 2"], ["busy 3"]]
-        ), patch.object(backend, "shell_close_tab") as close, patch.object(
-            backend, "shell_ensure_tab"
-        ) as ensure:
+        with (
+            patch("time.sleep"),
+            patch.object(backend, "_tmux_send_keys") as send,
+            patch.object(
+                backend,
+                "_tmux_capture",
+                side_effect=[["busy 1"], ["busy 2"], ["busy 3"]],
+            ),
+            patch.object(backend, "shell_close_tab") as close,
+            patch.object(backend, "shell_ensure_tab") as ensure,
+        ):
             result = backend.shell_cancel("default")
         assert send.call_count == 2
         close.assert_called_once_with("default")
