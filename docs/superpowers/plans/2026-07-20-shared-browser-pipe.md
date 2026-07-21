@@ -1,12 +1,63 @@
 # Shared Browser — Plan 1 of 2: The Pipe (daemon streaming + orchestrator broker)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution complete:** This plan was run inline, task by task. Checked boxes
+> record the completed implementation; the execution record below is the
+> authoritative summary of the as-built result.
 
 **Goal:** The workspace's `browser-exec` daemon streams live CDP screencast frames of its Chromium over a loopback-only TCP listener, and the orchestrator relays that stream (plus user input/control) to an authenticated WebSocket — the complete backend pipe for the shared-browser feature (spec: `docs/features/shared_browser.md`, Steps A+B).
 
 **Architecture:** `browser-exec` (single-file Python daemon in the workspace) gains a streaming side-channel: framed protocol on `127.0.0.1:38801`, screencast via browser-use's in-process CDP client, and a daemon-held control **baton** that refuses agent mutating actions while the user drives. The orchestrator gains a fail-closed config, a `POST …/browser/open` endpoint (ensure workspace → `stream_info` over SSH → set canvas `BrowserSource`), and a binary WS relay riding `PinnedSSHTransportPool.open_loopback_connection` (the canvas live-app SSH path). Plan 2 (separate) builds the cockpit renderer on top.
 
 **Tech Stack:** Python 3 stdlib (daemon), browser-use 0.12.x in-process CDP (`session.get_or_create_cdp_session`), FastAPI + asyncssh (orchestrator), pytest, podman (Fedora — use `:Z` on volume mounts).
+
+## Execution record (updated 2026-07-21)
+
+**Plan 1 is complete.** All 13 tasks below were implemented on `develop` in
+commits `cd712525` through `9f06579d`, followed by the lifecycle/race review
+fix in `29424593`. The feature remains dark by default, and nothing was
+pushed during execution.
+
+Implemented scope:
+
+- browser-use `0.12.9` CDP feasibility probe and recorded call forms;
+- daemon framing, navigation validation, generation/stream state, control
+  baton, loopback listener, screencast, input dispatch, and real-Chromium
+  container conformance gate;
+- orchestrator fail-closed config, broker helpers, Canvas capability, open
+  endpoint, generation-pinned WebSocket relay, activity marking, and Helm
+  wiring.
+
+Final verification evidence:
+
+- the six shared-browser pytest files passed: **55 tests**;
+- the selected Canvas regression suites passed: **40 tests**;
+- a rebuilt `srw-workspace-stream-test` image passed the Podman conformance
+  gate against real Chromium, including a received 6,990-byte JPEG frame;
+- both Helm CI value sets linted successfully;
+- `ruff check src/ orchestrator/ tests/` passed.
+
+The full repository `ruff format --check` still reports three unrelated,
+pre-existing files outside this plan's changes:
+`orchestrator/services/project_loop_sweeper.py`,
+`tests/test_loop_unified_advance.py`, and
+`tests/test_project_loop_sweeper.py`. The files touched by this plan pass the
+format check. The optional Canvas SSH transport suite also remains
+environment-limited on this host because `asyncssh` is not installed (31
+passed, 2 skipped, 6 failed at that import boundary).
+
+The final review deliberately tightened several details beyond the illustrative
+code snippets below. Baton changes and user input are serialized with daemon
+browser actions; mutating actions re-check the baton while holding that lock;
+page-state changes are broadcast; viewer activity is marked immediately on
+attach; spawned SSH children are reaped; and the relay closes with `4409` when
+the staged Canvas generation is either missing or different. The checked-in
+implementation and tests are authoritative where a snippet below differs.
+
+The container workspace path is conformance-proven. VM support is not yet
+claimed operational: it still needs an attested remote Canvas binding,
+orchestrator-to-VM routing in the target deployment, and the Plan-2 VM image
+provisioning/conformance wiring. The shared SSH abstraction is ready for that
+path, but the current default deployment does not prove it.
 
 ## Global Constraints
 
@@ -48,7 +99,7 @@ The whole daemon design assumes browser-use exposes an in-process CDP client (`s
 **Interfaces:**
 - Produces: written confirmation of the four call forms Task 6's `ScreencastCdp` uses: (1) obtain CDP session, (2) start screencast + receive `Page.screencastFrame` events, (3) `Page.screencastFrameAck`, (4) `Input.dispatchMouseEvent`/`dispatchKeyEvent`.
 
-- [ ] **Step 1: Build the workspace image locally** (uses the repo's own Dockerfile so the probe matches HEAD; takes several minutes)
+- [x] **Step 1: Build the workspace image locally** (uses the repo's own Dockerfile so the probe matches HEAD; takes several minutes)
 
 ```bash
 podman build -f docker/Dockerfile.workspace -t srw-workspace-probe .
@@ -56,7 +107,7 @@ podman build -f docker/Dockerfile.workspace -t srw-workspace-probe .
 
 Expected: successful build ending with the `assert-browser-stack.sh` gate printing `Workspace browser stack OK.`
 
-- [ ] **Step 2: Write the probe script** to `/tmp/claude-1000/…/scratchpad/cdp_probe.py` (any scratch path works; it is volume-mounted, not committed):
+- [x] **Step 2: Write the probe script** to `/tmp/claude-1000/…/scratchpad/cdp_probe.py` (any scratch path works; it is volume-mounted, not committed):
 
 ```python
 """Probe browser-use's in-process CDP surface inside the workspace image."""
@@ -130,7 +181,7 @@ async def main() -> int:
 sys.exit(asyncio.run(main()))
 ```
 
-- [ ] **Step 3: Run the probe in the image**
+- [x] **Step 3: Run the probe in the image**
 
 ```bash
 podman run --rm --entrypoint python3 \
@@ -140,11 +191,11 @@ podman run --rm --entrypoint python3 \
 
 Expected: `PROBE PASS` with `FRAME OK`, `ACK OK`, `INPUT OK` printed. If an attribute is missing (e.g. no `client.register`), the probe stack-traces at that line — that's the data you need.
 
-- [ ] **Step 4: Record results.** Write `docs/superpowers/plans/notes-browseruse-cdp-api.md` capturing: browser-use version, the exact working call forms for the four capabilities, whether `target_id` exists on the session object, and the layout-metrics key holding the CSS viewport (`cssLayoutViewport` expected). If a call form differed from the probe script's, record the working form — Task 6 adapts **only** its `ScreencastCdp` class to match.
+- [x] **Step 4: Record results.** Write `docs/superpowers/plans/notes-browseruse-cdp-api.md` capturing: browser-use version, the exact working call forms for the four capabilities, whether `target_id` exists on the session object, and the layout-metrics key holding the CSS viewport (`cssLayoutViewport` expected). If a call form differed from the probe script's, record the working form — Task 6 adapts **only** its `ScreencastCdp` class to match.
 
 **⛔ STOP GATE:** If screencast frames or input dispatch are NOT reachable in-process by any call form, stop and report back — the spec's Piece-1 architecture needs revisiting before any code is written.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/superpowers/plans/notes-browseruse-cdp-api.md
@@ -162,7 +213,7 @@ git commit -m "docs(browser): record browser-use in-process CDP probe results"
 **Interfaces:**
 - Produces: `encode_stream_frame(ftype: int, payload: bytes) -> bytes`, `async read_stream_frame(reader) -> tuple[int, bytes]`, `encode_frame_payload(header: dict, jpeg: bytes) -> bytes`, `decode_frame_payload(payload: bytes) -> tuple[dict, bytes]`, constants `T_HELLO..T_ERROR`, `STREAM_PORT`, `STREAM_QUALITY`, `STREAM_MAX_WIDTH`, `STREAM_MAX_HEIGHT`, `STREAM_EVERY_NTH`, `MAX_STREAM_FRAME`, `BATON_GRACE_S`. Consumed by Tasks 4–7 (and mirrored by Task 9).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 """Host-side unit tests for docker/browser-exec streaming additions.
@@ -230,12 +281,12 @@ class TestFramingCodec:
         assert jpeg2 == jpeg
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -v`
 Expected: FAIL — `AttributeError: module 'browser_exec_mod' has no attribute 'encode_stream_frame'` (import of the file itself must succeed).
 
-- [ ] **Step 3: Implement.** In `docker/browser-exec`, add `import struct` to the stdlib import block, then insert after the `VALID_ACTIONS` block (~line 98):
+- [x] **Step 3: Implement.** In `docker/browser-exec`, add `import struct` to the stdlib import block, then insert after the `VALID_ACTIONS` block (~line 98):
 
 ```python
 # ─────────────────────────────────────────────────────────────────────
@@ -283,12 +334,12 @@ def decode_frame_payload(payload: bytes) -> tuple:
     return json.loads(payload[2 : 2 + hlen].decode()), payload[2 + hlen :]
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -v`
 Expected: 5 PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docker/browser-exec tests/tools/research/test_browser_exec_stream.py
@@ -309,7 +360,7 @@ User URL-bar navigations must apply the same policy as agent navigation (`src/to
 - Consumes: `LocalFileServer.url_for(url)` (exists, `docker/browser-exec:195`).
 - Produces: `validate_user_nav(url: str, files) -> str` (raises `ValueError` on policy violation). Consumed by Task 5's CONTROL `navigate`.
 
-- [ ] **Step 1: Write the failing tests** (append to the test file)
+- [x] **Step 1: Write the failing tests** (append to the test file)
 
 ```python
 class _StubFiles:
@@ -350,12 +401,12 @@ class TestValidateUserNav:
             BE.validate_user_nav("   ", _StubFiles())
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -k ValidateUserNav -v`
 Expected: FAIL — no attribute `validate_user_nav`.
 
-- [ ] **Step 3: Implement** (in `docker/browser-exec`; `re` must be added to the stdlib imports):
+- [x] **Step 3: Implement** (in `docker/browser-exec`; `re` must be added to the stdlib imports):
 
 ```python
 # Vendored from src/tools/research/browser_security.py (the daemon cannot
@@ -395,12 +446,12 @@ def validate_user_nav(url: str, files) -> str:
     return url
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -v`
 Expected: all PASS (13 total).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docker/browser-exec tests/tools/research/test_browser_exec_stream.py
@@ -421,7 +472,7 @@ The baton (single-controller lease) lives in the daemon, next to the browser. Wh
 - Consumes: Task 2 constants.
 - Produces: `class StreamHub` with `baton: str`, `generation: str|None`, `token: str|None`, `viewers: dict[int, asyncio.Queue]`, `mint_generation(initial_baton=None)`, `state_payload() -> dict`, `take_baton()`, `release_baton()`, `add_viewer(queue) -> int`, `remove_viewer(vid)`, `broadcast(frame: bytes)`, `shutdown_viewers(code: str)`, `on_state_change` callback attr; `MUTATING_ACTIONS` set; `BrowserDaemon.hub`; daemon action `stream_info` returning `{"generation", "token", "port", "baton"}`; refusal dict `{"error": "user_is_driving", "url": …, "message": …}`. Consumed by Tasks 5–7 and (over SSH) Tasks 11–12.
 
-- [ ] **Step 1: Write the failing tests** (append)
+- [x] **Step 1: Write the failing tests** (append)
 
 ```python
 class TestStreamHub:
@@ -503,12 +554,12 @@ class TestBatonRefusal:
         assert "unknown action" in resp["error"]
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -k "StreamHub or BatonRefusal" -v`
 Expected: FAIL — no attribute `StreamHub`.
 
-- [ ] **Step 3: Implement.** Add `import secrets`, `import time`, `import uuid` to the stdlib imports. Insert after `validate_user_nav`:
+- [x] **Step 3: Implement.** Add `import secrets`, `import time`, `import uuid` to the stdlib imports. Insert after `validate_user_nav`:
 
 ```python
 # Agent actions refused while the user holds the baton. Reads (snapshot,
@@ -667,12 +718,12 @@ Note: `session = await self._get_session()` already runs before the action branc
         result["baton"] = self.hub.baton
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -v`
 Expected: all PASS (21 total).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docker/browser-exec tests/tools/research/test_browser_exec_stream.py
@@ -693,7 +744,7 @@ The TCP side-channel: authenticate via hello token, register a viewer queue, pum
 - Consumes: Tasks 2–4 (codec, `validate_user_nav`, `StreamHub`).
 - Produces: `async start_stream_server(daemon) -> asyncio.AbstractServer` (binds `127.0.0.1:STREAM_PORT`, wires `hub.on_state_change`); `BrowserDaemon.ensure_screencast()` / `stop_screencast()` (no-op stubs until Task 6); `BrowserDaemon.user_control_nav(op, url=None)`; `BrowserDaemon.dispatch_user_input(event: dict)` (stub until Task 6). Consumed by Tasks 6–7 and the orchestrator relay (protocol peer).
 
-- [ ] **Step 1: Write the failing tests** (append)
+- [x] **Step 1: Write the failing tests** (append)
 
 ```python
 class TestStreamListener:
@@ -773,12 +824,12 @@ class TestStreamListener:
         asyncio.run(run())
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -k StreamListener -v`
 Expected: FAIL — no attribute `start_stream_server`.
 
-- [ ] **Step 3: Implement.** Add to `BrowserDaemon` (after `user_control_nav` insertion points below); first the daemon methods:
+- [x] **Step 3: Implement.** Add to `BrowserDaemon` (after `user_control_nav` insertion points below); first the daemon methods:
 
 ```python
     # ── shared-browser streaming hooks ──
@@ -934,12 +985,12 @@ and in the shutdown path (after `await stop_event.wait()`):
     await stream_server.wait_closed()
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -v`
 Expected: all PASS (24 total).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docker/browser-exec tests/tools/research/test_browser_exec_stream.py
@@ -959,7 +1010,7 @@ The only part written against browser-use's CDP surface. **Consult `docs/superpo
 - Consumes: Task 1 notes; `StreamHub.broadcast`; codec.
 - Produces: real `ensure_screencast()` / `stop_screencast()` / `dispatch_user_input()` bodies; `INPUT` message contract `{"kind": "mouse"|"key"|"wheel", "params": {…CDP Input params…}}`.
 
-- [ ] **Step 1: Implement `ScreencastCdp`** (module level, after `StreamHub`):
+- [x] **Step 1: Implement `ScreencastCdp`** (module level, after `StreamHub`):
 
 ```python
 class ScreencastCdp:
@@ -1070,7 +1121,7 @@ class ScreencastCdp:
         log("screencast stopped")
 ```
 
-- [ ] **Step 2: Replace the three Task-5 stubs on `BrowserDaemon`:**
+- [x] **Step 2: Replace the three Task-5 stubs on `BrowserDaemon`:**
 
 ```python
     async def ensure_screencast(self) -> None:
@@ -1102,12 +1153,12 @@ Also add `self._screencast = None` to `BrowserDaemon.__init__`, and in `_close_s
         self._screencast = None
 ```
 
-- [ ] **Step 3: Sanity-check imports and syntax** (no Chromium on the host, so only a parse/test-suite check):
+- [x] **Step 3: Sanity-check imports and syntax** (no Chromium on the host, so only a parse/test-suite check):
 
 Run: `python -m pytest tests/tools/research/test_browser_exec_stream.py -v`
 Expected: all 24 still PASS (proves the file still imports stdlib-only and nothing regressed).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docker/browser-exec
@@ -1127,7 +1178,7 @@ End-to-end proof inside the actual workspace image: daemon spawns, stream authen
 - Consumes: everything from Tasks 2–6, over the real unix socket + TCP listener.
 - Produces: an executable check exiting 0 on pass — the future `assert-browser-stack.sh` `_check` target.
 
-- [ ] **Step 1: Write the check script** at `docker/check-browser-stream.py`:
+- [x] **Step 1: Write the check script** at `docker/check-browser-stream.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -1282,14 +1333,14 @@ if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
 ```
 
-- [ ] **Step 2: Make it executable and rebuild the image** (picks up the Task 2–6 daemon changes):
+- [x] **Step 2: Make it executable and rebuild the image** (picks up the Task 2–6 daemon changes):
 
 ```bash
 chmod +x docker/check-browser-stream.py
 podman build -f docker/Dockerfile.workspace -t srw-workspace-stream-test .
 ```
 
-- [ ] **Step 3: Run the gate**
+- [x] **Step 3: Run the gate**
 
 ```bash
 podman run --rm --entrypoint python3 \
@@ -1299,7 +1350,7 @@ podman run --rm --entrypoint python3 \
 
 Expected: every line `ok`, ending `Shared-browser stream conformance OK.`, exit 0. On failure, `podman run … cat /tmp/bx-check.log` equivalent (add `--rm=false` and inspect) shows the daemon log. Debug loop: fix `docker/browser-exec` (usually `ScreencastCdp` call forms vs the Task-1 notes), rebuild, rerun.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docker/check-browser-stream.py
@@ -1317,7 +1368,7 @@ git commit -m "test(browser): container conformance gate for stream mode"
 **Interfaces:**
 - Produces: `browser_stream_config() -> BrowserStreamConfig` with fields `enabled: bool`, `stream_port: int`, `max_viewers: int`, `connect_timeout_seconds: int`, `activity_interval_seconds: int`; `BrowserStreamConfigurationError`. Consumed by Tasks 10–12.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 """Fail-closed config for the shared-browser broker (mirrors canvas_viewer_config style)."""
@@ -1371,12 +1422,12 @@ def test_bounded_int_rejects_garbage(monkeypatch):
         browser_stream_config()
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_shared_browser_config.py -v`
 Expected: FAIL — `ModuleNotFoundError: services.browser_stream_config` (the repo conftest puts `orchestrator/` on `sys.path`).
 
-- [ ] **Step 3: Implement** `orchestrator/services/browser_stream_config.py`:
+- [x] **Step 3: Implement** `orchestrator/services/browser_stream_config.py`:
 
 ```python
 """Fail-closed configuration for the shared-browser stream broker.
@@ -1443,12 +1494,12 @@ def browser_stream_config() -> BrowserStreamConfig:
     )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_shared_browser_config.py -v`
 Expected: 4 PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/browser_stream_config.py tests/test_shared_browser_config.py
@@ -1469,7 +1520,7 @@ Shared helpers both the open endpoint and the WS relay use. The framing codec is
 - Consumes: `build_agent_ssh_cmd` (`orchestrator/services/ssh_helpers.py:77`), Task 8 config.
 - Produces: `T_HELLO..T_ERROR`, `encode_stream_frame(ftype, payload) -> bytes`, `async read_stream_frame(reader) -> tuple[int, bytes]`, `workspace_ready(thread: dict) -> bool`, `ssh_endpoint(thread: dict) -> tuple[str, int]` (raises `BrowserStreamUnavailable`), `async exec_stream_info(thread: dict, *, initial_baton: str | None = None) -> dict` (raises `BrowserStreamUnavailable`), `class BrowserStreamUnavailable(Exception)` with `.status` and `.detail`. Consumed by Tasks 11–12.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 """Broker helper tests: codec mirror, readiness, ssh endpoint resolution."""
@@ -1546,12 +1597,12 @@ class TestExecStreamInfo:
             asyncio.run(broker.exec_stream_info(thread))
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_shared_browser_broker.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement** `orchestrator/services/browser_stream_broker.py` (helpers half):
+- [x] **Step 3: Implement** `orchestrator/services/browser_stream_broker.py` (helpers half):
 
 ```python
 """Shared-browser stream broker: helpers + WS↔SSH relay.
@@ -1660,12 +1711,12 @@ async def exec_stream_info(thread: dict, *, initial_baton: str | None = None) ->
     return info
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_shared_browser_broker.py -v`
 Expected: 7 PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/browser_stream_broker.py tests/test_shared_browser_broker.py
@@ -1685,7 +1736,7 @@ git commit -m "feat(canvas): browser stream broker helpers and framing mirror"
 - Consumes: `BrowserSource` (`canvas.py:102`), `browser_stream_config`, `workspace_ready`.
 - Produces: `CanvasCapabilities.can_stream_browser: bool` in every canvas state response; `status == "ready"` for browser records when the feature is on and the workspace is up. Consumed by the Plan-2 cockpit renderer gate.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 """Browser canvas records expose can_stream_browser when the feature is on."""
@@ -1750,12 +1801,12 @@ def test_default_field_value():
 
 Note: if `CanvasRecord`'s constructor signature differs (check `orchestrator/services/canvas.py` around the `CanvasRecord` definition before writing), build the record with the actual fields — the assertion targets are the point, not the fixture shape.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_shared_browser_capability.py -v`
 Expected: FAIL — `can_stream_browser` unknown field / capability False.
 
-- [ ] **Step 3: Implement.** In `orchestrator/services/canvas.py` extend `CanvasCapabilities`:
+- [x] **Step 3: Implement.** In `orchestrator/services/canvas.py` extend `CanvasCapabilities`:
 
 ```python
 class CanvasCapabilities(_StrictFrozenModel):
@@ -1780,12 +1831,12 @@ In `orchestrator/routers/canvases.py` add imports (`BrowserSource` to the existi
             )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_shared_browser_capability.py -v`
 Expected: 4 PASS. Also run `python -m pytest tests/test_canvas_slice0.py -v` — the slice-0 model tests must stay green (the new field defaults to False and the model is additive).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/canvas.py orchestrator/routers/canvases.py tests/test_shared_browser_capability.py
@@ -1807,7 +1858,7 @@ The single cold-start + recovery path (spec Piece 2): lite-reject → ensure wor
 - Consumes: `require_thread_owner` (`security.access`), `CanvasService.set` + `CanvasSetInput` + `BrowserSource` (`services.canvas`), `ensure_session_workspace` + main globals (`sessions.py:236-250` pattern), `LITE_BACKENDS` (`src.core.backends.factory`), Task 9 helpers.
 - Produces: `POST /api/persistent/threads/{thread_id}/browser/open` → `200 {"status":"ready","generation":…,"stream_port":…}` | `202 {"status":"provisioning"}` | `404` flag off | `409 {"code":"workspace_required"}` lite | `5xx` per `BrowserStreamUnavailable`. `opened_by: "user"|"agent"` request field (default `"user"`) → daemon initial baton. Consumed by the Plan-2 cockpit button and agent `set_canvas` handling.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 """Open-endpoint flow tests with faked db/ssh/provisioning."""
@@ -1921,12 +1972,12 @@ def test_browser_unreachable_maps_status(client, monkeypatch):
     assert resp.status_code == 502
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_shared_browser_open.py -v`
 Expected: FAIL — `ModuleNotFoundError: routers.shared_browser`.
 
-- [ ] **Step 3: Implement** `orchestrator/routers/shared_browser.py`:
+- [x] **Step 3: Implement** `orchestrator/routers/shared_browser.py`:
 
 ```python
 """Shared-browser open endpoint (docs/features/shared_browser.md, Piece 2).
@@ -2052,12 +2103,12 @@ async def open_shared_browser(
 
 Register it: in `orchestrator/routers/__init__.py`, export following the existing pattern (e.g. `from .shared_browser import router as shared_browser_router`), and in `orchestrator/main.py` add `app.include_router(shared_browser_router)` next to the existing block (~line 7282) with the matching import next to the other router imports.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_shared_browser_open.py -v`
 Expected: 5 PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/routers/shared_browser.py orchestrator/routers/__init__.py orchestrator/main.py tests/test_shared_browser_open.py
@@ -2079,7 +2130,7 @@ The binary WS ↔ SSH relay: auth-before-accept (ide_proxy_ws pattern, `main.py:
 - Consumes: `resolve_ws_user` (`security/auth.py:646`), `resolve_remote_workspace_target` + `bound_workspace_generation` + `PINNED_SSH_TRANSPORT_POOL` (`services/canvas_ssh.py`), `resolve_ssh_key_path` (`services/__init__.py:8`), `db.get_thread`, `db.merge_thread_workspace_context` (`postgres.py:3064` — bumps `threads.last_activity`), Task 9 helpers.
 - Produces: `async relay_browser_stream(ws, thread_id, *, db)`; WS route `GET /api/persistent/threads/{thread_id}/browser/stream`; WS message contract: binary `[1-byte type][payload]` both directions; close codes `4404` disabled, `4401` unauthenticated, `4403` not owner/approved, `4503` workspace not ready, `4429` viewer cap, `4409` generation mismatch vs canvas, `4502` upstream unreachable.
 
-- [ ] **Step 1: Write the failing tests** (append to `tests/test_shared_browser_broker.py`)
+- [x] **Step 1: Write the failing tests** (append to `tests/test_shared_browser_broker.py`)
 
 ```python
 from contextlib import asynccontextmanager
@@ -2230,12 +2281,12 @@ class TestRelayHappyPath:
         assert any(w[4] == broker.T_CONTROL for w in written[1:])
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `python -m pytest tests/test_shared_browser_broker.py -v`
 Expected: new tests FAIL — `relay_browser_stream` missing.
 
-- [ ] **Step 3: Implement the relay** (append to `orchestrator/services/browser_stream_broker.py`):
+- [x] **Step 3: Implement the relay** (append to `orchestrator/services/browser_stream_broker.py`):
 
 ```python
 # ── WS ↔ SSH relay ───────────────────────────────────────────────────
@@ -2408,12 +2459,12 @@ async def shared_browser_stream_ws(ws: WebSocket, thread_id: str):
     await relay_browser_stream(ws, thread_id, db=postgres_db)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_shared_browser_broker.py -v`
 Expected: all PASS (11 total).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/services/browser_stream_broker.py orchestrator/main.py tests/test_shared_browser_broker.py
@@ -2433,7 +2484,7 @@ The five-file flag pattern (matching `canvas.livePreview.enabled` exactly), a sl
 **Interfaces:**
 - Produces: `canvas.sharedBrowser.enabled` (default `false`) → env `CANVAS_SHARED_BROWSER_ENABLED` on the orchestrator; dev profile on.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 """Helm gate for canvas.sharedBrowser (pattern: test_canvas_slice3_infra)."""
@@ -2470,12 +2521,12 @@ def test_dev_profile_enables_shared_browser():
     assert experimental["canvas"]["sharedBrowser"]["enabled"] is True
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/test_shared_browser_infra.py -v`
 Expected: FAIL — `KeyError: 'sharedBrowser'`.
 
-- [ ] **Step 3: Implement the five files.**
+- [x] **Step 3: Implement the five files.**
 
 `helm/values.yaml` — under `canvas:`, sibling of `livePreview:`:
 
@@ -2520,12 +2571,12 @@ Expected: FAIL — `KeyError: 'sharedBrowser'`.
     enabled: true
 ```
 
-- [ ] **Step 4: Run test to verify it passes, then lint the chart**
+- [x] **Step 4: Run test to verify it passes, then lint the chart**
 
 Run: `python -m pytest tests/test_shared_browser_infra.py -v` → 3 PASS.
 Run: `helm lint helm/` → `1 chart(s) linted, 0 chart(s) failed`.
 
-- [ ] **Step 5: Full plan verification sweep**
+- [x] **Step 5: Full plan verification sweep**
 
 ```bash
 python -m pytest tests/test_shared_browser_config.py tests/test_shared_browser_broker.py \
@@ -2536,7 +2587,7 @@ python -m pytest tests/test_canvas_slice0.py tests/test_canvas_slice3_infra.py -
 
 Expected: all PASS (the canvas slice suites prove no regression in the models/infra the plan touched).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add helm/values.yaml helm/values.schema.json helm/templates/configmap.yaml \
