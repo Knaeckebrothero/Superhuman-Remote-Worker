@@ -1390,8 +1390,7 @@ class RemoteBackend(WorkspaceBackend):
         self._ensure_shell()
         if tab_name not in self._tabs:
             raise KeyError(
-                f"Tab '{tab_name}' not found. Available: "
-                f"{', '.join(self._tabs.keys())}"
+                f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}"
             )
         tab = self._tabs[tab_name]
 
