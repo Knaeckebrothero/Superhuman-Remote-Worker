@@ -535,7 +535,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isCanvasState(value: unknown): value is CanvasState {
+export function isCanvasState(value: unknown): value is CanvasState {
   if (!isRecord(value)) return false;
   const source = value['source'];
   const capabilities = value['capabilities'];
@@ -560,6 +560,8 @@ function isCanvasState(value: unknown): value is CanvasState {
     typeof capabilities['can_edit'] === 'boolean' &&
     typeof capabilities['can_pop_out'] === 'boolean' &&
     typeof capabilities['can_take_control'] === 'boolean' &&
+    (capabilities['can_stream_browser'] === undefined ||
+      typeof capabilities['can_stream_browser'] === 'boolean') &&
     typeof value['updated_at'] === 'string'
   );
 }
