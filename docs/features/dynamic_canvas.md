@@ -2733,6 +2733,14 @@ The precise current boundary, protocol, and redacted evidence are in
 `shared_browser.md`, `docs/tests/shared_browser_verification.md`, and the two
 execution plans.
 
+The next shared-browser checkpoint is **Plan 3 — release and enablement**. It
+will carry the four unfinished Plan-2 acceptance gates: reproducible live k3d
+automation on healthy networking, prompt-driven form/cookie handoff with a
+working LLM, the stage-2 VM image conformance run, and guarded Tilt enablement.
+No new Canvas source or renderer is required for that checkpoint. Proactive
+agent takeover requests and pushed baton events belong to a later
+evidence-driven collaboration slice.
+
 ### Slice 6 — Expansion based on evidence
 
 - Multiple named canvases and optionally a grid.
