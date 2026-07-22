@@ -217,8 +217,9 @@ RUN chmod +x /usr/local/bin/browser-exec
 #     See docs/issues/vm_workspace_missing_browser_exec.md. Installed permanently
 #     as well as run, so any live workspace can be interrogated in five seconds.
 # ---------------------------------------------------------------------------
+COPY docker/check-browser-stream.py /usr/local/bin/check-browser-stream
 COPY docker/assert-browser-stack.sh /usr/local/bin/assert-browser-stack
-RUN chmod +x /usr/local/bin/assert-browser-stack \
+RUN chmod +x /usr/local/bin/check-browser-stream /usr/local/bin/assert-browser-stack \
     && /usr/local/bin/assert-browser-stack
 
 # ---------------------------------------------------------------------------
