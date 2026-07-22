@@ -13,6 +13,7 @@ from services.canvas_ssh import (
     CANVAS_LOOPBACK_HOST,
     CanvasDirectChannelUnavailable,
     CanvasSSHError,
+    PinnedSSHCommandResult,
     PinnedSSHTransportPool,
     RemoteWorkspaceTarget,
 )
@@ -74,6 +75,9 @@ class _Connection:
         self.open_error: BaseException | None = None
         self.open_calls: list[tuple[str, int]] = []
         self.writers: list[_Writer] = []
+        self.processes: list[_Process] = []
+        self.process_error: BaseException | None = None
+        self.commands: list[str] = []
 
     def is_closed(self) -> bool:
         return self.closed or self.remote_closed
@@ -92,6 +96,52 @@ class _Connection:
         writer = _Writer()
         self.writers.append(writer)
         return object(), writer
+
+    async def create_process(self, command: str, *, encoding=None):
+        assert encoding is None
+        self.commands.append(command)
+        if self.process_error is not None:
+            raise self.process_error
+        return self.processes.pop(0)
+
+
+class _Reader:
+    def __init__(self, data: bytes = b"", *, stall: bool = False) -> None:
+        self._data = bytearray(data)
+        self._stall = stall
+
+    async def read(self, size: int) -> bytes:
+        if self._stall:
+            await asyncio.Event().wait()
+        if not self._data:
+            return b""
+        result = bytes(self._data[:size])
+        del self._data[:size]
+        return result
+
+
+class _Process:
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        exit_status: int = 0,
+        stall: bool = False,
+    ) -> None:
+        self.stdout = _Reader(stdout, stall=stall)
+        self.stderr = _Reader(stderr, stall=stall)
+        self.exit_status = exit_status
+        self.terminated = False
+        self.waited = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.stdout._stall = False
+        self.stderr._stall = False
+
+    async def wait_closed(self) -> None:
+        self.waited = True
 
 
 def _target(generation: UUID = GENERATION) -> RemoteWorkspaceTarget:
@@ -144,6 +194,279 @@ async def test_direct_channel_teardown_is_bounded(monkeypatch) -> None:
 
 async def _resolved_thread() -> dict[str, Any]:
     return _thread()
+
+
+@pytest.mark.asyncio
+async def test_run_command_uses_pinned_transport_and_revalidates_identity(
+    monkeypatch,
+) -> None:
+    connection = _Connection()
+    connection.processes.append(
+        _Process(stdout=b"ready\n", stderr=b"warning\n", exit_status=0)
+    )
+    connect_calls = 0
+
+    async def connect(*args: Any, **kwargs: Any):
+        nonlocal connect_calls
+        del args, kwargs
+        connect_calls += 1
+        return connection
+
+    monkeypatch.setattr(canvas_ssh.asyncssh, "connect", connect)
+    pool = PinnedSSHTransportPool(idle_timeout=60)
+    resolver_calls = 0
+
+    async def current() -> dict[str, Any]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return _thread()
+
+    result = await pool.run_command(
+        target=_target(),
+        command="browser-exec stream_info --json '{}'",
+        key_path="/tmp/id_ed25519",
+        generation_resolver=current,
+        timeout=1,
+        max_output_bytes=64 * 1024,
+    )
+
+    assert result == PinnedSSHCommandResult(
+        exit_status=0,
+        stdout=b"ready\n",
+        stderr=b"warning\n",
+    )
+    assert connection.commands == ["browser-exec stream_info --json '{}'"]
+    assert resolver_calls == 2
+    assert connect_calls == 1
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_run_command_rejects_post_command_generation_change(monkeypatch) -> None:
+    connection = _Connection()
+    connection.processes.append(_Process(stdout=b"ready\n"))
+
+    async def connect(*args: Any, **kwargs: Any):
+        del args, kwargs
+        return connection
+
+    monkeypatch.setattr(canvas_ssh.asyncssh, "connect", connect)
+    pool = PinnedSSHTransportPool(idle_timeout=60)
+    calls = 0
+
+    async def rotated() -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return _thread() if calls == 1 else _thread(generation=NEXT_GENERATION)
+
+    with pytest.raises(CanvasSSHError) as error:
+        await pool.run_command(
+            target=_target(),
+            command="true",
+            key_path="/tmp/key",
+            generation_resolver=rotated,
+            timeout=1,
+            max_output_bytes=64 * 1024,
+        )
+
+    assert error.value.code == "workspace_generation_changed"
+    assert connection.closed is False
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_run_command_rejects_generation_change_before_process(
+    monkeypatch,
+) -> None:
+    connection = _Connection()
+
+    async def connect(*args: Any, **kwargs: Any):
+        del args, kwargs
+        return connection
+
+    monkeypatch.setattr(canvas_ssh.asyncssh, "connect", connect)
+    pool = PinnedSSHTransportPool(idle_timeout=60)
+
+    async def rotated() -> dict[str, Any]:
+        return _thread(generation=NEXT_GENERATION)
+
+    with pytest.raises(CanvasSSHError) as error:
+        await pool.run_command(
+            target=_target(),
+            command="true",
+            key_path="/tmp/key",
+            generation_resolver=rotated,
+            timeout=1,
+            max_output_bytes=64 * 1024,
+        )
+
+    assert error.value.code == "workspace_generation_changed"
+    assert connection.commands == []
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_run_command_nonzero_is_channel_scoped_and_transport_is_reused(
+    monkeypatch,
+) -> None:
+    connection = _Connection()
+    connection.processes.extend(
+        [
+            _Process(stdout=b"out", stderr=b"failed", exit_status=7),
+            _Process(stdout=b"ok", exit_status=0),
+        ]
+    )
+    connect_calls = 0
+
+    async def connect(*args: Any, **kwargs: Any):
+        nonlocal connect_calls
+        del args, kwargs
+        connect_calls += 1
+        return connection
+
+    monkeypatch.setattr(canvas_ssh.asyncssh, "connect", connect)
+    pool = PinnedSSHTransportPool(idle_timeout=60)
+    kwargs = {
+        "target": _target(),
+        "key_path": "/tmp/key",
+        "generation_resolver": _resolved_thread,
+        "timeout": 1,
+        "max_output_bytes": 64 * 1024,
+    }
+
+    failed = await pool.run_command(command="false", **kwargs)
+    succeeded = await pool.run_command(command="true", **kwargs)
+
+    assert failed.exit_status == 7
+    assert failed.stderr == b"failed"
+    assert succeeded.stdout == b"ok"
+    assert connect_calls == 1
+    assert connection.closed is False
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_run_command_timeout_or_cancellation_terminates_process(
+    monkeypatch, cancel: bool
+) -> None:
+    connection = _Connection()
+    process = _Process(stall=True)
+    connection.processes.append(process)
+
+    async def connect(*args: Any, **kwargs: Any):
+        del args, kwargs
+        return connection
+
+    monkeypatch.setattr(canvas_ssh.asyncssh, "connect", connect)
+    pool = PinnedSSHTransportPool(idle_timeout=60)
+    task = asyncio.create_task(
+        pool.run_command(
+            target=_target(),
+            command="sleep forever",
+            key_path="/tmp/key",
+            generation_resolver=_resolved_thread,
+            timeout=0.01 if not cancel else 60,
+            max_output_bytes=64 * 1024,
+        )
+    )
+    if cancel:
+        while not connection.commands:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(CanvasSSHError) as error:
+            await task
+        assert error.value.status_code == 504
+
+    assert process.terminated is True
+    assert process.waited is True
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_run_command_bounds_combined_output(monkeypatch) -> None:
+    connection = _Connection()
+    process = _Process(stdout=b"a" * 32768, stderr=b"b" * 32769)
+    connection.processes.append(process)
+
+    async def connect(*args: Any, **kwargs: Any):
+        del args, kwargs
+        return connection
+
+    monkeypatch.setattr(canvas_ssh.asyncssh, "connect", connect)
+    pool = PinnedSSHTransportPool(idle_timeout=60)
+
+    with pytest.raises(CanvasSSHError) as error:
+        await pool.run_command(
+            target=_target(),
+            command="noisy",
+            key_path="/tmp/key",
+            generation_resolver=_resolved_thread,
+            timeout=1,
+            max_output_bytes=64 * 1024,
+        )
+
+    assert error.value.code == "workspace_command_output_too_large"
+    assert process.terminated is True
+    assert process.waited is True
+    assert connection.closed is False
+    await pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_run_command_invalidates_a_broken_transport(monkeypatch) -> None:
+    connection = _Connection()
+    connection.remote_closed = True
+    connection.process_error = OSError("transport lost")
+
+    async def connect(*args: Any, **kwargs: Any):
+        del args, kwargs
+        connection.remote_closed = False
+        return connection
+
+    original_create = connection.create_process
+
+    async def broken_create(*args: Any, **kwargs: Any):
+        connection.remote_closed = True
+        return await original_create(*args, **kwargs)
+
+    connection.create_process = broken_create  # type: ignore[method-assign]
+    monkeypatch.setattr(canvas_ssh.asyncssh, "connect", connect)
+    pool = PinnedSSHTransportPool(idle_timeout=60)
+
+    with pytest.raises(CanvasSSHError) as error:
+        await pool.run_command(
+            target=_target(),
+            command="true",
+            key_path="/tmp/key",
+            generation_resolver=_resolved_thread,
+            timeout=1,
+            max_output_bytes=64 * 1024,
+        )
+
+    assert error.value.code == "workspace_unavailable"
+    assert connection.closed is True
+    assert pool._entries == {}
+
+
+def test_pinned_client_rejects_host_key_mismatch() -> None:
+    class Key:
+        def __init__(self, fingerprint: str) -> None:
+            self.fingerprint = fingerprint
+
+        def get_fingerprint(self, algorithm: str) -> str:
+            assert algorithm == "sha256"
+            return self.fingerprint
+
+    client = canvas_ssh.PinnedSSHClient("SHA256:expected")
+
+    assert client.validate_host_public_key(None, None, None, Key("SHA256:expected"))
+    assert not client.validate_host_public_key(
+        None, None, None, Key("SHA256:unexpected")
+    )
 
 
 @pytest.mark.asyncio

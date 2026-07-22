@@ -33,7 +33,14 @@ def client(monkeypatch):
 
     monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
     monkeypatch.setattr(sb, "require_thread_owner", fake_owner)
-    monkeypatch.setattr(sb, "_get_db", lambda: SimpleNamespace())
+    db = SimpleNamespace()
+
+    async def get_thread(thread_id):
+        del thread_id
+        return dict(_READY_THREAD)
+
+    db.get_thread = get_thread
+    monkeypatch.setattr(sb, "_get_db", lambda: db)
     return app, TestClient(app)
 
 
@@ -99,7 +106,8 @@ def test_ready_workspace_sets_canvas_and_returns_generation(client, monkeypatch)
     _, test_client = client
     calls = {}
 
-    async def fake_info(thread, *, initial_baton=None):
+    async def fake_info(thread, *, initial_baton=None, generation_resolver):
+        assert await generation_resolver() == _READY_THREAD
         calls["baton"] = initial_baton
         return {
             "generation": "5f0a9f5e-0000-4000-8000-000000000001",
@@ -137,7 +145,8 @@ def test_ready_workspace_sets_canvas_and_returns_generation(client, monkeypatch)
 def test_browser_unreachable_maps_status(client, monkeypatch):
     _, test_client = client
 
-    async def fake_info(thread, *, initial_baton=None):
+    async def fake_info(thread, *, initial_baton=None, generation_resolver):
+        del generation_resolver
         raise BrowserStreamUnavailable(502, "browser-exec unreachable")
 
     monkeypatch.setattr(sb, "exec_stream_info", fake_info)

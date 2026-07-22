@@ -2,8 +2,10 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+import logging
 import threading
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi import FastAPI, WebSocket
@@ -11,6 +13,31 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from services import browser_stream_broker as broker
+from services.canvas_ssh import CanvasSSHError, PinnedSSHCommandResult
+
+
+_WORKSPACE_GENERATION = UUID("11111111-aaaa-4aaa-8aaa-111111111111")
+
+
+def _bound_thread(*, generation: UUID = _WORKSPACE_GENERATION) -> dict:
+    return {
+        "id": "t1",
+        "user_id": "u1",
+        "metadata": {
+            "_workspace_binding": {
+                "generation": str(generation),
+                "kind": "remote",
+                "backing_id": "workspace-a",
+                "ssh_host_key_fingerprint": "SHA256:test",
+            },
+            "workspace_container": {
+                "status": "ready",
+                "ssh_host": "workspace.test",
+                "ssh_port": 30022,
+                "_canvas_workspace_generation": str(generation),
+            },
+        },
+    }
 
 
 class TestCodecMirror:
@@ -43,126 +70,117 @@ class TestWorkspaceResolution:
             }
         }
         assert broker.workspace_ready(thread) is True
-        assert broker.ssh_endpoint(thread) == ("10.1.2.3", 2222)
-
-    def test_vm_preferred_when_ready(self):
-        thread = {
-            "metadata": {
-                "vm": {
-                    "status": "ready",
-                    "ssh_host": "100.99.1.2",
-                    "ssh_port": 22,
-                },
-                "workspace_container": {
-                    "status": "ready",
-                    "ssh_host": "10.1.2.3",
-                    "ssh_port": 2222,
-                },
-            }
-        }
-        assert broker.ssh_endpoint(thread) == ("100.99.1.2", 22)
 
     def test_not_ready(self):
         assert broker.workspace_ready({"metadata": {}}) is False
-        with pytest.raises(broker.BrowserStreamUnavailable):
-            broker.ssh_endpoint({"metadata": {}})
 
 
 class TestExecStreamInfo:
-    def test_parses_last_stdout_line(self, monkeypatch):
-        async def fake_exec(*cmd, **kwargs):
-            class Proc:
-                returncode = 0
+    def test_uses_pinned_pool_and_parses_last_stdout_line(self, monkeypatch):
+        captured = {}
 
-                async def communicate(self):
-                    return (
-                        b'[browser-exec] noise\n{"generation": "g1", '
-                        b'"token": "t", "port": 38801, "baton": "user"}\n',
-                        b"",
-                    )
+        async def run_command(**kwargs):
+            captured.update(kwargs)
+            return PinnedSSHCommandResult(
+                exit_status=0,
+                stdout=(
+                    b'[browser-exec] noise\n{"generation": "g1", '
+                    b'"token": "t", "port": 38801, "baton": "user"}\n'
+                ),
+                stderr=b"",
+            )
 
-                def kill(self):
-                    pass
+        async def forbidden_exec(*args, **kwargs):
+            raise AssertionError((args, kwargs))
 
-            return Proc()
+        monkeypatch.setattr(
+            broker.PINNED_SSH_TRANSPORT_POOL, "run_command", run_command
+        )
+        monkeypatch.setattr(broker, "build_agent_ssh_cmd", forbidden_exec, raising=False)
+        monkeypatch.setattr(broker.asyncio, "create_subprocess_exec", forbidden_exec)
+        monkeypatch.setattr(broker, "resolve_ssh_key_path", lambda: "/tmp/key")
+        monkeypatch.setattr(broker, "orchestrator_can_reach", lambda host: True)
+        thread = _bound_thread()
 
-        monkeypatch.setattr(broker.asyncio, "create_subprocess_exec", fake_exec)
-        thread = {
-            "metadata": {
-                "workspace_container": {
-                    "status": "ready",
-                    "ssh_host": "h",
-                    "ssh_port": 22,
-                }
-            }
-        }
-        info = asyncio.run(broker.exec_stream_info(thread, initial_baton="user"))
+        async def current():
+            return thread
+
+        info = asyncio.run(
+            broker.exec_stream_info(
+                thread,
+                initial_baton="user",
+                generation_resolver=current,
+            )
+        )
+
         assert info["generation"] == "g1"
+        assert captured["target"].generation == _WORKSPACE_GENERATION
+        assert captured["key_path"] == "/tmp/key"
+        assert captured["command"] == (
+            "browser-exec stream_info --json '{\"initial_baton\":\"user\"}'"
+        )
+        assert captured["generation_resolver"] is current
+        assert captured["max_output_bytes"] == 64 * 1024
 
-    def test_error_payload_raises(self, monkeypatch):
-        async def fake_exec(*cmd, **kwargs):
-            class Proc:
-                returncode = 0
+    def test_generation_change_maps_to_typed_unavailable(self, monkeypatch):
+        async def run_command(**kwargs):
+            await kwargs["generation_resolver"]()
+            raise CanvasSSHError(
+                409,
+                "workspace_generation_changed",
+                "sentinel private endpoint",
+            )
 
-                async def communicate(self):
-                    return (
-                        b'{"error": "could not reach browser-exec daemon"}\n',
-                        b"",
-                    )
-
-                def kill(self):
-                    pass
-
-            return Proc()
-
-        monkeypatch.setattr(broker.asyncio, "create_subprocess_exec", fake_exec)
-        thread = {
-            "metadata": {
-                "workspace_container": {
-                    "status": "ready",
-                    "ssh_host": "h",
-                    "ssh_port": 22,
-                }
-            }
-        }
-        with pytest.raises(broker.BrowserStreamUnavailable):
-            asyncio.run(broker.exec_stream_info(thread))
-
-    def test_timeout_kills_and_reaps_ssh_process(self, monkeypatch):
-        state = {"killed": False, "waited": False}
-
-        class Proc:
-            returncode = None
-
-            async def communicate(self):
-                await asyncio.sleep(3600)
-
-            def kill(self):
-                state["killed"] = True
-
-            async def wait(self):
-                state["waited"] = True
-
-        async def fake_exec(*cmd, **kwargs):
-            return Proc()
-
-        monkeypatch.setattr(broker.asyncio, "create_subprocess_exec", fake_exec)
-        monkeypatch.setattr(broker, "STREAM_INFO_TIMEOUT_S", 0.01)
-        thread = {
-            "metadata": {
-                "workspace_container": {
-                    "status": "ready",
-                    "ssh_host": "h",
-                    "ssh_port": 22,
-                }
-            }
-        }
+        monkeypatch.setattr(
+            broker.PINNED_SSH_TRANSPORT_POOL, "run_command", run_command
+        )
+        monkeypatch.setattr(broker, "resolve_ssh_key_path", lambda: "/tmp/key")
+        monkeypatch.setattr(broker, "orchestrator_can_reach", lambda host: True)
 
         with pytest.raises(broker.BrowserStreamUnavailable) as error:
-            asyncio.run(broker.exec_stream_info(thread))
+            asyncio.run(
+                broker.exec_stream_info(
+                    _bound_thread(),
+                    generation_resolver=lambda: asyncio.sleep(
+                        0, result=_bound_thread(generation=UUID(int=2))
+                    ),
+                )
+            )
 
-        assert error.value.status == 504
-        assert state == {"killed": True, "waited": True}
+        assert error.value.status == 409
+        assert "sentinel" not in error.value.detail
+
+    def test_nonzero_result_redacts_remote_output(
+        self, monkeypatch, caplog
+    ):
+        async def run_command(**kwargs):
+            del kwargs
+            return PinnedSSHCommandResult(
+                exit_status=7,
+                stdout=b"stdout-secret-sentinel",
+                stderr=b"stderr-secret-sentinel",
+            )
+
+        monkeypatch.setattr(
+            broker.PINNED_SSH_TRANSPORT_POOL, "run_command", run_command
+        )
+        monkeypatch.setattr(broker, "resolve_ssh_key_path", lambda: "/tmp/key")
+        monkeypatch.setattr(broker, "orchestrator_can_reach", lambda host: True)
+        caplog.set_level(logging.DEBUG)
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            asyncio.run(
+                broker.exec_stream_info(
+                    _bound_thread(),
+                    generation_resolver=lambda: asyncio.sleep(
+                        0, result=_bound_thread()
+                    ),
+                )
+            )
+
+        captured = error.value.detail + caplog.text
+        assert "stdout-secret-sentinel" not in captured
+        assert "stderr-secret-sentinel" not in captured
 
 
 def _ws_app():
