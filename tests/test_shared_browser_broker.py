@@ -583,7 +583,10 @@ class TestViewerAccounting:
 
             second_ws = _FakeWebSocket()
             await broker.relay_browser_stream(second_ws, "t1", db=db)
-            assert second_ws.accepted is False
+            # A pre-accept ASGI close becomes an HTTP denial in a real server,
+            # which browsers surface as abnormal code 1006. Complete the
+            # handshake first so Cockpit receives the contractual 4429.
+            assert second_ws.accepted is True
             assert second_ws.closes == [(4429, "Viewer limit reached")]
             assert broker._ACTIVE_VIEWERS == {"t1": 1}
 
