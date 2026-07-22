@@ -4,8 +4,10 @@
 > every task. Every implementation checkbox below starts unchecked; update it
 > only after the named verification has passed.
 >
-> **Plan status (2026-07-22):** Ready for execution; implementation has not
-> started.
+> **Plan status (2026-07-22):** Tasks 1–13 are implemented and verified.
+> Task 14 is partial: repository, container, Cockpit, Helm, and substantial
+> live-container gates pass, while VM artifact, prompt-driven LLM, and full
+> pod-rotation acceptance remain blocked by the recorded environment gaps.
 
 **Goal:** A session owner can click **Open browser** in Cockpit, watch and drive
 the exact Chromium used by the agent, hand control back and forth without
@@ -39,6 +41,39 @@ Podman/Packer, Helm, k3d/Tilt.
   Plan-1 baseline.
 - `docs/superpowers/plans/notes-browseruse-cdp-api.md` — real 0.12.9 CDP call
   forms.
+
+## Execution record — 2026-07-22
+
+Inline execution produced these path-scoped commits; nothing was pushed:
+
+| Task | Commit |
+|---|---|
+| 1 | `2e103cb9` |
+| 2 | `23389dfb` |
+| 3 | `438f87f6` |
+| 4 | `343a39a4` |
+| 5 | `e2a642a5` |
+| 6 | `4f2fc468` |
+| 7 | `3bfd1a2c` |
+| 8 | `9fdd152e` |
+| 9 | `b5e59aba` |
+| 10 | `0fad013f` |
+| 11 | `0e107915` |
+| 12 | `9b1e3ba3` |
+| 13 | `0c691202` |
+| Live admission fix | `e208fae9` |
+| Live service-restart fix | `5296ccaa` |
+
+Final automated evidence: 649 focused Python tests; Ruff lint; all Plan-2
+Python files independently Ruff-formatted; 95 Cockpit files / 1,347 tests;
+i18n parity; production build; 33 Chromium/Firefox/WebKit conformance cases;
+both Helm lint overlays and default/experimental renders; and a fresh Podman
+real-Chromium image conformance run. Live container evidence includes cold
+open, shared executor identity, baton/refusal, bad-navigation containment,
+popout, viewer cap, activity, zero-viewer release, clean-1012 reconnect, and
+ended/restart. See `docs/tests/shared_browser_verification.md` for the redacted
+record and the exact incomplete gates. Because those gates are incomplete,
+`deployment/values-tilt.yaml` remains disabled.
 
 ## Baseline and release boundary
 
@@ -274,14 +309,14 @@ identity.
         generation_resolver: GenerationResolver,
     ) -> dict
 
-- [ ] **Step 1: Write failing transport tests.** Cover an exact pinned target,
+- [x] **Step 1: Write failing transport tests.** Cover an exact pinned target,
   pre-command and post-command generation revalidation, host-key mismatch,
   non-zero command status, timeout, cancellation cleanup, a 64 KiB combined
   stdout/stderr limit, and transport invalidation on a broken connection.
   A remote command failure is channel-scoped and must not evict an otherwise
   healthy pooled transport.
 
-- [ ] **Step 2: Add `run_command`.** Lease via `checkout`, call
+- [x] **Step 2: Add `run_command`.** Lease via `checkout`, call
   `require_same_remote_workspace` before and after the remote process, read
   stdout and stderr concurrently into bounded byte buffers, and put the
   process under `asyncio.timeout`. On timeout/cancellation/output overflow,
@@ -289,7 +324,7 @@ identity.
   `_bounded_wait_closed`. Do not add a local listener and do not call a shell
   `ssh` binary.
 
-- [ ] **Step 3: Move `exec_stream_info`.** Resolve
+- [x] **Step 3: Move `exec_stream_info`.** Resolve
   `bound_workspace_generation -> resolve_remote_workspace_target -> key path`,
   reject `not orchestrator_can_reach(target.host)`, and invoke exactly:
 
@@ -302,14 +337,14 @@ identity.
   bounded `BrowserStreamUnavailable` messages; never return or log token-bearing
   stdout, raw stderr, the target, fingerprint, key path, or full command.
 
-- [ ] **Step 4: Prove the regression.** A test must patch
+- [x] **Step 4: Prove the regression.** A test must patch
   `build_agent_ssh_cmd`/`asyncio.create_subprocess_exec` to raise if reached
   while a fake pinned pool returns the identity. Another test changes the
   generation during the command and expects a typed unavailable result. A
   non-zero fake result containing sentinel secrets in both streams must return
   a generic error with neither sentinel in the detail or captured logs.
 
-- [ ] **Step 5: Run:**
+- [x] **Step 5: Run:**
 
       python -m pytest tests/test_canvas_ssh_transport.py \
         tests/test_shared_browser_broker.py -q
@@ -320,7 +355,7 @@ identity.
   Expected: all named tests pass and `rg "build_agent_ssh_cmd|StrictHostKeyChecking"
   orchestrator/services/browser_stream_broker.py` returns no matches.
 
-- [ ] **Step 6: Commit:**
+- [x] **Step 6: Commit:**
 
       git add orchestrator/services/canvas_ssh.py \
         orchestrator/services/browser_stream_broker.py \
@@ -366,24 +401,24 @@ identity.
         title: str,
     ) -> CanvasMutation
 
-- [ ] **Step 1: Write the capability matrix first.** Test flag off, cold
+- [x] **Step 1: Write the capability matrix first.** Test flag off, cold
   sandbox, cold VM, both lite tiers, ready-but-unbound, bad fingerprint,
   mismatched generation, missing key, unroutable tailnet, and a fully attested
   reachable container. Assert the public model has exactly the four locked
   fields and contains none of the private metadata used to decide.
 
-- [ ] **Step 2: Implement `browser_capability`.** Reuse
+- [x] **Step 2: Implement `browser_capability`.** Reuse
   `_thread_backend`, `remote_canvas_presentation_available`,
   `resolve_remote_workspace_target`, `resolve_ssh_key_path`, and
   `orchestrator_can_reach`. Do not duplicate a looser “ready” check. Cold open
   is positive only for `sandbox`/legacy `container` because their provisioner
   is already capable of creating the attested binding.
 
-- [ ] **Step 3: Add `GET /capability`.** Authenticate and authorize the owner
+- [x] **Step 3: Add `GET /capability`.** Authenticate and authorize the owner
   before returning the response, including while the feature is disabled.
   An absent/unauthorized thread must not be distinguishable through this route.
 
-- [ ] **Step 4: Add an idempotent Canvas mutation.** Add
+- [x] **Step 4: Add an idempotent Canvas mutation.** Add
   `CanvasService.set_if_changed` (or an equivalently named browser-specific
   method as one atomic PostgreSQL transaction. Take a transaction-scoped
   advisory lock derived from a domain-separated hash of `thread_id + canvas_id`
@@ -397,21 +432,21 @@ identity.
   unlocked read followed by `set`, and do **not** change ordinary `set`
   semantics: file/app republishing may intentionally advance a revision.
 
-- [ ] **Step 5: Factor prepare/commit.** `prepare_browser_canvas` calls the
+- [x] **Step 5: Factor prepare/commit.** `prepare_browser_canvas` calls the
   pinned `exec_stream_info` and validates a UUID generation. The route then
   re-runs owner admission and the capability gate before
   `commit_browser_canvas` revalidates the selected workspace target and writes
   `BrowserSource`. This prevents a long browser start from committing after an
   owner, flag, workspace generation, or endpoint change.
 
-- [ ] **Step 6: Change public `POST /open`.** Remove `opened_by` from
+- [x] **Step 6: Change public `POST /open`.** Remove `opened_by` from
   `BrowserOpenRequest`; public calls always prepare with creation-time holder
   `user`, without changing an existing generation's baton. Preserve the `202`
   provisioning behavior. For `200`, build the ordinary public browser
   representation, return it through the existing `_state_response` shape with
   `ETag` and `X-Canvas-Mutation-Changed`, and expose no generation/port.
 
-- [ ] **Step 7: Complete the staged representation.** In `_represent` set all
+- [x] **Step 7: Complete the staged representation.** In `_represent` set all
   three positive Browser capabilities only when the same live capability
   check passes:
 
@@ -424,7 +459,7 @@ identity.
   A stale/unattested Browser source stays `unavailable` with all capabilities
   false.
 
-- [ ] **Step 8: Test idempotence and races.** Cover: first open revision 1;
+- [x] **Step 8: Test idempotence and races.** Cover: first open revision 1;
   same generation/same title stays revision 1; changed title advances once;
   ended/new generation advances once; two concurrent identical opens produce
   one logical transition; owner/flag/generation change between prepare and
@@ -432,7 +467,7 @@ identity.
   only for the caller that caused a durable transition, and an idempotent open
   never changes the existing daemon baton.
 
-- [ ] **Step 9: Run:**
+- [x] **Step 9: Run:**
 
       python -m pytest tests/test_shared_browser_capability.py \
         tests/test_shared_browser_open.py tests/test_canvas_slice0.py -q
@@ -444,7 +479,7 @@ identity.
   Expected: all pass; an open-ready test asserts both body validation and a
   strong `ETag`.
 
-- [ ] **Step 10: Commit:**
+- [x] **Step 10: Commit:**
 
       git add orchestrator/services/shared_browser_canvas.py \
         orchestrator/routers/shared_browser.py orchestrator/routers/canvases.py \
@@ -470,25 +505,25 @@ identity.
 
     MAX_BROWSER_CLIENT_MESSAGE = 64 * 1024
 
-- [ ] **Step 1: Export one normalized origin authority.** Refactor the current
+- [x] **Step 1: Export one normalized origin authority.** Refactor the current
   CORS-mirroring origin set from `csrf.py` into a public helper used by both
   HTTP CSRF and this WebSocket. Trim environment entries, accept only canonical
   `http://`/`https://` origins with no credentials/path/query/fragment, and
   retain the four current localhost development origins.
 
-- [ ] **Step 2: Add failing WS tests.** Require exactly one non-`null` Origin.
+- [x] **Step 2: Add failing WS tests.** Require exactly one non-`null` Origin.
   Cover allowed same-origin/dev origins, absent Origin, duplicate Origin,
   malformed origin, cross-site origin, and an allowed environment origin.
   Origin is the first admission check—even while the feature is disabled—so a
   cross-site probe cannot distinguish gate/auth/thread state. Rejection happens
   before `accept` and closes `4403`.
 
-- [ ] **Step 3: Bound client messages.** Text, empty, unknown-type, malformed
+- [x] **Step 3: Bound client messages.** Text, empty, unknown-type, malformed
   ASGI receive shape, or a binary message larger than 64 KiB closes `4400`.
   Do not silently keep a bad protocol connection alive. Valid `INPUT` and
   `CONTROL` remain opaque to the relay.
 
-- [ ] **Step 4: Re-admit after startup.** After `exec_stream_info` returns,
+- [x] **Step 4: Re-admit after startup.** After `exec_stream_info` returns,
   fetch the thread again and recheck approval/owner, feature flag, remote
   binding/route, and the latest durable Browser Canvas generation. Only then
   retain the viewer reservation and call `accept`. Reserve once after the
@@ -496,12 +531,12 @@ identity.
   per-replica startup cap with a handshake burst. The `generation_resolver`
   used by both the command and direct channel always reloads the thread.
 
-- [ ] **Step 5: Make viewer accounting exception-safe.** Reserve exactly once,
+- [x] **Step 5: Make viewer accounting exception-safe.** Reserve exactly once,
   release only if reserved, and test failures before accept, during SSH open,
   after accept, and during cancellation. Immediate activity marking remains
   before the first sleep.
 
-- [ ] **Step 6: Run:**
+- [x] **Step 6: Run:**
 
       python -m pytest tests/test_csrf.py tests/test_shared_browser_broker.py -q
       ruff check orchestrator/security/csrf.py \
@@ -510,7 +545,7 @@ identity.
 
   Expected: all pass, including `4400`, `4403`, and `4409` assertions.
 
-- [ ] **Step 7: Commit:**
+- [x] **Step 7: Commit:**
 
       git add orchestrator/security/csrf.py \
         orchestrator/services/browser_stream_broker.py \
@@ -537,7 +572,7 @@ identity.
     target_id = session.agent_focus_target_id
     cdp = await session.get_or_create_cdp_session(target_id=target_id)
 
-- [ ] **Step 1: Extend the probe note before implementation.** In the existing
+- [x] **Step 1: Extend the probe note before implementation.** In the existing
   built `srw-workspace-stream-test` image, record the exact
   `AgentFocusChangedEvent` import, `event_bus.on` call, event fields, focused
   target field, and `get_or_create_cdp_session(target_id=...)` call. Also record
@@ -545,20 +580,20 @@ identity.
   `Page.frameStoppedLoading`. If any call differs, adapt this task to the
   observed 0.12.9 API before editing the daemon.
 
-- [ ] **Step 2: Turn `ScreencastCdp` into a session-lifetime adapter.** It
+- [x] **Step 2: Turn `ScreencastCdp` into a session-lifetime adapter.** It
   tracks the current CDP/session ID, main frame ID, registered CDP clients, and
   running state. `start(target_id=None)` may switch targets; it stops the prior
   target, attaches the requested/current focus target, registers each client
   callback at most once, primes viewport/url/title/main-frame state, then starts
   the new screencast. Every callback ignores stale session IDs.
 
-- [ ] **Step 3: Fix zero-viewer restart.** `stop_screencast` stops the current
+- [x] **Step 3: Fix zero-viewer restart.** `stop_screencast` stops the current
   screencast but retains the adapter and its callback-registration inventory.
   A later viewer calls `start` on that same adapter. Only
   `_close_session` discards it. This prevents callback multiplication on every
   hide/reveal cycle.
 
-- [ ] **Step 4: Subscribe once to active-focus changes.** When a new
+- [x] **Step 4: Subscribe once to active-focus changes.** When a new
   `BrowserSession` is created, install one synchronous event handler which only
   schedules work and returns. The scheduled task coalesces to
   `session.agent_focus_target_id` and takes locks in the existing order before
@@ -566,13 +601,13 @@ identity.
   event-bus callback itself; browser-use may dispatch the event from the action
   currently holding that lock.
 
-- [ ] **Step 5: Emit loading transitions.** Prime the main frame with
+- [x] **Step 5: Emit loading transitions.** Prime the main frame with
   `Page.getFrameTree`. A main-frame `frameStartedLoading` sets
   `loading=true`. `frameStoppedLoading` sets `loading=false` and schedules a
   stale-session-guarded URL/title refresh. Main `frameNavigated` updates the
   frame ID and URL. Subframe events do nothing.
 
-- [ ] **Step 6: Enforce the cross-replica viewer cap in the daemon.** Extend
+- [x] **Step 6: Enforce the cross-replica viewer cap in the daemon.** Extend
   HELLO with integer `max_viewers` from the broker config, validated in
   `1..16` with booleans rejected. `StreamHub.add_viewer` atomically refuses the
   fourth default viewer across all orchestrator replicas because every relay
@@ -583,14 +618,14 @@ identity.
   screencast. Keep the broker's local reservation as a fast path; the daemon
   is the final global authority.
 
-- [ ] **Step 7: Add focused unit tests.** Cover main/subframe loading,
+- [x] **Step 7: Add focused unit tests.** Cover main/subframe loading,
   stale-target events, target A→B switch, newest-target coalescing, frame ACK on
   old target without rebroadcast, no callback duplication across three
   stop/start cycles, no switch with zero viewers, adapter teardown on browser
   close, invalid HELLO limits, mixed rolling-replica limits, and global viewer
   refusal.
 
-- [ ] **Step 8: Run:**
+- [x] **Step 8: Run:**
 
       python -m pytest tests/tools/research/test_browser_exec_stream.py \
         tests/test_shared_browser_broker.py -q
@@ -601,7 +636,7 @@ identity.
 
   Expected: all pass; compile emits no output.
 
-- [ ] **Step 9: Commit:**
+- [x] **Step 9: Commit:**
 
       git add docs/superpowers/plans/notes-browseruse-cdp-api.md \
         docker/browser-exec orchestrator/services/browser_stream_broker.py \
@@ -624,7 +659,7 @@ identity.
 - Modify: `Tiltfile`
 - Modify: `tests/test_shared_browser_infra.py`
 
-- [ ] **Step 1: Strengthen and clean the conformance program.** In addition to
+- [x] **Step 1: Strengthen and clean the conformance program.** In addition to
   Plan 1's identity/frame/input/baton checks, make it:
 
   - observe `loading=true -> loading=false` for a main navigation;
@@ -635,7 +670,7 @@ identity.
   - close every file/socket/process and remove its socket, profile, HTML, and
     log artifacts in `finally` so the image layer stays clean.
 
-- [ ] **Step 2: Install the check in the container image.** Copy it to
+- [x] **Step 2: Install the check in the container image.** Copy it to
   `/usr/local/bin/check-browser-stream` beside `browser-exec`, mode 0755.
   Extend `assert-browser-stack.sh` with:
 
@@ -644,23 +679,23 @@ identity.
 
   The assertion still runs as the actual workspace user in the VM build.
 
-- [ ] **Step 3: Install the exact same file in VM stage 2.** Add
+- [x] **Step 3: Install the exact same file in VM stage 2.** Add
   `../check-browser-stream.py` to the Packer file sources and install it in
   `provision-stage2.sh` before running the shared assertion. Do not copy a
   second implementation under `agent-vm-base/files`.
 
-- [ ] **Step 4: Fix rebuild watch lists.**
+- [x] **Step 4: Fix rebuild watch lists.**
 
   - WORKSPACE and Tilt `only`: add `docker/check-browser-stream.py`.
   - VM_BASE: add `docker/check-browser-stream.py`.
   - Keep `assert-browser-stack.sh` in VM_BASE_STAGE1 because changing the
     shared required capability must still rebuild the dependency layer.
 
-- [ ] **Step 5: Extend infra tests.** Assert both images source/install the
+- [x] **Step 5: Extend infra tests.** Assert both images source/install the
   same check, the shared assertion invokes it, and every relevant CI/Tilt
   change detector watches it.
 
-- [ ] **Step 6: Run the real container gate:**
+- [x] **Step 6: Run the real container gate:**
 
       podman build -f docker/Dockerfile.workspace \
         -t srw-workspace-shared-browser-plan2 .
@@ -673,7 +708,7 @@ identity.
       Shared-browser stream conformance OK.
       Workspace browser stack OK.
 
-- [ ] **Step 7: Validate VM plumbing without claiming runtime routing:**
+- [x] **Step 7: Validate VM plumbing without claiming runtime routing:**
 
       bash -n docker/assert-browser-stack.sh
       bash -n docker/agent-vm-base/scripts/provision-stage2.sh
@@ -686,7 +721,7 @@ identity.
 
   Expected: all exit zero. The actual stage-2 image build is a Task-14/CI gate.
 
-- [ ] **Step 8: Commit:**
+- [x] **Step 8: Commit:**
 
       git add docker/check-browser-stream.py docker/assert-browser-stack.sh \
         docker/Dockerfile.workspace docker/agent-vm-base/stage2.pkr.hcl \
@@ -729,7 +764,7 @@ identity.
         title="Shared browser",
     )
 
-- [ ] **Step 1: Add a positive attach capability.** Extend
+- [x] **Step 1: Add a positive attach capability.** Extend
   `_agent_canvas_workspace_capabilities` and the internal workspace response
   with `canvas_shared_browser_available`. It is true only when:
 
@@ -742,7 +777,7 @@ identity.
   path remain false. The agent consumes this orchestrator-attested bit; it does
   not independently infer support from an environment variable.
 
-- [ ] **Step 2: Extend the closed internal request.** Add `browser` to
+- [x] **Step 2: Extend the closed internal request.** Add `browser` to
   `CanvasSetRequest.source_type` and:
 
       browser_id: Literal["current"] | None = None
@@ -751,7 +786,7 @@ identity.
   `editable=false`, no file/app fields, no alt text, and `new_app=false`.
   Every other source kind rejects `browser_id`.
 
-- [ ] **Step 3: Add the internal browser branch.** After delegated owner
+- [x] **Step 3: Add the internal browser branch.** After delegated owner
   admission, call Task 2's shared prepare path with creation-time holder
   `agent` (without flipping an existing generation), re-admit delegated owner
   and capability after the long call, commit
@@ -761,7 +796,7 @@ identity.
   contract. A stale agent whose capability was withdrawn receives a typed
   server rejection and cannot stage a browser.
 
-- [ ] **Step 4: Build exact capability-scoped schemas.** Preserve today's
+- [x] **Step 4: Build exact capability-scoped schemas.** Preserve today's
   file-only and file+port schemas. Add file+browser and file+port+browser
   variants chosen from:
 
@@ -772,7 +807,7 @@ identity.
   The four JSON schemas must advertise only the forms the current backend can
   execute.
 
-- [ ] **Step 5: Extend the tool body.** The browser payload sent through
+- [x] **Step 5: Extend the tool body.** The browser payload sent through
   `set_thread_canvas` is exactly:
 
       {
@@ -790,19 +825,19 @@ identity.
   any present value other than `true|false`. Emit the ordinary `canvas.updated`
   invalidation only when `changed=true`.
 
-- [ ] **Step 6: Update tool metadata/docstrings.** Say the tool can present a
+- [x] **Step 6: Update tool metadata/docstrings.** Say the tool can present a
   file, an attested live port, or the current shared browser when the matching
   capability is advertised. Explain that `browser_id="current"` resolves at
   call time and that control may remain with the user.
 
-- [ ] **Step 7: Test all four schema combinations.** Assert required and
+- [x] **Step 7: Test all four schema combinations.** Assert required and
   rejected fields, exact payloads, agent initial baton, idempotent repeat,
   logical redaction, post-commit event, stale-gate rejection, and no event on
   failure or idempotent no-op. Include client parsing for true/false/absent/
   malformed mutation headers and a hot sandbox→unattested-VM swap that
   withdraws browser advertisement.
 
-- [ ] **Step 8: Run:**
+- [x] **Step 8: Run:**
 
       python -m pytest tests/test_shared_browser_internal.py \
         tests/test_canvas_tool.py tests/test_canvas_slice3_callable.py \
@@ -815,7 +850,7 @@ identity.
         tests/test_shared_browser_internal.py tests/test_canvas_tool.py \
         tests/test_orchestrator_client_canvas.py
 
-- [ ] **Step 9: Commit:**
+- [x] **Step 9: Commit:**
 
       git add orchestrator/main.py orchestrator/routers/canvases.py \
         src/core/workspace_backend.py src/api/persistent_session.py \
@@ -835,7 +870,7 @@ identity.
 - Modify: `src/tools/research/browser_direct.py`
 - Test: `tests/tools/research/test_browser_tools.py`
 
-- [ ] **Step 1: Write two failing result-format tests.**
+- [x] **Step 1: Write two failing result-format tests.**
 
   A successful snapshot with `baton="user"` must contain:
 
@@ -854,17 +889,17 @@ identity.
   release control. It must not collapse to
   `Browser error: user_is_driving`.
 
-- [ ] **Step 2: Implement the special case in `_page_state_to_text`.** Use the
+- [x] **Step 2: Implement the special case in `_page_state_to_text`.** Use the
   daemon's bounded `message` when present, but key behavior on the stable error
   code. Keep all other error formatting unchanged. Do not wrap or interpret
   page DOM on an error result.
 
-- [ ] **Step 3: Add the control line to successful state.** Accept only
+- [x] **Step 3: Add the control line to successful state.** Accept only
   `agent` or `user` and ignore unknown future values. Place it with URL/title,
   before nonce-wrapped DOM. Screenshot extraction remains byte-for-byte
   unchanged.
 
-- [ ] **Step 4: Run:**
+- [x] **Step 4: Run:**
 
       python -m pytest tests/tools/research/test_browser_tools.py -q
       ruff check src/tools/research/browser_direct.py \
@@ -872,7 +907,7 @@ identity.
 
   Expected: all pass; existing nonce and image-tag tests remain green.
 
-- [ ] **Step 5: Commit:**
+- [x] **Step 5: Commit:**
 
       git add src/tools/research/browser_direct.py \
         tests/tools/research/test_browser_tools.py
@@ -908,12 +943,12 @@ identity.
     encodeBrowserInput(message: BrowserInput): ArrayBuffer
     browserStreamUrl(threadId: string, apiUrl?: string): string | null
 
-- [ ] **Step 1: Extend public models fail-closed.** Add optional
+- [x] **Step 1: Extend public models fail-closed.** Add optional
   `can_stream_browser?: boolean` to `CanvasCapabilities` and the locked
   `BrowserCapability` model/reason union. Absence of either positive bit means
   unavailable. Keep `BrowserCanvasSource` generation-free.
 
-- [ ] **Step 2: Select the renderer only on a double gate.**
+- [x] **Step 2: Select the renderer only on a double gate.**
 
       source.type === 'browser'
       renderer === 'auto'
@@ -923,11 +958,11 @@ identity.
   `browser:<presentation_revision>`. Add selection/key tests, including a
   same-revision idempotent open and a new-revision restart.
 
-- [ ] **Step 3: Define protocol constants and closed types.** Mirror
+- [x] **Step 3: Define protocol constants and closed types.** Mirror
   `HELLO=1, FRAME=2, STATE=3, INPUT=4, CONTROL=5, ERROR=6`. Server parser accepts
   only `FRAME/STATE/ERROR`. Client encoders produce only `INPUT/CONTROL`.
 
-- [ ] **Step 4: Parse STATE under strict bounds.** Require:
+- [x] **Step 4: Parse STATE under strict bounds.** Require:
 
   - canonical UUID generation (kept protocol-private);
   - baton `agent|user`;
@@ -939,7 +974,7 @@ identity.
   Return a public controller state without generation plus an internal
   generation value used only to pin frames.
 
-- [ ] **Step 5: Parse FRAME exactly.** WebSocket data is:
+- [x] **Step 5: Parse FRAME exactly.** WebSocket data is:
 
       [1-byte type][2-byte big-endian header length][header JSON][raw JPEG]
 
@@ -947,21 +982,21 @@ identity.
   header dimensions, JPEG SOI, and total 8 MiB cap. Keep the JPEG as a bounded
   slice. Header `w/h` are diagnostic only and must never size the renderer.
 
-- [ ] **Step 6: Parse ERROR.** Accept only bounded `code`/`message` strings.
+- [x] **Step 6: Parse ERROR.** Accept only bounded `code`/`message` strings.
   Unknown server types and malformed payloads return null; they never become
   partially trusted state.
 
-- [ ] **Step 7: Derive the socket URL.** Starting from
+- [x] **Step 7: Derive the socket URL.** Starting from
   `environment.apiUrl`, require HTTP(S), no credentials/query/fragment, and a
   normalized API path. Convert protocol to WS(S) and append the encoded thread
   path. Reject control characters, ambiguous slashes/backslashes, and invalid
   base URLs. Never append a query parameter.
 
-- [ ] **Step 8: Tighten `isCanvasState`.** Validate an optional
+- [x] **Step 8: Tighten `isCanvasState`.** Validate an optional
   `can_stream_browser` only when boolean and keep forward compatibility for
   other optional capabilities. Add invalid-type tests.
 
-- [ ] **Step 9: Run:**
+- [x] **Step 9: Run:**
 
       (
         cd cockpit
@@ -972,7 +1007,7 @@ identity.
 
   Expected: all pass.
 
-- [ ] **Step 10: Commit:**
+- [x] **Step 10: Commit:**
 
       git add cockpit/src/app/core/models/canvas.model.ts \
         cockpit/src/app/core/services/canvas.service.ts \
@@ -1017,25 +1052,25 @@ identity.
       sendInput(message): boolean;
     }
 
-- [ ] **Step 1: Add injectable browser seams for tests.** Provide pane-local
+- [x] **Step 1: Add injectable browser seams for tests.** Provide pane-local
   tokens/factories for WebSocket construction, `createImageBitmap`, timeout,
   and document visibility. Production defaults use native browser APIs; tests
   use deterministic fakes. Do not put the controller in `providedIn:root`.
 
-- [ ] **Step 2: Implement desired-source identity.** Connect only when the pane
+- [x] **Step 2: Implement desired-source identity.** Connect only when the pane
   is active, the document is visible, the selected thread exists, source is
   Browser, status is `ready|starting`, and `can_stream_browser===true`.
   Desired identity is thread ID + presentation revision. Any change closes the
   old socket intentionally before opening the new one.
 
-- [ ] **Step 3: Build the connection lifecycle.** Set `binaryType=arraybuffer`.
+- [x] **Step 3: Build the connection lifecycle.** Set `binaryType=arraybuffer`.
   A valid first STATE establishes the private expected generation and moves to
   ready. A FRAME before STATE or from a different generation is ignored. A
   later valid STATE with a different generation is an ended-generation
   transition: clear pixels and close instead of silently re-pinning. Malformed
   server data closes as a terminal protocol error.
 
-- [ ] **Step 4: Bound decoding.** For a valid current FRAME:
+- [x] **Step 4: Bound decoding.** For a valid current FRAME:
 
   1. if a decode is already active, drop the new frame;
   2. call `createImageBitmap(new Blob([jpeg], {type:'image/jpeg'}))`;
@@ -1046,23 +1081,23 @@ identity.
   and controller destruction. Promise rejection becomes a recoverable frame
   error without an unhandled rejection.
 
-- [ ] **Step 5: Add reconnect policy.** Use 250, 500, 1000, 2000, then 5000 ms
+- [x] **Step 5: Add reconnect policy.** Use 250, 500, 1000, 2000, then 5000 ms
   capped backoff while the desired source remains active. A successful STATE
   resets the attempt. Intentional hide/source teardown never retries.
 
-- [ ] **Step 6: Map terminal/transient signals.** Implement the locked close
+- [x] **Step 6: Map terminal/transient signals.** Implement the locked close
   table. `ERROR navigation_rejected` is nonterminal and leaves the stream
   attached. `ERROR browser_gone` and `4409` clear the bitmap and become
   `ended`. `viewer_limit` becomes an explicit manual-retry state. Auth/owner/
   disabled states never auto-retry. `4502` and unclean network loss do.
 
-- [ ] **Step 7: Detach on visibility.** Register one
+- [x] **Step 7: Detach on visibility.** Register one
   `visibilitychange` listener. Hidden document closes the socket and bitmap;
   visible document re-evaluates the still-current desired source. The Canvas
   pane's existing `active` input separately handles settings/mobile/closed
   hiding and therefore triggers the daemon's 30-second zero-viewer release.
 
-- [ ] **Step 8: Wire the pane provider/effect.** Add
+- [x] **Step 8: Wire the pane provider/effect.** Add
   `CanvasBrowserController` to `CanvasPaneComponent.providers` and:
 
       effect(() => this.browser.syncPresentation(
@@ -1071,14 +1106,14 @@ identity.
         this.state(),
       ));
 
-- [ ] **Step 9: Unit-test lifecycle and leaks.** Cover activation, capability
+- [x] **Step 9: Unit-test lifecycle and leaks.** Cover activation, capability
   fail-close, source replacement, hide/show, document visibility, binary URL,
   invalid STATE, mismatched later STATE, mismatched FRAME, decode skip, stale
   decode, bitmap close, backoff/reset, every close/error mapping, retry, and
   destroy. Fake timers must end with zero pending timers and every fake bitmap
   closed.
 
-- [ ] **Step 10: Run:**
+- [x] **Step 10: Run:**
 
       (
         cd cockpit
@@ -1088,7 +1123,7 @@ identity.
 
   Expected: all pass with no unhandled promise output.
 
-- [ ] **Step 11: Commit:**
+- [x] **Step 11: Commit:**
 
       git add cockpit/src/app/views/canvas/canvas-browser.controller.ts \
         cockpit/src/app/views/canvas/canvas-browser.controller.spec.ts \
@@ -1111,42 +1146,42 @@ identity.
 - Modify: `cockpit/src/assets/i18n/en.json`
 - Modify: `cockpit/src/assets/i18n/de-DE.json`
 
-- [ ] **Step 1: Create the standalone renderer.** Inject the pane-local
+- [x] **Step 1: Create the standalone renderer.** Inject the pane-local
   controller. Render trusted host chrome plus one focusable HTML `canvas`.
   The first slice of toolbar is read-only: page title, current URL, loading
   indicator, connection status, and baton label. No iframe, `innerHTML`,
   object URL, or remote resource URL is involved.
 
-- [ ] **Step 2: Paint decoded bitmaps.** On each controller frame, set the
+- [x] **Step 2: Paint decoded bitmaps.** On each controller frame, set the
   backing store to `bitmap.width`/`bitmap.height` and draw at `0,0`. Never use
   protocol metadata to set width/height. Clear the surface when no current
   frame exists. Unit-test a metadata/bitmap mismatch.
 
-- [ ] **Step 3: Make display geometry exact.** The element itself has the
+- [x] **Step 3: Make display geometry exact.** The element itself has the
   stream viewport aspect ratio and is contain-scaled inside the pane. Put any
   letterbox/background on a wrapper, not inside a larger event canvas, so
   `getBoundingClientRect()` describes exactly the interactive picture. Give it
   a visible focus ring and `touch-action:none`.
 
-- [ ] **Step 4: Wire renderer selection into the pane.** Treat `browser` like
+- [x] **Step 4: Wire renderer selection into the pane.** Treat `browser` like
   `app` in `effectiveRenderer` instead of passing it through
   `CanvasContentController.displayRenderer`. A Browser presentation counts as
   visual while connecting even before its first frame. Add the renderer to the
   template/imports and add English/German `browser` source-kind/renderer labels
   in this task.
 
-- [ ] **Step 5: Preserve all existing Canvas modes.** Content/editor/viewer
+- [x] **Step 5: Preserve all existing Canvas modes.** Content/editor/viewer
   controllers must remain idle for Browser; file/app rendering, unsaved edit
   preservation, reset-origin, popout eligibility, refresh, and overlays remain
   unchanged. Add regression cases for each source kind.
 
-- [ ] **Step 6: Add accessible non-frame states.** Connecting/reconnecting,
+- [x] **Step 6: Add accessible non-frame states.** Connecting/reconnecting,
   unavailable, viewer-limit, protocol-error, and ended copy is rendered in
   trusted chrome and announced through the pane's existing polite live region.
   Add the corresponding English and German keys in this task. Buttons arrive
   in Tasks 11/13; no state is represented by color alone.
 
-- [ ] **Step 7: Run:**
+- [x] **Step 7: Run:**
 
       (
         cd cockpit
@@ -1159,7 +1194,7 @@ identity.
 
   Expected: all pass.
 
-- [ ] **Step 8: Commit:**
+- [x] **Step 8: Commit:**
 
       git add cockpit/src/app/views/canvas/canvas-browser-renderer.component.ts \
         cockpit/src/app/views/canvas/canvas-browser-renderer.component.scss \
@@ -1199,14 +1234,14 @@ identity.
     openBrowser(title?: string): void
     retryOpenBrowser(): void
 
-- [ ] **Step 1: Reconcile capability with thread selection.** Start a separate
+- [x] **Step 1: Reconcile capability with thread selection.** Start a separate
   cancellable `GET .../browser/capability` whenever `selectThread` selects a
   real thread. A thread change cancels both capability and open/retry work and
   synchronously clears their signals. Validate the four-field response before
   applying it. A `404` from an older/disabled server is a dark capability, not
   an app-wide error; auth failures clear potentially stale state.
 
-- [ ] **Step 2: Implement the bounded open state machine.**
+- [x] **Step 2: Implement the bounded open state machine.**
 
   1. Require the currently selected thread and positive `can_open_browser`.
   2. Set phase from the capability:
@@ -1223,14 +1258,14 @@ identity.
   All timers/subscriptions are cancelled on thread change or destroy. Multiple
   button clicks coalesce into the active attempt.
 
-- [ ] **Step 3: Notify both runtimes.** Extend
+- [x] **Step 3: Notify both runtimes.** Extend
   `applyMutationResponse(..., notifyRuntime=true)` so a Browser source sends
   the same bounded `canvas.presentation_updated` control event as an app.
   This is an invalidation only; no browser identity is included. A
   `changed=false` response still reconciles local state/ETag but emits neither
   the runtime event nor a duplicate BroadcastChannel invalidation.
 
-- [ ] **Step 4: Make empty Canvas hostable.** Change
+- [x] **Step 4: Make empty Canvas hostable.** Change
   `ChatPage.canvasAvailable` to include
   `browserCapability.feature_enabled===true`. Fix the source-tracking effect:
 
@@ -1243,14 +1278,14 @@ identity.
   This is required for the empty-state button; test the exact effect so a later
   refactor cannot reintroduce the open-then-instant-close loop.
 
-- [ ] **Step 5: Add the always-present chat toolbar action.** When
+- [x] **Step 5: Add the always-present chat toolbar action.** When
   `feature_enabled` is true, render a browser icon in the persistent-chat
   header action area even if no Canvas source exists. Clicking it opens/focuses
   Canvas immediately to show progress, then starts `openBrowser`. On a lite or
   otherwise unsupported backend, keep it visible but disabled with the
   server-reason tooltip.
 
-- [ ] **Step 6: Add the empty-state action.** When no source is staged, Canvas
+- [x] **Step 6: Add the empty-state action.** When no source is staged, Canvas
   shows a primary **Open browser** button plus the capability explanation.
   During cold start it shows:
 
@@ -1263,17 +1298,17 @@ identity.
   Add English/German parity keys for the action, disabled reasons, phases,
   errors, Retry, and the dirty-edit explanation in this task.
 
-- [ ] **Step 7: Protect unsaved edits.** Both chat-toolbar and pane actions are
+- [x] **Step 7: Protect unsaved edits.** Both chat-toolbar and pane actions are
   disabled while `canvasDirty()`/the pane editor is dirty, with copy explaining
   that opening the browser would replace the current stage. There is no silent
   discard and no new confirmation modal in v1.
 
-- [ ] **Step 8: Cover replacement semantics.** From a clean file/app Canvas,
+- [x] **Step 8: Cover replacement semantics.** From a clean file/app Canvas,
   Open browser replaces the single main source and the normal revision
   invalidation switches the pane. An exact repeat does not create a new
   source key. A stale open response from a previous thread is ignored.
 
-- [ ] **Step 9: Run:**
+- [x] **Step 9: Run:**
 
       (
         cd cockpit
@@ -1286,7 +1321,7 @@ identity.
   Expected: all pass, including fake-timer cold provisioning and the empty-pane
   persistence regression.
 
-- [ ] **Step 10: Commit:**
+- [x] **Step 10: Commit:**
 
       git add cockpit/src/app/core/models/canvas.model.ts \
         cockpit/src/app/core/services/canvas.service.ts \
@@ -1326,7 +1361,7 @@ identity.
 
     browserModifiers(event): number  // Alt=1 Ctrl=2 Meta=4 Shift=8
 
-- [ ] **Step 1: Lock coordinate behavior with pure tests.** Map CSS display
+- [x] **Step 1: Lock coordinate behavior with pure tests.** Map CSS display
   coordinates into CDP CSS viewport pixels:
 
       x = (clientX - rect.left) * viewport.width / rect.width
@@ -1336,7 +1371,7 @@ identity.
   the accepted right/bottom edge below viewport bounds. Cover 1:1, downscale,
   upscale, fractional offsets, portrait, and the metadata-vs-bitmap mismatch.
 
-- [ ] **Step 2: Add pointer/mouse events only while user drives.**
+- [x] **Step 2: Add pointer/mouse events only while user drives.**
 
   - pointer move -> CDP `mouseMoved`, at most once per animation frame;
   - primary/middle/secondary down/up -> `mousePressed`/`mouseReleased` with
@@ -1352,14 +1387,14 @@ identity.
 
   The daemon remains the final authority and independently drops stale input.
 
-- [ ] **Step 3: Add keyboard translation.** On a focused surface, send
+- [x] **Step 3: Add keyboard translation.** On a focused surface, send
   `keyDown`/`keyUp` with key, code, location, repeat, modifier bitmask, and
   printable `text` only when no Ctrl/Meta/Alt command chord is active. Track
   pressed keys. On blur, visibility loss, baton release, disconnect, or source
   replacement, send best-effort keyUp for held modifiers/keys and clear local
   state. Ignore IME composition in v1 instead of emitting corrupt text.
 
-- [ ] **Step 4: Add the editable browser toolbar.**
+- [x] **Step 4: Add the editable browser toolbar.**
 
   - URL form initialized from current STATE without overwriting text while the
     user edits;
@@ -1371,7 +1406,7 @@ identity.
   Use Angular interpolation and ordinary form controls; never treat URL/title/
   server error text as HTML.
 
-- [ ] **Step 5: Add the baton pill.**
+- [x] **Step 5: Add the baton pill.**
 
   - Agent baton: **Agent is driving** + **Take control**.
   - User baton: **You're driving** + **Release control**.
@@ -1384,17 +1419,17 @@ identity.
   toolbar, navigation error, baton holder, Take control, and Release control
   in this task.
 
-- [ ] **Step 6: Test output frames exactly.** Decode captured fake-socket bytes
+- [x] **Step 6: Test output frames exactly.** Decode captured fake-socket bytes
   and assert type byte + JSON body for mouse, wheel, key, navigate, back,
   reload, take, and release. Assert no sends for agent baton, stale socket,
   hidden pane, outside pointer, or composition.
 
-- [ ] **Step 7: Test same-user multi-view behavior.** Two controller fakes may
+- [x] **Step 7: Test same-user multi-view behavior.** Two controller fakes may
   both receive the user baton; either may send input because v1 has one
   authenticated owner, not per-tab ownership. Their labels update only from
   broadcast STATE. This documents the intentional v1 boundary.
 
-- [ ] **Step 8: Run:**
+- [x] **Step 8: Run:**
 
       (
         cd cockpit
@@ -1406,7 +1441,7 @@ identity.
 
   Expected: all pass.
 
-- [ ] **Step 9: Commit:**
+- [x] **Step 9: Commit:**
 
       git add cockpit/src/app/views/canvas/canvas-browser-input.ts \
         cockpit/src/app/views/canvas/canvas-browser-input.spec.ts \
@@ -1436,7 +1471,7 @@ identity.
 - Modify: `cockpit/e2e/canvas/playwright.config.ts`
 - Create: `cockpit/e2e/canvas/shared-browser-conformance.spec.ts`
 
-- [ ] **Step 1: Complete trusted lifecycle actions.**
+- [x] **Step 1: Complete trusted lifecycle actions.**
 
   - transient disconnect: Reconnecting overlay while backoff runs;
   - `viewer_limit`: explanatory state + manual Retry;
@@ -1449,13 +1484,13 @@ identity.
   arrives. Restart never follows a moving `current` generation without a
   deliberate open/Canvas transition.
 
-- [ ] **Step 2: Verify popout fan-out.** The existing authenticated wrapper
+- [x] **Step 2: Verify popout fan-out.** The existing authenticated wrapper
   owns its own pane-local controller and attaches a second socket. Closing
   either window detaches only that viewer. Both paint broadcast frames and
   baton STATE; neither stores stream data in `BroadcastChannel`. The root
   Canvas service continues to use the channel only for revision invalidations.
 
-- [ ] **Step 3: Complete and audit English/German copy.** Retain the keys
+- [x] **Step 3: Complete and audit English/German copy.** Retain the keys
   landed with Tasks 10–12 and add/audit parity for:
 
   - browser source kind and renderer;
@@ -1470,19 +1505,19 @@ identity.
   Keep “Untrusted” host chrome: the page is workspace-controlled content even
   though transport is authenticated.
 
-- [ ] **Step 4: Add keyboard/focus accessibility tests.** Toolbar controls have
+- [x] **Step 4: Add keyboard/focus accessibility tests.** Toolbar controls have
   labels and logical tab order; the canvas has an explicit name and visible
   focus; status uses `aria-live=polite`; terminal failures use an appropriate
   alert; Take/Release exposes pressed/status semantics without color alone.
   Reduced motion removes reconnect animation.
 
-- [ ] **Step 5: Extend the production fixture HTTP API.** Add a browser
+- [x] **Step 5: Extend the production fixture HTTP API.** Add a browser
   scenario that returns pre-source capability, `204` before open, and a
   Browser Canvas state + ETag + mutation header after open. Record
   CSRF/header/cookie metadata with the existing safe recorder; never record
   cookie values.
 
-- [ ] **Step 6: Mock the binary socket with Playwright
+- [x] **Step 6: Mock the binary socket with Playwright
   `page.routeWebSocket`.** Send:
 
   - strict STATE for a canonical private generation;
@@ -1494,7 +1529,7 @@ identity.
   Capture client Buffer messages and decode them in the fixture test. No
   production-only test hook or debug endpoint is allowed.
 
-- [ ] **Step 7: Cover the complete three-engine UI flow.** In Chromium,
+- [x] **Step 7: Cover the complete three-engine UI flow.** In Chromium,
   Firefox, and WebKit:
 
   1. an empty Canvas exposes the Open button;
@@ -1508,12 +1543,12 @@ identity.
      generation appears in DOM/URL/local storage/console;
   9. malformed/oversized mocked frames never paint or wedge the page.
 
-- [ ] **Step 8: Update Playwright config.** Set `testMatch` to the explicit
+- [x] **Step 8: Update Playwright config.** Set `testMatch` to the explicit
   array `['canvas-conformance.spec.ts',
   'shared-browser-conformance.spec.ts']`. Preserve one worker and the existing
   three browser projects.
 
-- [ ] **Step 9: Run:**
+- [x] **Step 9: Run:**
 
       (
         cd cockpit
@@ -1526,7 +1561,7 @@ identity.
   Expected: Vitest/build pass and both Canvas E2E files pass in Chromium,
   Firefox, and WebKit.
 
-- [ ] **Step 10: Commit:**
+- [x] **Step 10: Commit:**
 
       git add cockpit/src/assets/i18n/en.json \
         cockpit/src/assets/i18n/de-DE.json \
@@ -1554,7 +1589,7 @@ identity.
 - Modify: `docs/features/dynamic_canvas.md`
 - Modify: this plan (check completed tasks and add execution record)
 
-- [ ] **Step 1: Run the complete focused Python gate:**
+- [x] **Step 1: Run the complete focused Python gate:**
 
       python -m pytest \
         tests/test_canvas_ssh_transport.py \
@@ -1576,7 +1611,7 @@ identity.
 
   Expected: all pass.
 
-- [ ] **Step 2: Run static and Cockpit gates:**
+- [x] **Step 2: Run static and Cockpit gates:**
 
       ruff check src/ orchestrator/ tests/
       ruff format --check src/ orchestrator/ tests/
@@ -1592,7 +1627,7 @@ identity.
   unrelated file, record it precisely and prove every touched Python file
   passes; do not reformat unrelated owner work.
 
-- [ ] **Step 3: Run chart/config gates from the repository root:**
+- [x] **Step 3: Run chart/config gates from the repository root:**
 
       helm lint helm/ -f helm/ci/test-values.yaml
       helm lint helm/ -f helm/ci/customer-external-values.yaml
@@ -1609,7 +1644,7 @@ identity.
   Expected: both lints pass and the default render carries `"false"`.
   The experimental render carries `"true"`.
 
-- [ ] **Step 4: Re-run the real container-image gate:**
+- [x] **Step 4: Re-run the real container-image gate:**
 
       podman build -f docker/Dockerfile.workspace \
         -t srw-workspace-shared-browser-plan2-final .
@@ -1635,7 +1670,11 @@ identity.
   capability tests must still return false for unattested/unroutable VM
   contexts.
 
-- [ ] **Step 6: Enable only the local acceptance deployment.** Before changing
+  **2026-07-22 result:** Not run. `/dev/kvm` exists, but this host has neither
+  Packer nor the required stage-1 qcow2. Static image-parity and fail-closed VM
+  capability tests pass; no VM artifact claim is made.
+
+- [x] **Step 6: Enable only the local acceptance deployment.** Before changing
   committed values, preserve any existing ignored
   `deployment/values-local.yaml`, add only
   `canvas.sharedBrowser.enabled=true` to that local overlay, and run:
@@ -1674,13 +1713,26 @@ identity.
   Use a workspace-local deterministic HTML form or a stable non-sensitive test
   page. Do not enter real credentials or record page/frame content in logs.
 
+  **2026-07-22 result:** Partial. Cold open, exact executor snapshot/navigation,
+  baton refusal/read behavior, popout, zero-viewer release, activity, and
+  ended/restart passed. Prompt-driven calls and the form/cookie handoff were
+  not claimed because the default model had no serving backend and the only
+  separately probed external credential was a rejected local placeholder.
+
 - [ ] **Step 8: Exercise failure boundaries live.** Verify lite sessions show
   the disabled explanatory button, feature-off hides empty affordances, bad
   navigation is rejected without disconnect, a fourth viewer gets the limit
   state, an orchestrator rollout reconnects, and an unattested VM exposes no
   runnable browser action.
 
-- [ ] **Step 9: Record evidence.** Create
+  **2026-07-22 result:** Partial. Lite UX, bad navigation, the three-viewer cap,
+  fourth-viewer terminal UX, static VM denial, and a real clean-1012 Uvicorn
+  reconnect passed. A replacement orchestrator pod could not reach an existing
+  workspace because the local k3d CNI returned `No route to host`. Feature-off
+  reconciled live to `false`; its final browser assertion is covered by the
+  production-browser suite but could not be repeated after that CNI failure.
+
+- [x] **Step 9: Record evidence.** Create
   `docs/tests/shared_browser_verification.md` with date/context, image hashes
   or commits, summarized test counts, each live-flow result, activity timing,
   and the explicit VM image-vs-runtime boundary. Redact thread IDs, user data,
@@ -1704,13 +1756,17 @@ identity.
   more, and confirm the live ConfigMap remains enabled from the committed
   overlay before recording the gate.
 
-- [ ] **Step 11: Close documentation honestly.** Update both feature docs from
+  **2026-07-22 result:** Deliberately not performed. The temporary override was
+  removed and the ConfigMap reconciled to `false`; Tilt stays off until Steps
+  5, 7, and 8 complete on suitable infrastructure.
+
+- [x] **Step 11: Close documentation honestly.** Update both feature docs from
   “backend foundation” to “container user flow implemented and verified,” link
   this plan and the verification record, list the exact automation counts, and
   retain the VM runtime caveat. Mark this plan's boxes only for completed work
   and add commit/check evidence at the top. Do not rewrite Plan 1 history.
 
-- [ ] **Step 12: Final diff hygiene:**
+- [x] **Step 12: Final diff hygiene:**
 
       git diff --check
       git status --short
@@ -1719,7 +1775,7 @@ identity.
   Expected: no whitespace errors; only Plan-2 paths plus the owner's existing
   unrelated entries are present.
 
-- [ ] **Step 13: Commit the gate and record:**
+- [x] **Step 13: Commit the gate and record:**
 
       git add deployment/values-tilt.yaml tests/test_shared_browser_infra.py \
         docs/tests/shared_browser_verification.md \
