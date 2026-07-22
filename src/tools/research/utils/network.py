@@ -102,7 +102,7 @@ class ProxyConfig:
     def from_config(cls, config: Dict[str, Any]) -> "ProxyConfig":
         """Load proxy config from agent config dict.
 
-        Expected format (from defaults.yaml research.proxy section):
+        Expected format (from worker_base.yaml research.proxy section):
             proxy:
               enabled: true
               type: socks5

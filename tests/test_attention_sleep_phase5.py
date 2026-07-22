@@ -565,7 +565,7 @@ class TestPhase5WakeIfSuspended:
 
         svc.restore_thread_workspace.assert_awaited_with("thread-abc")
         prov.create_agent_pod.assert_called_with(
-            "thread-abc", config_name="persistent_defaults"
+            "thread-abc", config_name="session_base"
         )
 
     @pytest.mark.asyncio

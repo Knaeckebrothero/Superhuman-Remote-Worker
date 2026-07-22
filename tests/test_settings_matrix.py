@@ -248,6 +248,95 @@ class TestApplySettingsMatrix:
 
 
 # =============================================================================
+# _apply_settings_matrix — shell mode (model-family default)
+# =============================================================================
+
+
+class TestApplySettingsMatrixShellMode:
+    """Model-family default for shell.mode.
+
+    Precedence: explicit human shell.mode > family default (capable → persistent)
+    > stateless floor. The floor is the read-site ``.get("mode", "stateless")``,
+    so a non-capable family simply leaves ``data["shell"]["mode"]`` unset here.
+    """
+
+    def test_capable_family_defaults_to_persistent(self):
+        data = {"llm": {"model": "claude-opus-4-8"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["shell"]["mode"] == "persistent"
+
+    def test_gpt56_defaults_to_persistent(self):
+        data = {"llm": {"model": "gpt-5.6-sol"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["shell"]["mode"] == "persistent"
+
+    def test_small_family_leaves_mode_unset(self):
+        # gemma is not capable -> no shell_mode in its matrix block -> mode stays
+        # absent; the read-site floors it to stateless.
+        data = {"llm": {"model": "gemma-3-27b-it"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data.get("shell", {}).get("mode") is None
+
+    def test_unknown_family_leaves_mode_unset(self):
+        data = {"llm": {"model": "some-unknown-model"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data.get("shell", {}).get("mode") is None
+
+    def test_human_stateless_wins_over_capable_family(self):
+        # A human chose stateless on a capable model -> matrix must NOT flip it.
+        data = {"llm": {"model": "claude-opus-4-8"}, "shell": {"mode": "stateless"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["shell"]["mode"] == "stateless"
+
+    def test_human_persistent_wins_over_small_family(self):
+        data = {"llm": {"model": "gemma-3-27b-it"}, "shell": {"mode": "persistent"}}
+        _apply_settings_matrix(data, expert_llm_keys=set())
+        assert data["shell"]["mode"] == "persistent"
+
+    def test_end_to_end_capable_family_persistent(self, tmp_path):
+        expert = {
+            "$extends": "defaults",
+            "agent_id": "a",
+            "display_name": "A",
+            "llm": {"model": "claude-opus-4-8"},
+        }
+        config_file = tmp_path / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(expert, f)
+        config = loader.load_agent_config(str(config_file))
+        assert config.extra["shell"]["mode"] == "persistent"
+
+    def test_end_to_end_human_override_wins(self, tmp_path):
+        expert = {
+            "$extends": "defaults",
+            "agent_id": "a",
+            "display_name": "A",
+            "llm": {"model": "claude-opus-4-8"},
+            "shell": {"mode": "stateless"},
+        }
+        config_file = tmp_path / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(expert, f)
+        config = loader.load_agent_config(str(config_file))
+        assert config.extra["shell"]["mode"] == "stateless"
+
+    def test_end_to_end_small_family_floors_stateless(self, tmp_path):
+        # Non-capable model, no override: mode unset in extra so the read-sites
+        # (create_shell_tools / get_all_tool_names) floor to stateless.
+        expert = {
+            "$extends": "defaults",
+            "agent_id": "a",
+            "display_name": "A",
+            "llm": {"model": "gemma-3-27b-it"},
+        }
+        config_file = tmp_path / "config.yaml"
+        with open(config_file, "w") as f:
+            yaml.dump(expert, f)
+        config = loader.load_agent_config(str(config_file))
+        assert config.extra.get("shell", {}).get("mode") is None
+
+
+# =============================================================================
 # _apply_settings_matrix — limits sub-dict
 # =============================================================================
 
@@ -464,7 +553,7 @@ class TestSettingsMatrixIntegration:
 
         config = loader.load_agent_config(str(config_file))
 
-        # Settings matrix should have overridden defaults.yaml temperature
+        # Settings matrix should have overridden worker_base.yaml temperature
         assert config.llm.temperature == 1.0
         assert config.llm.top_p == 0.95
         assert config.llm.top_k is None  # M2.7 does not support top_k
@@ -508,7 +597,7 @@ class TestSettingsMatrixIntegration:
 
         config = loader.load_agent_config(str(config_file))
 
-        # defaults.yaml temperature preserved (default entry has no temperature)
+        # worker_base.yaml temperature preserved (matrix default has no temperature)
         assert config.llm.temperature == 0.0
         # But limits come from default entry
         assert config.limits.context_threshold_tokens == 102400  # 128000 * 0.80

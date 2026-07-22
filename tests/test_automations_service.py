@@ -116,3 +116,37 @@ class TestCreateJobFromAutomation:
             db.create_job.await_args.kwargs["project_id"]
             == "cccccccc-cccc-cccc-cccc-cccccccccccc"
         )
+
+    @pytest.mark.asyncio
+    async def test_unpinned_automation_resolves_application_worker_default(
+        self, monkeypatch
+    ) -> None:
+        """Headless runs use the same DB default resolver as REST creation."""
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
+        db = _mock_db_returning_job()
+        owner_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        expert_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        db.get_user = AsyncMock(return_value={"id": owner_id, "is_admin": False})
+        db.list_grants_for_scopes = AsyncMock(
+            return_value={"user": [], "project": [], "global": []}
+        )
+        db.get_user_expert_default = AsyncMock(return_value=None)
+        db.get_application_expert_default = AsyncMock(
+            return_value={
+                "id": expert_id,
+                "expert_type": "worker",
+                "owner_id": None,
+            }
+        )
+
+        await create_job_from_automation(
+            db, _make_automation_row(expert="worker_base")
+        )
+
+        kwargs = db.create_job.await_args.kwargs
+        assert kwargs["config_name"] == "worker_base"
+        assert kwargs["expert_id"] == expert_id
+        assert kwargs["context"]["expert_selection"] == {
+            "source": "application",
+            "expert_id": expert_id,
+        }

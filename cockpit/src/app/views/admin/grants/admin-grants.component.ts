@@ -4,7 +4,9 @@ import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-togg
 import {AdminGrantsService, ScopeKind} from '../../../core/services/admin-grants.service';
 import {AdminUsersService} from '../../../core/services/admin-users.service';
 import {ApiService} from '../../../core/services/api.service';
-import {GrantCatalogEntry} from '../../../core/models/api.model';
+import {Expert, GrantCatalogEntry} from '../../../core/models/api.model';
+import {TranslocoPipe} from '@jsverse/transloco';
+import {RouterLink} from '@angular/router';
 
 const INHERIT = '__inherit__';
 
@@ -17,7 +19,7 @@ const INHERIT = '__inherit__';
   selector: 'app-admin-grants',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FormsModule, SidebarToggleComponent],
+  imports: [FormsModule, SidebarToggleComponent, TranslocoPipe, RouterLink],
   template: `
     <div class="admin-page">
       <div class="admin-container">
@@ -25,6 +27,31 @@ const INHERIT = '__inherit__';
           <app-sidebar-toggle />
           <h1 class="page-title">Capability Grants</h1>
         </div>
+
+        <section class="admin-section expert-defaults-section">
+          <h2>{{ 'adminExpertDefaults.title' | transloco }}</h2>
+          <p class="desc">{{ 'adminExpertDefaults.desc' | transloco }}</p>
+          <div class="scope-bar">
+            @for (type of expertTypes; track type) {
+              <label>{{ ('adminExpertDefaults.' + type) | transloco }}
+                <select
+                  [ngModel]="applicationDefaults()[type] ?? ''"
+                  [disabled]="applicationDefaultSaving() === type"
+                  (ngModelChange)="setApplicationDefault(type, $event)"
+                >
+                  @for (expert of globalExperts(type); track expert.id) {
+                    <option [value]="expert.id">{{ expert.display_name }}</option>
+                  }
+                </select>
+                @if (applicationDefaults()[type]; as expertId) {
+                  <a class="default-edit-link" [routerLink]="['/experts', expertId, 'edit']">
+                    {{ 'adminExpertDefaults.edit' | transloco }}
+                  </a>
+                }
+              </label>
+            }
+          </div>
+        </section>
 
         <section class="admin-section">
           <p class="desc">
@@ -124,6 +151,9 @@ const INHERIT = '__inherit__';
       background: var(--panel-bg); border: 1px solid var(--border-color);
       border-radius: var(--radius-lg); padding: 1.25rem;
     }
+    .expert-defaults-section { margin-bottom: 1rem; }
+    .expert-defaults-section h2 { margin-top: 0; color: var(--text-primary); }
+    .default-edit-link { color: var(--accent-color); font-size: 0.8rem; }
     .desc { color: var(--text-muted); margin: 0 0 1rem; }
     .scope-bar { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1rem; }
     .scope-bar label { display: flex; flex-direction: column; gap: 0.25rem; color: var(--text-muted); font-size: 0.85rem; }
@@ -173,6 +203,13 @@ export class AdminGrantsComponent implements OnInit {
   listDraft = signal('');
   projects = signal<{id: string; name: string}[]>([]);
   error = signal('');
+  readonly expertTypes = ['worker', 'session'] as const;
+  readonly experts = signal<Expert[]>([]);
+  readonly applicationDefaults = signal<Record<'worker' | 'session', string | null>>({
+    worker: null,
+    session: null,
+  });
+  readonly applicationDefaultSaving = signal<'worker' | 'session' | null>(null);
 
   catalogKeys = computed(() => Object.keys(this.svc.catalog()));
   scopeReady = computed(() => this.scopeKind() === 'global' || !!this.scopeId());
@@ -188,6 +225,41 @@ export class AdminGrantsComponent implements OnInit {
     this.api.getProjects().subscribe((ps) =>
       this.projects.set((ps ?? []).map((p) => ({id: p.id, name: p.name}))));
     this.reload();
+    this.loadApplicationDefaults();
+  }
+
+  globalExperts(type: 'worker' | 'session'): Expert[] {
+    return this.experts().filter(
+      (expert) => expert.expert_type === type &&
+        (expert.source === 'global' || expert.source === 'managed'),
+    );
+  }
+
+  private loadApplicationDefaults(): void {
+    this.api.getExperts().subscribe((experts) => this.experts.set(experts));
+    this.api.getApplicationExpertDefaults().subscribe({
+      next: (response) => {
+        this.applicationDefaults.set({
+          worker: response.defaults.worker?.id ?? null,
+          session: response.defaults.session?.id ?? null,
+        });
+        this.applicationDefaultSaving.set(null);
+      },
+      error: () => this.applicationDefaultSaving.set(null),
+    });
+  }
+
+  setApplicationDefault(type: 'worker' | 'session', expertId: string): void {
+    if (!expertId || this.applicationDefaultSaving()) return;
+    this.error.set('');
+    this.applicationDefaultSaving.set(type);
+    this.api.setApplicationExpertDefault(type, expertId).subscribe({
+      next: () => this.loadApplicationDefaults(),
+      error: (e: unknown) => {
+        this.error.set(this.detail(e));
+        this.applicationDefaultSaving.set(null);
+      },
+    });
   }
 
   onScopeKindChange(kind: ScopeKind): void {

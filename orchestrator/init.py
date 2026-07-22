@@ -159,6 +159,21 @@ async def init_postgres(force_reset: bool = False) -> bool:
             await db.apply_migrations()
             logger.info("  Applied pending migrations")
 
+        # Bootstrap the two stable platform defaults from bundled YAML.  The
+        # seed helper is insert-only: after first boot, the DB copies and the
+        # operator-selected pointers are authoritative and are never reset by an
+        # image upgrade.
+        from orchestrator.services.default_experts import seed_managed_default_experts
+
+        managed_defaults = await seed_managed_default_experts(
+            db, PROJECT_ROOT / "config"
+        )
+        logger.info(
+            "  Ensured managed expert defaults: worker=%s session=%s",
+            managed_defaults.get("worker"),
+            managed_defaults.get("session"),
+        )
+
         # Verify tables exist
         logger.info("  Verifying tables:")
         table_status = await db.verify_schema()

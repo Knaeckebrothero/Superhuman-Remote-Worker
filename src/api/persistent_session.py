@@ -1170,8 +1170,10 @@ class PersistentSession:
                 tool_names.append(name)
 
         # Fleet Management is the UI-facing group for SRW control-plane tools.
-        # Experts & Skills and Automations & Loops are separate default-on
-        # groups keyed by ``tools.agent_catalog`` and ``tools.workflows``.
+        # Experts & Skills and Automations & Loops are separate groups keyed by
+        # ``tools.agent_catalog`` and ``tools.workflows``. New resolved configs
+        # carry explicit off-markers from their complete merged tool policy;
+        # marker absence stays enabled only for legacy-session compatibility.
         from ..tools.registry import get_tools_by_category
 
         fleet_management_enabled = _fleet_management_enabled(self.config)

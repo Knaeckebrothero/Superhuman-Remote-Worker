@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Product QA Tester - product-level usability, integration, and stability audit
-$extends: defaults
+$extends: worker_base
 
 agent_id: product-qa
 display_name: Product QA Tester

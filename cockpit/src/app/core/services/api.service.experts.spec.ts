@@ -26,6 +26,32 @@ const body: ExpertCreateRequest = {
 };
 
 describe('ApiService expert write methods', () => {
+  it('filters the catalog by expert type', () => {
+    const {svc, http} = makeService();
+    svc.getExperts('session').subscribe();
+    expect(http.get).toHaveBeenCalledWith('/api/experts', {params: expect.anything()});
+    const params = http.get.mock.calls[0][1].params;
+    expect(params.get('type')).toBe('session');
+  });
+
+  it('loads project-aware effective defaults', () => {
+    const {svc, http} = makeService();
+    svc.getExpertDefaults('project-1').subscribe();
+    expect(http.get).toHaveBeenCalledWith('/api/expert-defaults', {params: expect.anything()});
+    const params = http.get.mock.calls[0][1].params;
+    expect(params.get('project_id')).toBe('project-1');
+  });
+
+  it('sets and clears a personal default', () => {
+    const {svc, http} = makeService();
+    svc.setPersonalExpertDefault('worker', 'expert-1').subscribe();
+    svc.clearPersonalExpertDefault('worker').subscribe();
+    expect(http.put).toHaveBeenCalledWith('/api/expert-defaults/worker', {
+      expert_id: 'expert-1',
+    });
+    expect(http.delete).toHaveBeenCalledWith('/api/expert-defaults/worker');
+  });
+
   it('createExpert POSTs to /experts', () => {
     const {svc, http} = makeService();
     svc.createExpert(body).subscribe();

@@ -128,6 +128,7 @@ minimax-m3:
   guardrails:
     file: minimax_m3.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     structured_output_method: function_calling
     temperature: 1.0   # MiniMax recommends temp 1.0 for M-series reasoning models
     top_p: 0.95        # MiniMax recommended top_p
@@ -151,6 +152,7 @@ minimax-m3:
 o-series:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high] }
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0
     multimodal: true  # o3/o4-mini support image inputs
     parallel_tool_calls: true
@@ -200,6 +202,7 @@ deepseek:
   guardrails:
     file: deepseek.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     # In THINKING mode DeepSeek V4 ignores temperature/top_p/penalties — tune the
     # prompt, not sampling. These values apply only to any non-thinking fallback
     # turn; DeepSeek's own guidance is temp 0.0 for code/agentic work. Reasoning
@@ -237,6 +240,7 @@ glm:
   guardrails:
     file: glm.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0           # Z.ai published default for GLM-5.2 (thinking on by default)
     top_p: 0.95                # Z.ai published default
     multimodal: false          # text-only; vision is the separate GLM-5V-Turbo
@@ -249,6 +253,7 @@ gemini:
   # v1: no control wired; output capture via include_thoughts stays in the factory.
   reasoning: { method: none }
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     top_p: 0.95
     top_k: 40
     multimodal: true  # Gemini models are natively multimodal
@@ -264,6 +269,7 @@ claude-opus:
   # Phase 2 → token_budget (thinking.budget_tokens; min 1024; no temp/top_p/top_k).
   reasoning: { method: none }
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
     multimodal: true  # Claude Opus 4.6 supports vision
     parallel_tool_calls: true
@@ -279,6 +285,7 @@ claude-opus:
 claude-sonnet:
   reasoning: { method: none }   # Phase 2 → token_budget
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0
     multimodal: true
     parallel_tool_calls: true
@@ -294,6 +301,7 @@ claude-sonnet:
 claude-haiku:
   reasoning: { method: none }   # Phase 2 → token_budget
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0
     multimodal: true
     parallel_tool_calls: true
@@ -320,6 +328,7 @@ gpt-5:
   guardrails:
     file: gpt_5.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5 supports image inputs
     # Enabled 2026-07-15. langchain#34660 is still OPEN but only concerns the
@@ -359,6 +368,7 @@ gpt-5.6:
   guardrails:
     file: gpt_5_6.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     structured_output_method: json_schema
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5.6 supports image inputs
@@ -386,6 +396,7 @@ codex:
   guardrails:
     file: codex.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
     # Enabled 2026-07-15. Same Responses-API/codex-proxy path as gpt-5; see the
@@ -408,6 +419,7 @@ codex-spark:
   guardrails:
     file: codex_spark.yaml
   settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: false  # Codex Spark is code-focused, no vision
     # Enabled 2026-07-15. Same Responses-API/codex-proxy path as gpt-5; see the

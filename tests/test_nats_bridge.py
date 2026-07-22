@@ -451,7 +451,7 @@ class TestRequestVmCreate:
         await bridge_with_db.request_vm_create(job_id="test-job-123")
 
         payload = json.loads(mock_nc.publish.call_args.args[1].decode())
-        assert payload["agent_config"] == "defaults"
+        assert payload["agent_config"] == "worker_base"
         assert payload["cpu_cores"] == 8
         assert payload["memory"] == "16Gi"
         assert payload["description"] == ""

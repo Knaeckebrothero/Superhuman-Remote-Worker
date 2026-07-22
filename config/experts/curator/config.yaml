@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Curator - Knowledge extraction specialist for project knowledge base
-$extends: defaults
+$extends: worker_base
 
 agent_id: curator
 display_name: Curator

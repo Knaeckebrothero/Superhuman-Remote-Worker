@@ -54,6 +54,14 @@ export function parseConfigText(text: string): ParsedConfig {
   return {config: parsed as Record<string, unknown>};
 }
 
+export function expertBaseConfigName(expertType: 'worker' | 'session'): string {
+  return expertType === 'session' ? 'session_base' : 'worker_base';
+}
+
+export function expertEditorMode(expertType: 'worker' | 'session'): 'job' | 'session' {
+  return expertType === 'session' ? 'session' : 'job';
+}
+
 /** Prompt segments the editor can author (one family-agnostic version each). */
 export interface PromptFields {
   persona: string;
@@ -479,8 +487,9 @@ export class ExpertEditorComponent implements OnInit {
     configText: '',
   };
 
+  private readonly expertType = signal<'worker' | 'session'>('worker');
   isEdit = computed(() => this.editingId() !== null);
-  mode = computed<'job' | 'session'>(() => (this.form.expert_type === 'session' ? 'session' : 'job'));
+  mode = computed<'job' | 'session'>(() => expertEditorMode(this.expertType()));
   /** Base config for the structured controls' "default: X" displays: the type
    *  base merged with the expert's own fragment. */
   baseForGroups = computed(() => deepMergeConfig(this.frameworkDefaults(), this.rawFragment()));
@@ -506,14 +515,10 @@ export class ExpertEditorComponent implements OnInit {
       this.capabilities.set(c ? c.grants : null);
       this.catalog.set(c?.catalog ?? {});
     });
-    // Type base (worker + session both use `defaults`): drives default displays
-    // + the tools-group baseline.
-    this.api.getExpertDetail('defaults').subscribe((d) => {
-      this.frameworkDefaults.set((d?.config as Record<string, unknown>) ?? {});
-      this.defaultsTools.set(d?.defaults_tools ?? {});
-      this.settingsMatrix.set(d?.settings_matrix ?? {});
-      this.frameworkEffectiveModels.set(d?.effective_models ?? null);
-    });
+    // Drives the structured controls' inherited-value displays. The request is
+    // repeated when the expert type changes because worker and session experts
+    // intentionally inherit from different conservative bases.
+    this.loadFrameworkDefaults('worker');
 
     const id = this.route.snapshot.paramMap.get('id');
     if (!id) return;
@@ -528,6 +533,8 @@ export class ExpertEditorComponent implements OnInit {
       this.form.color = (b['color'] as string) ?? '#6B7280';
       this.form.tags = Array.isArray(b['tags']) ? (b['tags'] as string[]).join(', ') : '';
       this.form.expert_type = b['expert_type'] === 'session' ? 'session' : 'worker';
+      this.expertType.set(this.form.expert_type);
+      this.loadFrameworkDefaults(this.form.expert_type);
       const prompts = (b['prompts'] ?? {}) as Record<string, unknown>;
       this.form.persona = (prompts['persona'] as string) ?? '';
       this.form.instructions = (prompts['instructions'] as string) ?? '';
@@ -588,6 +595,8 @@ export class ExpertEditorComponent implements OnInit {
   onTypeChange(v: 'worker' | 'session' | null): void {
     if (v !== 'worker' && v !== 'session') return;
     this.form.expert_type = v;
+    this.expertType.set(v);
+    this.loadFrameworkDefaults(v);
     // Structured state differs by mode (tool categories, autonomy vs permission
     // mode); reset so a worker→session switch on CREATE doesn't carry stale state.
     this.execGroup()?.resetAll();
@@ -602,6 +611,18 @@ export class ExpertEditorComponent implements OnInit {
     this.form.strategic = '';
     this.form.tactical = '';
     this.form.summarization = '';
+  }
+
+  private loadFrameworkDefaults(expertType: 'worker' | 'session'): void {
+    const baseName = expertBaseConfigName(expertType);
+    this.api.getExpertDetail(baseName).subscribe((d) => {
+      // Ignore a slower response for the type the user just switched away from.
+      if (this.expertType() !== expertType) return;
+      this.frameworkDefaults.set((d?.config as Record<string, unknown>) ?? {});
+      this.defaultsTools.set(d?.defaults_tools ?? {});
+      this.settingsMatrix.set(d?.settings_matrix ?? {});
+      this.frameworkEffectiveModels.set(d?.effective_models ?? null);
+    });
   }
 
   /** Assemble the prompts payload for save (see buildPromptsPayload). */

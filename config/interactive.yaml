@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=schema.json
-$extends: persistent_defaults
+$extends: session_base
 
 agent_id: interactive
 display_name: Interactive Assistant

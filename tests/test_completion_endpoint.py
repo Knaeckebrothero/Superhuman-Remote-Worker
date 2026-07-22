@@ -151,8 +151,8 @@ class TestGetVerificationConfig:
     def test_is_verification_enabled(self):
         assert is_verification_enabled(make_job(verification_enabled=True)) is True
         assert is_verification_enabled(make_job(verification_enabled=False)) is False
-        # When resolved_config is NULL, falls back to disk — defaults.yaml has enabled=true
-        assert is_verification_enabled({"id": "x", "resolved_config": None}) is True
+        # The conservative worker base does not start a critic round implicitly.
+        assert is_verification_enabled({"id": "x", "resolved_config": None}) is False
 
     def test_is_verification_disabled_by_override(self):
         """Config override disables verification even without resolved_config."""
@@ -462,10 +462,10 @@ class TestGetScholarConfig:
 class TestResolveScholarConfigFromDisk:
     """Test the lightweight YAML reader for creation-time config checks."""
 
-    def test_defaults_has_scholar_enabled(self):
-        """defaults.yaml should have scholar enabled."""
+    def test_worker_base_has_scholar_disabled(self):
+        """The framework base must not start a research subjob implicitly."""
         sc = resolve_scholar_config_from_disk("default")
-        assert sc.get("enabled") is True
+        assert sc.get("enabled") is False
 
     def test_config_override_disables(self):
         sc = resolve_scholar_config_from_disk(
@@ -483,7 +483,7 @@ class TestResolveScholarConfigFromDisk:
 
     def test_nonexistent_config_falls_back_to_defaults(self):
         sc = resolve_scholar_config_from_disk("nonexistent_config_xyz")
-        assert sc.get("enabled") is True  # From defaults.yaml
+        assert sc.get("enabled") is False  # From worker_base.yaml
 
     def test_scholar_config_reads_scholar_expert(self):
         """The scholar expert config disables scholar spawning to prevent

@@ -59,19 +59,28 @@ describe('SessionCreateComponent framework defaults', () => {
       toolsGroup: {prefillFromConfig: prefillTools},
     } as any;
 
-    http.expectOne((request) => request.url.endsWith('/experts')).flush([]);
+    http.expectOne(
+      (request) => request.urlWithParams.endsWith('/experts?type=session'),
+    ).flush([]);
+    http.expectOne((request) => request.url.endsWith('/expert-defaults')).flush({
+      personal_defaults_allowed: true,
+      defaults: {
+        worker: {application: null, personal: null, effective: null, source: 'application'},
+        session: {application: null, personal: null, effective: null, source: 'application'},
+      },
+    });
     http.expectOne((request) => request.url.endsWith('/datasources/eligible')).flush([]);
     const persistentConfig = {
-      agent_id: 'persistent',
+      agent_id: 'session_base',
       tools: {communication: [], delegation: []},
     };
     http.expectOne(
-      (request) => request.urlWithParams.endsWith('/experts/defaults?type=session'),
+      (request) => request.urlWithParams.endsWith('/experts/session_base?type=session'),
     ).flush({
       config: persistentConfig,
     });
 
-    expect(fixture.componentInstance.frameworkDefaults()?.['agent_id']).toBe('persistent');
+    expect(fixture.componentInstance.frameworkDefaults()?.['agent_id']).toBe('session_base');
     expect(prefillTools).toHaveBeenCalledWith(persistentConfig);
     http.verify();
   });

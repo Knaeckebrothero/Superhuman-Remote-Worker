@@ -8,11 +8,11 @@
 # --limit 10..20.
 name: persistent_current
 description: >
-  Seam replay of config/persistent_defaults.yaml (persistent writer set,
+  Seam replay of config/session_base.yaml (persistent writer set,
   recall_two_tier + kb_notes read path) — the current system's baseline.
-base_config: persistent_defaults
+base_config: session_base
 
-# The committed persistent_defaults auxiliary.model points at the cluster
+# The committed session_base auxiliary.model points at the cluster
 # router (key injected at dispatch in production). Local runs must route
 # extraction somewhere reachable — fill in your endpoint; the key comes
 # from the environment variable named by api_key_env, never this file.

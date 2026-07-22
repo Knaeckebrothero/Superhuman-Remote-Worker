@@ -80,9 +80,9 @@ No human bottleneck in the loop. You set the direction, the system iterates.
 
 Not everything fits the innovation loop. The system also has agents for direct interaction and design work:
 
-**General Secretary** (`config/defaults.yaml`) — Jack-of-all-trades with all tools enabled and no specialization. The agent you talk to directly for ad-hoc tasks. The escape hatch for "just do this thing."
+**General Worker** — The database-backed application default for new jobs. A safe generalist for research, writing, analysis, planning, and file deliverables; administrators can customize it without rebuilding the image.
 
-**Interactive** — Conversational assistant for persistent sessions. No phase/todo structure — continuous tool-calling loop with WebSocket transport. For when you need an agent that stays online and responds in real time.
+**Assistant** — The database-backed application default for persistent sessions. It uses the continuous tool-calling loop and can be customized by administrators or forked as a user's personal default.
 
 **Designer** — UI/UX design specialist that creates self-contained HTML/CSS mockups using the project's design system. Analyzes interface patterns and produces structured design specifications.
 
@@ -346,7 +346,7 @@ Quick checklist after a fresh `helm install` (or after recreating the cluster). 
 
 **1. Cockpit + Keycloak login** — open `https://localhost/`, log in as `test`/`test`. Lands on the Sessions list (`/sessions`). If you land in a refresh loop, jump to the matching troubleshooting entry below.
 
-**2. Sessions (persistent agent + WS)** — Sessions → **New Session** → pick any expert (e.g. Scholar) → **Create Session**. Expected sequence in the UI:
+**2. Sessions (persistent agent + WS)** — Sessions → **New Session** → keep the preselected Assistant (or choose another session expert) → **Create Session**. Expected sequence in the UI:
 
 - "Creating thread" ✓ within 1 s
 - "Provisioning agent" ✓ within ~10 s (k8s pulls the agent + workspace images on the first run)
@@ -660,16 +660,20 @@ pytest tests/ --cov=src                    # With coverage
 
 | Expert | Config | Mode | Role |
 |--------|--------|------|------|
-| **General Secretary** | `config/defaults.yaml` | Worker | Default — all tools, no specialization, ad-hoc tasks |
+| **General Worker** | managed DB expert seeded from `config/experts/general-worker/` | Worker | Application default for general jobs |
 | **Scholar** | `config/experts/scholar/` | Worker | R&D exploration, idea generation, web research, paper analysis |
 | **Critic** | `config/experts/critic/` | Worker | Code review, proposal review, codebase audits, test execution |
 | **Developer** | `config/experts/developer/` | Worker | Claude Code delegation, PR factory, implementation |
 | **Curator** | `config/experts/curator/` | Worker | Knowledge extraction from job artifacts into project KB |
 | **Designer** | `config/experts/designer/` | Worker | UI/UX design, HTML/CSS mockups, design specifications |
-| **Interactive** | `config/experts/interactive/` | Persistent | Conversational assistant, real-time tool use via WebSocket |
+| **Assistant** | managed DB expert seeded from `config/experts/assistant/` | Persistent | Application default for conversational sessions |
 | **Designer-Interactive** | `config/experts/designer-interactive/` | Persistent | Collaborative design iteration in real-time sessions |
 
-All experts share the same universal agent codebase. Worker-mode experts extend `config/defaults.yaml`, persistent-mode experts extend `config/persistent_defaults.yaml`. Both use `$extends` for deep-merge inheritance. See [config/README.md](config/README.md) for details.
+All experts share the same universal agent codebase. Worker experts extend
+`config/worker_base.yaml`; session experts extend `config/session_base.yaml`.
+Those files are conservative inheritance fallbacks, while the user-facing
+defaults are database expert pointers selected by the administrator, project,
+or user. See [config/README.md](config/README.md) for details.
 
 ### Two Operating Modes
 
@@ -683,7 +687,7 @@ All experts share the same universal agent codebase. Worker-mode experts extend 
 
 - No phase/todo structure. The agent stays online and responds in real time via WebSocket.
 - Supports idle timeout handling and memory injection across turns.
-- Used by Interactive and Designer-Interactive experts.
+- Used by Assistant and Designer-Interactive experts.
 
 Agents run in `dual` mode by default, accepting both jobs and persistent sessions.
 

@@ -65,7 +65,7 @@ describe('ToolsGroupComponent live mode', () => {
     expect(component.categories().length).toBeGreaterThan(LIVE_TOOL_CATEGORIES.length);
   });
 
-  it('re-enable payload uses the closed-vocabulary mirror, not defaults.yaml lists', () => {
+  it('re-enable payload uses the closed-vocabulary mirror, not mode-base lists', () => {
     const component = createToolsGroup('live');
     // Baseline: canvas currently disabled (as the live config would show).
     component.prefillFromConfig({tools: {canvas: []}});

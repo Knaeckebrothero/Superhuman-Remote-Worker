@@ -69,7 +69,7 @@ class TestThreadCreateDefault:
     """Hole A: the request-model default."""
 
     def test_bare_thread_create_defaults_to_persistent_config(self):
-        assert orch_main.ThreadCreateRequest().config_name == "persistent_defaults"
+        assert orch_main.ThreadCreateRequest().config_name == "session_base"
 
 
 class TestSessionWorkspaceBackendOverride:
@@ -408,6 +408,7 @@ class TestSendSessionAttachPayload:
                 "_thread_project_ids",
                 AsyncMock(return_value=[]),
             ),
+            patch.object(orch_main, "_is_experts_db_enabled", return_value=False),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
@@ -416,13 +417,13 @@ class TestSendSessionAttachPayload:
                 {"llm": {"model": "m"}},
                 ["p1"],
                 datasources=None,
-                config_name="persistent_defaults",
+                config_name="session_base",
             )
         assert ok is False
         assert len(_FakeAsyncClient.calls) == 1
         call = _FakeAsyncClient.calls[0]
         assert call["url"] == "http://10.0.0.1:8001/session/attach"
-        assert call["json"]["config_name"] == "persistent_defaults"
+        assert call["json"]["config_name"] == "session_base"
         assert call["json"]["thread_id"] == "tid-1"
 
     @pytest.mark.asyncio

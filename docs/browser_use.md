@@ -45,7 +45,7 @@ provider the main agent uses (Anthropic, Google, etc.).
 | `browse_website(url, task, use_vision=False)` | Navigate + extract info | Configurable per-call | Tactical |
 | `download_from_website(url, download_task)` | Navigate + download file | Always False | Tactical |
 
-### Configuration (`config/defaults.yaml` → `browser:`)
+### Configuration (`config/worker_base.yaml` → `browser:`)
 
 ```yaml
 browser:
@@ -981,7 +981,7 @@ New tool category `browser_direct` in `TOOL_REGISTRY`:
 }
 ```
 
-Enabled by default in `defaults.yaml` and `persistent_defaults.yaml`.
+Enabled by default in `worker_base.yaml` and `session_base.yaml`.
 Cockpit agent-settings gets a "Browser (direct)" toggle alongside the
 existing "Research" toggle.
 
@@ -1067,7 +1067,7 @@ async def browser_navigate(url: str, ctx: ToolContext) -> dict:
 - `src/tools/research/web.py` — Tavily-based web tools (search, extract, crawl)
 - `src/tools/context.py` — ToolContext (`_llm_config`, `_current_phase`)
 - `src/core/loader.py` — `create_llm()`, `LLMConfig`
-- `config/defaults.yaml` → `browser:` section
-- `config/persistent_defaults.yaml` → `browser:` section
+- `config/worker_base.yaml` → `browser:` section
+- `config/session_base.yaml` → `browser:` section
 - `docker/Dockerfile.workspace` — workspace container with Chromium
 - `deployment/21d-workspace-network-policy.yaml` — CDP network policy

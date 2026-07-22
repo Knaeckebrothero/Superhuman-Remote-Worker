@@ -95,7 +95,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Universal Agent application...")
 
     # Get config path from environment or global setting
-    config_path = _config_path or os.getenv("AGENT_CONFIG", "default")
+    config_path = _config_path or os.getenv("AGENT_CONFIG", "worker_base")
     resolved_path, deployment_dir = resolve_config_path(config_path)
 
     logger.info(f"Loading agent configuration from: {resolved_path}")
@@ -505,7 +505,7 @@ async def _process_orchestrator_job(
             metadata.update(context)
         if instructions:
             metadata["instructions"] = instructions
-        if config_name and config_name != "default":
+        if config_name and config_name != "worker_base":
             metadata["config_name"] = config_name
         if expert_id:
             metadata["expert_id"] = expert_id

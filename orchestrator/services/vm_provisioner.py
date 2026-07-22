@@ -235,7 +235,7 @@ class VMProvisioner:
         """
         replacements = {
             "${JOB_ID}": job_config["job_id"],
-            "${AGENT_CONFIG}": job_config.get("agent_config", "defaults"),
+            "${AGENT_CONFIG}": job_config.get("agent_config", "worker_base"),
             "${VM_IMAGE}": job_config.get("vm_image") or self._default_vm_image,
             "${CPU_CORES}": str(job_config.get("cpu_cores", 8)),
             "${MEMORY}": job_config.get("memory", "16Gi"),
@@ -259,7 +259,7 @@ class VMProvisioner:
     async def create_vm(
         self,
         job_id: str,
-        agent_config: str = "defaults",
+        agent_config: str = "worker_base",
         vm_image: Optional[str] = None,
         cpu_cores: int = 8,
         memory: str = "16Gi",
@@ -892,7 +892,7 @@ class VMProvisioner:
     async def create_thread_vm(
         self,
         thread_id: str,
-        agent_config: str = "defaults",
+        agent_config: str = "worker_base",
         vm_image: Optional[str] = None,
         cpu_cores: int = 8,
         memory: str = "16Gi",

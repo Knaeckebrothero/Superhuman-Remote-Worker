@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Scholar - Continuous R&D exploration and idea generation
-$extends: defaults
+$extends: worker_base
 
 agent_id: scholar
 display_name: Scholar
@@ -25,6 +25,7 @@ scholar:
 # and authors the synthesis. The reader MODEL comes from the llm.subagent tier
 # (falls back to llm.tactical; override per job via config_override.llm.subagent).
 delegation:
+  enabled: true
   mode: light
 
 workspace:
@@ -38,7 +39,7 @@ workspace:
     - repo/
   git_versioning: true
 
-# Scholar-specific instruction files (extends defaults' todo-guide skill)
+# Scholar-specific instruction files (the conservative base does not add these)
 instruction_files:
   - skill: todo-guide
     trigger: before_tool:next_phase_todos
@@ -102,7 +103,7 @@ tools:
   sql: []
   # Citations: a research agent must back every factual claim with a source.
   # the research-guide skill (tactical phase) instructs cite_web / cite_document,
-  # so the tools must exist. Mirrors defaults.yaml's citation suite.
+  # so the tools must exist. Mirrors worker_base.yaml's citation suite.
   citation:
     - cite_document
     - cite_web

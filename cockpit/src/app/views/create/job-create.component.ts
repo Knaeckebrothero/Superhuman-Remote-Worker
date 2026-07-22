@@ -4,7 +4,7 @@ import {ApiService} from '../../core/services/api.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
 import {UserService} from '../../core/services/user.service';
-import {Datasource, EffectiveModels, Expert, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
+import {Datasource, EffectiveModels, Expert, ExpertDefaultsResponse, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
 import {FilePreview, UploadStatus} from '../../core/models/file.model';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
 import {PRIORITY_LEVELS, resolveEffectiveModels} from '../agent-settings/agent-settings.types';
@@ -149,6 +149,9 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             <span class="field-hint">
               @if (selectedExpert()) {
                 {{ 'jobs.create.expertSelectedPrefix' | transloco }} {{ selectedExpert()!.display_name }}
+                @if (selectedExpertSource()) {
+                  · {{ ('settings.expertDefaults.source.' + selectedExpertSource()) | transloco }}
+                }
               } @else {
                 {{ 'jobs.create.expertHintUnselected' | transloco }}
               }
@@ -1140,6 +1143,10 @@ export class JobCreateComponent implements OnInit {
 
   readonly experts = signal<Expert[]>([]);
   readonly selectedExpert = signal<Expert | null>(null);
+  private readonly effectiveDefaultExpertId = signal<string | null>(null);
+  readonly selectedExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
+  private expertSelectionTouched = false;
+  private defaultRequestSerial = 0;
   readonly isLoadingExperts = signal(false);
   readonly expertDetail = signal<ExpertDetail | null>(null);
   readonly isLoadingExpertDetail = signal(false);
@@ -1165,6 +1172,7 @@ export class JobCreateComponent implements OnInit {
     this.selectedProjectId.set(value && value !== '' ? value : null);
     // Refresh eligible datasources for the newly selected project.
     this.loadDatasources();
+    this.loadEffectiveDefault();
   }
 
   onCloudStorageChange(value: string | null): void {
@@ -1189,9 +1197,9 @@ export class JobCreateComponent implements OnInit {
 
   readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
-  // Server-resolved effective models for the framework "defaults" expert — the
-  // floor used when no expert is selected, so the model picker's "Default"
-  // option shows the resolved chat pin instead of the config-literal placeholder.
+  // Server-resolved effective models for worker_base — the fallback floor used
+  // underneath the selected expert, so the model picker's "Default" option
+  // shows the resolved chat pin instead of the config-literal placeholder.
   readonly frameworkEffectiveModels = signal<EffectiveModels | null>(null);
   readonly resolvedEffectiveModels = computed(() =>
     resolveEffectiveModels(this.expertDetail()?.effective_models, this.frameworkEffectiveModels()),
@@ -1217,7 +1225,7 @@ export class JobCreateComponent implements OnInit {
     this.modelService.load();
     this.loadExperts();
     this.loadDatasources();
-    this.api.getExpertDetail('defaults').subscribe((d) => {
+    this.api.getExpertDetail('worker_base').subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
       if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
       if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
@@ -1226,22 +1234,44 @@ export class JobCreateComponent implements OnInit {
 
   private loadExperts(): void {
     this.isLoadingExperts.set(true);
-    this.api.getExperts().subscribe({
-      next: (experts) => { this.experts.set(experts); this.isLoadingExperts.set(false); },
+    this.api.getExperts('worker').subscribe({
+      next: (experts) => {
+        this.experts.set(experts);
+        this.applyEffectiveDefault();
+        this.isLoadingExperts.set(false);
+      },
       error: () => { this.isLoadingExperts.set(false); },
+    });
+    this.loadEffectiveDefault();
+  }
+
+  private loadEffectiveDefault(): void {
+    if (this.expertSelectionTouched) return;
+    const serial = ++this.defaultRequestSerial;
+    this.api.getExpertDefaults(this.selectedProjectId()).subscribe((response: ExpertDefaultsResponse | null) => {
+      if (serial !== this.defaultRequestSerial || this.expertSelectionTouched) return;
+      this.effectiveDefaultExpertId.set(response?.defaults?.worker?.effective?.id ?? null);
+      this.selectedExpertSource.set(response?.defaults?.worker?.source ?? null);
+      this.applyEffectiveDefault();
     });
   }
 
-  toggleExpert(expert: Expert): void {
-    if (this.selectedExpert()?.id === expert.id) {
-      this.selectedExpert.set(null);
-      this.expertDetail.set(null);
-      this.artifacts.instructions.set(null);
-      this.agentSettings?.resetAll();
-    } else {
+  private applyEffectiveDefault(): void {
+    if (this.expertSelectionTouched) return;
+    const id = this.effectiveDefaultExpertId();
+    const expert = id ? this.experts().find(item => item.id === id) : undefined;
+    if (expert && this.selectedExpert()?.id !== expert.id) {
       this.selectedExpert.set(expert);
       this.fetchExpertDetail(expert.id);
     }
+  }
+
+  toggleExpert(expert: Expert): void {
+    this.expertSelectionTouched = true;
+    this.selectedExpertSource.set('explicit');
+    if (this.selectedExpert()?.id === expert.id) return;
+    this.selectedExpert.set(expert);
+    this.fetchExpertDetail(expert.id);
   }
 
   private fetchExpertDetail(expertId: string): void {
@@ -1295,6 +1325,7 @@ export class JobCreateComponent implements OnInit {
       // Now that a project is selected, refresh eligible datasources so
       // project-linked sources are included and pre-selected.
       this.loadDatasources();
+      this.loadEffectiveDefault();
     });
   }
 
@@ -1367,11 +1398,11 @@ export class JobCreateComponent implements OnInit {
     const request: JobCreateRequest = { description: this.formData.description };
 
     const expert = this.selectedExpert();
-    if (expert && expert.id !== 'defaults') {
+    if (expert && !['default', 'defaults', 'worker_base'].includes(expert.id)) {
       // DB-backed experts (source user/global) go via expert_id — the
       // orchestrator resolves them into the job config. Bundled experts keep
       // the config_name path. Fixes the config_name=<uuid> conflation.
-      if (expert.source === 'user' || expert.source === 'global') {
+      if (expert.storage_kind === 'db' || ['user', 'global', 'managed'].includes(expert.source ?? '')) {
         request.expert_id = expert.id;
       } else {
         request.config_name = expert.id;
@@ -1468,12 +1499,15 @@ export class JobCreateComponent implements OnInit {
     this.filePreviews.set([]);
     this.uploadId = null;
     this.selectedExpert.set(null);
+    this.selectedExpertSource.set(null);
+    this.expertSelectionTouched = false;
     this.expertDetail.set(null);
     this.selectedPriority.set(5);
     this.cloudStorageOverride.set('inherit');
     this.agentSettings?.resetAll();
     const defaultProject = this.projects().find((p) => p.is_default);
     this.selectedProjectId.set(defaultProject?.id ?? this.projects()[0]?.id ?? null);
+    this.loadEffectiveDefault();
     this.artifacts.reset();
   }
 

@@ -6,15 +6,16 @@ This directory contains agent configuration files and templates.
 
 ```
 config/
-├── defaults.yaml                # Framework defaults (all configs extend this)
+├── worker_base.yaml             # Conservative inheritance base for worker experts
+├── session_base.yaml            # Conservative inheritance base for session experts
 ├── schema.json                  # JSON Schema for config validation
 ├── prompt_matrix.yaml           # Base prompt matrix (model family → filename)
 ├── instruction_matrix.yaml      # Base instruction matrix (model family → filename)
 ├── settings_matrix.yaml         # Model-family-specific inference params & context limits
 ├── README.md                    # This file
-├── experts/                     # Pre-built agent roles (developer, scholar, critic)
+├── experts/                     # Bundled roles and application-default seed bundles
 │   └── <expert>/
-│       ├── config.yaml              # Agent config (extends defaults)
+│       ├── config.yaml              # Expert overlay (extends one mode base)
 │       ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
 │       └── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
 ├── prompts/                     # Prompt templates (system prompt, phase prompts)
@@ -52,11 +53,11 @@ config/
 
 ### Option 1: Single File Config
 
-Create a YAML file that extends defaults:
+Create a worker YAML file that extends the worker mode base:
 
 ```yaml
 # yaml-language-server: $schema=schema.json
-$extends: defaults
+$extends: worker_base
 
 agent_id: my_agent
 display_name: My Custom Agent
@@ -76,6 +77,11 @@ Save as `config/my_agent.yaml` and run:
 python agent.py --config my_agent
 ```
 
+Persistent/session experts use `$extends: session_base` instead. The legacy
+names `default`, `defaults`, `persistent_default`, and `persistent_defaults`
+remain accepted as compatibility aliases, but new configs should use the
+explicit mode-base names.
+
 ### Option 2: Directory Config (with prompt overrides)
 
 For configs that need custom prompts or instructions, create a directory:
@@ -83,7 +89,7 @@ For configs that need custom prompts or instructions, create a directory:
 ```
 config/
 └── my_agent/
-    ├── config.yaml              # Agent config (extends defaults)
+    ├── config.yaml              # Expert overlay (extends a mode base)
     ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
     ├── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
     ├── instructions.md          # Custom instructions (optional)
@@ -272,7 +278,9 @@ tools:
     - cite_document
 ```
 
-See `defaults.yaml` for the full default tool set.
+See `worker_base.yaml` and `session_base.yaml` for the conservative inherited
+tool surfaces. Privileged and orchestration-oriented groups such as shell,
+delegation, automations, and loops are opt-in at the expert layer.
 
 ### Research & Browser Configuration
 
@@ -406,7 +414,8 @@ memory:
 
 ## Inheritance
 
-Configs use `$extends: defaults` to inherit from `defaults.yaml`. Deep merge applies:
+Configs use `$extends: worker_base` or `$extends: session_base` to inherit the
+appropriate execution-mode fallback. Deep merge applies:
 - Objects (dicts): Recursively merged
 - Arrays (lists): Override replaces entirely
 - Scalars: Override replaces
@@ -415,7 +424,7 @@ Configs use `$extends: defaults` to inherit from `defaults.yaml`. Deep merge app
 Example clearing an inherited array:
 
 ```yaml
-$extends: defaults
+$extends: worker_base
 
 tools:
   research: null  # Clears all research tools
@@ -434,7 +443,7 @@ This works with VS Code + Red Hat YAML extension.
 ## Running Agents
 
 ```bash
-# Use defaults
+# Use the worker framework base directly (normally a named expert is selected)
 python agent.py
 
 # Use custom config

@@ -64,7 +64,7 @@ class ArmSpec:
 
     name: str
     description: str = ""
-    base_config: str = "persistent_defaults"
+    base_config: str = "session_base"
     config_overrides: Dict[str, Any] = field(default_factory=dict)
     auxiliary: Dict[str, Any] = field(default_factory=dict)
     ingestion: IngestionOptions = field(default_factory=IngestionOptions)
@@ -80,7 +80,7 @@ class ArmSpec:
         return cls(
             name=data.get("name") or Path(path).stem,
             description=data.get("description", ""),
-            base_config=data.get("base_config", "persistent_defaults"),
+            base_config=data.get("base_config", "session_base"),
             config_overrides=data.get("config_overrides") or {},
             auxiliary=data.get("auxiliary") or {},
             ingestion=IngestionOptions(**(data.get("ingestion") or {})),

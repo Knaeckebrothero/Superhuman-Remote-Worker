@@ -5,11 +5,12 @@ import {UserService} from '../../core/services/user.service';
 
 /**
  * Persistent top banner that reads ``GET /api/system/readiness`` and shows
- * the three-step onboarding checklist when the LLM stack isn't ready:
+ * the onboarding checklist when the runtime isn't ready:
  *
  *   1. At least one provider key or endpoint configured.
  *   2. At least one chat / embedding / auxiliary catalog row.
  *   3. A default model pinned for each required capability.
+ *   4. A DB-backed application expert selected for workers and sessions.
  *
  * Each step deep-links to the admin page that resolves it. Non-admin users
  * see a "contact your admin" message instead — the underlying readiness
@@ -66,6 +67,15 @@ import {UserService} from '../../core/services/user.service';
                 </a>
               } @else {
                 <span>(Required defaults can be pinned once each capability has a model.)</span>
+              }
+            </li>
+            <li [class.done]="hasAllExpertDefaults()">
+              @if (hasAllExpertDefaults()) {
+                ✓ <span>Application expert defaults selected</span>
+              } @else {
+                <a routerLink="/admin/grants" class="banner-link">
+                  Select application experts for: {{ missingExpertDefaultsText() }}
+                </a>
               }
             </li>
           </ol>
@@ -144,6 +154,14 @@ export class ReadinessGateBannerComponent implements OnInit {
 
   readonly missingDefaultsText = computed(() => {
     return this.readiness.readiness().missing_defaults.join(', ');
+  });
+
+  readonly hasAllExpertDefaults = computed(() => {
+    return (this.readiness.readiness().missing_expert_defaults ?? []).length === 0;
+  });
+
+  readonly missingExpertDefaultsText = computed(() => {
+    return (this.readiness.readiness().missing_expert_defaults ?? []).join(', ');
   });
 
   ngOnInit(): void {

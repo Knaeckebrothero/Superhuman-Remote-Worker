@@ -244,10 +244,10 @@ def test_todo_guide_skill_exists_and_parses():
     assert len(body) > 500
 
 
-def test_defaults_bind_todo_guide_as_skill():
+def test_worker_base_binds_todo_guide_as_skill():
     import yaml
 
-    cfg = yaml.safe_load(_P("config/defaults.yaml").read_text())
+    cfg = yaml.safe_load(_P("config/worker_base.yaml").read_text())
     entries = cfg["instruction_files"]
     todo = [e for e in entries if e.get("skill") == "todo-guide"]
     assert len(todo) == 1
