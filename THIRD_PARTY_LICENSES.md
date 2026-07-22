@@ -191,7 +191,7 @@ _No bundled dependency ships a NOTICE file._
 | [etag](https://www.npmjs.com/package/etag) | 1.8.1 | MIT | ALLOW |
 | [express](https://www.npmjs.com/package/express) | 5.2.1 | MIT | ALLOW |
 | [fast-deep-equal](https://www.npmjs.com/package/fast-deep-equal) | 3.1.3 | MIT | ALLOW |
-| [fast-uri](https://www.npmjs.com/package/fast-uri) | 3.1.2 | BSD-3-Clause | ALLOW |
+| [fast-uri](https://www.npmjs.com/package/fast-uri) | 3.1.4 | BSD-3-Clause | ALLOW |
 | [finalhandler](https://www.npmjs.com/package/finalhandler) | 2.1.1 | MIT | ALLOW |
 | [forwarded](https://www.npmjs.com/package/forwarded) | 0.2.0 | MIT | ALLOW |
 | [fresh](https://www.npmjs.com/package/fresh) | 2.0.0 | MIT | ALLOW |
