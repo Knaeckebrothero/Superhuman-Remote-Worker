@@ -63,6 +63,19 @@ class CanvasDirectChannelUnavailable(Exception):
     """The pinned SSH transport is healthy but the loopback port is closed."""
 
 
+@dataclass(frozen=True, slots=True)
+class PinnedSSHCommandResult:
+    """Bounded output from one command on an authenticated SSH transport."""
+
+    exit_status: int
+    stdout: bytes
+    stderr: bytes
+
+
+class _CommandOutputTooLarge(Exception):
+    """Internal sentinel used to stop a noisy remote process."""
+
+
 def workspace_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     """Return one thread's parsed metadata without mutating the source row."""
 
@@ -481,6 +494,148 @@ class PinnedSSHTransportPool:
         if close:
             await self._close(entry)
 
+    @staticmethod
+    async def _terminate_process(process: Any) -> None:
+        """Terminate one remote channel and bound its close acknowledgement."""
+
+        terminate = getattr(process, "terminate", None)
+        if callable(terminate):
+            with suppress(Exception):
+                terminate()
+        await _bounded_wait_closed(process)
+
+    @staticmethod
+    async def _read_command_stream(
+        reader: Any,
+        *,
+        chunks: list[bytes],
+        remaining: list[int],
+    ) -> None:
+        while True:
+            chunk = await reader.read(8192)
+            if not chunk:
+                return
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            elif not isinstance(chunk, bytes):
+                chunk = bytes(chunk)
+            remaining[0] -= len(chunk)
+            if remaining[0] < 0:
+                raise _CommandOutputTooLarge
+            chunks.append(chunk)
+
+    @staticmethod
+    async def _wait_process(process: Any) -> None:
+        wait_closed = getattr(process, "wait_closed", None)
+        if callable(wait_closed):
+            await wait_closed()
+            return
+        wait = getattr(process, "wait", None)
+        if callable(wait):
+            await wait()
+
+    async def run_command(
+        self,
+        *,
+        target: RemoteWorkspaceTarget,
+        command: str,
+        key_path: str,
+        generation_resolver: GenerationResolver,
+        timeout: float,
+        max_output_bytes: int,
+    ) -> PinnedSSHCommandResult:
+        """Run one bounded command on the pinned, generation-bound transport."""
+
+        if not command or not isinstance(command, str):
+            raise ValueError("command must be a non-empty string")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if max_output_bytes <= 0:
+            raise ValueError("max_output_bytes must be positive")
+
+        async with self.checkout(target=target, key_path=key_path) as connection:
+            require_same_remote_workspace(await generation_resolver(), target)
+            process = None
+            pumps: list[asyncio.Task[None]] = []
+            stdout_chunks: list[bytes] = []
+            stderr_chunks: list[bytes] = []
+            remaining = [max_output_bytes]
+            try:
+                async with asyncio.timeout(timeout):
+                    process = await connection.create_process(command, encoding=None)
+                    pumps = [
+                        asyncio.create_task(
+                            self._read_command_stream(
+                                process.stdout,
+                                chunks=stdout_chunks,
+                                remaining=remaining,
+                            )
+                        ),
+                        asyncio.create_task(
+                            self._read_command_stream(
+                                process.stderr,
+                                chunks=stderr_chunks,
+                                remaining=remaining,
+                            )
+                        ),
+                    ]
+                    await asyncio.gather(*pumps)
+                    await self._wait_process(process)
+            except TimeoutError as exc:
+                if process is not None:
+                    await self._terminate_process(process)
+                raise CanvasSSHError(
+                    504,
+                    "workspace_command_timeout",
+                    "Workspace command timed out",
+                ) from exc
+            except asyncio.CancelledError:
+                if process is not None:
+                    cleanup = asyncio.create_task(self._terminate_process(process))
+                    with suppress(asyncio.CancelledError):
+                        await asyncio.shield(cleanup)
+                raise
+            except _CommandOutputTooLarge as exc:
+                if process is not None:
+                    await self._terminate_process(process)
+                raise CanvasSSHError(
+                    502,
+                    "workspace_command_output_too_large",
+                    "Workspace command output exceeded the allowed size",
+                ) from exc
+            except CanvasSSHError:
+                raise
+            except Exception as exc:
+                if process is not None:
+                    await self._terminate_process(process)
+                if self._is_connection_closed(connection):
+                    await self.invalidate(target)
+                raise CanvasSSHError(
+                    503,
+                    "workspace_unavailable",
+                    "Workspace SSH command could not be completed",
+                ) from exc
+            finally:
+                for pump in pumps:
+                    if not pump.done():
+                        pump.cancel()
+                if pumps:
+                    await asyncio.gather(*pumps, return_exceptions=True)
+
+            require_same_remote_workspace(await generation_resolver(), target)
+            exit_status = getattr(process, "exit_status", None)
+            if isinstance(exit_status, bool) or not isinstance(exit_status, int):
+                raise CanvasSSHError(
+                    503,
+                    "workspace_unavailable",
+                    "Workspace command did not return an exit status",
+                )
+            return PinnedSSHCommandResult(
+                exit_status=exit_status,
+                stdout=b"".join(stdout_chunks),
+                stderr=b"".join(stderr_chunks),
+            )
+
     @asynccontextmanager
     async def open_loopback_connection(
         self,
@@ -633,8 +788,10 @@ __all__ = [
     "CanvasDirectChannelUnavailable",
     "CanvasSSHError",
     "EMPTY_KNOWN_HOSTS",
+    "GenerationResolver",
     "PINNED_SSH_TRANSPORT_POOL",
     "PinnedSFTPPool",
+    "PinnedSSHCommandResult",
     "PinnedSSHClient",
     "PinnedSSHTransportPool",
     "RemoteWorkspaceTarget",
