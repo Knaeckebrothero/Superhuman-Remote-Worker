@@ -4447,6 +4447,57 @@ class PostgresDB:
             )
             return row is not None
 
+    async def queue_job_for_resume(
+        self, job_id: str, context_merge: Dict[str, Any] | None = None
+    ) -> bool:
+        """Park a job as 'paused' (dispatchable) in ONE statement.
+
+        Merges ``context_merge`` (``queued_feedback`` and friends), flips the
+        status, unassigns the agent, and sheds the row-level freeze — stashing
+        it in ``context.last_freeze_data`` for observability first.
+
+        Clearing the freeze is the whole point. ``get_dispatchable_jobs``
+        requires ``freeze_data IS NULL`` (partial-index contract, 0046), so a
+        resume that keeps the blob leaves the job paused-but-INVISIBLE: the
+        dispatcher never selects it again and nothing else is scheduled to
+        change its state. A stale row-level freeze also poisons the next
+        completion (``_parse_freeze_data`` prefers the DB copy over the request
+        body). Every other frozen→paused transition already does this
+        (``claim_delegation_resume``, ``claim_llm_outage_redispatch``, the
+        vm_upgrade approve/deny arms); the human-reply resume paths did not,
+        which wedged every reply to a blocking agent message.
+        See docs/issues/blocking_message_reply_keeps_freeze_data.md.
+
+        Returns True iff a row was updated.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET context = COALESCE(context, '{}'::jsonb)
+                                 || $2::jsonb
+                                 || CASE
+                                        WHEN freeze_data IS NULL THEN '{}'::jsonb
+                                        ELSE jsonb_build_object(
+                                            'last_freeze_data', freeze_data
+                                        )
+                                    END,
+                       status = 'paused',
+                       assigned_agent_id = NULL,
+                       freeze_data = NULL,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                RETURNING id
+                """,
+                job_uuid,
+                json.dumps(context_merge or {}),
+            )
+            return row is not None
+
     async def list_due_llm_outage_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Paused ``llm_unavailable`` jobs whose backoff timer is due for re-dispatch.
 

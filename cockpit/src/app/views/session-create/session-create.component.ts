@@ -385,9 +385,15 @@ export class SessionCreateComponent implements OnInit {
     this.modelService.load();
     this.loadExperts();
     this.loadDatasourcesList();
-    this.http.get<ExpertDetail>(`${environment.apiUrl}/experts/defaults`).subscribe({
+    this.http.get<ExpertDetail>(`${environment.apiUrl}/experts/defaults?type=session`).subscribe({
       next: (d) => {
-        if (d?.config) this.frameworkDefaults.set(d.config);
+        if (d?.config) {
+          this.frameworkDefaults.set(d.config);
+          // Tool toggles keep their own override state rather than deriving it
+          // directly from the config input. Synchronize the asynchronously
+          // loaded session base so empty persistent categories render disabled.
+          this.agentSettings?.toolsGroup?.prefillFromConfig(d.config);
+        }
         if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
         if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
       },
@@ -446,6 +452,8 @@ export class SessionCreateComponent implements OnInit {
       this.selectedExpert.set(null);
       this.expertDetail.set(null);
       this.agentSettings?.resetAll();
+      const defaults = this.frameworkDefaults();
+      if (defaults) this.agentSettings?.toolsGroup?.prefillFromConfig(defaults);
     } else {
       this.selectedExpert.set(expert);
       this.fetchExpertDetail(expert.id);

@@ -1,5 +1,8 @@
 import {describe, expect, it} from 'vitest';
-import {allToolCategoriesSelected} from './tools-group.component';
+import {
+  allToolCategoriesSelected,
+  disabledToolCategoriesFromConfig,
+} from './tools-group.component';
 
 /**
  * Select-all state for the tool toggles. A category is "selected" (enabled)
@@ -30,5 +33,25 @@ describe('tools-group select-all state', () => {
     // A grant-blocked category lingering in the disabled set must not flip the
     // state false, since it is excluded from the selectable keys.
     expect(allToolCategoriesSelected(['research'], new Set(['browser_direct']))).toBe(true);
+  });
+});
+
+describe('resolved tool config', () => {
+  it('recognizes categories disabled by persistent session defaults', () => {
+    const disabled = disabledToolCategoriesFromConfig({
+      tools: {
+        communication: [],
+        delegation: [],
+        agent_catalog: [],
+        workflows: [],
+      },
+    }, ['communication', 'delegation', 'agent_catalog', 'workflows', 'research']);
+
+    expect(disabled).toEqual(new Set([
+      'communication',
+      'delegation',
+      'agent_catalog',
+      'workflows',
+    ]));
   });
 });
