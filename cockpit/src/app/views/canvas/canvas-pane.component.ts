@@ -37,6 +37,10 @@ import {CanvasEditController} from './canvas-edit.controller';
 import {CanvasEditorComponent} from './canvas-editor.component';
 import {CanvasViewerController} from './canvas-viewer.controller';
 import {CanvasBrowserController} from './canvas-browser.controller';
+import {
+  CanvasBrowserRendererComponent,
+  canvasBrowserStatusKey,
+} from './canvas-browser-renderer.component';
 import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.component';
 import {
   CanvasLiveAppUnavailableComponent,
@@ -88,6 +92,7 @@ export function openCanvasPopOut(
     AppIconComponent,
     AppIconButtonComponent,
     AppSpinnerComponent,
+    CanvasBrowserRendererComponent,
     CanvasHtmlRendererComponent,
     CanvasImageRendererComponent,
     CanvasLiveAppRendererComponent,
@@ -285,6 +290,9 @@ export function openCanvasPopOut(
                                               (frameUnbound)="viewer.unbindFrame($event)"
                                               (frameMessage)="viewer.handleFrameMessage($event)" />
               }
+              @case ('browser') {
+                <app-canvas-browser-renderer />
+              }
             }
             @if (showOverlay()) {
               <div class="canvas-overlay" role="status">
@@ -370,6 +378,7 @@ export class CanvasPaneComponent {
   readonly hasVisual = computed(() => {
     if (this.editor.editMode() && this.editor.hasSession()) return true;
     if (this.effectiveRenderer() === 'app') return this.viewer.frameUrl() !== null;
+    if (this.effectiveRenderer() === 'browser') return true;
     if (this.effectiveRenderer() === 'image') return this.imageUrl() !== null;
     return this.effectiveRenderer() !== 'unsupported' &&
       (this.contentStatus() !== 'idle' || this.editor.hasSession());
@@ -385,6 +394,9 @@ export class CanvasPaneComponent {
         ? source.entry_path
         : this.transloco.translate('canvas.app.source');
     }
+    if (source?.type === 'browser') {
+      return this.transloco.translate('canvas.browser.source');
+    }
     return this.transloco.translate('canvas.noSource');
   });
   readonly rendererLabel = computed(() =>
@@ -393,7 +405,13 @@ export class CanvasPaneComponent {
   readonly isLiveAppSource = computed(() => this.chromeState()?.source?.type === 'workspace_app');
   readonly sourceKindLabel = computed(() => {
     const type = this.chromeState()?.source?.type;
-    const kind = type === 'workspace_file' ? 'file' : type === 'workspace_app' ? 'app' : 'unknown';
+    const kind = type === 'workspace_file'
+      ? 'file'
+      : type === 'workspace_app'
+        ? 'app'
+        : type === 'browser'
+          ? 'browser'
+          : 'unknown';
     return this.transloco.translate(`canvas.sourceKind.${kind}`);
   });
   readonly lastSyncedAt = computed(() =>
@@ -453,6 +471,9 @@ export class CanvasPaneComponent {
   });
   readonly statusText = computed(() => {
     const state = this.state();
+    if (this.effectiveRenderer() === 'browser') {
+      return this.transloco.translate(canvasBrowserStatusKey(this.browser.connectionStatus()));
+    }
     if (this.liveAppFailureVisible()) {
       return this.transloco.translate(
         `canvas.app.failure.${canvasLiveAppFailureKind(this.liveAppErrorCode())}.title`,
@@ -504,7 +525,7 @@ export class CanvasPaneComponent {
 
   constructor() {
     effect(() => this.content.syncPresentation(
-      this.active(),
+      this.active() && this.effectiveRenderer() !== 'browser',
       this.canvas.threadId(),
       this.state(),
       () => this.contentViewport()?.nativeElement.scrollTop ?? 0,
@@ -514,7 +535,7 @@ export class CanvasPaneComponent {
       },
     ));
     effect(() => this.editor.sync(
-      this.active(),
+      this.active() && this.effectiveRenderer() !== 'browser',
       this.canvas.threadId(),
       this.state(),
       this.displayState(),
