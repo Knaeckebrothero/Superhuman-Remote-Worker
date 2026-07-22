@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=schema.json
-# Framework defaults - agents extend this via $extends
+# Framework worker base — safe fallbacks for worker experts.
 
-agent_id: default
-display_name: The General Secretary
+agent_id: worker_base
+display_name: Framework Worker Base
 
 llm:
   model: RedHatAI/gemma-4-31B-it-FP8-Dynamic
@@ -148,10 +148,9 @@ tools:
   # Injected automatically via datasource system
   email: []
   # Shell tools - shell command execution (src/tools/shell/)
-  shell:
-    - run_command     # Execute commands, get output (stateless mode, default)
-    - cancel_command  # Abort a stuck/hung command (Ctrl+C), freeing the tab
-    - shell_read      # Read more output from scrollback when needed
+  # Privileged and orchestration-oriented capabilities are opt-in at the expert
+  # layer.  This base is a reliable fallback, not a maximal role profile.
+  shell: []
   # Evaluation tools - verdict tools for critic agents (src/tools/evaluation/)
   # Enable in critic config to give reviewer agents approve/return capabilities.
   evaluation: []
@@ -172,9 +171,7 @@ tools:
   communication:
     - send_message
   # Delegation tools - spawn child jobs as workspace branches (src/tools/delegation/)
-  delegation:
-    - delegate_work
-    - resume_delegation_child
+  delegation: []
   # Orchestrator tools - job delegation for persistent agents (src/tools/orchestrator/)
   # Empty by default; persistent agents auto-load these via PersistentSession
   orchestrator: [ ]
@@ -184,7 +181,7 @@ tools:
   # Empty by default; persistent agents auto-load these via PersistentSession
   agent_catalog: [ ]
   # Workflow tools - automations and project loop inspection
-  # Empty by default; persistent agents auto-load safe defaults via PersistentSession
+  # Empty by default; session experts opt into this closed control group.
   workflows: [ ]
   # Git tools - workspace version control (src/tools/git/)
   git:
@@ -382,7 +379,7 @@ auxiliary:
 # The critic either approves the job or resumes it with feedback.
 # See docs/features/verification_phase.md for full design.
 verification:
-  enabled: true          # Spawn a critic job after job_complete to review deliverables
+  enabled: false         # Experts opt in when an independent critic is required
   critic_config: critic  # Which expert config to use for the reviewer
   max_rounds: 5          # Max feedback round-trips before auto-accepting (0 = unlimited)
 
@@ -398,12 +395,12 @@ curator:
 # The scholar gathers information, does web research, and writes findings
 # to the research/ folder in the workspace. The main job starts after.
 scholar:
-  enabled: true            # Spawn a scholar job before main job starts
+  enabled: false           # Experts opt in when a dedicated research pass is required
   scholar_config: scholar   # Which expert config to use
 
 # Subagent delegation — let agents spawn child jobs that branch off the workspace
 delegation:
-  enabled: true              # Agents can spawn child jobs via delegate_work
+  enabled: false             # Experts opt in; base workers never spawn children
   max_depth: 1               # Nesting depth (1 = no grandchildren)
   default_timeout: 7200      # Default timeout per delegation in seconds (2h)
   max_timeout: 14400          # Maximum allowed timeout (4h)
@@ -466,7 +463,12 @@ browser:
 # Shell command execution (tmux-backed terminal multiplexer)
 # Requires tmux installed.
 shell:
-  mode: stateless              # "stateless" (run_command, default) or "persistent" (shell_execute)
+  # `mode` is intentionally NOT set here. It is model-family-derived
+  # (config/model_config_matrix.yaml `settings.shell_mode`): capable families ->
+  # "persistent" (shell_execute), everything else falls to the stateless floor at
+  # the read-sites (shell_tools.create_shell_tools / loader.get_all_tool_names,
+  # both `.get("mode", "stateless")`). An explicit `mode:` here or in an
+  # expert/session/project config overrides that family default (human wins).
   max_tabs: 15                   # Maximum number of concurrent shell tabs
   max_read_lines: 200          # Maximum lines shell_read can return
   scrollback_limit: 5000       # Tmux history-limit per pane

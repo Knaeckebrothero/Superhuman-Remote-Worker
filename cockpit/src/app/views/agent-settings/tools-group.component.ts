@@ -262,7 +262,7 @@ export class ToolsGroupComponent {
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
   disabled = input(false);
-  /** Default tool lists from defaults.yaml, used to re-enable expert-disabled categories. */
+  /** Tool lists from the selected expert's mode base, used when re-enabling categories. */
   defaultsTools = input<Record<string, string[]>>({});
   /** Author's resolved capability grants for editor greying; null ⇒ no gating
    *  (launch flow / admin). Maps tool categories → catalog keys. */
@@ -407,7 +407,7 @@ export class ToolsGroupComponent {
     // → restore a full tool list. Live mode uses the closed-vocabulary
     // mirror (enablement is keyed off empty-vs-non-empty agent-side, but the
     // payload must survive the closed-group validation); creation modes keep
-    // the defaults.yaml lists.
+    // the mode-base lists.
     const defaults = this.mode() === 'live' ? SESSION_TOOL_GROUP_NAMES : this.defaultsTools();
     for (const cat of this.expertDisabledCategories) {
       if (!disabled.has(cat) && defaults[cat]?.length) {

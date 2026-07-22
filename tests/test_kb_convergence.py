@@ -460,8 +460,9 @@ class TestLoopExpertResolution:
 
         kwargs = db.create_job.call_args.kwargs
         assert kwargs["expert_id"] == str(expert_id)
-        # NAME stays in config_name (the guard-safe combo); UUID only in expert_id.
-        assert kwargs["config_name"] == "scholar-fast"
+        # A DB expert resolves directly on the worker base; combining it with a
+        # bundled role slug would merge two experts.
+        assert kwargs["config_name"] == "worker_base"
 
     @pytest.mark.asyncio
     async def test_unknown_role_passes_no_expert_id(self, monkeypatch):
@@ -484,7 +485,7 @@ class TestLoopExpertResolution:
 
     @pytest.mark.asyncio
     async def test_flag_off_skips_resolution(self, monkeypatch):
-        monkeypatch.delenv("EXPERTS_DB_ENABLED", raising=False)
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
         from orchestrator.services.project_loops import create_loop_job
 
         db = self._db()

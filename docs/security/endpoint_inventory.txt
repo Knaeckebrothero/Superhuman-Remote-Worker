@@ -16,6 +16,8 @@ POST   /api/admin/config/overrides                                              
 DELETE /api/admin/config/overrides/{override_id}                                        admin:_require_admin
 GET    /api/admin/config/overrides/{override_id}                                        admin:_require_admin
 PUT    /api/admin/config/overrides/{override_id}                                        admin:_require_admin
+GET    /api/admin/expert-defaults                                                       admin:_require_admin
+PUT    /api/admin/expert-defaults/{expert_type}                                         admin:_require_admin
 GET    /api/admin/families                                                              admin:_require_admin
 GET    /api/admin/families/detect                                                       admin:_require_admin
 GET    /api/admin/grants                                                                admin:_require_admin
@@ -104,6 +106,10 @@ PUT    /api/datasources/{datasource_id}                                         
 GET    /api/datasources/{datasource_id}/index-status                                    gated:require_datasource_access
 POST   /api/datasources/{datasource_id}/reindex                                         gated:require_datasource_owner
 POST   /api/datasources/{datasource_id}/test                                            gated:require_datasource_owner
+GET    /api/expert-defaults                                                             gated:require_project_member
+DELETE /api/expert-defaults/{expert_type}                                               gated:require_approved_user
+PUT    /api/expert-defaults/{expert_type}                                               gated:require_approved_user
+POST   /api/expert-defaults/{expert_type}/fork                                          gated:require_approved_user
 GET    /api/experts                                                                     gated:require_approved_user
 POST   /api/experts                                                                     gated:require_approved_user
 POST   /api/experts/import                                                              gated:require_approved_user
@@ -224,6 +230,8 @@ GET    /api/projects/{project_id}/datasources                                   
 DELETE /api/projects/{project_id}/datasources/{datasource_id}                           gated:require_project_owner
 PATCH  /api/projects/{project_id}/datasources/{datasource_id}                           gated:require_project_owner
 POST   /api/projects/{project_id}/datasources/{datasource_id}                           gated:require_project_owner
+DELETE /api/projects/{project_id}/expert-defaults/{expert_type}                         gated:require_project_owner
+PUT    /api/projects/{project_id}/expert-defaults/{expert_type}                         gated:require_project_owner
 GET    /api/projects/{project_id}/experts                                               gated:require_project_member
 GET    /api/projects/{project_id}/experts/{expert_name}                                 gated:require_project_member
 GET    /api/projects/{project_id}/jobs                                                  gated:require_project_member

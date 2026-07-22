@@ -34,7 +34,7 @@ def _find_repo_root() -> Path:
     """Walk up from this file to find the directory containing ``config/``."""
     anchor = Path(__file__).resolve().parent
     for _ in range(5):
-        if (anchor / "config" / "defaults.yaml").is_file():
+        if (anchor / "config" / "worker_base.yaml").is_file():
             return anchor
         anchor = anchor.parent
     # Last resort: assume working directory (WORKDIR /app in Docker)
@@ -107,7 +107,7 @@ def is_verification_enabled(job: dict[str, Any]) -> bool:
     if cfg:
         return bool(cfg.get("enabled", False))
     # Disk fallback when resolved_config is missing
-    config_name = job.get("config_name", "default")
+    config_name = job.get("config_name") or "worker_base"
     config_override = job.get("config_override")
     if isinstance(config_override, str):
         try:
@@ -155,7 +155,7 @@ def _resolve_config_section_from_disk(
 
     Reads just the ``section`` key from:
 
-    1. ``config/defaults.yaml`` (base defaults)
+    1. ``config/worker_base.yaml`` (base defaults)
     2. ``config/experts/{config_name}/config.yaml`` or
        ``config/{config_name}.yaml`` (expert override)
     3. ``config_override[section]`` (per-job override)
@@ -165,7 +165,7 @@ def _resolve_config_section_from_disk(
     result: dict[str, Any] = {}
 
     # 1. Read defaults
-    defaults_path = _REPO_ROOT / "config" / "defaults.yaml"
+    defaults_path = _REPO_ROOT / "config" / "worker_base.yaml"
     if defaults_path.exists():
         try:
             with open(defaults_path, encoding="utf-8") as f:
@@ -173,7 +173,7 @@ def _resolve_config_section_from_disk(
             if isinstance(defaults.get(section), dict):
                 result.update(defaults[section])
         except Exception as e:
-            logger.warning("Failed to read defaults.yaml for %s config: %s", section, e)
+            logger.warning("Failed to read worker_base.yaml for %s config: %s", section, e)
 
     # 2. Read expert config (overrides defaults)
     expert_paths = [

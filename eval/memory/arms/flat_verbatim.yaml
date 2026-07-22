@@ -13,7 +13,7 @@ name: flat_verbatim
 description: >
   Verbatim round-level index, dedup off, no TTL pinning — published-
   baseline reproduction + smoke arm.
-base_config: persistent_defaults
+base_config: session_base
 
 config_overrides:
   memory:

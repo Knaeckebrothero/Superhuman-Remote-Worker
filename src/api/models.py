@@ -272,7 +272,7 @@ class JobStartRequest(BaseModel):
         description="DB-backed expert UUID for this job",
     )
     config_name: str = Field(
-        default="default",
+        default="worker_base",
         description="Agent configuration name",
     )
     config_override: Optional[Dict[str, Any]] = Field(

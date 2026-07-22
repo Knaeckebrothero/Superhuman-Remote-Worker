@@ -282,6 +282,15 @@ from services.config_resolver import (  # noqa: E402
     resolve_config,
     unrouted_model_slots,
 )
+from services.default_experts import (  # noqa: E402
+    BASE_CONFIG_NAMES,
+    DefaultExpertUnavailable,
+    ExpertSelectionError,
+    personal_defaults_allowed,
+    resolve_root_expert,
+    seed_managed_default_experts,
+)
+from src.core.loader import canonical_config_name  # noqa: E402
 from services.session_router import SessionRouterService  # noqa: E402
 from services.session_tokens import SessionTokenService  # noqa: E402
 from services.lifecycle import (  # noqa: E402
@@ -1267,9 +1276,14 @@ def _is_experts_db_enabled() -> bool:
 
     Gates whether the orchestrator resolves the full config at dispatch/attach
     and emits a ``resolved_config`` blob. Off → the agent uses its ``from_config``
-    fallback (today's path). Dev on / prod off (helm ``expertsDbEnabled``).
+    fallback (emergency compatibility path). Enabled by default because root
+    creation depends on persisted application expert pointers.
     """
-    return os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
+    return os.getenv("EXPERTS_DB_ENABLED", "true").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    )
 
 
 def _is_skills_db_enabled() -> bool:
@@ -1313,9 +1327,58 @@ async def _resolve_default_models(user_id: str | None) -> dict[str, Any]:
     ) or await postgres_db.resolve_default_for_capability("auxiliary")
     if chat:
         out.setdefault("llm", {})["model"] = chat
+    reasoning = user_settings.get("default_reasoning_level")
+    if reasoning:
+        # Account reasoning is a gap-filler like the account model: the mode
+        # base supplies the system floor, while an expert/request pin must win.
+        out.setdefault("llm", {})["reasoning_level"] = reasoning
     if aux:
         out.setdefault("auxiliary", {})["model"] = aux
     return out
+
+
+async def _resolve_session_account_defaults(
+    user_id: str | None,
+    all_user_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Account-level session fallbacks, always below the selected expert."""
+    out = await _resolve_default_models(user_id)
+    if not user_id:
+        return out
+    settings = (
+        all_user_settings
+        if all_user_settings is not None
+        else (await postgres_db.get_user_settings(str(user_id)) or {})
+    )
+    persistent = (settings or {}).get("persistent_agent") or {}
+    layer: dict[str, Any] = {}
+    if persistent.get("model"):
+        layer["llm"] = {"model": persistent["model"]}
+    interactive: dict[str, Any] = {}
+    for key in ("permission_mode", "greeting", "idle_timeout_minutes"):
+        if persistent.get(key) is not None:
+            interactive[key] = persistent[key]
+    if interactive:
+        layer["interactive"] = interactive
+    if persistent.get("command_allowlist"):
+        layer["command_allowlist"] = persistent["command_allowlist"]
+    headless: dict[str, Any] = {}
+    if persistent.get("headless_mode"):
+        headless["mode"] = persistent["headless_mode"]
+    if persistent.get("headless_attention_sleep_minutes") is not None:
+        headless["attention_sleep_minutes"] = int(
+            persistent["headless_attention_sleep_minutes"]
+        )
+    if persistent.get("notification_channels"):
+        headless["notification_channels"] = list(
+            persistent["notification_channels"]
+        )
+    if headless:
+        layer["headless"] = headless
+    layer["workspace"] = {
+        "backend": _default_session_workspace_backend(persistent)
+    }
+    return _deep_merge_dicts(out, layer)
 
 
 async def _resolve_session_config(
@@ -1331,7 +1394,7 @@ async def _resolve_session_config(
 
     The session sibling of the job-dispatch resolve. Sessions **re-resolve on
     every (re)attach** — there is no freeze (mutable run; spec delivery table).
-    Layers: persistent_defaults base + default-model floor + DB expert
+    Layers: session_base + account/system fallback + DB expert
     (``metadata.expert_id``) + thread ``config_override`` (request) → creds.
     ``config_override`` overrides ``metadata.config_override`` for the warm-pool
     path (it carries the attach-time lite-workspace backend).
@@ -1347,17 +1410,26 @@ async def _resolve_session_config(
         expert_row = (
             await postgres_db.get_expert_by_id(str(expert_id)) if expert_id else None
         )
-        base = thread.get("config_name") or "persistent_defaults"
-        if base in ("default", "persistent_default") or _looks_like_uuid(base):
+        base = canonical_config_name(thread.get("config_name") or "session_base")
+        if _looks_like_uuid(base):
             # Sentinel / cockpit-conflated expert UUID → resolve onto the real
             # session base; the expert is delivered via expert_id, not the name.
-            base = "persistent_defaults"
+            base = "session_base"
         request_override = (
             config_override
             if config_override is not None
             else (metadata.get("config_override") or None)
         )
-        base_defaults = await _resolve_default_models(user_id)
+        base_defaults = await _resolve_session_account_defaults(user_id)
+        project_overrides = None
+        if project_id and expert_id:
+            link = await postgres_db.get_project_expert_link(
+                project_id=project_id, expert_id=str(expert_id)
+            )
+            if link:
+                project_overrides = link.get("config_override") or None
+                if isinstance(project_overrides, str):
+                    project_overrides = json.loads(project_overrides)
         _cap: dict = {}
         _skills_payload = await _gather_in_scope_skills(
             user_id, [project_id] if project_id else None
@@ -1373,6 +1445,7 @@ async def _resolve_session_config(
             base_config_name=base,
             base_defaults=base_defaults,
             expert_row=expert_row,
+            project_overrides=project_overrides,
             request_override=request_override,
             expert_type="session",
             capture=_cap,
@@ -1383,7 +1456,13 @@ async def _resolve_session_config(
         from src.core.skill_resolution import filter_bound_skills
 
         filter_bound_skills(resolved)
-        session_tool_markers = _session_tool_group_disabled_markers(request_override)
+        # Empty session-control groups are meaningful at every layer.  Derive
+        # runtime injection markers from the fully merged config, so a safe base
+        # or expert can disable Automations & Loops without requiring the create
+        # form to redundantly submit an empty request override.
+        session_tool_markers = _session_tool_group_disabled_markers(
+            _cap["merged_fragment"]
+        )
         if session_tool_markers:
             resolved.setdefault("agent", {}).update(session_tool_markers)
         # Session dispatch PEP (decision 9): the merged config — including
@@ -2262,12 +2341,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     expert_row = await postgres_db.get_expert_by_id(
                         str(job["expert_id"])
                     )
-                _base_name = job.get("config_name") or "defaults"
-                if _base_name == "default":
-                    # JobCreate / JobStartRequest sentinel for "the default
-                    # config"; the real base file is defaults.yaml (a literal
-                    # resolve of "default" 404s). The agent boots "defaults" too.
-                    _base_name = "defaults"
+                _base_name = canonical_config_name(
+                    job.get("config_name") or "worker_base"
+                )
                 # Default-model floor (model names only): the base config carries
                 # a placeholder model; the effective default is the user's pinned
                 # model else the system capability default. Resolution applies it
@@ -2400,7 +2476,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             instructions_upload_id=instructions_upload_id,
             instructions=instructions,
             document_path=job.get("document_path"),
-            config_name=job.get("config_name", "default"),
+            config_name=canonical_config_name(
+                job.get("config_name") or "worker_base"
+            ),
             config_override=None if resolved_config else config_override,
             resolved_config=resolved_config,
             git_remote_url=git_remote_url,
@@ -2488,9 +2566,9 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # runner's CURRENT grants. Fail closed: deny -> mark failed + refuse.
         if await _user_experts_enabled():
             try:
-                _rbase = job.get("config_name") or "defaults"
-                if _rbase == "default":
-                    _rbase = "defaults"
+                _rbase = canonical_config_name(
+                    job.get("config_name") or "worker_base"
+                )
                 _rcap: dict = {}
                 resolve_config(
                     base_config_name=_rbase,
@@ -2635,7 +2713,9 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
 
         resume_payload = {
             "job_id": job_id,
-            "config_name": job.get("config_name", "default"),
+            "config_name": canonical_config_name(
+                job.get("config_name") or "worker_base"
+            ),
             "config_upload_id": job_context.get("config_upload_id"),
             "config_override": config_override,
             "datasources": datasources_payload,
@@ -2838,7 +2918,7 @@ async def _send_session_attach(
     """Send a session attach request to an idle persistent agent.
 
     ``config_name`` is the thread's config — pool pods boot as workers
-    ('defaults'), so the agent must re-resolve the session base config
+    (``worker_base``), so the agent must re-resolve the session base config
     from this name instead of its boot config
     (docs/issues/session_config_name_plumbing.md, hole B).
 
@@ -4915,7 +4995,7 @@ def _dispatch_llm_provider_fallback(
             if prov is not None:
                 return prov
 
-    config_name = job.get("config_name", "default")
+    config_name = canonical_config_name(job.get("config_name") or "worker_base")
     if config_name and "anthropic" in config_name.lower():
         return "anthropic"
     return "openai"
@@ -5083,7 +5163,9 @@ async def _try_dispatch_pending_jobs() -> None:
                         vm_cfg = config_override.get("workspace", {}).get("vm", {})
                         ok = await vm_provisioner.create_vm(
                             job_id=job_id,
-                            agent_config=job.get("config_name", "defaults"),
+                            agent_config=canonical_config_name(
+                                job.get("config_name", "worker_base")
+                            ),
                             vm_image=vm_cfg.get("image"),
                             cpu_cores=vm_cfg.get("cpu_cores", 8),
                             memory=vm_cfg.get("memory", "16Gi"),
@@ -5149,7 +5231,9 @@ async def _try_dispatch_pending_jobs() -> None:
                         vm_cfg = config_override.get("workspace", {}).get("vm", {})
                         await vm_provisioner.create_vm(
                             job_id=job_id,
-                            agent_config=job.get("config_name", "defaults"),
+                            agent_config=canonical_config_name(
+                                job.get("config_name", "worker_base")
+                            ),
                             vm_image=vm_cfg.get("image"),
                             cpu_cores=vm_cfg.get("cpu_cores", 8),
                             memory=vm_cfg.get("memory", "16Gi"),
@@ -5752,7 +5836,7 @@ class JobCreate(BaseModel):
     document_dir: str | None = Field(
         None, description="Directory containing documents (deprecated)"
     )
-    config_name: str = Field("default", description="Agent configuration name")
+    config_name: str = Field("worker_base", description="Agent configuration name")
     expert_id: str | None = Field(
         None,
         description=(
@@ -5815,7 +5899,7 @@ class JobStartRequest(BaseModel):
     instructions_upload_id: str | None = None
     document_path: str | None = None
     document_dir: str | None = None
-    config_name: str = "default"
+    config_name: str = "worker_base"
     config_override: dict[str, Any] | None = None
     resolved_config: dict[str, Any] | None = Field(
         default=None,
@@ -5862,7 +5946,7 @@ class VMCreateRequest(BaseModel):
     """Request body for creating a VM for a job."""
 
     job_id: str
-    agent_config: str = "defaults"
+    agent_config: str = "worker_base"
     vm_image: str | None = None
     cpu_cores: int = Field(8, ge=1, le=16)
     memory: str = "16Gi"
@@ -6492,6 +6576,14 @@ async def lifespan(app: FastAPI):
     # checksum drift or a dirty row from a prior failure (see
     # docs/db_migration.md §Operational runbook for repair steps).
     await postgres_db.apply_migrations()
+    managed_defaults = await seed_managed_default_experts(
+        postgres_db, _get_config_dir()
+    )
+    logger.info(
+        "Managed expert defaults ready: worker=%s session=%s",
+        managed_defaults.get("worker"),
+        managed_defaults.get("session"),
+    )
     await vector_db.apply_migrations()
     if audit_db is not None and audit_ready:
         try:
@@ -7811,30 +7903,93 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             ),
         )
 
-        # Resolve project defaults (config name, config override)
+        # Resolve project config fallback plus the authoritative DB expert
+        # selection.  Root jobs persist a concrete expert id; internal
+        # children/specialists keep their explicit/inherited selector and never
+        # silently acquire a user's current default.
         project = None
-        config_name = job.config_name
-        config_override = job.config_override
+        config_name = canonical_config_name(job.config_name or "worker_base")
+        if job.expert_id and config_name != "worker_base":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "expert_id cannot be combined with a bundled worker "
+                    "config_name; select one expert source"
+                ),
+            )
+        request_config_override = job.config_override
+        project_default_override: dict[str, Any] | None = None
         if project_id:
             project = await postgres_db.get_project(project_id)
             if not project:
                 raise HTTPException(
                     status_code=404, detail=f"Project '{project_id}' not found"
                 )
-            if config_name == "default" and project.get("default_config_name"):
-                config_name = project["default_config_name"]
             project_default_override = project.get("default_config_override")
             if project_default_override:
                 # asyncpg may return JSONB as a string — parse it
                 if isinstance(project_default_override, str):
                     project_default_override = json.loads(project_default_override)
-                if config_override:
-                    # Deep merge: project defaults as base, job overrides on top
+
+        config_override = project_default_override
+        resolved_expert_id = job.expert_id
+        # A worker launched from an interactive thread is still a user-level
+        # root job (the thread supplies scope/datasources, not a worker parent).
+        # Only actual worker children/specialists carry parent_job_id.
+        root_creation = not job.parent_job_id
+        should_resolve_default = (
+            root_creation
+            and bool(effective_user_id)
+            and config_name == "worker_base"
+            and _is_experts_db_enabled()
+            and await _user_experts_enabled()
+        )
+        should_validate_explicit = (
+            bool(job.expert_id)
+            and bool(effective_user_id)
+            and _is_experts_db_enabled()
+        )
+        selection = None
+        try:
+            if should_resolve_default or should_validate_explicit:
+                principal = internal_principal if internal_call else caller
+                selection = await resolve_root_expert(
+                    postgres_db,
+                    expert_type="worker",
+                    user_id=str(effective_user_id),
+                    project_id=project_id,
+                    explicit_expert_id=job.expert_id,
+                    is_admin=bool((principal or {}).get("is_admin")),
+                )
+                resolved_expert_id = str(selection.expert["id"])
+                config_name = "worker_base"
+                if selection.project_override:
                     config_override = _deep_merge_dicts(
-                        project_default_override, config_override
+                        config_override or {}, selection.project_override
                     )
-                else:
-                    config_override = project_default_override
+                context["expert_selection"] = {
+                    "source": selection.source,
+                    "expert_id": resolved_expert_id,
+                }
+            elif (
+                root_creation
+                and config_name == "worker_base"
+                and project
+                and project.get("default_config_name")
+                and not _is_experts_db_enabled()
+            ):
+                # Emergency compatibility mode only.  In normal operation the
+                # typed project_experts pointer supersedes this legacy slug.
+                config_name = canonical_config_name(project["default_config_name"])
+        except ExpertSelectionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except DefaultExpertUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        if request_config_override:
+            config_override = _deep_merge_dicts(
+                config_override or {}, request_config_override
+            )
 
         # VM permission gate: refuse at submit time so the user gets a clear
         # 403 instead of a silent failure later in the dispatcher. The
@@ -7933,7 +8088,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             document_path=job.document_path,
             document_dir=job.document_dir,
             config_name=config_name,
-            expert_id=job.expert_id,
+            expert_id=resolved_expert_id,
             config_override=config_override,
             context=context if context else None,
             user_id=effective_user_id,
@@ -8691,7 +8846,9 @@ async def send_agent_message(
             subject=request.subject,
             message_md=request.message,
             job_description=job.get("description", "")[:100],
-            config_name=job.get("config_name", "default"),
+            config_name=canonical_config_name(
+                job.get("config_name") or "worker_base"
+            ),
             thread_id=thread_id,
             recipient_email=recipient_email,
             recipient_name=recipient_name,
@@ -8859,7 +9016,7 @@ async def _notify_operator_freeze(
 
     recipient_email = user.get("email")
     recipient_name = user.get("display_name", "User")
-    config_name = job.get("config_name", "default")
+    config_name = canonical_config_name(job.get("config_name") or "worker_base")
     description = (job.get("description") or "")[:100]
 
     subject, message_md = _format_freeze_notification(
@@ -10030,9 +10187,9 @@ async def resume_job(
             _rco = job.get("config_override")
             if isinstance(_rco, str):
                 _rco = json.loads(_rco)
-            _rbase = job.get("config_name") or "defaults"
-            if _rbase == "default":
-                _rbase = "defaults"
+            _rbase = canonical_config_name(
+                job.get("config_name") or "worker_base"
+            )
             _rcap: dict = {}
             resolve_config(
                 base_config_name=_rbase,
@@ -10548,7 +10705,9 @@ async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> None
             ssh_host=ssh_host,
             ssh_port=ssh_port,
             source_type=source,
-            agent_config=job.get("config_name") or "defaults",
+            agent_config=canonical_config_name(
+                job.get("config_name") or "worker_base"
+            ),
         )
         logger.info(
             f"Freeze capture for {job_id} ({source} {ssh_host}:{ssh_port}): "
@@ -11071,7 +11230,9 @@ async def _handle_delegation_child_completion(
                 "job_id": child_id,
                 "description": child.get("description", ""),
                 "status": child_status,
-                "config_name": child.get("config_name", "default"),
+                "config_name": canonical_config_name(
+                    child.get("config_name") or "worker_base"
+                ),
                 "output_path": child_output_path,
                 "creation_order": child.get("creation_order"),
                 "branch_name": child.get("branch_name"),
@@ -11275,7 +11436,9 @@ async def _check_delegation_timeouts() -> int:
                         "job_id": child_id,
                         "description": child.get("description", ""),
                         "status": child.get("status", "unknown"),
-                        "config_name": child.get("config_name", "default"),
+                        "config_name": canonical_config_name(
+                            child.get("config_name") or "worker_base"
+                        ),
                         "output_path": child_output_path,
                         "creation_order": child.get("creation_order"),
                         "branch_name": child.get("branch_name"),
@@ -17585,7 +17748,7 @@ async def register_agent(
 class AgentThreadCreateRequest(BaseModel):
     """Request from agent to create its own thread on startup."""
 
-    config_name: str = Field("persistent_defaults", description="Agent config name")
+    config_name: str = Field("session_base", description="Agent config name")
     permission_mode: str = Field("supervised", description="Permission mode")
     title: str = Field("Local Session", description="Session title")
 
@@ -17623,53 +17786,51 @@ async def agent_create_thread(
     """
     await require_internal(request)
     try:
+        config_name = canonical_config_name(body.config_name or "session_base")
+        selected_expert = None
+        if _is_experts_db_enabled() and config_name == "session_base":
+            selected_expert = await postgres_db.get_application_expert_default(
+                "session"
+            )
+            if not selected_expert:
+                raise HTTPException(
+                    status_code=503,
+                    detail="No application session expert default is configured",
+                )
+
+        create_capture: dict[str, Any] = {}
+        resolve_config(
+            base_config_name=config_name,
+            base_defaults=await _resolve_session_account_defaults(None),
+            expert_row=selected_expert,
+            expert_type="session",
+            capture=create_capture,
+        )
+        effective_backend = _backend_from_override(
+            create_capture["merged_fragment"]
+        )
+        config_override: dict[str, Any] = {}
+        if effective_backend:
+            config_override = {"workspace": {"backend": effective_backend}}
+
         thread_id = await postgres_db.create_thread(
             user_id=None,
-            config_name=body.config_name,
+            config_name=config_name,
             permission_mode=body.permission_mode,
             title=body.title,
         )
 
-        # Inject system-default model pins so the standalone agent boots
-        # against the catalog (with resolved base_url + api_key) instead of
-        # falling through to its YAML default. Same shape as the cockpit
-        # create_thread path above, just without user prefs since this
-        # endpoint has no user context.
-        config_override: dict[str, Any] = {}
-        chat_model = await postgres_db.resolve_default_for_capability("chat")
-        if chat_model:
-            llm_section: dict[str, Any] = {"model": chat_model}
-            await _inject_model_credentials(
-                section=llm_section,
-                model_id=chat_model,
-                user_id=None,
-                resolved_keys=None,
+        metadata_patch: dict[str, Any] = {}
+        if selected_expert:
+            metadata_patch.update(
+                {
+                    "expert_id": str(selected_expert["id"]),
+                    "expert_selection_source": "application",
+                }
             )
-            config_override["llm"] = llm_section
-        aux_model = await postgres_db.resolve_default_for_capability("auxiliary")
-        if aux_model:
-            aux_section: dict[str, Any] = {"model": aux_model}
-            await _inject_model_credentials(
-                section=aux_section,
-                model_id=aux_model,
-                user_id=None,
-                resolved_keys=None,
-                capability="auxiliary",
-            )
-            config_override["auxiliary"] = aux_section
-        embedding_model = await postgres_db.resolve_default_for_capability("embedding")
-        if embedding_model:
-            env_keys_block: dict[str, Any] = {"EMBEDDING_MODEL": embedding_model}
-            await _inject_env_key_credentials(
-                env_keys=env_keys_block,
-                prefix="EMBEDDING",
-                model_id=embedding_model,
-                user_id=None,
-                resolved_keys=None,
-                capability="embedding",
-            )
-            config_override["env_keys"] = env_keys_block
         if config_override:
+            metadata_patch["config_override"] = config_override
+        if metadata_patch:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     """
@@ -17678,7 +17839,7 @@ async def agent_create_thread(
                     WHERE id = $1
                     """,
                     thread_id,
-                    json.dumps({"config_override": config_override}),
+                    json.dumps(metadata_patch),
                 )
 
         # Create Gitea repo for workspace versioning
@@ -17711,6 +17872,8 @@ async def agent_create_thread(
             )
 
         return {"thread_id": thread_id, "status": "created"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -18827,7 +18990,9 @@ async def agent_upgrade_thread_to_vm(
 
     ok = await vm_provisioner.create_thread_vm(
         thread_id=thread_id,
-        agent_config=thread.get("config_name", "defaults"),
+        agent_config=canonical_config_name(
+            thread.get("config_name", "session_base")
+        ),
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to request VM provisioning")
@@ -19291,10 +19456,10 @@ class ThreadCreateRequest(BaseModel):
     """Request body for creating a persistent thread."""
 
     # Sessions run the persistent base config — every other session-config
-    # fallback in this file already says "persistent_defaults". The old
+    # fallback in this file already says "session_base". The old
     # "defaults" default silently put bare API threads on the WORKER yaml
     # (docs/issues/session_config_name_plumbing.md, hole A).
-    config_name: str = Field("persistent_defaults", description="Agent config to use")
+    config_name: str = Field("session_base", description="Agent config to use")
     project_id: str | None = Field(None, description="(Legacy) Single project to scope")
     project_ids: list[str] | None = Field(
         None, description="List of project UUIDs to scope"
@@ -19507,60 +19672,83 @@ async def _thread_has_knowledge_scope(
 async def create_thread(
     request_body: ThreadCreateRequest, request: Request
 ) -> dict[str, Any]:
-    """Create a new persistent thread (auth required).
-
-    Merges user's persistent_agent settings into thread metadata.config_override
-    so the agent can apply them via the existing deep_merge path.
-    """
+    """Create a new persistent thread with a concrete resolved expert."""
     await _enforce_readiness_gate()
     try:
         user = await require_approved_user(request, postgres_db)
 
-        # Build config_override: user settings as base, request fields win.
-        # NB: the auth-path user dict carries no `settings` column
-        # (get_user_by_keycloak_sub selects identity/admission fields only), so
-        # preferences must be fetched explicitly — `user.get("settings")` here
-        # was always None, silently disabling every saved persistent_agent
-        # default (model, permission_mode, …) at create time (found 2026-07-12
-        # smoke-testing the workspace_backend defaults chain).
-        config_override = {}
+        # Project scope is needed for both selection precedence and grant
+        # resolution, so authorize it before choosing the expert.
+        requested_project_ids = list(request_body.project_ids or [])
+        if (
+            request_body.project_id
+            and str(request_body.project_id) not in requested_project_ids
+        ):
+            requested_project_ids.append(str(request_body.project_id))
+        effective_project_ids = await _authorize_thread_project_ids(
+            user, requested_project_ids
+        )
+        # A project default/config override is safe only with one unambiguous
+        # primary project. The legacy project_id field explicitly identifies
+        # that primary; otherwise a multi-project session skips this layer.
+        primary_project_id = (
+            str(request_body.project_id)
+            if request_body.project_id
+            else (
+                effective_project_ids[0]
+                if len(effective_project_ids) == 1
+                else None
+            )
+        )
+
+        # Account preferences are fallback values, not request overrides. Keep
+        # them below the selected expert during both create-time provisioning
+        # and every later attach. Fetch them only after scope authorization so
+        # an invalid project request fails before any unrelated account work.
         all_user_settings = await postgres_db.get_user_settings(str(user["id"]))
-        user_settings = (all_user_settings or {}).get("persistent_agent") or {}
-        if user_settings:
-            if user_settings.get("model"):
-                config_override["llm"] = {"model": user_settings["model"]}
-            if user_settings.get("permission_mode"):
-                config_override["interactive"] = {
-                    "permission_mode": user_settings["permission_mode"]
-                }
-            if user_settings.get("greeting"):
-                config_override.setdefault("interactive", {})["greeting"] = (
-                    user_settings["greeting"]
+        account_defaults = await _resolve_session_account_defaults(
+            str(user["id"]), all_user_settings or {}
+        )
+
+        config_name = canonical_config_name(
+            request_body.config_name or "session_base"
+        )
+        if request_body.expert_id and config_name != "session_base":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "expert_id cannot be combined with a bundled session "
+                    "config_name; select one expert source"
+                ),
+            )
+        selected_expert_id = request_body.expert_id
+        selected_expert_row: dict[str, Any] | None = None
+        project_expert_override: dict[str, Any] | None = None
+        selection = None
+        try:
+            if (
+                _is_experts_db_enabled()
+                and await _user_experts_enabled()
+                and (request_body.expert_id or config_name == "session_base")
+            ):
+                selection = await resolve_root_expert(
+                    postgres_db,
+                    expert_type="session",
+                    user_id=str(user["id"]),
+                    project_id=primary_project_id,
+                    explicit_expert_id=request_body.expert_id,
+                    is_admin=bool(user.get("is_admin")),
                 )
-            if user_settings.get("idle_timeout_minutes"):
-                config_override.setdefault("interactive", {})[
-                    "idle_timeout_minutes"
-                ] = user_settings["idle_timeout_minutes"]
-            if user_settings.get("command_allowlist"):
-                config_override["command_allowlist"] = user_settings[
-                    "command_allowlist"
-                ]
-            # Phase 6: headless behavior (polite/eager + attention-sleep TTL +
-            # notification channels). Carried under config_override.headless
-            # so the agent's loader maps it onto AgentConfig.headless.
-            headless_override: dict[str, Any] = {}
-            if user_settings.get("headless_mode"):
-                headless_override["mode"] = user_settings["headless_mode"]
-            if user_settings.get("headless_attention_sleep_minutes") is not None:
-                headless_override["attention_sleep_minutes"] = int(
-                    user_settings["headless_attention_sleep_minutes"]
-                )
-            if user_settings.get("notification_channels"):
-                headless_override["notification_channels"] = list(
-                    user_settings["notification_channels"]
-                )
-            if headless_override:
-                config_override["headless"] = headless_override
+                selected_expert_row = selection.expert
+                selected_expert_id = str(selection.expert["id"])
+                project_expert_override = selection.project_override
+                config_name = "session_base"
+        except ExpertSelectionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except DefaultExpertUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        config_override: dict[str, Any] = {}
 
         # Per-session overrides from request (take priority over user defaults)
         if request_body.model:
@@ -19606,26 +19794,28 @@ async def create_thread(
         if req_tool_groups:
             config_override.setdefault("tools", {}).update(req_tool_groups)
 
-        # Workspace-backend default chain (docs/features/instant_landing_session.md):
-        # explicit request > owner's saved default > platform default. Sessions
-        # are never implicitly sandbox anymore — an omitted backend means "the
-        # owner's default", so minimal create bodies (instant landing, MCP) get
-        # the same tier the owner picked in Settings. Safe to inject before the
-        # grant check below: the PDP gates only `vm`, which
-        # _validated_session_workspace_override already rejects.
-        if not (config_override.get("workspace") or {}).get("backend"):
-            config_override.setdefault("workspace", {})["backend"] = (
-                _default_session_workspace_backend(user_settings)
-            )
-
-        # Normalize + authorize project attachments (backward compat:
-        # project_id → [project_id]). A project UUID is a selector, not an
-        # access grant; use one generic denial for missing/inaccessible rows.
-        effective_project_ids = await _authorize_thread_project_ids(
-            user,
-            request_body.project_ids
-            or ([request_body.project_id] if request_body.project_id else []),
+        # Resolve the complete create-time policy view.  This is also the source
+        # for infrastructure-affecting values and grants, preventing the create
+        # path from validating only a thin request fragment while attach sees a
+        # broader expert/base config.
+        create_capture: dict[str, Any] = {}
+        resolve_config(
+            base_config_name=config_name,
+            base_defaults=account_defaults,
+            expert_row=selected_expert_row,
+            project_overrides=project_expert_override,
+            request_override=config_override or None,
+            expert_type="session",
+            capture=create_capture,
         )
+        effective_create_config = create_capture["merged_fragment"]
+
+        # A workspace tier is physical session state. Materialize the resolved
+        # choice once so later edits to an expert/account default cannot make the
+        # persisted runtime disagree with the workspace already provisioned.
+        effective_backend = _backend_from_override(effective_create_config)
+        if effective_backend:
+            config_override.setdefault("workspace", {})["backend"] = effective_backend
 
         # Datasource attachment is an authorization boundary, not merely a UI
         # picker. Resolve every requested id before persisting the thread so a
@@ -19637,11 +19827,6 @@ async def create_thread(
             request_body.datasource_ids,
             workspace_backend=_backend_from_override(config_override),
         )
-        include_kb_profile = await _thread_has_knowledge_scope(
-            project_ids=effective_project_ids,
-            datasource_ids=selected_thread_datasource_ids,
-        )
-
         # VM tier is operator-gated on top of the ``vm_workspace`` PDP grant that
         # _enforce_session_create_grants runs below: the global ``vm_workspaces``
         # kill-switch + per-user ``can_use_vm`` (admins bypass). Fail fast with a
@@ -19656,7 +19841,7 @@ async def create_thread(
                     detail="VM provisioning is not available on this deployment",
                 )
 
-        # Layer 2 (fail loud at create): the requested config must fit the
+        # Layer 2 (fail loud at create): the fully resolved config must fit the
         # owner's capability grants. Reject a never-startable session with 422
         # NOW — before persisting/provisioning — instead of accepting it and
         # letting the attach pre-flight fail it later (Phase 1). Validates the
@@ -19664,36 +19849,22 @@ async def create_thread(
         # tools) against the owner's grants + the session's project scope; admins
         # bypass. docs/issues/session_permission_mode_grant_denied_ready_timeout.md
         await _enforce_session_create_grants(
-            config_override,
+            effective_create_config,
             user_id=str(user["id"]),
             project_ids=effective_project_ids,
         )
 
-        # Resolve + inject LLM / auxiliary / embedding credentials so the agent
-        # gets the right base_url + api_key. Mirrors the worker-job dispatch
-        # injection. Secrets are injected in-flight here (and re-injected at
-        # session attach/resume) but stripped before the row is persisted (see
-        # redact_config_override below) — the threads table never stores keys.
-        config_override = await _inject_thread_dispatch_credentials(
-            config_override,
-            user_id=str(user["id"]),
-            project_id=effective_project_ids[0] if effective_project_ids else None,
-            user_settings=user_settings,
-            include_kb_profile=include_kb_profile,
-        )
-
         # Keep the threads.permission_mode column in sync with the mode the
-        # agent will actually load from config_override (request > user default >
-        # "supervised"). Mirrors the column sync in agent_update_thread_config.
-        effective_permission_mode = (config_override.get("interactive") or {}).get(
-            "permission_mode"
-        ) or "supervised"
+        # fully resolved config will load (request > expert > account > base).
+        effective_permission_mode = (
+            (effective_create_config.get("interactive") or {}).get("permission_mode")
+            or "supervised"
+        )
 
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
-            project_id=effective_project_ids[0] if effective_project_ids else None,
-            config_name=request_body.config_name
-            or user_settings.get("config_name", "persistent_defaults"),
+            project_id=primary_project_id,
+            config_name=config_name,
             permission_mode=effective_permission_mode,
             title=request_body.title,
         )
@@ -19704,15 +19875,17 @@ async def create_thread(
         # ``metadata.project_ids`` JSONB key is no longer written.
         metadata_patch = {}
         if config_override:
-            # Persist WITHOUT secrets: keys are injected in-flight at attach
-            # (provision_or_assign / _assign_pool_agent below pass the enriched
-            # in-memory copy) and re-injected on resume (workspace endpoint +
-            # resume dispatcher). The threads row never stores plaintext keys.
+            # This is the explicit per-session layer only. Account fallback and
+            # expert fields are re-resolved at attach; credentials are injected
+            # into the delivery blob and never stored in the thread row.
             metadata_patch["config_override"] = redact_config_override(config_override)
-        if request_body.expert_id:
-            # DB expert selection: resolved into the session config at attach
-            # (_resolve_session_config reads metadata.expert_id).
-            metadata_patch["expert_id"] = request_body.expert_id
+        if selected_expert_id:
+            # Persist the actual selected row, including application/personal/
+            # project fallthroughs, so pointer changes affect only new sessions.
+            metadata_patch["expert_id"] = selected_expert_id
+            metadata_patch["expert_selection_source"] = (
+                selection.source if selection else "explicit"
+            )
         if selected_thread_datasource_ids:
             metadata_patch["datasource_ids"] = selected_thread_datasource_ids
         if request_body.protected_cloud:
@@ -19812,9 +19985,7 @@ async def create_thread(
             except (TypeError, ValueError):
                 _vm_cpu = 8
             _vm_mem = str(_vm_ws.get("memory") or "16Gi")
-            _vm_agent_config = request_body.config_name or user_settings.get(
-                "config_name", "persistent_defaults"
-            )
+            _vm_agent_config = config_name
 
             async def _provision_thread_vm(
                 tid: str, cpu: int, mem: str, cfg: str
@@ -20012,9 +20183,7 @@ async def create_thread(
         )
         if use_k8s_agent:
             # Kubernetes mode: create agent pod on demand, with pool fallback
-            effective_config = request_body.config_name or user_settings.get(
-                "config_name", "persistent_defaults"
-            )
+            effective_config = config_name
 
             from services.provision_or_assign import provision_or_assign
 
@@ -20068,7 +20237,7 @@ async def create_thread(
                     config_override,
                     effective_project_ids,
                     selected_thread_datasource_ids,
-                    request_body.config_name,
+                    config_name,
                 )
             )
         else:
@@ -21394,7 +21563,7 @@ async def resume_thread(
 
     # Re-provision agent pod and restore workspace if suspended
     if agent_provisioner.is_available:
-        config_name = thread.get("config_name", "persistent_defaults")
+        config_name = canonical_config_name(thread.get("config_name", "session_base"))
 
         async def _reprovision(tid: str, cfg: str) -> None:
             # Serialise concurrent provisioning attempts for the same
@@ -21501,7 +21670,7 @@ async def resume_thread(
 
         asyncio.create_task(_reprovision(thread_id, config_name))
     elif persistent_provisioner.is_available:
-        config_name = thread.get("config_name", "persistent_defaults")
+        config_name = canonical_config_name(thread.get("config_name", "session_base"))
         asyncio.create_task(
             persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
         )
@@ -22834,7 +23003,9 @@ async def _phase5_wake_if_suspended(thread_id: str) -> None:
         # for the same tool_call_id, where the select-first guard picks up
         # the decision we just UPDATEd.
         if persistent_provisioner is not None and not thread.get("agent_id"):
-            config_name = thread.get("config_name", "persistent_defaults")
+            config_name = canonical_config_name(
+                thread.get("config_name", "session_base")
+            )
             asyncio.create_task(
                 persistent_provisioner.create_agent_pod(
                     thread_id, config_name=config_name
@@ -23879,6 +24050,7 @@ class ExpertInfo(BaseModel):
     icon: str = "psychology"
     color: str = "#cba6f7"
     tags: list[str] = []
+    expert_type: Literal["worker", "session"] = "worker"
 
 
 def _get_config_dir() -> Path:
@@ -23915,6 +24087,11 @@ def _scan_experts() -> list[ExpertInfo]:
             with open(config_path) as f:
                 data = yaml.safe_load(f) or {}
 
+            extends = canonical_config_name(str(data.get("$extends") or "worker_base"))
+            expert_type: Literal["worker", "session"] = (
+                "session" if extends == "session_base" else "worker"
+            )
+
             description = data.get("description", "").strip()
 
             # Summarize tools if no description
@@ -23937,6 +24114,7 @@ def _scan_experts() -> list[ExpertInfo]:
                     icon=data.get("icon", "psychology"),
                     color=data.get("color", "#cba6f7"),
                     tags=data.get("tags", []),
+                    expert_type=expert_type,
                 )
             )
         except Exception as e:
@@ -23955,12 +24133,8 @@ async def list_experts(
 ) -> list[dict[str, Any]]:
     """List experts: bundled (disk) + DB rows visible to the caller (owned +
     project-linked + global), each tagged with ``source``. **P4e** — approved
-    users only. ``type`` narrows the DB rows (worker/session); bundled experts
-    are unfiltered (they carry no type), preserving today's behavior.
-
-    Read-only surface. Expert CRUD (create/update/delete/import/export) is the
-    deferred fast-follow — the orchestrator-resolved config feature only needs
-    the catalog visible + selectable.
+    users only. ``type`` narrows both DB and bundled rows to worker/session;
+    bundled type is inferred from the canonical ``$extends`` base.
     """
     user = await require_approved_user(request, postgres_db)
     global _experts_cache
@@ -23969,8 +24143,15 @@ async def list_experts(
     # ``name`` is the slug callers use to reference an expert by name (e.g. the
     # project loop's role_sequence). For bundled experts the id IS the slug; for
     # DB rows it's the separate name column (id is a UUID).
+    bundled = [e for e in _experts_cache if type is None or e.expert_type == type]
     result = [
-        {**e.model_dump(), "source": "bundled", "name": e.id} for e in _experts_cache
+        {
+            **e.model_dump(),
+            "source": "bundled",
+            "storage_kind": "bundled",
+            "name": e.id,
+        }
+        for e in bundled
     ]
     if _is_experts_db_enabled():
         visible = await user_visible_project_ids(user, postgres_db)
@@ -23978,6 +24159,11 @@ async def list_experts(
         rows = await postgres_db.list_experts_visible(
             user_id=str(user["id"]), project_ids=pids, expert_type=type
         )
+        managed_names = {r["name"] for r in rows if r.get("managed_key")}
+        if managed_names:
+            # Assistant/General Worker remain on disk as bootstrap templates,
+            # but their managed DB copies are the selectable runtime entries.
+            result = [r for r in result if r.get("name") not in managed_names]
         result += [
             {
                 "id": str(r["id"]),
@@ -23988,7 +24174,14 @@ async def list_experts(
                 "color": r["color"],
                 "tags": r.get("tags") or [],
                 "expert_type": r["expert_type"],
-                "source": "global" if r["is_global"] else "user",
+                "source": (
+                    "managed"
+                    if r.get("managed_key")
+                    else ("global" if r["is_global"] else "user")
+                ),
+                "storage_kind": "db",
+                "managed_key": r.get("managed_key"),
+                "owner_id": str(r["owner_id"]) if r.get("owner_id") else None,
             }
             for r in rows
         ]
@@ -24156,9 +24349,7 @@ async def _load_expert_detail(
         row = await postgres_db.get_expert_by_id(expert_id)
         if not row:
             return {}
-        base_name = (
-            "defaults" if row["expert_type"] == "worker" else "persistent_defaults"
-        )
+        base_name = BASE_CONFIG_NAMES[row["expert_type"]]
         base_path = _get_config_dir() / f"{base_name}.yaml"
         base = yaml.safe_load(base_path.read_text()) if base_path.exists() else {}
         cfg = row.get("config") or {}
@@ -24174,6 +24365,12 @@ async def _load_expert_detail(
             if user_id
             else None
         )
+        # Keep DB-backed detail responses at parity with bundled experts.  The
+        # editor/create forms need the mode base's full tool lists to turn an
+        # expert-disabled category back on, and they resolve model-family
+        # defaults client-side from the raw matrix.
+        defaults_tools = base.get("tools", {}) if isinstance(base, dict) else {}
+        raw_matrix = _load_settings_matrix(_get_config_dir())
         return {
             "id": str(row["id"]),
             "display_name": row["display_name"],
@@ -24182,17 +24379,37 @@ async def _load_expert_detail(
             "color": row["color"],
             "tags": row.get("tags") or [],
             "expert_type": row["expert_type"],
-            "source": "user",
+            "source": (
+                "managed"
+                if row.get("managed_key")
+                else ("global" if row.get("is_global") else "user")
+            ),
+            "storage_kind": "db",
+            "managed_key": row.get("managed_key"),
             "config": merged,
             "instructions": prompts.get("instructions"),
             "persona": prompts.get("persona"),
+            "defaults_tools": defaults_tools,
+            "settings_matrix": raw_matrix,
             "effective_models": effective,
         }
     config_dir = _get_config_dir()
 
     # Load expert config
-    if expert_id == "defaults":
-        base_name = "persistent_defaults" if defaults_type == "session" else "defaults"
+    if expert_id in {
+        "default",
+        "defaults",
+        "worker_base",
+        "persistent_default",
+        "persistent_defaults",
+        "session_base",
+    }:
+        inferred_type = (
+            "session"
+            if canonical_config_name(expert_id) == "session_base"
+            else defaults_type
+        )
+        base_name = "session_base" if inferred_type == "session" else "worker_base"
         defaults_path = config_dir / f"{base_name}.yaml"
         if defaults_path.exists():
             with open(defaults_path) as f:
@@ -24213,11 +24430,13 @@ async def _load_expert_detail(
             expert_data = yaml.safe_load(f) or {}
 
         # Resolve $extends to load the correct base config
-        # (e.g. persistent_defaults for interactive, defaults for worker experts)
-        extends_name = expert_data.pop("$extends", "defaults")
+        # (e.g. session_base for interactive, worker_base for worker experts)
+        extends_name = canonical_config_name(
+            str(expert_data.pop("$extends", "worker_base"))
+        )
         base_path = config_dir / f"{extends_name}.yaml"
         if not base_path.exists():
-            base_path = config_dir / "defaults.yaml"
+            base_path = config_dir / "worker_base.yaml"
         if base_path.exists():
             with open(base_path) as f:
                 defaults = yaml.safe_load(f) or {}
@@ -24245,7 +24464,14 @@ async def _load_expert_detail(
     instructions_content = None
     # Check for expert-specific instructions.md first
     instr_path = expert_config_dir / "instructions.md"
-    if expert_id != "defaults" and instr_path.exists():
+    if expert_id not in {
+        "default",
+        "defaults",
+        "worker_base",
+        "persistent_default",
+        "persistent_defaults",
+        "session_base",
+    } and instr_path.exists():
         instructions_content = instr_path.read_text(encoding="utf-8")
     else:
         # Fall back to template referenced in config
@@ -24297,7 +24523,14 @@ async def get_expert(
 
     # DB-backed expert (UUID): the detail payload is self-contained.
     if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
-        detail = await _load_expert_detail(expert_id, user_id=_uid)
+        visible = await user_visible_project_ids(user, postgres_db)
+        row = await postgres_db.get_expert_visible_by_id(
+            expert_id,
+            user_id=_uid,
+            project_ids=[] if visible == "all" else [str(p) for p in visible],
+            is_admin=bool(user.get("is_admin")),
+        )
+        detail = await _load_expert_detail(expert_id, user_id=_uid) if row else {}
         if not detail:
             raise HTTPException(
                 status_code=404, detail=f"Expert not found: {expert_id}"
@@ -24309,10 +24542,17 @@ async def get_expert(
     if _experts_cache is None:
         _experts_cache = _scan_experts()
 
-    if expert_id == "defaults":
+    if expert_id in {
+        "default",
+        "defaults",
+        "worker_base",
+        "persistent_default",
+        "persistent_defaults",
+        "session_base",
+    }:
         # "defaults" is a virtual expert representing the framework base for
         # the requested agent type. Worker remains the backward-compatible
-        # default; session creation explicitly requests persistent_defaults.
+        # default; session creation explicitly requests session_base.
         detail = await _load_expert_detail(expert_id, user_id=_uid, defaults_type=type)
         if not detail:
             raise HTTPException(status_code=404, detail="Defaults config not found")
@@ -24340,7 +24580,8 @@ async def get_expert(
 # Restored from 8334fb3c (removed by 6f8c635e). WRITE surface only — config
 # resolution stays orchestrator-side in services/config_resolver.py (the agent
 # is a pure executor). The save-time hard-deny scan is the credential boundary;
-# per-user grants are Slice 2. Gated by EXPERTS_DB_ENABLED (on in dev, off prod).
+# per-user grants are Slice 2. Gated by EXPERTS_DB_ENABLED, which is on by default;
+# false is retained as an emergency compatibility mode.
 
 # Prompt segments a DB expert may carry (mirrors
 # config_resolver._OVERLAY_PROMPT_KEYS). persona+instructions are v1 (migration
@@ -24707,7 +24948,7 @@ def _bundled_expert_bundle(expert_id: str) -> dict[str, Any] | None:
     if not config_path.exists():
         return None
     raw = yaml.safe_load(config_path.read_text()) or {}
-    extends = raw.pop("$extends", "defaults")
+    extends = canonical_config_name(str(raw.pop("$extends", "worker_base")))
     raw.pop("connections", None)
     # Part 2: capture all prompt segments a fork should round-trip — base
     # (family-agnostic) files only. Disk family variants (strategic_gpt_5.txt …)
@@ -24731,7 +24972,7 @@ def _bundled_expert_bundle(expert_id: str) -> dict[str, Any] | None:
         "icon": info.icon,
         "color": info.color,
         "tags": info.tags,
-        "expert_type": "session" if extends == "persistent_defaults" else "worker",
+        "expert_type": "session" if extends == "session_base" else "worker",
         "config": raw,
         "prompts": prompts,
     }
@@ -24841,9 +25082,16 @@ async def update_expert(
         _validate_expert_fragment(body.config)
     await _enforce_expert_save(request, body.config or {}, user=user)
     fields = body.model_dump(exclude_unset=True)
-    return await postgres_db.update_expert(
+    updated = await postgres_db.update_expert(
         expert_id, updated_by=str(user["id"]), **fields
     )
+    if updated and existing.get("managed_key"):
+        await postgres_db.record_managed_expert_update(
+            expert_id=expert_id,
+            expert_type=existing["expert_type"],
+            actor_user_id=str(user["id"]),
+        )
+    return updated
 
 
 @app.delete("/api/experts/{expert_id}")
@@ -24857,6 +25105,11 @@ async def delete_expert(request: Request, expert_id: str) -> dict[str, Any]:
     existing = await postgres_db.get_expert_by_id(expert_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Expert not found")
+    if existing.get("managed_key"):
+        raise HTTPException(
+            status_code=409,
+            detail="Managed platform experts cannot be deleted; change the application default instead",
+        )
     if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
         raise HTTPException(
             status_code=403, detail="Only the owner may delete this expert"
@@ -24881,7 +25134,13 @@ async def duplicate_expert(request: Request, expert_id: str) -> dict[str, Any]:
     _require_experts_db()
     user = await require_approved_user(request, postgres_db)
     if _looks_like_uuid(expert_id):
-        row = await postgres_db.get_expert_by_id(expert_id)
+        visible = await user_visible_project_ids(user, postgres_db)
+        row = await postgres_db.get_expert_visible_by_id(
+            expert_id,
+            user_id=str(user["id"]),
+            project_ids=[] if visible == "all" else [str(p) for p in visible],
+            is_admin=bool(user.get("is_admin")),
+        )
         if not row:
             raise HTTPException(status_code=404, detail="Expert not found")
         src = _db_expert_to_bundle_src(row)
@@ -24899,9 +25158,15 @@ async def export_expert(request: Request, expert_id: str) -> dict[str, Any]:
     from src.core.expert_resolution import to_export_bundle
 
     _require_experts_db()
-    await require_approved_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     if _looks_like_uuid(expert_id):
-        row = await postgres_db.get_expert_by_id(expert_id)
+        visible = await user_visible_project_ids(user, postgres_db)
+        row = await postgres_db.get_expert_visible_by_id(
+            expert_id,
+            user_id=str(user["id"]),
+            project_ids=[] if visible == "all" else [str(p) for p in visible],
+            is_admin=bool(user.get("is_admin")),
+        )
         if not row:
             raise HTTPException(status_code=404, detail="Expert not found")
         return to_export_bundle(_db_expert_to_bundle_src(row))
@@ -24947,6 +25212,295 @@ async def import_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
                 continue
             raise
     raise HTTPException(status_code=409, detail="No free name for the import")
+
+
+# =============================================================================
+# DB-backed application / personal / project expert defaults
+# =============================================================================
+
+
+class ExpertDefaultSetRequest(BaseModel):
+    expert_id: str
+
+
+class ExpertDefaultForkRequest(BaseModel):
+    expert_id: str | None = None
+
+
+def _default_expert_summary(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    return {
+        "id": str(row["id"]),
+        "name": row["name"],
+        "display_name": row["display_name"],
+        "description": row.get("description") or "",
+        "icon": row.get("icon") or "smart_toy",
+        "color": row.get("color") or "#6B7280",
+        "tags": row.get("tags") or [],
+        "expert_type": row["expert_type"],
+        "owner_id": str(row["owner_id"]) if row.get("owner_id") else None,
+        "is_global": bool(row.get("is_global")),
+        "managed_key": row.get("managed_key"),
+        "storage_kind": "db",
+    }
+
+
+@app.get("/api/expert-defaults")
+async def get_my_expert_defaults(
+    request: Request, project_id: str | None = None
+) -> dict[str, Any]:
+    """Effective and editable personal defaults for the current user."""
+    _require_experts_db()
+    user = await require_approved_user(request, postgres_db)
+    uid = str(user["id"])
+    if project_id:
+        await require_project_member(request, postgres_db, project_id)
+    allowed = await personal_defaults_allowed(
+        postgres_db,
+        user_id=uid,
+        project_ids=[project_id] if project_id else [],
+        is_admin=bool(user.get("is_admin")),
+    )
+    slots: dict[str, Any] = {}
+    for expert_type in ("worker", "session"):
+        application = await postgres_db.get_application_expert_default(expert_type)
+        personal = await postgres_db.get_user_expert_default(
+            user_id=uid, expert_type=expert_type
+        )
+        try:
+            selection = await resolve_root_expert(
+                postgres_db,
+                expert_type=expert_type,
+                user_id=uid,
+                project_id=project_id,
+                is_admin=bool(user.get("is_admin")),
+            )
+            effective = selection.expert
+            effective_source = selection.source
+        except DefaultExpertUnavailable:
+            effective = None
+            effective_source = "application"
+        slots[expert_type] = {
+            "application": _default_expert_summary(application),
+            "personal": _default_expert_summary(personal),
+            "effective": _default_expert_summary(effective),
+            "source": effective_source,
+        }
+    return {"personal_defaults_allowed": allowed, "defaults": slots}
+
+
+@app.put("/api/expert-defaults/{expert_type}")
+async def set_my_expert_default(
+    request: Request,
+    expert_type: Literal["worker", "session"],
+    body: ExpertDefaultSetRequest,
+) -> dict[str, Any]:
+    _require_experts_db()
+    user = await require_approved_user(request, postgres_db)
+    uid = str(user["id"])
+    if not await personal_defaults_allowed(
+        postgres_db, user_id=uid, is_admin=bool(user.get("is_admin"))
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Your administrator has disabled personal default experts",
+        )
+    try:
+        await postgres_db.set_user_expert_default(
+            user_id=uid, expert_type=expert_type, expert_id=body.expert_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    row = await postgres_db.get_user_expert_default(
+        user_id=uid, expert_type=expert_type
+    )
+    return {"default": _default_expert_summary(row), "source": "user"}
+
+
+@app.delete("/api/expert-defaults/{expert_type}")
+async def clear_my_expert_default(
+    request: Request, expert_type: Literal["worker", "session"]
+) -> dict[str, Any]:
+    """Clear is intentionally allowed even after the grant is revoked."""
+    _require_experts_db()
+    user = await require_approved_user(request, postgres_db)
+    deleted = await postgres_db.clear_user_expert_default(
+        user_id=str(user["id"]), expert_type=expert_type
+    )
+    application = await postgres_db.get_application_expert_default(expert_type)
+    return {
+        "deleted": deleted,
+        "default": _default_expert_summary(application),
+        "source": "application",
+    }
+
+
+@app.post("/api/expert-defaults/{expert_type}/fork")
+async def fork_my_expert_default(
+    request: Request,
+    expert_type: Literal["worker", "session"],
+    body: ExpertDefaultForkRequest,
+) -> dict[str, Any]:
+    """Atomically copy a visible expert and select the owned copy as default."""
+    _require_experts_db()
+    user = await require_approved_user(request, postgres_db)
+    uid = str(user["id"])
+    if not await personal_defaults_allowed(
+        postgres_db, user_id=uid, is_admin=bool(user.get("is_admin"))
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Your administrator has disabled personal default experts",
+        )
+
+    if body.expert_id and not _looks_like_uuid(body.expert_id):
+        source = _bundled_expert_bundle(body.expert_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Expert not found")
+        if source["expert_type"] != expert_type:
+            raise HTTPException(status_code=422, detail="Expert type does not match")
+    else:
+        try:
+            selection = await resolve_root_expert(
+                postgres_db,
+                expert_type=expert_type,
+                user_id=uid,
+                explicit_expert_id=body.expert_id,
+                is_admin=bool(user.get("is_admin")),
+            )
+        except ExpertSelectionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except DefaultExpertUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        source = _db_expert_to_bundle_src(selection.expert)
+
+    _validate_expert_fragment(source.get("config") or {})
+    await _enforce_expert_save(request, source.get("config") or {}, user=user)
+    try:
+        row = await postgres_db.fork_and_set_user_expert_default(
+            user_id=uid, expert_type=expert_type, source=source
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"default": _default_expert_summary(row), "source": "user"}
+
+
+@app.get("/api/admin/expert-defaults")
+async def get_application_expert_defaults(request: Request) -> dict[str, Any]:
+    _require_experts_db()
+    await _require_admin(request)
+    rows = await postgres_db.list_application_expert_defaults()
+    by_type = {row["expert_type"]: _default_expert_summary(row) for row in rows}
+    return {"defaults": by_type}
+
+
+@app.put("/api/admin/expert-defaults/{expert_type}")
+async def set_application_expert_default(
+    request: Request,
+    expert_type: Literal["worker", "session"],
+    body: ExpertDefaultSetRequest,
+) -> dict[str, Any]:
+    _require_experts_db()
+    admin = await _require_admin(request)
+    target = await postgres_db.get_expert_by_id(body.expert_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Expert not found")
+    if target.get("expert_type") != expert_type:
+        raise HTTPException(
+            status_code=422, detail="Expert type does not match default slot"
+        )
+    if not target.get("is_global"):
+        raise HTTPException(
+            status_code=422, detail="Application defaults must be global experts"
+        )
+
+    # Admins may author broader profiles, but an application default must fit
+    # the deployment-wide grant floor or ordinary users could be assigned a
+    # profile that can never dispatch. User/project restrictions are still
+    # evaluated later for the actual runner.
+    from services.grants_service import resolve_grants_for
+    from src.core.capability_grants import evaluate
+
+    capture: dict[str, Any] = {}
+    resolve_config(
+        base_config_name=BASE_CONFIG_NAMES[expert_type],
+        base_defaults=await _resolve_default_models(None),
+        expert_row=target,
+        expert_type=expert_type,
+        capture=capture,
+    )
+    global_grants = await resolve_grants_for(
+        postgres_db, user_id=None, project_ids=[]
+    )
+    violations = evaluate(capture["merged_fragment"], global_grants)
+    if violations:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Application default exceeds the deployment capability floor: "
+                + "; ".join(violations)
+            ),
+        )
+    try:
+        await postgres_db.set_application_expert_default(
+            expert_type=expert_type,
+            expert_id=body.expert_id,
+            actor_user_id=str(admin["id"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    row = await postgres_db.get_application_expert_default(expert_type)
+    return {"default": _default_expert_summary(row)}
+
+
+@app.put("/api/projects/{project_id}/expert-defaults/{expert_type}")
+async def set_project_expert_default(
+    request: Request,
+    project_id: str,
+    expert_type: Literal["worker", "session"],
+    body: ExpertDefaultSetRequest,
+) -> dict[str, Any]:
+    _require_experts_db()
+    user, _project = await require_project_owner(request, postgres_db, project_id)
+    visible = await postgres_db.get_expert_visible_by_id(
+        body.expert_id,
+        user_id=str(user["id"]),
+        project_ids=[project_id],
+        is_admin=bool(user.get("is_admin")),
+    )
+    if not visible:
+        raise HTTPException(status_code=404, detail="Expert not found")
+    try:
+        await postgres_db.set_project_default_expert(
+            project_id=project_id,
+            expert_type=expert_type,
+            expert_id=body.expert_id,
+            actor_user_id=str(user["id"]),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    row = await postgres_db.get_project_default_expert(
+        project_id=project_id, expert_type=expert_type
+    )
+    return {"default": _default_expert_summary(row)}
+
+
+@app.delete("/api/projects/{project_id}/expert-defaults/{expert_type}")
+async def clear_project_expert_default(
+    request: Request,
+    project_id: str,
+    expert_type: Literal["worker", "session"],
+) -> dict[str, Any]:
+    _require_experts_db()
+    user, _project = await require_project_owner(request, postgres_db, project_id)
+    return {
+        "deleted": await postgres_db.clear_project_default_expert(
+            project_id=project_id,
+            expert_type=expert_type,
+            actor_user_id=str(user["id"]),
+        )
+    }
 
 
 # =============================================================================
@@ -25281,7 +25835,7 @@ async def get_project_expert(
 
     # Merge with defaults
     config_dir = _get_config_dir()
-    defaults_path = config_dir / "defaults.yaml"
+    defaults_path = config_dir / "worker_base.yaml"
     if defaults_path.exists():
         with open(defaults_path) as f:
             defaults = yaml.safe_load(f) or {}
@@ -26757,23 +27311,23 @@ async def _resolve_preference_defaults() -> dict[str, Any]:
 
     The chat/auxiliary/session model defaults come from the DB model registry
     (``resolve_default_for_capability`` — the SAME source dispatch uses), so the
-    UI shows the model the agent will actually run, not the ``defaults.yaml``
+    UI shows the model the agent will actually run, not the ``worker_base.yaml``
     placeholder. Non-model fields (autonomy, reasoning, helper-model env
     fallbacks) still read framework defaults / env vars. This lets the UI show
     the actual effective value instead of "Not set" / "Server default".
     """
     config_dir = _get_config_dir()
 
-    # Worker defaults (defaults.yaml)
-    defaults_path = config_dir / "defaults.yaml"
+    # Worker framework base (worker_base.yaml)
+    defaults_path = config_dir / "worker_base.yaml"
     if defaults_path.exists():
         with open(defaults_path) as f:
             worker_cfg = yaml.safe_load(f) or {}
     else:
         worker_cfg = {}
 
-    # Persistent defaults (persistent_defaults.yaml)
-    persistent_path = config_dir / "persistent_defaults.yaml"
+    # Persistent framework base (session_base.yaml)
+    persistent_path = config_dir / "session_base.yaml"
     if persistent_path.exists():
         with open(persistent_path) as f:
             persistent_cfg = yaml.safe_load(f) or {}
@@ -26817,7 +27371,7 @@ async def _resolve_preference_defaults() -> dict[str, Any]:
         "persistent_agent": {
             # Sessions resolve their base model via the same chat-capability
             # default (base_defaults in _resolve_session_config), so surface that
-            # — not the persistent_defaults.yaml placeholder.
+            # — not the session_base.yaml placeholder.
             "model": registry_chat or p_llm.get("model"),
             "permission_mode": "supervised",
             "idle_timeout_minutes": 30,

@@ -304,7 +304,7 @@ class CockpitClient:
     def create_job(
         self,
         description: str,
-        config_name: str = "default",
+        config_name: str = "worker_base",
         datasource_ids: list[str] | None = None,
         instructions: str | None = None,
         config_override: dict[str, Any] | None = None,
@@ -800,7 +800,7 @@ class AsyncCockpitClient:
     async def create_job(
         self,
         description: str,
-        config_name: str = "default",
+        config_name: str = "worker_base",
         datasource_ids: list[str] | None = None,
         instructions: str | None = None,
         config_override: dict[str, Any] | None = None,
@@ -1772,7 +1772,7 @@ class AsyncCockpitClient:
         self,
         project_id: str,
         description: str,
-        config_name: str = "default",
+        config_name: str = "worker_base",
         datasource_ids: list[str] | None = None,
         instructions: str | None = None,
         config_override: dict[str, Any] | None = None,
@@ -2385,7 +2385,7 @@ class AsyncCockpitClient:
     @_create_retry_decorator()
     async def create_persistent_thread(
         self,
-        config_name: str = "defaults",
+        config_name: str = "session_base",
         title: str = "Untitled Session",
         permission_mode: str = "supervised",
         project_id: str | None = None,

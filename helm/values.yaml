@@ -181,7 +181,7 @@ agent:
   # lifecycle redesign — `agent.replicas` is no longer honored. The
   # PodDisruptionBudget and Service stay; they target the dynamic pods
   # via shared chart selector labels.
-  config: "defaults"
+  config: "worker_base"
   port: "8001"
   persistentConfig: "interactive"
   # -- Apply admin-curated DB config overrides (config_overrides table) to
@@ -189,9 +189,10 @@ agent:
   # file turns it on. Gates only the agent's prompt resolver — not the
   # orchestrator or the admin UI (overrides remain editable regardless).
   configDbOverridesEnabled: "false"
-  # -- Enable DB-backed user experts (experts table) for both orchestrator and
-  # agent. Default OFF (prod-safe); the dev/experimental values file turns it on.
-  expertsDbEnabled: "false"
+  # -- Enable DB-backed experts for both orchestrator and agent.
+  # DB-backed experts are the source of truth for the application and personal
+  # root-creation defaults. Set false only as an emergency compatibility switch.
+  expertsDbEnabled: "true"
   # -- Enable DB-backed Agent Skills (skills + skill_files tables). Default OFF
   # (prod-safe); the dev/experimental values file turns it on. Mirrors
   # expertsDbEnabled.

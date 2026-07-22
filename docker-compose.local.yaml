@@ -569,7 +569,7 @@ services:
       dockerfile: docker/Dockerfile.agent
     image: srw-agent:local
     environment:
-      AGENT_CONFIG: ${AGENT_CONFIG:-defaults}
+      AGENT_CONFIG: ${AGENT_CONFIG:-worker_base}
       AGENT_PORT: 8001
       # Core databases
       DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}

@@ -246,6 +246,10 @@ REQUIRED_TABLES = [
     "user_api_keys",
     "project_api_keys",
     "models",
+    "experts",
+    "application_expert_defaults",
+    "user_expert_defaults",
+    "expert_default_audit",
 ]
 
 # Tables in the vector DB (verified separately when VECTOR_DB_URL is set)
@@ -899,7 +903,7 @@ class PostgresDB:
         description: str,
         document_path: str | None = None,
         document_dir: str | None = None,
-        config_name: str = "default",
+        config_name: str = "worker_base",
         config_override: Dict[str, Any] | None = None,
         context: Dict[str, Any] | None = None,
         user_id: str | None = None,
@@ -920,7 +924,7 @@ class PostgresDB:
             description: Job description - what the agent should accomplish
             document_path: Optional path to a document
             document_dir: Optional directory containing documents
-            config_name: Agent configuration name (default: "default")
+            config_name: Agent configuration name (default: "worker_base")
             config_override: Optional per-job configuration overrides
             context: Optional context dictionary
             user_id: Optional user UUID who created this job
@@ -4698,7 +4702,7 @@ class PostgresDB:
         self,
         user_id: str | None = None,
         project_id: str | None = None,
-        config_name: str = "defaults",
+        config_name: str = "session_base",
         permission_mode: str = "supervised",
         title: str = "Untitled Session",
     ) -> str:
@@ -7527,6 +7531,97 @@ class PostgresDB:
         )
         return dict(row) if row else None
 
+    async def get_expert_by_managed_key(
+        self, managed_key: str
+    ) -> Dict[str, Any] | None:
+        row = await self.fetchrow(
+            "SELECT * FROM experts WHERE managed_key = $1", managed_key
+        )
+        return dict(row) if row else None
+
+    async def upsert_managed_expert(
+        self,
+        *,
+        managed_key: str,
+        seed_version: int,
+        name: str,
+        display_name: str,
+        expert_type: str,
+        description: str | None = None,
+        icon: str = "smart_toy",
+        color: str = "#6B7280",
+        tags: List[str] | None = None,
+        config: Dict[str, Any] | None = None,
+        prompts: Dict[str, Any] | None = None,
+    ) -> tuple[Dict[str, Any], bool]:
+        """Insert a platform-managed seed expert without overwriting edits.
+
+        ``managed_key`` is the immutable identity; display name and content are
+        deliberately insert-only.  Upgrades may ship a newer seed template, but
+        an operator's DB copy remains authoritative until an explicit reset
+        workflow is requested.
+        """
+        row = await self.fetchrow(
+            """
+            INSERT INTO experts
+                (name, display_name, description, icon, color, tags, expert_type,
+                 config, prompts, owner_id, is_global, managed_key, seed_version)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
+                    NULL, TRUE, $10, $11)
+            ON CONFLICT (managed_key) WHERE managed_key IS NOT NULL DO NOTHING
+            RETURNING *
+            """,
+            name,
+            display_name,
+            description,
+            icon,
+            color,
+            tags or [],
+            expert_type,
+            json.dumps(config or {}),
+            json.dumps(prompts or {}),
+            managed_key,
+            seed_version,
+        )
+        if row:
+            return dict(row), True
+        existing = await self.get_expert_by_managed_key(managed_key)
+        if not existing:  # defensive: conflict target should make this impossible
+            raise RuntimeError(f"managed expert seed disappeared: {managed_key}")
+        return existing, False
+
+    async def get_expert_visible_by_id(
+        self,
+        expert_id: str,
+        *,
+        user_id: str,
+        project_ids: List[str] | None = None,
+        is_admin: bool = False,
+    ) -> Dict[str, Any] | None:
+        """Return an expert only when the principal may select it."""
+        proj = [UUID(str(p)) for p in (project_ids or [])]
+        row = await self.fetchrow(
+            """
+            SELECT e.*
+            FROM experts e
+            WHERE e.id = $1
+              AND (
+                $4::boolean = TRUE
+                OR e.owner_id = $2
+                OR e.is_global = TRUE
+                OR e.id IN (
+                    SELECT expert_id FROM project_experts
+                    WHERE project_id = ANY($3::uuid[])
+                )
+              )
+            """,
+            UUID(str(expert_id)),
+            UUID(str(user_id)),
+            proj,
+            is_admin,
+        )
+        return dict(row) if row else None
+
     async def list_experts_visible(
         self,
         *,
@@ -7558,6 +7653,457 @@ class PostgresDB:
             expert_type,
         )
         return [dict(r) for r in rows]
+
+    # ── Default expert pointers ──────────────────────────────────────────
+
+    async def ensure_application_expert_default(
+        self, *, expert_type: str, expert_id: str
+    ) -> Dict[str, Any]:
+        """Seed an application pointer if the operator has not set one."""
+        row = await self.fetchrow(
+            """
+            INSERT INTO application_expert_defaults (expert_type, expert_id)
+            VALUES ($1, $2)
+            ON CONFLICT (expert_type) DO NOTHING
+            RETURNING *
+            """,
+            expert_type,
+            UUID(str(expert_id)),
+        )
+        if row:
+            await self.execute(
+                """
+                INSERT INTO expert_default_audit
+                    (expert_type, scope_kind, new_expert_id, action)
+                VALUES ($1, 'application', $2, 'seed')
+                """,
+                expert_type,
+                UUID(str(expert_id)),
+            )
+            return dict(row)
+        current = await self.get_application_expert_default(expert_type)
+        if not current:
+            raise RuntimeError(f"application default disappeared: {expert_type}")
+        return current
+
+    async def get_application_expert_default(
+        self, expert_type: str
+    ) -> Dict[str, Any] | None:
+        row = await self.fetchrow(
+            """
+            SELECT d.expert_type AS default_type, d.created_at AS default_created_at,
+                   d.updated_at AS default_updated_at, e.*
+            FROM application_expert_defaults d
+            JOIN experts e ON e.id = d.expert_id
+            WHERE d.expert_type = $1
+            """,
+            expert_type,
+        )
+        return dict(row) if row else None
+
+    async def list_application_expert_defaults(self) -> List[Dict[str, Any]]:
+        rows = await self.fetch(
+            """
+            SELECT d.expert_type AS default_type, d.updated_at AS default_updated_at,
+                   e.*
+            FROM application_expert_defaults d
+            JOIN experts e ON e.id = d.expert_id
+            ORDER BY d.expert_type
+            """
+        )
+        return [dict(r) for r in rows]
+
+    async def set_application_expert_default(
+        self, *, expert_type: str, expert_id: str, actor_user_id: str
+    ) -> Dict[str, Any]:
+        """Atomically validate and replace an operator-selected default."""
+        eid = UUID(str(expert_id))
+        actor = UUID(str(actor_user_id))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                target = await conn.fetchrow(
+                    "SELECT * FROM experts WHERE id = $1 FOR SHARE", eid
+                )
+                if not target:
+                    raise ValueError("Expert not found")
+                if target["expert_type"] != expert_type:
+                    raise ValueError("Expert type does not match default slot")
+                if not target["is_global"]:
+                    raise ValueError("Application defaults must be global experts")
+                previous = await conn.fetchval(
+                    "SELECT expert_id FROM application_expert_defaults "
+                    "WHERE expert_type = $1 FOR UPDATE",
+                    expert_type,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO application_expert_defaults
+                        (expert_type, expert_id, updated_by)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (expert_type) DO UPDATE
+                    SET expert_id = EXCLUDED.expert_id,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    RETURNING *
+                    """,
+                    expert_type,
+                    eid,
+                    actor,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO expert_default_audit
+                        (actor_user_id, expert_type, scope_kind,
+                         old_expert_id, new_expert_id, action)
+                    VALUES ($1, $2, 'application', $3, $4, 'set')
+                    """,
+                    actor,
+                    expert_type,
+                    previous,
+                    eid,
+                )
+        return dict(row)
+
+    async def get_user_expert_default(
+        self, *, user_id: str, expert_type: str
+    ) -> Dict[str, Any] | None:
+        row = await self.fetchrow(
+            """
+            SELECT d.user_id AS default_user_id,
+                   d.expert_type AS default_type,
+                   d.updated_at AS default_updated_at,
+                   e.*
+            FROM user_expert_defaults d
+            JOIN experts e ON e.id = d.expert_id
+            WHERE d.user_id = $1 AND d.expert_type = $2
+            """,
+            UUID(str(user_id)),
+            expert_type,
+        )
+        return dict(row) if row else None
+
+    async def list_user_expert_defaults(self, user_id: str) -> List[Dict[str, Any]]:
+        rows = await self.fetch(
+            """
+            SELECT d.user_id AS default_user_id,
+                   d.expert_type AS default_type,
+                   d.updated_at AS default_updated_at,
+                   e.*
+            FROM user_expert_defaults d
+            JOIN experts e ON e.id = d.expert_id
+            WHERE d.user_id = $1
+            ORDER BY d.expert_type
+            """,
+            UUID(str(user_id)),
+        )
+        return [dict(r) for r in rows]
+
+    async def set_user_expert_default(
+        self, *, user_id: str, expert_type: str, expert_id: str
+    ) -> Dict[str, Any]:
+        """Set a personal default, enforcing ownership and type atomically."""
+        uid = UUID(str(user_id))
+        eid = UUID(str(expert_id))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                target = await conn.fetchrow(
+                    "SELECT * FROM experts WHERE id = $1 FOR SHARE", eid
+                )
+                if not target:
+                    raise ValueError("Expert not found")
+                if target["expert_type"] != expert_type:
+                    raise ValueError("Expert type does not match default slot")
+                if target["owner_id"] != uid:
+                    raise ValueError("Personal defaults must be owned by the user")
+                previous = await conn.fetchval(
+                    "SELECT expert_id FROM user_expert_defaults "
+                    "WHERE user_id = $1 AND expert_type = $2 FOR UPDATE",
+                    uid,
+                    expert_type,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO user_expert_defaults
+                        (user_id, expert_type, expert_id)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (user_id, expert_type) DO UPDATE
+                    SET expert_id = EXCLUDED.expert_id, updated_at = NOW()
+                    RETURNING *
+                    """,
+                    uid,
+                    expert_type,
+                    eid,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO expert_default_audit
+                        (actor_user_id, target_user_id, expert_type, scope_kind,
+                         old_expert_id, new_expert_id, action)
+                    VALUES ($1, $1, $2, 'user', $3, $4, 'set')
+                    """,
+                    uid,
+                    expert_type,
+                    previous,
+                    eid,
+                )
+        return dict(row)
+
+    async def clear_user_expert_default(
+        self, *, user_id: str, expert_type: str
+    ) -> bool:
+        uid = UUID(str(user_id))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                previous = await conn.fetchval(
+                    "DELETE FROM user_expert_defaults "
+                    "WHERE user_id = $1 AND expert_type = $2 RETURNING expert_id",
+                    uid,
+                    expert_type,
+                )
+                if previous is None:
+                    return False
+                await conn.execute(
+                    """
+                    INSERT INTO expert_default_audit
+                        (actor_user_id, target_user_id, expert_type, scope_kind,
+                         old_expert_id, action)
+                    VALUES ($1, $1, $2, 'user', $3, 'clear')
+                    """,
+                    uid,
+                    expert_type,
+                    previous,
+                )
+        return True
+
+    async def fork_and_set_user_expert_default(
+        self,
+        *,
+        user_id: str,
+        expert_type: str,
+        source: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Atomically fork a source expert and make the fork the personal default."""
+        uid = UUID(str(user_id))
+        base_name = str(source["name"])
+        config = source.get("config") or {}
+        prompts = source.get("prompts") or {}
+        if isinstance(config, str):
+            config = json.loads(config)
+        if isinstance(prompts, str):
+            prompts = json.loads(prompts)
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Serialize fork naming for one principal; avoids a name race
+                # without letting a unique violation poison the transaction.
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    str(uid),
+                )
+                name = ""
+                for index in range(1, 100):
+                    suffix = "default" if index == 1 else f"default-{index}"
+                    candidate = f"{base_name}-{suffix}"[:100]
+                    exists = await conn.fetchval(
+                        "SELECT 1 FROM experts WHERE owner_id = $1 AND name = $2",
+                        uid,
+                        candidate,
+                    )
+                    if not exists:
+                        name = candidate
+                        break
+                if not name:
+                    raise ValueError("No free name for the personal default copy")
+                expert = await conn.fetchrow(
+                    """
+                    INSERT INTO experts
+                        (name, display_name, description, icon, color, tags,
+                         expert_type, config, prompts, owner_id, is_global)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb,
+                            $10, FALSE)
+                    RETURNING *
+                    """,
+                    name,
+                    f"{source['display_name']} (My Default)"[:200],
+                    source.get("description"),
+                    source.get("icon", "smart_toy"),
+                    source.get("color", "#6B7280"),
+                    source.get("tags") or [],
+                    expert_type,
+                    json.dumps(config),
+                    json.dumps(prompts),
+                    uid,
+                )
+                previous = await conn.fetchval(
+                    "SELECT expert_id FROM user_expert_defaults "
+                    "WHERE user_id = $1 AND expert_type = $2 FOR UPDATE",
+                    uid,
+                    expert_type,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO user_expert_defaults
+                        (user_id, expert_type, expert_id)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (user_id, expert_type) DO UPDATE
+                    SET expert_id = EXCLUDED.expert_id, updated_at = NOW()
+                    """,
+                    uid,
+                    expert_type,
+                    expert["id"],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO expert_default_audit
+                        (actor_user_id, target_user_id, expert_type, scope_kind,
+                         old_expert_id, new_expert_id, action)
+                    VALUES ($1, $1, $2, 'user', $3, $4, 'set')
+                    """,
+                    uid,
+                    expert_type,
+                    previous,
+                    expert["id"],
+                )
+        return dict(expert)
+
+    async def get_project_default_expert(
+        self, *, project_id: str, expert_type: str
+    ) -> Dict[str, Any] | None:
+        row = await self.fetchrow(
+            """
+            SELECT pe.project_id, pe.default_for, pe.config_override, e.*
+            FROM project_experts pe
+            JOIN experts e ON e.id = pe.expert_id
+            WHERE pe.project_id = $1 AND pe.default_for = $2
+              AND e.expert_type = $2
+            """,
+            UUID(str(project_id)),
+            expert_type,
+        )
+        return dict(row) if row else None
+
+    async def get_project_expert_link(
+        self, *, project_id: str, expert_id: str
+    ) -> Dict[str, Any] | None:
+        row = await self.fetchrow(
+            "SELECT * FROM project_experts WHERE project_id = $1 AND expert_id = $2",
+            UUID(str(project_id)),
+            UUID(str(expert_id)),
+        )
+        return dict(row) if row else None
+
+    async def set_project_default_expert(
+        self,
+        *,
+        project_id: str,
+        expert_type: str,
+        expert_id: str,
+        actor_user_id: str,
+        config_override: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        pid, eid = UUID(str(project_id)), UUID(str(expert_id))
+        actor = UUID(str(actor_user_id))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                target = await conn.fetchrow(
+                    "SELECT expert_type FROM experts WHERE id = $1 FOR SHARE", eid
+                )
+                if not target:
+                    raise ValueError("Expert not found")
+                if target["expert_type"] != expert_type:
+                    raise ValueError("Expert type does not match default slot")
+                previous = await conn.fetchval(
+                    "SELECT expert_id FROM project_experts "
+                    "WHERE project_id = $1 AND default_for = $2 FOR UPDATE",
+                    pid,
+                    expert_type,
+                )
+                await conn.execute(
+                    """
+                    UPDATE project_experts SET default_for = NULL
+                    WHERE project_id = $1 AND default_for = $2 AND expert_id <> $3
+                    """,
+                    pid,
+                    expert_type,
+                    eid,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO project_experts
+                        (project_id, expert_id, default_for, config_override)
+                    VALUES ($1, $2, $3, $4::jsonb)
+                    ON CONFLICT (project_id, expert_id) DO UPDATE
+                    SET default_for = EXCLUDED.default_for,
+                        config_override = COALESCE(
+                            EXCLUDED.config_override, project_experts.config_override
+                        )
+                    RETURNING *
+                    """,
+                    pid,
+                    eid,
+                    expert_type,
+                    json.dumps(config_override) if config_override is not None else None,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO expert_default_audit
+                        (actor_user_id, target_project_id, expert_type, scope_kind,
+                         old_expert_id, new_expert_id, action)
+                    VALUES ($1, $2, $3, 'project', $4, $5, 'set')
+                    """,
+                    actor,
+                    pid,
+                    expert_type,
+                    previous,
+                    eid,
+                )
+        return dict(row)
+
+    async def clear_project_default_expert(
+        self, *, project_id: str, expert_type: str, actor_user_id: str
+    ) -> bool:
+        pid, actor = UUID(str(project_id)), UUID(str(actor_user_id))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                previous = await conn.fetchval(
+                    """
+                    UPDATE project_experts SET default_for = NULL
+                    WHERE project_id = $1 AND default_for = $2
+                    RETURNING expert_id
+                    """,
+                    pid,
+                    expert_type,
+                )
+                if previous is None:
+                    return False
+                await conn.execute(
+                    """
+                    INSERT INTO expert_default_audit
+                        (actor_user_id, target_project_id, expert_type, scope_kind,
+                         old_expert_id, action)
+                    VALUES ($1, $2, $3, 'project', $4, 'clear')
+                    """,
+                    actor,
+                    pid,
+                    expert_type,
+                    previous,
+                )
+        return True
+
+    async def record_managed_expert_update(
+        self, *, expert_id: str, expert_type: str, actor_user_id: str
+    ) -> None:
+        """Attribute operator edits to an insert-only platform seed row."""
+        await self.execute(
+            """
+            INSERT INTO expert_default_audit
+                (actor_user_id, expert_type, scope_kind,
+                 old_expert_id, new_expert_id, action)
+            VALUES ($1, $2, 'managed', $3, $3, 'update')
+            """,
+            UUID(str(actor_user_id)),
+            expert_type,
+            UUID(str(expert_id)),
+        )
 
     async def update_expert(
         self, expert_id: str, *, updated_by: str, **fields: Any
@@ -7625,6 +8171,43 @@ class PostgresDB:
         blockers += [
             {"type": "job", "id": str(j["id"]), "label": (j["description"] or "")[:80]}
             for j in jobs
+        ]
+        app_defaults = await self.fetch(
+            "SELECT expert_type FROM application_expert_defaults WHERE expert_id = $1",
+            UUID(str(expert_id)),
+        )
+        blockers += [
+            {
+                "type": "application_default",
+                "id": d["expert_type"],
+                "label": f"Application {d['expert_type']} default",
+            }
+            for d in app_defaults
+        ]
+        user_defaults = await self.fetch(
+            "SELECT user_id, expert_type FROM user_expert_defaults WHERE expert_id = $1",
+            UUID(str(expert_id)),
+        )
+        blockers += [
+            {
+                "type": "user_default",
+                "id": str(d["user_id"]),
+                "label": f"User {d['expert_type']} default",
+            }
+            for d in user_defaults
+        ]
+        project_defaults = await self.fetch(
+            "SELECT project_id, default_for FROM project_experts "
+            "WHERE expert_id = $1 AND default_for IS NOT NULL",
+            UUID(str(expert_id)),
+        )
+        blockers += [
+            {
+                "type": "project_default",
+                "id": str(d["project_id"]),
+                "label": f"Project {d['default_for']} default",
+            }
+            for d in project_defaults
         ]
         return blockers
 

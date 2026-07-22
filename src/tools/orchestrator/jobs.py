@@ -41,7 +41,7 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Create a new worker job on the orchestrator. A worker agent will "
             "pick it up and execute it autonomously. Returns the job ID for "
             "monitoring. Use config_name to select an expert (developer, scholar, "
-            "critic) or 'defaults' for general-purpose."
+            "critic) or 'worker_base' for the framework fallback."
         ),
         "category": "orchestrator",
         "short_description": "Delegate work to a worker agent via the orchestrator.",
@@ -376,7 +376,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
     @tool
     async def create_worker_job(
         description: str,
-        config_name: str = "defaults",
+        config_name: str = "worker_base",
         instructions: Optional[str] = None,
         priority: int = 5,
         project_id: Optional[str] = None,
@@ -386,7 +386,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
 
         Args:
             description: What the worker should accomplish
-            config_name: Expert config to use (defaults, developer, scholar, critic)
+            config_name: Expert config to use (worker_base, developer, scholar, critic)
             instructions: Additional instructions for the worker
             priority: Job priority 1-10, higher = more urgent (default: 5)
             project_id: Optional project to scope the job to

@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=schema.json
-# Persistent agent defaults — base for interactive/persistent configs.
-# Worker-mode configs should extend defaults.yaml instead.
+# Framework session base — safe fallbacks for interactive/persistent experts.
+# Worker-mode configs should extend worker_base.yaml instead.
 #
 # Does NOT include: instruction_files, phase_settings, delegation, autonomy,
 # verification, scholar, curator, communication. Those are worker-mode only.
@@ -8,8 +8,8 @@
 # Model-specific inference params (temperature, top_p, context limits) are
 # injected automatically by the settings matrix — do not set them here.
 
-agent_id: persistent
-display_name: Persistent Agent
+agent_id: session_base
+display_name: Framework Session Base
 
 # Image quality — resolution tier of images the agent receives
 # economy | standard | high (default standard). Resolved to a per-model-family
@@ -93,9 +93,10 @@ tools:
     - tag_source
     - search_library
     - generate_bibliography
-  shell:
-    - run_command
-    - shell_read
+  # Shell and application-control groups are opt-in at the expert layer.  Empty
+  # application groups are converted into runtime disable markers after the
+  # complete base/expert/project/request merge.
+  shell: []
   git:
     - git_log
     - git_show
@@ -113,16 +114,17 @@ tools:
     - kb_provenance
     - kb_unanswered
     - kb_export
-  # Orchestrator tools auto-injected by PersistentSession._setup_tools()
+  # PersistentSession injects this closed group only when an expert/override
+  # supplies a non-empty list.
   orchestrator: [ ]
   # File-backed Dynamic Canvas presentation (persistent sessions only)
   canvas:
     - get_canvas
     - set_canvas
     - clear_canvas
-  # Expert/skill catalog tools auto-injected by PersistentSession._setup_tools()
+  # Expert/skill catalog controls are opt-in at the expert/override layer.
   agent_catalog: [ ]
-  # Automation and project-loop workflow tools auto-injected by PersistentSession._setup_tools()
+  # Automation and project-loop controls are opt-in at the expert/override layer.
   workflows: [ ]
   # Phase-specific tools not used in persistent mode
   core: [ ]
@@ -274,7 +276,9 @@ browser:
     blocked_schemes: ["file", "javascript", "data"]
 
 shell:
-  mode: stateless
+  # `mode` intentionally unset — model-family-derived via model_config_matrix.yaml
+  # (settings.shell_mode); read-site floor is stateless. Explicit mode here or in
+  # an expert/session config overrides the family default. See config/worker_base.yaml.
   max_tabs: 15
   max_read_lines: 200
   scrollback_limit: 5000

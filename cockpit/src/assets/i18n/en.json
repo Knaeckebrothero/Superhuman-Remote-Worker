@@ -336,6 +336,13 @@
       "permission_mode": "This permission mode requires a grant."
     }
   },
+  "adminExpertDefaults": {
+    "title": "Application expert defaults",
+    "desc": "These global database experts are preselected for users who do not have an active personal or project default.",
+    "worker": "New jobs",
+    "session": "New sessions",
+    "edit": "Edit selected expert"
+  },
   "shell": {
     "newSession": "New session",
     "untitledSession": "Untitled",
@@ -487,6 +494,7 @@
       "cancel": "Cancel",
       "expertLabel": "Expert",
       "expertLoading": "Loading experts...",
+      "expertSelectedPrefix": "Selected:",
       "createSession": "Create Session",
       "protectedCloud": "Protected cloud — agent writes are staged for your review",
       "protectedCloudHint": "The agent gets read-only cloud access; its changes wait for your approval in the review panel."
@@ -609,7 +617,7 @@
       "expertLabel": "Agent Expert",
       "expertLoading": "Loading experts...",
       "expertSelectedPrefix": "Selected:",
-      "expertHintUnselected": "Select an expert profile or leave unselected for the default agent",
+      "expertHintUnselected": "The effective default expert is selected automatically",
       "documentsLabel": "Documents",
       "dropHint": "Drop files here or click to browse",
       "maxHint": "Max {{maxFiles}} files, {{maxSizeMb}}MB each",
@@ -865,6 +873,24 @@
       "providerLocal": "Local",
       "providerOpenrouter": "OpenRouter",
       "save": "Save Preferences"
+    },
+    "expertDefaults": {
+      "title": "Default assistants",
+      "desc": "Choose the database expert preselected for new jobs and sessions. Your model and behavior preferences below only fill fields that the selected expert leaves unspecified.",
+      "worker": "New jobs",
+      "session": "New sessions",
+      "useApplication": "Use the application default",
+      "customize": "Customize a copy",
+      "clear": "Clear personal default",
+      "manage": "Manage my experts",
+      "restricted": "Your administrator controls default assistants. You can still clear an older personal selection.",
+      "effective": "Effective: {{name}} ({{source}})",
+      "source": {
+        "application": "application default",
+        "user": "your default",
+        "project": "project default",
+        "explicit": "explicit selection"
+      }
     },
     "persistent": {
       "title": "Persistent Agent",

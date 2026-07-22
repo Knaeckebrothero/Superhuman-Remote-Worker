@@ -1,5 +1,11 @@
 import {describe, expect, it} from 'vitest';
-import {buildPromptsPayload, parseConfigText, slugify} from './expert-editor.component';
+import {
+  buildPromptsPayload,
+  expertBaseConfigName,
+  expertEditorMode,
+  parseConfigText,
+  slugify,
+} from './expert-editor.component';
 
 const FIELDS = {
   persona: 'P',
@@ -23,6 +29,15 @@ describe('parseConfigText', () => {
     expect(parseConfigText('{"llm":{"model":"x"}}')).toEqual({config: {llm: {model: 'x'}}}));
   it('array is rejected', () => expect(parseConfigText('[]').error).toBeTruthy());
   it('non-json is rejected', () => expect(parseConfigText('{nope').error).toBeTruthy());
+});
+
+describe('expert type base', () => {
+  it('maps each immutable expert type to its matching mode and base', () => {
+    expect(expertBaseConfigName('worker')).toBe('worker_base');
+    expect(expertEditorMode('worker')).toBe('job');
+    expect(expertBaseConfigName('session')).toBe('session_base');
+    expect(expertEditorMode('session')).toBe('session');
+  });
 });
 
 describe('buildPromptsPayload', () => {

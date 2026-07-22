@@ -645,7 +645,7 @@ class TestCreateThread:
 
     @pytest.mark.asyncio
     async def test_uses_default_args(self, client):
-        """Default args: config_name='persistent_defaults', permission_mode='supervised', title='Local Session'."""
+        """Default args use the canonical session framework base."""
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {"thread_id": "tid-3"}
@@ -655,7 +655,7 @@ class TestCreateThread:
             await client.create_thread()
 
             call_payload = mock_http.post.call_args[1]["json"]
-            assert call_payload["config_name"] == "persistent_defaults"
+            assert call_payload["config_name"] == "session_base"
             assert call_payload["permission_mode"] == "supervised"
             assert call_payload["title"] == "Local Session"
 

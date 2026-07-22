@@ -143,10 +143,10 @@ class TestAuxiliaryConfigParsing:
         assert config.timeout == 60.0
 
     def test_full_config_from_yaml(self):
-        """Test that defaults.yaml auxiliary section parses correctly."""
+        """Test that worker_base.yaml's auxiliary section parses correctly."""
         from src.core.loader import load_agent_config
 
-        config = load_agent_config("config/defaults.yaml")
+        config = load_agent_config("config/worker_base.yaml")
         assert config.auxiliary.enabled is True
         assert config.auxiliary.model == "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
         assert config.auxiliary.tasks["extract_memories"].enabled is True

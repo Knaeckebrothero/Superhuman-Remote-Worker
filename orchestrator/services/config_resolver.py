@@ -90,11 +90,29 @@ def resolve_config(
     intent (the base is actually selected by ``base_config_name``).
     """
     base_path, deployment_dir = resolve_config_path(base_config_name)
-    data = load_and_merge_config(base_path)  # bundled base + $extends
 
-    # Protect explicitly-set llm keys from the settings matrix: the base leaf's
-    # own keys (mirrors load_agent_config) plus every overlay layer's keys.
-    explicit_llm_keys = _raw_leaf_llm_keys(base_path)
+    # A named bundled expert is logically an expert overlay, not the base layer.
+    # Split its leaf from $extends so account fallbacks can sit above the real
+    # framework base but below the bundled expert, matching DB expert precedence.
+    # (Previously account defaults silently replaced bundled expert models.)
+    bundled_leaf: dict = {}
+    parent_path: str | None = None
+    try:
+        with open(base_path, "r", encoding="utf-8") as f:
+            raw_leaf = yaml.safe_load(f) or {}
+        if isinstance(raw_leaf, dict) and raw_leaf.get("$extends"):
+            parent_path, _ = resolve_config_path(str(raw_leaf["$extends"]))
+            bundled_leaf = dict(raw_leaf)
+            bundled_leaf.pop("$extends", None)
+    except Exception:
+        raw_leaf = {}
+
+    if parent_path:
+        data = load_and_merge_config(parent_path)
+        explicit_llm_keys = _raw_leaf_llm_keys(parent_path)
+    else:
+        data = load_and_merge_config(base_path)
+        explicit_llm_keys = _raw_leaf_llm_keys(base_path)
 
     # Default-model floor: replace the base placeholder model before the expert
     # merges (the expert/request still override it).
@@ -102,6 +120,11 @@ def resolve_config(
         if base_defaults.get("llm"):
             explicit_llm_keys |= set(base_defaults["llm"].keys())
         data = deep_merge(data, base_defaults)
+
+    if bundled_leaf:
+        if bundled_leaf.get("llm"):
+            explicit_llm_keys |= set(bundled_leaf["llm"].keys())
+        data = deep_merge(data, bundled_leaf)
 
     # Expert fragment is the BASE overlay (below project/db/user/request layers,
     # decision 24 replacement-not-merge onto the type base). Mirrors the retired

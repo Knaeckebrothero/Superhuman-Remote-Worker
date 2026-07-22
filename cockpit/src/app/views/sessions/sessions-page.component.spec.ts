@@ -144,7 +144,7 @@ describe('SessionsPageComponent', () => {
         });
 
         it('should have default form values', () => {
-            expect(component.newConfig).toBe('persistent_defaults');
+            expect(component.newConfig).toBe('session_base');
             expect(component.newPermission).toBe('supervised');
             expect(component.newModel).toBe('');
             expect(component.newTitle).toBe('');

@@ -122,7 +122,7 @@ class TestCreateThread:
         await db.create_thread()
 
         call_args = conn.fetchrow.call_args
-        assert call_args[0][3] == "defaults"  # config_name
+        assert call_args[0][3] == "session_base"  # config_name
         assert call_args[0][4] == "supervised"  # permission_mode
         assert call_args[0][5] == "Untitled Session"  # title
 

@@ -74,15 +74,37 @@ The `sshpass` pattern is ugly and repetitive, but it might be closer to what the
 
 Rather than replacing the persistent shell system, we add a second mode — a stateless `run_command` tool that uses the persistent tmux infrastructure underneath but hides all session management from the model. The two modes are toggled via config.
 
-### Config Toggle
+### Mode selection (3 layers)
+
+The stateless-vs-persistent split is *tier-dependent*: models trained on/strong at agentic
+terminals drive the persistent shell well, while smaller models fall back to script-writing and
+get confused by statefulness (above). So `shell.mode` (`stateless` | `persistent`) is resolved
+with most-specific-wins precedence:
+
+1. **Explicit human config** — `shell.mode` set on an expert, project, session, or request
+   config always wins. The Cockpit "Shell" toggle (agent settings / expert editor) writes here.
+2. **Model-family default** — capable frontier families default to `persistent`, everything else
+   to `stateless`. Encoded per family in `config/model_config_matrix.yaml`
+   (`settings.shell_mode: persistent`) and applied in `_apply_settings_matrix`
+   (`src/core/loader.py`, after all human layers merge — so #1 wins via presence-detection).
+   Capable today: `claude-opus/sonnet/haiku`, `gpt-5`, `gpt-5.6`, `codex`, `codex-spark`,
+   `o-series`, `gemini`, `deepseek`, `glm`, `minimax-m3`.
+3. **Global floor** — `stateless`. This is the *read-site* default (`create_shell_tools` /
+   `get_all_tool_names`, both `.get("mode", "stateless")`), NOT a value in the base config: the
+   base (`worker_base.yaml` / `session_base.yaml`) intentionally leaves `mode` unset so the
+   family default can apply.
 
 ```yaml
 shell:
-  mode: stateless    # "stateless" (new run_command) or "persistent" (current shell_execute + shell_read)
+  # `mode` is model-family-derived by default (see above). Set it explicitly to override.
+  mode: stateless    # "stateless" (run_command + cancel_command) or "persistent" (shell_execute)
 ```
 
-- **`stateless`** (new default): Exposes `run_command` + `shell_read`. The model fires commands and gets output back. No tab management, no keys mode, no async. Simple command→output interface.
-- **`persistent`**: Current behavior. Exposes `shell_execute` + `shell_read`. Full tab management, keys mode, async mode. For agents that need interactive terminal workflows.
+- **`stateless`**: Exposes `run_command` + `cancel_command` + `shell_read`. The model fires
+  commands and gets output back; `cancel_command` sends Ctrl+C to abort a stuck command. No tab
+  management, no keys mode, no async. Simple command→output interface.
+- **`persistent`**: Exposes `shell_execute` + `shell_read`. Full tab management, keys mode
+  (incl. C-c), async mode. For capable models / interactive terminal workflows.
 
 ### `run_command` Tool Design
 

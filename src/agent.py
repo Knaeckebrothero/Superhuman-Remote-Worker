@@ -3033,7 +3033,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             if not is_stub:
                 return
         description = (metadata.get("description") or "").strip()
-        config_name = metadata.get("config_name") or "default"
+        config_name = metadata.get("config_name") or "worker_base"
         lines = [f"# Job {job_id[:8]}", ""]
         if description:
             lines += [description, ""]

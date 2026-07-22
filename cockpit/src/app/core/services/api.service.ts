@@ -17,6 +17,7 @@ import {
     DatasourceUpdateRequest,
     SSHKeyGenerateResponse,
     Expert,
+    ExpertDefaultsResponse,
     ExpertCreateRequest,
     ExpertDetail,
     ExpertUpdateRequest,
@@ -468,10 +469,45 @@ export class ApiService {
   /**
    * Get list of available expert configurations.
    */
-  getExperts(): Observable<Expert[]> {
-    return this.http.get<Expert[]>(`${this.baseUrl}/experts`).pipe(
+  getExperts(expertType?: 'worker' | 'session'): Observable<Expert[]> {
+    const params = expertType ? new HttpParams().set('type', expertType) : undefined;
+    return this.http.get<Expert[]>(`${this.baseUrl}/experts`, {params}).pipe(
       catchError(() => of([])),
     );
+  }
+
+  /** Effective application/project/personal expert defaults for this caller. */
+  getExpertDefaults(projectId?: string | null): Observable<ExpertDefaultsResponse | null> {
+    const params = projectId ? new HttpParams().set('project_id', projectId) : undefined;
+    return this.http
+      .get<ExpertDefaultsResponse>(`${this.baseUrl}/expert-defaults`, {params})
+      .pipe(catchError(() => of(null)));
+  }
+
+  setPersonalExpertDefault(type: 'worker' | 'session', expertId: string): Observable<unknown> {
+    return this.http.put(`${this.baseUrl}/expert-defaults/${type}`, {expert_id: expertId});
+  }
+
+  clearPersonalExpertDefault(type: 'worker' | 'session'): Observable<unknown> {
+    return this.http.delete(`${this.baseUrl}/expert-defaults/${type}`);
+  }
+
+  forkPersonalExpertDefault(type: 'worker' | 'session', expertId?: string): Observable<unknown> {
+    return this.http.post(`${this.baseUrl}/expert-defaults/${type}/fork`, {
+      expert_id: expertId ?? null,
+    });
+  }
+
+  getApplicationExpertDefaults(): Observable<{defaults: Partial<Record<'worker' | 'session', Expert>>}> {
+    return this.http.get<{defaults: Partial<Record<'worker' | 'session', Expert>>}>(
+      `${this.baseUrl}/admin/expert-defaults`,
+    );
+  }
+
+  setApplicationExpertDefault(type: 'worker' | 'session', expertId: string): Observable<unknown> {
+    return this.http.put(`${this.baseUrl}/admin/expert-defaults/${type}`, {
+      expert_id: expertId,
+    });
   }
 
   /**

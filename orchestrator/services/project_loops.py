@@ -707,7 +707,7 @@ async def create_loop_job(
     project-scoped shared store (it retires/re-TTLs existing memories); running N
     of them concurrently over one project would race that curation slot. It is
     disabled via the existing ``auxiliary.tasks.assemble_memories.enabled`` flag
-    (the same lever ``persistent_defaults.yaml`` uses) rather than by editing the
+    (the same lever ``session_base.yaml`` uses) rather than by editing the
     ``memory.pipeline.writers`` list — a scalar deep-merge that leaves the
     append-only extractors, the KB curator, and the writers list untouched. See
     docs/features/loop_parallel_stages.md and [[project_kb_convergence_f13]].
@@ -803,12 +803,17 @@ async def create_loop_job(
     # custom expert in the rotation pulls its OWN overlay (model, prompts, tools)
     # rather than just a bundled disk config. Mirrors the automations
     # name-resolution path (services/automations.py); falls through to the
-    # bundled config_name when nothing matches or the flag is off. The NAME stays
-    # in config_name and the UUID only ever goes in expert_id — the guard-safe
-    # combo (services/agent_provisioner.py rejects a UUID in config_name).
+    # bundled config_name when nothing matches or the flag is off. A DB winner
+    # resolves on worker_base; keeping the role slug in config_name as well would
+    # accidentally merge the bundled role and the DB expert into one profile.
     expert_id: str | None = None
+    config_name = role
     owner_id = str(loop["owner_id"]) if loop.get("owner_id") else None
-    if os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes"):
+    if os.getenv("EXPERTS_DB_ENABLED", "true").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    ):
         from src.core.expert_resolution import pick_expert_by_name
 
         pids = [project_id] if project_id else []
@@ -820,6 +825,7 @@ async def create_loop_job(
             winner = pick_expert_by_name(matches, owner_id, set(pids))
             if winner:
                 expert_id = str(winner["id"])
+                config_name = "worker_base"
         except Exception as e:
             logger.warning(
                 "loop %s: expert resolution for role %s failed: %s", loop_id, role, e
@@ -827,7 +833,7 @@ async def create_loop_job(
 
     job = await db.create_job(
         description=description,
-        config_name=role,
+        config_name=config_name,
         config_override=config_override,
         context=context,
         user_id=owner_id,

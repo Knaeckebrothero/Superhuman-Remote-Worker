@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=../../schema.json
+# General Worker — bundled seed for the application worker default.
+$extends: worker_base
+
+agent_id: general-worker
+display_name: General Worker
+description: |
+  General-purpose worker for research, writing, analysis, planning, and file
+  deliverables. It starts with a safe, non-orchestrating tool profile: no shell,
+  delegation, scholar pre-job, critic verification, automations, or loops unless
+  an administrator or copied expert explicitly enables them.
+icon: engineering
+color: "#a6e3a1"
+tags:
+  - general
+  - worker
+  - safe-default
+
+verification:
+  enabled: false
+scholar:
+  enabled: false
+curator:
+  enabled: false
+delegation:
+  enabled: false
+
