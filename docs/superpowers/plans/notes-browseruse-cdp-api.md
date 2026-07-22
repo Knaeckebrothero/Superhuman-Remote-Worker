@@ -16,6 +16,71 @@ version with `importlib.metadata.version("browser-use")`.
 
 ## Working call forms
 
+### Active-target focus events (2026-07-22 follow-up)
+
+Re-probed the existing `srw-workspace-stream-test` image
+(`6edb0e9b2fa98b8f2554fda1f463939e81f4568ec727dfa911c1da391cf5c5c1`).
+In browser-use 0.12.9 the exact import and synchronous registration are:
+
+```python
+from browser_use.browser.events import AgentFocusChangedEvent
+
+def on_focus_changed(event):
+    target_id = event.target_id
+    url = event.url
+
+session.event_bus.on(AgentFocusChangedEvent, on_focus_changed)
+```
+
+`AgentFocusChangedEvent` has required `target_id: str` and `url: str` fields.
+The currently focused target is `session.agent_focus_target_id` (`str | None`).
+The exact target-bound attached-session call is:
+
+```python
+target_id = session.agent_focus_target_id
+cdp = await session.get_or_create_cdp_session(target_id=target_id)
+```
+
+The live probe confirmed that `cdp.target_id` matches the requested focus
+target and that `cdp.session_id` is the attached CDP session identity.
+
+The image also includes browser-use's Force Background Tab extension, so a
+raw CDP click—or even `ClickElementEvent` by itself—opens a `target="_blank"`
+page without changing agent focus. The supported explicit handoff is
+`SwitchTabEvent(target_id=...)`; its 0.12.9 handler activates the target and
+dispatches `AgentFocusChangedEvent`. `browser-exec` therefore records the tab
+IDs before a `_blank` click, waits for the new ID, and dispatches that event:
+
+```python
+from browser_use.browser.events import SwitchTabEvent
+
+switch = session.event_bus.dispatch(SwitchTabEvent(target_id=new_target_id))
+await switch
+await switch.event_result(raise_if_any=True)
+```
+
+### Loading callbacks
+
+Both typed registrations work on the existing timeout-wrapped CDP client:
+
+```python
+client.register.Page.frameStartedLoading(on_frame_started_loading)
+client.register.Page.frameStoppedLoading(on_frame_stopped_loading)
+```
+
+Each callback receives `({"frameId": ...}, event_session_id)`. A direct
+`Page.navigate` produced both started and stopped callbacks. The same main
+frame event was also observed with a different attached session ID, confirming
+that every callback must reject events whose `event_session_id` does not match
+the adapter's current `cdp.session_id`.
+
+The main frame can be primed with:
+
+```python
+tree = await client.send.Page.getFrameTree(session_id=cdp.session_id)
+main_frame = tree["frameTree"]["frame"]
+```
+
 Obtain the focused target's attached CDP session:
 
 ```python
