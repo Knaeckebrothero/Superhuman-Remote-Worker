@@ -496,6 +496,9 @@ class PersistentSession:
                 workspace_backend.supports_canvas_live_apps = (
                     workspace_override or {}
                 ).get("canvas_live_apps_available") is True
+                workspace_backend.supports_canvas_shared_browser = (
+                    workspace_override or {}
+                ).get("canvas_shared_browser_available") is True
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, workspace_backend.connect)
                 logger.info(

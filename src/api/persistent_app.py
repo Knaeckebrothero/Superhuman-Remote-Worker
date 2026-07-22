@@ -6196,6 +6196,7 @@ async def _poll_workspace_ready(
                 # Slice 1 has no trusted VM host-identity adapter.
                 "canvas_presentation_available": False,
                 "canvas_live_apps_available": False,
+                "canvas_shared_browser_available": False,
                 "remote": {
                     "host": ws["vm_ssh_host"],
                     "port": ws.get("vm_ssh_port", 22),
@@ -6229,6 +6230,9 @@ async def _poll_workspace_ready(
                 ),
                 "canvas_live_apps_available": (
                     ws.get("canvas_live_apps_available") is True
+                ),
+                "canvas_shared_browser_available": (
+                    ws.get("canvas_shared_browser_available") is True
                 ),
                 "remote": {
                     "host": ws["pod_ip"],
@@ -6463,6 +6467,9 @@ async def _handle_workspace_upgrade(
         )
         new_backend.supports_canvas_live_apps = (
             ws_config.get("canvas_live_apps_available") is True
+        )
+        new_backend.supports_canvas_shared_browser = (
+            ws_config.get("canvas_shared_browser_available") is True
         )
 
         # 4. Connect the new backend now so the SEED copy (next) runs while BOTH
