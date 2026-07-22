@@ -131,7 +131,15 @@
       "surfaceLabel": "Seite im geteilten Browser",
       "baton": {
         "agent": "Der Agent steuert",
-        "user": "Sie steuern"
+        "user": "Sie steuern",
+        "take": "Steuerung übernehmen",
+        "release": "Steuerung abgeben"
+      },
+      "toolbar": {
+        "back": "Zurück",
+        "reload": "Neu laden",
+        "address": "Adresse",
+        "navigationRejected": "Navigation blockiert:"
       },
       "open": {
         "action": "Browser öffnen",

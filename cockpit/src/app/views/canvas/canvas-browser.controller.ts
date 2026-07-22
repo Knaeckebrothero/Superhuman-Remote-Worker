@@ -1,6 +1,7 @@
 import { DestroyRef, Injectable, InjectionToken, inject, signal } from '@angular/core';
 import { CanvasState } from '../../core/models/canvas.model';
 import {
+  BrowserBaton,
   BrowserControl,
   BrowserInput,
   BrowserPageState,
@@ -89,6 +90,8 @@ export class CanvasBrowserController {
   readonly frame = signal<ImageBitmap | null>(null);
   readonly errorCode = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
+  /** Expected holder after a sent baton control; cleared only by authoritative STATE. */
+  readonly pendingBaton = signal<BrowserBaton | null>(null);
 
   private presentation: LastPresentation | null = null;
   private desired: DesiredBrowser | null = null;
@@ -134,10 +137,33 @@ export class CanvasBrowserController {
   }
 
   sendControl(message: BrowserControl): boolean {
-    return this.send(encodeBrowserControl, message);
+    const baton = this.pageState()?.baton;
+    if (message.op === 'take_baton') {
+      if (baton !== 'agent' || this.pendingBaton() !== null) return false;
+    } else if (message.op === 'release_baton') {
+      if (baton !== 'user' || this.pendingBaton() !== null) return false;
+    } else if (baton !== 'user') {
+      return false;
+    }
+    const sent = this.send(encodeBrowserControl, message);
+    if (!sent) return false;
+    if (message.op === 'take_baton') this.pendingBaton.set('user');
+    if (message.op === 'release_baton') this.pendingBaton.set('agent');
+    if (
+      message.op === 'navigate' ||
+      message.op === 'back' ||
+      message.op === 'reload'
+    ) {
+      if (this.errorCode() === 'navigation_rejected') {
+        this.errorCode.set(null);
+        this.errorMessage.set(null);
+      }
+    }
+    return true;
   }
 
   sendInput(message: BrowserInput): boolean {
+    if (this.pageState()?.baton !== 'user' || this.pendingBaton() !== null) return false;
     return this.send(encodeBrowserInput, message);
   }
 
@@ -254,6 +280,7 @@ export class CanvasBrowserController {
         return;
       }
       this.pageState.set(message.state);
+      if (this.pendingBaton() === message.state.baton) this.pendingBaton.set(null);
       return;
     }
 
@@ -374,6 +401,7 @@ export class CanvasBrowserController {
     this.expectedGeneration = null;
     this.errorCode.set(code);
     this.errorMessage.set(null);
+    this.pendingBaton.set(null);
     this.connectionStatus.set('reconnecting');
     const desiredIdentity = this.desired.identity;
     const delay =
@@ -405,6 +433,7 @@ export class CanvasBrowserController {
     this.connectionStatus.set(status);
     this.errorCode.set(code);
     this.errorMessage.set(message);
+    this.pendingBaton.set(null);
     this.terminalIdentity = identity;
   }
 
@@ -415,6 +444,7 @@ export class CanvasBrowserController {
     if (clearPageState) this.pageState.set(null);
     this.expectedGeneration = null;
     this.decodeEpoch = null;
+    this.pendingBaton.set(null);
     this.connectionStatus.set(status);
     if (status === 'idle') {
       this.errorCode.set(null);
