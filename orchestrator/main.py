@@ -10078,19 +10078,15 @@ async def resume_job(
             """Park the job as 'paused' (dispatchable, unassigned) and kick the
             auto-dispatcher. Used both when no agent is ready and when the
             picked agent rejects the resume (its DB 'ready' was stale). Stashes
-            feedback into context so it survives until a real agent picks it up.
+            feedback into context so it survives until a real agent picks it up,
+            and sheds the row-level freeze — an explicit Resume on a frozen job
+            must not leave it paused-but-invisible to the dispatcher
+            (``get_dispatchable_jobs`` requires ``freeze_data IS NULL``).
             """
             feedback = request.feedback if request else None
-            if feedback:
-                await postgres_db.merge_job_context(
-                    job_id, {"queued_feedback": feedback}
-                )
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    "UPDATE jobs SET status = 'paused', assigned_agent_id = NULL, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
-                    job_id,
-                )
+            await postgres_db.queue_job_for_resume(
+                job_id, {"queued_feedback": feedback} if feedback else None
+            )
             logger.info(
                 f"Queued job {job_id} for auto-dispatch (previous status: "
                 f"{job['status']}, feedback: {bool(feedback)})"
@@ -10671,23 +10667,20 @@ async def _internal_resume_job(job_id: str, feedback: str) -> None:
     Stores feedback in the job's context as ``queued_feedback``, sets status
     to ``paused`` (dispatchable), and triggers the dispatcher.  Avoids HTTP
     self-calls — the dispatcher will pick it up and send it to an agent.
+
+    The single write also sheds the row-level freeze. This path's dominant
+    caller is a human reply to a ``blocking_message`` freeze, so the job ALWAYS
+    arrives here frozen — and ``get_dispatchable_jobs`` requires
+    ``freeze_data IS NULL``, so keeping the blob parked the job as
+    paused-but-invisible forever.
+    See docs/issues/blocking_message_reply_keeps_freeze_data.md.
     """
-    job = await postgres_db.get_job(job_id)
-    if not job:
+    if not await postgres_db.queue_job_for_resume(
+        job_id, {"queued_feedback": feedback}
+    ):
         logger.warning(f"_internal_resume_job: job {job_id} not found")
         return
 
-    # Store feedback in context and flip to paused in ONE statement: the || merge
-    # keeps concurrent context keys, and fusing keeps the queued feedback visible
-    # the instant the job becomes dispatchable.
-    async with postgres_db.acquire() as conn:
-        await conn.execute(
-            "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
-            "status = 'paused', assigned_agent_id = NULL, "
-            "updated_at = CURRENT_TIMESTAMP WHERE id = $2::uuid",
-            json.dumps({"queued_feedback": feedback}),
-            job_id,
-        )
     logger.info(f"Queued job {job_id} for auto-dispatch with feedback")
     _trigger_dispatch()
 
@@ -24116,7 +24109,10 @@ async def _compute_expert_effective_models(
 
 
 async def _load_expert_detail(
-    expert_id: str, *, user_id: str | None = None
+    expert_id: str,
+    *,
+    user_id: str | None = None,
+    defaults_type: Literal["worker", "session"] | None = None,
 ) -> dict[str, Any]:
     """Load full expert detail: merged config + instructions content. DB-backed
     experts (UUID) resolve their fragment onto the expert_type base; bundled
@@ -24167,7 +24163,8 @@ async def _load_expert_detail(
 
     # Load expert config
     if expert_id == "defaults":
-        defaults_path = config_dir / "defaults.yaml"
+        base_name = "persistent_defaults" if defaults_type == "session" else "defaults"
+        defaults_path = config_dir / f"{base_name}.yaml"
         if defaults_path.exists():
             with open(defaults_path) as f:
                 defaults = yaml.safe_load(f) or {}
@@ -24253,7 +24250,11 @@ async def _load_expert_detail(
 
 
 @app.get("/api/experts/{expert_id}")
-async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
+async def get_expert(
+    request: Request,
+    expert_id: str,
+    type: Literal["worker", "session"] | None = None,
+) -> dict[str, Any]:
     """Get full expert detail including merged config and instructions content.
 
     **P4e** — gated to approved users (shared catalog metadata, not per-user).
@@ -24280,8 +24281,10 @@ async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
         _experts_cache = _scan_experts()
 
     if expert_id == "defaults":
-        # "defaults" is a virtual expert representing framework defaults
-        detail = await _load_expert_detail(expert_id, user_id=_uid)
+        # "defaults" is a virtual expert representing the framework base for
+        # the requested agent type. Worker remains the backward-compatible
+        # default; session creation explicitly requests persistent_defaults.
+        detail = await _load_expert_detail(expert_id, user_id=_uid, defaults_type=type)
         if not detail:
             raise HTTPException(status_code=404, detail="Defaults config not found")
         return detail

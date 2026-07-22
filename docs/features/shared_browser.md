@@ -63,11 +63,18 @@ shared-browser tests plus 40 selected Canvas regressions pass. The exact task,
 commit, and check record lives in
 `docs/superpowers/plans/2026-07-20-shared-browser-pipe.md`.
 
+The reviewed execution plan for the remaining user-facing work is
+`docs/superpowers/plans/2026-07-22-shared-browser-cockpit-handoff.md`. It was
+created on 2026-07-22 and is ready for inline execution; all implementation
+tasks remain unchecked.
+
 Still deferred are the Cockpit renderer/controller/toolbar and open button,
 agent-side Canvas advertisement and refusal UX, active-target reattachment,
-VM provisioning/conformance wiring, and live k3d acceptance. Until those land,
-the endpoint plumbing is intentionally dark and the complete product flow
-described below remains the target design rather than available UI.
+VM image conformance wiring, and live k3d acceptance. VM runtime trust/routing
+remains fail-closed and is not silently included in that plan. Until the
+user-facing tasks land, the endpoint plumbing is intentionally dark and the
+complete product flow described below remains the target design rather than
+available UI.
 
 ## Motivation
 
@@ -200,6 +207,7 @@ One Chromium, two drivers, one new pipe:
 ┌──────────────────────┴─────────────────────────────────────┐
 │  orchestrator: stream broker                               │
 │    • WS  /api/persistent/threads/{tid}/browser/stream      │
+│    • GET /api/persistent/threads/{tid}/browser/capability  │
 │    • POST /api/persistent/threads/{tid}/browser/open       │
 │    • stateless byte relay + auth + activity marking        │
 └──────────────────────┬─────────────────────────────────────┘
@@ -305,62 +313,75 @@ URL bar shows why.
 
 ### Piece 2 — Orchestrator broker
 
-Two endpoints on the orchestrator (new module, e.g.
-`orchestrator/routers/shared_browser.py` +
-`orchestrator/services/browser_stream_broker.py`), both gated on
-`CANVAS_SHARED_BROWSER_ENABLED` and standard thread ownership auth:
+Three endpoints on the orchestrator (`orchestrator/routers/shared_browser.py`
+and `orchestrator/services/browser_stream_broker.py`), all behind
+`CANVAS_SHARED_BROWSER_ENABLED` behavior and standard thread ownership auth:
+
+**`GET /api/persistent/threads/{tid}/browser/capability`** — the pre-source
+capability used before a Canvas row exists. It returns only
+`feature_enabled`, `can_open_browser`, `workspace_ready`, and a bounded reason
+code. It never returns a host, port, backing ID, workspace/browser generation,
+fingerprint, or token. Cold container sessions may be openable before their
+workspace is ready because `open` owns provisioning; lite sessions and
+unattested or unroutable VM contexts fail closed.
 
 **`POST /api/persistent/threads/{tid}/browser/open`** — the one recovery and
-cold-start path (idempotent):
+cold-start path (idempotent). Its public body may supply only a title; a public
+caller requests the user as initial holder when a new browser generation is
+created. The internal agent Canvas adapter calls the same service with the
+agent as creation-time holder without exposing that choice in the public API.
+Re-opening an existing generation never flips its current baton:
 
-1. Reject lite backends (`virtual`/`none`) with a typed capability error.
-2. Ensure the session workspace exists (`ensure_session_workspace`) —
-   the auto-start decision.
-3. Over SSH: spawn/ping the `browser-exec` daemon, ensure the stream
-   listener is up, read the hello token, and if no browser generation exists
-   yet, start one at its default page, passing the **initial baton holder**
-   (`user` for the future Cockpit button, `agent` for the future `set_canvas`
-   path) with the start command. Navigation then uses the validated stream
-   control path.
-4. Set the canvas presentation source to
-   `{type: "browser", browser_generation: <uuid>}` through the **existing
-   canvas control plane**, so the pane opens/switches via the normal
-   invalidation → reconcile flow, the standard canvas tool-card/history
-   behavior applies, and `clear_canvas` works unmodified.
-5. Return `{status: "ready", generation, stream_port}`. The first `STATE`
-   stream message carries the viewport and current page state.
+1. Reject lite and untrusted/unroutable remote backends with a typed capability
+   error.
+2. Ensure the session workspace exists (`ensure_session_workspace`) — the
+   auto-start decision. A still-provisioning request returns `202` plus a
+   bounded retry hint.
+3. Over the same provisioner-attested, generation-bound, host-key-pinned SSH
+   transport as the stream relay: spawn/ping the `browser-exec` daemon, ensure
+   the listener is up, read its private hello token, and start a browser at its
+   default page if no generation exists. Navigation then uses the validated
+   stream control path.
+4. Set the canvas presentation source to the private concrete
+   `{type: "browser", browser_generation: <uuid>}` through the existing Canvas
+   control plane. An atomic compare-and-no-op write keeps retries on the same
+   generation at the same presentation revision.
+5. Return the ordinary generation-redacted `CanvasPublicState` plus its strong
+   `ETag` and a boolean mutation header. The first `STATE` stream message
+   carries the private generation, viewport, and current page state only inside
+   the authenticated controller.
 
-This is implemented for the future Cockpit button (initial holder → `user`)
-and agent `set_canvas(source_type="browser")` handling (initial holder →
-`agent`). Those callers, including the ended-generation restart UI, remain
-Plan 2.
+Plan 1 shipped a dark bootstrap form of `open`; Plan 2 tightens it to this
+public contract before adding either caller, including the ended-generation
+restart UI.
 
 **`GET /api/persistent/threads/{tid}/browser/stream`** (WebSocket) — the
 relay:
 
-1. Authenticate the upgrade the way the existing orchestrator WS proxy does
-   (cookie-resolved user + thread ownership, `ide_proxy_ws` pattern). The
-   cockpit applies its standard backoff-reconnect on drops; distinct 44xx
-   close codes signal disabled/unauthenticated/ended-generation states.
+1. Authenticate the upgrade with the BFF session cookie, exact allowed
+   `Origin`, approved user, and thread ownership. Re-run admission after the
+   potentially long browser startup and before accepting. Cockpit applies
+   bounded-backoff reconnect on transient drops; distinct 44xx/45xx close
+   codes signal malformed input, disabled/auth/owner, ended-generation,
+   viewer-limit, transient transport, and unavailable-workspace states.
 2. Open `PinnedSSHTransportPool.open_loopback_connection(workspace,
    BROWSER_EXEC_STREAM_PORT)` — the exact mechanism the canvas live-app
    gateway uses for long-lived byte streaming, host-key-pinned and
    generation-checked. The container path is conformance-proven. The transport
-   abstraction also supports attested VMs, but the shared-browser VM path is
-   not operationally claimed until deployment routing, remote binding, and VM
-   image conformance are verified.
-3. Send `HELLO`, then relay both directions. WS messages are binary and
-   carry `[1-byte type][payload]` — the TCP framing minus the length prefix
-   (WebSocket messages are already delimited). The broker strips/adds the
-   length prefix and otherwise never parses payloads — a stateless relay
-   with auth.
-4. While at least one stream WS is attached, periodically mark **workspace
-   activity** (the same marker the idle-sweeper reads) so watching a page
-   cannot get the workspace reaped mid-view.
+   abstraction can support attested VMs, but the shared-browser VM path is not
+   operationally claimed until deployment routing and remote binding are
+   independently verified.
+3. Send `HELLO`, then relay both directions. WS messages are binary and carry
+   `[1-byte type][payload]` — the TCP framing minus the length prefix. The
+   broker bounds client commands and accepts only `INPUT`/`CONTROL`; otherwise
+   it remains a byte relay and never interprets page/frame content.
+4. While at least one stream WS is attached, periodically mark workspace
+   activity so watching a page cannot get the workspace reaped mid-view.
 
-HA note: each viewer WS is served by whichever replica accepted it; each
-opens its own SSH channel; the daemon fans out. No cross-replica coordination
-— the shared state (baton, generation) lives daemon-side.
+HA note: each viewer WS is served by whichever replica accepted it; each opens
+its own SSH channel; the daemon fans out and enforces the final global viewer
+cap. No cross-replica baton/generation coordination is needed because that
+shared state lives daemon-side.
 
 The IDE proxy (`ide_proxy_ws`) is the in-repo proof that the orchestrator can
 bridge binary WebSockets; its transport (direct pod-IP, fails on VMs) is
@@ -422,10 +443,12 @@ helper, unit-tested across viewport/display ratios.
 
 ### Piece 4 — Agent surface (deliberately tiny)
 
-- `set_canvas` advertises `source_type: "browser"` when the capability holds
-  (non-lite backend + feature flag), resolving `browser_id: "current"` at
-  tool-call time to the concrete generation per the Slice-5 contract. The
-  server-side handling shares the `open` path.
+- `set_canvas` advertises `source_type: "browser"` only when the agent backend
+  has the positive `canvas_shared_browser_available` bit from the
+  orchestrator-attested attach response. It resolves `browser_id: "current"`
+  at tool-call time to the concrete generation per the Slice-5 contract. The
+  server-side handling shares the `open` service; the agent does not infer
+  capability from a local flag or generic remote-backend label.
 - Browser action tools surface the daemon's `user_is_driving` refusal as a
   clear tool result ("The user is currently driving the shared browser
   (currently on <url>). Ask them to release control, or work with read-only
@@ -474,7 +497,7 @@ screencast** (one extra process, not a VNC stack). The code must not couple
 
 | Risk | Mitigation |
 |------|-----------|
-| browser-use 0.12.9 CDP API differs from the inspected 0.11.9 surface | Pre-flight task in Step A: verify `session.cdp_client` / `get_or_create_cdp_session` + screencast on the real workspace image before building on it |
+| browser-use active-target/loading APIs drift within the pinned 0.12 line | Plan 1 recorded the real 0.12.9 screencast calls; Plan 2 extends that probe note for `AgentFocusChangedEvent` and Page loading events before changing the daemon, then gates both images with the same live check |
 | Screencast work starves agent actions in the daemon | Streaming task never takes the action lock; zero-viewer stop; CDP ack-backpressure caps frame production |
 | Slow viewer stalls the stream for everyone | Ack after fan-out with per-viewer send queues; drop frames for laggards rather than blocking the ack |
 | User input collides with agent actions | Baton enforced at the daemon — the only place with a total order over both input paths |
@@ -491,7 +514,9 @@ screencast** (one extra process, not a VNC stack). The code must not couple
 ## Build order
 
 Five landable steps — each leaves the tree green and shippable. A and B are
-implemented; C through E remain Plan 2:
+implemented; C through E plus the prerequisite backend/daemon hardening remain
+Plan 2. The executable task order and gates are in
+`docs/superpowers/plans/2026-07-22-shared-browser-cockpit-handoff.md`:
 
 - **A — Daemon streaming mode (implemented).** Pre-flight CDP API verification
   on the real image; stream listener + framing + screencast task + baton +
