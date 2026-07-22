@@ -1,30 +1,24 @@
-"""Shared-browser cold-start and recovery endpoint.
-
-The endpoint rejects workspace-less sessions, ensures a cold workspace, asks
-``browser-exec`` for the live stream identity over SSH, and then pins that
-browser generation into the existing Canvas control plane.
-"""
+"""Owner-scoped shared-browser capability, cold start, and recovery actions."""
 
 from __future__ import annotations
 
 import asyncio
-import json
-from typing import Any, Literal
-from uuid import UUID
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from routers.canvases import _represent, _state_response
 from security.access import require_thread_owner
-from services.browser_stream_broker import (
-    BrowserStreamUnavailable,
-    exec_stream_info,
-    workspace_ready,
+from services.shared_browser_canvas import (
+    BrowserCanvasError,
+    BrowserCapabilityResponse,
+    browser_capability,
+    commit_browser_canvas,
+    prepare_browser_canvas,
+    require_browser_capability,
 )
-from services.browser_stream_config import browser_stream_config
-from services.canvas import BrowserSource, CanvasService, CanvasSetInput
-from src.core.backends.factory import LITE_BACKENDS
 
 router = APIRouter(
     prefix="/api/persistent/threads/{thread_id}/browser",
@@ -38,36 +32,6 @@ def _get_db() -> Any:
     from main import postgres_db  # type: ignore
 
     return postgres_db
-
-
-def _get_canvas_service(db: Any) -> CanvasService:
-    return CanvasService(db)
-
-
-def _mapping(value: Any) -> dict[str, Any]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (TypeError, ValueError):
-            return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _thread_backend(thread: dict[str, Any]) -> str:
-    """Read both current session metadata and the legacy/direct fixture shape."""
-
-    metadata = _mapping(thread.get("metadata"))
-    direct = metadata.get("workspace_backend")
-    if isinstance(direct, str) and direct:
-        return direct
-    config_override = _mapping(metadata.get("config_override"))
-    workspace = _mapping(config_override.get("workspace"))
-    backend = workspace.get("backend")
-    return backend if isinstance(backend, str) and backend else "container"
-
-
-def _is_lite_backend(thread: dict[str, Any]) -> bool:
-    return _thread_backend(thread) in LITE_BACKENDS
 
 
 def _kick_workspace_provisioning(thread_id: str, db: Any) -> None:
@@ -92,8 +56,37 @@ def _kick_workspace_provisioning(thread_id: str, db: Any) -> None:
 class BrowserOpenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    opened_by: Literal["user", "agent"] = "user"
     title: str | None = Field(default=None, max_length=200)
+
+
+def _raise_browser_error(error: BrowserCanvasError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": error.message},
+    ) from error
+
+
+def _require_openable(
+    capability: BrowserCapabilityResponse,
+    *,
+    require_ready: bool,
+) -> None:
+    try:
+        require_browser_capability(capability, require_ready=require_ready)
+    except BrowserCanvasError as exc:
+        _raise_browser_error(exc)
+
+
+@router.get("/capability", response_model=BrowserCapabilityResponse)
+async def get_browser_capability(
+    thread_id: str,
+    request: Request,
+) -> BrowserCapabilityResponse:
+    """Return the closed pre-source capability only after owner admission."""
+
+    db = _get_db()
+    _, thread = await require_thread_owner(request, db, thread_id)
+    return browser_capability(thread)
 
 
 @router.post("/open")
@@ -102,29 +95,18 @@ async def open_shared_browser(
     request: Request,
     body: BrowserOpenRequest,
 ) -> Any:
-    config = browser_stream_config()
-    if not config.enabled:
-        raise HTTPException(status_code=404, detail="Shared browser is not enabled")
+    """Provision/reuse a browser and return ordinary redacted Canvas state."""
 
     db = _get_db()
     _, thread = await require_thread_owner(request, db, thread_id)
-    if _is_lite_backend(thread):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "workspace_required",
-                "message": (
-                    "The shared browser needs a full workspace; this session "
-                    "runs on a lite backend without one."
-                ),
-            },
-        )
-
-    if not workspace_ready(thread):
+    capability = browser_capability(thread)
+    _require_openable(capability, require_ready=False)
+    if not capability.workspace_ready:
         _kick_workspace_provisioning(thread_id, db)
         return JSONResponse(
             status_code=202,
             content={"status": "provisioning"},
+            headers={"Retry-After": "1"},
         )
 
     async def generation_resolver() -> dict[str, Any]:
@@ -132,31 +114,45 @@ async def open_shared_browser(
         return dict(current) if current else {}
 
     try:
-        info = await exec_stream_info(
+        prepared = await prepare_browser_canvas(
             thread,
-            initial_baton=body.opened_by,
+            initial_baton="user",
             generation_resolver=generation_resolver,
         )
-        generation = UUID(info["generation"])
-    except BrowserStreamUnavailable as exc:
-        raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-    except (KeyError, TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="browser-exec returned invalid stream identity",
-        ) from exc
-
-    await _get_canvas_service(db).set(
-        thread_id,
-        CanvasSetInput(
-            source=BrowserSource(browser_generation=generation),
+        # Browser startup can be long. Re-run owner and capability admission
+        # immediately before the durable transition.
+        _, current = await require_thread_owner(request, db, thread_id)
+        _require_openable(browser_capability(current), require_ready=True)
+        mutation = await commit_browser_canvas(
+            db,
+            thread_id,
+            prepared,
             title=(body.title or "").strip() or "Shared browser",
-            renderer="auto",
-            editable=False,
-        ),
+        )
+    except BrowserCanvasError as exc:
+        _raise_browser_error(exc)
+
+    assert mutation.record is not None
+    _, visible_thread = await require_thread_owner(request, db, thread_id)
+    representation = await _represent(
+        thread_id,
+        visible_thread,
+        mutation.record,
+        browser_content_url=True,
+        db=db,
     )
-    return {
-        "status": "ready",
-        "generation": str(generation),
-        "stream_port": config.stream_port,
-    }
+    return _state_response(
+        representation.payload,
+        representation.etag,
+        extra_headers={
+            "X-Canvas-Mutation-Changed": str(mutation.changed).lower(),
+        },
+    )
+
+
+__all__ = [
+    "BrowserOpenRequest",
+    "get_browser_capability",
+    "open_shared_browser",
+    "router",
+]
