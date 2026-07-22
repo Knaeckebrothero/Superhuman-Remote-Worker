@@ -538,7 +538,8 @@ jobs:
           # deployed. See docs/features/browser_workspace_executor.md.
           WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
             docker/Dockerfile.workspace docker/workspace-entrypoint.sh \
-            docker/browser-exec docker/assert-browser-stack.sh \
+            docker/browser-exec docker/check-browser-stream.py \
+            docker/assert-browser-stack.sh \
             .playwright-version)
 
           VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
@@ -588,7 +589,7 @@ jobs:
             docker/agent-vm-base/stage2.pkr.hcl \
             docker/agent-vm-base/Dockerfile.containerDisk \
             docker/agent-vm-base/files/ \
-            docker/browser-exec)
+            docker/browser-exec docker/check-browser-stream.py)
 
           SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
             vm/sudo-daemon/ vm/sudo-plugin/)

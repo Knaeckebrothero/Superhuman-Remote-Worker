@@ -44,6 +44,9 @@ _check() {
     # distinguishes them.
     if out=$("$@" 2>&1); then
         printf '  ok       %s\n' "$label"
+        if [ "$label" = "shared-browser stream conformance" ] && [ -n "$out" ]; then
+            printf '%s\n' "$out"
+        fi
     else
         printf '  MISSING  %s\n' "$label"
         if [ -n "$out" ]; then
@@ -76,6 +79,12 @@ _check "agent-chromium executable" test -x /usr/local/bin/agent-chromium
 # Chromium fails here rather than on the first agent screenshot.
 _check "agent-chromium runs"       /usr/local/bin/agent-chromium --headless --no-sandbox --version
 
+# Exercises the actual browser-use/CDP stream seam, including loading, active
+# target handoff, viewer limits, and a zero-viewer restart. The program owns and
+# removes all of its temporary state so this is safe inside an image-build RUN.
+_check "shared-browser stream conformance" \
+    /usr/local/bin/check-browser-stream
+
 if [ "$fail" -ne 0 ]; then
     cat >&2 <<'EOF'
 
@@ -87,6 +96,7 @@ Every workspace image must install all of:
   - browser-use, CAPPED <0.13.0 (0.13 dropped Playwright for pure CDP and
     breaks the browser-exec daemon)
   - docker/browser-exec -> /usr/local/bin/browser-exec, chmod +x
+  - docker/check-browser-stream.py -> /usr/local/bin/check-browser-stream
 
 Container: docker/Dockerfile.workspace
 VM:        docker/agent-vm-base/scripts/provision-stage1.sh (pip deps, chromium)
