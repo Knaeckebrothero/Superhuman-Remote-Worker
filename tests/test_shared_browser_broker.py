@@ -7,9 +7,11 @@ import threading
 from types import SimpleNamespace
 from uuid import UUID
 
+import httpx
 import pytest
 from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
 from starlette.websockets import WebSocketDisconnect
 
 from services import browser_stream_broker as broker
@@ -17,6 +19,14 @@ from services.canvas_ssh import CanvasSSHError, PinnedSSHCommandResult
 
 
 _WORKSPACE_GENERATION = UUID("11111111-aaaa-4aaa-8aaa-111111111111")
+_VALID_ORIGIN = "http://localhost:4200"
+
+
+@pytest.fixture(autouse=True)
+def _clear_active_viewers():
+    broker._ACTIVE_VIEWERS.clear()
+    yield
+    broker._ACTIVE_VIEWERS.clear()
 
 
 def _bound_thread(*, generation: UUID = _WORKSPACE_GENERATION) -> dict:
@@ -96,7 +106,9 @@ class TestExecStreamInfo:
         monkeypatch.setattr(
             broker.PINNED_SSH_TRANSPORT_POOL, "run_command", run_command
         )
-        monkeypatch.setattr(broker, "build_agent_ssh_cmd", forbidden_exec, raising=False)
+        monkeypatch.setattr(
+            broker, "build_agent_ssh_cmd", forbidden_exec, raising=False
+        )
         monkeypatch.setattr(broker.asyncio, "create_subprocess_exec", forbidden_exec)
         monkeypatch.setattr(broker, "resolve_ssh_key_path", lambda: "/tmp/key")
         monkeypatch.setattr(broker, "orchestrator_can_reach", lambda host: True)
@@ -117,7 +129,7 @@ class TestExecStreamInfo:
         assert captured["target"].generation == _WORKSPACE_GENERATION
         assert captured["key_path"] == "/tmp/key"
         assert captured["command"] == (
-            "browser-exec stream_info --json '{\"initial_baton\":\"user\"}'"
+            'browser-exec stream_info --json \'{"initial_baton":"user"}\''
         )
         assert captured["generation_resolver"] is current
         assert captured["max_output_bytes"] == 64 * 1024
@@ -150,9 +162,7 @@ class TestExecStreamInfo:
         assert error.value.status == 409
         assert "sentinel" not in error.value.detail
 
-    def test_nonzero_result_redacts_remote_output(
-        self, monkeypatch, caplog
-    ):
+    def test_nonzero_result_redacts_remote_output(self, monkeypatch, caplog):
         async def run_command(**kwargs):
             del kwargs
             return PinnedSSHCommandResult(
@@ -195,22 +205,179 @@ def _ws_app():
     return app
 
 
-def _connect_and_capture_close(client, url) -> int:
+def _connect_and_capture_close(client, url, *, headers=None) -> int:
+    if headers is None:
+        headers = {"origin": _VALID_ORIGIN}
     try:
-        with client.websocket_connect(url) as ws:
+        with client.websocket_connect(url, headers=headers) as ws:
             ws.receive_bytes()
         return 1000
     except WebSocketDisconnect as exc:
         return exc.code
 
 
+def _patch_ready_transport(monkeypatch) -> None:
+    monkeypatch.setattr(broker, "resolve_ssh_key_path", lambda: "/tmp/key")
+    monkeypatch.setattr(broker, "orchestrator_can_reach", lambda host: True)
+
+
+class _RelayDB:
+    def __init__(self, thread: dict | None = None):
+        self.thread = thread or _bound_thread()
+        self.get_calls = 0
+        self.activity_calls = 0
+
+    async def get_thread(self, thread_id):
+        assert thread_id == "t1"
+        self.get_calls += 1
+        return dict(self.thread) if self.thread is not None else None
+
+    async def merge_thread_workspace_context(self, thread_id, updates):
+        assert thread_id == "t1"
+        assert updates == {}
+        self.activity_calls += 1
+        return True
+
+
+class _HangingSSHReader:
+    async def readexactly(self, size):
+        del size
+        await asyncio.sleep(3600)
+
+
+class _RecordingSSHWriter:
+    def __init__(self):
+        self.frames: list[bytes] = []
+
+    def write(self, data):
+        self.frames.append(bytes(data))
+
+    async def drain(self):
+        pass
+
+
+class _FakeWebSocket:
+    def __init__(self, receive_message=None):
+        self.headers = Headers({"origin": _VALID_ORIGIN})
+        self.receive_message = receive_message
+        self.accepted = False
+        self.closes: list[tuple[int, str | None]] = []
+
+    async def accept(self):
+        self.accepted = True
+
+    async def close(self, *, code=1000, reason=None):
+        self.closes.append((code, reason))
+
+    async def receive(self):
+        return self.receive_message
+
+    async def send_bytes(self, data):
+        del data
+
+
+def _install_hanging_relay(monkeypatch, *, db: _RelayDB | None = None):
+    monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+    _patch_ready_transport(monkeypatch)
+    db = db or _RelayDB()
+    writer = _RecordingSSHWriter()
+
+    async def fake_user(ws, database):
+        assert database is db
+        return {"id": "u1", "is_approved": True}
+
+    async def fake_info(thread, **kwargs):
+        del thread, kwargs
+        return {"generation": "g1", "token": "tok", "port": 38801}
+
+    async def fake_record(database, thread_id):
+        assert database is db
+        assert thread_id == "t1"
+        return SimpleNamespace(source=SimpleNamespace(browser_generation="g1"))
+
+    @asynccontextmanager
+    async def fake_open(**kwargs):
+        del kwargs
+        yield _HangingSSHReader(), writer
+
+    monkeypatch.setattr(broker, "resolve_ws_user", fake_user)
+    monkeypatch.setattr(broker, "exec_stream_info", fake_info)
+    monkeypatch.setattr(broker, "_get_canvas_record", fake_record)
+    monkeypatch.setattr(broker, "_open_loopback", fake_open)
+    app = _ws_app()
+    monkeypatch.setattr("main.postgres_db", db, raising=False)
+    return app, db, writer
+
+
 class TestRelayAuthGates:
+    def test_missing_origin_closes_4403_before_feature_gate(self, monkeypatch):
+        monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
+        app = _ws_app()
+        monkeypatch.setattr("main.postgres_db", object(), raising=False)
+
+        assert (
+            _connect_and_capture_close(TestClient(app), "/stream/t1", headers={})
+            == 4403
+        )
+
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "https://cross-site.example.test",
+            "null",
+            "https://example.test/path",
+        ],
+    )
+    def test_bad_origin_closes_4403_before_feature_gate(self, monkeypatch, origin):
+        monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
+        app = _ws_app()
+        monkeypatch.setattr("main.postgres_db", object(), raising=False)
+
+        assert (
+            _connect_and_capture_close(
+                TestClient(app),
+                "/stream/t1",
+                headers={"origin": origin},
+            )
+            == 4403
+        )
+
+    def test_duplicate_origin_closes_4403_before_feature_gate(self, monkeypatch):
+        monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
+        headers = httpx.Headers([("origin", _VALID_ORIGIN), ("origin", _VALID_ORIGIN)])
+        app = _ws_app()
+        monkeypatch.setattr("main.postgres_db", object(), raising=False)
+
+        assert (
+            _connect_and_capture_close(
+                TestClient(app),
+                "/stream/t1",
+                headers=headers,
+            )
+            == 4403
+        )
+
     def test_disabled_closes_4404(self, monkeypatch):
         monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
         app = _ws_app()
         monkeypatch.setattr("main.postgres_db", object(), raising=False)
 
         assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4404
+
+    def test_allowed_environment_origin_reaches_feature_gate(self, monkeypatch):
+        monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
+        monkeypatch.setenv("CORS_ORIGINS", "https://cockpit.example.test")
+        app = _ws_app()
+        monkeypatch.setattr("main.postgres_db", object(), raising=False)
+
+        assert (
+            _connect_and_capture_close(
+                TestClient(app),
+                "/stream/t1",
+                headers={"origin": "HTTPS://COCKPIT.EXAMPLE.TEST:443"},
+            )
+            == 4404
+        )
 
     def test_unauthenticated_closes_4401(self, monkeypatch):
         monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
@@ -226,6 +393,7 @@ class TestRelayAuthGates:
 
     def test_stale_generation_closes_4409(self, monkeypatch):
         monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+        _patch_ready_transport(monkeypatch)
 
         async def fake_user(ws, db):
             return {"id": "u1", "is_approved": True}
@@ -236,17 +404,7 @@ class TestRelayAuthGates:
         async def fake_record(db, thread_id):
             return SimpleNamespace(source=SimpleNamespace(browser_generation="g-old"))
 
-        thread = {
-            "id": "t1",
-            "user_id": "u1",
-            "metadata": {
-                "workspace_container": {
-                    "status": "ready",
-                    "ssh_host": "h",
-                    "ssh_port": 22,
-                }
-            },
-        }
+        thread = _bound_thread()
 
         class FakeDB:
             async def get_thread(self, thread_id):
@@ -259,13 +417,190 @@ class TestRelayAuthGates:
         monkeypatch.setattr("main.postgres_db", FakeDB(), raising=False)
 
         assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4409
+        assert broker._ACTIVE_VIEWERS == {}
+
+
+class TestRelayReadmission:
+    def test_feature_is_rechecked_after_startup(self, monkeypatch):
+        app, _, _ = _install_hanging_relay(monkeypatch)
+
+        async def disable_during_start(thread, **kwargs):
+            del thread, kwargs
+            monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "false")
+            return {"generation": "g1", "token": "tok", "port": 38801}
+
+        monkeypatch.setattr(broker, "exec_stream_info", disable_during_start)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4404
+        assert broker._ACTIVE_VIEWERS == {}
+
+    def test_approval_is_rechecked_after_startup(self, monkeypatch):
+        app, db, _ = _install_hanging_relay(monkeypatch)
+        calls = 0
+
+        async def approval_changes(ws, database):
+            nonlocal calls
+            del ws
+            assert database is db
+            calls += 1
+            return {"id": "u1", "is_approved": calls == 1}
+
+        monkeypatch.setattr(broker, "resolve_ws_user", approval_changes)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4403
+        assert calls == 2
+        assert broker._ACTIVE_VIEWERS == {}
+
+    def test_owner_is_rechecked_after_startup(self, monkeypatch):
+        db = _RelayDB()
+        app, _, _ = _install_hanging_relay(monkeypatch, db=db)
+
+        async def transfer_during_start(thread, **kwargs):
+            del thread, kwargs
+            db.thread = {**db.thread, "user_id": "u2"}
+            return {"generation": "g1", "token": "tok", "port": 38801}
+
+        monkeypatch.setattr(broker, "exec_stream_info", transfer_during_start)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4403
+        assert broker._ACTIVE_VIEWERS == {}
+
+    def test_workspace_binding_is_rechecked_after_startup(self, monkeypatch):
+        db = _RelayDB()
+        app, _, _ = _install_hanging_relay(monkeypatch, db=db)
+
+        async def revoke_binding_during_start(thread, **kwargs):
+            del thread, kwargs
+            changed = _bound_thread()
+            changed["metadata"].pop("_workspace_binding")
+            db.thread = changed
+            return {"generation": "g1", "token": "tok", "port": 38801}
+
+        monkeypatch.setattr(broker, "exec_stream_info", revoke_binding_during_start)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4503
+        assert broker._ACTIVE_VIEWERS == {}
+
+
+class TestRelayClientProtocol:
+    @pytest.mark.parametrize(
+        ("kind", "payload"),
+        [
+            ("text", "not-binary"),
+            ("bytes", b""),
+            ("bytes", b"\x99unknown"),
+            (
+                "bytes",
+                bytes([broker.T_INPUT]) + b"x" * broker.MAX_BROWSER_CLIENT_MESSAGE,
+            ),
+        ],
+        ids=["text", "empty", "unknown-type", "oversized"],
+    )
+    def test_invalid_client_message_closes_4400(self, monkeypatch, kind, payload):
+        app, _, _ = _install_hanging_relay(monkeypatch)
+
+        with TestClient(app).websocket_connect(
+            "/stream/t1",
+            headers={"origin": _VALID_ORIGIN},
+        ) as ws:
+            if kind == "text":
+                ws.send_text(payload)
+            else:
+                ws.send_bytes(payload)
+            with pytest.raises(WebSocketDisconnect) as closed:
+                ws.receive_bytes()
+
+        assert closed.value.code == 4400
+        assert broker._ACTIVE_VIEWERS == {}
+
+    def test_ssh_open_failure_releases_reserved_viewer(self, monkeypatch):
+        app, _, _ = _install_hanging_relay(monkeypatch)
+
+        @asynccontextmanager
+        async def broken_open(**kwargs):
+            del kwargs
+            raise RuntimeError("loopback unavailable")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(broker, "_open_loopback", broken_open)
+
+        with TestClient(app).websocket_connect(
+            "/stream/t1",
+            headers={"origin": _VALID_ORIGIN},
+        ) as ws:
+            with pytest.raises(WebSocketDisconnect) as closed:
+                ws.receive_bytes()
+
+        assert closed.value.code == 4502
+        assert broker._ACTIVE_VIEWERS == {}
+
+    def test_malformed_asgi_receive_shape_closes_4400(self, monkeypatch):
+        _, db, _ = _install_hanging_relay(monkeypatch)
+        ws = _FakeWebSocket({"type": "websocket.receive"})
+
+        asyncio.run(broker.relay_browser_stream(ws, "t1", db=db))
+
+        assert ws.accepted is True
+        assert ws.closes == [(4400, "Invalid browser protocol message")]
+        assert broker._ACTIVE_VIEWERS == {}
+
+
+class TestViewerAccounting:
+    def test_startup_failure_before_accept_releases_viewer(self, monkeypatch):
+        app, _, _ = _install_hanging_relay(monkeypatch)
+
+        async def unavailable(thread, **kwargs):
+            del thread, kwargs
+            raise broker.BrowserStreamUnavailable(503, "private detail")
+
+        monkeypatch.setattr(broker, "exec_stream_info", unavailable)
+
+        assert _connect_and_capture_close(TestClient(app), "/stream/t1") == 4502
+        assert broker._ACTIVE_VIEWERS == {}
+
+    def test_startup_reservation_caps_handshakes_and_releases_on_cancel(
+        self, monkeypatch
+    ):
+        _, db, _ = _install_hanging_relay(monkeypatch)
+        monkeypatch.setenv("CANVAS_BROWSER_MAX_VIEWERS", "1")
+
+        async def run():
+            startup_entered = asyncio.Event()
+
+            async def blocked_info(thread, **kwargs):
+                del thread, kwargs
+                startup_entered.set()
+                await asyncio.sleep(3600)
+
+            monkeypatch.setattr(broker, "exec_stream_info", blocked_info)
+            first_ws = _FakeWebSocket()
+            first = asyncio.create_task(
+                broker.relay_browser_stream(first_ws, "t1", db=db)
+            )
+            await startup_entered.wait()
+            assert broker._ACTIVE_VIEWERS == {"t1": 1}
+
+            second_ws = _FakeWebSocket()
+            await broker.relay_browser_stream(second_ws, "t1", db=db)
+            assert second_ws.accepted is False
+            assert second_ws.closes == [(4429, "Viewer limit reached")]
+            assert broker._ACTIVE_VIEWERS == {"t1": 1}
+
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert broker._ACTIVE_VIEWERS == {}
+
+        asyncio.run(run())
 
 
 class TestRelayHappyPath:
     def test_relays_state_frame_and_sends_hello(self, monkeypatch):
         monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+        _patch_ready_transport(monkeypatch)
         written = []
         activity_touched = threading.Event()
+        client_frames_forwarded = threading.Event()
 
         class FakeSSHReader:
             def __init__(self):
@@ -285,6 +620,8 @@ class TestRelayHappyPath:
         class FakeSSHWriter:
             def write(self, data):
                 written.append(bytes(data))
+                if len(written) >= 3:
+                    client_frames_forwarded.set()
 
             async def drain(self):
                 pass
@@ -302,17 +639,7 @@ class TestRelayHappyPath:
         async def fake_record(db, thread_id):
             return SimpleNamespace(source=SimpleNamespace(browser_generation="g1"))
 
-        thread = {
-            "id": "t1",
-            "user_id": "u1",
-            "metadata": {
-                "workspace_container": {
-                    "status": "ready",
-                    "ssh_host": "h",
-                    "ssh_port": 22,
-                }
-            },
-        }
+        thread = _bound_thread()
 
         class FakeDB:
             async def get_thread(self, thread_id):
@@ -325,19 +652,27 @@ class TestRelayHappyPath:
         monkeypatch.setattr(broker, "resolve_ws_user", fake_user)
         monkeypatch.setattr(broker, "exec_stream_info", fake_info)
         monkeypatch.setattr(broker, "_get_canvas_record", fake_record)
-        monkeypatch.setattr(broker, "_resolve_target", lambda thread: object())
-        monkeypatch.setattr(broker, "_resolve_key_path", lambda: "/tmp/key")
         monkeypatch.setattr(broker, "_open_loopback", fake_open)
         app = _ws_app()
         monkeypatch.setattr("main.postgres_db", FakeDB(), raising=False)
 
-        with TestClient(app).websocket_connect("/stream/t1") as ws:
+        with TestClient(app).websocket_connect(
+            "/stream/t1",
+            headers={"origin": _VALID_ORIGIN},
+        ) as ws:
             first = ws.receive_bytes()
             assert first[0] == broker.T_STATE
             assert first[1:] == b'{"baton":"user"}'
             assert activity_touched.wait(timeout=1)
+            ws.send_bytes(bytes([broker.T_INPUT]) + b"opaque-input")
             ws.send_bytes(bytes([broker.T_CONTROL]) + b'{"op":"take_baton"}')
+            assert client_frames_forwarded.wait(timeout=1)
 
         assert written[0][4] == broker.T_HELLO
         assert b'"token": "tok"' in written[0] or b'"token":"tok"' in written[0]
+        assert any(
+            frame[4] == broker.T_INPUT and frame[5:] == b"opaque-input"
+            for frame in written[1:]
+        )
         assert any(frame[4] == broker.T_CONTROL for frame in written[1:])
+        assert broker._ACTIVE_VIEWERS == {}
