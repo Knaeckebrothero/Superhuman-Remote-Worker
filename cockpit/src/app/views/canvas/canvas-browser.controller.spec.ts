@@ -421,6 +421,18 @@ describe('Canvas shared-browser controller', () => {
     expect(sockets).toHaveLength(3);
   });
 
+  it('reconnects after the clean service-restart close used by orchestrator rollouts', () => {
+    controller.syncPresentation(true, 'thread-1', browserState());
+    sockets[0].serverClose(1012, true);
+
+    expect(controller.connectionStatus()).toBe('reconnecting');
+    expect(controller.errorCode()).toBe('browser_stream_unavailable');
+    expect(timeouts.delays).toEqual([250]);
+
+    timeouts.runNext();
+    expect(sockets).toHaveLength(2);
+  });
+
   it('maps bounded daemon errors without detaching navigation rejection', () => {
     controller.syncPresentation(true, 'thread-1', browserState(1));
     const first = sockets[0];
