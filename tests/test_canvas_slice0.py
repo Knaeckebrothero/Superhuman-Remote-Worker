@@ -28,6 +28,7 @@ from services.canvas import (
     WorkspaceFileSource,
     build_public_canvas_representation,
     canonical_source_fingerprint,
+    canvas_presentation_lock_key,
 )
 
 _THREAD_ID = "a3333333-3333-3333-3333-333333333333"
@@ -44,6 +45,8 @@ class _FakeCanvasDB:
         self.now = datetime(2026, 7, 13, 8, 0, tzinfo=timezone.utc)
         self.in_transaction = False
         self.acquire_count = 0
+        self.advisory_calls = 0
+        self._transaction_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def acquire(self):
@@ -52,16 +55,26 @@ class _FakeCanvasDB:
 
     @asynccontextmanager
     async def transaction(self):
-        assert not self.in_transaction
-        self.in_transaction = True
-        try:
-            yield
-        finally:
-            self.in_transaction = False
+        async with self._transaction_lock:
+            assert not self.in_transaction
+            self.in_transaction = True
+            try:
+                yield
+            finally:
+                self.in_transaction = False
 
     def _tick(self) -> datetime:
         self.now += timedelta(microseconds=1)
         return self.now
+
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        sql = " ".join(query.split())
+        if sql == "SELECT pg_advisory_xact_lock($1)":
+            assert self.in_transaction
+            assert isinstance(args[0], int)
+            self.advisory_calls += 1
+            return None
+        raise AssertionError(f"unexpected Canvas SQL: {sql}")
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
         sql = " ".join(query.split())
@@ -79,19 +92,34 @@ class _FakeCanvasDB:
             return dict(row) if row is not None else None
 
         if sql.startswith("INSERT INTO canvases"):
-            (
-                thread_id,
-                canvas_id,
-                source_json,
-                title,
-                renderer,
-                editable,
-                alt_text,
-                source_fingerprint,
-                source_version,
-                origin_candidate,
-                new_app,
-            ) = args
+            if len(args) == 11:
+                (
+                    thread_id,
+                    canvas_id,
+                    source_json,
+                    title,
+                    renderer,
+                    editable,
+                    alt_text,
+                    source_fingerprint,
+                    source_version,
+                    origin_candidate,
+                    new_app,
+                ) = args
+            else:
+                (
+                    thread_id,
+                    canvas_id,
+                    source_json,
+                    title,
+                    renderer,
+                    editable,
+                    alt_text,
+                    source_fingerprint,
+                    source_version,
+                    origin_candidate,
+                ) = args
+                new_app = False
             key = (str(thread_id), str(canvas_id))
             existing = self.rows.get(key)
             now = self._tick()
@@ -172,6 +200,19 @@ def _file_set(
         title=title,
         renderer="markdown",
         source_version=_SOURCE_VERSION,
+    )
+
+
+def _browser_set(
+    *,
+    generation: UUID = UUID("33333333-cccc-4ccc-8ccc-333333333333"),
+    title: str = "Shared browser",
+) -> CanvasSetInput:
+    return CanvasSetInput(
+        source=BrowserSource(browser_generation=generation),
+        title=title,
+        renderer="auto",
+        editable=False,
     )
 
 
@@ -289,6 +330,87 @@ async def test_set_refresh_replace_and_origin_rotation_are_atomic() -> None:
     assert app_refresh.record.origin_generation == app_first.record.origin_generation
     assert app_reset.record is not None
     assert app_reset.record.origin_generation != app_first.record.origin_generation
+
+
+@pytest.mark.asyncio
+async def test_browser_set_if_changed_is_idempotent_but_ordinary_set_is_not() -> None:
+    db = _FakeCanvasDB()
+    callbacks: list[int] = []
+
+    async def callback(event) -> None:
+        callbacks.append(event.params.presentation_revision)
+
+    service = CanvasService(db, event_callback=callback)
+    first = await service.set_if_changed(_THREAD_ID, _browser_set())
+    repeated = await service.set_if_changed(_THREAD_ID, _browser_set())
+    retitled = await service.set_if_changed(
+        _THREAD_ID, _browser_set(title="Research browser")
+    )
+    replaced = await service.set_if_changed(
+        _THREAD_ID,
+        _browser_set(generation=UUID("44444444-dddd-4ddd-8ddd-444444444444")),
+    )
+    ordinary = await service.set(
+        _THREAD_ID,
+        _browser_set(generation=UUID("44444444-dddd-4ddd-8ddd-444444444444")),
+    )
+
+    assert first.changed is True
+    assert first.record is not None and first.record.presentation_revision == 1
+    assert repeated.changed is False
+    assert repeated.record is not None and repeated.record.presentation_revision == 1
+    assert retitled.changed is True
+    assert retitled.record is not None and retitled.record.presentation_revision == 2
+    assert replaced.changed is True
+    assert replaced.record is not None and replaced.record.presentation_revision == 3
+    assert ordinary.record is not None and ordinary.record.presentation_revision == 4
+    assert callbacks == [1, 2, 3, 4]
+    assert db.advisory_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_browser_set_if_changed_serializes_concurrent_missing_row() -> None:
+    db = _FakeCanvasDB()
+    callbacks: list[int] = []
+
+    async def callback(event) -> None:
+        callbacks.append(event.params.presentation_revision)
+
+    first, second = await asyncio.gather(
+        CanvasService(db, event_callback=callback).set_if_changed(
+            _THREAD_ID, _browser_set()
+        ),
+        CanvasService(db, event_callback=callback).set_if_changed(
+            _THREAD_ID, _browser_set()
+        ),
+    )
+
+    assert sorted((first.changed, second.changed)) == [False, True]
+    assert first.record is not None and first.record.presentation_revision == 1
+    assert second.record is not None and second.record.presentation_revision == 1
+    assert callbacks == [1]
+    assert db.advisory_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_browser_set_if_changed_rejects_noncanonical_presentation() -> None:
+    db = _FakeCanvasDB()
+    presentation = _browser_set().model_copy(update={"renderer": "markdown"})
+
+    with pytest.raises(ValueError, match="restricted to Browser"):
+        await CanvasService(db).set_if_changed(_THREAD_ID, presentation)
+
+    assert db.rows == {}
+    assert db.advisory_calls == 0
+
+
+def test_browser_presentation_lock_is_stable_and_domain_separated() -> None:
+    first = canvas_presentation_lock_key(_THREAD_ID, "main")
+    second = canvas_presentation_lock_key(_THREAD_ID, "main")
+
+    assert first == second
+    assert -(2**63) <= first < 2**63
+    assert first != canvas_presentation_lock_key(_THREAD_ID, "secondary")
 
 
 @pytest.mark.asyncio

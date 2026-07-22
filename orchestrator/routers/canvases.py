@@ -55,8 +55,7 @@ from services.canvas_viewer_sessions import (
     CanvasViewerSessionService,
     canvas_viewer_error_detail,
 )
-from services.browser_stream_broker import workspace_ready
-from services.browser_stream_config import browser_stream_config
+from services.shared_browser_canvas import browser_capability
 
 router = APIRouter(
     prefix="/api/persistent/threads/{thread_id}/canvases",
@@ -496,12 +495,14 @@ async def _represent(
                         can_create_viewer_session=True,
                     )
     elif isinstance(record.source, BrowserSource):
-        # Metadata-only capability gate. The stream endpoint revalidates the
-        # live daemon identity and the concrete browser generation.
-        if browser_stream_config().enabled and workspace_ready(thread):
+        # The stream endpoint still revalidates the concrete browser generation;
+        # this presentation gate uses the same attested workspace authority as open.
+        capability = browser_capability(thread)
+        if capability.can_open_browser and capability.workspace_ready:
             status = "ready"
             capabilities = CanvasCapabilities(
                 can_pop_out=True,
+                can_take_control=True,
                 can_stream_browser=True,
             )
     return build_public_canvas_representation(
