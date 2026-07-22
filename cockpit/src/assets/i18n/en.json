@@ -90,6 +90,7 @@
     "sourceKind": {
       "file": "File",
       "app": "Live app",
+      "browser": "Shared browser",
       "unknown": "Canvas"
     },
     "renderer": {
@@ -98,6 +99,7 @@
       "html": "Static HTML",
       "image": "Image",
       "app": "Live app",
+      "browser": "Shared browser",
       "unsupported": "Unsupported source"
     },
     "status": {
@@ -120,6 +122,27 @@
     },
     "html": {
       "frameTitle": "Static Canvas preview: {{title}}"
+    },
+    "browser": {
+      "source": "Current shared browser",
+      "untitled": "Untitled page",
+      "noUrl": "No page URL",
+      "loading": "Page loading…",
+      "surfaceLabel": "Shared browser page",
+      "baton": {
+        "agent": "Agent is driving",
+        "user": "You're driving"
+      },
+      "status": {
+        "connecting": "Connecting to the shared browser…",
+        "ready": "Shared browser connected",
+        "reconnecting": "Reconnecting to the shared browser…",
+        "ended": "This browser session has ended.",
+        "viewerLimit": "The shared browser has reached its viewer limit.",
+        "unauthorized": "You no longer have access to this shared browser.",
+        "unavailable": "The shared browser is currently unavailable.",
+        "error": "The shared-browser connection encountered a protocol error."
+      }
     },
     "app": {
       "source": "Workspace application",

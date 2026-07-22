@@ -277,7 +277,10 @@ describe('Canvas pane trusted chrome', () => {
   });
 
   it('syncs the pane-local browser controller for the selected browser renderer', () => {
-    const browser = {syncPresentation: vi.fn()};
+    const browser = {
+      syncPresentation: vi.fn(),
+      connectionStatus: signal<'connecting'>('connecting'),
+    };
     const state = signal<CanvasState | null>(canvasState(4, 'auto', {
       source: {type: 'browser'},
       source_version: null,
@@ -331,15 +334,37 @@ describe('Canvas pane trusted chrome', () => {
       ],
     });
     try {
-      TestBed.runInInjectionContext(() => new CanvasPaneComponent());
+      const pane = TestBed.runInInjectionContext(() => new CanvasPaneComponent());
       TestBed.flushEffects();
 
+      expect(pane.effectiveRenderer()).toBe('browser');
+      expect(pane.hasVisual()).toBe(true);
+      expect(pane.sourceSummary()).toBe('canvas.browser.source');
+      expect(pane.sourceKindLabel()).toBe('canvas.sourceKind.browser');
+      expect(pane.statusText()).toBe('canvas.browser.status.connecting');
       expect(browser.syncPresentation).toHaveBeenCalledWith(true, 'thread-1', state());
       expect(viewer.syncPresentation).toHaveBeenCalledWith(
         false,
         'thread-1',
         state(),
         '"canvas:4:browser"',
+      );
+      expect(content.syncPresentation).toHaveBeenCalledWith(
+        false,
+        'thread-1',
+        state(),
+        expect.any(Function),
+        expect.any(Function),
+      );
+      expect(editor.sync).toHaveBeenCalledWith(
+        false,
+        'thread-1',
+        state(),
+        null,
+        '',
+        null,
+        false,
+        false,
       );
     } finally {
       TestBed.resetTestingModule();

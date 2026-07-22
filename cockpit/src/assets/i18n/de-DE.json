@@ -90,6 +90,7 @@
     "sourceKind": {
       "file": "Datei",
       "app": "Live-App",
+      "browser": "Geteilter Browser",
       "unknown": "Canvas"
     },
     "renderer": {
@@ -98,6 +99,7 @@
       "html": "Statisches HTML",
       "image": "Bild",
       "app": "Live-App",
+      "browser": "Geteilter Browser",
       "unsupported": "Nicht unterstützte Quelle"
     },
     "status": {
@@ -120,6 +122,27 @@
     },
     "html": {
       "frameTitle": "Statische Canvas-Vorschau: {{title}}"
+    },
+    "browser": {
+      "source": "Aktueller geteilter Browser",
+      "untitled": "Seite ohne Titel",
+      "noUrl": "Keine Seitenadresse",
+      "loading": "Seite wird geladen…",
+      "surfaceLabel": "Seite im geteilten Browser",
+      "baton": {
+        "agent": "Der Agent steuert",
+        "user": "Sie steuern"
+      },
+      "status": {
+        "connecting": "Verbindung zum geteilten Browser wird hergestellt…",
+        "ready": "Geteilter Browser verbunden",
+        "reconnecting": "Verbindung zum geteilten Browser wird wiederhergestellt…",
+        "ended": "Diese Browser-Sitzung wurde beendet.",
+        "viewerLimit": "Der geteilte Browser hat sein Anzeigelimit erreicht.",
+        "unauthorized": "Sie haben keinen Zugriff mehr auf diesen geteilten Browser.",
+        "unavailable": "Der geteilte Browser ist derzeit nicht verfügbar.",
+        "error": "Bei der Verbindung zum geteilten Browser ist ein Protokollfehler aufgetreten."
+      }
     },
     "app": {
       "source": "Workspace-Anwendung",
