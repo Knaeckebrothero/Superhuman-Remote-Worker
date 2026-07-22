@@ -1149,7 +1149,12 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
           else
-            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest" "${IMAGE}:experimental")
+            # develop owns the :experimental stage1 tag; :latest belongs to main
+            # (main.yml + the stage1-rebuild cron). Pushing :latest from develop
+            # would clobber main's prod base image, and — worse — a main-built
+            # :latest that lacks develop-only base changes (e.g. browser_use)
+            # would then fail develop's own stage2 gate.
+            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
           fi
           BUILD_ARGS=()
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
@@ -1245,7 +1250,11 @@ jobs:
       - name: Pull stage1 containerDisk and extract qcow2
         working-directory: docker/agent-vm-base
         run: |
-          STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:latest" | tr '[:upper:]' '[:lower:]')
+          # develop layers stage2 on its OWN stage1 base (:experimental), NOT the
+          # shared :latest that main's cron also writes. Otherwise a main-built
+          # :latest lacking develop-only base changes (browser_use) fails develop's
+          # stage2 gate. Contract: main.yml pulls :latest, develop pulls :experimental.
+          STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:experimental" | tr '[:upper:]' '[:lower:]')
           docker pull "$STAGE1_IMAGE"
           # FROM scratch images have no shell so a real CMD doesn't matter — we
           # never start the container, just create-then-cp.

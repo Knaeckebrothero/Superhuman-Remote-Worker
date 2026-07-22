@@ -46,7 +46,16 @@ In one sitting, in roughly this order:
 
 ### Pre-merge bootstrap (one-time, then never again)
 
-Stage2 builds depend on a pre-existing `:latest` tag on `ghcr.io/.../-agent-vm-base-stage1`. Before this design merges, run **`stage1-rebuild.yml`** once via `workflow_dispatch` to seed the registry. Without that, the first stage2 build fails with `manifest unknown` from `docker pull`.
+Stage2 builds depend on a pre-existing stage1 base tag on `ghcr.io/.../-agent-vm-base-stage1`. Before this design merges, run **`stage1-rebuild.yml`** once via `workflow_dispatch` to seed the registry. Without that, the first stage2 build fails with `manifest unknown` from `docker pull`. (The stage1 tag is now **per-channel** — see the update below.)
+
+### Update (2026-07-22) — per-channel stage1 base tags
+
+The single shared `:latest` stage1 tag was **split per release channel**, matching the tag convention the *final* agent-vm-base image already uses:
+
+- **main → `:latest`**, **develop → `:experimental`**. Each branch's stage2 pulls its own channel's stage1 base, and **develop no longer pushes `:latest`** (so it can't clobber main's prod base).
+- `stage1-rebuild.yml` refreshes **both** channels via a `matrix` (`main→:latest`, `develop→:experimental`), each leg checked out from its own branch. GitHub fires `schedule` only from the default branch, so the weekly **develop** leg runs once the matrix is present on `main`; `workflow_dispatch --ref <branch>` uses that branch's copy immediately.
+
+**Why:** a base-image requirement can land on `develop` ahead of `main`. The `browser_use` requirement (`9fe74797`: install in `provision-stage1.sh` + the `assert-browser-stack.sh` gate) shipped on develop but not main, so main's weekly cron kept publishing a browser_use-less `:latest` that develop's stage2 browser-stack gate then rejected — breaking every develop VM build. Per-channel tags let develop evolve its base ahead of main without cross-branch clobbering. Refs: `.github/workflows/{develop,stage1-rebuild}.yml`, `docker/agent-vm-base/scripts/provision-stage1.sh`.
 
 ### Known gaps to validate on first real run
 
@@ -199,7 +208,7 @@ Split `provision.sh` into two phases:
 - Playwright Chromium with deps (`:146–149`) **— this alone is 8–12 min**
 - Node.js 22 + global npm packages (`:163–174`) **— 4–6 min**
 
-Inputs: a checksum of `provision.sh` lines 25–174, the `.playwright-version` file, and a manual rebuild trigger. Output: a `qcow2` wrapped as a containerDisk image, pushed to `ghcr.io/.../agent-vm-base-stage1:<hash>` and `:latest`.
+Inputs: a checksum of `provision.sh` lines 25–174, the `.playwright-version` file, and a manual rebuild trigger. Output: a `qcow2` wrapped as a containerDisk image, pushed to `ghcr.io/.../agent-vm-base-stage1:<hash>` and its **channel tag** (main → `:latest`, develop → `:experimental` — see the per-channel update above).
 
 **Stage2 — light, volatile, runs every CI build:**
 - User setup, SSH/tmux/git config (`provision.sh:178–214`)
