@@ -206,6 +206,7 @@ class StreamHub:
         self.generation = None
         self.token = None
         self.viewers: dict = {}
+        self.viewer_limit = None
         self._next_viewer_id = 0
         self._auto_release = None
         self.state_extra = {"url": None, "title": None, "loading": False}
@@ -269,7 +270,15 @@ class StreamHub:
         if self.on_state_change is not None:
             self.on_state_change()
 
-    def add_viewer(self, queue) -> int:
+    def add_viewer(self, queue, max_viewers: int):
+        """Atomically apply the daemon-wide cap and reserve a viewer slot."""
+        if not self.viewers or self.viewer_limit is None:
+            effective_limit = max_viewers
+        else:
+            effective_limit = min(self.viewer_limit, max_viewers)
+        self.viewer_limit = effective_limit
+        if len(self.viewers) >= effective_limit:
+            return None
         if self._auto_release is not None:
             self._auto_release.cancel()
             self._auto_release = None
@@ -280,6 +289,8 @@ class StreamHub:
 
     def remove_viewer(self, viewer_id) -> None:
         self.viewers.pop(viewer_id, None)
+        if not self.viewers:
+            self.viewer_limit = None
         if not self.viewers and self.baton == "user":
             loop = asyncio.get_running_loop()
             self._auto_release = loop.call_later(
@@ -346,16 +357,59 @@ class ScreencastCdp:
         self._session = session
         self._hub = hub
         self._cdp = None
+        self._main_frame_id = None
+        self._registered_clients = {}
+        self._session_clients = {}
         self._running = False
 
-    async def start(self) -> None:
-        self._cdp = await self._session.get_or_create_cdp_session()
-        client = self._cdp.cdp_client
+    def _is_current_event(self, event_session_id) -> bool:
+        return (
+            self._cdp is not None
+            and (
+                event_session_id is None
+                or event_session_id == self._cdp.session_id
+            )
+        )
+
+    def _register_client(self, client) -> None:
+        """Register this adapter's callbacks once per CDP client wrapper."""
+        identity = id(client)
+        if identity in self._registered_clients:
+            return
         client.register.Page.screencastFrame(self._on_frame_event)
         client.register.Page.frameNavigated(self._on_navigated_event)
+        client.register.Page.frameStartedLoading(
+            self._on_frame_started_loading_event
+        )
+        client.register.Page.frameStoppedLoading(
+            self._on_frame_stopped_loading_event
+        )
+        self._registered_clients[identity] = client
+
+    async def start(self, target_id=None) -> None:
+        """Start or move the screencast to the latest focused target."""
+        requested_target = target_id or self._session.agent_focus_target_id
+        if (
+            self._running
+            and self._cdp is not None
+            and self._cdp.target_id == requested_target
+        ):
+            return
+        if self._running:
+            await self.stop()
+
+        cdp = await self._session.get_or_create_cdp_session(
+            target_id=requested_target
+        )
+        self._cdp = cdp
+        self._main_frame_id = None
+        client = cdp.cdp_client
+        self._register_client(client)
+        self._session_clients[cdp.session_id] = client
+
         try:
             metrics = await client.send.Page.getLayoutMetrics(
-                session_id=self._cdp.session_id
+                session_id=cdp.session_id
             )
             css_viewport = (
                 metrics.get("cssVisualViewport")
@@ -363,21 +417,28 @@ class ScreencastCdp:
                 or {}
             )
             self._hub.viewport = {
-                "width": int(
-                    css_viewport.get("clientWidth", STREAM_MAX_WIDTH)
-                ),
-                "height": int(
-                    css_viewport.get("clientHeight", STREAM_MAX_HEIGHT)
-                ),
+                "width": int(css_viewport.get("clientWidth", STREAM_MAX_WIDTH)),
+                "height": int(css_viewport.get("clientHeight", STREAM_MAX_HEIGHT)),
             }
         except Exception:
             pass
         try:
-            self._hub.state_extra["url"] = (
-                await self._session.get_current_page_url()
+            frame_tree = await client.send.Page.getFrameTree(
+                session_id=cdp.session_id
             )
-            self._hub.state_extra["title"] = (
-                await self._session.get_current_page_title()
+            main_frame = (frame_tree.get("frameTree") or {}).get("frame") or {}
+            self._main_frame_id = main_frame.get("id")
+            self._hub.update_page_state(
+                url=main_frame.get("url"),
+                loading=False,
+            )
+        except Exception:
+            pass
+        try:
+            self._hub.update_page_state(
+                url=await self._session.get_current_page_url(),
+                title=await self._session.get_current_page_title(),
+                loading=False,
             )
         except Exception:
             pass
@@ -394,7 +455,7 @@ class ScreencastCdp:
                     "maxHeight": STREAM_MAX_HEIGHT,
                     "everyNthFrame": STREAM_EVERY_NTH,
                 },
-                session_id=self._cdp.session_id,
+                session_id=cdp.session_id,
             )
         except Exception:
             self._running = False
@@ -406,13 +467,15 @@ class ScreencastCdp:
         asyncio.create_task(self._handle_frame(params, session_id))
 
     async def _handle_frame(self, params, event_session_id=None) -> None:
-        if self._cdp is None:
-            return
-        ack_session_id = event_session_id or self._cdp.session_id
+        current_cdp = self._cdp
+        ack_session_id = event_session_id or (
+            current_cdp.session_id if current_cdp is not None else None
+        )
+        ack_client = self._session_clients.get(event_session_id)
+        if ack_client is None and current_cdp is not None:
+            ack_client = current_cdp.cdp_client
         try:
-            if event_session_id and event_session_id != self._cdp.session_id:
-                return
-            if not self._running:
+            if not self._is_current_event(event_session_id) or not self._running:
                 return
             jpeg = base64.b64decode(params["data"])
             metadata = params.get("metadata") or {}
@@ -431,24 +494,49 @@ class ScreencastCdp:
             # ACK after hand-off to the bounded viewer queues. This preserves
             # CDP source backpressure while slow viewers drop old frames.
             try:
-                await self._cdp.cdp_client.send.Page.screencastFrameAck(
-                    params={"sessionId": params["sessionId"]},
-                    session_id=ack_session_id,
-                )
+                if ack_client is not None and ack_session_id is not None:
+                    await ack_client.send.Page.screencastFrameAck(
+                        params={"sessionId": params["sessionId"]},
+                        session_id=ack_session_id,
+                    )
             except Exception:
                 pass
 
     def _on_navigated_event(self, params, session_id=None) -> None:
-        if (
-            self._cdp is not None
-            and session_id
-            and session_id != self._cdp.session_id
-        ):
+        if not self._is_current_event(session_id):
             return
         frame = params.get("frame") or {}
         if frame.get("parentId"):
             return
+        self._main_frame_id = frame.get("id")
         self._hub.update_page_state(url=frame.get("url"))
+
+    def _on_frame_started_loading_event(self, params, session_id=None) -> None:
+        if not self._is_current_event(session_id):
+            return
+        if params.get("frameId") != self._main_frame_id:
+            return
+        self._hub.update_page_state(loading=True)
+
+    def _on_frame_stopped_loading_event(self, params, session_id=None) -> None:
+        if not self._is_current_event(session_id):
+            return
+        if params.get("frameId") != self._main_frame_id:
+            return
+        self._hub.update_page_state(loading=False)
+        asyncio.create_task(self._refresh_page_state(session_id))
+
+    async def _refresh_page_state(self, expected_session_id) -> None:
+        if not self._is_current_event(expected_session_id):
+            return
+        try:
+            url = await self._session.get_current_page_url()
+            title = await self._session.get_current_page_title()
+        except Exception:
+            return
+        if not self._is_current_event(expected_session_id):
+            return
+        self._hub.update_page_state(url=url, title=title)
 
     async def dispatch_input(self, event: dict) -> None:
         if self._cdp is None:
@@ -472,8 +560,9 @@ class ScreencastCdp:
             )
 
     async def stop(self) -> None:
+        was_running = self._running
         self._running = False
-        if self._cdp is not None:
+        if self._cdp is not None and was_running:
             try:
                 await self._cdp.cdp_client.send.Page.stopScreencast(
                     session_id=self._cdp.session_id
@@ -623,6 +712,9 @@ class BrowserDaemon:
         self._lock = asyncio.Lock()
         self._screencast_lock = asyncio.Lock()
         self._screencast = None
+        self._focus_change_task = None
+        self._focus_change_revision = 0
+        self._focus_handler = None
         self.should_exit = False
         self._files = LocalFileServer()
         self.hub = StreamHub()
@@ -655,17 +747,76 @@ class BrowserDaemon:
         )
         await session.start()
         self._session = session
+        self._install_focus_handler(session)
         log("Chromium session started")
         return session
 
+    def _install_focus_handler(self, session) -> None:
+        """Subscribe once; the event-bus callback itself never awaits locks."""
+        from browser_use.browser.events import AgentFocusChangedEvent
+
+        def on_agent_focus_changed(event) -> None:
+            del event
+            self._focus_change_revision += 1
+            if (
+                self._focus_change_task is None
+                or self._focus_change_task.done()
+            ):
+                self._focus_change_task = asyncio.create_task(
+                    self._follow_agent_focus()
+                )
+
+        session.event_bus.on(AgentFocusChangedEvent, on_agent_focus_changed)
+        self._focus_handler = on_agent_focus_changed
+
+    async def _follow_agent_focus(self) -> None:
+        """Coalesce focus events and switch under screencast→action locks."""
+        task = asyncio.current_task()
+        try:
+            while True:
+                await asyncio.sleep(0)
+                revision = self._focus_change_revision
+                if not self.hub.viewers:
+                    return
+                async with self._screencast_lock:
+                    if not self.hub.viewers:
+                        return
+                    async with self._lock:
+                        session = self._session
+                        if session is None:
+                            return
+                        target_id = session.agent_focus_target_id
+                        if target_id is None:
+                            return
+                        if self._screencast is None:
+                            self._screencast = ScreencastCdp(session, self.hub)
+                        await self._screencast.start(target_id=target_id)
+                if revision == self._focus_change_revision:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log(f"active-target screencast switch failed: {exc}")
+        finally:
+            if self._focus_change_task is task:
+                self._focus_change_task = None
+
     async def _close_session(self) -> None:
+        focus_task = self._focus_change_task
+        if focus_task is not None and focus_task is not asyncio.current_task():
+            focus_task.cancel()
+            await asyncio.gather(focus_task, return_exceptions=True)
+        self._focus_change_task = None
+        self._focus_handler = None
+        if self._screencast is not None:
+            await self._screencast.stop()
+            self._screencast = None
         if self._session is not None:
             try:
                 await self._session.stop()
             except Exception:
                 pass
             self._session = None
-        self._screencast = None
         self.hub.clear_generation()
         self.hub.shutdown_viewers("browser_gone")
 
@@ -724,9 +875,43 @@ class BrowserDaemon:
             raise ValueError(
                 f"Element ref={ref} not found. Use snapshot to get current refs."
             )
+        opens_new_tab = (
+            (getattr(node, "attributes", {}) or {}).get("target", "").lower()
+            == "_blank"
+        )
+        existing_targets = (
+            {tab.target_id for tab in await session.get_tabs()}
+            if opens_new_tab
+            else set()
+        )
         event = session.event_bus.dispatch(ClickElementEvent(node=node))
         await event
         await event.event_result(raise_if_any=True)
+        if opens_new_tab:
+            await self._switch_to_new_click_target(session, existing_targets)
+
+    async def _switch_to_new_click_target(self, session, existing_targets) -> None:
+        """Make browser-use's newest `_blank` target the explicit agent focus."""
+        from browser_use.browser.events import SwitchTabEvent
+
+        new_target_id = None
+        for _ in range(40):
+            tabs = await session.get_tabs()
+            new_targets = [
+                tab.target_id
+                for tab in tabs
+                if tab.target_id not in existing_targets
+            ]
+            if new_targets:
+                new_target_id = new_targets[-1]
+                break
+            await asyncio.sleep(0.05)
+        if new_target_id is not None:
+            switch = session.event_bus.dispatch(
+                SwitchTabEvent(target_id=new_target_id)
+            )
+            await switch
+            await switch.event_result(raise_if_any=True)
 
     async def _type(self, session, ref: int, text: str, clear: bool = True) -> None:
         from browser_use.browser.events import TypeTextEvent
@@ -799,21 +984,17 @@ class BrowserDaemon:
                 return
             async with self._lock:
                 session = await self._get_session()
-            screencast = ScreencastCdp(session, self.hub)
-            self._screencast = screencast
-            try:
-                await screencast.start()
-            except Exception:
-                if self._screencast is screencast:
-                    self._screencast = None
-                raise
+            if self._screencast is None:
+                self._screencast = ScreencastCdp(session, self.hub)
+            await self._screencast.start(
+                target_id=session.agent_focus_target_id
+            )
 
     async def stop_screencast(self) -> None:
         async with self._screencast_lock:
             if self.hub.viewers:
                 return
             screencast = self._screencast
-            self._screencast = None
             if screencast is not None:
                 await screencast.stop()
 
@@ -983,6 +1164,19 @@ def _queue_stream_frame(queue, frame) -> None:
         pass
 
 
+async def _send_stream_error(writer, code: str, message: str) -> None:
+    try:
+        writer.write(
+            encode_stream_frame(
+                T_ERROR,
+                json.dumps({"code": code, "message": message}).encode(),
+            )
+        )
+        await writer.drain()
+    except Exception:
+        pass
+
+
 async def _handle_stream_conn(daemon, reader, writer) -> None:
     hub = daemon.hub
     try:
@@ -995,26 +1189,38 @@ async def _handle_stream_conn(daemon, reader, writer) -> None:
         return
 
     if not hub.token or hello.get("token") != hub.token:
-        try:
-            writer.write(
-                encode_stream_frame(
-                    T_ERROR,
-                    json.dumps(
-                        {
-                            "code": "unauthorized",
-                            "message": "invalid stream hello token",
-                        }
-                    ).encode(),
-                )
-            )
-            await writer.drain()
-        except Exception:
-            pass
+        await _send_stream_error(
+            writer,
+            "unauthorized",
+            "invalid stream hello token",
+        )
+        writer.close()
+        return
+
+    max_viewers = hello.get("max_viewers")
+    if (
+        isinstance(max_viewers, bool)
+        or not isinstance(max_viewers, int)
+        or not 1 <= max_viewers <= 16
+    ):
+        await _send_stream_error(
+            writer,
+            "invalid_hello",
+            "max_viewers must be an integer within [1, 16]",
+        )
         writer.close()
         return
 
     queue = asyncio.Queue(maxsize=4)
-    viewer_id = hub.add_viewer(queue)
+    viewer_id = hub.add_viewer(queue, max_viewers)
+    if viewer_id is None:
+        await _send_stream_error(
+            writer,
+            "viewer_limit",
+            "shared browser viewer limit reached",
+        )
+        writer.close()
+        return
     tasks = []
     log(
         f"stream viewer {viewer_id} connected "

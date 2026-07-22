@@ -369,7 +369,11 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
             generation_resolver=generation_resolver,
         ) as (reader, writer):
             hello = json.dumps(
-                {"token": info["token"], "min_protocol": 1},
+                {
+                    "token": info["token"],
+                    "min_protocol": 1,
+                    "max_viewers": current_config.max_viewers,
+                },
                 separators=(",", ":"),
             ).encode()
             writer.write(encode_stream_frame(T_HELLO, hello))
