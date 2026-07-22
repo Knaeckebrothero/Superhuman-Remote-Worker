@@ -280,6 +280,7 @@ describe('Canvas pane trusted chrome', () => {
     const browser = {
       syncPresentation: vi.fn(),
       connectionStatus: signal<'connecting'>('connecting'),
+      errorCode: signal<string | null>(null),
     };
     const state = signal<CanvasState | null>(canvasState(4, 'auto', {
       source: {type: 'browser'},

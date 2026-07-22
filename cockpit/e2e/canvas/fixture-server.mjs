@@ -14,6 +14,8 @@ const VIEWER_SUFFIX = '.canvas.invalid';
 
 export const THREAD_ID = '11111111-1111-4111-8111-111111111111';
 const CANVAS_PATH = `/api/persistent/threads/${THREAD_ID}/canvases/main`;
+const BROWSER_CAPABILITY_PATH = `/api/persistent/threads/${THREAD_ID}/browser/capability`;
+const BROWSER_OPEN_PATH = `/api/persistent/threads/${THREAD_ID}/browser/open`;
 const STATE_ETAG_DIGEST = 'a'.repeat(64);
 const CHALLENGE = 'c'.repeat(43);
 const READY_RECEIPT = 'r'.repeat(43);
@@ -64,6 +66,9 @@ function freshState(scenario = 'normal') {
     authenticated: true,
     revoked: false,
     presentationRevision: 1,
+    browserOpened: false,
+    browserOpenCount: 0,
+    browserOpen: [],
     originGeneration: 1,
     attachmentCounter: 0,
     requests: [],
@@ -81,6 +86,7 @@ function stateEtag() {
 }
 
 function canvasState() {
+  if (state.scenario === 'shared-browser') return browserCanvasState();
   const cleared = state.revoked;
   return {
     canvas_id: 'main',
@@ -104,6 +110,27 @@ function canvasState() {
       can_take_control: false,
       can_create_viewer_session: !cleared,
       can_reset_origin: !cleared,
+    },
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function browserCanvasState() {
+  return {
+    canvas_id: 'main',
+    source: {type: 'browser'},
+    title: 'Shared browser',
+    renderer: 'auto',
+    editable: false,
+    alt_text: null,
+    presentation_revision: state.presentationRevision,
+    source_version: null,
+    status: 'ready',
+    capabilities: {
+      can_edit: false,
+      can_pop_out: true,
+      can_take_control: true,
+      can_stream_browser: true,
     },
     updated_at: new Date().toISOString(),
   };
@@ -236,6 +263,9 @@ const server = createServer(async (req, res) => {
         authenticated: state.authenticated,
         revoked: state.revoked,
         presentationRevision: state.presentationRevision,
+        browserOpened: state.browserOpened,
+        browserOpenCount: state.browserOpenCount,
+        browserOpen: state.browserOpen,
         originGeneration: state.originGeneration,
         requests: state.requests,
         attachments: state.attachments,
@@ -332,6 +362,32 @@ const server = createServer(async (req, res) => {
       record(req, pathname);
       return json(res, 200, {});
     }
+    if (pathname === `/api/persistent/threads/${THREAD_ID}` && req.method === 'GET') {
+      record(req, pathname);
+      return json(res, 200, {
+        thread_id: THREAD_ID,
+        title: 'Shared browser conformance',
+        status: 'ended',
+        config_name: 'assistant',
+        total_turns: 0,
+        metadata: {},
+        ended_at: '2026-07-22T12:00:00Z',
+      });
+    }
+    if (
+      pathname === `/api/persistent/threads/${THREAD_ID}/messages` &&
+      req.method === 'GET'
+    ) {
+      record(req, pathname);
+      return json(res, 200, {messages: [], total: 0});
+    }
+    if (
+      pathname === `/api/persistent/threads/${THREAD_ID}/citations` &&
+      req.method === 'GET'
+    ) {
+      record(req, pathname);
+      return json(res, 200, {citations: []});
+    }
     if (
       (pathname === '/api/notifications/events' || pathname === '/api/sudo/events') &&
       req.method === 'GET'
@@ -350,7 +406,42 @@ const server = createServer(async (req, res) => {
 
     if (pathname === CANVAS_PATH && req.method === 'GET') {
       record(req, pathname);
+      if (state.scenario === 'shared-browser' && !state.browserOpened) {
+        res.writeHead(204, {'Cache-Control': 'private, no-store'});
+        return res.end();
+      }
       return json(res, 200, canvasState(), {ETag: stateEtag()});
+    }
+
+    if (pathname === BROWSER_CAPABILITY_PATH && req.method === 'GET') {
+      record(req, pathname);
+      if (state.scenario !== 'shared-browser') {
+        return json(res, 404, {detail: {code: 'fixture_route_missing', path: pathname}});
+      }
+      return json(res, 200, {
+        feature_enabled: true,
+        can_open_browser: true,
+        workspace_ready: true,
+        reason: null,
+      });
+    }
+
+    if (pathname === BROWSER_OPEN_PATH && req.method === 'POST') {
+      record(req, pathname);
+      if (state.scenario !== 'shared-browser') {
+        return json(res, 404, {detail: {code: 'fixture_route_missing', path: pathname}});
+      }
+      const body = await readJson(req);
+      state.browserOpen.push({
+        bodyKeys: body && typeof body === 'object' ? Object.keys(body).sort() : [],
+      });
+      state.browserOpenCount += 1;
+      state.browserOpened = true;
+      state.presentationRevision = state.browserOpenCount;
+      return json(res, 200, browserCanvasState(), {
+        ETag: stateEtag(),
+        'X-Canvas-Mutation-Changed': 'true',
+      });
     }
 
     if (pathname === `${CANVAS_PATH}/view-attachments` && req.method === 'POST') {

@@ -13,6 +13,7 @@ import {
   signal,
 } from '@angular/core';
 import { TranslocoPipe } from '@jsverse/transloco';
+import { CanvasService } from '../../core/services/canvas.service';
 import { AppButtonComponent } from '../../ui/button';
 import { AppIconComponent } from '../../ui/icon';
 import { AppIconButtonComponent } from '../../ui/icon-button';
@@ -43,7 +44,11 @@ const BROWSER_STATUS_KEYS: Record<CanvasBrowserConnectionStatus, string> = {
   error: 'canvas.browser.status.error',
 };
 
-export function canvasBrowserStatusKey(status: CanvasBrowserConnectionStatus): string {
+export function canvasBrowserStatusKey(
+  status: CanvasBrowserConnectionStatus,
+  errorCode: string | null = null,
+): string {
+  if (errorCode === 'shared_browser_disabled') return 'canvas.browser.status.disabled';
   return BROWSER_STATUS_KEYS[status];
 }
 
@@ -93,7 +98,8 @@ interface PressedBrowserKey {
   ],
   template: `
     <section class="browser-renderer" [attr.data-connection-status]="browser.connectionStatus()">
-      <header class="browser-toolbar">
+      <header class="browser-toolbar" role="toolbar"
+              [attr.aria-label]="'canvas.browser.toolbar.label' | transloco">
         <div class="browser-page">
           <strong class="browser-title">
             {{ browser.pageState()?.title || ('canvas.browser.untitled' | transloco) }}
@@ -136,12 +142,22 @@ interface PressedBrowserKey {
             {{ connectionStatusKey() | transloco }}
           </span>
           @if (batonKey(); as key) {
-            <span class="browser-baton" [attr.data-baton]="browser.pageState()?.baton">
+            <span class="browser-baton" role="status" aria-live="polite"
+                  [attr.data-baton]="browser.pageState()?.baton">
               <span>{{ key | transloco }}</span>
-              <app-button size="sm" variant="ghost" [disabled]="batonDisabled()"
-                          (clicked)="toggleBaton()">
+              @if (browser.pendingBaton()) {
+                <span class="browser-baton-pending">
+                  {{ 'canvas.browser.baton.pending' | transloco }}
+                </span>
+              }
+              <button type="button" class="browser-baton-action"
+                      [disabled]="batonDisabled()"
+                      [attr.aria-label]="batonActionKey() | transloco"
+                      [attr.aria-pressed]="browser.pageState()?.baton === 'user'"
+                      [attr.aria-busy]="browser.pendingBaton() !== null || null"
+                      (click)="toggleBaton()">
                 {{ batonActionKey() | transloco }}
-              </app-button>
+              </button>
             </span>
           }
         </div>
@@ -175,11 +191,29 @@ interface PressedBrowserKey {
         >
         </canvas>
         @if (!browser.frame()) {
-          <div class="browser-empty-state" role="status">
-            @if (isConnecting()) {
+          <div class="browser-empty-state"
+               [attr.role]="emptyStateRole()"
+               aria-live="polite" aria-atomic="true">
+            @if (isConnecting() || restartPending()) {
               <app-spinner size="md" tone="accent" />
             }
             <span>{{ connectionStatusKey() | transloco }}</span>
+            @if (canRetryConnection() || canRestart()) {
+              <div class="browser-lifecycle-actions">
+                @if (canRetryConnection()) {
+                  <app-button size="sm" variant="secondary"
+                              [disabled]="restartPending()" (clicked)="retryConnection()">
+                    {{ 'canvas.browser.retryConnection' | transloco }}
+                  </app-button>
+                }
+                @if (canRestart()) {
+                  <app-button size="sm" [loading]="restartPending()"
+                              (clicked)="restartBrowser()">
+                    {{ 'canvas.browser.restart' | transloco }}
+                  </app-button>
+                }
+              </div>
+            }
           </div>
         }
       </div>
@@ -189,6 +223,7 @@ interface PressedBrowserKey {
 })
 export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy {
   readonly browser = inject(CanvasBrowserController);
+  readonly canvas = inject(CanvasService);
   private readonly injector = inject(Injector);
   private paintEffect: EffectRef | null = null;
   private pointerFrame: number | null = null;
@@ -207,8 +242,19 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
     return viewport ? `${viewport.width} / ${viewport.height}` : '16 / 9';
   });
   readonly connectionStatusKey = computed(() =>
-    canvasBrowserStatusKey(this.browser.connectionStatus()),
+    canvasBrowserStatusKey(this.browser.connectionStatus(), this.browser.errorCode()),
   );
+  restartPending(): boolean {
+    const status = this.canvas.browserOpenStatus();
+    return status === 'workspace' || status === 'browser';
+  }
+
+  emptyStateRole(): 'status' | 'alert' {
+    const status = this.browser.connectionStatus();
+    return status === 'idle' || status === 'connecting' || status === 'reconnecting'
+      ? 'status'
+      : 'alert';
+  }
   readonly batonKey = computed(() => {
     const baton = this.browser.pageState()?.baton;
     return baton === 'agent'
@@ -241,6 +287,18 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
       ? this.browser.errorMessage()
       : null,
   );
+  canRetryConnection(): boolean {
+    const status = this.browser.connectionStatus();
+    return status === 'viewer_limit' ||
+      (status === 'unavailable' && this.browser.errorCode() !== 'shared_browser_disabled');
+  }
+
+  canRestart(): boolean {
+    const status = this.browser.connectionStatus();
+    return (status === 'ended' || status === 'unavailable') &&
+      this.browser.errorCode() !== 'shared_browser_disabled' &&
+      this.canvas.browserCapability()?.can_open_browser === true;
+  }
 
   private readonly visibilityListener = (): void => {
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
@@ -307,6 +365,16 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
     } else {
       this.browser.sendControl({op: 'take_baton'});
     }
+  }
+
+  retryConnection(): void {
+    if (!this.canRetryConnection() || this.restartPending()) return;
+    this.browser.retry();
+  }
+
+  restartBrowser(): void {
+    if (!this.canRestart() || this.restartPending()) return;
+    this.canvas.openBrowser();
   }
 
   onPointerMove(event: PointerEvent): void {

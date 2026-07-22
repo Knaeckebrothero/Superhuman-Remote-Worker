@@ -129,13 +129,17 @@
       "noUrl": "Keine Seitenadresse",
       "loading": "Seite wird geladen…",
       "surfaceLabel": "Seite im geteilten Browser",
+      "retryConnection": "Verbindung erneut versuchen",
+      "restart": "Browser neu starten",
       "baton": {
         "agent": "Der Agent steuert",
         "user": "Sie steuern",
         "take": "Steuerung übernehmen",
-        "release": "Steuerung abgeben"
+        "release": "Steuerung abgeben",
+        "pending": "Warten auf Browser…"
       },
       "toolbar": {
+        "label": "Steuerelemente des geteilten Browsers",
         "back": "Zurück",
         "reload": "Neu laden",
         "address": "Adresse",
@@ -172,6 +176,7 @@
         "viewerLimit": "Der geteilte Browser hat sein Anzeigelimit erreicht.",
         "unauthorized": "Sie haben keinen Zugriff mehr auf diesen geteilten Browser.",
         "unavailable": "Der geteilte Browser ist derzeit nicht verfügbar.",
+        "disabled": "Der geteilte Browser ist auf diesem Server deaktiviert.",
         "error": "Bei der Verbindung zum geteilten Browser ist ein Protokollfehler aufgetreten."
       }
     },
