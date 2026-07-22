@@ -598,6 +598,7 @@ class TestSetupWorkspace:
         # generation + host identity pairing, even when labelled sandbox.
         assert mock_remote.supports_canvas_presentation is False
         assert mock_remote.supports_canvas_live_apps is False
+        assert mock_remote.supports_canvas_shared_browser is False
         assert session.workspace_manager is not None
 
     @pytest.mark.asyncio
@@ -614,6 +615,7 @@ class TestSetupWorkspace:
             "remote": {"host": "paired.test", "port": 30022},
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
+            "canvas_shared_browser_available": True,
         }
 
         with (
@@ -634,6 +636,7 @@ class TestSetupWorkspace:
 
         assert mock_remote.supports_canvas_presentation is True
         assert mock_remote.supports_canvas_live_apps is True
+        assert mock_remote.supports_canvas_shared_browser is True
 
     @pytest.mark.asyncio
     async def test_vm_remote_backend_disables_canvas_presentation(self):
@@ -663,6 +666,7 @@ class TestSetupWorkspace:
 
         assert mock_remote.supports_canvas_presentation is False
         assert mock_remote.supports_canvas_live_apps is False
+        assert mock_remote.supports_canvas_shared_browser is False
 
     @pytest.mark.asyncio
     async def test_remote_retry_succeeds_after_failures(self):

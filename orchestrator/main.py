@@ -18053,8 +18053,8 @@ def _agent_canvas_workspace_capabilities(
     metadata: dict[str, Any],
     workspace_context: dict[str, Any],
     vm_context: dict[str, Any],
-) -> tuple[bool, bool]:
-    """Return file/live capability bits for the internal agent attach payload."""
+) -> tuple[bool, bool, bool]:
+    """Return file/live/browser bits for the internal agent attach payload."""
 
     vm_is_active = bool(
         isinstance(vm_context, dict)
@@ -18074,7 +18074,33 @@ def _agent_canvas_workspace_capabilities(
     canvas_live_apps_available = bool(
         canvas_presentation_available and canvas_live_preview_enabled()
     )
-    return canvas_presentation_available, canvas_live_apps_available
+    from services.ssh_helpers import orchestrator_can_reach
+
+    selected_context = vm_context if vm_is_active else workspace_context
+    selected_host = (
+        selected_context.get("ssh_host")
+        or selected_context.get("host")
+        or selected_context.get("pod_ip")
+    )
+    shared_browser_enabled = os.getenv(
+        "CANVAS_SHARED_BROWSER_ENABLED", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        selected_target_reachable = bool(
+            selected_host and orchestrator_can_reach(str(selected_host))
+        )
+    except Exception:
+        selected_target_reachable = False
+    canvas_shared_browser_available = bool(
+        canvas_presentation_available
+        and shared_browser_enabled
+        and selected_target_reachable
+    )
+    return (
+        canvas_presentation_available,
+        canvas_live_apps_available,
+        canvas_shared_browser_available,
+    )
 
 
 @app.get("/api/agents/threads/{thread_id}/workspace")
@@ -18099,9 +18125,11 @@ async def agent_get_thread_workspace(
             metadata = {}
     ws = metadata.get("workspace_container") or {}
     vm = metadata.get("vm") or {}
-    canvas_presentation_available, canvas_live_apps_available = (
-        _agent_canvas_workspace_capabilities(metadata, ws, vm)
-    )
+    (
+        canvas_presentation_available,
+        canvas_live_apps_available,
+        canvas_shared_browser_available,
+    ) = _agent_canvas_workspace_capabilities(metadata, ws, vm)
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
     project_ids = await _revalidate_thread_project_ids(
         thread, await _thread_project_ids(thread_id)
@@ -18221,6 +18249,7 @@ async def agent_get_thread_workspace(
         # not cause the agent to advertise Canvas tools which can never work.
         "canvas_presentation_available": canvas_presentation_available,
         "canvas_live_apps_available": canvas_live_apps_available,
+        "canvas_shared_browser_available": canvas_shared_browser_available,
         # SSH key path (set by Docker provisioner in dev mode)
         "ssh_key_path": os.environ.get("SSH_KEY_PATH"),
         # VM fields (take precedence when present)

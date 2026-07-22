@@ -9,6 +9,7 @@ from src.api.orchestrator_client import (
     CANVAS_REQUEST_TIMEOUT_SECONDS,
     CanvasClearResult,
     CanvasClientError,
+    CanvasSetResult,
     OrchestratorClient,
 )
 
@@ -112,6 +113,61 @@ async def test_clear_result_carries_non_model_visible_changed_header():
         await client.close()
 
     assert result == CanvasClearResult(state=state, changed=False)
+
+
+@pytest.mark.parametrize(
+    ("header", "expected_changed"),
+    [("true", True), ("false", False), (None, True)],
+)
+@pytest.mark.asyncio
+async def test_set_result_parses_closed_mutation_header(
+    header: str | None, expected_changed: bool
+):
+    state = {
+        "canvas_id": "main",
+        "source": {"type": "browser"},
+        "presentation_revision": 4,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        headers = {"X-Canvas-Mutation-Changed": header} if header is not None else {}
+        return httpx.Response(200, headers=headers, json=state)
+
+    client = _client()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await client.set_thread_canvas(
+            "thread-1",
+            {"source_type": "browser", "browser_id": "current"},
+        )
+    finally:
+        await client.close()
+
+    assert result == CanvasSetResult(state=state, changed=expected_changed)
+
+
+@pytest.mark.parametrize("header", ["TRUE", "False", " true", "", "1"])
+@pytest.mark.asyncio
+async def test_set_result_rejects_malformed_mutation_header(header: str):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"X-Canvas-Mutation-Changed": header},
+            json={"canvas_id": "main", "source": {"type": "browser"}},
+        )
+
+    client = _client()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(CanvasClientError) as error:
+            await client.set_thread_canvas(
+                "thread-1",
+                {"source_type": "browser", "browser_id": "current"},
+            )
+    finally:
+        await client.close()
+
+    assert error.value.code == "invalid_canvas_response"
 
 
 @pytest.mark.asyncio

@@ -55,7 +55,13 @@ from services.canvas_viewer_sessions import (
     CanvasViewerSessionService,
     canvas_viewer_error_detail,
 )
-from services.shared_browser_canvas import browser_capability
+from services.shared_browser_canvas import (
+    BrowserCanvasError,
+    browser_capability,
+    commit_browser_canvas,
+    prepare_browser_canvas,
+    require_browser_capability,
+)
 
 router = APIRouter(
     prefix="/api/persistent/threads/{thread_id}/canvases",
@@ -90,10 +96,11 @@ class CanvasSetRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    source_type: Literal["workspace_file", "workspace_port"]
+    source_type: Literal["workspace_file", "workspace_port", "browser"]
     path: str | None = Field(default=None, min_length=1, max_length=4096)
     port: int | None = Field(default=None, ge=1, le=65535)
     entry_path: str | None = Field(default=None, min_length=1, max_length=2048)
+    browser_id: Literal["current"] | None = None
     title: str | None = Field(default=None, max_length=200)
     renderer: CanvasRenderer = "auto"
     editable: bool = False
@@ -115,13 +122,37 @@ class CanvasSetRequest(BaseModel):
         if self.source_type == "workspace_file":
             if self.path is None:
                 raise ValueError("workspace_file requires path")
-            if self.port is not None or self.entry_path is not None or self.new_app:
+            if (
+                self.port is not None
+                or self.entry_path is not None
+                or self.browser_id is not None
+                or self.new_app
+            ):
                 raise ValueError("workspace_file does not accept live-app fields")
+            return self
+
+        if self.source_type == "browser":
+            if self.browser_id != "current":
+                raise ValueError("browser requires browser_id='current'")
+            if (
+                self.path is not None
+                or self.port is not None
+                or self.entry_path is not None
+                or self.alt_text is not None
+                or self.new_app
+            ):
+                raise ValueError("browser does not accept file or live-app fields")
+            if self.renderer != "auto" or self.editable:
+                raise ValueError("browser requires renderer='auto' and editable=false")
             return self
 
         if self.port is None:
             raise ValueError("workspace_port requires port")
-        if self.path is not None or self.alt_text is not None:
+        if (
+            self.path is not None
+            or self.alt_text is not None
+            or self.browser_id is not None
+        ):
             raise ValueError("workspace_port does not accept file fields")
         if self.renderer != "auto" or self.editable:
             raise ValueError(
@@ -224,6 +255,13 @@ def _raise_edit_error(error: CanvasEditError) -> None:
 
 
 def _raise_app_error(error: CanvasAppError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": error.message},
+    ) from error
+
+
+def _raise_browser_error(error: BrowserCanvasError) -> None:
     raise HTTPException(
         status_code=error.status_code,
         detail={"code": error.code, "message": error.message},
@@ -1308,6 +1346,52 @@ async def internal_set_main_canvas(
     db = _get_db()
     _, thread = await _require_delegated_owner(request, db, thread_id)
 
+    if body.source_type == "browser":
+
+        async def generation_resolver() -> dict[str, Any]:
+            current = await db.get_thread(thread_id)
+            return dict(current) if current else {}
+
+        try:
+            prepared = await prepare_browser_canvas(
+                thread,
+                initial_baton="agent",
+                generation_resolver=generation_resolver,
+            )
+            # Startup can outlive the delegated admission or the workspace
+            # binding. Re-authorize and re-evaluate the positive capability
+            # immediately before the idempotent durable transition.
+            _, fresh_thread = await _require_delegated_owner(request, db, thread_id)
+            require_browser_capability(
+                browser_capability(fresh_thread),
+                require_ready=True,
+            )
+            mutation = await commit_browser_canvas(
+                db,
+                thread_id,
+                prepared,
+                title=body.title or "Shared browser",
+            )
+        except BrowserCanvasError as exc:
+            _raise_browser_error(exc)
+
+        assert mutation.record is not None
+        _, visible_thread = await _require_delegated_owner(request, db, thread_id)
+        representation = await _represent(
+            thread_id,
+            visible_thread,
+            mutation.record,
+            browser_content_url=False,
+            db=db,
+        )
+        return _state_response(
+            representation.payload,
+            representation.etag,
+            extra_headers={
+                "X-Canvas-Mutation-Changed": str(mutation.changed).lower(),
+            },
+        )
+
     if body.source_type == "workspace_port":
         assert body.port is not None
         if not canvas_live_preview_enabled():
@@ -1365,7 +1449,11 @@ async def internal_set_main_canvas(
             capabilities=CanvasCapabilities(),
             content_url=None,
         )
-        return _state_response(representation.payload, representation.etag)
+        return _state_response(
+            representation.payload,
+            representation.etag,
+            extra_headers={"X-Canvas-Mutation-Changed": "true"},
+        )
 
     assert body.path is not None
     gateway = _get_file_gateway(db)
@@ -1427,7 +1515,11 @@ async def internal_set_main_canvas(
             can_pop_out=True,
         ),
     )
-    return _state_response(representation.payload, representation.etag)
+    return _state_response(
+        representation.payload,
+        representation.etag,
+        extra_headers={"X-Canvas-Mutation-Changed": "true"},
+    )
 
 
 @internal_router.delete("/main", response_model=CanvasPublicState)

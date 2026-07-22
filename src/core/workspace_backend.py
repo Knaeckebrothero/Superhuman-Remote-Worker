@@ -566,6 +566,11 @@ class WorkspaceBackend(ABC):
     # it separate prevents a file-capable backend from advertising ports.
     supports_canvas_live_apps: bool = False
 
+    # Shared-browser presentation is separately attested because it also
+    # requires an enabled broker and an orchestrator-reachable SSH target.
+    # Generic, lite, custom, and unattested VM backends stay fail-closed.
+    supports_canvas_shared_browser: bool = False
+
     # --- Lifecycle ---
 
     @abstractmethod

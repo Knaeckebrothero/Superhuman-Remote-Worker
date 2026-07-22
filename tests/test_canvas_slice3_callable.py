@@ -201,26 +201,43 @@ def test_agent_attach_live_capability_requires_gate_attestation_and_non_vm(
 
     metadata = _thread()["metadata"]
     workspace = metadata["workspace_container"]
+    monkeypatch.setattr(
+        "services.ssh_helpers.orchestrator_can_reach", lambda host: True
+    )
     monkeypatch.delenv("CANVAS_LIVE_PREVIEW_ENABLED", raising=False)
+    monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
     assert main._agent_canvas_workspace_capabilities(metadata, workspace, {}) == (
         True,
+        False,
         False,
     )
 
     monkeypatch.setenv("CANVAS_LIVE_PREVIEW_ENABLED", "true")
+    monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
     assert main._agent_canvas_workspace_capabilities(metadata, workspace, {}) == (
         True,
         True,
+        True,
+    )
+
+    monkeypatch.setattr(
+        "services.ssh_helpers.orchestrator_can_reach", lambda host: False
+    )
+    assert main._agent_canvas_workspace_capabilities(metadata, workspace, {}) == (
+        True,
+        True,
+        False,
     )
 
     unattested = _thread()["metadata"]
     unattested["_workspace_binding"].pop("ssh_host_key_fingerprint")
     assert main._agent_canvas_workspace_capabilities(
         unattested, unattested["workspace_container"], {}
-    ) == (False, False)
+    ) == (False, False, False)
 
     vm = {"status": "ready", "ssh_host": "vm.test"}
     assert main._agent_canvas_workspace_capabilities(metadata, workspace, vm) == (
+        False,
         False,
         False,
     )

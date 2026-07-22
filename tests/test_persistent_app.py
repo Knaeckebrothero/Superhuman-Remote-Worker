@@ -1590,6 +1590,7 @@ class TestPollWorkspaceReady:
             "git_remote_url": "http://gitea/repo",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
+            "canvas_shared_browser_available": True,
         }
 
         result = await _poll_workspace_ready(client, "tid", timeout=5)
@@ -1600,6 +1601,7 @@ class TestPollWorkspaceReady:
         assert result["remote"]["port"] == 2222
         assert result["canvas_presentation_available"] is False
         assert result["canvas_live_apps_available"] is False
+        assert result["canvas_shared_browser_available"] is False
 
     @pytest.mark.asyncio
     async def test_returns_container_config_when_ready(self):
@@ -1611,6 +1613,7 @@ class TestPollWorkspaceReady:
             "git_remote_url": "http://gitea/repo",
             "canvas_presentation_available": True,
             "canvas_live_apps_available": True,
+            "canvas_shared_browser_available": True,
         }
 
         result = await _poll_workspace_ready(client, "tid", timeout=5)
@@ -1621,6 +1624,7 @@ class TestPollWorkspaceReady:
         assert result["remote"]["port"] == 30022
         assert result["canvas_presentation_available"] is True
         assert result["canvas_live_apps_available"] is True
+        assert result["canvas_shared_browser_available"] is True
 
     @pytest.mark.asyncio
     async def test_container_without_attestation_disables_canvas(self):
@@ -1636,6 +1640,7 @@ class TestPollWorkspaceReady:
         assert result["backend"] == "sandbox"
         assert result["canvas_presentation_available"] is False
         assert result["canvas_live_apps_available"] is False
+        assert result["canvas_shared_browser_available"] is False
 
     @pytest.mark.asyncio
     async def test_returns_none_on_status_none_no_vm(self):
@@ -2671,11 +2676,16 @@ class TestHandleWorkspaceUpgradeVm:
 class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("attested", "live_attested"),
-        [(True, True), (True, False), (False, False)],
+        ("attested", "live_attested", "browser_attested"),
+        [
+            (True, True, True),
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ],
     )
     async def test_live_swap_uses_attested_canvas_capability(
-        self, attested, live_attested
+        self, attested, live_attested, browser_attested
     ):
         import sys
 
@@ -2697,6 +2707,7 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
             "backend": "sandbox",
             "canvas_presentation_available": attested,
             "canvas_live_apps_available": live_attested,
+            "canvas_shared_browser_available": browser_attested,
             "remote": {"host": "workspace.test", "port": 30022},
         }
 
@@ -2716,6 +2727,50 @@ class TestHandleWorkspaceUpgradeSandboxCanvasCapability:
 
         assert new_backend.supports_canvas_presentation is attested
         assert new_backend.supports_canvas_live_apps is live_attested
+        assert new_backend.supports_canvas_shared_browser is browser_attested
+        session.swap_backend.assert_called_once_with(new_backend)
+        session.resetup_tools_for_backend.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sandbox_to_unattested_vm_withdraws_browser_capability(self):
+        import sys
+
+        ws = AsyncMock()
+        client = AsyncMock()
+        client.request_thread_workspace_upgrade.return_value = True
+        client.get_thread_workspace.return_value = {}
+        old_backend = SimpleNamespace(
+            supports_shell=True,
+            supports_canvas_presentation=True,
+            supports_canvas_live_apps=True,
+            supports_canvas_shared_browser=True,
+        )
+        session = MagicMock()
+        session.config.extra = {"shell": {}}
+        session.workspace_manager.backend = old_backend
+        session.swap_backend = MagicMock()
+        session.resetup_tools_for_backend = MagicMock()
+        new_backend = MagicMock()
+        new_backend.connect = MagicMock()
+        remote_module = MagicMock()
+        remote_module.RemoteBackend.return_value = new_backend
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._orchestrator_client", client),
+            patch("src.api.persistent_app._thread_id", "tid"),
+            patch(
+                "src.api.persistent_app._poll_vm_ready",
+                new_callable=AsyncMock,
+                return_value={"ssh_host": "vm.test", "ssh_port": 22},
+            ),
+            patch.dict(sys.modules, {"src.core.backends.remote": remote_module}),
+            patch("src.core.backends.seed.seed_workspace", return_value=1),
+        ):
+            await _handle_workspace_upgrade(ws, target_tier="vm")
+
+        assert new_backend.supports_canvas_presentation is False
+        assert new_backend.supports_canvas_live_apps is False
+        assert new_backend.supports_canvas_shared_browser is False
         session.swap_backend.assert_called_once_with(new_backend)
         session.resetup_tools_for_backend.assert_called_once()
 

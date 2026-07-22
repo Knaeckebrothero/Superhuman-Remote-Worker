@@ -49,11 +49,13 @@ CANVAS_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "canvas",
         "function": "set_canvas",
         "description": (
-            "Present or refresh a validated workspace file or, when the current "
-            "workspace advertises live preview, one loopback workspace port on "
-            "the persistent thread's shared Canvas. Never supply a hostname or "
-            "URL. Re-read files the user may have changed before overwriting "
-            "them, and call set_canvas again after updating a presented source."
+            "Present or refresh a validated workspace file, an attested loopback "
+            "workspace port, or the current shared browser when the matching "
+            "workspace capability is advertised. browser_id='current' resolves "
+            "the agent's current browser at call time; control may remain with "
+            "the user. Never supply a hostname or URL. Re-read files the user "
+            "may have changed before overwriting them, and call set_canvas again "
+            "after updating a presented source."
         ),
         "category": "canvas",
         "short_description": "Present or refresh a workspace source on Canvas.",
@@ -189,6 +191,175 @@ class _SetLiveCanvasArguments(BaseModel):
         return self
 
 
+class _SetBrowserCanvasArguments(BaseModel):
+    """Flat file-or-browser schema exposed by a browser-capable backend."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    source_type: Literal["workspace_file", "browser"] = Field(
+        description="Present an existing workspace file or the current shared browser."
+    )
+    path: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4096,
+        description="Workspace-relative file path; workspace_file only.",
+    )
+    browser_id: Literal["current"] | None = Field(
+        default=None,
+        description=(
+            "Browser selector; browser requires 'current' and resolves it at call time."
+        ),
+    )
+    title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Optional descriptive stage title.",
+    )
+    renderer: Literal["auto", "markdown", "text", "html", "image"] = Field(
+        default="auto",
+        description="File renderer. Browser presentation requires 'auto'.",
+    )
+    editable: bool = Field(
+        default=False,
+        description="Conditional file editing. Browser presentation is never editable.",
+    )
+    alt_text: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1000,
+        description="Meaningful image description; workspace_file only.",
+    )
+
+    @model_validator(mode="after")
+    def _source_fields_do_not_mix(self) -> "_SetBrowserCanvasArguments":
+        if self.source_type == "workspace_file":
+            if self.path is None:
+                raise ValueError("workspace_file requires path")
+            if self.browser_id is not None:
+                raise ValueError("workspace_file does not accept browser fields")
+            return self
+
+        if self.browser_id != "current":
+            raise ValueError("browser requires browser_id='current'")
+        if self.path is not None or self.alt_text is not None:
+            raise ValueError("browser does not accept file fields")
+        if self.renderer != "auto" or self.editable:
+            raise ValueError("browser requires renderer='auto' and editable=false")
+        return self
+
+
+class _SetLiveBrowserCanvasArguments(BaseModel):
+    """Flat schema exposed by a backend attested for apps and the browser."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    source_type: Literal["workspace_file", "workspace_port", "browser"] = Field(
+        description=(
+            "Present an existing file, an attested loopback port, or the current browser."
+        )
+    )
+    path: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4096,
+        description="Workspace-relative file path; workspace_file only.",
+    )
+    port: int | None = Field(
+        default=None,
+        ge=1024,
+        le=65535,
+        description="Workspace loopback HTTP port; workspace_port only.",
+    )
+    entry_path: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=2048,
+        description="Absolute application entry path; workspace_port only.",
+    )
+    browser_id: Literal["current"] | None = Field(
+        default=None,
+        description=(
+            "Browser selector; browser requires 'current' and resolves it at call time."
+        ),
+    )
+    title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Optional descriptive stage title.",
+    )
+    renderer: Literal["auto", "markdown", "text", "html", "image"] = Field(
+        default="auto",
+        description="File renderer. Live applications and browser require 'auto'.",
+    )
+    editable: bool = Field(
+        default=False,
+        description=(
+            "Conditional file editing. Applications and browser are never editable."
+        ),
+    )
+    alt_text: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1000,
+        description="Meaningful image description; workspace_file only.",
+    )
+    new_app: bool = Field(
+        default=False,
+        description=(
+            "Rotate isolated app storage when unrelated code takes over the same port. "
+            "workspace_port only."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _source_fields_do_not_mix(self) -> "_SetLiveBrowserCanvasArguments":
+        if self.source_type == "workspace_file":
+            if self.path is None:
+                raise ValueError("workspace_file requires path")
+            if (
+                self.port is not None
+                or self.entry_path is not None
+                or self.browser_id is not None
+                or self.new_app
+            ):
+                raise ValueError("workspace_file does not accept app or browser fields")
+            return self
+
+        if self.source_type == "workspace_port":
+            if self.port is None:
+                raise ValueError("workspace_port requires port")
+            if (
+                self.path is not None
+                or self.alt_text is not None
+                or self.browser_id is not None
+            ):
+                raise ValueError(
+                    "workspace_port does not accept file or browser fields"
+                )
+            if self.renderer != "auto" or self.editable:
+                raise ValueError(
+                    "workspace_port requires renderer='auto' and editable=false"
+                )
+            return self
+
+        if self.browser_id != "current":
+            raise ValueError("browser requires browser_id='current'")
+        if (
+            self.path is not None
+            or self.port is not None
+            or self.entry_path is not None
+            or self.alt_text is not None
+            or self.new_app
+        ):
+            raise ValueError("browser does not accept file or live-app fields")
+        if self.renderer != "auto" or self.editable:
+            raise ValueError("browser requires renderer='auto' and editable=false")
+        return self
+
+
 def get_canvas_metadata() -> Dict[str, Dict[str, Any]]:
     """Return registry metadata for the Canvas category."""
     return CANVAS_TOOLS_METADATA.copy()
@@ -310,11 +481,16 @@ def create_canvas_tools(context: ToolContext) -> list[Any]:
         raise RuntimeError("Canvas internal service authentication is unavailable")
 
     backend = getattr(context.workspace_manager, "backend", None)
-    set_arguments = (
-        _SetLiveCanvasArguments
-        if getattr(backend, "supports_canvas_live_apps", False)
-        else _SetFileCanvasArguments
-    )
+    supports_live_apps = getattr(backend, "supports_canvas_live_apps", False)
+    supports_shared_browser = getattr(backend, "supports_canvas_shared_browser", False)
+    if supports_live_apps and supports_shared_browser:
+        set_arguments = _SetLiveBrowserCanvasArguments
+    elif supports_live_apps:
+        set_arguments = _SetLiveCanvasArguments
+    elif supports_shared_browser:
+        set_arguments = _SetBrowserCanvasArguments
+    else:
+        set_arguments = _SetFileCanvasArguments
 
     @tool(args_schema=_NoCanvasArguments)
     async def get_canvas() -> dict[str, Any] | None:
@@ -329,7 +505,7 @@ def create_canvas_tools(context: ToolContext) -> list[Any]:
 
     @tool(args_schema=set_arguments)
     async def set_canvas(
-        source_type: Literal["workspace_file", "workspace_port"],
+        source_type: Literal["workspace_file", "workspace_port", "browser"],
         path: str | None = None,
         title: str | None = None,
         renderer: Literal["auto", "markdown", "text", "html", "image"] = "auto",
@@ -337,9 +513,14 @@ def create_canvas_tools(context: ToolContext) -> list[Any]:
         alt_text: str | None = None,
         port: int | None = None,
         entry_path: str | None = None,
+        browser_id: Literal["current"] | None = None,
         new_app: bool = False,
     ) -> dict[str, Any]:
-        """Present or refresh one validated workspace source on Canvas."""
+        """Present a file, attested app, or current browser when advertised.
+
+        ``browser_id='current'`` resolves at call time. Presenting it does not
+        take the control baton away from a user who already holds it.
+        """
         thread_id, user_id = _require_persistent_identity(context)
         if source_type == "workspace_file":
             if path is None:  # Defensive for direct calls bypassing args_schema.
@@ -352,7 +533,7 @@ def create_canvas_tools(context: ToolContext) -> list[Any]:
             }
             if alt_text is not None:
                 payload["alt_text"] = alt_text
-        else:
+        elif source_type == "workspace_port":
             if port is None:
                 raise ValueError("workspace_port requires port")
             payload = {
@@ -363,16 +544,26 @@ def create_canvas_tools(context: ToolContext) -> list[Any]:
                 "editable": False,
                 "new_app": new_app,
             }
+        else:
+            if browser_id != "current":
+                raise ValueError("browser requires browser_id='current'")
+            payload = {
+                "source_type": "browser",
+                "browser_id": "current",
+                "renderer": "auto",
+                "editable": False,
+            }
         if title is not None:
             payload["title"] = title
 
         client = _client_for(context, user_id)
         try:
-            state = await client.set_thread_canvas(thread_id, payload)
+            result = await client.set_thread_canvas(thread_id, payload)
         finally:
             await _close_client(client)
-        state = _logical_canvas_state(state)
-        await _emit_after_commit(context, "canvas.updated", state)
+        state = _logical_canvas_state(result.state)
+        if result.changed:
+            await _emit_after_commit(context, "canvas.updated", state)
         return state
 
     @tool(args_schema=_NoCanvasArguments)
