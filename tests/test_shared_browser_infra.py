@@ -32,3 +32,53 @@ def test_dev_profile_enables_shared_browser():
         (REPO / "deployment/values-experimental.yaml").read_text()
     )
     assert experimental["canvas"]["sharedBrowser"]["enabled"] is True
+
+
+def test_container_and_vm_install_the_same_stream_conformance_program():
+    check = REPO / "docker/check-browser-stream.py"
+    assert check.read_text().startswith("#!/usr/bin/env python3\n")
+    assert not (REPO / "docker/agent-vm-base/files/check-browser-stream.py").exists()
+
+    dockerfile = (REPO / "docker/Dockerfile.workspace").read_text()
+    assert (
+        "COPY docker/check-browser-stream.py /usr/local/bin/check-browser-stream"
+        in dockerfile
+    )
+    assert "chmod +x /usr/local/bin/check-browser-stream" in dockerfile
+
+    packer = (REPO / "docker/agent-vm-base/stage2.pkr.hcl").read_text()
+    provision = (REPO / "docker/agent-vm-base/scripts/provision-stage2.sh").read_text()
+    assert '"../check-browser-stream.py"' in packer
+    assert (
+        "install -o root -g root -m 0755 /tmp/check-browser-stream.py "
+        "/usr/local/bin/check-browser-stream"
+    ) in provision
+
+
+def test_shared_browser_stack_assertion_runs_live_stream_conformance():
+    assertion = (REPO / "docker/assert-browser-stack.sh").read_text()
+    expected = (
+        '_check "shared-browser stream conformance" \\'
+        "\n    /usr/local/bin/check-browser-stream"
+    )
+    assert expected in assertion
+    assert '[ "$label" = "shared-browser stream conformance" ]' in assertion
+
+
+def test_stream_conformance_changes_rebuild_every_workspace_image():
+    workflow = (REPO / ".github/workflows/develop.yml").read_text()
+    workspace_detector = workflow.split("WORKSPACE=$(has_changes", 1)[1].split(
+        "VM_CONTROLLER=$(has_changes", 1
+    )[0]
+    vm_detector = workflow.split("VM_BASE=$(has_changes", 1)[1].split(
+        "SUDO_GATE=$(has_changes", 1
+    )[0]
+    assert "docker/check-browser-stream.py" in workspace_detector
+    assert "docker/check-browser-stream.py" in vm_detector
+
+    tilt = (REPO / "Tiltfile").read_text()
+    workspace_build = tilt.split("docker_build(\n    'srw-workspace'", 1)[1].split(
+        "# -----------------------------------------------------------------------------",
+        1,
+    )[0]
+    assert "'docker/check-browser-stream.py'" in workspace_build

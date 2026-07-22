@@ -277,6 +277,7 @@ sudo -u agent-host git config --global core.pager cat
 
 _section "Installing browser-exec"
 sudo install -o root -g root -m 0755 /tmp/browser-exec /usr/local/bin/browser-exec
+sudo install -o root -g root -m 0755 /tmp/check-browser-stream.py /usr/local/bin/check-browser-stream
 
 # -----------------------------------------------------------------------------
 # 8. Browser stack conformance gate
