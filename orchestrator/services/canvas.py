@@ -308,6 +308,18 @@ def canvas_file_lock_key(thread_id: str, canonical_path: str) -> int:
     return int.from_bytes(hashlib.sha256(material).digest()[:8], "big", signed=True)
 
 
+def canvas_presentation_lock_key(thread_id: str, canvas_id: str) -> int:
+    """Return a domain-separated transaction lock for one presentation slot."""
+
+    material = (
+        b"srw-canvas-presentation-v1\x00"
+        + thread_id.encode("utf-8")
+        + b"\x00"
+        + canvas_id.encode("utf-8")
+    )
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big", signed=True)
+
+
 @asynccontextmanager
 async def _canvas_mutation_admission():
     admitted = False
@@ -614,6 +626,114 @@ class CanvasService:
         record = CanvasRecord.from_row(row)
         await self._emit(record, method="canvas.updated")
         return CanvasMutation(changed=True, record=record)
+
+    async def set_if_changed(
+        self,
+        thread_id: str,
+        presentation: CanvasSetInput,
+        *,
+        canvas_id: str = MAIN_CANVAS_ID,
+    ) -> CanvasMutation:
+        """Idempotently stage one Browser source under a missing-row-safe lock."""
+
+        self._require_main(canvas_id)
+        if (
+            not isinstance(presentation.source, BrowserSource)
+            or presentation.source_version is not None
+            or presentation.new_app
+            or presentation.renderer != "auto"
+            or presentation.editable
+            or presentation.alt_text is not None
+        ):
+            raise ValueError("set_if_changed is restricted to Browser presentations")
+
+        source = presentation.source
+        source_fingerprint = canonical_source_fingerprint(source)
+        source_json = json.dumps(
+            source.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        lock_key = canvas_presentation_lock_key(thread_id, canvas_id)
+        changed = False
+        result: CanvasRecord | None = None
+
+        async with self._db.acquire() as conn:
+            async with conn.transaction():
+                # This precedes the row lookup intentionally. A row lock cannot
+                # serialize two concurrent first presentations when no row exists.
+                await conn.fetchval("SELECT pg_advisory_xact_lock($1)", lock_key)
+                row = await conn.fetchrow(
+                    """
+                    SELECT thread_id, canvas_id, source, title, renderer, editable,
+                           alt_text, presentation_revision, source_fingerprint,
+                           source_version, origin_generation, created_at, updated_at
+                    FROM canvases
+                    WHERE thread_id = $1 AND canvas_id = $2
+                    FOR UPDATE
+                    """,
+                    thread_id,
+                    canvas_id,
+                )
+                current = CanvasRecord.from_row(row) if row is not None else None
+                if (
+                    current is not None
+                    and current.source == source
+                    and current.source_fingerprint == source_fingerprint
+                    and current.title == presentation.title
+                    and current.renderer == presentation.renderer
+                    and current.editable is presentation.editable
+                    and current.alt_text == presentation.alt_text
+                    and current.source_version == presentation.source_version
+                    and current.origin_generation is None
+                ):
+                    result = current
+                else:
+                    updated = await conn.fetchrow(
+                        """
+                        INSERT INTO canvases (
+                            thread_id, canvas_id, source, title, renderer, editable,
+                            alt_text, presentation_revision, source_fingerprint,
+                            source_version, origin_generation
+                        )
+                        VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, 1, $8, $9, $10)
+                        ON CONFLICT ON CONSTRAINT uq_canvases_thread_canvas
+                        DO UPDATE SET
+                            source = EXCLUDED.source,
+                            title = EXCLUDED.title,
+                            renderer = EXCLUDED.renderer,
+                            editable = EXCLUDED.editable,
+                            alt_text = EXCLUDED.alt_text,
+                            presentation_revision = canvases.presentation_revision + 1,
+                            source_fingerprint = EXCLUDED.source_fingerprint,
+                            source_version = EXCLUDED.source_version,
+                            origin_generation = EXCLUDED.origin_generation,
+                            updated_at = now()
+                        RETURNING thread_id, canvas_id, source, title, renderer,
+                                  editable, alt_text, presentation_revision,
+                                  source_fingerprint, source_version,
+                                  origin_generation, created_at, updated_at
+                        """,
+                        thread_id,
+                        canvas_id,
+                        source_json,
+                        presentation.title,
+                        presentation.renderer,
+                        presentation.editable,
+                        presentation.alt_text,
+                        source_fingerprint,
+                        presentation.source_version,
+                        None,
+                    )
+                    result = CanvasRecord.from_row(updated)
+                    changed = True
+
+        assert result is not None
+        if changed:
+            await self._emit(result, method="canvas.updated")
+        return CanvasMutation(changed=changed, record=result)
 
     async def edit_file(
         self,
@@ -1151,6 +1271,7 @@ __all__ = [
     "WorkspaceFileSource",
     "build_public_canvas_representation",
     "canvas_file_lock_key",
+    "canvas_presentation_lock_key",
     "canonical_source_fingerprint",
     "canvas_invalidation",
 ]
