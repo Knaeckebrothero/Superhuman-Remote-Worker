@@ -127,8 +127,16 @@ async def open_shared_browser(
             content={"status": "provisioning"},
         )
 
+    async def generation_resolver() -> dict[str, Any]:
+        current = await db.get_thread(thread_id)
+        return dict(current) if current else {}
+
     try:
-        info = await exec_stream_info(thread, initial_baton=body.opened_by)
+        info = await exec_stream_info(
+            thread,
+            initial_baton=body.opened_by,
+            generation_resolver=generation_resolver,
+        )
         generation = UUID(info["generation"])
     except BrowserStreamUnavailable as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
