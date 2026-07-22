@@ -239,6 +239,12 @@ _section "Installing Playwright Chromium + browser-use"
 # browser-exec daemon is written against. Do NOT loosen this cap without
 # upgrading docker/browser-exec to the 0.13 API.
 #
+# Because this browser_use requirement currently lives on develop AHEAD of main,
+# develop publishes its OWN stage1 base under the :experimental tag while main
+# keeps :latest (see .github/workflows/stage1-rebuild.yml + develop.yml). A
+# shared :latest would let a main-built base — lacking browser_use — fail
+# develop's stage2 browser-stack gate on every build.
+#
 # --ignore-installed is required HERE but not in docker/Dockerfile.workspace,
 # and the difference is the base image. The container starts from a minimal
 # ubuntu:24.04; this VM starts from the Ubuntu *cloud image*, which preinstalls
