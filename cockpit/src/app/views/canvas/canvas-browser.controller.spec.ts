@@ -59,6 +59,14 @@ function serverJson(type: number, value: unknown): ArrayBuffer {
   return wire.buffer;
 }
 
+function decodeClient(data: ArrayBuffer): {type: number; body: unknown} {
+  const bytes = new Uint8Array(data);
+  return {
+    type: bytes[0],
+    body: JSON.parse(new TextDecoder().decode(bytes.subarray(1))),
+  };
+}
+
 function frame(generation = GENERATION): ArrayBuffer {
   const header = utf8.encode(JSON.stringify({ generation, w: 1280, h: 720, ts: 1_753_200_000 }));
   const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 1, 2, 3]);
@@ -444,6 +452,160 @@ describe('Canvas shared-browser controller', () => {
       }),
     );
     expect(controller.connectionStatus()).toBe('viewer_limit');
+  });
+
+  it('gates and encodes mouse, wheel, key, navigation, and baton frames exactly', () => {
+    controller.syncPresentation(true, 'thread-1', browserState());
+    const socket = sockets[0];
+    socket.open();
+    socket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState()));
+
+    expect(controller.sendInput({
+      kind: 'mouse',
+      params: {type: 'mouseMoved', x: 10, y: 20, modifiers: 0},
+    })).toBe(false);
+    expect(controller.sendControl({op: 'navigate', url: 'https://example.test/next'})).toBe(false);
+    expect(controller.sendControl({op: 'release_baton'})).toBe(false);
+    expect(controller.sendControl({op: 'take_baton'})).toBe(true);
+    expect(controller.sendControl({op: 'take_baton'})).toBe(false);
+    expect(controller.pageState()?.baton).toBe('agent');
+    expect(controller.pendingBaton()).toBe('user');
+    expect(decodeClient(socket.sent[0])).toEqual({
+      type: BROWSER_MESSAGE_TYPE.CONTROL,
+      body: {op: 'take_baton'},
+    });
+
+    socket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState({baton: 'user'})));
+    expect(controller.pendingBaton()).toBeNull();
+    expect(controller.sendInput({
+      kind: 'mouse',
+      params: {
+        type: 'mousePressed',
+        x: 100.5,
+        y: 200.25,
+        button: 'left',
+        buttons: 1,
+        modifiers: 8,
+        clickCount: 1,
+      },
+    })).toBe(true);
+    expect(controller.sendInput({
+      kind: 'wheel',
+      params: {x: 100.5, y: 200.25, deltaX: 0, deltaY: 32, modifiers: 0},
+    })).toBe(true);
+    expect(controller.sendInput({
+      kind: 'key',
+      params: {
+        type: 'keyDown',
+        key: 'A',
+        code: 'KeyA',
+        location: 0,
+        autoRepeat: false,
+        modifiers: 8,
+        text: 'A',
+      },
+    })).toBe(true);
+    expect(controller.sendControl({op: 'navigate', url: 'https://example.test/next'})).toBe(true);
+    expect(controller.sendControl({op: 'back'})).toBe(true);
+    expect(controller.sendControl({op: 'reload'})).toBe(true);
+    expect(controller.sendControl({op: 'release_baton'})).toBe(true);
+    expect(controller.sendControl({op: 'release_baton'})).toBe(false);
+    expect(controller.sendInput({
+      kind: 'key',
+      params: {type: 'keyUp', key: 'A', code: 'KeyA', location: 0, modifiers: 0},
+    })).toBe(false);
+
+    expect(socket.sent.slice(1).map(decodeClient)).toEqual([
+      {
+        type: BROWSER_MESSAGE_TYPE.INPUT,
+        body: {
+          kind: 'mouse',
+          params: {
+            type: 'mousePressed',
+            x: 100.5,
+            y: 200.25,
+            button: 'left',
+            buttons: 1,
+            modifiers: 8,
+            clickCount: 1,
+          },
+        },
+      },
+      {
+        type: BROWSER_MESSAGE_TYPE.INPUT,
+        body: {
+          kind: 'wheel',
+          params: {x: 100.5, y: 200.25, deltaX: 0, deltaY: 32, modifiers: 0},
+        },
+      },
+      {
+        type: BROWSER_MESSAGE_TYPE.INPUT,
+        body: {
+          kind: 'key',
+          params: {
+            type: 'keyDown',
+            key: 'A',
+            code: 'KeyA',
+            location: 0,
+            autoRepeat: false,
+            modifiers: 8,
+            text: 'A',
+          },
+        },
+      },
+      {type: BROWSER_MESSAGE_TYPE.CONTROL, body: {op: 'navigate', url: 'https://example.test/next'}},
+      {type: BROWSER_MESSAGE_TYPE.CONTROL, body: {op: 'back'}},
+      {type: BROWSER_MESSAGE_TYPE.CONTROL, body: {op: 'reload'}},
+      {type: BROWSER_MESSAGE_TYPE.CONTROL, body: {op: 'release_baton'}},
+    ]);
+  });
+
+  it('allows two same-user views to drive only after each receives authoritative user STATE', () => {
+    const second = TestBed.runInInjectionContext(() => new CanvasBrowserController());
+    controller.syncPresentation(true, 'thread-1', browserState());
+    second.syncPresentation(true, 'thread-1', browserState());
+    const firstSocket = sockets[0];
+    const secondSocket = sockets[1];
+    firstSocket.open();
+    secondSocket.open();
+
+    firstSocket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState({baton: 'user'})));
+    expect(controller.sendInput({
+      kind: 'mouse',
+      params: {type: 'mouseMoved', x: 1, y: 2},
+    })).toBe(true);
+    expect(second.sendInput({
+      kind: 'mouse',
+      params: {type: 'mouseMoved', x: 3, y: 4},
+    })).toBe(false);
+
+    secondSocket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState({baton: 'user'})));
+    expect(second.sendInput({
+      kind: 'mouse',
+      params: {type: 'mouseMoved', x: 3, y: 4},
+    })).toBe(true);
+    expect(firstSocket.sent).toHaveLength(1);
+    expect(secondSocket.sent).toHaveLength(1);
+  });
+
+  it('rejects input after visibility teardown or source replacement', () => {
+    controller.syncPresentation(true, 'thread-1', browserState(1));
+    const first = sockets[0];
+    first.open();
+    first.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState({baton: 'user'})));
+    visibility.set('hidden');
+    expect(controller.sendInput({
+      kind: 'mouse',
+      params: {type: 'mouseMoved', x: 1, y: 2},
+    })).toBe(false);
+
+    visibility.set('visible');
+    controller.syncPresentation(true, 'thread-1', browserState(2));
+    expect(controller.sendInput({
+      kind: 'mouse',
+      params: {type: 'mouseMoved', x: 1, y: 2},
+    })).toBe(false);
+    expect(first.sent).toHaveLength(0);
   });
 
   it('treats malformed server data as terminal and supports explicit retry', () => {

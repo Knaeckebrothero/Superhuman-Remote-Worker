@@ -1,13 +1,48 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { TranslocoTestingModule } from '@jsverse/transloco';
+import { TranslocoPipe, TranslocoTestingModule } from '@jsverse/transloco';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { signal, ɵresolveComponentResources } from '@angular/core';
+import {
+  Component,
+  EventEmitter,
+  Input,
+  Output,
+  signal,
+  ɵresolveComponentResources,
+} from '@angular/core';
 import { BrowserPageState } from './canvas-browser-protocol';
 import {
   CanvasBrowserConnectionStatus,
   CanvasBrowserController,
 } from './canvas-browser.controller';
 import { CanvasBrowserRendererComponent } from './canvas-browser-renderer.component';
+
+@Component({selector: 'app-icon-button', standalone: true, template: '<ng-content />'})
+class IconButtonStubComponent {
+  @Input() size = '';
+  @Input() ariaLabel = '';
+  @Input() tooltip = '';
+  @Input() disabled = false;
+  @Output() readonly clicked = new EventEmitter<MouseEvent>();
+}
+
+@Component({selector: 'app-button', standalone: true, template: '<ng-content />'})
+class ButtonStubComponent {
+  @Input() size = '';
+  @Input() variant = '';
+  @Input() disabled = false;
+  @Output() readonly clicked = new EventEmitter<MouseEvent>();
+}
+
+@Component({selector: 'app-icon', standalone: true, template: '<ng-content />'})
+class IconStubComponent {
+  @Input() size = '';
+}
+
+@Component({selector: 'app-spinner', standalone: true, template: ''})
+class SpinnerStubComponent {
+  @Input() size = '';
+  @Input() tone = '';
+}
 
 const translations = {
   canvas: {
@@ -16,7 +51,18 @@ const translations = {
       noUrl: 'No page URL',
       loading: 'Page loading…',
       surfaceLabel: 'Shared browser page',
-      baton: { agent: 'Agent is driving', user: "You're driving" },
+      baton: {
+        agent: 'Agent is driving',
+        user: "You're driving",
+        take: 'Take control',
+        release: 'Release control',
+      },
+      toolbar: {
+        back: 'Back',
+        reload: 'Reload',
+        address: 'Address',
+        navigationRejected: 'Navigation blocked:',
+      },
       status: {
         connecting: 'Connecting',
         ready: 'Connected',
@@ -52,6 +98,11 @@ describe('Canvas shared-browser renderer', () => {
     connectionStatus: ReturnType<typeof signal<CanvasBrowserConnectionStatus>>;
     pageState: ReturnType<typeof signal<BrowserPageState | null>>;
     frame: ReturnType<typeof signal<ImageBitmap | null>>;
+    errorCode: ReturnType<typeof signal<string | null>>;
+    errorMessage: ReturnType<typeof signal<string | null>>;
+    pendingBaton: ReturnType<typeof signal<'agent' | 'user' | null>>;
+    sendControl: ReturnType<typeof vi.fn>;
+    sendInput: ReturnType<typeof vi.fn>;
   };
   let context: {
     clearRect: ReturnType<typeof vi.fn>;
@@ -68,6 +119,11 @@ describe('Canvas shared-browser renderer', () => {
       connectionStatus: signal<CanvasBrowserConnectionStatus>('connecting'),
       pageState: signal<BrowserPageState | null>(page()),
       frame: signal<ImageBitmap | null>(null),
+      errorCode: signal<string | null>(null),
+      errorMessage: signal<string | null>(null),
+      pendingBaton: signal<'agent' | 'user' | null>(null),
+      sendControl: vi.fn(() => true),
+      sendInput: vi.fn(() => true),
     };
     context = { clearRect: vi.fn(), drawImage: vi.fn() };
     getContext = vi
@@ -83,6 +139,21 @@ describe('Canvas shared-browser renderer', () => {
       ],
       providers: [{ provide: CanvasBrowserController, useValue: controller }],
     });
+    TestBed.overrideComponent(CanvasBrowserRendererComponent, {
+      set: {
+        styleUrl: undefined,
+        styleUrls: [],
+        styles: [''],
+        imports: [
+          ButtonStubComponent,
+          IconButtonStubComponent,
+          IconStubComponent,
+          SpinnerStubComponent,
+          TranslocoPipe,
+        ],
+      },
+    });
+    await ɵresolveComponentResources(() => Promise.resolve(''));
     await TestBed.compileComponents();
     fixture = TestBed.createComponent(CanvasBrowserRendererComponent);
     fixture.detectChanges();
@@ -93,17 +164,21 @@ describe('Canvas shared-browser renderer', () => {
   afterEach(() => {
     fixture?.destroy();
     getContext?.mockRestore();
+    vi.unstubAllGlobals();
     TestBed.resetTestingModule();
   });
 
-  it('renders only trusted read-only chrome and one focusable bitmap canvas', () => {
+  it('renders only trusted chrome and one focusable bitmap canvas', () => {
     const root = fixture.nativeElement as HTMLElement;
     const surface = root.querySelector('canvas') as HTMLCanvasElement;
 
     expect(root.textContent).toContain('Example form');
-    expect(root.textContent).toContain('https://example.test/form');
     expect(root.textContent).toContain('Agent is driving');
+    expect(root.textContent).toContain('Take control');
     expect(root.textContent).toContain('Connecting');
+    expect((root.querySelector('input') as HTMLInputElement).value).toBe(
+      'https://example.test/form',
+    );
     expect(surface.tabIndex).toBe(0);
     expect(surface.getAttribute('aria-label')).toBe('Shared browser page');
     expect(root.querySelectorAll('canvas')).toHaveLength(1);
@@ -140,6 +215,351 @@ describe('Canvas shared-browser renderer', () => {
     expect(
       (fixture.nativeElement.querySelector('.browser-baton') as HTMLElement).dataset['baton'],
     ).toBe('user');
+  });
+
+  it('keeps URL edits local and sends navigation and baton controls without optimistic labels', () => {
+    const component = fixture.componentInstance;
+    controller.connectionStatus.set('ready');
+    fixture.detectChanges();
+
+    expect(component.canDrive()).toBe(false);
+    expect(component.batonDisabled()).toBe(false);
+    component.toggleBaton();
+    expect(controller.sendControl).toHaveBeenLastCalledWith({op: 'take_baton'});
+    expect(fixture.nativeElement.textContent).toContain('Agent is driving');
+
+    controller.pendingBaton.set('user');
+    fixture.detectChanges();
+    component.toggleBaton();
+    expect(controller.sendControl).toHaveBeenCalledOnce();
+    expect(fixture.nativeElement.textContent).toContain('Agent is driving');
+
+    controller.pendingBaton.set(null);
+    controller.pageState.set(page({baton: 'user'}));
+    fixture.detectChanges();
+    expect(component.canDrive()).toBe(true);
+    expect(fixture.nativeElement.textContent).toContain("You're driving");
+    expect(fixture.nativeElement.textContent).toContain('Release control');
+
+    component.urlEditing.set(true);
+    const input = fixture.nativeElement.querySelector('input') as HTMLInputElement;
+    input.value = 'https://typed.example/path';
+    component.onUrlInput({target: input} as unknown as Event);
+    controller.pageState.set(page({baton: 'user', url: 'https://state.example/new'}));
+    TestBed.flushEffects();
+    expect(component.urlValue()).toBe('https://typed.example/path');
+
+    const submit = {preventDefault: vi.fn()} as unknown as Event;
+    component.navigate(submit);
+    component.goBack();
+    component.reload();
+    expect(controller.sendControl.mock.calls.slice(-3).map(call => call[0])).toEqual([
+      {op: 'navigate', url: 'https://typed.example/path'},
+      {op: 'back'},
+      {op: 'reload'},
+    ]);
+
+    component.urlEditing.set(false);
+    TestBed.flushEffects();
+    expect(component.urlValue()).toBe('https://state.example/new');
+    component.toggleBaton();
+    expect(controller.sendControl).toHaveBeenLastCalledWith({op: 'release_baton'});
+  });
+
+  it('maps and throttles pointer input on the exact displayed canvas', () => {
+    const component = fixture.componentInstance;
+    const surface = fixture.nativeElement.querySelector('canvas') as HTMLCanvasElement;
+    controller.connectionStatus.set('ready');
+    controller.pageState.set(page({baton: 'user', viewport: {width: 1280, height: 720}}));
+    fixture.detectChanges();
+    surface.focus();
+    vi.spyOn(surface, 'getBoundingClientRect').mockReturnValue(
+      {left: 10, top: 20, width: 200, height: 100} as DOMRect,
+    );
+    const setPointerCapture = vi.fn();
+    const releasePointerCapture = vi.fn();
+    Object.defineProperty(surface, 'setPointerCapture', {value: setPointerCapture});
+    Object.defineProperty(surface, 'releasePointerCapture', {value: releasePointerCapture});
+    let animationFrame: FrameRequestCallback | null = null;
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+      animationFrame = callback;
+      return 17;
+    }));
+    vi.stubGlobal('cancelAnimationFrame', vi.fn());
+
+    const pointer = (overrides: Record<string, unknown> = {}) => ({
+      clientX: 60,
+      clientY: 45,
+      pointerId: 3,
+      isPrimary: true,
+      button: 0,
+      buttons: 1,
+      detail: 1,
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      preventDefault: vi.fn(),
+      ...overrides,
+    }) as unknown as PointerEvent;
+
+    component.onPointerMove(pointer({clientX: 60, clientY: 45}));
+    component.onPointerMove(pointer({clientX: 110, clientY: 70}));
+    expect(controller.sendInput).not.toHaveBeenCalled();
+    expect(animationFrame).not.toBeNull();
+    animationFrame!(0);
+    expect(controller.sendInput).toHaveBeenLastCalledWith({
+      kind: 'mouse',
+      params: {
+        type: 'mouseMoved',
+        x: 640,
+        y: 360,
+        buttons: 1,
+        modifiers: 0,
+      },
+    });
+
+    controller.sendInput.mockClear();
+    const down = pointer();
+    component.onPointerDown(down);
+    component.onPointerUp(pointer({clientX: 500, clientY: 500, buttons: 0}));
+    expect(controller.sendInput.mock.calls.map(call => call[0])).toEqual([
+      {
+        kind: 'mouse',
+        params: {
+          type: 'mousePressed',
+          x: 320,
+          y: 180,
+          button: 'left',
+          buttons: 1,
+          modifiers: 0,
+          clickCount: 1,
+        },
+      },
+      {
+        kind: 'mouse',
+        params: {
+          type: 'mouseReleased',
+          x: 320,
+          y: 180,
+          button: 'left',
+          buttons: 0,
+          modifiers: 0,
+          clickCount: 1,
+        },
+      },
+    ]);
+    expect(down.preventDefault).toHaveBeenCalledOnce();
+    expect(setPointerCapture).toHaveBeenCalledWith(3);
+    expect(releasePointerCapture).toHaveBeenCalledWith(3);
+
+    controller.sendInput.mockClear();
+    component.onPointerDown(pointer({button: 4}));
+    component.onPointerDown(pointer({clientX: 9}));
+    expect(controller.sendInput).not.toHaveBeenCalled();
+
+    component.onPointerDown(pointer());
+    component.onPointerCancel(pointer({buttons: 0}));
+    expect(controller.sendInput).toHaveBeenLastCalledWith({
+      kind: 'mouse',
+      params: {
+        type: 'mouseReleased',
+        x: 320,
+        y: 180,
+        button: 'left',
+        buttons: 0,
+        modifiers: 0,
+        clickCount: 1,
+      },
+    });
+  });
+
+  it('normalizes focused wheel and keyboard input and ignores composition or agent baton', () => {
+    const component = fixture.componentInstance;
+    const surface = fixture.nativeElement.querySelector('canvas') as HTMLCanvasElement;
+    controller.connectionStatus.set('ready');
+    controller.pageState.set(page({baton: 'user', viewport: {width: 1280, height: 720}}));
+    fixture.detectChanges();
+    surface.focus();
+    vi.spyOn(surface, 'getBoundingClientRect').mockReturnValue(
+      {left: 10, top: 20, width: 200, height: 100} as DOMRect,
+    );
+    const base = {
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      preventDefault: vi.fn(),
+    };
+    const wheel = {
+      ...base,
+      clientX: 110,
+      clientY: 70,
+      deltaX: 1,
+      deltaY: -2,
+      deltaMode: 1,
+    } as unknown as WheelEvent;
+    component.onWheel(wheel);
+    expect(controller.sendInput).toHaveBeenLastCalledWith({
+      kind: 'wheel',
+      params: {x: 640, y: 360, deltaX: 102.4, deltaY: -230.4, modifiers: 0},
+    });
+    expect(base.preventDefault).toHaveBeenCalledOnce();
+
+    const keyDown = {
+      ...base,
+      key: 'A',
+      code: 'KeyA',
+      location: 0,
+      repeat: false,
+      isComposing: false,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent;
+    component.onKeyDown(keyDown);
+    expect(controller.sendInput).toHaveBeenLastCalledWith({
+      kind: 'key',
+      params: {
+        type: 'keyDown',
+        key: 'A',
+        code: 'KeyA',
+        location: 0,
+        autoRepeat: false,
+        modifiers: 0,
+        text: 'A',
+      },
+    });
+    component.onKeyUp({
+      ...keyDown,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent);
+    expect(controller.sendInput).toHaveBeenLastCalledWith({
+      kind: 'key',
+      params: {
+        type: 'keyUp',
+        key: 'A',
+        code: 'KeyA',
+        location: 0,
+        modifiers: 0,
+      },
+    });
+
+    controller.sendInput.mockClear();
+    component.composing = true;
+    component.onKeyDown(keyDown);
+    expect(controller.sendInput).not.toHaveBeenCalled();
+    component.composing = false;
+    controller.pageState.set(page({baton: 'agent'}));
+    fixture.detectChanges();
+    TestBed.flushEffects();
+    component.onWheel(wheel);
+    component.onKeyDown(keyDown);
+    expect(controller.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('best-effort releases held pointer and keys on blur or authoritative baton loss', () => {
+    const component = fixture.componentInstance;
+    const surface = fixture.nativeElement.querySelector('canvas') as HTMLCanvasElement;
+    controller.connectionStatus.set('ready');
+    controller.pageState.set(page({baton: 'user'}));
+    fixture.detectChanges();
+    surface.focus();
+    vi.spyOn(surface, 'getBoundingClientRect').mockReturnValue(
+      {left: 0, top: 0, width: 1280, height: 720} as DOMRect,
+    );
+    Object.defineProperty(surface, 'setPointerCapture', {value: vi.fn()});
+    Object.defineProperty(surface, 'releasePointerCapture', {value: vi.fn()});
+    const modifiers = {
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+    };
+    component.onPointerDown({
+      ...modifiers,
+      clientX: 10,
+      clientY: 20,
+      pointerId: 1,
+      isPrimary: true,
+      button: 0,
+      buttons: 1,
+      detail: 1,
+      preventDefault: vi.fn(),
+    } as unknown as PointerEvent);
+    component.onKeyDown({
+      ...modifiers,
+      key: 'Control',
+      code: 'ControlLeft',
+      location: 1,
+      repeat: false,
+      isComposing: false,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent);
+
+    controller.sendInput.mockClear();
+    component.releaseHeldInput();
+    expect(controller.sendInput.mock.calls.map(call => call[0])).toEqual([
+      {
+        kind: 'mouse',
+        params: {
+          type: 'mouseReleased',
+          x: 10,
+          y: 20,
+          button: 'left',
+          buttons: 0,
+          modifiers: 0,
+          clickCount: 1,
+        },
+      },
+      {
+        kind: 'key',
+        params: {
+          type: 'keyUp',
+          key: 'Control',
+          code: 'ControlLeft',
+          location: 1,
+          modifiers: 0,
+        },
+      },
+    ]);
+
+    controller.sendInput.mockClear();
+    component.onKeyDown({
+      ...modifiers,
+      key: 'Shift',
+      code: 'ShiftLeft',
+      location: 1,
+      repeat: false,
+      isComposing: false,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent);
+    controller.sendInput.mockClear();
+    controller.pageState.set(page({baton: 'agent'}));
+    fixture.detectChanges();
+    TestBed.flushEffects();
+    expect(controller.sendInput).toHaveBeenCalledWith({
+      kind: 'key',
+      params: {
+        type: 'keyUp',
+        key: 'Shift',
+        code: 'ShiftLeft',
+        location: 1,
+        modifiers: 0,
+      },
+    });
+  });
+
+  it('renders the bounded navigation rejection without detaching the stream', () => {
+    controller.connectionStatus.set('ready');
+    controller.pageState.set(page({baton: 'user'}));
+    controller.errorCode.set('navigation_rejected');
+    controller.errorMessage.set('Blocked hostname');
+    fixture.detectChanges();
+
+    const alert = fixture.nativeElement.querySelector('.browser-navigation-error') as HTMLElement;
+    expect(alert.getAttribute('role')).toBe('alert');
+    expect(alert.textContent).toContain('Navigation blocked:');
+    expect(alert.textContent).toContain('Blocked hostname');
+    expect(controller.connectionStatus()).toBe('ready');
   });
 
   it.each([

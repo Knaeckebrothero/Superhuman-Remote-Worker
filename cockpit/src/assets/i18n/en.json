@@ -131,7 +131,15 @@
       "surfaceLabel": "Shared browser page",
       "baton": {
         "agent": "Agent is driving",
-        "user": "You're driving"
+        "user": "You're driving",
+        "take": "Take control",
+        "release": "Release control"
+      },
+      "toolbar": {
+        "back": "Back",
+        "reload": "Reload",
+        "address": "Address",
+        "navigationRejected": "Navigation blocked:"
       },
       "open": {
         "action": "Open browser",
