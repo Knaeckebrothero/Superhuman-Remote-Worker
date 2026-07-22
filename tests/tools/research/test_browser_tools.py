@@ -645,6 +645,77 @@ class TestBrowserDirectDispatch:
         assert "nonce" not in result
 
     @pytest.mark.asyncio
+    async def test_snapshot_surfaces_known_browser_control_holder(
+        self, mock_remote_tool_context
+    ):
+        from src.tools.research.browser_direct import create_browser_direct_tools
+
+        ctx = self._ctx(
+            mock_remote_tool_context,
+            {
+                "dom": "[1]<button>Continue</button>",
+                "url": "https://example.test/form",
+                "title": "Form",
+                "baton": "user",
+            },
+        )
+        tools = {t.name: t for t in create_browser_direct_tools(ctx)}
+
+        result = await tools["browser_snapshot"].ainvoke({})
+
+        assert "URL: https://example.test/form" in result
+        assert "Title: Form" in result
+        assert "Browser control: user" in result
+        assert result.index("Browser control: user") < result.index(
+            "page_content nonce="
+        )
+
+    @pytest.mark.asyncio
+    async def test_user_driving_refusal_is_actionable_prompt_visible_prose(
+        self, mock_remote_tool_context
+    ):
+        from src.tools.research.browser_direct import create_browser_direct_tools
+
+        daemon_message = "Interactive browser input is reserved for the user."
+        ctx = self._ctx(
+            mock_remote_tool_context,
+            {
+                "error": "user_is_driving",
+                "url": "https://example.test/form",
+                "message": daemon_message,
+                "dom": "must not be interpreted",
+            },
+        )
+        tools = {t.name: t for t in create_browser_direct_tools(ctx)}
+
+        result = await tools["browser_click"].ainvoke({"ref": 1})
+
+        assert "Browser error: user_is_driving" not in result
+        assert "https://example.test/form" in result
+        assert daemon_message in result
+        assert "Read-only browser snapshots still work" in result
+        assert "Ask the user to release browser control" in result
+        assert "page_content nonce=" not in result
+        assert "must not be interpreted" not in result
+
+    @pytest.mark.parametrize("baton", ["observer", "", None, 1])
+    @pytest.mark.asyncio
+    async def test_snapshot_ignores_unknown_control_holder(
+        self, mock_remote_tool_context, baton
+    ):
+        from src.tools.research.browser_direct import create_browser_direct_tools
+
+        ctx = self._ctx(
+            mock_remote_tool_context,
+            {"dom": "page", "url": "https://e.com", "baton": baton},
+        )
+        tools = {t.name: t for t in create_browser_direct_tools(ctx)}
+
+        result = await tools["browser_snapshot"].ainvoke({})
+
+        assert "Browser control:" not in result
+
+    @pytest.mark.asyncio
     async def test_screenshot_emitted_as_image_tag(self, mock_remote_tool_context):
         """A screenshot is surfaced as an <image_data> tag so the graph-side
         extract_image_tags post-processor lifts it into a real image block

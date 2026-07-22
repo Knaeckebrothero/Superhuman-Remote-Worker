@@ -144,14 +144,33 @@ def _page_state_to_text(result: Dict[str, Any]) -> str:
     if not isinstance(result, dict):
         return str(result)
     if result.get("error"):
+        if result.get("error") == "user_is_driving":
+            lines = ["Browser action refused because the user currently has control."]
+            url = result.get("url")
+            if isinstance(url, str) and url:
+                lines.append(f"Current URL: {url}")
+            message = result.get("message")
+            if isinstance(message, str) and message:
+                lines.append(message)
+            lines.append(
+                "Read-only browser snapshots still work. Ask the user to release "
+                "browser control before trying an interactive action again."
+            )
+            return "\n".join(lines)
         return f"Browser error: {result['error']}"
 
     wrapped = wrap_with_nonce(result)
     lines: List[str] = []
-    for key, label in (("url", "URL"), ("title", "Title"), ("tabs", "Open tabs")):
+    for key, label in (("url", "URL"), ("title", "Title")):
         value = wrapped.get(key)
         if value:
             lines.append(f"{label}: {value}")
+    baton = wrapped.get("baton")
+    if baton in {"agent", "user"}:
+        lines.append(f"Browser control: {baton}")
+    tabs = wrapped.get("tabs")
+    if tabs:
+        lines.append(f"Open tabs: {tabs}")
     dom = wrapped.get("dom")
     if dom:
         lines.append(str(dom))
