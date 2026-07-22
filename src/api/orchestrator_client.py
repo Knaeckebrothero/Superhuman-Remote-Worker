@@ -76,6 +76,14 @@ class CanvasClientError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class CanvasSetResult:
+    """Internal set response plus its non-model-visible mutation signal."""
+
+    state: dict[str, Any]
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class CanvasClearResult:
     """Internal clear response plus its non-model-visible mutation signal."""
 
@@ -644,8 +652,13 @@ class OrchestratorClient:
 
     async def set_thread_canvas(
         self, thread_id: str, payload: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Set ``main`` through the internal delegated-user Canvas adapter."""
+    ) -> CanvasSetResult:
+        """Set ``main`` through the internal delegated-user Canvas adapter.
+
+        The mutation signal is transport-only. Its absence means ``true`` for
+        compatibility with older orchestrator replicas whose file/app set
+        endpoint always changed state; a present value is a closed contract.
+        """
         if not self._client:
             await self.connect()
         assert self._client is not None
@@ -677,7 +690,19 @@ class OrchestratorClient:
             raise CanvasClientError(
                 "invalid_canvas_response", "Canvas service returned an invalid response"
             )
-        return data
+        mutation_header = response.headers.get("X-Canvas-Mutation-Changed")
+        if mutation_header is None:
+            changed = True
+        elif mutation_header == "true":
+            changed = True
+        elif mutation_header == "false":
+            changed = False
+        else:
+            raise CanvasClientError(
+                "invalid_canvas_response",
+                "Canvas service returned an invalid response",
+            )
+        return CanvasSetResult(state=data, changed=changed)
 
     async def clear_thread_canvas(self, thread_id: str) -> CanvasClearResult | None:
         """Clear ``main`` through the internal delegated-user Canvas adapter.

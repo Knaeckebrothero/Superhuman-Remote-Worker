@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from src.api.orchestrator_client import CanvasClearResult
+from src.api.orchestrator_client import CanvasClearResult, CanvasSetResult
 from src.tools.canvas import create_canvas_tools, get_canvas_metadata
 from src.tools.context import ToolContext
 from src.tools.registry import filter_tools_by_backend, load_tools
@@ -48,7 +48,7 @@ def _tool(tools, name: str):
 class _CanvasClient:
     def __init__(self):
         self.get_result: dict[str, Any] | None = _state()
-        self.set_result: dict[str, Any] = _state()
+        self.set_result = CanvasSetResult(state=_state(), changed=True)
         self.clear_result: CanvasClearResult | None = None
         self.set_calls: list[tuple[str, dict[str, Any]]] = []
         self.get_calls: list[str] = []
@@ -99,6 +99,23 @@ def _live_app_context(callback=None) -> ToolContext:
     manager = SimpleNamespace(
         is_initialized=True,
         backend=SimpleNamespace(supports_canvas_live_apps=True),
+    )
+    return ToolContext(
+        workspace_manager=manager,
+        _thread_id="thread-1",
+        user_id="user-1",
+        config={"agent_id": "persistent-test"},
+        canvas_event_callback=callback,
+    )
+
+
+def _capability_context(*, live: bool, browser: bool, callback=None) -> ToolContext:
+    manager = SimpleNamespace(
+        is_initialized=True,
+        backend=SimpleNamespace(
+            supports_canvas_live_apps=live,
+            supports_canvas_shared_browser=browser,
+        ),
     )
     return ToolContext(
         workspace_manager=manager,
@@ -173,6 +190,136 @@ def test_set_schema_adds_flat_port_fields_only_for_attested_backend(monkeypatch)
     assert parsed.port == 8501
     assert parsed.entry_path == "/demo"
     assert parsed.new_app is True
+
+
+@pytest.mark.parametrize(
+    ("live", "browser", "expected_properties", "expected_source_types"),
+    [
+        (
+            False,
+            False,
+            {"source_type", "path", "title", "renderer", "editable", "alt_text"},
+            ["workspace_file"],
+        ),
+        (
+            True,
+            False,
+            {
+                "source_type",
+                "path",
+                "port",
+                "entry_path",
+                "title",
+                "renderer",
+                "editable",
+                "alt_text",
+                "new_app",
+            },
+            ["workspace_file", "workspace_port"],
+        ),
+        (
+            False,
+            True,
+            {
+                "source_type",
+                "path",
+                "browser_id",
+                "title",
+                "renderer",
+                "editable",
+                "alt_text",
+            },
+            ["workspace_file", "browser"],
+        ),
+        (
+            True,
+            True,
+            {
+                "source_type",
+                "path",
+                "port",
+                "entry_path",
+                "browser_id",
+                "title",
+                "renderer",
+                "editable",
+                "alt_text",
+                "new_app",
+            },
+            ["workspace_file", "workspace_port", "browser"],
+        ),
+    ],
+)
+def test_set_schema_matches_both_attested_backend_capabilities(
+    live, browser, expected_properties, expected_source_types
+):
+    set_canvas = _tool(
+        create_canvas_tools(_capability_context(live=live, browser=browser)),
+        "set_canvas",
+    )
+    schema = set_canvas.args_schema.model_json_schema()
+    assert set(schema["properties"]) == expected_properties
+    source_schema = schema["properties"]["source_type"]
+    advertised = (
+        [source_schema["const"]] if "const" in source_schema else source_schema["enum"]
+    )
+    assert advertised == expected_source_types
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"source_type": "browser"},
+        {"source_type": "browser", "browser_id": "current", "path": "a.md"},
+        {
+            "source_type": "browser",
+            "browser_id": "current",
+            "alt_text": "browser",
+        },
+        {
+            "source_type": "browser",
+            "browser_id": "current",
+            "renderer": "html",
+        },
+        {
+            "source_type": "browser",
+            "browser_id": "current",
+            "editable": True,
+        },
+        {
+            "source_type": "browser",
+            "browser_id": "current",
+            "port": 8501,
+        },
+        {
+            "source_type": "browser",
+            "browser_id": "current",
+            "entry_path": "/",
+        },
+        {
+            "source_type": "browser",
+            "browser_id": "current",
+            "new_app": True,
+        },
+        {
+            "source_type": "workspace_file",
+            "path": "a.md",
+            "browser_id": "current",
+        },
+        {
+            "source_type": "workspace_port",
+            "port": 8501,
+            "browser_id": "current",
+        },
+    ],
+)
+def test_browser_set_schema_rejects_missing_or_cross_kind_fields(payload):
+    set_canvas = _tool(
+        create_canvas_tools(_capability_context(live=True, browser=True)),
+        "set_canvas",
+    )
+    with pytest.raises(ValidationError):
+        set_canvas.args_schema.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -338,19 +485,22 @@ async def test_set_port_sends_exact_flat_payload_and_redacts_returned_source(
     clients, identities = canvas_client
     events: list[tuple[str, dict[str, Any]]] = []
     client = _CanvasClient()
-    client.set_result = _state(
-        source={
-            "type": "workspace_app",
-            "entry_path": "/demo",
-            "entry_port": 8501,
-            "origin_generation": "origin-secret",
-            "workspace_generation": "workspace-secret",
-            "host": "10.0.0.9",
-        },
-        title="Prototype",
-        renderer="auto",
-        source_version=None,
-        status="starting",
+    client.set_result = CanvasSetResult(
+        state=_state(
+            source={
+                "type": "workspace_app",
+                "entry_path": "/demo",
+                "entry_port": 8501,
+                "origin_generation": "origin-secret",
+                "workspace_generation": "workspace-secret",
+                "host": "10.0.0.9",
+            },
+            title="Prototype",
+            renderer="auto",
+            source_version=None,
+            status="starting",
+        ),
+        changed=True,
     )
 
     def factory(config_name: str, *, user_id: str | None = None):
@@ -405,6 +555,82 @@ async def test_set_port_sends_exact_flat_payload_and_redacts_returned_source(
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_set_browser_sends_exact_payload_redacts_identity_and_emits_once(
+    monkeypatch,
+):
+    events: list[tuple[str, dict[str, Any]]] = []
+    browser_state = _state(
+        source={
+            "type": "browser",
+            "browser_generation": "private-generation",
+            "stream_port": 9223,
+            "token": "private-token",
+        },
+        title="Research browser",
+        renderer="auto",
+        source_version=None,
+        capabilities={
+            "can_edit": False,
+            "can_pop_out": True,
+            "can_take_control": True,
+            "can_stream_browser": True,
+        },
+    )
+    changed_client = _CanvasClient()
+    changed_client.set_result = CanvasSetResult(state=browser_state, changed=True)
+    repeated_client = _CanvasClient()
+    repeated_client.set_result = CanvasSetResult(state=browser_state, changed=False)
+    clients = iter((changed_client, repeated_client))
+    monkeypatch.setattr(
+        "src.tools.canvas._new_orchestrator_client", lambda *a, **kw: next(clients)
+    )
+    set_canvas = _tool(
+        create_canvas_tools(
+            _capability_context(
+                live=False,
+                browser=True,
+                callback=lambda method, params: events.append((method, params)),
+            )
+        ),
+        "set_canvas",
+    )
+    arguments = {
+        "source_type": "browser",
+        "browser_id": "current",
+        "title": "Research browser",
+    }
+
+    first = await set_canvas.ainvoke(arguments)
+    repeated = await set_canvas.ainvoke(arguments)
+
+    expected_payload = {
+        "source_type": "browser",
+        "browser_id": "current",
+        "renderer": "auto",
+        "editable": False,
+        "title": "Research browser",
+    }
+    assert changed_client.set_calls == [("thread-1", expected_payload)]
+    assert repeated_client.set_calls == [("thread-1", expected_payload)]
+    assert first["source"] == {"type": "browser"}
+    assert repeated["source"] == {"type": "browser"}
+    assert "can_stream_browser" not in first["capabilities"]
+    assert events == [
+        (
+            "canvas.updated",
+            {
+                "canvas_id": "main",
+                "presentation_revision": 3,
+                "updated_at": "2026-07-13T10:00:00Z",
+                "source_type": "browser",
+            },
+        )
+    ]
+    assert changed_client.closed is True
+    assert repeated_client.closed is True
 
 
 @pytest.mark.asyncio
