@@ -344,14 +344,14 @@ class TestRenderTemplate:
         )
 
     def test_render_default_agent_config(self, controller):
-        """agent_config defaults to 'defaults' when not specified."""
+        """agent_config defaults to 'worker_base' when not specified."""
         config = {"job_id": "test-id"}
         result = controller.render_template(config)
 
         user_data = result["spec"]["template"]["spec"]["volumes"][1][
             "cloudInitNoCloud"
         ]["userData"]
-        assert "AGENT_CONFIG=defaults" in user_data
+        assert "AGENT_CONFIG=worker_base" in user_data
 
     def test_render_empty_tailscale_key(self, controller):
         """Empty tailscale auth key results in empty placeholder."""

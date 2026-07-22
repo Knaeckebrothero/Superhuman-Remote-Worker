@@ -8,6 +8,8 @@ import asyncio
 import importlib.machinery
 import importlib.util
 import json
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -466,7 +468,27 @@ class TestActiveTargetLifecycle:
 
         asyncio.run(run())
 
-    def test_target_blank_click_explicitly_switches_browser_use_focus(self):
+    def test_target_blank_click_explicitly_switches_browser_use_focus(
+        self, monkeypatch
+    ):
+        # `_switch_to_new_click_target` is the one exercised path that trips the
+        # daemon's lazy `browser_use` import (see module docstring). browser-use
+        # is a workspace-image dependency, not a CI/test one, so stand in the
+        # single event class it imports. monkeypatch.setitem unwinds the
+        # sys.modules entries afterwards so the stub can't leak into other tests.
+        class SwitchTabEvent:
+            def __init__(self, target_id):
+                self.target_id = target_id
+
+        events = types.ModuleType("browser_use.browser.events")
+        events.SwitchTabEvent = SwitchTabEvent
+        for name, mod in (
+            ("browser_use", types.ModuleType("browser_use")),
+            ("browser_use.browser", types.ModuleType("browser_use.browser")),
+            ("browser_use.browser.events", events),
+        ):
+            monkeypatch.setitem(sys.modules, name, mod)
+
         async def run():
             daemon = BE.BrowserDaemon()
             dispatched = []

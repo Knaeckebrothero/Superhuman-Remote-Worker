@@ -289,11 +289,19 @@ def endpoint_collaborators(monkeypatch, fake_conn):
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
     monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock(return_value=agent))
     monkeypatch.setattr(main.postgres_db, "merge_job_context", AsyncMock())
+    queue_for_resume = AsyncMock(return_value=True)
+    monkeypatch.setattr(main.postgres_db, "queue_job_for_resume", queue_for_resume)
     monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
     monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
     delegate = AsyncMock(return_value=True)
     monkeypatch.setattr(main, "_resume_job_on_agent", delegate)
-    return SimpleNamespace(job=job, agent=agent, delegate=delegate, conn=fake_conn)
+    return SimpleNamespace(
+        job=job,
+        agent=agent,
+        delegate=delegate,
+        conn=fake_conn,
+        queue_for_resume=queue_for_resume,
+    )
 
 
 class TestResumeEndpointDelegation:
@@ -334,5 +342,8 @@ class TestResumeEndpointDelegation:
 
         assert result["status"] == "queued"
         assert result["job_id"] == JOB_ID
-        queue_sql = endpoint_collaborators.conn.execute.await_args.args[0]
-        assert "SET status = 'paused', assigned_agent_id = NULL" in queue_sql
+        # The re-queue WRITE itself (status flip, agent unassign, freeze shed —
+        # the dispatcher-visibility contract) is locked against real Postgres in
+        # tests/test_queue_job_for_resume.py. Here we only pin the seam: a
+        # declined delegation must fall back to that write.
+        endpoint_collaborators.queue_for_resume.assert_awaited_once_with(JOB_ID, None)
