@@ -2,11 +2,20 @@ import {provideHttpClient} from '@angular/common/http';
 import {HttpTestingController, provideHttpClientTesting} from '@angular/common/http/testing';
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
+import {Router} from '@angular/router';
+import {TranslocoService} from '@jsverse/transloco';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {CanvasState} from '../../core/models/canvas.model';
 import {CanvasService} from '../../core/services/canvas.service';
 import {CanvasContentController} from './canvas-content.controller';
-import {canvasResetTargetMatches, openCanvasPopOut} from './canvas-pane.component';
+import {CanvasBrowserController} from './canvas-browser.controller';
+import {CanvasEditController} from './canvas-edit.controller';
+import {
+  CanvasPaneComponent,
+  canvasResetTargetMatches,
+  openCanvasPopOut,
+} from './canvas-pane.component';
+import {CanvasViewerController} from './canvas-viewer.controller';
 
 function contentUrl(revision: number): string {
   return (
@@ -265,5 +274,75 @@ describe('Canvas pane trusted chrome', () => {
       8,
       'workspace_app:/other',
     )).toBe(false);
+  });
+
+  it('syncs the pane-local browser controller for the selected browser renderer', () => {
+    const browser = {syncPresentation: vi.fn()};
+    const state = signal<CanvasState | null>(canvasState(4, 'auto', {
+      source: {type: 'browser'},
+      source_version: null,
+      capabilities: {
+        can_edit: false,
+        can_pop_out: true,
+        can_take_control: true,
+        can_stream_browser: true,
+      },
+    }));
+    const canvas = {
+      threadId: signal<string | null>('thread-1'),
+      state,
+      stateEtag: signal<string | null>('"canvas:4:browser"'),
+      loadStatus: signal<'idle' | 'loading' | 'ready' | 'error'>('ready'),
+      lastSuccessfulSyncAt: signal<number | null>(null),
+      reconcile: vi.fn(),
+    };
+    const content = {
+      displayRenderer: signal('unsupported'),
+      displayState: signal<CanvasState | null>(null),
+      displaySourceKey: signal<string | null>(null),
+      textContent: signal(''),
+      contentEtag: signal<string | null>(null),
+      imageUrl: signal<string | null>(null),
+      contentStatus: signal('idle'),
+      contentErrorCode: signal<string | null>(null),
+      syncPresentation: vi.fn(),
+    };
+    const editor = {
+      hasSession: signal(false),
+      dirty: signal(false),
+      conflict: signal(null),
+      sessionState: signal<CanvasState | null>(null),
+      sessionRenderer: signal('unsupported'),
+      buffer: signal(''),
+      editMode: signal(false),
+      sync: vi.fn(),
+    };
+    const viewer = {syncPresentation: vi.fn()};
+
+    TestBed.configureTestingModule({
+      providers: [
+        {provide: CanvasService, useValue: canvas},
+        {provide: CanvasContentController, useValue: content},
+        {provide: CanvasEditController, useValue: editor},
+        {provide: CanvasViewerController, useValue: viewer},
+        {provide: CanvasBrowserController, useValue: browser},
+        {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+        {provide: Router, useValue: {}},
+      ],
+    });
+    try {
+      TestBed.runInInjectionContext(() => new CanvasPaneComponent());
+      TestBed.flushEffects();
+
+      expect(browser.syncPresentation).toHaveBeenCalledWith(true, 'thread-1', state());
+      expect(viewer.syncPresentation).toHaveBeenCalledWith(
+        false,
+        'thread-1',
+        state(),
+        '"canvas:4:browser"',
+      );
+    } finally {
+      TestBed.resetTestingModule();
+    }
   });
 });
