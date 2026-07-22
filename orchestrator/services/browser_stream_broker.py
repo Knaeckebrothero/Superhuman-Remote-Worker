@@ -239,6 +239,26 @@ async def _close_ws(ws, code: int = 1000, reason: str | None = None) -> None:
         pass
 
 
+async def _reject_ws(ws, code: int, reason: str) -> None:
+    """Complete the handshake before sending a contractual close code.
+
+    ASGI servers turn ``websocket.close`` before ``websocket.accept`` into an
+    HTTP handshake denial. Real browsers then observe an abnormal ``1006``
+    close instead of the application code, so Cockpit cannot distinguish a
+    viewer limit, stale generation, or disabled feature from a network flap.
+    Accepting and immediately closing exposes no browser payload while making
+    the fail-closed reason observable to the admitted client.
+    """
+
+    try:
+        await ws.accept()
+    except Exception:
+        # The peer may disappear during admission. ``_close_ws`` is already
+        # exception-safe, so let it make the final best-effort close.
+        pass
+    await _close_ws(ws, code, reason)
+
+
 async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     """Relay binary WebSocket frames through a generation-pinned SSH channel.
 
@@ -250,43 +270,43 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     # This must be the first admission check so cross-site probes cannot use
     # close codes to distinguish feature, authentication, or thread state.
     if not websocket_origin_allowed(ws.headers):
-        await _close_ws(ws, 4403, "Origin not allowed")
+        await _reject_ws(ws, 4403, "Origin not allowed")
         return
 
     try:
         config = browser_stream_config()
     except BrowserStreamConfigurationError:
-        await _close_ws(ws, 4404, "Shared browser is not enabled")
+        await _reject_ws(ws, 4404, "Shared browser is not enabled")
         return
     if not config.enabled:
-        await _close_ws(ws, 4404, "Shared browser is not enabled")
+        await _reject_ws(ws, 4404, "Shared browser is not enabled")
         return
 
     user = await resolve_ws_user(ws, db)
     if not user:
-        await _close_ws(ws, 4401, "Authentication required")
+        await _reject_ws(ws, 4401, "Authentication required")
         return
     if not user.get("is_approved"):
-        await _close_ws(ws, 4403, "Account pending approval")
+        await _reject_ws(ws, 4403, "Account pending approval")
         return
 
     thread = await db.get_thread(thread_id)
     if not thread or str(thread.get("user_id") or "") != str(user.get("id") or ""):
-        await _close_ws(ws, 4403, "Thread access denied")
+        await _reject_ws(ws, 4403, "Thread access denied")
         return
     if not workspace_ready(thread):
-        await _close_ws(ws, 4503, "Workspace not ready")
+        await _reject_ws(ws, 4503, "Workspace not ready")
         return
     try:
         _resolve_reachable_target(thread)
         _resolve_key_path()
     except Exception:
-        await _close_ws(ws, 4503, "Workspace SSH unavailable")
+        await _reject_ws(ws, 4503, "Workspace SSH unavailable")
         return
 
     reserved = False
     if not _reserve_viewer(thread_id, config.max_viewers):
-        await _close_ws(ws, 4429, "Viewer limit reached")
+        await _reject_ws(ws, 4429, "Viewer limit reached")
         return
     reserved = True
 
@@ -305,7 +325,7 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
                 generation_resolver=generation_resolver,
             )
         except BrowserStreamUnavailable:
-            await _close_ws(ws, 4502, "Browser unreachable")
+            await _reject_ws(ws, 4502, "Browser unreachable")
             return
 
         # Startup is deliberately outside the accepted WebSocket. Re-admit
@@ -314,34 +334,34 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
         try:
             current_config = browser_stream_config()
         except BrowserStreamConfigurationError:
-            await _close_ws(ws, 4404, "Shared browser is not enabled")
+            await _reject_ws(ws, 4404, "Shared browser is not enabled")
             return
         if not current_config.enabled:
-            await _close_ws(ws, 4404, "Shared browser is not enabled")
+            await _reject_ws(ws, 4404, "Shared browser is not enabled")
             return
 
         current_user = await resolve_ws_user(ws, db)
         if not current_user:
-            await _close_ws(ws, 4401, "Authentication required")
+            await _reject_ws(ws, 4401, "Authentication required")
             return
         if not current_user.get("is_approved"):
-            await _close_ws(ws, 4403, "Account pending approval")
+            await _reject_ws(ws, 4403, "Account pending approval")
             return
 
         current_thread = await db.get_thread(thread_id)
         if not current_thread or str(current_thread.get("user_id") or "") != str(
             current_user.get("id") or ""
         ):
-            await _close_ws(ws, 4403, "Thread access denied")
+            await _reject_ws(ws, 4403, "Thread access denied")
             return
         if not workspace_ready(current_thread):
-            await _close_ws(ws, 4503, "Workspace not ready")
+            await _reject_ws(ws, 4503, "Workspace not ready")
             return
         try:
             target = _resolve_reachable_target(current_thread)
             key_path = _resolve_key_path()
         except Exception:
-            await _close_ws(ws, 4503, "Workspace SSH unavailable")
+            await _reject_ws(ws, 4503, "Workspace SSH unavailable")
             return
 
         # The durable Canvas pointer is the browser identity authority. Missing,
@@ -354,10 +374,10 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
             None,
         )
         if staged is None or str(staged) != str(info.get("generation")):
-            await _close_ws(ws, 4409, "Browser generation ended")
+            await _reject_ws(ws, 4409, "Browser generation ended")
             return
         if int(info["port"]) != current_config.stream_port:
-            await _close_ws(ws, 4502, "Browser unreachable")
+            await _reject_ws(ws, 4502, "Browser unreachable")
             return
 
         await ws.accept()
@@ -448,7 +468,7 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
             exc_info=True,
         )
         if not accepted:
-            await _close_ws(ws, 4502, "Browser unreachable")
+            await _reject_ws(ws, 4502, "Browser unreachable")
     finally:
         if reserved:
             _release_viewer(thread_id)
