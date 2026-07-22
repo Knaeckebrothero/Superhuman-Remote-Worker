@@ -81,6 +81,40 @@ those Task-14 release gates are incomplete, chart defaults and the committed
 Tilt profile remain off; the full container UI is available only when an
 operator explicitly enables the feature.
 
+## Delivery sequence and next plan
+
+The work now has three explicit phases:
+
+1. **Plan 1 — backend pipe (complete):** workspace daemon, Chromium/CDP
+   screencast, baton authority, pinned-SSH broker, generation-pinned Canvas
+   source, and default-off infrastructure.
+2. **Plan 2 — user window and handoff (implementation complete):** agent
+   presentation/refusal behavior plus the Cockpit open, view, drive, popout,
+   reconnect, and restart experience. Its release-acceptance Task 14 remains
+   partial for the environmental reasons in the verification record.
+3. **Plan 3 — release and enablement (next; execution plan not yet authored):**
+   turn the remaining acceptance work into a reproducible gate, close it on
+   suitable infrastructure, and only then enable the committed local
+   development profile.
+
+Plan 3 should carry forward the four deliberately unchecked Plan-2 steps, not
+reimplement the browser:
+
+- automate the complete live flow on a fresh, healthy ephemeral k3d cluster,
+  including feature-off behavior and an actual orchestrator pod replacement;
+- run prompt-driven handoff through a known-good disposable LLM endpoint and a
+  deterministic workspace-local form, proving DOM, cookie, and baton
+  continuity through the agent rather than only the executor;
+- build the stage-2 VM image with Packer and the required stage-1 qcow2, run
+  the shared browser conformance program, and retain runtime denial until SSH
+  binding and routing are independently attested; and
+- after those gates pass, enable only `deployment/values-tilt.yaml` and prove
+  chart defaults plus customer/external overlays remain disabled.
+
+Agent-initiated “please take control” requests, pushed baton events, multi-tab
+UI, and other collaboration features are a later product plan. They are not a
+substitute for shipping the implemented v1 safely.
+
 ## Motivation
 
 The agent runs in a black box. The user has several windows into what it's

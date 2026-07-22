@@ -75,6 +75,13 @@ ended/restart. See `docs/tests/shared_browser_verification.md` for the redacted
 record and the exact incomplete gates. Because those gates are incomplete,
 `deployment/values-tilt.yaml` remains disabled.
 
+**Next-plan handoff:** Plan 3 should be a release-and-enablement plan, not a
+third implementation of the browser. It inherits the four unchecked Task-14
+steps: VM image conformance, prompt-driven same-browser/form-cookie acceptance,
+full live failure-boundary acceptance on healthy k3d networking, and guarded
+Tilt enablement. Agent-initiated takeover requests and pushed baton events stay
+outside that release plan as later product work.
+
 ## Baseline and release boundary
 
 Plan 1 is already implemented: the daemon framing/listener/screencast/baton,

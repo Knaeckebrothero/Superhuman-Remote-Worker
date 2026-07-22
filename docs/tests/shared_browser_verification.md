@@ -134,3 +134,10 @@ partially complete because the three boundaries above prevent the plan's full
 acceptance definition. Chart defaults remain off, the experimental profile
 remains explicitly on, and `deployment/values-tilt.yaml` was deliberately not
 enabled.
+
+The next implementation document should be **Plan 3 — Shared Browser Release
+and Enablement**. It should convert the remaining Plan-2 Task-14 work into a
+repeatable acceptance harness, run it on infrastructure with healthy pod
+networking, a usable disposable LLM endpoint, Packer, and the stage-1 VM image,
+then enable only the Tilt overlay after every gate passes. New collaboration
+features are explicitly deferred until this release checkpoint is closed.
