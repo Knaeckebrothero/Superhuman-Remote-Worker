@@ -369,6 +369,10 @@ export class CanvasBrowserController {
       case 4429:
         this.finishTerminal('viewer_limit', 'viewer_limit');
         break;
+      case 1012:
+        // Uvicorn sends Service Restart during a graceful pod rollout. The
+        // close is clean, but the browser source and generation are still
+        // valid; reconnect through the replacement orchestrator pod.
       case 4502:
         this.scheduleReconnect('browser_stream_unavailable');
         break;
