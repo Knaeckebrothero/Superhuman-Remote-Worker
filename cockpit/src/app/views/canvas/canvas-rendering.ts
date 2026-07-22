@@ -11,6 +11,7 @@ export type CanvasTrustedRenderer =
   | 'html'
   | 'image'
   | 'app'
+  | 'browser'
   | 'unsupported';
 
 const MARKDOWN_TAGS = [
@@ -163,6 +164,13 @@ export function resolveCanvasContentUrl(
 /** The backend normally resolves `auto`; an unknown/new source fails closed. */
 export function selectCanvasRenderer(state: CanvasState | null): CanvasTrustedRenderer {
   if (
+    state?.source?.type === 'browser' &&
+    state.renderer === 'auto' &&
+    state.capabilities.can_stream_browser === true
+  ) {
+    return 'browser';
+  }
+  if (
     state?.source?.type === 'workspace_app' &&
     state.renderer === 'auto' &&
     state.capabilities.can_create_viewer_session === true
@@ -260,6 +268,9 @@ export function canvasSourceKey(state: CanvasState | null): string | null {
   if (state.source.type === 'workspace_file') return `workspace_file:${state.source.path}`;
   if (state.source.type === 'workspace_app') {
     return `workspace_app:${state.source.manifest_path ?? ''}:${state.source.entry_path ?? ''}`;
+  }
+  if (state.source.type === 'browser') {
+    return `browser:${state.presentation_revision}`;
   }
   return state.source.type;
 }

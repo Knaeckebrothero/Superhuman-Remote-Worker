@@ -65,6 +65,23 @@ export interface CanvasCapabilities {
    * capability shape; absence always means unsupported.
    */
   readonly can_create_viewer_session?: boolean;
+  /** Positive authority for attaching to an already-staged shared browser. */
+  readonly can_stream_browser?: boolean;
+}
+
+export type BrowserCapabilityReason =
+  | 'feature_disabled'
+  | 'workspace_required'
+  | 'workspace_unattested'
+  | 'workspace_unroutable'
+  | 'transport_unavailable';
+
+/** Owner-scoped capability for creating or recovering a shared browser. */
+export interface BrowserCapability {
+  readonly feature_enabled: boolean;
+  readonly can_open_browser: boolean;
+  readonly workspace_ready: boolean;
+  readonly reason: BrowserCapabilityReason | null;
 }
 
 export interface CanvasViewAttachment {

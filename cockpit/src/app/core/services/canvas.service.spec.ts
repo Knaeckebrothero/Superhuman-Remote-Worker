@@ -6,7 +6,11 @@ import {
 } from '@angular/common/http/testing';
 import {TestBed} from '@angular/core/testing';
 import {CanvasState} from '../models/canvas.model';
-import {CanvasService, parseCanvasBroadcastInvalidation} from './canvas.service';
+import {
+  CanvasService,
+  isCanvasState,
+  parseCanvasBroadcastInvalidation,
+} from './canvas.service';
 import {PersistentThreadTransportBridge} from './persistent-thread-transport-bridge.service';
 
 function canvasState(
@@ -32,6 +36,29 @@ function canvasState(
     ...overrides,
   };
 }
+
+describe('Canvas state validation', () => {
+  it('accepts only a boolean optional browser-stream capability', () => {
+    const base = canvasState(1);
+    expect(isCanvasState(base)).toBe(true);
+    expect(isCanvasState({
+      ...base,
+      capabilities: {...base.capabilities, can_stream_browser: true},
+    })).toBe(true);
+    expect(isCanvasState({
+      ...base,
+      capabilities: {...base.capabilities, can_stream_browser: false},
+    })).toBe(true);
+    expect(isCanvasState({
+      ...base,
+      capabilities: {...base.capabilities, can_stream_browser: 'true'},
+    })).toBe(false);
+    expect(isCanvasState({
+      ...base,
+      capabilities: {...base.capabilities, future_capability: {version: 2}},
+    })).toBe(true);
+  });
+});
 
 describe('CanvasService', () => {
   let service: CanvasService;
