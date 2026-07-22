@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -73,6 +74,92 @@ class _StubFiles:
         if url.startswith("file://"):
             return "http://127.0.0.1:45678/mock.html"
         return url
+
+
+class _FakePageRegister:
+    def __init__(self):
+        self.callbacks = {}
+        self.counts = {}
+
+    def __getattr__(self, name):
+        def register(callback):
+            self.callbacks[name] = callback
+            self.counts[name] = self.counts.get(name, 0) + 1
+
+        return register
+
+
+class _FakePageSend:
+    def __init__(self, client):
+        self.client = client
+
+    async def getLayoutMetrics(self, *, session_id):
+        self.client.calls.append(("metrics", session_id))
+        return {"cssVisualViewport": {"clientWidth": 1024, "clientHeight": 640}}
+
+    async def getFrameTree(self, *, session_id):
+        self.client.calls.append(("frame_tree", session_id))
+        target = session_id.removeprefix("session-")
+        return {
+            "frameTree": {
+                "frame": {
+                    "id": f"frame-{target}",
+                    "url": f"https://{target}.example.test/",
+                }
+            }
+        }
+
+    async def startScreencast(self, *, params, session_id):
+        self.client.calls.append(("start", session_id, params))
+
+    async def stopScreencast(self, *, session_id):
+        self.client.calls.append(("stop", session_id))
+
+    async def screencastFrameAck(self, *, params, session_id):
+        self.client.calls.append(("ack", session_id, params["sessionId"]))
+
+
+class _FakeInputSend:
+    async def dispatchMouseEvent(self, **kwargs):
+        del kwargs
+
+    async def dispatchKeyEvent(self, **kwargs):
+        del kwargs
+
+
+class _FakeCdpClient:
+    def __init__(self):
+        page_register = _FakePageRegister()
+        self.register = SimpleNamespace(Page=page_register)
+        self.calls = []
+        self.send = SimpleNamespace(
+            Page=_FakePageSend(self),
+            Input=_FakeInputSend(),
+        )
+
+
+class _FakeBrowserSession:
+    def __init__(self, client=None):
+        self.client = client or _FakeCdpClient()
+        self.agent_focus_target_id = "A"
+        self.cdp_calls = []
+        self.url = "https://A.example.test/"
+        self.title = "Target A"
+
+    async def get_or_create_cdp_session(self, target_id=None):
+        target_id = target_id or self.agent_focus_target_id
+        self.cdp_calls.append(target_id)
+        return SimpleNamespace(
+            target_id=target_id,
+            session_id=f"session-{target_id}",
+            cdp_client=self.client,
+        )
+
+    async def get_current_page_url(self):
+        return self.url
+
+    async def get_current_page_title(self):
+        return self.title
 
 
 class TestValidateUserNav:
@@ -162,7 +249,7 @@ class TestStreamHub:
         async def run():
             hub = BE.StreamHub()
             queue = asyncio.Queue(maxsize=2)
-            hub.add_viewer(queue)
+            hub.add_viewer(queue, 3)
             for frame in (b"f1", b"f2", b"f3"):
                 hub.broadcast(frame)
             assert queue.qsize() == 2
@@ -171,13 +258,29 @@ class TestStreamHub:
 
         asyncio.run(run())
 
+    def test_mixed_replica_limits_only_tighten_until_zero_viewers(self):
+        hub = BE.StreamHub()
+        first = hub.add_viewer(asyncio.Queue(), 5)
+        second = hub.add_viewer(asyncio.Queue(), 6)
+
+        assert first is not None and second is not None
+        assert hub.viewer_limit == 5
+        assert hub.add_viewer(asyncio.Queue(), 1) is None
+        assert hub.viewer_limit == 1
+
+        hub.remove_viewer(first)
+        hub.remove_viewer(second)
+        assert hub.viewer_limit is None
+        assert hub.add_viewer(asyncio.Queue(), 6) is not None
+        assert hub.viewer_limit == 6
+
     def test_auto_release_after_last_viewer_leaves(self, monkeypatch):
         monkeypatch.setattr(BE, "BATON_GRACE_S", 0.05)
 
         async def run():
             hub = BE.StreamHub()
             hub.mint_generation("user")
-            viewer_id = hub.add_viewer(asyncio.Queue(maxsize=4))
+            viewer_id = hub.add_viewer(asyncio.Queue(maxsize=4), 3)
             hub.remove_viewer(viewer_id)
             assert hub.baton == "user"
             await asyncio.sleep(0.15)
@@ -191,11 +294,211 @@ class TestStreamHub:
         async def run():
             hub = BE.StreamHub()
             hub.mint_generation("user")
-            viewer_id = hub.add_viewer(asyncio.Queue(maxsize=4))
+            viewer_id = hub.add_viewer(asyncio.Queue(maxsize=4), 3)
             hub.remove_viewer(viewer_id)
-            hub.add_viewer(asyncio.Queue(maxsize=4))
+            hub.add_viewer(asyncio.Queue(maxsize=4), 3)
             await asyncio.sleep(0.15)
             assert hub.baton == "user"
+
+        asyncio.run(run())
+
+
+class TestScreencastCdp:
+    @staticmethod
+    def _adapter():
+        session = _FakeBrowserSession()
+        hub = BE.StreamHub()
+        hub.mint_generation()
+        return BE.ScreencastCdp(session, hub), session, hub
+
+    def test_main_frame_loading_and_subframes(self):
+        async def run():
+            adapter, session, hub = self._adapter()
+            await adapter.start("A")
+
+            adapter._on_frame_started_loading_event(
+                {"frameId": "subframe"}, "session-A"
+            )
+            assert hub.state_extra["loading"] is False
+            adapter._on_frame_started_loading_event({"frameId": "frame-A"}, "session-A")
+            assert hub.state_extra["loading"] is True
+            adapter._on_frame_stopped_loading_event(
+                {"frameId": "subframe"}, "session-A"
+            )
+            assert hub.state_extra["loading"] is True
+
+            session.url = "https://A.example.test/loaded"
+            session.title = "Loaded A"
+            adapter._on_frame_stopped_loading_event({"frameId": "frame-A"}, "session-A")
+            await asyncio.sleep(0)
+
+            assert hub.state_extra == {
+                "url": "https://A.example.test/loaded",
+                "title": "Loaded A",
+                "loading": False,
+            }
+
+        asyncio.run(run())
+
+    def test_target_switch_rejects_stale_events_and_acks_old_frame(self):
+        async def run():
+            adapter, session, hub = self._adapter()
+            queue = asyncio.Queue()
+            hub.add_viewer(queue, 3)
+            await adapter.start("A")
+            session.agent_focus_target_id = "B"
+            session.url = "https://B.example.test/"
+            session.title = "Target B"
+            await adapter.start("B")
+            state = dict(hub.state_extra)
+
+            adapter._on_navigated_event(
+                {"frame": {"id": "old", "url": "https://stale.test/"}},
+                "session-A",
+            )
+            adapter._on_frame_started_loading_event({"frameId": "frame-A"}, "session-A")
+            await adapter._handle_frame(
+                {
+                    "data": BE.base64.b64encode(b"jpeg").decode(),
+                    "metadata": {},
+                    "sessionId": 91,
+                },
+                "session-A",
+            )
+
+            assert hub.state_extra == state
+            assert queue.empty()
+            assert ("stop", "session-A") in session.client.calls
+            assert any(
+                call[:2] == ("start", "session-B") for call in session.client.calls
+            )
+            assert ("ack", "session-A", 91) in session.client.calls
+
+        asyncio.run(run())
+
+    def test_callbacks_are_not_duplicated_across_stop_start_cycles(self):
+        async def run():
+            adapter, session, _ = self._adapter()
+            for _ in range(3):
+                await adapter.start("A")
+                await adapter.stop()
+            await adapter.start("A")
+
+            assert session.client.register.Page.counts == {
+                "screencastFrame": 1,
+                "frameNavigated": 1,
+                "frameStartedLoading": 1,
+                "frameStoppedLoading": 1,
+            }
+
+        asyncio.run(run())
+
+
+class TestActiveTargetLifecycle:
+    class _Adapter:
+        def __init__(self):
+            self.targets = []
+            self.stops = 0
+
+        async def start(self, target_id=None):
+            self.targets.append(target_id)
+
+        async def stop(self):
+            self.stops += 1
+
+    def test_focus_changes_coalesce_to_newest_target(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+            session = _FakeBrowserSession()
+            adapter = self._Adapter()
+            daemon._session = session
+            daemon._screencast = adapter
+            daemon.hub.add_viewer(asyncio.Queue(), 3)
+            daemon._focus_change_revision = 1
+            task = asyncio.create_task(daemon._follow_agent_focus())
+            daemon._focus_change_task = task
+            session.agent_focus_target_id = "B"
+            daemon._focus_change_revision = 2
+
+            await task
+
+            assert adapter.targets == ["B"]
+
+        asyncio.run(run())
+
+    def test_focus_change_does_not_switch_without_viewers(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+            daemon._session = _FakeBrowserSession()
+            adapter = self._Adapter()
+            daemon._screencast = adapter
+            daemon._focus_change_revision = 1
+
+            await daemon._follow_agent_focus()
+
+            assert adapter.targets == []
+
+        asyncio.run(run())
+
+    def test_browser_close_stops_and_discards_adapter(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+            adapter = self._Adapter()
+
+            class Session:
+                stopped = False
+
+                async def stop(self):
+                    self.stopped = True
+
+            session = Session()
+            daemon._session = session
+            daemon._screencast = adapter
+            daemon.hub.mint_generation()
+
+            await daemon._close_session()
+
+            assert adapter.stops == 1
+            assert daemon._screencast is None
+            assert daemon._session is None
+            assert session.stopped is True
+            assert daemon.hub.generation is None
+
+        asyncio.run(run())
+
+    def test_target_blank_click_explicitly_switches_browser_use_focus(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+            dispatched = []
+
+            class DispatchResult:
+                def __await__(self):
+                    return self.wait().__await__()
+
+                async def wait(self):
+                    return None
+
+                async def event_result(self, **kwargs):
+                    assert kwargs == {"raise_if_any": True}
+
+            class EventBus:
+                def dispatch(self, event):
+                    dispatched.append(event)
+                    return DispatchResult()
+
+            class Session:
+                event_bus = EventBus()
+
+                async def get_tabs(self):
+                    return [
+                        SimpleNamespace(target_id="A"),
+                        SimpleNamespace(target_id="B"),
+                    ]
+
+            await daemon._switch_to_new_click_target(Session(), {"A"})
+
+            assert len(dispatched) == 1
+            assert dispatched[0].target_id == "B"
 
         asyncio.run(run())
 
@@ -363,6 +666,92 @@ class TestStreamListener:
 
         asyncio.run(run())
 
+    @pytest.mark.parametrize("limit", [None, True, 0, 17, "3"])
+    def test_invalid_hello_viewer_limit_gets_error_and_close(self, monkeypatch, limit):
+        async def run():
+            daemon = self._daemon(monkeypatch, 38896)
+            server = await BE.start_stream_server(daemon)
+            try:
+                reader, writer = await self._client(38896)
+                await self._send(
+                    writer,
+                    BE.T_HELLO,
+                    {
+                        "token": daemon.hub.token,
+                        "min_protocol": 1,
+                        "max_viewers": limit,
+                    },
+                )
+                frame_type, error = await self._recv(reader)
+                assert frame_type == BE.T_ERROR
+                assert error["code"] == "invalid_hello"
+                assert await reader.read(1) == b""
+                assert daemon.hub.viewers == {}
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(run())
+
+    def test_daemon_refuses_global_viewer_over_effective_limit(self, monkeypatch):
+        async def run():
+            daemon = self._daemon(monkeypatch, 38895)
+            starts = 0
+
+            async def count_start():
+                nonlocal starts
+                starts += 1
+
+            daemon.ensure_screencast = count_start
+            server = await BE.start_stream_server(daemon)
+            first_writer = None
+            second_writer = None
+            try:
+                first_reader, first_writer = await self._client(38895)
+                await self._send(
+                    first_writer,
+                    BE.T_HELLO,
+                    {
+                        "token": daemon.hub.token,
+                        "min_protocol": 1,
+                        "max_viewers": 1,
+                    },
+                )
+                frame_type, _ = await self._recv(first_reader)
+                assert frame_type == BE.T_STATE
+
+                second_reader, second_writer = await self._client(38895)
+                await self._send(
+                    second_writer,
+                    BE.T_HELLO,
+                    {
+                        "token": daemon.hub.token,
+                        "min_protocol": 1,
+                        "max_viewers": 16,
+                    },
+                )
+                frame_type, error = await self._recv(second_reader)
+                assert frame_type == BE.T_ERROR
+                assert error["code"] == "viewer_limit"
+                assert await second_reader.read(1) == b""
+                assert len(daemon.hub.viewers) == 1
+                assert daemon.hub.viewer_limit == 1
+                assert starts == 1
+            finally:
+                if second_writer is not None:
+                    second_writer.close()
+                    await second_writer.wait_closed()
+                if first_writer is not None:
+                    first_writer.close()
+                    await first_writer.wait_closed()
+                await asyncio.sleep(0.05)
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(run())
+
     def test_good_token_gets_state_then_baton_flip_broadcast(self, monkeypatch):
         async def run():
             daemon = self._daemon(monkeypatch, 38898)
@@ -372,7 +761,11 @@ class TestStreamListener:
                 await self._send(
                     writer,
                     BE.T_HELLO,
-                    {"token": daemon.hub.token, "min_protocol": 1},
+                    {
+                        "token": daemon.hub.token,
+                        "min_protocol": 1,
+                        "max_viewers": 3,
+                    },
                 )
                 frame_type, state = await self._recv(reader)
                 assert (frame_type, state["baton"]) == (BE.T_STATE, "user")
@@ -399,7 +792,11 @@ class TestStreamListener:
                 await self._send(
                     writer,
                     BE.T_HELLO,
-                    {"token": daemon.hub.token, "min_protocol": 1},
+                    {
+                        "token": daemon.hub.token,
+                        "min_protocol": 1,
+                        "max_viewers": 3,
+                    },
                 )
                 await self._recv(reader)
                 assert len(daemon.hub.viewers) == 1

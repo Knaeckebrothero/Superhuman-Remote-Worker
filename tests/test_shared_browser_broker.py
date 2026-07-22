@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+import json
 import logging
 import threading
 from types import SimpleNamespace
@@ -670,6 +671,11 @@ class TestRelayHappyPath:
 
         assert written[0][4] == broker.T_HELLO
         assert b'"token": "tok"' in written[0] or b'"token":"tok"' in written[0]
+        assert json.loads(written[0][5:]) == {
+            "token": "tok",
+            "min_protocol": 1,
+            "max_viewers": 3,
+        }
         assert any(
             frame[4] == broker.T_INPUT and frame[5:] == b"opaque-input"
             for frame in written[1:]
