@@ -9,8 +9,12 @@ import shlex
 import struct
 
 from security.auth import resolve_ws_user
+from security.csrf import websocket_origin_allowed
 from services import resolve_ssh_key_path
-from services.browser_stream_config import browser_stream_config
+from services.browser_stream_config import (
+    BrowserStreamConfigurationError,
+    browser_stream_config,
+)
 from services.canvas_ssh import (
     PINNED_SSH_TRANSPORT_POOL,
     CanvasSSHError,
@@ -22,6 +26,7 @@ from services.ssh_helpers import orchestrator_can_reach
 
 T_HELLO, T_FRAME, T_STATE, T_INPUT, T_CONTROL, T_ERROR = 1, 2, 3, 4, 5, 6
 MAX_STREAM_FRAME = 8 * 1024 * 1024
+MAX_BROWSER_CLIENT_MESSAGE = 64 * 1024
 STREAM_INFO_TIMEOUT_S = 45.0
 STREAM_INFO_MAX_OUTPUT = 64 * 1024
 
@@ -94,9 +99,7 @@ async def exec_stream_info(
             bound_workspace_generation(thread),
         )
         if not orchestrator_can_reach(target.host):
-            raise BrowserStreamUnavailable(
-                503, "workspace route is unavailable"
-            )
+            raise BrowserStreamUnavailable(503, "workspace route is unavailable")
         key_path = _resolve_key_path()
         result = await PINNED_SSH_TRANSPORT_POOL.run_command(
             target=target,
@@ -169,6 +172,15 @@ def _resolve_target(thread: dict):
     )
 
 
+def _resolve_reachable_target(thread: dict):
+    """Resolve the current attested workspace route, failing closed."""
+
+    target = _resolve_target(thread)
+    if not orchestrator_can_reach(target.host):
+        raise BrowserStreamUnavailable(503, "workspace route is unavailable")
+    return target
+
+
 async def _get_canvas_record(db, thread_id: str):
     """Load the staged browser identity, failing closed on storage errors."""
 
@@ -235,7 +247,17 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     without inspecting browser frame or input payloads.
     """
 
-    config = browser_stream_config()
+    # This must be the first admission check so cross-site probes cannot use
+    # close codes to distinguish feature, authentication, or thread state.
+    if not websocket_origin_allowed(ws.headers):
+        await _close_ws(ws, 4403, "Origin not allowed")
+        return
+
+    try:
+        config = browser_stream_config()
+    except BrowserStreamConfigurationError:
+        await _close_ws(ws, 4404, "Shared browser is not enabled")
+        return
     if not config.enabled:
         await _close_ws(ws, 4404, "Shared browser is not enabled")
         return
@@ -255,14 +277,25 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
     if not workspace_ready(thread):
         await _close_ws(ws, 4503, "Workspace not ready")
         return
+    try:
+        _resolve_reachable_target(thread)
+        _resolve_key_path()
+    except Exception:
+        await _close_ws(ws, 4503, "Workspace SSH unavailable")
+        return
+
+    reserved = False
     if not _reserve_viewer(thread_id, config.max_viewers):
         await _close_ws(ws, 4429, "Viewer limit reached")
         return
+    reserved = True
 
     accepted = False
     stream_failed = False
+    protocol_closed = False
     try:
         try:
+
             async def generation_resolver() -> dict:
                 current = await db.get_thread(thread_id)
                 return dict(current) if current else {}
@@ -273,6 +306,42 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
             )
         except BrowserStreamUnavailable:
             await _close_ws(ws, 4502, "Browser unreachable")
+            return
+
+        # Startup is deliberately outside the accepted WebSocket. Re-admit
+        # against fresh authority before exposing browser state or retaining
+        # the viewer slot for a live relay.
+        try:
+            current_config = browser_stream_config()
+        except BrowserStreamConfigurationError:
+            await _close_ws(ws, 4404, "Shared browser is not enabled")
+            return
+        if not current_config.enabled:
+            await _close_ws(ws, 4404, "Shared browser is not enabled")
+            return
+
+        current_user = await resolve_ws_user(ws, db)
+        if not current_user:
+            await _close_ws(ws, 4401, "Authentication required")
+            return
+        if not current_user.get("is_approved"):
+            await _close_ws(ws, 4403, "Account pending approval")
+            return
+
+        current_thread = await db.get_thread(thread_id)
+        if not current_thread or str(current_thread.get("user_id") or "") != str(
+            current_user.get("id") or ""
+        ):
+            await _close_ws(ws, 4403, "Thread access denied")
+            return
+        if not workspace_ready(current_thread):
+            await _close_ws(ws, 4503, "Workspace not ready")
+            return
+        try:
+            target = _resolve_reachable_target(current_thread)
+            key_path = _resolve_key_path()
+        except Exception:
+            await _close_ws(ws, 4503, "Workspace SSH unavailable")
             return
 
         # The durable Canvas pointer is the browser identity authority. Missing,
@@ -287,19 +356,15 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
         if staged is None or str(staged) != str(info.get("generation")):
             await _close_ws(ws, 4409, "Browser generation ended")
             return
-
-        try:
-            target = _resolve_target(thread)
-            key_path = _resolve_key_path()
-        except Exception:
-            await _close_ws(ws, 4503, "Workspace SSH unavailable")
+        if int(info["port"]) != current_config.stream_port:
+            await _close_ws(ws, 4502, "Browser unreachable")
             return
 
         await ws.accept()
         accepted = True
         async with _open_loopback(
             target=target,
-            destination_port=config.stream_port,
+            destination_port=current_config.stream_port,
             key_path=key_path,
             generation_resolver=generation_resolver,
         ) as (reader, writer):
@@ -311,13 +376,27 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
             await writer.drain()
 
             async def ws_to_tcp() -> None:
+                nonlocal protocol_closed
                 while True:
                     message = await ws.receive()
-                    if message["type"] == "websocket.disconnect":
+                    if (
+                        isinstance(message, dict)
+                        and message.get("type") == "websocket.disconnect"
+                    ):
                         return
-                    data = message.get("bytes")
-                    if not data or data[0] not in (T_INPUT, T_CONTROL):
-                        continue
+                    data = message.get("bytes") if isinstance(message, dict) else None
+                    if (
+                        not isinstance(message, dict)
+                        or message.get("type") != "websocket.receive"
+                        or message.get("text") is not None
+                        or not isinstance(data, bytes)
+                        or not data
+                        or len(data) > MAX_BROWSER_CLIENT_MESSAGE
+                        or data[0] not in (T_INPUT, T_CONTROL)
+                    ):
+                        protocol_closed = True
+                        await _close_ws(ws, 4400, "Invalid browser protocol message")
+                        return
                     writer.write(encode_stream_frame(data[0], data[1:]))
                     await writer.drain()
 
@@ -336,7 +415,7 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
                             thread_id,
                             exc_info=True,
                         )
-                    await asyncio.sleep(config.activity_interval_seconds)
+                    await asyncio.sleep(current_config.activity_interval_seconds)
 
             tasks = [
                 asyncio.create_task(ws_to_tcp()),
@@ -364,9 +443,12 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
             thread_id,
             exc_info=True,
         )
+        if not accepted:
+            await _close_ws(ws, 4502, "Browser unreachable")
     finally:
-        _release_viewer(thread_id)
-        if accepted:
+        if reserved:
+            _release_viewer(thread_id)
+        if accepted and not protocol_closed:
             if stream_failed:
                 await _close_ws(ws, 4502, "stream ended")
             else:
@@ -375,6 +457,7 @@ async def relay_browser_stream(ws, thread_id: str, *, db) -> None:
 
 __all__ = [
     "BrowserStreamUnavailable",
+    "MAX_BROWSER_CLIENT_MESSAGE",
     "MAX_STREAM_FRAME",
     "T_CONTROL",
     "T_ERROR",
