@@ -7097,7 +7097,7 @@ app.add_middleware(
     # local Cockpit dev server (4200) calls the orchestrator (8085)
     # cross-origin, so both non-secret response headers must be readable by
     # HttpClient there. Production remains same-origin behind the BFF.
-    expose_headers=["ETag", "X-Canvas-Content-ETag"],
+    expose_headers=["ETag", "X-Canvas-Content-ETag", "X-Canvas-Mutation-Changed"],
 )
 
 

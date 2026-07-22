@@ -4,7 +4,7 @@ import {ActivatedRoute, convertToParamMap, Router} from '@angular/router';
 import {BehaviorSubject} from 'rxjs';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {CanvasService} from '../../core/services/canvas.service';
-import {CanvasState} from '../../core/models/canvas.model';
+import {BrowserCapability, CanvasState} from '../../core/models/canvas.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -26,8 +26,14 @@ function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
     threadId: ReturnType<typeof signal<string | null>>;
     state: ReturnType<typeof signal<CanvasState | null>>;
     loadStatus: ReturnType<typeof signal<'idle' | 'loading' | 'ready' | 'error'>>;
+    browserCapability: ReturnType<typeof signal<BrowserCapability | null>>;
+    browserCapabilityStatus: ReturnType<typeof signal<'idle' | 'loading' | 'ready' | 'error'>>;
+    browserOpenStatus: ReturnType<typeof signal<'idle' | 'workspace' | 'browser' | 'error'>>;
+    browserOpenError: ReturnType<typeof signal<string | null>>;
     selectThread: ReturnType<typeof vi.fn>;
     reconcile: ReturnType<typeof vi.fn>;
+    openBrowser: ReturnType<typeof vi.fn>;
+    retryOpenBrowser: ReturnType<typeof vi.fn>;
   };
   viewport: {isMobile: ReturnType<typeof signal<boolean>>};
   router: {navigate: ReturnType<typeof vi.fn>};
@@ -47,11 +53,21 @@ function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
     threadId: signal<string | null>(null),
     state: signal<CanvasState | null>(null),
     loadStatus: signal<'idle' | 'loading' | 'ready' | 'error'>('idle'),
+    browserCapability: signal<BrowserCapability | null>(null),
+    browserCapabilityStatus: signal<'idle' | 'loading' | 'ready' | 'error'>('idle'),
+    browserOpenStatus: signal<'idle' | 'workspace' | 'browser' | 'error'>('idle'),
+    browserOpenError: signal<string | null>(null),
     selectThread: vi.fn(),
     reconcile: vi.fn(),
+    openBrowser: vi.fn(),
+    retryOpenBrowser: vi.fn(),
   };
   canvas.selectThread.mockImplementation((threadId: string | null) => {
     canvas.threadId.set(threadId);
+    canvas.browserCapability.set(null);
+    canvas.browserCapabilityStatus.set(threadId ? 'loading' : 'idle');
+    canvas.browserOpenStatus.set('idle');
+    canvas.browserOpenError.set(null);
     if (threadId === null) canvas.state.set(null);
   });
   const viewport = {isMobile: signal(false)};
@@ -260,6 +276,88 @@ describe('ChatPageComponent Canvas route selection', () => {
 
     expect(component.canvasAvailable()).toBe(true);
     expect(component.canvasOpen()).toBe(false);
+  });
+
+  it('keeps an explicitly opened empty browser host without auto-opening on discovery', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+
+    canvas.browserCapability.set({
+      feature_enabled: true,
+      can_open_browser: true,
+      workspace_ready: false,
+      reason: null,
+    });
+    canvas.browserCapabilityStatus.set('ready');
+    TestBed.tick();
+    expect(component.canvasAvailable()).toBe(true);
+    expect(component.canvasOpen()).toBe(false);
+
+    component.openCanvas();
+    TestBed.tick();
+    expect(component.canvasOpen()).toBe(true);
+
+    canvas.browserCapabilityStatus.set('loading');
+    TestBed.tick();
+    expect(component.canvasOpen()).toBe(true);
+  });
+
+  it('closes an empty browser host on an authoritative cleared state', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.browserCapability.set({
+      feature_enabled: true,
+      can_open_browser: true,
+      workspace_ready: true,
+      reason: null,
+    });
+    component.openCanvas();
+    canvas.state.set({...presentedState(2), source: null, status: 'cleared'});
+    TestBed.tick();
+
+    expect(component.canvasOpen()).toBe(false);
+  });
+
+  it('opens and starts the browser from chat but never replaces a dirty stage', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.browserCapability.set({
+      feature_enabled: true,
+      can_open_browser: true,
+      workspace_ready: true,
+      reason: null,
+    });
+
+    component.openSharedBrowser();
+    expect(component.canvasOpen()).toBe(true);
+    expect(canvas.openBrowser).toHaveBeenCalledOnce();
+
+    component.canvasDirty.set(true);
+    expect(component.browserActionDisabled()).toBe(true);
+    expect(component.browserActionTooltipKey()).toBe('canvas.browser.open.dirty');
+    component.openSharedBrowser();
+    expect(canvas.openBrowser).toHaveBeenCalledOnce();
+  });
+
+  it('keeps an unsupported feature-visible browser action disabled with its reason', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.browserCapability.set({
+      feature_enabled: true,
+      can_open_browser: false,
+      workspace_ready: false,
+      reason: 'workspace_required',
+    });
+
+    expect(component.browserActionVisible()).toBe(true);
+    expect(component.browserActionDisabled()).toBe(true);
+    expect(component.browserActionTooltipKey()).toBe(
+      'canvas.browser.reason.workspace_required',
+    );
   });
 });
 

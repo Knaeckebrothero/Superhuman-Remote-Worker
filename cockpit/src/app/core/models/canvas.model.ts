@@ -84,6 +84,9 @@ export interface BrowserCapability {
   readonly reason: BrowserCapabilityReason | null;
 }
 
+export type BrowserCapabilityStatus = 'idle' | 'loading' | 'ready' | 'error';
+export type BrowserOpenStatus = 'idle' | 'workspace' | 'browser' | 'error';
+
 export interface CanvasViewAttachment {
   readonly attachment_id: string;
   readonly origin: string;

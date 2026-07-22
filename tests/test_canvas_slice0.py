@@ -794,7 +794,7 @@ def test_main_cors_exposes_canvas_etag_to_local_cockpit(monkeypatch) -> None:
     )
     assert response.status_code == 200
     assert response.headers["access-control-expose-headers"] == (
-        "ETag, X-Canvas-Content-ETag"
+        "ETag, X-Canvas-Content-ETag, X-Canvas-Mutation-Changed"
     )
     assert response.headers["access-control-allow-origin"] == "http://localhost:4200"
 
