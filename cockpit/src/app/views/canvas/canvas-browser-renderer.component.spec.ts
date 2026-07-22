@@ -1,4 +1,5 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { readFileSync } from 'node:fs';
 import { TranslocoPipe, TranslocoTestingModule } from '@jsverse/transloco';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -10,13 +11,18 @@ import {
   ɵresolveComponentResources,
 } from '@angular/core';
 import { BrowserPageState } from './canvas-browser-protocol';
+import { CanvasService } from '../../core/services/canvas.service';
 import {
   CanvasBrowserConnectionStatus,
   CanvasBrowserController,
 } from './canvas-browser.controller';
 import { CanvasBrowserRendererComponent } from './canvas-browser-renderer.component';
 
-@Component({selector: 'app-icon-button', standalone: true, template: '<ng-content />'})
+@Component({
+  selector: 'app-icon-button',
+  standalone: true,
+  template: '<button type="button" [attr.aria-label]="ariaLabel" [disabled]="disabled" (click)="clicked.emit($event)"><ng-content /></button>',
+})
 class IconButtonStubComponent {
   @Input() size = '';
   @Input() ariaLabel = '';
@@ -30,6 +36,7 @@ class ButtonStubComponent {
   @Input() size = '';
   @Input() variant = '';
   @Input() disabled = false;
+  @Input() loading = false;
   @Output() readonly clicked = new EventEmitter<MouseEvent>();
 }
 
@@ -51,13 +58,17 @@ const translations = {
       noUrl: 'No page URL',
       loading: 'Page loading…',
       surfaceLabel: 'Shared browser page',
+      retryConnection: 'Retry connection',
+      restart: 'Restart browser',
       baton: {
         agent: 'Agent is driving',
         user: "You're driving",
         take: 'Take control',
         release: 'Release control',
+        pending: 'Waiting for browser…',
       },
       toolbar: {
+        label: 'Shared browser controls',
         back: 'Back',
         reload: 'Reload',
         address: 'Address',
@@ -71,7 +82,15 @@ const translations = {
         viewerLimit: 'Viewer limit',
         unauthorized: 'Unauthorized',
         unavailable: 'Unavailable',
+        disabled: 'Disabled',
         error: 'Protocol error',
+      },
+      open: {
+        phase: {
+          workspace: 'Starting workspace…',
+          browser: 'Starting browser…',
+        },
+        error: { failed: 'Browser open failed' },
       },
     },
   },
@@ -101,8 +120,19 @@ describe('Canvas shared-browser renderer', () => {
     errorCode: ReturnType<typeof signal<string | null>>;
     errorMessage: ReturnType<typeof signal<string | null>>;
     pendingBaton: ReturnType<typeof signal<'agent' | 'user' | null>>;
+    retry: ReturnType<typeof vi.fn>;
     sendControl: ReturnType<typeof vi.fn>;
     sendInput: ReturnType<typeof vi.fn>;
+  };
+  let canvas: {
+    browserCapability: ReturnType<typeof signal<{
+      feature_enabled: boolean;
+      can_open_browser: boolean;
+      workspace_ready: boolean;
+      reason: null;
+    } | null>>;
+    browserOpenStatus: ReturnType<typeof signal<'idle' | 'workspace' | 'browser' | 'error'>>;
+    openBrowser: ReturnType<typeof vi.fn>;
   };
   let context: {
     clearRect: ReturnType<typeof vi.fn>;
@@ -122,8 +152,19 @@ describe('Canvas shared-browser renderer', () => {
       errorCode: signal<string | null>(null),
       errorMessage: signal<string | null>(null),
       pendingBaton: signal<'agent' | 'user' | null>(null),
+      retry: vi.fn(),
       sendControl: vi.fn(() => true),
       sendInput: vi.fn(() => true),
+    };
+    canvas = {
+      browserCapability: signal({
+        feature_enabled: true,
+        can_open_browser: true,
+        workspace_ready: true,
+        reason: null,
+      }),
+      browserOpenStatus: signal<'idle' | 'workspace' | 'browser' | 'error'>('idle'),
+      openBrowser: vi.fn(),
     };
     context = { clearRect: vi.fn(), drawImage: vi.fn() };
     getContext = vi
@@ -137,7 +178,10 @@ describe('Canvas shared-browser renderer', () => {
           translocoConfig: { availableLangs: ['en'], defaultLang: 'en' },
         }),
       ],
-      providers: [{ provide: CanvasBrowserController, useValue: controller }],
+      providers: [
+        { provide: CanvasBrowserController, useValue: controller },
+        { provide: CanvasService, useValue: canvas },
+      ],
     });
     TestBed.overrideComponent(CanvasBrowserRendererComponent, {
       set: {
@@ -166,6 +210,18 @@ describe('Canvas shared-browser renderer', () => {
     getContext?.mockRestore();
     vi.unstubAllGlobals();
     TestBed.resetTestingModule();
+  });
+
+  it('keeps keyboard focus visible and disables reconnect motion on request', () => {
+    const styles = readFileSync(
+      'src/app/views/canvas/canvas-browser-renderer.component.scss',
+      'utf8',
+    );
+
+    expect(styles).toContain('.browser-surface:focus-visible');
+    expect(styles).toContain('@media (prefers-reduced-motion: reduce)');
+    expect(styles).toContain('animation: none !important');
+    expect(styles).toContain('transition: none !important');
   });
 
   it('renders only trusted chrome and one focusable bitmap canvas', () => {
@@ -215,6 +271,10 @@ describe('Canvas shared-browser renderer', () => {
     expect(
       (fixture.nativeElement.querySelector('.browser-baton') as HTMLElement).dataset['baton'],
     ).toBe('user');
+    expect(
+      (fixture.nativeElement.querySelector('.browser-baton-action') as HTMLButtonElement)
+        .getAttribute('aria-pressed'),
+    ).toBe('true');
   });
 
   it('keeps URL edits local and sends navigation and baton controls without optimistic labels', () => {
@@ -562,6 +622,81 @@ describe('Canvas shared-browser renderer', () => {
     expect(controller.connectionStatus()).toBe('ready');
   });
 
+  it('exposes labelled keyboard controls and polite authoritative status', () => {
+    controller.connectionStatus.set('ready');
+    controller.pageState.set(page({baton: 'user'}));
+    fixture.detectChanges();
+
+    const root = fixture.nativeElement as HTMLElement;
+    const toolbar = root.querySelector('[role="toolbar"]') as HTMLElement;
+    const focusables = [...toolbar.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)')];
+    expect(toolbar.getAttribute('aria-label')).toBe('Shared browser controls');
+    expect(focusables.map(element => element.getAttribute('aria-label'))).toEqual([
+      'Back',
+      'Reload',
+      'Release control',
+      null,
+    ]);
+    expect((focusables[3] as HTMLInputElement).labels?.[0]?.textContent).toContain('Address');
+    expect(focusables.every(element => element.tabIndex === 0)).toBe(true);
+    expect(root.querySelector('.browser-baton')?.getAttribute('aria-live')).toBe('polite');
+    expect(root.querySelector('canvas')?.getAttribute('aria-label')).toBe('Shared browser page');
+  });
+
+  it('offers manual retry for viewer limits and unavailable streams', () => {
+    const component = fixture.componentInstance;
+    controller.connectionStatus.set('viewer_limit');
+    controller.errorCode.set('viewer_limit');
+    fixture.detectChanges();
+
+    let state = fixture.nativeElement.querySelector('.browser-empty-state') as HTMLElement;
+    expect(state.getAttribute('role')).toBe('alert');
+    expect(state.getAttribute('aria-live')).toBe('polite');
+    expect(state.textContent).toContain('Retry connection');
+    component.retryConnection();
+    expect(controller.retry).toHaveBeenCalledOnce();
+
+    controller.connectionStatus.set('unavailable');
+    controller.errorCode.set('browser_workspace_unavailable');
+    fixture.detectChanges();
+    state = fixture.nativeElement.querySelector('.browser-empty-state') as HTMLElement;
+    expect(state.textContent).toContain('Retry connection');
+    expect(state.textContent).toContain('Restart browser');
+  });
+
+  it('restarts ended generations through the ordinary bounded open workflow', () => {
+    const component = fixture.componentInstance;
+    controller.connectionStatus.set('ended');
+    controller.errorCode.set('browser_generation_ended');
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.textContent).toContain('Restart browser');
+    component.restartBrowser();
+    expect(canvas.openBrowser).toHaveBeenCalledOnce();
+
+    canvas.browserOpenStatus.set('workspace');
+    fixture.detectChanges();
+    expect(component.restartPending()).toBe(true);
+    expect(fixture.nativeElement.textContent).toContain('Ended');
+    component.restartBrowser();
+    expect(canvas.openBrowser).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['unavailable', 'shared_browser_disabled', 'Disabled'],
+    ['unauthorized', 'browser_unauthorized', 'Unauthorized'],
+    ['error', 'invalid_browser_protocol', 'Protocol error'],
+  ] as const)('renders terminal %s failures without retry actions', (status, code, copy) => {
+    controller.connectionStatus.set(status);
+    controller.errorCode.set(code);
+    fixture.detectChanges();
+
+    const state = fixture.nativeElement.querySelector('.browser-empty-state') as HTMLElement;
+    expect(state.getAttribute('role')).toBe('alert');
+    expect(state.textContent).toContain(copy);
+    expect(state.querySelector('.browser-lifecycle-actions')).toBeNull();
+  });
+
   it.each([
     ['connecting', 'Connecting'],
     ['reconnecting', 'Reconnecting'],
@@ -575,7 +710,9 @@ describe('Canvas shared-browser renderer', () => {
     fixture.detectChanges();
 
     const state = fixture.nativeElement.querySelector('.browser-empty-state') as HTMLElement;
-    expect(state.getAttribute('role')).toBe('status');
+    expect(state.getAttribute('role')).toBe(
+      status === 'connecting' || status === 'reconnecting' ? 'status' : 'alert',
+    );
     expect(state.textContent).toContain(copy);
     expect(fixture.nativeElement.querySelector('.browser-renderer').dataset.connectionStatus).toBe(
       status,

@@ -129,13 +129,17 @@
       "noUrl": "No page URL",
       "loading": "Page loading…",
       "surfaceLabel": "Shared browser page",
+      "retryConnection": "Retry connection",
+      "restart": "Restart browser",
       "baton": {
         "agent": "Agent is driving",
         "user": "You're driving",
         "take": "Take control",
-        "release": "Release control"
+        "release": "Release control",
+        "pending": "Waiting for browser…"
       },
       "toolbar": {
+        "label": "Shared browser controls",
         "back": "Back",
         "reload": "Reload",
         "address": "Address",
@@ -172,6 +176,7 @@
         "viewerLimit": "The shared browser has reached its viewer limit.",
         "unauthorized": "You no longer have access to this shared browser.",
         "unavailable": "The shared browser is currently unavailable.",
+        "disabled": "Shared browser is disabled on this server.",
         "error": "The shared-browser connection encountered a protocol error."
       }
     },

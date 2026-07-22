@@ -540,7 +540,9 @@ export class CanvasPaneComponent {
     const state = this.state();
     if (this.browserEmptyState()) return this.transloco.translate(this.browserEmptyTextKey());
     if (this.effectiveRenderer() === 'browser') {
-      return this.transloco.translate(canvasBrowserStatusKey(this.browser.connectionStatus()));
+      return this.transloco.translate(
+        canvasBrowserStatusKey(this.browser.connectionStatus(), this.browser.errorCode()),
+      );
     }
     if (this.liveAppFailureVisible()) {
       return this.transloco.translate(

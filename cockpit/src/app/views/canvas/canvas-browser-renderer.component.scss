@@ -38,13 +38,10 @@
 
 .browser-title {
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.browser-title {
   color: var(--text-primary);
   font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .browser-navigation {
@@ -130,6 +127,26 @@
   gap: 5px;
 }
 
+.browser-baton-pending {
+  color: var(--text-muted);
+}
+
+.browser-baton-action {
+  padding: 3px 8px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-control);
+}
+
+.browser-baton-action:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+}
+
+
 .browser-navigation-error {
   display: flex;
   flex: 0 0 auto;
@@ -182,6 +199,23 @@
   font-size: 13px;
   text-align: center;
   pointer-events: none;
+}
+
+.browser-lifecycle-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-empty-state,
+  .browser-loading,
+  .browser-lifecycle-actions {
+    animation: none !important;
+    transition: none !important;
+  }
 }
 
 @media (width <= 620px) {
