@@ -1,0 +1,135 @@
+:host {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
+}
+
+.browser-renderer {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 320px;
+  flex-direction: column;
+  background: var(--app-bg);
+}
+
+.browser-toolbar {
+  display: flex;
+  min-width: 0;
+  min-height: 48px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 12px;
+  box-sizing: border-box;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.browser-page {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.browser-title,
+.browser-url {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-title {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.browser-url {
+  color: var(--text-muted);
+  font: 10.5px/1.3 var(--font-mono, ui-monospace, monospace);
+}
+
+.browser-indicators,
+.browser-loading {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.browser-indicators {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.browser-connection,
+.browser-baton,
+.browser-loading {
+  min-height: 24px;
+  padding: 3px 7px;
+  box-sizing: border-box;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+}
+
+.browser-baton[data-baton='user'] {
+  color: var(--accent-color);
+  border-color: color-mix(in srgb, var(--accent-color) 55%, var(--border-color));
+}
+
+.browser-stage {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #15171b;
+}
+
+.browser-surface {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  background: white;
+  outline: none;
+  touch-action: none;
+}
+
+.browser-surface:focus-visible {
+  outline: 3px solid var(--accent-color);
+  outline-offset: -3px;
+}
+
+.browser-empty-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 24px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: center;
+  pointer-events: none;
+}
+
+@media (width <= 620px) {
+  .browser-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .browser-indicators {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+}
