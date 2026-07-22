@@ -127,9 +127,7 @@ class SeedDB:
 async def test_managed_seed_is_idempotent_and_insert_only():
     db = SeedDB()
     first = await seed_managed_default_experts(db, ROOT / "config")
-    db.rows["application-default-session-seed"]["display_name"] = (
-        "Operator Assistant"
-    )
+    db.rows["application-default-session-seed"]["display_name"] = "Operator Assistant"
     second = await seed_managed_default_experts(db, ROOT / "config")
     assert first == second
     assert (

@@ -93,7 +93,9 @@ def load_seed_bundle(
 
     return {
         "name": directory,
-        "display_name": str(raw.get("display_name") or directory.replace("-", " ").title()),
+        "display_name": str(
+            raw.get("display_name") or directory.replace("-", " ").title()
+        ),
         "description": str(raw.get("description") or "").strip(),
         "icon": str(raw.get("icon") or "smart_toy"),
         "color": str(raw.get("color") or "#6B7280"),
