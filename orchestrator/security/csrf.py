@@ -33,8 +33,12 @@ no-cookie rule):
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import os
+import re
+from typing import Any
+from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -53,18 +57,94 @@ _EXEMPT_PREFIXES = (
 )
 
 
-def _allowed_origins() -> set[str]:
-    """Origins permitted to issue state-changing requests with the session
-    cookie. Mirrors the CORS allowlist; same env knob.
-    """
+def _normalize_browser_origin(value: str) -> str | None:
+    """Return one canonical HTTP(S) origin, rejecting URL-shaped variants."""
+
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if (
+        not value
+        or value.lower() == "null"
+        or "\\" in value
+        or any(ord(char) < 33 or ord(char) == 127 for char in value)
+    ):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if (
+        scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.netloc.endswith(":")
+    ):
+        return None
+    hostname = parsed.hostname
+    if not hostname or hostname.endswith(".") or "%" in hostname:
+        return None
+
+    bracketed = False
+    try:
+        address = ipaddress.ip_address(hostname)
+        host = address.compressed.lower()
+        bracketed = address.version == 6
+    except ValueError:
+        try:
+            host = hostname.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            return None
+        if len(host) > 253 or any(
+            not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in host.split(".")
+        ):
+            return None
+
+    if port == (80 if scheme == "http" else 443):
+        port = None
+    authority = f"[{host}]" if bracketed else host
+    if port is not None:
+        authority = f"{authority}:{port}"
+    return f"{scheme}://{authority}"
+
+
+def allowed_browser_origins() -> frozenset[str]:
+    """Return the normalized HTTP CSRF and browser-WebSocket origin authority."""
+
     statics = {
         "http://localhost:4200",
         "http://127.0.0.1:4200",
         "http://localhost:4000",
         "http://127.0.0.1:4000",
     }
-    from_env = {o for o in os.environ.get("CORS_ORIGINS", "").split(",") if o}
-    return statics | from_env
+    from_env = {
+        normalized
+        for item in os.environ.get("CORS_ORIGINS", "").split(",")
+        if (normalized := _normalize_browser_origin(item)) is not None
+    }
+    return frozenset(statics | from_env)
+
+
+def websocket_origin_allowed(headers: Any) -> bool:
+    """Require exactly one non-null Origin in the shared browser allowlist."""
+
+    getlist = getattr(headers, "getlist", None)
+    if callable(getlist):
+        values = list(getlist("origin"))
+    else:
+        value = headers.get("origin") if hasattr(headers, "get") else None
+        values = [] if value is None else [value]
+    if len(values) != 1:
+        return False
+    normalized = _normalize_browser_origin(values[0])
+    return normalized is not None and normalized in allowed_browser_origins()
 
 
 class CSRFMiddleware:
@@ -135,8 +215,12 @@ class CSRFMiddleware:
         # Origin entirely on some POSTs; we only reject when it's present
         # and not in the allowlist.
         if sfs is None:
-            origin = request.headers.get("origin")
-            if origin and origin not in _allowed_origins():
+            origins = request.headers.getlist("origin")
+            if origins and (
+                len(origins) != 1
+                or (normalized := _normalize_browser_origin(origins[0])) is None
+                or normalized not in allowed_browser_origins()
+            ):
                 await _send_403(send, "csrf:bad-origin")
                 return
 
@@ -163,3 +247,10 @@ async def _send_403(send: Send, reason: str) -> None:
         }
     )
     await send({"type": "http.response.body", "body": body})
+
+
+__all__ = [
+    "CSRFMiddleware",
+    "allowed_browser_origins",
+    "websocket_origin_allowed",
+]
