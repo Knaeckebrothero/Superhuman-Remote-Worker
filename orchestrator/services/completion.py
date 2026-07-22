@@ -173,7 +173,9 @@ def _resolve_config_section_from_disk(
             if isinstance(defaults.get(section), dict):
                 result.update(defaults[section])
         except Exception as e:
-            logger.warning("Failed to read worker_base.yaml for %s config: %s", section, e)
+            logger.warning(
+                "Failed to read worker_base.yaml for %s config: %s", section, e
+            )
 
     # 2. Read expert config (overrides defaults)
     expert_paths = [

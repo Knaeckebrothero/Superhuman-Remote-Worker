@@ -1370,14 +1370,10 @@ async def _resolve_session_account_defaults(
             persistent["headless_attention_sleep_minutes"]
         )
     if persistent.get("notification_channels"):
-        headless["notification_channels"] = list(
-            persistent["notification_channels"]
-        )
+        headless["notification_channels"] = list(persistent["notification_channels"])
     if headless:
         layer["headless"] = headless
-    layer["workspace"] = {
-        "backend": _default_session_workspace_backend(persistent)
-    }
+    layer["workspace"] = {"backend": _default_session_workspace_backend(persistent)}
     return _deep_merge_dicts(out, layer)
 
 
@@ -2476,9 +2472,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             instructions_upload_id=instructions_upload_id,
             instructions=instructions,
             document_path=job.get("document_path"),
-            config_name=canonical_config_name(
-                job.get("config_name") or "worker_base"
-            ),
+            config_name=canonical_config_name(job.get("config_name") or "worker_base"),
             config_override=None if resolved_config else config_override,
             resolved_config=resolved_config,
             git_remote_url=git_remote_url,
@@ -2566,9 +2560,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         # runner's CURRENT grants. Fail closed: deny -> mark failed + refuse.
         if await _user_experts_enabled():
             try:
-                _rbase = canonical_config_name(
-                    job.get("config_name") or "worker_base"
-                )
+                _rbase = canonical_config_name(job.get("config_name") or "worker_base")
                 _rcap: dict = {}
                 resolve_config(
                     base_config_name=_rbase,
@@ -7945,9 +7937,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             and await _user_experts_enabled()
         )
         should_validate_explicit = (
-            bool(job.expert_id)
-            and bool(effective_user_id)
-            and _is_experts_db_enabled()
+            bool(job.expert_id) and bool(effective_user_id) and _is_experts_db_enabled()
         )
         selection = None
         try:
@@ -8846,9 +8836,7 @@ async def send_agent_message(
             subject=request.subject,
             message_md=request.message,
             job_description=job.get("description", "")[:100],
-            config_name=canonical_config_name(
-                job.get("config_name") or "worker_base"
-            ),
+            config_name=canonical_config_name(job.get("config_name") or "worker_base"),
             thread_id=thread_id,
             recipient_email=recipient_email,
             recipient_name=recipient_name,
@@ -10187,9 +10175,7 @@ async def resume_job(
             _rco = job.get("config_override")
             if isinstance(_rco, str):
                 _rco = json.loads(_rco)
-            _rbase = canonical_config_name(
-                job.get("config_name") or "worker_base"
-            )
+            _rbase = canonical_config_name(job.get("config_name") or "worker_base")
             _rcap: dict = {}
             resolve_config(
                 base_config_name=_rbase,
@@ -10705,9 +10691,7 @@ async def _capture_workspace_snapshot_for_freeze(job: dict, job_id: str) -> None
             ssh_host=ssh_host,
             ssh_port=ssh_port,
             source_type=source,
-            agent_config=canonical_config_name(
-                job.get("config_name") or "worker_base"
-            ),
+            agent_config=canonical_config_name(job.get("config_name") or "worker_base"),
         )
         logger.info(
             f"Freeze capture for {job_id} ({source} {ssh_host}:{ssh_port}): "
@@ -17806,9 +17790,7 @@ async def agent_create_thread(
             expert_type="session",
             capture=create_capture,
         )
-        effective_backend = _backend_from_override(
-            create_capture["merged_fragment"]
-        )
+        effective_backend = _backend_from_override(create_capture["merged_fragment"])
         config_override: dict[str, Any] = {}
         if effective_backend:
             config_override = {"workspace": {"backend": effective_backend}}
@@ -18990,9 +18972,7 @@ async def agent_upgrade_thread_to_vm(
 
     ok = await vm_provisioner.create_thread_vm(
         thread_id=thread_id,
-        agent_config=canonical_config_name(
-            thread.get("config_name", "session_base")
-        ),
+        agent_config=canonical_config_name(thread.get("config_name", "session_base")),
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to request VM provisioning")
@@ -19694,11 +19674,7 @@ async def create_thread(
         primary_project_id = (
             str(request_body.project_id)
             if request_body.project_id
-            else (
-                effective_project_ids[0]
-                if len(effective_project_ids) == 1
-                else None
-            )
+            else (effective_project_ids[0] if len(effective_project_ids) == 1 else None)
         )
 
         # Account preferences are fallback values, not request overrides. Keep
@@ -19710,9 +19686,7 @@ async def create_thread(
             str(user["id"]), all_user_settings or {}
         )
 
-        config_name = canonical_config_name(
-            request_body.config_name or "session_base"
-        )
+        config_name = canonical_config_name(request_body.config_name or "session_base")
         if request_body.expert_id and config_name != "session_base":
             raise HTTPException(
                 status_code=400,
@@ -19857,9 +19831,8 @@ async def create_thread(
         # Keep the threads.permission_mode column in sync with the mode the
         # fully resolved config will load (request > expert > account > base).
         effective_permission_mode = (
-            (effective_create_config.get("interactive") or {}).get("permission_mode")
-            or "supervised"
-        )
+            effective_create_config.get("interactive") or {}
+        ).get("permission_mode") or "supervised"
 
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
@@ -24464,14 +24437,18 @@ async def _load_expert_detail(
     instructions_content = None
     # Check for expert-specific instructions.md first
     instr_path = expert_config_dir / "instructions.md"
-    if expert_id not in {
-        "default",
-        "defaults",
-        "worker_base",
-        "persistent_default",
-        "persistent_defaults",
-        "session_base",
-    } and instr_path.exists():
+    if (
+        expert_id
+        not in {
+            "default",
+            "defaults",
+            "worker_base",
+            "persistent_default",
+            "persistent_defaults",
+            "session_base",
+        }
+        and instr_path.exists()
+    ):
         instructions_content = instr_path.read_text(encoding="utf-8")
     else:
         # Fall back to template referenced in config
@@ -25430,9 +25407,7 @@ async def set_application_expert_default(
         expert_type=expert_type,
         capture=capture,
     )
-    global_grants = await resolve_grants_for(
-        postgres_db, user_id=None, project_ids=[]
-    )
+    global_grants = await resolve_grants_for(postgres_db, user_id=None, project_ids=[])
     violations = evaluate(capture["merged_fragment"], global_grants)
     if violations:
         raise HTTPException(

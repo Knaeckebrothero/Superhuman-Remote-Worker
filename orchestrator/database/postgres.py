@@ -8041,7 +8041,9 @@ class PostgresDB:
                     pid,
                     eid,
                     expert_type,
-                    json.dumps(config_override) if config_override is not None else None,
+                    json.dumps(config_override)
+                    if config_override is not None
+                    else None,
                 )
                 await conn.execute(
                     """
