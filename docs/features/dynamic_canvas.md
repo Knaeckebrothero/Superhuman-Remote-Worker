@@ -2708,8 +2708,14 @@ Plan 2 still needs to deliver:
   and ended-generation states, and explicit take/release UI;
 - agent `set_canvas(browser)` advertisement/handling and clear
   `user_is_driving` refusal surfacing;
-- active-target reattachment, VM image/routing/binding attestation, and live
-  k3d acceptance with a `docs/tests/` record.
+- pinned browser-start transport, active-target/loading correctness, VM image
+  conformance parity, and live k3d acceptance with a `docs/tests/` record.
+
+The reviewed Plan-2 execution document is
+`docs/superpowers/plans/2026-07-22-shared-browser-cockpit-handoff.md` (created
+2026-07-22; implementation not started). VM runtime remains deliberately
+disabled unless a deployment independently supplies both attested binding and
+orchestrator routing; building the golden image does not claim either.
 
 The precise current boundary, protocol, and verification record are in
 `shared_browser.md` and

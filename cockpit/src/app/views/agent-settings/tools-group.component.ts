@@ -20,6 +20,21 @@ export function allToolCategoriesSelected(
   return selectableKeys.length > 0 && selectableKeys.every(k => !disabledCategories.has(k));
 }
 
+/** Category keys explicitly disabled by a resolved config. */
+export function disabledToolCategoriesFromConfig(
+  config: Record<string, unknown>,
+  categoryKeys: string[],
+): Set<string> {
+  const tools = config['tools'] as Record<string, unknown[]> | undefined;
+  const disabled = new Set<string>();
+  if (!tools) return disabled;
+  for (const key of categoryKeys) {
+    const value = tools[key];
+    if (Array.isArray(value) && value.length === 0) disabled.add(key);
+  }
+  return disabled;
+}
+
 /**
  * Tool category toggles.
  * Session mode shows additional categories (knowledge, git).
@@ -422,16 +437,10 @@ export class ToolsGroupComponent {
 
   /** Called by parent when expert changes to sync disabled state. */
   prefillFromConfig(config: Record<string, unknown>): void {
-    const tools = config['tools'] as Record<string, unknown[]> | undefined;
-    const disabled = new Set<string>();
-    if (tools) {
-      for (const cat of this.categories()) {
-        const val = tools[cat.key];
-        if (Array.isArray(val) && val.length === 0) {
-          disabled.add(cat.key);
-        }
-      }
-    }
+    const disabled = disabledToolCategoriesFromConfig(
+      config,
+      this.categories().map((category) => category.key),
+    );
     this.disabledCategories.set(disabled);
     this.expertDisabledCategories = new Set(disabled);
 
