@@ -60,6 +60,18 @@ import {SettingsPaneComponent} from './settings-pane.component';
                [attr.aria-hidden]="chatAreaHidden() ? 'true' : null">
             <app-persistent-chat (canvasRequested)="openCanvas(true)"
                                  (settingsRequested)="openSettings($event)">
+              @if (browserActionVisible()) {
+                <span chatHeaderAction class="canvas-toggle-wrap">
+                  <app-icon-button size="sm"
+                                   [ariaLabel]="'canvas.browser.open.action' | transloco"
+                                   [tooltip]="browserActionTooltipKey() | transloco"
+                                   [disabled]="browserActionDisabled()"
+                                   [loading]="browserActionLoading()"
+                                   (clicked)="openSharedBrowser()">
+                    <app-icon size="sm">web</app-icon>
+                  </app-icon-button>
+                </span>
+              }
               @if (canvasAvailable()) {
                 <span chatHeaderAction #canvasToggle class="canvas-toggle-wrap">
                   <app-icon-button size="sm"
@@ -219,7 +231,27 @@ export class ChatPageComponent implements OnInit, OnDestroy {
 
     readonly canvasAvailable = computed(() => {
         const state = this.canvas.state();
-        return this.canvasDirty() || (!!state?.source && state.status !== 'cleared');
+        return this.canvasDirty() ||
+            this.canvas.browserCapability()?.feature_enabled === true ||
+            (!!state?.source && state.status !== 'cleared');
+    });
+    readonly browserActionVisible = computed(
+        () => this.canvas.browserCapability()?.feature_enabled === true,
+    );
+    readonly browserActionLoading = computed(() => {
+        const status = this.canvas.browserOpenStatus();
+        return status === 'workspace' || status === 'browser';
+    });
+    readonly browserActionDisabled = computed(() =>
+        this.canvasDirty() || this.canvas.browserCapability()?.can_open_browser !== true,
+    );
+    readonly browserActionTooltipKey = computed(() => {
+        if (this.canvasDirty()) return 'canvas.browser.open.dirty';
+        const capability = this.canvas.browserCapability();
+        if (!capability?.can_open_browser && capability?.reason) {
+            return `canvas.browser.reason.${capability.reason}`;
+        }
+        return 'canvas.browser.open.action';
     });
     readonly chatAreaVisible = computed(
         () => !this.viewport.isMobile() || (!this.canvasFocus() && !this.settingsFocus()),
@@ -273,6 +305,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
             const state = this.canvas.state();
             const source = canvasSourceKey(state);
             const dirty = this.canvasDirty();
+            const browserHostable = this.canvas.browserCapability()?.feature_enabled === true;
             if (threadId !== this.previousCanvasThread) {
                 this.previousCanvasThread = threadId;
                 this.previousCanvasSource = null;
@@ -283,7 +316,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 this.settingsFocus.set(false);
                 this.canvasPending.set(false);
             }
-            if (!source || state?.status === 'cleared') {
+            if (state?.status === 'cleared') {
                 if (dirty) {
                     this.configureSplitterAccessibility();
                     return;
@@ -293,6 +326,14 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 this.canvasOpen.set(false);
                 this.canvasFocus.set(false);
                 if (restoreFocus) queueMicrotask(() => this.focusCanvasOpener());
+            } else if (!source) {
+                this.previousCanvasSource = null;
+                if (!browserHostable) {
+                    const restoreFocus = this.canvasOpen() && this.shouldRestoreFocusFromCanvas();
+                    this.canvasOpen.set(false);
+                    this.canvasFocus.set(false);
+                    if (restoreFocus) queueMicrotask(() => this.focusCanvasOpener());
+                }
             } else if (source !== this.previousCanvasSource) {
                 this.previousCanvasSource = source;
                 this.canvasOpen.set(true);
@@ -359,6 +400,12 @@ export class ChatPageComponent implements OnInit, OnDestroy {
         if (this.viewport.isMobile()) this.canvasFocus.set(true);
         this.configureSplitterAccessibility();
         if (focus) queueMicrotask(() => this.pane()?.focusContent());
+    }
+
+    openSharedBrowser(): void {
+        if (this.browserActionDisabled()) return;
+        this.openCanvas(true);
+        this.canvas.openBrowser();
     }
 
     returnToChat(): void {

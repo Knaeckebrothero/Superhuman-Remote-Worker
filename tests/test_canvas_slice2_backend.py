@@ -53,6 +53,7 @@ def test_canvas_mutation_etags_are_exposed_to_cross_origin_cockpit() -> None:
     assert set(cors.kwargs["expose_headers"]) >= {
         "ETag",
         "X-Canvas-Content-ETag",
+        "X-Canvas-Mutation-Changed",
     }
 
 

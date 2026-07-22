@@ -133,8 +133,31 @@
         "agent": "Agent is driving",
         "user": "You're driving"
       },
+      "open": {
+        "action": "Open browser",
+        "explanation": "Open a browser that you and the agent can use together.",
+        "dirty": "Save or discard your Canvas edits before opening the browser. Opening it replaces the current stage.",
+        "retry": "Retry",
+        "phase": {
+          "workspace": "Starting workspace…",
+          "browser": "Starting browser…",
+          "connecting": "Connecting…"
+        },
+        "error": {
+          "timeout": "The browser took too long to start. You can retry.",
+          "invalidResponse": "The server returned an invalid browser response.",
+          "failed": "The browser could not be opened. You can retry."
+        }
+      },
+      "reason": {
+        "feature_disabled": "Shared browser is disabled on this server.",
+        "workspace_required": "This session type does not provide a browser workspace.",
+        "workspace_unattested": "This workspace is not trusted for shared-browser access.",
+        "workspace_unroutable": "The server cannot securely reach this workspace browser.",
+        "transport_unavailable": "Secure browser transport is not configured on this server."
+      },
       "status": {
-        "connecting": "Connecting to the shared browser…",
+        "connecting": "Connecting…",
         "ready": "Shared browser connected",
         "reconnecting": "Reconnecting to the shared browser…",
         "ended": "This browser session has ended.",

@@ -3,6 +3,9 @@ import {DestroyRef, inject, Injectable, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {map, Observable, Subscription, tap, throwError} from 'rxjs';
 import {
+  BrowserCapability,
+  BrowserCapabilityStatus,
+  BrowserOpenStatus,
   CanvasContentSaveRequest,
   CanvasLoadStatus,
   CanvasMutationResponse,
@@ -20,6 +23,9 @@ import {
 /** Avoid a REST request on every focus bounce while still repairing missed SSE. */
 export const CANVAS_RECONCILE_STALE_MS = 30_000;
 export const CANVAS_BROADCAST_CHANNEL = 'srw.canvas.presentation.v1';
+export const BROWSER_OPEN_TIMEOUT_MS = 5 * 60_000;
+export const BROWSER_OPEN_RETRY_DEFAULT_MS = 1_000;
+export const BROWSER_OPEN_RETRY_MAX_MS = 10_000;
 
 interface CanvasBroadcastInvalidation {
   readonly type: 'canvas.presentation_invalidated';
@@ -27,6 +33,17 @@ interface CanvasBroadcastInvalidation {
   readonly canvasId: typeof MAIN_CANVAS_ID;
   readonly presentationRevision: number;
 }
+
+interface BrowserOpenMutationResponse extends CanvasStateMutationResponse {
+  readonly changed: boolean;
+}
+
+const DARK_BROWSER_CAPABILITY: BrowserCapability = Object.freeze({
+  feature_enabled: false,
+  can_open_browser: false,
+  workspace_ready: false,
+  reason: 'feature_disabled',
+});
 
 /**
  * Authoritative Dynamic Canvas state for the selected persistent thread.
@@ -46,6 +63,10 @@ export class CanvasService {
   readonly stateEtag = signal<string | null>(null);
   readonly loadStatus = signal<CanvasLoadStatus>('idle');
   readonly requestError = signal<CanvasRequestError | null>(null);
+  readonly browserCapability = signal<BrowserCapability | null>(null);
+  readonly browserCapabilityStatus = signal<BrowserCapabilityStatus>('idle');
+  readonly browserOpenStatus = signal<BrowserOpenStatus>('idle');
+  readonly browserOpenError = signal<string | null>(null);
   /** Browser time of the last authoritative GET or mutation applied locally. */
   readonly lastSuccessfulSyncAt = signal<number | null>(null);
 
@@ -57,6 +78,13 @@ export class CanvasService {
   private pendingRevisionFollowUpAllowed = false;
   private pendingForcedReconcile = false;
   private broadcastChannel: BroadcastChannel | null = null;
+  private browserCapabilitySubscription: Subscription | null = null;
+  private browserCapabilityRequestToken: symbol | null = null;
+  private browserOpenSubscription: Subscription | null = null;
+  private browserOpenToken: symbol | null = null;
+  private browserOpenTimer: ReturnType<typeof setTimeout> | null = null;
+  private browserOpenStartedAt = 0;
+  private browserOpenTitle: string | undefined;
 
   constructor() {
     this.transport.canvasInvalidations$
@@ -92,7 +120,10 @@ export class CanvasService {
       }
     }
 
-    this.destroyRef.onDestroy(() => this.cancelRequest());
+    this.destroyRef.onDestroy(() => {
+      this.cancelRequest();
+      this.cancelBrowserWork();
+    });
   }
 
   /**
@@ -101,11 +132,20 @@ export class CanvasService {
    */
   selectThread(threadId: string | null): void {
     if (this.threadId() === threadId) {
-      if (threadId) this.reconcileIfStale();
+      if (threadId) {
+        this.reconcileIfStale();
+        if (
+          this.browserCapabilityStatus() === 'idle' ||
+          this.browserCapabilityStatus() === 'error'
+        ) {
+          this.startBrowserCapabilityRequest(threadId);
+        }
+      }
       return;
     }
 
     this.cancelRequest();
+    this.cancelBrowserWork();
     this.pendingRevision = null;
     this.pendingRevisionFollowUpAllowed = false;
     this.pendingForcedReconcile = false;
@@ -114,6 +154,10 @@ export class CanvasService {
     this.state.set(null);
     this.stateEtag.set(null);
     this.requestError.set(null);
+    this.browserCapability.set(null);
+    this.browserCapabilityStatus.set('idle');
+    this.browserOpenStatus.set('idle');
+    this.browserOpenError.set(null);
 
     if (!threadId) {
       this.loadStatus.set('idle');
@@ -121,6 +165,7 @@ export class CanvasService {
     }
 
     this.startReconcile(null);
+    this.startBrowserCapabilityRequest(threadId);
   }
 
   /** Force an authoritative reload, coalescing with a request already running. */
@@ -131,6 +176,32 @@ export class CanvasService {
       return;
     }
     this.startReconcile(null);
+  }
+
+  /** Open or recover the one shared browser for the selected thread. */
+  openBrowser(title?: string): void {
+    if (this.browserOpenToken) return;
+    const threadId = this.threadId();
+    const capability = this.browserCapability();
+    if (!threadId || !capability?.can_open_browser) {
+      this.browserOpenStatus.set('error');
+      this.browserOpenError.set(capability?.reason ?? 'browser_not_available');
+      return;
+    }
+
+    const normalizedTitle = title?.trim();
+    this.browserOpenTitle = normalizedTitle || undefined;
+    this.browserOpenStartedAt = Date.now();
+    this.browserOpenError.set(null);
+    const token = Symbol('canvas-browser-open');
+    this.browserOpenToken = token;
+    this.postBrowserOpen(token, threadId);
+  }
+
+  /** Retry the last bounded open attempt without multiplying active work. */
+  retryOpenBrowser(): void {
+    if (this.browserOpenToken || this.browserOpenStatus() !== 'error') return;
+    this.openBrowser(this.browserOpenTitle);
   }
 
   /**
@@ -201,6 +272,207 @@ export class CanvasService {
       map(response => this.parseStateMutationResponse(response)),
       tap(response => this.applyMutationResponse(threadId, response, true)),
     );
+  }
+
+  private startBrowserCapabilityRequest(
+    threadId: string,
+    settled?: (capability: BrowserCapability | null, errorCode: string | null) => void,
+  ): void {
+    this.cancelBrowserCapabilityRequest();
+    if (this.threadId() !== threadId) return;
+
+    const token = Symbol('browser-capability-request');
+    this.browserCapabilityRequestToken = token;
+    this.browserCapabilityStatus.set('loading');
+    const url =
+      `${environment.apiUrl}/persistent/threads/${encodeURIComponent(threadId)}` +
+      '/browser/capability';
+    const subscription = this.http.get<unknown>(url).subscribe({
+      next: value => {
+        if (!this.isCurrentBrowserCapabilityRequest(token, threadId)) return;
+        if (!isBrowserCapability(value)) {
+          this.browserCapability.set(null);
+          this.browserCapabilityStatus.set('error');
+          settled?.(null, 'invalid_browser_capability');
+          return;
+        }
+        this.browserCapability.set(value);
+        this.browserCapabilityStatus.set('ready');
+        settled?.(value, null);
+      },
+      error: (error: unknown) => {
+        if (!this.isCurrentBrowserCapabilityRequest(token, threadId)) return;
+        this.browserCapabilityRequestToken = null;
+        this.browserCapabilitySubscription = null;
+        const requestError = toCanvasRequestError(error);
+        if (requestError.status === 404) {
+          this.browserCapability.set(DARK_BROWSER_CAPABILITY);
+          this.browserCapabilityStatus.set('ready');
+          settled?.(DARK_BROWSER_CAPABILITY, null);
+          return;
+        }
+        this.browserCapability.set(null);
+        this.browserCapabilityStatus.set('error');
+        settled?.(null, requestError.code ?? 'browser_capability_unavailable');
+      },
+      complete: () => {
+        if (!this.isCurrentBrowserCapabilityRequest(token, threadId)) return;
+        this.browserCapabilityRequestToken = null;
+        this.browserCapabilitySubscription = null;
+      },
+    });
+    if (this.browserCapabilityRequestToken === token) {
+      this.browserCapabilitySubscription = subscription;
+    } else {
+      subscription.unsubscribe();
+    }
+  }
+
+  private postBrowserOpen(token: symbol, threadId: string): void {
+    if (!this.isCurrentBrowserOpen(token, threadId)) return;
+    if (Date.now() - this.browserOpenStartedAt >= BROWSER_OPEN_TIMEOUT_MS) {
+      this.failBrowserOpen(token, threadId, 'browser_open_timeout');
+      return;
+    }
+
+    const capability = this.browserCapability();
+    if (!capability?.can_open_browser) {
+      this.failBrowserOpen(
+        token,
+        threadId,
+        capability?.reason ?? 'browser_not_available',
+      );
+      return;
+    }
+    this.browserOpenStatus.set(capability.workspace_ready ? 'browser' : 'workspace');
+    const url =
+      `${environment.apiUrl}/persistent/threads/${encodeURIComponent(threadId)}` +
+      '/browser/open';
+    let subscription: Subscription;
+    subscription = this.http.post<CanvasState>(
+      url,
+      {title: this.browserOpenTitle ?? null},
+      {observe: 'response'},
+    ).subscribe({
+      next: response => {
+        if (!this.isCurrentBrowserOpen(token, threadId)) return;
+        if (response.status === 202) {
+          this.scheduleBrowserOpenRetry(token, threadId, response.headers.get('Retry-After'));
+          return;
+        }
+        try {
+          const mutation = this.parseBrowserOpenMutationResponse(response);
+          this.applyMutationResponse(threadId, mutation, true, mutation.changed);
+          this.completeBrowserOpen(token, threadId);
+        } catch {
+          this.failBrowserOpen(token, threadId, 'invalid_browser_open_response');
+        }
+      },
+      error: (error: unknown) => {
+        if (!this.isCurrentBrowserOpen(token, threadId)) return;
+        const requestError = toCanvasRequestError(error);
+        this.failBrowserOpen(
+          token,
+          threadId,
+          requestError.code ?? 'browser_open_failed',
+        );
+      },
+      complete: () => {
+        if (
+          this.isCurrentBrowserOpen(token, threadId) &&
+          this.browserOpenSubscription === subscription
+        ) {
+          this.browserOpenSubscription = null;
+        }
+      },
+    });
+    if (this.isCurrentBrowserOpen(token, threadId)) {
+      this.browserOpenSubscription = subscription;
+    } else {
+      subscription.unsubscribe();
+    }
+  }
+
+  private scheduleBrowserOpenRetry(
+    token: symbol,
+    threadId: string,
+    retryAfter: string | null,
+  ): void {
+    this.browserOpenSubscription = null;
+    const elapsed = Date.now() - this.browserOpenStartedAt;
+    const remaining = BROWSER_OPEN_TIMEOUT_MS - elapsed;
+    if (remaining <= 0) {
+      this.failBrowserOpen(token, threadId, 'browser_open_timeout');
+      return;
+    }
+    const delay = Math.min(browserOpenRetryDelayMs(retryAfter), remaining);
+    this.clearBrowserOpenTimer();
+    this.browserOpenTimer = setTimeout(() => {
+      this.browserOpenTimer = null;
+      if (!this.isCurrentBrowserOpen(token, threadId)) return;
+      if (Date.now() - this.browserOpenStartedAt >= BROWSER_OPEN_TIMEOUT_MS) {
+        this.failBrowserOpen(token, threadId, 'browser_open_timeout');
+        return;
+      }
+      this.startBrowserCapabilityRequest(threadId, (capability, errorCode) => {
+        if (!this.isCurrentBrowserOpen(token, threadId)) return;
+        if (errorCode) {
+          this.failBrowserOpen(token, threadId, errorCode);
+          return;
+        }
+        if (!capability?.can_open_browser) {
+          this.failBrowserOpen(
+            token,
+            threadId,
+            capability?.reason ?? 'browser_not_available',
+          );
+          return;
+        }
+        this.postBrowserOpen(token, threadId);
+      });
+    }, delay);
+  }
+
+  private parseBrowserOpenMutationResponse(
+    response: HttpResponse<CanvasState>,
+  ): BrowserOpenMutationResponse {
+    if (response.status !== 200) {
+      throw new Error('Shared-browser open returned an unexpected status');
+    }
+    const stateResponse = this.parseStateMutationResponse(response);
+    const changedHeader = response.headers.get('X-Canvas-Mutation-Changed');
+    if (changedHeader !== 'true' && changedHeader !== 'false') {
+      throw new Error('Shared-browser open returned invalid mutation metadata');
+    }
+    return {...stateResponse, changed: changedHeader === 'true'};
+  }
+
+  private completeBrowserOpen(token: symbol, threadId: string): void {
+    if (!this.isCurrentBrowserOpen(token, threadId)) return;
+    this.browserOpenToken = null;
+    this.clearBrowserOpenTimer();
+    this.browserOpenSubscription?.unsubscribe();
+    this.browserOpenSubscription = null;
+    this.browserOpenStatus.set('idle');
+    this.browserOpenError.set(null);
+  }
+
+  private failBrowserOpen(token: symbol, threadId: string, code: string): void {
+    if (!this.isCurrentBrowserOpen(token, threadId)) return;
+    this.browserOpenToken = null;
+    this.clearBrowserOpenTimer();
+    this.browserOpenSubscription?.unsubscribe();
+    this.browserOpenSubscription = null;
+    this.browserOpenStatus.set('error');
+    this.browserOpenError.set(code);
+  }
+
+  private isCurrentBrowserOpen(token: symbol, threadId: string): boolean {
+    return this.browserOpenToken === token && this.threadId() === threadId;
+  }
+
+  private isCurrentBrowserCapabilityRequest(token: symbol, threadId: string): boolean {
+    return this.browserCapabilityRequestToken === token && this.threadId() === threadId;
   }
 
   private handleInvalidation(event: CanvasInvalidation, rebroadcast: boolean): void {
@@ -386,6 +658,27 @@ export class CanvasService {
     this.requestSubscription = null;
   }
 
+  private cancelBrowserCapabilityRequest(): void {
+    this.browserCapabilityRequestToken = null;
+    this.browserCapabilitySubscription?.unsubscribe();
+    this.browserCapabilitySubscription = null;
+  }
+
+  private clearBrowserOpenTimer(): void {
+    if (this.browserOpenTimer !== null) clearTimeout(this.browserOpenTimer);
+    this.browserOpenTimer = null;
+  }
+
+  private cancelBrowserWork(): void {
+    this.cancelBrowserCapabilityRequest();
+    this.browserOpenToken = null;
+    this.browserOpenSubscription?.unsubscribe();
+    this.browserOpenSubscription = null;
+    this.clearBrowserOpenTimer();
+    this.browserOpenStartedAt = 0;
+    this.browserOpenTitle = undefined;
+  }
+
   private isCurrentRequest(token: symbol, threadId: string): boolean {
     return this.activeRequestToken === token && this.threadId() === threadId;
   }
@@ -443,6 +736,7 @@ export class CanvasService {
     threadId: string,
     response: CanvasStateMutationResponse,
     notifyRuntime: boolean,
+    changed = true,
   ): void {
     if (this.threadId() !== threadId) return;
     const currentRevision = this.state()?.presentation_revision ?? 0;
@@ -452,13 +746,15 @@ export class CanvasService {
     this.loadStatus.set('ready');
     this.requestError.set(null);
     this.lastSuccessfulSyncAt.set(Date.now());
-    this.broadcastPresentationInvalidation(
-      threadId,
-      response.state.presentation_revision,
-    );
+    if (changed) {
+      this.broadcastPresentationInvalidation(
+        threadId,
+        response.state.presentation_revision,
+      );
+    }
 
     const source = response.state.source;
-    if (!notifyRuntime) return;
+    if (!notifyRuntime || !changed) return;
     if (
       source?.type === 'workspace_file' &&
       typeof source.path === 'string' &&
@@ -471,7 +767,7 @@ export class CanvasService {
         presentation_revision: response.state.presentation_revision,
         source_version: response.state.source_version,
       });
-    } else if (source?.type === 'workspace_app') {
+    } else if (source?.type === 'workspace_app' || source?.type === 'browser') {
       this.transport.sendCanvasControl(threadId, {
         method: 'canvas.presentation_updated',
         canvas_id: MAIN_CANVAS_ID,
@@ -530,9 +826,43 @@ const CANVAS_STATUSES = new Set([
   'error',
   'cleared',
 ]);
+const BROWSER_CAPABILITY_REASONS = new Set([
+  'feature_disabled',
+  'workspace_required',
+  'workspace_unattested',
+  'workspace_unroutable',
+  'transport_unavailable',
+]);
+const BROWSER_CAPABILITY_KEYS = [
+  'can_open_browser',
+  'feature_enabled',
+  'reason',
+  'workspace_ready',
+];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function isBrowserCapability(value: unknown): value is BrowserCapability {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value).sort();
+  const reason = value['reason'];
+  return (
+    keys.length === BROWSER_CAPABILITY_KEYS.length &&
+    keys.every((key, index) => key === BROWSER_CAPABILITY_KEYS[index]) &&
+    typeof value['feature_enabled'] === 'boolean' &&
+    typeof value['can_open_browser'] === 'boolean' &&
+    typeof value['workspace_ready'] === 'boolean' &&
+    (reason === null || (typeof reason === 'string' && BROWSER_CAPABILITY_REASONS.has(reason)))
+  );
+}
+
+export function browserOpenRetryDelayMs(retryAfter: string | null): number {
+  if (retryAfter === null || retryAfter.trim() === '') return BROWSER_OPEN_RETRY_DEFAULT_MS;
+  const seconds = Number(retryAfter);
+  if (!Number.isFinite(seconds) || seconds < 0) return BROWSER_OPEN_RETRY_DEFAULT_MS;
+  return Math.min(Math.max(seconds * 1_000, 250), BROWSER_OPEN_RETRY_MAX_MS);
 }
 
 export function isCanvasState(value: unknown): value is CanvasState {

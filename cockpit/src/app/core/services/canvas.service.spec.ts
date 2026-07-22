@@ -5,9 +5,12 @@ import {
   provideHttpClientTesting,
 } from '@angular/common/http/testing';
 import {TestBed} from '@angular/core/testing';
-import {CanvasState} from '../models/canvas.model';
+import {BrowserCapability, CanvasState} from '../models/canvas.model';
 import {
+  BROWSER_OPEN_TIMEOUT_MS,
   CanvasService,
+  browserOpenRetryDelayMs,
+  isBrowserCapability,
   isCanvasState,
   parseCanvasBroadcastInvalidation,
 } from './canvas.service';
@@ -37,6 +40,18 @@ function canvasState(
   };
 }
 
+function browserCapability(
+  overrides: Partial<BrowserCapability> = {},
+): BrowserCapability {
+  return {
+    feature_enabled: true,
+    can_open_browser: true,
+    workspace_ready: true,
+    reason: null,
+    ...overrides,
+  };
+}
+
 describe('Canvas state validation', () => {
   it('accepts only a boolean optional browser-stream capability', () => {
     const base = canvasState(1);
@@ -57,6 +72,16 @@ describe('Canvas state validation', () => {
       ...base,
       capabilities: {...base.capabilities, future_capability: {version: 2}},
     })).toBe(true);
+  });
+
+  it('accepts only the exact four-field browser capability contract', () => {
+    expect(isBrowserCapability(browserCapability())).toBe(true);
+    expect(isBrowserCapability({...browserCapability(), private_host: 'workspace'})).toBe(false);
+    expect(isBrowserCapability({...browserCapability(), can_open_browser: 'true'})).toBe(false);
+    expect(isBrowserCapability({...browserCapability(), reason: 'future_reason'})).toBe(false);
+    expect(browserOpenRetryDelayMs(null)).toBe(1_000);
+    expect(browserOpenRetryDelayMs('2')).toBe(2_000);
+    expect(browserOpenRetryDelayMs('999')).toBe(10_000);
   });
 });
 
@@ -81,6 +106,16 @@ describe('CanvasService', () => {
   });
 
   afterEach(() => {
+    for (const request of http.match(req => req.url.endsWith('/browser/capability'))) {
+      if (!request.cancelled) {
+        request.flush(browserCapability({
+          feature_enabled: false,
+          can_open_browser: false,
+          workspace_ready: false,
+          reason: 'feature_disabled',
+        }));
+      }
+    }
     http.verify({ignoreCancelled: true});
     vi.useRealTimers();
   });
@@ -439,6 +474,263 @@ describe('CanvasService', () => {
     });
   });
 
+  it('discovers a strict browser capability and treats a missing endpoint as dark', () => {
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush({
+      ...browserCapability(),
+      private_generation: 'must-not-be-accepted',
+    });
+
+    expect(service.browserCapability()).toBeNull();
+    expect(service.browserCapabilityStatus()).toBe('error');
+
+    service.selectThread('thread-2');
+    http.expectOne(req => req.url.includes('/thread-2/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-2/browser/capability')).flush(
+      {detail: 'Not Found'},
+      {status: 404, statusText: 'Not Found'},
+    );
+
+    expect(service.browserCapability()).toEqual(browserCapability({
+      feature_enabled: false,
+      can_open_browser: false,
+      workspace_ready: false,
+      reason: 'feature_disabled',
+    }));
+    expect(service.browserCapabilityStatus()).toBe('ready');
+
+    service.selectThread('thread-3');
+    http.expectOne(req => req.url.includes('/thread-3/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-3/browser/capability')).flush(
+      {detail: {code: 'forbidden'}},
+      {status: 403, statusText: 'Forbidden'},
+    );
+    expect(service.browserCapability()).toBeNull();
+    expect(service.browserCapabilityStatus()).toBe('error');
+  });
+
+  it('moves through workspace and browser startup before applying the open response', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-22T10:00:00Z'));
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability({workspace_ready: false}),
+    );
+    const sender = vi.fn().mockReturnValue(true);
+    transport.attachControlSender(sender);
+
+    service.openBrowser('Research browser');
+    service.openBrowser('Duplicate click');
+    expect(service.browserOpenStatus()).toBe('workspace');
+    const provisioning = http.expectOne(req => req.url.endsWith('/thread-1/browser/open'));
+    expect(provisioning.request.method).toBe('POST');
+    expect(provisioning.request.body).toEqual({title: 'Research browser'});
+    provisioning.flush(
+      {status: 'provisioning'},
+      {status: 202, statusText: 'Accepted', headers: {'Retry-After': '2'}},
+    );
+
+    vi.advanceTimersByTime(1_999);
+    http.expectNone(req => req.url.endsWith('/thread-1/browser/capability'));
+    vi.advanceTimersByTime(1);
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability({workspace_ready: true}),
+    );
+    expect(service.browserOpenStatus()).toBe('browser');
+
+    const opened = http.expectOne(req => req.url.endsWith('/thread-1/browser/open'));
+    opened.flush(canvasState(1, {
+      source: {type: 'browser'},
+      title: 'Research browser',
+      renderer: 'auto',
+      source_version: null,
+      status: 'ready',
+      capabilities: {
+        can_edit: false,
+        can_pop_out: true,
+        can_take_control: true,
+        can_stream_browser: true,
+      },
+    }), {
+      headers: {
+        ETag: '"canvas:1:browser"',
+        'X-Canvas-Mutation-Changed': 'true',
+      },
+    });
+
+    expect(service.browserOpenStatus()).toBe('idle');
+    expect(service.browserOpenError()).toBeNull();
+    expect(service.state()?.source).toEqual({type: 'browser'});
+    expect(service.stateEtag()).toBe('"canvas:1:browser"');
+    expect(sender).toHaveBeenCalledWith('thread-1', {
+      method: 'canvas.presentation_updated',
+      canvas_id: 'main',
+      presentation_revision: 1,
+    });
+  });
+
+  it('applies an idempotent browser open without duplicate runtime or tab invalidation', () => {
+    const browser = canvasState(5, {
+      source: {type: 'browser'},
+      renderer: 'auto',
+      source_version: null,
+      status: 'ready',
+      capabilities: {
+        can_edit: false,
+        can_pop_out: true,
+        can_take_control: true,
+        can_stream_browser: true,
+      },
+    });
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      canvasState(4, {status: 'ready'}),
+      {headers: {ETag: '"canvas:4:file"'}},
+    );
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability(),
+    );
+    const sender = vi.fn().mockReturnValue(true);
+    const postMessage = vi.fn();
+    transport.attachControlSender(sender);
+    (service as unknown as {broadcastChannel: {
+      postMessage: ReturnType<typeof vi.fn>;
+      removeEventListener: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+    }}).broadcastChannel = {
+      postMessage,
+      removeEventListener: vi.fn(),
+      close: vi.fn(),
+    };
+
+    service.openBrowser();
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/open')).flush(browser, {
+      headers: {
+        ETag: '"canvas:5:browser"',
+        'X-Canvas-Mutation-Changed': 'true',
+      },
+    });
+    expect(service.state()?.presentation_revision).toBe(5);
+    expect(sender).toHaveBeenCalledOnce();
+    expect(postMessage).toHaveBeenCalledOnce();
+
+    sender.mockClear();
+    postMessage.mockClear();
+    service.openBrowser();
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/open')).flush(browser, {
+      headers: {
+        ETag: '"canvas:5:browser-refreshed"',
+        'X-Canvas-Mutation-Changed': 'false',
+      },
+    });
+
+    expect(service.stateEtag()).toBe('"canvas:5:browser-refreshed"');
+    expect(sender).not.toHaveBeenCalled();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on missing open mutation metadata and permits a retry', () => {
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability(),
+    );
+
+    service.openBrowser();
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/open')).flush(
+      canvasState(1, {
+        source: {type: 'browser'},
+        renderer: 'auto',
+        source_version: null,
+        status: 'ready',
+      }),
+      {headers: {ETag: '"canvas:1:browser"'}},
+    );
+
+    expect(service.state()).toBeNull();
+    expect(service.browserOpenStatus()).toBe('error');
+    expect(service.browserOpenError()).toBe('invalid_browser_open_response');
+
+    service.retryOpenBrowser();
+    expect(service.browserOpenStatus()).toBe('browser');
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/open')).flush(
+      {detail: {code: 'browser_gone'}},
+      {status: 503, statusText: 'Unavailable'},
+    );
+    expect(service.browserOpenError()).toBe('browser_gone');
+  });
+
+  it('times out cold provisioning after five minutes with a retryable error', () => {
+    vi.useFakeTimers();
+    const started = new Date('2026-07-22T10:00:00Z');
+    vi.setSystemTime(started);
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability({workspace_ready: false}),
+    );
+
+    service.openBrowser();
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/open')).flush(
+      {status: 'provisioning'},
+      {status: 202, statusText: 'Accepted', headers: {'Retry-After': '1'}},
+    );
+    vi.setSystemTime(new Date(started.getTime() + BROWSER_OPEN_TIMEOUT_MS));
+    vi.advanceTimersByTime(1_000);
+
+    expect(service.browserOpenStatus()).toBe('error');
+    expect(service.browserOpenError()).toBe('browser_open_timeout');
+    http.expectNone(req => req.url.endsWith('/thread-1/browser/capability'));
+  });
+
+  it('cancels stale capability and open work when the selected thread changes', () => {
+    service.selectThread('thread-a');
+    http.expectOne(req => req.url.includes('/thread-a/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-a/browser/capability')).flush(
+      browserCapability(),
+    );
+    service.openBrowser();
+    const staleOpen = http.expectOne(req => req.url.endsWith('/thread-a/browser/open'));
+
+    service.selectThread('thread-b');
+    expect(staleOpen.cancelled).toBe(true);
+    expect(service.browserCapability()).toBeNull();
+    expect(service.browserCapabilityStatus()).toBe('loading');
+    expect(service.browserOpenStatus()).toBe('idle');
+    expect(service.browserOpenError()).toBeNull();
+    http.expectOne(req => req.url.includes('/thread-b/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-b/browser/capability')).flush(
+      browserCapability(),
+    );
+    expect(service.state()).toBeNull();
+  });
+
   it('refuses to reset app storage without an authoritative state ETag', () => {
     let error: unknown;
     service.resetOrigin().subscribe({error: value => error = value});
@@ -578,6 +870,14 @@ describe('CanvasService cross-tab invalidation', () => {
 
     service.selectThread('thread-1');
     http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(canvasState(1));
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability({
+        feature_enabled: false,
+        can_open_browser: false,
+        workspace_ready: false,
+        reason: 'feature_disabled',
+      }),
+    );
     transport.forwardEvent('thread-1', {
       method: 'canvas.updated',
       params: {canvas_id: 'main', presentation_revision: 2},
