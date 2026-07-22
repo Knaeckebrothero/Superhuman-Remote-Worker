@@ -36,6 +36,7 @@ import {CanvasContentController} from './canvas-content.controller';
 import {CanvasEditController} from './canvas-edit.controller';
 import {CanvasEditorComponent} from './canvas-editor.component';
 import {CanvasViewerController} from './canvas-viewer.controller';
+import {CanvasBrowserController} from './canvas-browser.controller';
 import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.component';
 import {
   CanvasLiveAppUnavailableComponent,
@@ -73,7 +74,12 @@ export function openCanvasPopOut(
   selector: 'app-canvas-pane',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  providers: [CanvasContentController, CanvasEditController, CanvasViewerController],
+  providers: [
+    CanvasBrowserController,
+    CanvasContentController,
+    CanvasEditController,
+    CanvasViewerController,
+  ],
   imports: [
     DatePipe,
     TranslocoPipe,
@@ -320,6 +326,7 @@ export class CanvasPaneComponent {
   private readonly content = inject(CanvasContentController);
   readonly editor = inject(CanvasEditController);
   readonly viewer = inject(CanvasViewerController);
+  readonly browser = inject(CanvasBrowserController);
   private readonly transloco = inject(TranslocoService);
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
@@ -353,7 +360,7 @@ export class CanvasPaneComponent {
       return this.editor.sessionRenderer();
     }
     const selected = selectCanvasRenderer(this.state());
-    return selected === 'app' ? selected : this.displayRenderer();
+    return selected === 'app' || selected === 'browser' ? selected : this.displayRenderer();
   });
   readonly previewContent = computed(() =>
     this.editor.hasSession() && this.editor.dirty()
@@ -521,6 +528,11 @@ export class CanvasPaneComponent {
       this.canvas.threadId(),
       this.state(),
       this.canvas.stateEtag(),
+    ));
+    effect(() => this.browser.syncPresentation(
+      this.active() && this.effectiveRenderer() === 'browser',
+      this.canvas.threadId(),
+      this.state(),
     ));
     effect(() => this.dirtyChange.emit(this.editor.dirty()));
     effect(() => {
