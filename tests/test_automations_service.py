@@ -139,9 +139,7 @@ class TestCreateJobFromAutomation:
             }
         )
 
-        await create_job_from_automation(
-            db, _make_automation_row(expert="worker_base")
-        )
+        await create_job_from_automation(db, _make_automation_row(expert="worker_base"))
 
         kwargs = db.create_job.await_args.kwargs
         assert kwargs["config_name"] == "worker_base"
