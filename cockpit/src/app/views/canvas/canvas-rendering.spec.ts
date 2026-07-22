@@ -8,6 +8,7 @@ import {
   CANVAS_RENDER_MAX_OUTPUT_CHARS,
   CANVAS_STATIC_MAX_TOTAL_STYLE_CHARS,
   STATIC_HTML_CSP,
+  canvasSourceKey,
   renderCanvasMarkdown,
   renderCanvasStaticHtml,
   resolveCanvasContentUrl,
@@ -61,6 +62,32 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     expect(selectCanvasRenderer(unavailable)).toBe('unsupported');
     expect(selectCanvasRenderer(available)).toBe('app');
     expect(selectCanvasRenderer({...available, renderer: 'html'})).toBe('unsupported');
+  });
+
+  it('selects the browser renderer only with source, auto, and stream capability', () => {
+    const unavailable = state('auto', 'browser');
+    const available: CanvasState = {
+      ...unavailable,
+      capabilities: {...unavailable.capabilities, can_stream_browser: true},
+    };
+
+    expect(selectCanvasRenderer(unavailable)).toBe('unsupported');
+    expect(selectCanvasRenderer({
+      ...available,
+      capabilities: {...available.capabilities, can_stream_browser: false},
+    })).toBe('unsupported');
+    expect(selectCanvasRenderer({...available, renderer: 'html'})).toBe('unsupported');
+    expect(selectCanvasRenderer(available)).toBe('browser');
+  });
+
+  it('keys browser lifecycle to the logical presentation revision', () => {
+    const opened = state('auto', 'browser');
+    const idempotent = {...opened, title: 'Same generation'};
+    const restarted = {...opened, presentation_revision: 2};
+
+    expect(canvasSourceKey(opened)).toBe('browser:1');
+    expect(canvasSourceKey(idempotent)).toBe(canvasSourceKey(opened));
+    expect(canvasSourceKey(restarted)).toBe('browser:2');
   });
 
   it('preserves image zoom for a same-source refresh and resets on replacement', () => {
