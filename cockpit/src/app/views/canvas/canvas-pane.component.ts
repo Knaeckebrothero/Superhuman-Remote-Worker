@@ -74,6 +74,23 @@ export function openCanvasPopOut(
   openWindow(url, '_blank', 'noopener,noreferrer');
 }
 
+export function browserOpenErrorKey(code: string | null): string {
+  if (code === 'browser_open_timeout') return 'canvas.browser.open.error.timeout';
+  if (code === 'invalid_browser_open_response' || code === 'invalid_browser_capability') {
+    return 'canvas.browser.open.error.invalidResponse';
+  }
+  if (
+    code === 'feature_disabled' ||
+    code === 'workspace_required' ||
+    code === 'workspace_unattested' ||
+    code === 'workspace_unroutable' ||
+    code === 'transport_unavailable'
+  ) {
+    return `canvas.browser.reason.${code}`;
+  }
+  return 'canvas.browser.open.error.failed';
+}
+
 @Component({
   selector: 'app-canvas-pane',
   standalone: true,
@@ -307,13 +324,37 @@ export function openCanvasPopOut(
             }
           } @else {
             <div class="canvas-placeholder">
-              @if (contentStatus() === 'loading' || canvas.loadStatus() === 'loading' ||
-                   viewer.viewerStatus() === 'loading' || viewer.viewerStatus() === 'renewing') {
-                <app-spinner size="md" tone="accent" />
+              @if (browserEmptyState()) {
+                @if (browserOpenPending()) {
+                  <app-spinner size="md" tone="accent" />
+                } @else {
+                  <app-icon size="xl">web</app-icon>
+                }
+                <p [attr.role]="canvas.browserOpenStatus() === 'error' ? 'alert' : null">
+                  {{ browserEmptyTextKey() | transloco }}
+                </p>
+                <div class="canvas-browser-actions">
+                  @if (canvas.browserOpenStatus() === 'error') {
+                    <app-button size="sm" [disabled]="browserOpenDisabled()"
+                                (clicked)="canvas.retryOpenBrowser()">
+                      {{ 'canvas.browser.open.retry' | transloco }}
+                    </app-button>
+                  } @else if (!browserOpenPending()) {
+                    <app-button size="sm" [disabled]="browserOpenDisabled()"
+                                (clicked)="canvas.openBrowser()">
+                      {{ 'canvas.browser.open.action' | transloco }}
+                    </app-button>
+                  }
+                </div>
               } @else {
-                <app-icon size="xl">preview</app-icon>
+                @if (contentStatus() === 'loading' || canvas.loadStatus() === 'loading' ||
+                     viewer.viewerStatus() === 'loading' || viewer.viewerStatus() === 'renewing') {
+                  <app-spinner size="md" tone="accent" />
+                } @else {
+                  <app-icon size="xl">preview</app-icon>
+                }
+                <p>{{ emptyText() }}</p>
               }
-              <p>{{ emptyText() }}</p>
             </div>
           }
         }
@@ -452,6 +493,32 @@ export class CanvasPaneComponent {
   readonly sourceNeedsRefresh = computed(() =>
     this.state()?.status === 'source_changed' || this.contentStatus() === 'source_changed',
   );
+  readonly browserEmptyState = computed(() =>
+    this.canvas.browserCapability()?.feature_enabled === true &&
+    !this.state()?.source &&
+    this.state()?.status !== 'cleared',
+  );
+  readonly browserOpenPending = computed(() => {
+    const status = this.canvas.browserOpenStatus();
+    return status === 'workspace' || status === 'browser';
+  });
+  readonly browserOpenDisabled = computed(() =>
+    this.editor.dirty() ||
+    this.canvas.loadStatus() === 'loading' ||
+    this.canvas.browserCapability()?.can_open_browser !== true,
+  );
+  readonly browserEmptyTextKey = computed(() => {
+    const status = this.canvas.browserOpenStatus();
+    if (status === 'workspace') return 'canvas.browser.open.phase.workspace';
+    if (status === 'browser') return 'canvas.browser.open.phase.browser';
+    if (status === 'error') return browserOpenErrorKey(this.canvas.browserOpenError());
+    if (this.editor.dirty()) return 'canvas.browser.open.dirty';
+    const capability = this.canvas.browserCapability();
+    if (!capability?.can_open_browser && capability?.reason) {
+      return `canvas.browser.reason.${capability.reason}`;
+    }
+    return 'canvas.browser.open.explanation';
+  });
   readonly showOverlay = computed(() => {
     const state = this.state();
     return (
@@ -471,6 +538,7 @@ export class CanvasPaneComponent {
   });
   readonly statusText = computed(() => {
     const state = this.state();
+    if (this.browserEmptyState()) return this.transloco.translate(this.browserEmptyTextKey());
     if (this.effectiveRenderer() === 'browser') {
       return this.transloco.translate(canvasBrowserStatusKey(this.browser.connectionStatus()));
     }

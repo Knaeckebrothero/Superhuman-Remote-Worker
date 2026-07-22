@@ -291,6 +291,13 @@ app-canvas-image-renderer {
   line-height: 1.5;
 }
 
+.canvas-browser-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
 @media (width <= 520px) {
   .canvas-header {
     grid-template-columns: minmax(0, 1fr) auto;

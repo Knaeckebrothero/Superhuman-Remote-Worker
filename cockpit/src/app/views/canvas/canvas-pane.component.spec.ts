@@ -296,8 +296,19 @@ describe('Canvas pane trusted chrome', () => {
       state,
       stateEtag: signal<string | null>('"canvas:4:browser"'),
       loadStatus: signal<'idle' | 'loading' | 'ready' | 'error'>('ready'),
+      browserCapability: signal({
+        feature_enabled: true,
+        can_open_browser: true,
+        workspace_ready: true,
+        reason: null,
+      }),
+      browserCapabilityStatus: signal<'ready'>('ready'),
+      browserOpenStatus: signal<'idle' | 'workspace' | 'browser' | 'error'>('idle'),
+      browserOpenError: signal<string | null>(null),
       lastSuccessfulSyncAt: signal<number | null>(null),
       reconcile: vi.fn(),
+      openBrowser: vi.fn(),
+      retryOpenBrowser: vi.fn(),
     };
     const content = {
       displayRenderer: signal('unsupported'),
@@ -366,6 +377,26 @@ describe('Canvas pane trusted chrome', () => {
         false,
         false,
       );
+
+      state.set(null);
+      canvas.stateEtag.set(null);
+      canvas.browserOpenStatus.set('workspace');
+      TestBed.flushEffects();
+      expect(pane.browserEmptyState()).toBe(true);
+      expect(pane.browserOpenPending()).toBe(true);
+      expect(pane.browserEmptyTextKey()).toBe('canvas.browser.open.phase.workspace');
+      expect(pane.statusText()).toBe('canvas.browser.open.phase.workspace');
+
+      canvas.browserOpenStatus.set('browser');
+      expect(pane.browserEmptyTextKey()).toBe('canvas.browser.open.phase.browser');
+      canvas.browserOpenStatus.set('error');
+      canvas.browserOpenError.set('browser_open_timeout');
+      expect(pane.browserEmptyTextKey()).toBe('canvas.browser.open.error.timeout');
+
+      canvas.browserOpenStatus.set('idle');
+      editor.dirty.set(true);
+      expect(pane.browserOpenDisabled()).toBe(true);
+      expect(pane.browserEmptyTextKey()).toBe('canvas.browser.open.dirty');
     } finally {
       TestBed.resetTestingModule();
     }

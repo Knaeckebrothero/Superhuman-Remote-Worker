@@ -133,8 +133,31 @@
         "agent": "Der Agent steuert",
         "user": "Sie steuern"
       },
+      "open": {
+        "action": "Browser öffnen",
+        "explanation": "Öffnen Sie einen Browser, den Sie gemeinsam mit dem Agenten verwenden können.",
+        "dirty": "Speichern oder verwerfen Sie Ihre Canvas-Änderungen, bevor Sie den Browser öffnen. Dadurch wird die aktuelle Ansicht ersetzt.",
+        "retry": "Erneut versuchen",
+        "phase": {
+          "workspace": "Workspace wird gestartet…",
+          "browser": "Browser wird gestartet…",
+          "connecting": "Verbindung wird hergestellt…"
+        },
+        "error": {
+          "timeout": "Der Browser hat zu lange zum Starten gebraucht. Sie können es erneut versuchen.",
+          "invalidResponse": "Der Server hat eine ungültige Browser-Antwort zurückgegeben.",
+          "failed": "Der Browser konnte nicht geöffnet werden. Sie können es erneut versuchen."
+        }
+      },
+      "reason": {
+        "feature_disabled": "Der geteilte Browser ist auf diesem Server deaktiviert.",
+        "workspace_required": "Dieser Sitzungstyp stellt keinen Browser-Workspace bereit.",
+        "workspace_unattested": "Dieser Workspace ist für den Zugriff auf den geteilten Browser nicht vertrauenswürdig.",
+        "workspace_unroutable": "Der Server kann diesen Workspace-Browser nicht sicher erreichen.",
+        "transport_unavailable": "Der sichere Browser-Transport ist auf diesem Server nicht konfiguriert."
+      },
       "status": {
-        "connecting": "Verbindung zum geteilten Browser wird hergestellt…",
+        "connecting": "Verbindung wird hergestellt…",
         "ready": "Geteilter Browser verbunden",
         "reconnecting": "Verbindung zum geteilten Browser wird wiederhergestellt…",
         "ended": "Diese Browser-Sitzung wurde beendet.",
