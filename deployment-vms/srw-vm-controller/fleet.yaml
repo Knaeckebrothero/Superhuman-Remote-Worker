@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha-9011352"
+  version: "0.0.0-dev.sha-52c7103"
   takeOwnership: true
   values:
     license:
@@ -47,9 +47,9 @@ helm:
     # in-place via yq.
     image:
       vmController:
-        tag: "sha-0a3ba7c"
+        tag: "sha-52c7103"
     vmController:
-      defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-9011352"
+      defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-52c7103"
       # Golden-image boot acceleration: import the VM base image ONCE into a
       # per-digest golden PVC, then clone per-VM rootdisks from it (CDI
       # host-assisted on local-path) instead of a ~10-min GHCR registry
