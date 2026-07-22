@@ -939,9 +939,9 @@ async def lifespan(app: FastAPI):
                 # Dedicated mode: auto-create thread if needed (backwards compatible)
                 if _thread_id is None:
                     created_id = await _orchestrator_client.create_thread(
-                        config_name=_config_path or "persistent_defaults",
+                        config_name=_config_path or "session_base",
                         permission_mode=_agent.config.interactive.permission_mode,
-                        title=f"Local Session ({_config_path or 'persistent_defaults'})",
+                        title=f"Local Session ({_config_path or 'session_base'})",
                     )
                     if created_id:
                         _thread_id = created_id

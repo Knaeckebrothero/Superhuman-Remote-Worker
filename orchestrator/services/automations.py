@@ -18,6 +18,9 @@ import logging
 import os
 from typing import Any
 
+from .default_experts import resolve_root_expert
+from src.core.loader import canonical_config_name, deep_merge
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,27 +79,56 @@ async def create_job_from_automation(
     # experts are on (decision 5/15: name-resolving automations are live refs).
     # Falls through to config_name (bundled) when nothing matches.
     expert_id = None
-    if os.getenv("EXPERTS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes"):
+    config_name = canonical_config_name(str(automation["expert"]))
+    if os.getenv("EXPERTS_DB_ENABLED", "true").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    ):
         from src.core.expert_resolution import pick_expert_by_name
 
         owner_id = str(automation["owner_id"])
         pids = [str(project_id)] if project_id else []
         try:
-            candidates = await db.list_experts_visible(
-                user_id=owner_id, project_ids=pids
-            )
-            matches = [c for c in candidates if c["name"] == automation["expert"]]
-            winner = pick_expert_by_name(matches, owner_id, set(pids))
-            if winner:
-                expert_id = str(winner["id"])
+            if config_name == "worker_base":
+                owner = await db.get_user(owner_id)
+                selection = await resolve_root_expert(
+                    db,
+                    expert_type="worker",
+                    user_id=owner_id,
+                    project_id=str(project_id) if project_id else None,
+                    is_admin=bool((owner or {}).get("is_admin")),
+                )
+                expert_id = str(selection.expert["id"])
+                context["expert_selection"] = {
+                    "source": selection.source,
+                    "expert_id": expert_id,
+                }
+                if selection.project_override:
+                    # Project expert settings sit below the automation's own
+                    # per-run override, matching the normal root-job path.
+                    config_override = deep_merge(
+                        selection.project_override, config_override
+                    )
+            else:
+                candidates = await db.list_experts_visible(
+                    user_id=owner_id, project_ids=pids, expert_type="worker"
+                )
+                matches = [c for c in candidates if c["name"] == automation["expert"]]
+                winner = pick_expert_by_name(matches, owner_id, set(pids))
+                if winner:
+                    expert_id = str(winner["id"])
+                    config_name = "worker_base"
         except Exception as e:
+            if config_name == "worker_base":
+                raise
             logger.warning(
                 "Automation expert resolution failed (using config_name): %s", e
             )
 
     job = await db.create_job(
         description=automation["prompt"],
-        config_name=automation["expert"],
+        config_name=config_name,
         config_override=config_override,
         context=context,
         user_id=str(automation["owner_id"]),

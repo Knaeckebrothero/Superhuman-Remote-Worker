@@ -16,6 +16,14 @@ _AUTONOMY_ORDER = ["dependent", "guided", "partial", "review", "full"]
 _PERMISSION_ORDER = ["supervised", "auto_accept", "autonomous"]
 
 CATALOG: dict[str, dict[str, Any]] = {
+    # Lets a user fork/set a personal worker/session default.  Clearing an
+    # existing pointer remains allowed even when this grant is later revoked;
+    # runtime resolution simply treats the dormant pointer as absent.
+    "personal_default_experts": {
+        "type": "bool",
+        "default": True,
+        "restrict_only": True,
+    },
     "vm_workspace": {"type": "bool", "default": False, "restrict_only": True},
     "shell_tools": {"type": "bool", "default": False, "restrict_only": True},
     "delegation": {"type": "bool", "default": False, "restrict_only": True},

@@ -151,7 +151,7 @@ class VMController:
 
         replacements = {
             "${JOB_ID}": job_config["job_id"],
-            "${AGENT_CONFIG}": job_config.get("agent_config", "defaults"),
+            "${AGENT_CONFIG}": job_config.get("agent_config", "worker_base"),
             "${VM_IMAGE}": job_config.get("vm_image", DEFAULT_VM_IMAGE),
             "${CPU_CORES}": str(job_config.get("cpu_cores", DEFAULT_CPU)),
             "${MEMORY}": job_config.get("memory", DEFAULT_MEMORY),

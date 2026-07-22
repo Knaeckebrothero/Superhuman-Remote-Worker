@@ -247,11 +247,12 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
 
     Example:
         ```python
-        # config/my_agent.yaml with $extends: defaults
+        # config/my_agent.yaml with $extends: worker_base
         data = load_and_merge_config("config/my_agent.yaml")
-        # Returns merged defaults + agent overrides
+        # Returns merged worker base + agent overrides
         ```
     """
+    config_path = canonical_config_name(config_path)
     with open(config_path, "r", encoding="utf-8") as f:
         config_data = yaml.safe_load(f)
 
@@ -775,6 +776,17 @@ def _apply_settings_matrix(
             # (_get_visual_content via ToolContext), not the LLM/ContextManager.
             data.setdefault("limits", {})["pdf_render_dpi"] = value
             applied.append(f"limits.pdf_render_dpi={value}")
+            continue
+        if key == "shell_mode":
+            # Per-family DEFAULT agent shell mode -> data["shell"]["mode"] (NOT
+            # llm). Presence-detection is the "human wins" guard: this matrix
+            # runs AFTER every human config layer merges, so only fill when no
+            # human set shell.mode. The stateless floor is the read-sites'
+            # .get("mode", "stateless") (shell_tools.py / loader.get_all_tool_names),
+            # so non-capable families simply omit shell_mode and fall through.
+            if data.get("shell", {}).get("mode") is None:
+                data.setdefault("shell", {})["mode"] = value
+                applied.append(f"shell.mode={value}")
             continue
         if key not in expert_llm_keys:
             data.setdefault("llm", {})[key] = value
@@ -1857,7 +1869,7 @@ class DelegationConfig:
 class AgentConfig:
     """Complete agent configuration.
 
-    Loaded from YAML configuration file (e.g., defaults.yaml, my_agent.yaml).
+    Loaded from YAML configuration (e.g., worker_base.yaml, my_agent.yaml).
     """
 
     agent_id: str
@@ -2150,10 +2162,11 @@ def load_agent_config(
         config = load_agent_config("config/my_agent.yaml")
 
         # Directory config with prompt overrides
-        # config/my_agent/config.yaml with $extends: defaults
+        # config/my_agent/config.yaml with $extends: worker_base
         config = load_agent_config("config/my_agent/config.yaml", "config/my_agent")
         ```
     """
+    config_path = canonical_config_name(config_path)
     config_path_obj = Path(config_path)
 
     if not config_path_obj.exists():
@@ -2162,7 +2175,7 @@ def load_agent_config(
     # Load config with inheritance resolution
     data = load_and_merge_config(config_path)
 
-    # Apply settings matrix: model-family defaults between defaults.yaml and expert config.
+    # Apply settings matrix between the mode base and the expert config.
     # Read the raw expert file to know which llm keys were explicitly set.
     raw_expert_llm_keys = set()
     try:
@@ -2633,12 +2646,12 @@ def load_agent_config_from_dict(
 
 
 def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
-    """Load an uploaded config file and merge with defaults.
+    """Load an uploaded worker config file and merge with worker_base.
 
-    The uploaded config is treated as an override on top of defaults.yaml.
+    The uploaded config is treated as an override on top of worker_base.yaml.
     Uses the same deep_merge semantics as $extends inheritance.
 
-    This enables per-job config customization without modifying the defaults.
+    This enables per-job config customization without modifying the mode base.
 
     Args:
         uploaded_config_path: Path to the uploaded YAML config file
@@ -2652,14 +2665,14 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
         # llm:
         #   temperature: 0.7
         #
-        # Result is defaults.yaml with temperature overridden to 0.7
+        # Result is worker_base.yaml with temperature overridden to 0.7
 
         merged = load_uploaded_config(Path("/workspace/uploads/config_123/agent.yaml"))
         config = load_agent_config_from_dict(merged)
         ```
     """
     # Load defaults first
-    defaults_path, _ = resolve_config_path("defaults")
+    defaults_path, _ = resolve_config_path("worker_base")
     defaults_data = load_and_merge_config(defaults_path)
 
     # Load uploaded config
@@ -4260,6 +4273,46 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
     return names
 
 
+_CONFIG_NAME_ALIASES = {
+    # Public compatibility aliases retained across the base-profile rename.
+    "default": "worker_base",
+    "defaults": "worker_base",
+    "persistent_default": "session_base",
+    "persistent_defaults": "session_base",
+}
+
+
+def canonical_config_name(config_name: str) -> str:
+    """Return the canonical logical base name for a legacy selector.
+
+    The aliases are an API compatibility boundary, not duplicate config files:
+    old jobs, threads, CLI commands and expert ``$extends`` values continue to
+    load while every newly persisted root uses ``worker_base``/``session_base``.
+    Explicit non-base paths are left untouched.
+    """
+    if not config_name:
+        return config_name
+    raw = str(config_name)
+    if raw in _CONFIG_NAME_ALIASES:
+        return _CONFIG_NAME_ALIASES[raw]
+    path = Path(raw)
+    if path.name in {
+        "default.yaml",
+        "defaults.yaml",
+        "default.yml",
+        "defaults.yml",
+    }:
+        return str(path.with_name("worker_base" + path.suffix))
+    if path.name in {
+        "persistent_default.yaml",
+        "persistent_defaults.yaml",
+        "persistent_default.yml",
+        "persistent_defaults.yml",
+    }:
+        return str(path.with_name("session_base" + path.suffix))
+    return raw
+
+
 def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     """
     Resolve a config name to a full path and deployment directory.
@@ -4270,7 +4323,7 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     3. config/{name}.yaml (single file config)
 
     Args:
-        config_name: Config name (e.g., "defaults", "my_agent")
+        config_name: Config name (e.g., "worker_base", "my_agent")
                     or full path to config file
 
     Returns:
@@ -4279,6 +4332,8 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
         - deployment_dir: Directory containing deployment files (for prompt resolution)
                          None if using single file config or direct path
     """
+    config_name = canonical_config_name(config_name)
+
     # If it's already a full path or has explicit extension
     if os.path.isabs(config_name) or config_name.endswith((".yaml", ".yml", ".json")):
         return (config_name, None)

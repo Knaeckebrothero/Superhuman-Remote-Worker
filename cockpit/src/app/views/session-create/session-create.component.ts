@@ -15,7 +15,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
 import {AppFormFieldComponent} from '../../ui/form-field';
-import {EffectiveModels} from '../../core/models/api.model';
+import {EffectiveModels, ExpertDefaultsResponse} from '../../core/models/api.model';
 
 interface Project {
   id: string;
@@ -51,6 +51,7 @@ interface Expert {
   tags: string[];
   /** 'bundled' (disk) | 'user' | 'global' (DB). DB experts → expert_id. */
   source?: string;
+  storage_kind?: 'bundled' | 'db';
   expert_type?: string;
 }
 
@@ -152,6 +153,14 @@ interface ExpertDetail extends Expert {
                 </button>
               }
             </div>
+          }
+          @if (selectedExpert()) {
+            <span class="field-hint">
+              {{ 'sessions.create.expertSelectedPrefix' | transloco }} {{ selectedExpert()!.display_name }}
+              @if (selectedExpertSource()) {
+                · {{ ('settings.expertDefaults.source.' + selectedExpertSource()) | transloco }}
+              }
+            </span>
           }
         </app-form-field>
 
@@ -359,6 +368,10 @@ export class SessionCreateComponent implements OnInit {
   );
   readonly experts = signal<Expert[]>([]);
   readonly selectedExpert = signal<Expert | null>(null);
+  private readonly effectiveDefaultExpertId = signal<string | null>(null);
+  readonly selectedExpertSource = signal<'project' | 'user' | 'application' | 'explicit' | null>(null);
+  private expertSelectionTouched = false;
+  private defaultRequestSerial = 0;
   readonly expertDetail = signal<ExpertDetail | null>(null);
   readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
@@ -385,14 +398,16 @@ export class SessionCreateComponent implements OnInit {
     this.modelService.load();
     this.loadExperts();
     this.loadDatasourcesList();
-    this.http.get<ExpertDetail>(`${environment.apiUrl}/experts/defaults?type=session`).subscribe({
+    this.http.get<ExpertDetail>(`${environment.apiUrl}/experts/session_base?type=session`).subscribe({
       next: (d) => {
         if (d?.config) {
           this.frameworkDefaults.set(d.config);
           // Tool toggles keep their own override state rather than deriving it
           // directly from the config input. Synchronize the asynchronously
           // loaded session base so empty persistent categories render disabled.
-          this.agentSettings?.toolsGroup?.prefillFromConfig(d.config);
+          if (!this.expertDetail()) {
+            this.agentSettings?.toolsGroup?.prefillFromConfig(d.config);
+          }
         }
         if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
         if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
@@ -410,16 +425,48 @@ export class SessionCreateComponent implements OnInit {
           // Refresh eligible datasources now that a project is selected.
           this.loadDatasourcesList();
         }
+        this.loadEffectiveDefault();
       },
     });
   }
 
   private loadExperts(): void {
     this.loadingExperts.set(true);
-    this.http.get<Expert[]>(`${environment.apiUrl}/experts`).subscribe({
-      next: (experts) => { this.experts.set(experts); this.loadingExperts.set(false); },
+    this.http.get<Expert[]>(`${environment.apiUrl}/experts?type=session`).subscribe({
+      next: (experts) => {
+        this.experts.set(experts);
+        this.applyEffectiveDefault();
+        this.loadingExperts.set(false);
+      },
       error: () => this.loadingExperts.set(false),
     });
+    this.loadEffectiveDefault();
+  }
+
+  private loadEffectiveDefault(): void {
+    if (this.expertSelectionTouched) return;
+    const serial = ++this.defaultRequestSerial;
+    const projectIds = Array.from(this.selectedProjectIds());
+    const projectId = projectIds.length === 1 ? projectIds[0] : undefined;
+    const suffix = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+    this.http.get<ExpertDefaultsResponse>(`${environment.apiUrl}/expert-defaults${suffix}`).subscribe({
+      next: (response) => {
+        if (serial !== this.defaultRequestSerial || this.expertSelectionTouched) return;
+        this.effectiveDefaultExpertId.set(response?.defaults?.session?.effective?.id ?? null);
+        this.selectedExpertSource.set(response?.defaults?.session?.source ?? null);
+        this.applyEffectiveDefault();
+      },
+    });
+  }
+
+  private applyEffectiveDefault(): void {
+    if (this.expertSelectionTouched) return;
+    const id = this.effectiveDefaultExpertId();
+    const expert = id ? this.experts().find(item => item.id === id) : undefined;
+    if (expert && this.selectedExpert()?.id !== expert.id) {
+      this.selectedExpert.set(expert);
+      this.fetchExpertDetail(expert.id);
+    }
   }
 
   private loadDatasourcesList(): void {
@@ -445,19 +492,15 @@ export class SessionCreateComponent implements OnInit {
     });
     // Refresh eligible datasources for the new project selection.
     this.loadDatasourcesList();
+    this.loadEffectiveDefault();
   }
 
   toggleExpert(expert: Expert): void {
-    if (this.selectedExpert()?.id === expert.id) {
-      this.selectedExpert.set(null);
-      this.expertDetail.set(null);
-      this.agentSettings?.resetAll();
-      const defaults = this.frameworkDefaults();
-      if (defaults) this.agentSettings?.toolsGroup?.prefillFromConfig(defaults);
-    } else {
-      this.selectedExpert.set(expert);
-      this.fetchExpertDetail(expert.id);
-    }
+    this.expertSelectionTouched = true;
+    this.selectedExpertSource.set('explicit');
+    if (this.selectedExpert()?.id === expert.id) return;
+    this.selectedExpert.set(expert);
+    this.fetchExpertDetail(expert.id);
   }
 
   private fetchExpertDetail(expertId: string): void {
@@ -479,8 +522,9 @@ export class SessionCreateComponent implements OnInit {
     // DB-backed experts (source user/global) go via expert_id; config_name
     // stays the persistent base. Bundled experts keep the config_name path.
     // Fixes the config_name=<uuid> conflation that crashed session boot.
-    const isDbExpert = expert?.source === 'user' || expert?.source === 'global';
-    const configName = expert && !isDbExpert ? expert.id : 'persistent_defaults';
+    const isDbExpert = expert?.storage_kind === 'db' ||
+      ['user', 'global', 'managed'].includes(expert?.source ?? '');
+    const configName = expert && !isDbExpert ? expert.id : 'session_base';
     const expertId = isDbExpert ? expert!.id : undefined;
     const projectIds = Array.from(this.selectedProjectIds());
 

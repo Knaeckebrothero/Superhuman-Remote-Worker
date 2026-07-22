@@ -18,6 +18,8 @@ import {
     CodexStatus,
     CodexUsage,
     CommunicationSettings,
+    Expert,
+    ExpertDefaultsResponse,
     McpTokenCreateResponse,
     Project,
     ReadAloudReasoningLevel
@@ -578,6 +580,65 @@ const EXPIRY_OPTIONS = [
           </div>
         </section>
 
+        <!-- DB-backed defaults: these choose the expert; the settings below
+             remain fallback values for fields that expert does not specify. -->
+        <section class="settings-section section-spacer">
+          <h2 class="section-title">{{ 'settings.expertDefaults.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.expertDefaults.desc' | transloco }}</p>
+          @if (expertDefaults(); as defaults) {
+            @if (!defaults.personal_defaults_allowed) {
+              <p class="section-hint">{{ 'settings.expertDefaults.restricted' | transloco }}</p>
+            }
+            <div class="form-block">
+              @for (type of expertDefaultTypes; track type) {
+                <div class="form-row two-col">
+                  <app-form-field
+                    [label]="('settings.expertDefaults.' + type) | transloco"
+                    [hint]="defaultExpertHint(type)"
+                  >
+                    <app-select
+                      [value]="defaults.defaults[type].personal?.id ?? ''"
+                      [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
+                      (changed)="setDefaultExpert(type, $event ?? '')"
+                    >
+                      <option value="">{{ 'settings.expertDefaults.useApplication' | transloco }}</option>
+                      @for (expert of ownedExperts(type); track expert.id) {
+                        <option [value]="expert.id">{{ expert.display_name }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <div class="actions-row default-expert-actions">
+                    <app-button
+                      variant="secondary"
+                      size="sm"
+                      [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
+                      [loading]="defaultExpertBusy() === type"
+                      (clicked)="customizeDefaultExpert(type)"
+                    >
+                      {{ 'settings.expertDefaults.customize' | transloco }}
+                    </app-button>
+                    @if (defaults.defaults[type].personal && !defaults.personal_defaults_allowed) {
+                      <app-button
+                        variant="ghost"
+                        size="sm"
+                        [disabled]="!!defaultExpertBusy()"
+                        (clicked)="setDefaultExpert(type, '')"
+                      >
+                        {{ 'settings.expertDefaults.clear' | transloco }}
+                      </app-button>
+                    }
+                  </div>
+                </div>
+              }
+              <div class="actions-row">
+                <app-button variant="ghost" size="sm" (clicked)="openExperts()">
+                  {{ 'settings.expertDefaults.manage' | transloco }}
+                </app-button>
+              </div>
+            </div>
+          }
+        </section>
+
         <!-- Persistent Agent Section -->
         <section class="settings-section section-spacer">
           <h2 class="section-title">{{ 'settings.persistent.title' | transloco }}</h2>
@@ -594,31 +655,19 @@ const EXPIRY_OPTIONS = [
                 (changed)="onPaModelChange($event)"
               />
             </app-form-field>
-            <div class="form-row two-col">
-              <app-form-field
-                [label]="'settings.persistent.permissionMode' | transloco"
-                [hint]="capabilities.permissionRestricted() ? ('grants.locked.permission_mode' | transloco) : ''"
+            <app-form-field
+              [label]="'settings.persistent.permissionMode' | transloco"
+              [hint]="capabilities.permissionRestricted() ? ('grants.locked.permission_mode' | transloco) : ''"
+            >
+              <app-select
+                [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
+                (changed)="onPrefChange(paPermissionMode, resolved().persistent_agent?.permission_mode, $event)"
               >
-                <app-select
-                  [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
-                  (changed)="onPrefChange(paPermissionMode, resolved().persistent_agent?.permission_mode, $event)"
-                >
-                  <option value="supervised">{{ 'settings.persistent.permissionSupervised' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'supervised' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="auto_accept" [disabled]="!capabilities.allowsPermissionMode('auto_accept')">{{ 'settings.persistent.permissionAutoAccept' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                  <option value="autonomous" [disabled]="!capabilities.allowsPermissionMode('autonomous')">{{ 'settings.persistent.permissionAutonomous' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
-                </app-select>
-              </app-form-field>
-              <app-form-field [label]="'settings.persistent.config' | transloco">
-                <app-select
-                  [value]="paConfigName()"
-                  (changed)="paConfigName.set($event ?? '')"
-                >
-                  <option value="">{{ 'settings.persistent.configDefault' | transloco }}</option>
-                  <option value="developer">{{ 'settings.persistent.configDeveloper' | transloco }}</option>
-                  <option value="scholar">{{ 'settings.persistent.configScholar' | transloco }}</option>
-                </app-select>
-              </app-form-field>
-            </div>
+                <option value="supervised">{{ 'settings.persistent.permissionSupervised' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'supervised' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                <option value="auto_accept" [disabled]="!capabilities.allowsPermissionMode('auto_accept')">{{ 'settings.persistent.permissionAutoAccept' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                <option value="autonomous" [disabled]="!capabilities.allowsPermissionMode('autonomous')">{{ 'settings.persistent.permissionAutonomous' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+              </app-select>
+            </app-form-field>
             <app-form-field
               [label]="'settings.persistent.workspaceBackend' | transloco"
               [hint]="'settings.persistent.workspaceBackendHint' | transloco"
@@ -2333,6 +2382,12 @@ export class SettingsComponent implements OnInit {
   readonly savingPrefs = signal(false);
   readonly prefsSaved = signal(false);
 
+  // The selected DB experts are independent from the preference fallbacks.
+  readonly expertDefaultTypes = ['worker', 'session'] as const;
+  readonly expertDefaults = signal<ExpertDefaultsResponse | null>(null);
+  readonly experts = signal<Expert[]>([]);
+  readonly defaultExpertBusy = signal<'worker' | 'session' | null>(null);
+
   /** Resolved defaults shortcut for template use. */
   readonly resolved = this.settingsService.resolvedDefaults;
 
@@ -2342,7 +2397,6 @@ export class SettingsComponent implements OnInit {
   // Default session workspace tier (null = track the resolved system default,
   // which is "virtual" — see docs/features/instant_landing_session.md).
   readonly paWorkspaceBackend = signal<string | null>(null);
-  readonly paConfigName = signal('');
   readonly paGreeting = signal('');
   readonly paIdleTimeout = signal<number | null>(null);
   readonly paIdleTimeoutText = computed(() => {
@@ -2451,7 +2505,6 @@ export class SettingsComponent implements OnInit {
           this.paModel.set(pa.model ?? null);
           this.paPermissionMode.set(pa.permission_mode ?? null);
           this.paWorkspaceBackend.set(pa.workspace_backend ?? null);
-          this.paConfigName.set(pa.config_name || '');
           this.paGreeting.set(pa.greeting || '');
           this.paIdleTimeout.set(pa.idle_timeout_minutes ?? null);
           this.paCommandAllowlist.set((pa.command_allowlist || []).join(', '));
@@ -2537,6 +2590,7 @@ export class SettingsComponent implements OnInit {
     this.tokenService.loadTokens();
     this.settingsService.loadApiKeys();
     this.settingsService.loadPreferences();
+    this.loadExpertDefaults();
     // Admin-only loaders (codex status + cloud settings) are triggered
     // by the effect in the constructor — that path waits for currentUser()
     // to populate, which is the only thing that works on a hard F5 reload.
@@ -2701,6 +2755,69 @@ export class SettingsComponent implements OnInit {
 
   // ── Persistent Agent Settings ──────────────────────────────────
 
+  private loadExpertDefaults(): void {
+    this.apiService.getExperts().subscribe((experts) => this.experts.set(experts));
+    this.apiService.getExpertDefaults().subscribe((defaults) => {
+      this.expertDefaults.set(defaults);
+      this.defaultExpertBusy.set(null);
+    });
+  }
+
+  ownedExperts(type: 'worker' | 'session'): Expert[] {
+    const userId = this.userService.currentUserId();
+    return this.experts().filter(
+      (expert) =>
+        expert.expert_type === type &&
+        expert.storage_kind === 'db' &&
+        !!userId &&
+        expert.owner_id === userId,
+    );
+  }
+
+  defaultExpertHint(type: 'worker' | 'session'): string {
+    const slot = this.expertDefaults()?.defaults[type];
+    if (!slot?.effective) return '';
+    return this.transloco.translate('settings.expertDefaults.effective', {
+      name: slot.effective.display_name,
+      source: this.transloco.translate(`settings.expertDefaults.source.${slot.source}`),
+    });
+  }
+
+  setDefaultExpert(type: 'worker' | 'session', expertId: string): void {
+    if (this.defaultExpertBusy()) return;
+    this.defaultExpertBusy.set(type);
+    const request = expertId
+      ? this.apiService.setPersonalExpertDefault(type, expertId)
+      : this.apiService.clearPersonalExpertDefault(type);
+    request.subscribe({
+      next: () => this.loadExpertDefaults(),
+      error: () => this.defaultExpertBusy.set(null),
+    });
+  }
+
+  customizeDefaultExpert(type: 'worker' | 'session'): void {
+    if (this.defaultExpertBusy()) return;
+    const slot = this.expertDefaults()?.defaults[type];
+    if (slot?.personal?.id) {
+      this.router.navigate(['/experts', slot.personal.id, 'edit']);
+      return;
+    }
+    const sourceId = slot?.effective?.id;
+    this.defaultExpertBusy.set(type);
+    this.apiService.forkPersonalExpertDefault(type, sourceId).subscribe({
+      next: (result: any) => {
+        const id = result?.default?.id;
+        this.loadExpertDefaults();
+        if (id) this.router.navigate(['/experts', id, 'edit']);
+      },
+      error: () => this.defaultExpertBusy.set(null),
+    });
+  }
+
+  openExperts(): void {
+    this.router.navigate(['/experts']);
+  }
+
   onPaModelChange(text: string): void {
     this.paModel.set(text.trim() || null);
   }
@@ -2742,7 +2859,6 @@ export class SettingsComponent implements OnInit {
         model: this.paModel()?.trim() || null,
         permission_mode: this.paPermissionMode() || null,
         workspace_backend: this.paWorkspaceBackend() || null,
-        config_name: this.paConfigName() || null,
         greeting: this.paGreeting().trim() || null,
         idle_timeout_minutes: this.paIdleTimeout() || null,
         command_allowlist: allowlist,

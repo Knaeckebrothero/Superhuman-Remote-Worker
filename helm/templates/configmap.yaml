@@ -85,10 +85,11 @@ data:
   # (src/core/loader.py) via envFrom on this shared ConfigMap. Default-off
   # chart-wide (prod-safe); the dev/experimental values file turns it on.
   CONFIG_DB_OVERRIDES_ENABLED: {{ .Values.agent.configDbOverridesEnabled | default "false" | quote }}
-  # DB-backed user experts (experts table). Read by both the orchestrator
-  # (list/CRUD) and the agent (expert-by-id load) via envFrom on this shared
-  # ConfigMap. Default-off chart-wide (prod-safe); the dev values file turns it on.
-  EXPERTS_DB_ENABLED: {{ .Values.agent.expertsDbEnabled | default "false" | quote }}
+  # DB-backed experts (experts table). The orchestrator owns selection and
+  # resolved-config delivery; agents receive the flag through the shared
+  # ConfigMap for compatibility. Enabled because root creation resolves DB pointers;
+  # false is retained only as an emergency compatibility switch.
+  EXPERTS_DB_ENABLED: {{ .Values.agent.expertsDbEnabled | default "true" | quote }}
   # DB-backed Agent Skills (skills + skill_files). Read by the orchestrator's
   # skill CRUD/list endpoints. Default-off chart-wide (prod-safe); dev turns it on.
   SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}

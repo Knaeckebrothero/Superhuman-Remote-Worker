@@ -1659,13 +1659,13 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly isSavingSettings = signal(false);
   /** Admin-only fields (e.g. workspace network tier) are hidden unless this is true. */
   readonly isAdmin = computed(() => !!this.userService.currentUser()?.is_admin);
-  /** Framework defaults from GET /api/experts/defaults — used as fallback for toggles. */
+  /** Worker mode base from GET /api/experts/worker_base — toggle fallback. */
   private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly projectMemoryShared = computed(() => {
     const p = this.project();
     const val = (p?.default_config_override as any)?.memory?.project_scoped;
     if (typeof val === 'boolean') return val;
-    // Fall back to framework default from defaults.yaml
+    // Fall back to the conservative worker mode base.
     const defaults = this.frameworkDefaults();
     const defaultVal = (defaults?.['memory'] as any)?.['project_scoped'];
     return typeof defaultVal === 'boolean' ? defaultVal : true;
@@ -1702,8 +1702,8 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       if (this.projectId) this.loadAll();
     });
     this.api.getUsers().subscribe((users) => this.allUsers.set(users));
-    // Load framework defaults so toggles reflect the actual base config
-    this.api.getExpertDetail('defaults').subscribe((d) => {
+    // Load the worker base so project job toggles reflect the actual fallback.
+    this.api.getExpertDetail('worker_base').subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
     });
 

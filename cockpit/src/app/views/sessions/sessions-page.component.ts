@@ -85,7 +85,7 @@ interface Project {
           </app-form-field>
           <app-form-field [label]="'sessions.create.configLabel' | transloco">
             <app-select [(value)]="newConfig">
-              <option value="persistent_defaults">{{ 'sessions.create.configDefault' | transloco }}</option>
+              <option value="session_base">{{ 'sessions.create.configDefault' | transloco }}</option>
               <option value="developer">{{ 'sessions.create.configDeveloper' | transloco }}</option>
               <option value="scholar">{{ 'sessions.create.configScholar' | transloco }}</option>
             </app-select>
@@ -547,7 +547,7 @@ export class SessionsPageComponent implements OnInit {
 
     showCreate = false;
     newTitle = '';
-    newConfig = 'persistent_defaults';
+    newConfig = 'session_base';
     newModel = this.loadSavedSessionModel();
     newPermission = 'supervised';
 

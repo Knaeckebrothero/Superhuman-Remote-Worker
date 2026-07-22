@@ -523,7 +523,7 @@ async def pause_job(job_id: str) -> str:
 @mcp.tool
 async def create_job(
     description: str,
-    config_name: str = "default",
+    config_name: str = "worker_base",
     datasource_ids: list[str] | None = None,
     instructions: str | None = None,
     config_override: dict[str, Any] | None = None,
@@ -537,7 +537,7 @@ async def create_job(
 
     Args:
         description: Natural language task description
-        config_name: Expert/agent config to use (default: "default")
+        config_name: Expert/agent config to use (default: "worker_base")
         datasource_ids: List of global datasource UUIDs to clone as job-scoped
         instructions: Additional inline markdown instructions
         config_override: Per-job config overrides as JSON. To set the model,
@@ -980,7 +980,7 @@ async def get_expert(expert_id: str) -> str:
     """Get full detail for an expert config including merged config and instructions.
 
     Args:
-        expert_id: Expert config ID (e.g., "default", "researcher")
+        expert_id: Expert config ID (e.g., "general-worker", "researcher")
 
     Returns:
         Full config detail with system prompt, tool list, and instructions
@@ -1922,7 +1922,7 @@ async def list_project_jobs(
 async def create_project_job(
     project_id: str,
     description: str,
-    config_name: str = "default",
+    config_name: str = "worker_base",
     instructions: str | None = None,
     config_override: dict[str, Any] | None = None,
     datasource_ids: list[str] | None = None,
@@ -2790,7 +2790,7 @@ async def get_message_thread(job_id: str, thread_id: str) -> str:
 @mcp.tool
 async def create_persistent_thread(
     title: str = "Untitled Session",
-    config_name: str = "defaults",
+    config_name: str = "session_base",
     permission_mode: Literal["supervised", "auto_accept", "autonomous"] = "supervised",
     project_id: str | None = None,
     project_ids: list[str] | None = None,
@@ -2805,7 +2805,7 @@ async def create_persistent_thread(
 
     Args:
         title: Human-readable session title
-        config_name: Agent config to use (default: "defaults")
+        config_name: Agent config to use (default: "session_base")
         permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
         project_id: Single project UUID to scope (legacy)
         project_ids: List of project UUIDs to scope

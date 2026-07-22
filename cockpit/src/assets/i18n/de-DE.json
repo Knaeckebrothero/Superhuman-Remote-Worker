@@ -336,6 +336,13 @@
       "permission_mode": "Dieser Berechtigungsmodus erfordert eine Freigabe."
     }
   },
+  "adminExpertDefaults": {
+    "title": "Standard-Experten der Anwendung",
+    "desc": "Diese globalen Datenbank-Experten werden für Benutzer vorausgewählt, die keinen aktiven persönlichen oder Projektstandard haben.",
+    "worker": "Neue Aufträge",
+    "session": "Neue Sitzungen",
+    "edit": "Ausgewählten Experten bearbeiten"
+  },
   "shell": {
     "newSession": "Neue Sitzung",
     "untitledSession": "Unbenannt",
@@ -487,6 +494,7 @@
       "cancel": "Abbrechen",
       "expertLabel": "Experte",
       "expertLoading": "Experten werden geladen...",
+      "expertSelectedPrefix": "Ausgewählt:",
       "createSession": "Sitzung erstellen",
       "protectedCloud": "Geschützte Cloud — Agenten-Änderungen werden zur Überprüfung bereitgestellt",
       "protectedCloudHint": "Der Agent erhält schreibgeschützten Cloud-Zugriff; seine Änderungen warten im Prüfbereich auf Ihre Freigabe."
@@ -609,7 +617,7 @@
       "expertLabel": "Agent-Experte",
       "expertLoading": "Experten werden geladen...",
       "expertSelectedPrefix": "Ausgewählt:",
-      "expertHintUnselected": "Wählen Sie ein Expertenprofil oder lassen Sie die Auswahl leer für den Standard-Agenten",
+      "expertHintUnselected": "Der wirksame Standard-Experte wird automatisch ausgewählt",
       "documentsLabel": "Dokumente",
       "dropHint": "Dateien hierher ziehen oder klicken, um zu durchsuchen",
       "maxHint": "Max. {{maxFiles}} Dateien, je {{maxSizeMb}} MB",
@@ -865,6 +873,24 @@
       "providerLocal": "Lokal",
       "providerOpenrouter": "OpenRouter",
       "save": "Voreinstellungen speichern"
+    },
+    "expertDefaults": {
+      "title": "Standard-Assistenten",
+      "desc": "Wähle den Datenbank-Experten, der für neue Aufträge und Sitzungen vorausgewählt wird. Die Modell- und Verhaltensvorgaben darunter füllen nur Felder aus, die der ausgewählte Experte offenlässt.",
+      "worker": "Neue Aufträge",
+      "session": "Neue Sitzungen",
+      "useApplication": "Anwendungsstandard verwenden",
+      "customize": "Kopie anpassen",
+      "clear": "Persönlichen Standard entfernen",
+      "manage": "Meine Experten verwalten",
+      "restricted": "Dein Administrator verwaltet die Standard-Assistenten. Eine ältere persönliche Auswahl kannst du weiterhin entfernen.",
+      "effective": "Aktiv: {{name}} ({{source}})",
+      "source": {
+        "application": "Anwendungsstandard",
+        "user": "dein Standard",
+        "project": "Projektstandard",
+        "explicit": "explizite Auswahl"
+      }
     },
     "persistent": {
       "title": "Persistenter Agent",

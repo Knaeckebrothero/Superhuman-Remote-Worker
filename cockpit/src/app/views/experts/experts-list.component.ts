@@ -12,6 +12,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
+import {UserService} from '../../core/services/user.service';
 
 export type ExpertTypeFilter = 'all' | 'worker' | 'session';
 
@@ -109,7 +110,7 @@ export function isBundled(e: Expert): boolean {
                       <app-icon size="sm">more_vert</app-icon>
                     </app-icon-button>
                     <app-menu #rowMenu>
-                      @if (!bundled(e)) {
+                      @if (canEdit(e)) {
                         <app-menu-item (activated)="edit(e)">
                           {{ 'experts.edit' | transloco }}
                         </app-menu-item>
@@ -120,14 +121,14 @@ export function isBundled(e: Expert): boolean {
                       <app-menu-item (activated)="exportExpert(e)">
                         {{ 'experts.export' | transloco }}
                       </app-menu-item>
-                      @if (!bundled(e)) {
+                      @if (canDelete(e)) {
                         <app-menu-item tone="danger" (activated)="askDelete(e)">
                           {{ 'experts.delete' | transloco }}
                         </app-menu-item>
                       }
                     </app-menu>
                   } @else {
-                    @if (!bundled(e)) {
+                    @if (canEdit(e)) {
                       <app-icon-button
                         size="sm"
                         variant="ghost"
@@ -156,7 +157,7 @@ export function isBundled(e: Expert): boolean {
                     >
                       <app-icon size="sm">download</app-icon>
                     </app-icon-button>
-                    @if (!bundled(e)) {
+                    @if (canDelete(e)) {
                       <app-icon-button
                         size="sm"
                         variant="danger"
@@ -280,6 +281,7 @@ export class ExpertsListComponent implements OnInit {
   private api = inject(ApiService);
   private router = inject(Router);
   private transloco = inject(TranslocoService);
+  private userService = inject(UserService);
   protected readonly viewport = inject(ViewportService);
 
   filters: {value: ExpertTypeFilter; key: string}[] = [
@@ -297,6 +299,16 @@ export class ExpertsListComponent implements OnInit {
 
   filtered = computed(() => filterExperts(this.rows(), this.typeFilter()));
   bundled = isBundled;
+
+  canEdit(e: Expert): boolean {
+    if (isBundled(e)) return false;
+    const user = this.userService.currentUser();
+    return !!user && (user.is_admin || e.owner_id === user.id);
+  }
+
+  canDelete(e: Expert): boolean {
+    return !e.managed_key && this.canEdit(e);
+  }
 
   ngOnInit(): void {
     this.refresh();

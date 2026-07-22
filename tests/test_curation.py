@@ -212,10 +212,10 @@ class TestCurateKnowledgeTask:
 
 
 class TestCurationConfig:
-    """Tests for curation config in defaults.yaml and curator expert config."""
+    """Tests for curation config in worker_base.yaml and curator expert config."""
 
     def test_curation_config_defaults(self):
-        """Verify defaults.yaml has the curator section."""
+        """Verify worker_base.yaml has the curator section."""
         config = _load_config("defaults")
         assert hasattr(config, "extra")
         curator = config.extra.get("curator", {})

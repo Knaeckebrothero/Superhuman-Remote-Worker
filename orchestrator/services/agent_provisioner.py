@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
+from src.core.loader import canonical_config_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,8 +41,8 @@ def _normalize_config_name(config_name: str, purpose: str) -> str:
     try:
         UUID(str(config_name))
     except (ValueError, TypeError, AttributeError):
-        return config_name
-    base = "defaults" if purpose == "job" else "persistent_defaults"
+        return canonical_config_name(config_name)
+    base = "worker_base" if purpose == "job" else "session_base"
     logger.warning(
         "agent config_name %s is a UUID (expert id in the config slot); "
         "booting base %s instead — expert applies via config_override.",
@@ -216,7 +218,7 @@ class AgentProvisioner:
         self,
         purpose: str,
         thread_id: Optional[str] = None,
-        config_name: str = "defaults",
+        config_name: str = "worker_base",
         expert_id: Optional[str] = None,
         cpu_request: str = "250m",
         memory_request: str = "512Mi",

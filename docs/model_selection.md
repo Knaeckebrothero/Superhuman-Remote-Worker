@@ -130,7 +130,7 @@ When writing or modifying prompts for M2.7:
 
 | Change | Impact | Location |
 |---|---|---|
-| Use DeepSeek V3.2 for observer/summarization | Minor cost savings | `config/defaults.yaml` observer_model |
+| Use DeepSeek V3.2 for observer/summarization | Minor cost savings | `config/worker_base.yaml` observer_model |
 | Evaluate M2.7 standard vs Lightning empirically | Confirm standard is sufficient speed | Runtime testing |
 
 ## Cost Projections

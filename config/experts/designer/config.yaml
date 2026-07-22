@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Designer - UI/UX design and prototyping
-$extends: defaults
+$extends: worker_base
 
 agent_id: designer
 display_name: Designer

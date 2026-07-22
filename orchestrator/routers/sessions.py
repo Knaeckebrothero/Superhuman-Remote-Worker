@@ -123,7 +123,7 @@ async def prepare_session(
         boot_config_name = (
             persisted
             if persisted and not _is_expert_uuid(persisted)
-            else "persistent_defaults"
+            else "session_base"
         )
 
     # Fire-and-forget the actual work in a background task. Progress reaches
@@ -258,7 +258,7 @@ async def _do_prepare(
                 else:
                     await _provision_agent_for_thread(
                         thread_id=thread_id,
-                        config_name=config_name or "persistent_defaults",
+                        config_name=config_name or "session_base",
                         config_override=config_override,
                     )
                 needs_binding_wait = True

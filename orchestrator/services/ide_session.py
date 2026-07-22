@@ -520,7 +520,7 @@ class IdeSessionService:
 
         # Provision a fresh VM for the IDE session
         vm_name = f"ide-{job_id[:12]}"
-        config_name = job.get("config_name") or "defaults"
+        config_name = job.get("config_name") or "worker_base"
 
         ok = await self._vm_provisioner.create_vm(
             job_id=job_id,

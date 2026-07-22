@@ -57,12 +57,18 @@ class _FakeDb:
         capability_counts: dict[str, int] | None = None,
         pinned_capabilities: list[str] | None = None,
         fallback_setting: dict[str, Any] | None = None,
+        expert_defaults: list[dict[str, Any]] | None = None,
     ) -> None:
         self._api_keys = api_keys or []
         self._endpoints = endpoints or []
         self._counts = capability_counts or {}
         self._pinned = pinned_capabilities or []
         self._fallback_setting = fallback_setting
+        self._expert_defaults = (
+            expert_defaults
+            if expert_defaults is not None
+            else [{"expert_type": "worker"}, {"expert_type": "session"}]
+        )
 
     async def list_system_api_keys(self) -> list[dict[str, Any]]:
         return list(self._api_keys)
@@ -80,6 +86,9 @@ class _FakeDb:
         if key == "llm.fallback_optional_capabilities_to_chat":
             return self._fallback_setting
         return None
+
+    async def list_application_expert_defaults(self) -> list[dict[str, Any]]:
+        return list(self._expert_defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +159,20 @@ async def test_fully_ready_state() -> None:
     assert result["missing_providers"] == []
     assert result["missing_capabilities"] == []
     assert result["missing_defaults"] == []
+    assert result["missing_expert_defaults"] == []
+
+
+@pytest.mark.asyncio
+async def test_missing_application_expert_pointer_blocks_readiness() -> None:
+    db = _FakeDb(
+        api_keys=[{"provider": "openai"}],
+        capability_counts={"chat": 1, "embedding": 1, "auxiliary": 1},
+        pinned_capabilities=["chat", "embedding", "auxiliary"],
+        expert_defaults=[{"expert_type": "worker"}],
+    )
+    result = await readiness.compute_readiness(db)
+    assert result["ready"] is False
+    assert result["missing_expert_defaults"] == ["session"]
 
 
 @pytest.mark.asyncio
@@ -249,14 +272,17 @@ def test_gate_error_detail_carries_missing_lists() -> None:
         "missing_providers": [],
         "missing_capabilities": ["embedding"],
         "missing_defaults": ["chat"],
+        "missing_expert_defaults": ["session"],
         "optional_capability_fallbacks": {},
     }
     detail = readiness.gate_error_detail(payload)
     assert detail["error"] == "system_not_ready"
     assert detail["missing_capabilities"] == ["embedding"]
     assert detail["missing_defaults"] == ["chat"]
+    assert detail["missing_expert_defaults"] == ["session"]
     assert "embedding" in detail["message"]
     assert "chat" in detail["message"]
+    assert "session" in detail["message"]
 
 
 def test_gate_error_detail_message_for_no_providers() -> None:

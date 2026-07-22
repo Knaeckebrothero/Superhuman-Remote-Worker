@@ -23,6 +23,7 @@ def _rows(**kv):
 
 def test_catalog_keys_and_defaults():
     assert set(CATALOG) == {
+        "personal_default_experts",
         "vm_workspace",
         "shell_tools",
         "delegation",
@@ -35,6 +36,7 @@ def test_catalog_keys_and_defaults():
         "email_autonomous_send",
     }
     assert all(spec["restrict_only"] for spec in CATALOG.values())
+    assert CATALOG["personal_default_experts"]["default"] is True
     assert CATALOG["vm_workspace"]["default"] is False
     assert CATALOG["shell_tools"]["default"] is False  # deny-by-default
     assert CATALOG["delegation"]["default"] is False
@@ -243,10 +245,8 @@ def test_cross_layer_credential_assembly_denied():
     assert hard_deny_scan({"llm": {"model": "x", "api_key": "leaked"}})
 
 
-def test_worker_base_grandfather_is_exactly_shell_and_delegation():
-    """Empirical guard on the central design bet: the real worker base trips
-    EXACTLY shell_tools + delegation under deny-default, and grandfathering just
-    those two clears it (no self-DoS, nothing else needs grandfathering)."""
+def test_worker_base_is_safe_for_a_new_principal():
+    """The framework fallback itself must not require privileged grants."""
     from orchestrator.services.config_resolver import resolve_config
 
     cap: dict = {}
@@ -254,12 +254,10 @@ def test_worker_base_grandfather_is_exactly_shell_and_delegation():
     frag = cap["merged_fragment"]
     deny = {k: v["default"] for k, v in CATALOG.items()}
     flagged = {v.split(":")[0] for v in evaluate(frag, deny)}
-    assert flagged == {"shell_tools", "delegation"}
-    grand = {**deny, "shell_tools": True, "delegation": True}
-    assert evaluate(frag, grand) == []
+    assert flagged == set()
 
 
-def test_session_base_grandfather_is_exactly_shell():
+def test_session_base_is_safe_for_a_new_principal():
     from orchestrator.services.config_resolver import resolve_config
 
     cap: dict = {}
@@ -269,6 +267,16 @@ def test_session_base_grandfather_is_exactly_shell():
     frag = cap["merged_fragment"]
     deny = {k: v["default"] for k, v in CATALOG.items()}
     flagged = {v.split(":")[0] for v in evaluate(frag, deny)}
-    assert flagged == {"shell_tools"}
-    grand = {**deny, "shell_tools": True, "delegation": True}
-    assert evaluate(frag, grand) == []
+    assert flagged == set()
+
+
+def test_specialists_explicitly_opt_in_to_delegation():
+    """Profiles that declare spawn_subagent must not inherit the safe-base off."""
+    from orchestrator.services.config_resolver import resolve_config
+
+    for name in ("developer", "critic", "scholar"):
+        cap: dict = {}
+        resolve_config(base_config_name=name, capture=cap, expert_type="worker")
+        fragment = cap["merged_fragment"]
+        assert fragment["delegation"]["enabled"] is True
+        assert fragment["tools"]["delegation"] == ["spawn_subagent"]

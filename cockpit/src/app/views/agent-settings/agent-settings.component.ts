@@ -242,7 +242,7 @@ export class AgentSettingsComponent {
   readonly useVerticalTabs = computed(() => this.mode() === 'job' && !this.viewport.isMobile());
   /** Whether the selected project has shared memory. */
   showProjectMemory = input(false);
-  /** Default tool lists from defaults.yaml. */
+  /** Inherited tool lists from the selected expert's mode base. */
   defaultsTools = input<Record<string, string[]>>({});
   /** Raw settings_matrix for client-side model-family resolution. */
   settingsMatrix = input<Record<string, Record<string, unknown>>>({});

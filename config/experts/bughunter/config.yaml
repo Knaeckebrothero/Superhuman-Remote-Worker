@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Bug Hunter - Adversarial, exploratory testing of an existing target surface.
-$extends: defaults
+$extends: worker_base
 
 agent_id: bughunter
 display_name: Bug Hunter

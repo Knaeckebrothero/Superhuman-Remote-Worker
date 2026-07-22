@@ -546,7 +546,7 @@ class TestTemplateRendering:
 
         assert result["metadata"]["name"] == "agent-vm-test-456"
         # Defaults: agent_config=defaults, cpu=8, memory=16Gi
-        assert result["spec"]["config"]["agentConfig"] == "defaults"
+        assert result["spec"]["config"]["agentConfig"] == "worker_base"
         assert result["spec"]["template"]["spec"]["domain"]["cpu"]["cores"] == 8
         assert (
             result["spec"]["template"]["spec"]["domain"]["resources"]["requests"][

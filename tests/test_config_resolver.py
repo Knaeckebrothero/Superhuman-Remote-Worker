@@ -94,6 +94,18 @@ def test_base_defaults_replace_placeholder_below_expert():
     assert blob2["agent"]["llm"]["model"] == "expert-model"  # expert > floor
 
 
+def test_account_fallback_sits_below_bundled_expert_leaf():
+    """Bundled experts are overlays too; their explicit values beat account defaults."""
+    cap: dict = {}
+    resolve_config(
+        base_config_name="developer",
+        base_defaults={"llm": {"reasoning_level": "low"}},
+        capture=cap,
+        expert_type="worker",
+    )
+    assert cap["merged_fragment"]["llm"]["reasoning_level"] == "high"
+
+
 def test_expert_model_applies_when_no_request_override():
     blob = resolve_config(
         base_config_name="persistent_defaults",

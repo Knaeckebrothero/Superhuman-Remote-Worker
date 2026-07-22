@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Developer - test-driven implementation. Spec first, tests first, code last.
-$extends: defaults
+$extends: worker_base
 
 agent_id: developer
 display_name: Developer
@@ -28,6 +28,7 @@ llm:
 # from the llm.subagent tier (falls back to llm.tactical; per-job override via
 # config_override.llm.subagent).
 delegation:
+  enabled: true
   mode: light
   light:
     allow_writes: true
@@ -64,7 +65,7 @@ tools:
     - git_status
     - git_tags
   # Websearch — a coder must be able to look things up (docs, APIs, error
-  # messages). browser_direct (step-by-step Chromium) is inherited from defaults.
+  # messages). browser_direct (step-by-step Chromium) is inherited from worker_base.
   research:
     - web_search
     - extract_webpage
@@ -74,7 +75,7 @@ tools:
     - download_from_website
     - research_topic
   # Light subagent delegation via spawn_subagent (replaces the inherited heavy
-  # delegate_work / resume_delegation_child grant from defaults).
+  # delegate_work / resume_delegation_child grant from the former broad base).
   delegation:
     - spawn_subagent
   # Disable unused tool categories

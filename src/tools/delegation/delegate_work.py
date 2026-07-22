@@ -300,7 +300,7 @@ def create_delegation_tools(context: ToolContext) -> List[Any]:
             git.push()
 
         # 2. Create child jobs via orchestrator API
-        parent_config = tool_context._job_metadata.get("config_name", "defaults")
+        parent_config = tool_context._job_metadata.get("config_name", "worker_base")
         parent_project_id = tool_context._job_metadata.get("project_id")
         parent_priority = tool_context._job_metadata.get("priority", 5)
 

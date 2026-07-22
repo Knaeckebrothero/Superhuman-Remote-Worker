@@ -57,8 +57,8 @@ from tests._memory_fixtures import (
 )
 
 REPO_ROOT = Path(__file__).parent.parent
-WORKER_CONFIG_PATH = str(REPO_ROOT / "config" / "defaults.yaml")
-PERSISTENT_CONFIG_PATH = str(REPO_ROOT / "config" / "persistent_defaults.yaml")
+WORKER_CONFIG_PATH = str(REPO_ROOT / "config" / "worker_base.yaml")
+PERSISTENT_CONFIG_PATH = str(REPO_ROOT / "config" / "session_base.yaml")
 
 
 # ---------------------------------------------------------------------------

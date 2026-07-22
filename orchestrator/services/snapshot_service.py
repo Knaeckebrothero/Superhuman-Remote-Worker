@@ -361,7 +361,7 @@ class SnapshotService:
         ssh_port: int,
         phase_number: Optional[int] = None,
         source_type: str = "vm",
-        agent_config: str = "defaults",
+        agent_config: str = "worker_base",
         entity_type: str = "jobs",
         work_marker: Optional[int] = None,
     ) -> bool:

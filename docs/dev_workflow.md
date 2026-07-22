@@ -274,7 +274,7 @@ Create `config/experts/designer/` with all config, prompts, and instruction temp
 - `config/experts/designer/strategic_todos_initial.yaml`
 
 **Future work**:
-- Persistent/interactive variant config (`$extends: persistent_defaults`)
+- Persistent/interactive variant config (`$extends: session_base`)
 - Orchestrator support: inject design_spec/ into developer workspace
 - Completion handler: optional designer stage before pipeline begins
 - Cockpit UI: mockup preview panel (render HTML mockups inline)
@@ -297,7 +297,7 @@ Create `config/experts/requirements/` for structured requirements capture. Can r
 Wire the stages together in the orchestrator. Extend the completion handler to support multi-stage pipelines with parallel agents per stage.
 
 **Deliverables**:
-- Pipeline config schema (in `defaults.yaml`)
+- Pipeline config schema (in `worker_base.yaml`)
 - Pipeline state tracking (new JSONB fields on jobs)
 - Stage advancement logic in completion handler
 - Cross-stage artifact merging

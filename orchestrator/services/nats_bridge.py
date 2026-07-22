@@ -219,7 +219,7 @@ class NatsBridge:
     async def request_vm_create(
         self,
         job_id: str,
-        agent_config: str = "defaults",
+        agent_config: str = "worker_base",
         vm_image: Optional[str] = None,
         cpu_cores: int = 8,
         memory: str = "16Gi",

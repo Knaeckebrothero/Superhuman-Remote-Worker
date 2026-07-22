@@ -10,7 +10,7 @@ Lifecycle:
     get_pod_status()     — check if pod is running for a thread
 
 For local development, persistent agents are started manually via:
-    python agent.py --mode persistent --thread-id <uuid> --config persistent_defaults
+    python agent.py --mode persistent --thread-id <uuid> --config session_base
 """
 
 import asyncio
@@ -19,6 +19,8 @@ import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+from src.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
 
@@ -30,17 +32,17 @@ def _normalize_config_name(config_name: str) -> str:
     so fall back to the session base. See
     docs/done/global_expert_management.md."""
     if not config_name:
-        return config_name
+        return canonical_config_name(config_name)
     try:
         uuid.UUID(str(config_name))
     except (ValueError, TypeError, AttributeError):
         return config_name
     logger.warning(
         "session config_name %s is a UUID (expert id in the config slot); "
-        "booting persistent_defaults — expert applies via config_override.",
+        "booting session_base — expert applies via config_override.",
         config_name,
     )
-    return "persistent_defaults"
+    return "session_base"
 
 
 class PersistentProvisioner:
@@ -155,7 +157,7 @@ class PersistentProvisioner:
     async def create_agent_pod(
         self,
         thread_id: str,
-        config_name: str = "persistent_defaults",
+        config_name: str = "session_base",
         expert_id: str | None = None,
         cpu_request: str = "250m",
         memory_request: str = "512Mi",
@@ -166,7 +168,7 @@ class PersistentProvisioner:
 
         Args:
             thread_id: Thread UUID to bind the agent to.
-            config_name: Agent config to use (e.g. ``persistent_defaults``).
+            config_name: Agent config to use (e.g. ``session_base``).
             cpu_request: CPU request.
             memory_request: Memory request.
             cpu_limit: CPU limit.

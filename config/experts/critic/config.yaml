@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../../schema.json
 # Critic - Proactive code review, quality gating, idea rejection
-$extends: defaults
+$extends: worker_base
 
 agent_id: critic
 display_name: Critic
@@ -20,6 +20,7 @@ tags:
 # gather evidence, the critic renders the verdict. Reader model = llm.subagent
 # tier (falls back to llm.tactical).
 delegation:
+  enabled: true
   mode: light
 
 workspace:

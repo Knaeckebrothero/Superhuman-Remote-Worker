@@ -56,11 +56,29 @@ export interface Expert {
   icon: string;
   color: string;
   tags: string[];
-  /** 'bundled' (disk config) | 'user' | 'global' (DB-backed). DB experts are
+  /** 'bundled' (disk config) | 'user' | 'global' | 'managed' (DB-backed). DB experts are
    *  selected via expert_id; bundled experts via config_name. */
   source?: string;
-  /** 'worker' | 'session' — present on DB-backed experts only. */
+  storage_kind?: 'bundled' | 'db';
+  owner_id?: string | null;
+  managed_key?: string | null;
+  /** 'worker' | 'session'. */
   expert_type?: string;
+}
+
+export interface ExpertDefaultSlot {
+  application: Expert | null;
+  personal: Expert | null;
+  effective: Expert | null;
+  source: 'project' | 'user' | 'application' | 'explicit';
+}
+
+export interface ExpertDefaultsResponse {
+  personal_defaults_allowed: boolean;
+  defaults: {
+    worker: ExpertDefaultSlot;
+    session: ExpertDefaultSlot;
+  };
 }
 
 /**
@@ -97,7 +115,7 @@ export interface EffectiveModels {
 export interface ExpertDetail extends Expert {
   config: Record<string, unknown>;
   instructions: string | null;
-  /** Tool lists from defaults.yaml, used to re-enable expert-disabled categories. */
+  /** Tool lists from the expert's mode base, used by the structured editor. */
   defaults_tools?: Record<string, string[]>;
   /** Raw settings_matrix.yaml for client-side model-family resolution. */
   settings_matrix?: Record<string, Record<string, unknown>>;

@@ -71,10 +71,10 @@ def parse_args():
     parser.add_argument(
         "--config",
         "-c",
-        default="defaults",
+        default="worker_base",
         help=(
             "Agent config name or path. Looks in config/{name}/config.yaml first, "
-            "then config/{name}.yaml. (default: defaults)"
+            "then config/{name}.yaml. (default: worker_base)"
         ),
     )
 

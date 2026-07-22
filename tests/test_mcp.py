@@ -406,7 +406,7 @@ class TestAsyncCockpitClientPersistentThreads:
             url = mock.call_args[0][0]
             body = mock.call_args[1]["json"]
             assert url == "/api/persistent/threads"
-            assert body["config_name"] == "defaults"
+            assert body["config_name"] == "session_base"
             assert body["title"] == "Untitled Session"
             assert body["permission_mode"] == "supervised"
             # Optional fields should NOT be in body
