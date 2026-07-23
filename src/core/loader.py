@@ -1473,6 +1473,7 @@ class ToolsConfig:
     knowledge: List[str] = field(default_factory=list)
     webdav: List[str] = field(default_factory=list)
     email: List[str] = field(default_factory=list)
+    mcp: List[str] = field(default_factory=list)
     communication: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
@@ -2240,6 +2241,7 @@ def load_agent_config(
         knowledge=tools_data.get("knowledge", []),
         webdav=tools_data.get("webdav", []),
         email=tools_data.get("email", []),
+        mcp=tools_data.get("mcp", []),
         communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
@@ -2474,6 +2476,7 @@ def load_agent_config_from_dict(
         knowledge=tools_data.get("knowledge", []),
         webdav=tools_data.get("webdav", []),
         email=tools_data.get("email", []),
+        mcp=tools_data.get("mcp", []),
         communication=tools_data.get("communication", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
@@ -4248,6 +4251,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         "knowledge",
         "webdav",
         "email",
+        "mcp",
         "communication",
         "delegation",
         "orchestrator",
