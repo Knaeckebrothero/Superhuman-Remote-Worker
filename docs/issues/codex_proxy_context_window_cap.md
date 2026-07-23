@@ -44,3 +44,54 @@ The capped value flows through the existing dispatch injection (`orchestrator/ma
 ## Verification done
 
 `pytest tests/test_model_registry.py` (57 passed incl. 8 new `TestCodexContextWindowCap`: NULL→cap, oversized→cap, smaller-respected, non-codex-untouched, catalog path, env override, env=0 disables, malformed env→default). `ruff check` + `ruff format` clean. `tests/test_dispatch_phase_credentials.py` window tests green. Live probe above. **Remaining:** image rebuild + `helm upgrade`, then confirm a new gpt-5.6-sol session compacts before ~357K and no longer `context_too_large`s.
+
+---
+
+## Follow-up: `NULL -> cap` inflated sub-cap models (regression, fixed 2026-07-23)
+
+**Status:** fixed on `develop` (code + data), unpushed. Diagnosed from job `9a99f433-85fe-4e50-8bb0-d7f82c372c1e` (Loop iter 1 · SCHOLAR, model `gpt-5.3-codex-spark`).
+**Severity:** high — deterministic job kill, same `context_too_large` signature as the original bug but the opposite cause.
+
+The clamp above was written for models whose true window is **above** the cap (gpt-5.6: 1M → 400K), where `NULL -> cap` *narrows*. `gpt-5.3-codex-spark` shipped 2026-07-15 as the first codex-routed model whose true window is **below** the cap — a distilled **128K** model. Its catalog row had `context_window = NULL`, so the same rule handed back **400,000** and *widened* the window 3.1× past reality.
+
+That value is not advisory. Dispatch injects it (`orchestrator/main.py:1712`) into `llm.model_max_context_tokens`, where `loader._apply_settings_matrix:804` treats any truthy value as authoritative and **never falls back** to the family matrix — so `codex-spark`'s correct `model_max_context_tokens: 128000` (`config/model_config_matrix.yaml:429`) was masked. The 80% threshold landed at **320K** against a **128K** wall.
+
+Observed on the failed job: prompt tokens grew monotonically 42,477 (13:02) → **123,796** (13:08:41, last 200 OK); the next turn crossed the wall and returned `400 context_too_large` six identical times, tripping the deterministic-rejection classifier. Agent boot log confirms the whole chain in one line:
+
+```
+Created Codex LLM: model=gpt-5.3-codex-spark, ..., max_context_tokens=400000
+```
+
+### Fix
+
+**Code — the cap is a ceiling, never a floor.** `_cap_context_window(provider, context_window, model_id)` now resolves the effective window as `context_window or _family_context_window(model_id)` and `min`s *that* with the cap; the bare cap stands in only when neither is known. `_family_context_window` reads the matrix via a deferred `from src.core.loader import resolve_model_settings` (loader imports `family_of` from model_registry, so the dependency can only run in this direction at call time) and degrades to None on any failure, preserving the old behaviour. Registry and matrix now agree instead of the registry overriding it.
+
+Behaviour preserved for every prior case — gpt-5.6 NULL still yields 400K, because the family declares 1M and `min(1M, 400K) = 400K`. Only sub-cap families change. An unrecognised model now resolves via the matrix `default` family (128000) rather than the cap, which is both consistent with what the loader would derive alone and the safe direction.
+
+**Data — dev catalog re-seed.** The row was created without a window (`seeded_from` NULL; the 07-10 re-seed predates the model). `ON CONFLICT DO NOTHING` means only an UPDATE lands it:
+
+```sql
+UPDATE models SET context_window = 128000 WHERE model_id = 'gpt-5.3-codex-spark';
+```
+
+This is the **immediate** remedy: it fixes the deployed image with no rebuild, because `min(128000, 400000) = 128000` already holds under the old code. The code fix prevents the next sub-cap codex model from repeating it. `model_registry` has no caching, so the UPDATE takes effect on the next dispatch with no orchestrator restart.
+
+### Verification done
+
+`pytest tests/test_model_registry.py` (61 passed, incl. 4 new: sub-cap family via endpoint row + catalog row, sub-cap still clamped by a smaller env cap, unknown family → matrix default). Related suites green: `test_dispatch_phase_credentials`, `test_settings_matrix`, `test_config_resolver`, `test_loader_routing`, `test_admin_models_api`, `test_phase_model_budget`, `test_context_overflow`, `test_context_safety`, `test_context_methods`, `test_model_swap_hardening`, `test_prompt_matrix`, `test_tool_vocabularies` (359 passed). `ruff check` + `ruff format` clean.
+
+Live-verified against the **deployed** dev orchestrator image (`srw-orchestrator-74c896f7f`), which proves the matrix is readable there — the load-bearing assumption of the deferred import:
+
+```
+gpt-5.3-codex-spark | family= codex-spark | window= 128000
+gpt-5.6-sol         | family= gpt-5.6     | window= 1000000
+some-unheard-of-model | family= default   | window= 128000
+```
+
+and post-UPDATE resolution through the deployed `_catalog_row_to_meta`: `provider = codex | context_window = 128000` → threshold **102,400**, comfortably under the 128K wall.
+
+**Blast radius:** one job, cluster-wide — `SELECT status, count(*) FROM jobs WHERE error_message LIKE '%context_too_large%'` returned exactly `failed | 1`. gpt-5.6-* were never exposed (explicit 400000).
+
+### Contributing factor (not causal, still open)
+
+From iter ~300 the scholar was in a repetitive git-inspection loop — `git_tags, git_log, git_diff, git_show, list_files, read_file×3` on nearly every turn — driving 42K → 124K in six minutes. A correct 128K window would have compacted at ~102K and the job would have survived, so this is not the root cause, but it is why the wall was reached inside a single iteration.

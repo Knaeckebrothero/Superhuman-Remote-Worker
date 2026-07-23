@@ -113,6 +113,83 @@ class TestDeployBoundSkillWithoutDeploymentDir:
 
 
 class TestCapabilityScopedCanvasSkillDeployment:
+    def test_managed_app_guide_is_scoped_by_reader_and_never_materialized(self):
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {
+                    "menu": [
+                        {"name": "app-guide", "description": "shadow"},
+                        {"name": "ordinary-skill"},
+                    ],
+                    "files": {
+                        "app-guide": {"SKILL.md": "STALE-OR-USER-GUIDE"},
+                        "ordinary-skill": {"SKILL.md": "ordinary"},
+                    },
+                }
+            }
+        )
+        session = _make_session(config=cfg)
+        written: dict[str, str] = {}
+        workspace = MagicMock()
+        workspace.exists.side_effect = lambda path: path in written
+        workspace.write_file.side_effect = lambda path, content: written.__setitem__(
+            path, content
+        )
+        session.workspace_manager = workspace
+        session.tool_context = SimpleNamespace(config={})
+
+        session._scope_skills_for_tool_names(["read_product_guide"])
+        session._deploy_catalog_skill_files()
+
+        scoped = session.config.extra["_resolved_skills"]
+        app_entry = next(item for item in scoped["menu"] if item["name"] == "app-guide")
+        assert app_entry["system_managed"] is True
+        assert app_entry["loader_tool"] == "read_product_guide"
+        assert "STALE-OR-USER-GUIDE" not in scoped["files"]["app-guide"]["SKILL.md"]
+        assert written == {"skills/ordinary-skill/SKILL.md": "ordinary"}
+        assert session.tool_context.config["_resolved_skills"] == scoped
+
+    def test_app_guide_is_withheld_if_reader_failed_to_instantiate(self):
+        cfg = _make_config(extra={"_resolved_skills": {}})
+        session = _make_session(config=cfg)
+
+        session._scope_skills_for_tool_names([])
+
+        assert all(
+            item["name"] != "app-guide"
+            for item in session.config.extra["_resolved_skills"]["menu"]
+        )
+
+    def test_stale_bound_app_guide_instruction_is_removed(self):
+        from src.core.loader import InstructionFileEntry
+
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {},
+                "_resolved_instructions": {"app-guide": "STALE-BOUND-PRODUCT-GUIDANCE"},
+            }
+        )
+        cfg.instruction_files = [
+            InstructionFileEntry(
+                trigger="before_tool:create_worker_job",
+                skill="app-guide",
+            )
+        ]
+        session = _make_session(config=cfg)
+        written: dict[str, str] = {}
+        workspace = MagicMock()
+        workspace.exists.side_effect = lambda path: path in written
+        workspace.write_file.side_effect = lambda path, content: written.__setitem__(
+            path, content
+        )
+        session.workspace_manager = workspace
+
+        session._deploy_instruction_files()
+
+        assert session.config.instruction_files == []
+        assert "app-guide" not in session.config.extra["_resolved_instructions"]
+        assert "skills/app-guide/SKILL.md" not in written
+
     def test_managed_canvas_skill_upgrades_only_unchanged_owned_bytes(self):
         cfg = _make_config(
             extra={
@@ -523,10 +600,11 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
         mock_sm = MagicMock()
         session.shell_manager = mock_sm
 
-        captured_context = {}
+        captured_context = {"tool_name_calls": []}
 
         def spy_load_tools(names, ctx):
             captured_context["shell_manager"] = ctx.shell_manager
+            captured_context["tool_name_calls"].append(list(names))
             return []
 
         with (
@@ -547,6 +625,10 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
             session._setup_tools(None)
 
         assert captured_context["shell_manager"] is mock_sm
+        assert any(
+            "read_product_guide" in names
+            for names in captured_context["tool_name_calls"]
+        )
 
 
 # ---------------------------------------------------------------------------

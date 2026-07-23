@@ -150,22 +150,54 @@ def _codex_context_cap() -> int:
         return CODEX_CONTEXT_WINDOW_CAP_DEFAULT
 
 
-def _cap_context_window(provider: str, context_window: Optional[int]) -> Optional[int]:
+def _family_context_window(model_id: Optional[str]) -> Optional[int]:
+    """The family matrix's declared true window for ``model_id`` (None if absent).
+
+    Deferred import: ``loader`` imports ``family_of`` from this module, so the
+    dependency can only run in this direction at call time. Any failure degrades
+    to None — the caller then keeps the historical NULL->cap behaviour.
+    """
+    if not model_id:
+        return None
+    try:
+        from src.core.loader import resolve_model_settings
+
+        window = resolve_model_settings(model_id).get("model_max_context_tokens")
+        return int(window) if window else None
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug(f"Family window lookup failed for {model_id}: {e}")
+        return None
+
+
+def _cap_context_window(
+    provider: str, context_window: Optional[int], model_id: Optional[str] = None
+) -> Optional[int]:
     """Clamp a codex-routed model's working window to the Codex surface cap.
 
     Non-codex providers pass through untouched (they inherit their family/catalog
-    window as before). For ``codex``: a NULL/too-large window becomes the cap; a
-    deliberately-smaller admin ``context_window`` is respected (``min``). Keying on
+    window as before). For ``codex`` the cap is a **ceiling, never a floor**: the
+    effective window is the admin ``context_window`` when set, else the family
+    matrix's declared true window, and whichever applies is then ``min``'d with
+    the cap. Only when neither is known does the cap itself stand in. Keying on
     the resolved *provider* (transport), not the family, means gpt-5.x over the
     real API keeps its full window while the same model over the codex proxy is
     capped.
+
+    The family fallback matters for models whose true window is *below* the cap.
+    ``gpt-5.3-codex-spark`` is a distilled 128K model: with a NULL catalog row the
+    old ``NULL -> cap`` rule handed back 400K, and because that value is injected
+    at dispatch into ``llm.model_max_context_tokens`` it is truthy, so
+    ``loader._apply_settings_matrix`` never reached the matrix's correct 128000.
+    The 80% compaction threshold landed at 320K, compaction never fired, and the
+    job hard-400'd on ``context_too_large`` (job 9a99f433, 2026-07-23).
     """
     if provider != "codex":
         return context_window
     cap = _codex_context_cap()
     if cap <= 0:
         return context_window
-    return min(context_window, cap) if context_window else cap
+    effective = context_window or _family_context_window(model_id)
+    return min(effective, cap) if effective else cap
 
 
 # Dependency injection: the orchestrator registers DB-backed lookups at
@@ -335,7 +367,9 @@ def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
         display_name=row.get("display_name") or row["model_id"],
         base_url=row["base_url"],
         api_key_ref=None,
-        context_window=_cap_context_window(provider, row.get("context_window")),
+        context_window=_cap_context_window(
+            provider, row.get("context_window"), row["model_id"]
+        ),
         max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin=origin,
@@ -375,7 +409,9 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
             display_name=row.get("display_label") or row["model_id"],
             base_url=row.get("endpoint_base_url"),
             api_key_ref=None,
-            context_window=_cap_context_window(provider, row.get("context_window")),
+            context_window=_cap_context_window(
+                provider, row.get("context_window"), row["model_id"]
+            ),
             max_output_tokens=_params_max_output_tokens(row),
             reasoning_level=row.get("reasoning_level"),
             origin="catalog",
@@ -390,7 +426,9 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
         display_name=row.get("display_label") or row["model_id"],
         base_url=None,
         api_key_ref=provider_ref,
-        context_window=_cap_context_window(provider, row.get("context_window")),
+        context_window=_cap_context_window(
+            provider, row.get("context_window"), row["model_id"]
+        ),
         max_output_tokens=_params_max_output_tokens(row),
         reasoning_level=row.get("reasoning_level"),
         origin="catalog",
