@@ -113,7 +113,10 @@ STREAM_PORT = int(os.environ.get("BROWSER_EXEC_STREAM_PORT", "38801"))
 STREAM_QUALITY = int(os.environ.get("BROWSER_EXEC_STREAM_QUALITY", "60"))
 STREAM_MAX_WIDTH = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_WIDTH", "1280"))
 STREAM_MAX_HEIGHT = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_HEIGHT", "720"))
-STREAM_EVERY_NTH = int(os.environ.get("BROWSER_EXEC_STREAM_EVERY_NTH", "2"))
+# Every compositor frame: superseding viewer queues (ViewerQueue.put_frame)
+# handle backpressure by replacement, so skipping frames at the source only
+# adds latency.
+STREAM_EVERY_NTH = int(os.environ.get("BROWSER_EXEC_STREAM_EVERY_NTH", "1"))
 BATON_GRACE_S = float(os.environ.get("BROWSER_EXEC_BATON_GRACE", "30"))
 # Cap for viewer clipboard paste (Input.insertText). The cockpit enforces its
 # own, tighter cap; this one only bounds hand-rolled clients.
@@ -201,6 +204,39 @@ def validate_user_nav(url: str, files) -> str:
 # Agent actions refused while the user holds the baton. Reads (snapshot,
 # screenshot) always pass; stream_info/shutdown are lifecycle, not driving.
 MUTATING_ACTIONS = {"navigate", "click", "type", "select", "scroll", "back"}
+
+
+def _queue_stream_frame(queue, frame) -> None:
+    """Enqueue one outbound frame, dropping the oldest item if necessary."""
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        queue.put_nowait(frame)
+    except asyncio.QueueFull:
+        pass
+
+
+class ViewerQueue(asyncio.Queue):
+    """Bounded per-viewer queue where screencast frames supersede in place.
+
+    A viewer only ever wants the newest frame: replacing a queued unsent
+    FRAME caps stale-frame latency at one frame no matter how far the
+    viewer's TCP/WS path falls behind, while STATE/ERROR messages keep
+    their bounded FIFO ordering. Reaches into asyncio.Queue's backing
+    deque — our own subclass, single consumer, event-loop thread only.
+    """
+
+    def put_frame(self, frame: bytes) -> None:
+        buffer = self._queue
+        for index in range(len(buffer) - 1, -1, -1):
+            item = buffer[index]
+            if item is not None and len(item) > 4 and item[4] == T_FRAME:
+                buffer[index] = frame
+                return
+        _queue_stream_frame(self, frame)
 
 
 class StreamHub:
@@ -311,17 +347,18 @@ class StreamHub:
         self.release_baton()
 
     def broadcast(self, frame: bytes) -> None:
-        """Fan a pre-encoded frame to viewers; drop oldest for laggards."""
+        """Fan an ordered message to viewers; drop oldest for laggards."""
         for queue in self.viewers.values():
-            if queue.full():
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
-                queue.put_nowait(frame)
-            except asyncio.QueueFull:
-                pass
+            _queue_stream_frame(queue, frame)
+
+    def broadcast_frame(self, frame: bytes) -> None:
+        """Fan a screencast frame; a queued unsent frame is superseded."""
+        for queue in self.viewers.values():
+            put_frame = getattr(queue, "put_frame", None)
+            if put_frame is not None:
+                put_frame(frame)
+            else:
+                _queue_stream_frame(queue, frame)
 
     def shutdown_viewers(self, code: str) -> None:
         """Tell every viewer the browser is gone and stop its writer."""
@@ -494,7 +531,7 @@ class ScreencastCdp:
                 "h": metadata.get("deviceHeight"),
                 "ts": time.time(),
             }
-            self._hub.broadcast(
+            self._hub.broadcast_frame(
                 encode_stream_frame(
                     T_FRAME, encode_frame_payload(header, jpeg)
                 )
@@ -1188,19 +1225,6 @@ class BrowserDaemon:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _queue_stream_frame(queue, frame) -> None:
-    """Enqueue one outbound frame, dropping the oldest item if necessary."""
-    if queue.full():
-        try:
-            queue.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
-    try:
-        queue.put_nowait(frame)
-    except asyncio.QueueFull:
-        pass
-
-
 async def _send_stream_error(writer, code: str, message: str) -> None:
     try:
         writer.write(
@@ -1248,7 +1272,7 @@ async def _handle_stream_conn(daemon, reader, writer) -> None:
         writer.close()
         return
 
-    queue = asyncio.Queue(maxsize=4)
+    queue = ViewerQueue(maxsize=4)
     viewer_id = hub.add_viewer(queue, max_viewers)
     if viewer_id is None:
         await _send_stream_error(
