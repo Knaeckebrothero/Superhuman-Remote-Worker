@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  browserKeyText,
   browserModifiers,
   browserMouseButton,
   browserPrintableText,
+  browserVirtualKeyCode,
   browserWheelDeltas,
   mapBrowserPoint,
 } from './canvas-browser-input';
@@ -85,5 +87,27 @@ describe('shared-browser input geometry', () => {
     expect(browserPrintableText({...base, key: 'A'})).toBe('A');
     expect(browserPrintableText({...base, key: 'Enter'})).toBe('');
     expect(browserPrintableText({...base, key: 'a', ctrlKey: true})).toBe('');
+  });
+
+  it('carries CR text for Enter so CDP fires the default action', () => {
+    const base = {altKey: false, ctrlKey: false, metaKey: false, shiftKey: false};
+    expect(browserKeyText({...base, key: 'Enter'})).toBe('\r');
+    expect(browserKeyText({...base, key: 'Enter', ctrlKey: true})).toBe('');
+    expect(browserKeyText({...base, key: 'A'})).toBe('A');
+    expect(browserKeyText({...base, key: 'Escape'})).toBe('');
+  });
+
+  it('derives virtual key codes for named, printable, and function keys', () => {
+    expect(browserVirtualKeyCode({key: 'Enter'})).toBe(13);
+    expect(browserVirtualKeyCode({key: 'Backspace'})).toBe(8);
+    expect(browserVirtualKeyCode({key: 'ArrowDown'})).toBe(40);
+    expect(browserVirtualKeyCode({key: 'a'})).toBe(65);
+    expect(browserVirtualKeyCode({key: '5'})).toBe(53);
+    expect(browserVirtualKeyCode({key: 'F5'})).toBe(116);
+    expect(browserVirtualKeyCode({key: 'F12'})).toBe(123);
+    // A real browser event's own keyCode wins over the fallback table.
+    expect(browserVirtualKeyCode({key: 'Enter', keyCode: 13})).toBe(13);
+    expect(browserVirtualKeyCode({key: 'ü'})).toBe(0);
+    expect(browserVirtualKeyCode({key: 'MediaPlayPause'})).toBe(0);
   });
 });
