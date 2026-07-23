@@ -114,6 +114,23 @@ async def test_update_datasource_omitting_config_preserves_it():
 
 
 @pytest.mark.asyncio
+async def test_update_datasource_can_explicitly_clear_connection_url():
+    conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
+    db = _make_db(conn)
+
+    assert await db.update_datasource(
+        DATASOURCE_ID,
+        connection_url=None,
+        connection_url_set=True,
+    )
+
+    sql, *params = conn.execute.await_args.args
+    assert "connection_url = $1" in sql
+    assert params[0] is None
+
+
+@pytest.mark.asyncio
 async def test_crud_list_and_get_queries_return_config():
     conn = AsyncMock()
     conn.fetch.return_value = []

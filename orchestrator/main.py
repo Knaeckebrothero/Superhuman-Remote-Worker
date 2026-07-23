@@ -1292,6 +1292,160 @@ def _is_skills_db_enabled() -> bool:
     return os.getenv("SKILLS_DB_ENABLED", "").lower().strip() in ("true", "1", "yes")
 
 
+def _mcp_datasources_enabled() -> bool:
+    """Whether user-added MCP server datasources are enabled."""
+    return os.getenv("MCP_DATASOURCES_ENABLED", "").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _mcp_stdio_enabled() -> bool:
+    """Whether MCP datasources may execute local stdio server commands."""
+    return os.getenv("MCP_STDIO_ENABLED", "").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _validate_mcp_datasource(
+    connection_url: str | None,
+    credentials: dict[str, Any],
+) -> None:
+    """Validate an MCP datasource without reflecting credential values."""
+    if not isinstance(credentials, dict):
+        raise HTTPException(status_code=400, detail="MCP credentials must be an object")
+
+    raw_transport = credentials.get("transport") or "http"
+    if not isinstance(raw_transport, str):
+        raise HTTPException(status_code=400, detail="MCP transport must be a string")
+    transport = raw_transport.lower().strip()
+    if transport not in ("http", "sse", "stdio"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid MCP transport (expected http, sse, or stdio)",
+        )
+
+    if transport == "stdio":
+        if not _mcp_stdio_enabled():
+            raise HTTPException(
+                status_code=400,
+                detail="stdio MCP servers are disabled on this deployment",
+            )
+        unknown = sorted(set(credentials) - {"transport", "command", "args", "env"})
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown stdio MCP credential field(s)",
+            )
+        command = credentials.get("command")
+        if not isinstance(command, str) or not command.strip() or "\x00" in command:
+            raise HTTPException(
+                status_code=400,
+                detail="stdio MCP servers require a valid credentials.command",
+            )
+        args = credentials.get("args") or []
+        if (
+            not isinstance(args, list)
+            or not all(isinstance(arg, str) for arg in args)
+            or any("\x00" in arg for arg in args)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="MCP credentials.args must be a list of valid strings",
+            )
+        env = credentials.get("env") or {}
+        if not isinstance(env, dict) or not all(
+            isinstance(key, str)
+            and bool(key)
+            and "=" not in key
+            and "\x00" not in key
+            and isinstance(value, str)
+            and "\x00" not in value
+            for key, value in env.items()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="MCP credentials.env must map valid names to string values",
+            )
+        return
+
+    unknown = sorted(set(credentials) - {"transport", "auth"})
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown remote MCP credential field(s)",
+        )
+    value = (connection_url or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{transport} MCP servers require connection_url",
+        )
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail="Remote MCP connection_url must be an HTTP(S) URL",
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Remote MCP connection_url must not embed credentials",
+        )
+
+    auth = credentials.get("auth") or {}
+    if not isinstance(auth, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="MCP credentials.auth must be an object",
+        )
+    auth_type = auth.get("type") or "none"
+    if auth_type == "bearer":
+        if set(auth) - {"type", "token"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown MCP bearer auth field(s)",
+            )
+        token = auth.get("token")
+        if not isinstance(token, str) or not token:
+            raise HTTPException(
+                status_code=400,
+                detail="MCP bearer auth requires a token",
+            )
+    elif auth_type == "headers":
+        if set(auth) - {"type", "headers"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown MCP custom-header auth field(s)",
+            )
+        headers = auth.get("headers") or {}
+        if not isinstance(headers, dict) or not all(
+            isinstance(key, str)
+            and bool(key.strip())
+            and "\r" not in key
+            and "\n" not in key
+            and isinstance(value, str)
+            and "\r" not in value
+            and "\n" not in value
+            for key, value in headers.items()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="MCP custom headers must map valid names to string values",
+            )
+    elif auth_type in ("none", ""):
+        if set(auth) - {"type"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown MCP no-auth field(s)",
+            )
+    else:
+        raise HTTPException(status_code=400, detail="Invalid MCP auth type")
+
+
 def _is_protected_cloud_mode_enabled() -> bool:
     """Whether protected cloud mode (RO-reader provisioning + capture overlay)
     is enabled for this deployment. Dev-ON / prod-OFF via the helm
@@ -5653,7 +5807,7 @@ class DatasourceCreate(BaseModel):
     name: str = Field(..., description="User-provided label")
     type: str = Field(
         ...,
-        description="Datasource type: generic, repository, kb, postgresql, neo4j, mongodb, webdav, email, kubeconfig, ssh_key, generic_file",
+        description="Datasource type: generic, repository, kb, postgresql, neo4j, mongodb, webdav, email, mcp, kubeconfig, ssh_key, generic_file",
     )
     connection_url: str | None = Field(
         None, description="Connection string (nullable for generic)"
@@ -15469,7 +15623,12 @@ def _build_datasource_tool_override(
     # (they previously disagreed on read-write managed connectors). Email is
     # tier-keyed inside the shared map (EMAIL_TIER_TOOLS keyed by
     # config.access, clamped by project_read_only) — no extra handling here.
-    tools_override.update(datasource_tool_categories(datasources))
+    enabled_datasources = [
+        datasource
+        for datasource in datasources
+        if _mcp_datasource_runtime_allowed(datasource)
+    ]
+    tools_override.update(datasource_tool_categories(enabled_datasources))
     override["tools"] = tools_override
     return override
 
@@ -15524,6 +15683,8 @@ def _build_datasources_payload(
 
         is_read_only = ds.get("project_read_only", False)
         ds_type = ds["type"]
+        if not _mcp_datasource_runtime_allowed(ds):
+            continue
 
         # Read-only managed connectors: withhold credentials (tools hold them).
         # Email is exempt — its tools need a live IMAP login at every tier;
@@ -15576,6 +15737,26 @@ def _build_datasources_payload(
         payload.append(entry)
 
     return payload or None
+
+
+def _mcp_datasource_runtime_allowed(datasource: dict[str, Any]) -> bool:
+    """Apply deployment gates to a resolved datasource without exposing secrets."""
+    if datasource.get("type") != "mcp":
+        return True
+    if not _mcp_datasources_enabled():
+        return False
+    credentials = datasource.get("credentials") or {}
+    if isinstance(credentials, str):
+        try:
+            credentials = json.loads(credentials)
+        except (json.JSONDecodeError, ValueError):
+            credentials = {}
+    transport = (
+        credentials.get("transport", "http")
+        if isinstance(credentials, dict)
+        else "http"
+    )
+    return str(transport).lower() != "stdio" or _mcp_stdio_enabled()
 
 
 @app.post("/api/jobs/{job_id}/assign/{agent_id}")
@@ -15855,6 +16036,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         "mongodb",
         "webdav",
         "email",
+        "mcp",
         "kubeconfig",
         "ssh_key",
         "generic_file",
@@ -15872,6 +16054,13 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
                 "through the job's explicit datasource selection"
             ),
         )
+    if body.type == "mcp":
+        if not _mcp_datasources_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="MCP datasources are disabled on this deployment",
+            )
+        _validate_mcp_datasource(body.connection_url, body.credentials or {})
 
     user = await require_approved_user(request, postgres_db)
     user_id = str(user["id"])
@@ -15923,6 +16112,15 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
             datasource_config = validate_email_config(body.config, owner_has_send_grant)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif body.type == "mcp":
+        if (body.credentials or {}).get("transport", "http").lower() == "stdio":
+            connection_url = None
+        if body.config:
+            raise HTTPException(
+                status_code=400,
+                detail="Datasource config is not supported for MCP datasources",
+            )
+        datasource_config = {}
     else:
         if body.config:
             raise HTTPException(
@@ -15990,6 +16188,11 @@ async def update_datasource(
     user, existing_ds = await require_datasource_owner(
         request, postgres_db, datasource_id
     )
+    if existing_ds.get("type") == "mcp" and not _mcp_datasources_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="MCP datasources are disabled on this deployment",
+        )
     # Publish gate (spec: docs/features/public_datasources.md). Only the
     # false→true transition needs the capability; unpublishing must always
     # work for creator/admin (a revoked grant must not trap a public row).
@@ -16040,6 +16243,7 @@ async def update_datasource(
 
     connection_url = body.connection_url
     datasource_config = body.config
+    mcp_connection_url_set = False
     reindex_required = False
     if existing_ds.get("type") == "kb":
         if connection_url is not None:
@@ -16106,6 +16310,30 @@ async def update_datasource(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if credentials is not None:
             credentials = checked_credentials
+    elif existing_ds.get("type") == "mcp":
+        if datasource_config:
+            raise HTTPException(
+                status_code=400,
+                detail="Datasource config is not supported for MCP datasources",
+            )
+        effective_credentials = (
+            credentials
+            if credentials is not None
+            else (existing_ds.get("credentials") or {})
+        )
+        url_was_supplied = "connection_url" in body.model_fields_set
+        effective_url = (
+            body.connection_url
+            if url_was_supplied
+            else existing_ds.get("connection_url")
+        )
+        _validate_mcp_datasource(effective_url, effective_credentials)
+        transport = (effective_credentials.get("transport") or "http").lower()
+        if transport == "stdio":
+            connection_url = None
+            mcp_connection_url_set = bool(
+                url_was_supplied or existing_ds.get("connection_url") is not None
+            )
     elif datasource_config:
         raise HTTPException(
             status_code=400,
@@ -16115,7 +16343,7 @@ async def update_datasource(
             ),
         )
     try:
-        success = await postgres_db.update_datasource(
+        update_kwargs = dict(
             datasource_id=datasource_id,
             name=body.name,
             description=body.description,
@@ -16127,6 +16355,9 @@ async def update_datasource(
             is_global=body.is_global,
             read_only=read_only,
         )
+        if mcp_connection_url_set:
+            update_kwargs["connection_url_set"] = True
+        success = await postgres_db.update_datasource(**update_kwargs)
         if not success:
             raise HTTPException(
                 status_code=404, detail=f"Datasource '{datasource_id}' not found"
