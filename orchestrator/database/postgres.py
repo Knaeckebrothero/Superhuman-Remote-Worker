@@ -5784,6 +5784,7 @@ class PostgresDB:
         config: Dict[str, Any] | None = None,
         is_global: bool | None = None,
         read_only: bool | None = None,
+        connection_url_set: bool = False,
     ) -> bool:
         """Update a datasource.
 
@@ -5798,6 +5799,8 @@ class PostgresDB:
             config: New non-secret type-specific configuration
             is_global: Publish (True) / unpublish (False); None = unchanged
             read_only: Declared read-only flag; None = unchanged
+            connection_url_set: Persist ``connection_url`` even when it is
+                explicitly ``None`` (used when an MCP switches to stdio).
 
         Returns:
             True if updated, False if not found
@@ -5821,7 +5824,7 @@ class PostgresDB:
             updates.append(f"description = ${param_count}")
             values.append(description)
 
-        if connection_url is not None:
+        if connection_url is not None or connection_url_set:
             param_count += 1
             updates.append(f"connection_url = ${param_count}")
             values.append(connection_url)

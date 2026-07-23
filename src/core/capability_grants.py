@@ -167,7 +167,8 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
     ):
         v.append("delegation: delegation requires the delegation grant")
     if not grants.get("datasource_tools", True) and any(
-        _truthy(tools.get(k)) for k in ("sql", "mongodb", "graph")
+        _truthy(tools.get(k))
+        for k in ("sql", "mongodb", "graph", "webdav", "email", "mcp")
     ):
         v.append("datasource_tools: datasource tools are not permitted")
     if not grants.get("browser", True) and _truthy(tools.get("browser_direct")):

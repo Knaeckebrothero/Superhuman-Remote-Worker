@@ -122,6 +122,17 @@ def test_flags_ungranted_shell_and_vm_and_autonomy():
     assert "shell_tools" in j and "vm_workspace" in j and "autonomy_ceiling" in j
 
 
+def test_datasource_grant_covers_every_datasource_tool_category():
+    for category in ("sql", "mongodb", "graph", "webdav", "email", "mcp"):
+        violations = evaluate(
+            {"tools": {category: ["tool"]}},
+            {**DEFAULTS, "datasource_tools": False},
+        )
+        assert any("datasource_tools" in violation for violation in violations), (
+            category
+        )
+
+
 def test_workspace_upgrade_gate_vm_vs_sandbox():
     """Sec-1 (workspace_tier_upgrade.md §4.4): the upgrade gate re-runs this PDP
     on the post-upgrade fragment {workspace:{backend:target_tier}}.
