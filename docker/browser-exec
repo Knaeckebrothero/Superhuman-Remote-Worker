@@ -447,11 +447,37 @@ class ScreencastCdp:
         cdp = await self._session.get_or_create_cdp_session(
             target_id=requested_target
         )
-        self._cdp = cdp
-        self._main_frame_id = None
         client = cdp.cdp_client
+
+        # Resolve the main frame BEFORE publishing this session as current.
+        # _register_client subscribes once per client, so when the screencast
+        # moves to a target that reuses an already-registered client, the
+        # handlers are live the moment _cdp is set — and every one of them
+        # gates on _main_frame_id. Publishing _cdp first and resolving the
+        # frame id a couple of awaits later opened a window where
+        # frameStartedLoading was discarded as "not the main frame", so the
+        # viewer silently lost the loading:true edge for that navigation and
+        # anything waiting on the transition waited forever.
+        main_frame = None
+        try:
+            frame_tree = await client.send.Page.getFrameTree(
+                session_id=cdp.session_id
+            )
+            main_frame = (frame_tree.get("frameTree") or {}).get("frame") or {}
+        except Exception:
+            pass
+
+        # No await between these two: the pair must land atomically for the
+        # handlers, which read them together.
+        self._cdp = cdp
+        self._main_frame_id = (main_frame or {}).get("id")
         self._register_client(client)
         self._session_clients[cdp.session_id] = client
+        if main_frame is not None:
+            self._hub.update_page_state(
+                url=main_frame.get("url"),
+                loading=False,
+            )
 
         try:
             metrics = await client.send.Page.getLayoutMetrics(
@@ -466,18 +492,6 @@ class ScreencastCdp:
                 "width": int(css_viewport.get("clientWidth", STREAM_MAX_WIDTH)),
                 "height": int(css_viewport.get("clientHeight", STREAM_MAX_HEIGHT)),
             }
-        except Exception:
-            pass
-        try:
-            frame_tree = await client.send.Page.getFrameTree(
-                session_id=cdp.session_id
-            )
-            main_frame = (frame_tree.get("frameTree") or {}).get("frame") or {}
-            self._main_frame_id = main_frame.get("id")
-            self._hub.update_page_state(
-                url=main_frame.get("url"),
-                loading=False,
-            )
         except Exception:
             pass
         try:
@@ -864,15 +878,31 @@ class BrowserDaemon:
 
     async def _open_start_page(self) -> None:
         """Navigate a still-blank cold-opened browser to the start page."""
-        async with self._lock:
-            try:
+        # Decide under the lock, load outside it. Holding the daemon-wide
+        # lock across the load serialises every other action behind a page
+        # nobody asked for — and the victim is ensure_screencast, which
+        # is what SUBSCRIBES to the page events. Attaching late does not just
+        # delay the stream, it loses information: a navigation that starts
+        # before the screencast attaches never delivers its frameStartedLoading,
+        # so the viewer sees a page change with no loading:true edge and
+        # anything waiting on that transition waits forever.
+        try:
+            async with self._lock:
                 session = await self._get_session()
                 url = await session.get_current_page_url()
                 if url and url != "about:blank":
                     return
-                await session.navigate_to(STREAM_START_URL)
-            except Exception as exc:
-                log(f"start page navigation failed: {exc}")
+            # Deliberately NOT wrapped in asyncio.wait_for. Cancelling a
+            # navigate_to mid-flight does not abort the navigation, it
+            # abandons a browser-use NavigateToUrlEvent inside its event bus:
+            # the next navigation then queues behind the orphan until bubus
+            # times it out 30s later, with duplicate CDP responses along the
+            # way. A real navigation arriving while this one is still in
+            # flight simply supersedes it, which is the desired outcome —
+            # the start page only ever fires on an otherwise blank page.
+            await session.navigate_to(STREAM_START_URL)
+        except Exception as exc:
+            log(f"start page navigation failed: {exc}")
 
     def _install_focus_handler(self, session) -> None:
         """Subscribe once; the event-bus callback itself never awaits locks."""
@@ -1210,9 +1240,15 @@ class BrowserDaemon:
                     if self.hub.generation is None:
                         self.hub.mint_generation(args.get("initial_baton"))
                         # Cold open: land on the start page in the background
-                        # so the response (and first frame) isn't held behind
-                        # a page load. Lifecycle bootstrap, not agent driving
-                        # — deliberately outside the baton check.
+                        # so this response isn't held behind a page load.
+                        # Backgrounding alone does NOT free the viewer path —
+                        # the task holds the daemon-wide lock while it loads,
+                        # so anything that takes that lock (ensure_screencast,
+                        # user navigation) waits behind it. What keeps a slow
+                        # start page from stranding viewers is that viewer
+                        # STATE is delivered without ever taking that lock.
+                        # Lifecycle bootstrap, not agent driving —
+                        # deliberately outside the baton check.
                         self._start_page_task = asyncio.create_task(
                             self._open_start_page()
                         )
@@ -1349,7 +1385,6 @@ async def _handle_stream_conn(daemon, reader, writer) -> None:
                 T_STATE, json.dumps(hub.state_payload()).encode()
             )
         )
-        await daemon.ensure_screencast()
 
         async def pump_out():
             while True:
@@ -1394,10 +1429,18 @@ async def _handle_stream_conn(daemon, reader, writer) -> None:
                             ),
                         )
 
+        # Pumps first, THEN the screencast. The STATE above is already
+        # queued, and pump_out is the only thing that can put it on the
+        # wire — starting the screencast first makes a viewer's whole
+        # handshake hostage to daemon work it does not depend on. That is
+        # not hypothetical: ensure_screencast waits on the daemon-wide
+        # lock, so a cold-open start-page navigation holding that lock
+        # left viewers with no STATE until the page finished loading.
         tasks = [
             asyncio.create_task(pump_out()),
             asyncio.create_task(pump_in()),
         ]
+        await daemon.ensure_screencast()
         done, _ = await asyncio.wait(
             tasks, return_when=asyncio.FIRST_COMPLETED
         )
