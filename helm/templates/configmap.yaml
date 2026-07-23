@@ -93,6 +93,10 @@ data:
   # DB-backed Agent Skills (skills + skill_files). Read by the orchestrator's
   # skill CRUD/list endpoints. Default-off chart-wide (prod-safe); dev turns it on.
   SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}
+  # User-added MCP servers. stdio is separately gated because it runs
+  # third-party commands inside dynamically provisioned agent pods.
+  MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}
+  MCP_STDIO_ENABLED: {{ .Values.agent.mcpStdioEnabled | default "false" | quote }}
   # Protected cloud mode: RO-reader provisioning + capture overlay. Read by the
   # orchestrator's RO engage gate + reader reconciler. Default-off (prod-safe).
   PROTECTED_CLOUD_MODE_ENABLED: {{ .Values.agent.protectedCloudModeEnabled | default "false" | quote }}
