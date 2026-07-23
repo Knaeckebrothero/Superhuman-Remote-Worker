@@ -700,6 +700,41 @@ class TestBatonRefusal:
         asyncio.run(run())
 
 
+class TestLaunchHygiene:
+    def test_parse_chromium_version(self):
+        assert (
+            BE._parse_chromium_version("Chromium 138.0.7204.15 \n")
+            == "138.0.7204.15"
+        )
+        assert BE._parse_chromium_version("") is None
+        assert BE._parse_chromium_version("garbage") is None
+
+    def test_clean_user_agent_has_no_headless_marker(self, monkeypatch):
+        monkeypatch.setattr(BE, "_UA_CACHE", [])
+        monkeypatch.setattr(
+            BE.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(stdout="Chromium 138.0.7204.15"),
+        )
+        ua = BE._clean_user_agent()
+        assert "Headless" not in ua
+        assert "Chrome/138.0.7204.15" in ua
+        # Memoized: a second call must not re-probe the binary.
+        monkeypatch.setattr(
+            BE.subprocess,
+            "run",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-probed")),
+        )
+        assert BE._clean_user_agent() == ua
+
+    def test_clean_user_agent_none_when_probe_fails(self, monkeypatch):
+        monkeypatch.setattr(BE, "_UA_CACHE", [])
+        def boom(*a, **k):
+            raise OSError("no binary")
+        monkeypatch.setattr(BE.subprocess, "run", boom)
+        assert BE._clean_user_agent() is None
+
+
 class TestColdOpenStartPage:
     def test_cold_stream_info_lands_on_start_page(self):
         async def run():
