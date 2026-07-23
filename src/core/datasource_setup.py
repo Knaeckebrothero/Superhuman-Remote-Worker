@@ -129,6 +129,12 @@ DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
         "category": "email",
         "tiers": EMAIL_TIER_TOOLS,
     },
+    # MCP tool names are discovered only after the agent connects. The
+    # wildcard is expanded against the runtime registry before tool loading.
+    "mcp": {
+        "category": "mcp",
+        "dynamic": True,
+    },
 }
 
 
@@ -163,6 +169,9 @@ def datasource_tool_categories(
       per-datasource tiers come from ``config.access`` clamped by
       ``project_read_only`` (email_effective_access), and the tool layer's
       per-call tier check is the backup gate.
+    - dynamic types (MCP): ``["*"]`` while attached; the agent expands this
+      sentinel after runtime discovery. Project read-only does not alter MCP
+      tools because the server and its credentials are the access boundary.
 
     History: read-write managed connectors (postgresql/neo4j/mongodb) used
     to map to ``[]`` — "CLI mode" — which was dead on remote workspace
@@ -182,6 +191,8 @@ def datasource_tool_categories(
         ds_list = by_type.get(ds_type, [])
         if not ds_list:
             categories[category] = []
+        elif tool_info.get("dynamic"):
+            categories[category] = ["*"]
         elif "tiers" in tool_info:
             tier = max(
                 (email_effective_access(ds) for ds in ds_list),
