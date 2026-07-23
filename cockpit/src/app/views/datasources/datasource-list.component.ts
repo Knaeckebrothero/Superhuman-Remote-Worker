@@ -30,6 +30,10 @@ import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
+
+type McpTransport = 'http' | 'sse' | 'stdio';
+type KeyValueRow = {key: string; value: string};
+
 /**
  * Datasource management panel with full CRUD, type filtering, and connection testing.
  */
@@ -161,9 +165,30 @@ import {UserService} from '../../core/services/user.service';
                     <option value="ssh_key">{{ 'datasources.form.optSshKey' | transloco }}</option>
                     <option value="generic_file">{{ 'datasources.form.optGenericFile' | transloco }}</option>
                   </optgroup>
+                  <optgroup [label]="'datasources.form.typeGroupMcp' | transloco">
+                    <option value="mcp">{{ 'datasources.form.optMcp' | transloco }}</option>
+                  </optgroup>
                 </app-select>
               </app-form-field>
             </div>
+
+            @if (formData.type === 'mcp') {
+              <app-form-field
+                [label]="'datasources.form.mcpTransportLabel' | transloco"
+                [required]="true"
+              >
+                <app-select
+                  size="sm"
+                  [value]="formData.mcpTransport"
+                  (changed)="onMcpTransportSelect($event)"
+                  [disabled]="isSaving()"
+                >
+                  <option value="http">{{ 'datasources.form.mcpTransportHttp' | transloco }}</option>
+                  <option value="sse">{{ 'datasources.form.mcpTransportSse' | transloco }}</option>
+                  <option value="stdio">{{ 'datasources.form.mcpTransportStdio' | transloco }}</option>
+                </app-select>
+              </app-form-field>
+            }
 
             <!-- Connection URL (required for non-generic, non-credential-file types) -->
             @if (hasConnectionUrl() && formData.type !== 'generic') {
@@ -209,6 +234,164 @@ import {UserService} from '../../core/services/user.service';
                 [disabled]="isSaving()"
               />
             </app-form-field>
+
+            @if (formData.type === 'mcp' && formData.mcpTransport !== 'stdio') {
+              <app-form-field
+                [label]="'datasources.form.mcpTokenLabel' | transloco"
+                [optional]="'datasources.form.optional' | transloco"
+              >
+                <app-input
+                  size="sm"
+                  type="password"
+                  class="mono"
+                  [value]="formData.mcpToken"
+                  (valueChange)="formData.mcpToken = $event"
+                  [placeholder]="'datasources.form.mcpTokenPlaceholder' | transloco"
+                  [disabled]="isSaving()"
+                />
+              </app-form-field>
+              <app-form-field
+                [label]="'datasources.form.mcpHeadersLabel' | transloco"
+                [optional]="'datasources.form.optional' | transloco"
+              >
+                <div class="env-vars-editor">
+                  @for (header of formData.mcpHeaders; track $index) {
+                    <div class="env-var-row">
+                      <app-input
+                        size="sm"
+                        class="mono env-key"
+                        [value]="header.key"
+                        (valueChange)="header.key = $event"
+                        [placeholder]="'datasources.form.mcpHeaderKeyPlaceholder' | transloco"
+                        [disabled]="isSaving()"
+                      />
+                      <span class="env-eq">:</span>
+                      <app-input
+                        size="sm"
+                        type="password"
+                        class="mono env-val"
+                        [value]="header.value"
+                        (valueChange)="header.value = $event"
+                        [placeholder]="'datasources.form.mcpHeaderValuePlaceholder' | transloco"
+                        [disabled]="isSaving()"
+                      />
+                      <app-icon-button
+                        variant="danger"
+                        size="sm"
+                        [ariaLabel]="'datasources.form.envRemoveTooltip' | transloco"
+                        [tooltip]="'datasources.form.envRemoveTooltip' | transloco"
+                        [disabled]="isSaving()"
+                        (clicked)="removeMcpHeader($index)"
+                      >
+                        <app-icon size="sm">close</app-icon>
+                      </app-icon-button>
+                    </div>
+                  }
+                  <app-button
+                    variant="ghost"
+                    size="sm"
+                    class="btn-add-env"
+                    [disabled]="isSaving()"
+                    (clicked)="addMcpHeader()"
+                  >
+                    <app-icon size="sm">add</app-icon>
+                    {{ 'datasources.form.mcpHeaderAdd' | transloco }}
+                  </app-button>
+                </div>
+              </app-form-field>
+              @if (editingId()) {
+                <div class="credential-retain-hint">
+                  {{ 'datasources.form.mcpCredentialsRetainHint' | transloco }}
+                </div>
+              }
+            }
+
+            @if (formData.type === 'mcp' && formData.mcpTransport === 'stdio') {
+              <app-form-field
+                [label]="'datasources.form.mcpCommandLabel' | transloco"
+                [required]="true"
+              >
+                <app-input
+                  size="sm"
+                  class="mono"
+                  [value]="formData.mcpCommand"
+                  (valueChange)="formData.mcpCommand = $event"
+                  [placeholder]="'datasources.form.mcpCommandPlaceholder' | transloco"
+                  [disabled]="isSaving()"
+                />
+              </app-form-field>
+              <app-form-field
+                [label]="'datasources.form.mcpArgsLabel' | transloco"
+                [optional]="'datasources.form.optional' | transloco"
+              >
+                <app-textarea
+                  size="sm"
+                  class="mono"
+                  [value]="formData.mcpArgs"
+                  (valueChange)="formData.mcpArgs = $event"
+                  [placeholder]="'datasources.form.mcpArgsPlaceholder' | transloco"
+                  [rows]="3"
+                  [disabled]="isSaving()"
+                />
+              </app-form-field>
+              <app-form-field
+                [label]="'datasources.form.mcpEnvLabel' | transloco"
+                [optional]="'datasources.form.optional' | transloco"
+              >
+                <div class="env-vars-editor">
+                  @for (envVar of formData.mcpEnv; track $index) {
+                    <div class="env-var-row">
+                      <app-input
+                        size="sm"
+                        class="mono env-key"
+                        [value]="envVar.key"
+                        (valueChange)="envVar.key = $event"
+                        [placeholder]="'datasources.form.envKeyPlaceholder' | transloco"
+                        [disabled]="isSaving()"
+                      />
+                      <span class="env-eq">=</span>
+                      <app-input
+                        size="sm"
+                        type="password"
+                        class="mono env-val"
+                        [value]="envVar.value"
+                        (valueChange)="envVar.value = $event"
+                        [placeholder]="'datasources.form.envValuePlaceholder' | transloco"
+                        [disabled]="isSaving()"
+                      />
+                      <app-icon-button
+                        variant="danger"
+                        size="sm"
+                        [ariaLabel]="'datasources.form.envRemoveTooltip' | transloco"
+                        [tooltip]="'datasources.form.envRemoveTooltip' | transloco"
+                        [disabled]="isSaving()"
+                        (clicked)="removeMcpEnv($index)"
+                      >
+                        <app-icon size="sm">close</app-icon>
+                      </app-icon-button>
+                    </div>
+                  }
+                  <app-button
+                    variant="ghost"
+                    size="sm"
+                    class="btn-add-env"
+                    [disabled]="isSaving()"
+                    (clicked)="addMcpEnv()"
+                  >
+                    <app-icon size="sm">add</app-icon>
+                    {{ 'datasources.form.envAdd' | transloco }}
+                  </app-button>
+                </div>
+              </app-form-field>
+              @if (editingId()) {
+                <div class="credential-retain-hint">
+                  {{ 'datasources.form.mcpCredentialsRetainHint' | transloco }}
+                </div>
+              }
+              <div class="form-hint">
+                {{ 'datasources.form.mcpStdioWarning' | transloco }}
+              </div>
+            }
 
             <!-- Generic: CLI hint -->
             @if (formData.type === 'generic') {
@@ -884,7 +1067,7 @@ import {UserService} from '../../core/services/user.service';
                     variant="secondary"
                     size="sm"
                     [loading]="isTesting()"
-                    [disabled]="formData.type === 'email' ? !canSave() : !formData.connection_url"
+                    [disabled]="!canTestFromForm()"
                     (clicked)="testFromForm()"
                   >
                     @if (isTesting()) {
@@ -1868,6 +2051,7 @@ export class DatasourceListComponent implements OnInit {
     { labelKey: 'datasources.filter.mongodb', value: 'mongodb' },
     { labelKey: 'datasources.filter.webdav', value: 'webdav' },
     { labelKey: 'datasources.filter.email', value: 'email' },
+    { labelKey: 'datasources.filter.mcp', value: 'mcp' },
     { labelKey: 'datasources.filter.kubeconfig', value: 'kubeconfig' },
     { labelKey: 'datasources.filter.ssh_key', value: 'ssh_key' },
     { labelKey: 'datasources.filter.generic_file', value: 'generic_file' },
@@ -1884,7 +2068,11 @@ export class DatasourceListComponent implements OnInit {
   /** True for types that connect to something with a URL (everything except
    *  credential-files and email, whose endpoints live in credentials.imap/smtp). */
   hasConnectionUrl(): boolean {
-    return !this.isCredentialFileType() && this.formData.type !== 'email';
+    return (
+      !this.isCredentialFileType() &&
+      this.formData.type !== 'email' &&
+      !(this.formData.type === 'mcp' && this.formData.mcpTransport === 'stdio')
+    );
   }
 
   isGitBackedType(type: DatasourceType | string = this.formData.type): boolean {
@@ -1909,6 +2097,7 @@ export class DatasourceListComponent implements OnInit {
       neo4j: 'bolt://host:7687',
       mongodb: 'mongodb://user:pass@host:27017/dbname',
       webdav: 'http://host:8800/remote.php/dav/files/user/',
+      mcp: 'https://mcp.example.com/mcp',
     };
     return placeholders[this.formData.type] || '';
   });
@@ -1958,7 +2147,22 @@ export class DatasourceListComponent implements OnInit {
         (this.emailForm.access !== 'send' || this.emailForm.smtp_host.trim())
       );
     }
+    if (this.formData.type === 'mcp') {
+      // Existing credentials are redacted by the API; an untouched edit keeps
+      // the stored connection and remains testable.
+      if (this.editingId() !== null && !this.mcpCredentialsWereEntered()) {
+        return true;
+      }
+      if (this.formData.mcpTransport === 'stdio') {
+        return !!this.formData.mcpCommand.trim();
+      }
+      return !!this.formData.connection_url.trim();
+    }
     return !!this.formData.connection_url;
+  }
+
+  canTestFromForm(): boolean {
+    return this.canSave();
   }
 
   // Form data (mutable object, not a signal, matching job-create pattern)
@@ -1970,6 +2174,12 @@ export class DatasourceListComponent implements OnInit {
     cli_hint: string;
     default_branch: string;
     root_path: string;
+    mcpTransport: McpTransport;
+    mcpToken: string;
+    mcpHeaders: KeyValueRow[];
+    mcpCommand: string;
+    mcpArgs: string;
+    mcpEnv: KeyValueRow[];
     is_global: boolean;
     read_only: boolean;
   } = {
@@ -1980,6 +2190,12 @@ export class DatasourceListComponent implements OnInit {
     cli_hint: '',
     default_branch: '',
     root_path: '',
+    mcpTransport: 'http',
+    mcpToken: '',
+    mcpHeaders: [],
+    mcpCommand: '',
+    mcpArgs: '',
+    mcpEnv: [],
     is_global: false,
     read_only: true,
   };
@@ -2107,6 +2323,7 @@ export class DatasourceListComponent implements OnInit {
 
   // Generic env var editor
   envVars: { key: string; value: string }[] = [];
+  private mcpTransportDirty = false;
 
   ngOnInit(): void {
     this.refresh();
@@ -2152,6 +2369,15 @@ export class DatasourceListComponent implements OnInit {
       cli_hint: ds.cli_hint || '',
       default_branch: ds.default_branch || '',
       root_path: ds.config?.root_path || '',
+      // MCP credentials, including transport, are redacted by REST. Default
+      // the editor to remote HTTP and preserve the stored credential object
+      // unless the user enters replacement connection details.
+      mcpTransport: 'http',
+      mcpToken: '',
+      mcpHeaders: [],
+      mcpCommand: '',
+      mcpArgs: '',
+      mcpEnv: [],
       is_global: ds.is_global ?? false,
       read_only: ds.read_only ?? true,
     };
@@ -2188,6 +2414,7 @@ export class DatasourceListComponent implements OnInit {
     // if they want to replace the stored value.
     this.kubeconfigContent = '';
     this.genericFiles = [];
+    this.mcpTransportDirty = false;
     this.editingId.set(ds.id);
     this.showForm.set(true);
     this.formTestResult.set(null);
@@ -2312,6 +2539,15 @@ export class DatasourceListComponent implements OnInit {
     }
   }
 
+  onMcpTransportSelect(value: string | null): void {
+    if (value === 'http' || value === 'sse' || value === 'stdio') {
+      this.mcpTransportDirty =
+        this.mcpTransportDirty || this.formData.mcpTransport !== value;
+      this.formData.mcpTransport = value;
+      this.formTestResult.set(null);
+    }
+  }
+
   onGitAuthMethodChange(value: string | null): void {
     this.gitAuthMethod = value === 'ssh' ? 'ssh' : 'token';
   }
@@ -2345,6 +2581,7 @@ export class DatasourceListComponent implements OnInit {
         return 'accent';
       case 'repository':
       case 'postgresql':
+      case 'mcp':
         return 'info';
       case 'kb':
         return 'accent';
@@ -2396,6 +2633,16 @@ export class DatasourceListComponent implements OnInit {
     this.doSave();
   }
 
+  private connectionUrlForPayload(): string | undefined {
+    if (
+      this.formData.type === 'mcp' &&
+      this.formData.mcpTransport === 'stdio'
+    ) {
+      return undefined;
+    }
+    return this.formData.connection_url || undefined;
+  }
+
   doSave(): void {
     if (!this.formData.name) return;
 
@@ -2415,7 +2662,7 @@ export class DatasourceListComponent implements OnInit {
       const update: DatasourceUpdateRequest = {
         name: this.formData.name,
         description: this.formData.description || undefined,
-        connection_url: this.formData.connection_url || undefined,
+        connection_url: this.connectionUrlForPayload(),
         credentials: creds,
         cli_hint: this.formData.cli_hint || undefined,
         default_branch: this.formData.default_branch || undefined,
@@ -2451,7 +2698,7 @@ export class DatasourceListComponent implements OnInit {
       const create: DatasourceCreateRequest = {
         name: this.formData.name,
         type: this.formData.type,
-        connection_url: this.formData.connection_url || undefined,
+        connection_url: this.connectionUrlForPayload(),
         description: this.formData.description || undefined,
         credentials: creds,
         cli_hint: this.formData.cli_hint || undefined,
@@ -2499,14 +2746,14 @@ export class DatasourceListComponent implements OnInit {
       // For new datasources, save first then test (email carries its
       // endpoints in credentials instead of a connection URL)
       if (!this.formData.name) return;
-      if (!this.formData.connection_url && this.formData.type !== 'email') return;
+      if (!this.canTestFromForm()) return;
       this.isSaving.set(true);
       this.formTestResult.set(null);
 
       const create: DatasourceCreateRequest = {
         name: this.formData.name,
         type: this.formData.type,
-        connection_url: this.formData.connection_url || undefined,
+        connection_url: this.connectionUrlForPayload(),
         description: this.formData.description || undefined,
         credentials: this.buildCredentials(),
         default_branch: this.formData.default_branch || undefined,
@@ -2735,6 +2982,22 @@ export class DatasourceListComponent implements OnInit {
     this.envVars.splice(index, 1);
   }
 
+  addMcpHeader(): void {
+    this.formData.mcpHeaders.push({key: '', value: ''});
+  }
+
+  removeMcpHeader(index: number): void {
+    this.formData.mcpHeaders.splice(index, 1);
+  }
+
+  addMcpEnv(): void {
+    this.formData.mcpEnv.push({key: '', value: ''});
+  }
+
+  removeMcpEnv(index: number): void {
+    this.formData.mcpEnv.splice(index, 1);
+  }
+
   /** Non-secret, type-specific config for the create/update/test payloads.
    *  `undefined` for types without config so the column stays untouched. */
   private buildTypeConfig(): DatasourceConfig | undefined {
@@ -2777,6 +3040,36 @@ export class DatasourceListComponent implements OnInit {
       }
       if (Object.keys(envVarsObj).length === 0) return undefined;
       return { env_vars: envVarsObj };
+    }
+    if (this.formData.type === 'mcp') {
+      if (isEditing && !this.mcpCredentialsWereEntered()) {
+        return undefined;
+      }
+      const credentials: Record<string, unknown> = {
+        transport: this.formData.mcpTransport,
+      };
+      if (this.formData.mcpTransport === 'stdio') {
+        credentials['command'] = this.formData.mcpCommand.trim();
+        credentials['args'] = this.formData.mcpArgs
+          .split('\n')
+          .map((arg) => arg.trim())
+          .filter(Boolean);
+        credentials['env'] = this.kvRowsToObject(this.formData.mcpEnv);
+        return credentials;
+      }
+
+      if (this.formData.mcpToken) {
+        credentials['auth'] = {
+          type: 'bearer',
+          token: this.formData.mcpToken,
+        };
+        return credentials;
+      }
+      const headers = this.kvRowsToObject(this.formData.mcpHeaders);
+      if (Object.keys(headers).length > 0) {
+        credentials['auth'] = {type: 'headers', headers};
+      }
+      return credentials;
     }
     if (this.isGitBackedType()) {
       if (this.gitAuthMethod === 'ssh') {
@@ -2856,6 +3149,26 @@ export class DatasourceListComponent implements OnInit {
     };
   }
 
+  private kvRowsToObject(rows: KeyValueRow[]): Record<string, string> {
+    const values: Record<string, string> = {};
+    for (const row of rows) {
+      const key = row.key.trim();
+      if (key) values[key] = row.value;
+    }
+    return values;
+  }
+
+  private mcpCredentialsWereEntered(): boolean {
+    return (
+      this.mcpTransportDirty ||
+      !!this.formData.mcpToken ||
+      !!this.formData.mcpCommand.trim() ||
+      !!this.formData.mcpArgs.trim() ||
+      this.formData.mcpHeaders.some((row) => !!row.key.trim()) ||
+      this.formData.mcpEnv.some((row) => !!row.key.trim())
+    );
+  }
+
   private resetFormData(): void {
     this.formData = {
       name: '',
@@ -2865,6 +3178,12 @@ export class DatasourceListComponent implements OnInit {
       cli_hint: '',
       default_branch: '',
       root_path: '',
+      mcpTransport: 'http',
+      mcpToken: '',
+      mcpHeaders: [],
+      mcpCommand: '',
+      mcpArgs: '',
+      mcpEnv: [],
       is_global: false,
       read_only: true,
     };
@@ -2874,6 +3193,7 @@ export class DatasourceListComponent implements OnInit {
     this.gitAuthMethod = 'token';
     this.gitSshKey = '';
     this.envVars = [];
+    this.mcpTransportDirty = false;
     this.kubeconfigContent = '';
     this.genericFiles = [];
   }

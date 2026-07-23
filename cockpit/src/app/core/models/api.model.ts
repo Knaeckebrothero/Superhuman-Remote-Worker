@@ -221,6 +221,7 @@ export type DatasourceType =
   | 'mongodb'
   | 'webdav'
   | 'email'
+  | 'mcp'
   | 'kubeconfig'
   | 'ssh_key'
   | 'generic_file';

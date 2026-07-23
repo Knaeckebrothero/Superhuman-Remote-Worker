@@ -105,6 +105,12 @@ describe('DatasourceListComponent OKF Knowledge Base support', () => {
       cli_hint: '',
       default_branch: 'main',
       root_path: 'vault',
+      mcpTransport: 'http',
+      mcpToken: '',
+      mcpHeaders: [],
+      mcpCommand: '',
+      mcpArgs: '',
+      mcpEnv: [],
       is_global: false,
       read_only: true,
     };
@@ -315,6 +321,66 @@ describe('DatasourceListComponent email support', () => {
     expect(component.emailForm.smtp_host).toBe('smtp.gmail.com');
     expect(component.emailForm.smtp_port).toBe('587');
     expect(component.emailForm.smtp_security).toBe('starttls');
+  });
+});
+
+describe('DatasourceListComponent MCP support', () => {
+  it('offers the MCP type option', () => {
+    const {component} = createComponent();
+
+    expect(component.typeFilters).toContainEqual({
+      labelKey: 'datasources.filter.mcp',
+      value: 'mcp',
+    });
+  });
+
+  it('builds http credentials with bearer auth on save', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Remote tools';
+    component.onTypeSelect('mcp');
+    component.formData.connection_url = 'https://mcp.example.com/mcp';
+    component.formData.mcpTransport = 'http';
+    component.formData.mcpToken = 'secret-token';
+
+    component.saveForm();
+
+    expect(api.createDatasource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'mcp',
+        connection_url: 'https://mcp.example.com/mcp',
+        credentials: {
+          transport: 'http',
+          auth: {type: 'bearer', token: 'secret-token'},
+        },
+      }),
+    );
+  });
+
+  it('builds stdio credentials with args split per line', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'GitHub tools';
+    component.onTypeSelect('mcp');
+    component.formData.mcpTransport = 'stdio';
+    component.formData.mcpCommand = 'npx';
+    component.formData.mcpArgs =
+      '-y\n@modelcontextprotocol/server-github\n\n';
+
+    component.saveForm();
+
+    expect(api.createDatasource).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'mcp',
+        connection_url: undefined,
+        credentials: {
+          transport: 'stdio',
+          command: 'npx',
+          args: ['-y', '@modelcontextprotocol/server-github'],
+          env: {},
+        },
+      }),
+    );
   });
 });
 
