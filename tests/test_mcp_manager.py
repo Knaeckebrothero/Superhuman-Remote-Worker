@@ -5,6 +5,7 @@ Integration tests run a real stdio MCP server as a subprocess via
 """
 
 import asyncio
+import socket
 import sys
 import textwrap
 
@@ -32,6 +33,29 @@ ECHO_SERVER = textwrap.dedent(
     """
 )
 
+HTTP_ECHO_SERVER = textwrap.dedent(
+    """
+    import sys
+    from mcp.server.fastmcp import FastMCP
+
+    port = int(sys.argv[1])
+    transport = sys.argv[2]
+    mcp = FastMCP(
+        "echo",
+        host="127.0.0.1",
+        port=port,
+        log_level="ERROR",
+    )
+
+    @mcp.tool()
+    def echo(text: str) -> str:
+        \"\"\"Echo the input back.\"\"\"
+        return f"echo: {text}"
+
+    mcp.run(transport=transport)
+    """
+)
+
 
 def _stdio_ds(script_path, name="Echo Server"):
     return {
@@ -45,6 +69,18 @@ def _stdio_ds(script_path, name="Echo Server"):
             "env": {},
         },
     }
+
+
+async def _wait_for_port(port: int) -> None:
+    for _ in range(100):
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+            await writer.wait_closed()
+            return
+        except OSError:
+            await asyncio.sleep(0.05)
+    raise AssertionError(f"test MCP server did not listen on port {port}")
 
 
 class TestParseConfig:
@@ -147,6 +183,61 @@ async def test_unreachable_server_degrades_not_raises(tmp_path):
         )
     finally:
         await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_transport", "server_transport", "path"),
+    [
+        ("http", "streamable-http", "/mcp"),
+        ("sse", "sse", "/sse"),
+    ],
+)
+async def test_remote_transport_discover_and_call(
+    tmp_path,
+    client_transport,
+    server_transport,
+    path,
+):
+    script = tmp_path / "http_echo_server.py"
+    script.write_text(HTTP_ECHO_SERVER)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(script),
+        str(port),
+        server_transport,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    manager = None
+    try:
+        await _wait_for_port(port)
+        manager = MCPManager(
+            [
+                {
+                    "type": "mcp",
+                    "name": f"Remote {client_transport}",
+                    "connection_url": f"http://127.0.0.1:{port}{path}",
+                    "credentials": {"transport": client_transport},
+                }
+            ]
+        )
+        await manager.connect_all()
+        echo = next(
+            tool
+            for tool in manager.get_langchain_tools()
+            if tool.name.endswith("__echo")
+        )
+        assert "echo: remote" in str(await echo.coroutine(text="remote"))
+    finally:
+        if manager is not None:
+            await manager.aclose()
+        process.terminate()
+        await process.wait()
 
 
 @pytest.mark.asyncio
