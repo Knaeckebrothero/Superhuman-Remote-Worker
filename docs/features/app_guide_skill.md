@@ -10,10 +10,12 @@ tags:
 
 # SRW Self-Knowledge and App Guide
 
-> **Status**: v1 `app-guide` shipped 2026-07-08. M1a managed delivery was
-> implemented 2026-07-23; content repair, the live capability plane, visual
-> help, and the later roadmap remain in progress. The codebase and
-> primary-source review was completed 2026-07-22.
+> **Status**: v1 `app-guide` shipped 2026-07-08. M1a managed delivery, M1b
+> Email/OKF guidance plus the connector-type drift gate, and M1c
+> Automations/Fleet guidance plus live tool-group coverage were implemented
+> 2026-07-23. The broader content audit, live capability plane, visual help,
+> and later roadmap remain in progress. The codebase and primary-source review
+> was completed 2026-07-22.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -230,20 +232,80 @@ The first M1 slice makes the guide a persistent-session product floor:
   tests cover current delivery, stale-byte rejection, non-shadowing, digest
   refresh, invalid paths, and fail-closed behavior.
 
-This is not the M1 exit gate. The reference-content audit (especially email and
-OKF), break-glass/degraded-health surface, compaction evaluation, held-out
+This is not the M1 exit gate. The broader reference-content audit,
+break-glass/degraded-health surface, compaction evaluation, held-out
 trigger/answer evaluations, and fresh/resumed k3d matrix remain open below.
 
-### Remaining gaps after M1a
+### Shipped M1b — connector content and first drift gate
+
+The next M1 slice repairs the two highest-value connector journeys and gives
+them a deterministic inventory boundary:
+
+- `datasources-email` now covers provider/app-password setup, the four access
+  tiers, selective folder sharing, recipient limits, attachment, and the
+  current fail-closed send behavior;
+- `datasources-okf` now covers the Git/root/auth flow, central indexing and
+  readiness, incremental versus full rebuilds, attachment, lite-tier support,
+  and external read-only behavior;
+- Cockpit's English and German Email hints now describe the runtime's
+  fail-closed direct-send behavior instead of promising the not-yet-built
+  human-approval queue;
+- both references carry content-type, capability-ID, and journey-ID metadata
+  while remaining one level below the compact routing skill;
+- `src/core/datasource_catalog.py` is the canonical build-level inventory for
+  the 12 internal datasource types (called Connectors in the product);
+- backend creation validation and its API description consume that inventory;
+  and
+- `tests/test_datasource_catalog.py` asserts parity with Cockpit's type union,
+  authoring selector and filters, the agent credential/tool groupings, and a
+  routable guide-coverage decision for every type.
+
+This is intentionally a build inventory, not the Phase 2 capability plane. It
+does not claim that a connector is enabled, granted, attached, healthy, or
+usable in the current session.
+
+### Shipped M1c — Automations and fleet actionability
+
+This slice repairs the two highest-value work-dispatch journeys and makes their
+agent actionability explicit:
+
+- `automations` now explains the shipped schedule-only job template, presets
+  and cron/timezone preview, project scoping, Run-now semantics, pause/resume,
+  retained past jobs, max-fires and catchup controls, at-least-once delivery,
+  and the current absence of per-automation connector selection;
+- the guide distinguishes the Cockpit lifecycle from the default
+  **Automations & Loops** session group, which can inspect automations/runs and
+  prepare a proposal but cannot save, enable, run, pause, edit, or delete one;
+- `fleet-and-delegation` distinguishes independent worker jobs created through
+  **Fleet Management** from optional subagents created inside one parent job;
+- the Fleet path covers tool enablement, manual fallback, connector inheritance,
+  job/project/repository inspection, approval, feedback/resume, safe-point
+  pause, cancellation, parallel-capacity limits, and durable monitoring in
+  Jobs/Inbox;
+- the overview, sessions, and jobs references no longer promise that every
+  session can create jobs or continuously watch them without the actual Fleet
+  tools;
+- both focused references carry content-type, capability-ID, and journey-ID
+  metadata and are routed one hop below `SKILL.md`; and
+- `tests/test_app_guide_content.py` pins their critical safety/actionability
+  claims and requires every tool in the selectable live Fleet Management and
+  Automations & Loops groups to have an explicit guide-topic decision.
+
+Like M1b, these are static build-level claims. The guide tells the model to
+check its actual visible tools, but the Phase 2 capability plane is still
+needed to explain deployment, user, and current-session state reliably.
+
+### Remaining gaps after M1c
 
 The guide is now delivered reliably, but it is not yet self-maintaining or
 runtime-aware:
 
-- `references/datasources.md` predates the email and OKF datasource work and is
-  already incomplete. This is a concrete example of the drift this feature
-  must detect.
-- The reference-index test proves structural consistency, not factual
-  freshness.
+- The connector overview now routes Email and OKF to focused how-to topics and
+  covers MCP, credential-file, repository, WebDAV, and managed database
+  connectors. The new catalog catches type-list drift, but it does not verify
+  every workflow sentence against implementation.
+- The reference-index and connector-catalog tests prove structure, coverage
+  decisions, and selected consumer parity—not end-to-end factual freshness.
 - Static references can describe possible features but cannot inspect flags,
   user grants, service configuration, or the session's attached resources.
 - `get_session_context`, `list_experts`, `list_skills`, workflow tools, and
@@ -257,9 +319,15 @@ runtime-aware:
 - The current `BUILD_SHA` is a short, production-agent-only value, absent in
   local development by design. It is not an orchestrator, Cockpit, guide, or
   release identity, and SRW supports independently tagged component images.
-- Datasource types are duplicated across backend validation, Cockpit models
-  and filters, and agent setup maps; there is no canonical inventory seam for
-  a reliable coverage gate yet.
+- Cockpit still repeats connector IDs in TypeScript/UI source, but the canonical
+  Python inventory now drives backend acceptance and CI asserts parity. Other
+  user-visible inventories and Cockpit route/actions still lack canonical
+  seams.
+- The automation editor currently loads the unfiltered expert list and submits
+  the selected `Expert.id`, while the fire-time service documents and resolves
+  `automation.expert` as a worker expert name/config. DB-backed and
+  worker-only selection needs a dedicated product fix and regression test; the
+  guide therefore requires a Run-now verification before trusting a schedule.
 - The proposed `/datasources?new=email` target is not implemented today. The
   current route is `/datasources`, and creation is opened by local component
   state rather than a query parameter.
@@ -284,11 +352,12 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Capability service | Existing grants route in `orchestrator/main.py`; `orchestrator/services/grants_service.py` | Put product definitions/evaluation in a dedicated service and small router rather than enlarging the grants endpoint |
 | Thread ownership/scope | `orchestrator/routers/sessions.py` fetch-then-owner checks | Reuse the owned-thread pattern and resolve only the active thread/project scope |
 | Live session overlay | `src/tools/context.py`, `src/api/persistent_session.py`, and `src/tools/orchestrator/jobs.py` | Record final loaded tool names and overlay actual backend/datasource/knowledge/cloud observations in the agent tool |
-| Datasource inventory | Validation in `orchestrator/main.py`, agent mapping in `src/core/datasource_setup.py`, and Cockpit types/filters | Create one machine-readable source and assert consumer parity before relying on coverage tests |
+| Datasource inventory | `src/core/datasource_catalog.py`, validation in `orchestrator/main.py`, agent mapping in `src/core/datasource_setup.py`, and Cockpit types/filters | M1b makes the Python catalog authoritative for backend acceptance and asserts guide/Cockpit/agent parity; runtime availability remains Phase 2 |
+| Session work control groups | `src/core/session_tool_overrides.py`, `src/tools/orchestrator/jobs.py`, and `src/tools/orchestrator/workflows.py` | M1c gives every currently selectable Fleet/Workflow tool a focused guide-topic decision; route/action and runtime-state registries remain later work |
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
 | Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; static Canvas rendering strips scripts/interaction | Define a separately validated help-card/App contract; do not smuggle interactive help through arbitrary Canvas HTML |
 | Provenance | Agent-only `BUILD_SHA` in `docker/Dockerfile.agent` and short CI values; independently tagged images in Helm values | Stamp and surface full revision/digest metadata for each relevant component |
-| Tests | Bundled, resolution, product-help tool, CRUD, backend-tier, and persistent-session suites | M1a covers managed delivery/current bytes; add model triggers, grounded answers, content coverage, compaction, and the k3d resume matrix |
+| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, and persistent-session suites | M1a covers managed delivery/current bytes; M1b/M1c add focused content and inventory/group coverage; add model triggers, grounded answers, compaction, and the k3d resume matrix |
 
 ## Architecture
 
@@ -373,11 +442,11 @@ to the v1 reference set are:
 
 | Reference | Purpose |
 |---|---|
-| `automations.md` | Scheduled jobs, enable/disable semantics, runs, and safe authoring |
+| `automations.md` (shipped M1c) | Scheduled jobs, enable/disable semantics, runs, and safe authoring |
 | `canvas-and-browser.md` | File/app/browser presentation, shared browsing, and availability requirements |
-| `datasources-email.md` | Provider support, app passwords, access tiers, folder/recipient allowlists, attachment |
-| `datasources-knowledge.md` | OKF knowledge bases, repositories, indexing readiness, and read-only behavior |
-| `fleet-and-delegation.md` | What the session can delegate, inspect, approve, resume, pause, and cancel |
+| `datasources-email.md` (shipped M1b) | Provider support, app passwords, access tiers, folder/recipient allowlists, attachment |
+| `datasources-okf.md` (shipped M1b) | OKF knowledge bases, repositories, indexing readiness, and read-only behavior |
+| `fleet-and-delegation.md` (shipped M1c) | What the session can delegate, inspect, approve, resume, pause, and cancel |
 | `permissions-and-availability.md` | Grants, feature flags, workspace tiers, and how to interpret disabled controls |
 
 The exact split is an implementation-time content decision. `SKILL.md` remains
@@ -1068,7 +1137,9 @@ DB-authored-skills or DB-experts features.
 - [ ] Audit user-visible changes since the v1 guide shipped, including email,
   OKF knowledge bases, datasource readiness/scope, automations/workflows,
   fleet/job management, unified loops/campaigns, Canvas, live/shared browser,
-  protected cloud review, workspace tiers, and relevant settings.
+  protected cloud review, workspace tiers, and relevant settings. Email and
+  OKF were audited in M1b; Automations and Fleet/job management were audited in
+  M1c; the remaining areas are still open.
 - [x] Run a small delivery spike and record the choice: extend `use_skill` with
   an immutable system-bundle reader or add bounded `read_product_guide`; prove
   that authoritative bytes do not depend on mutable workspace files. M1a chose
@@ -1086,14 +1157,16 @@ DB-authored-skills or DB-experts features.
   deliberately has no authoritative workspace copy to reconcile.
 - [ ] Update the original references and add the high-value split references
   listed in this design, including content type, capability IDs, and journey
-  IDs.
+  IDs. The Email and OKF splits shipped in M1b; Automations and
+  Fleet/delegation shipped in M1c; Canvas/browser and
+  permissions/availability remain open.
 - [x] Update `SKILL.md` triggers and logical-topic routing for the managed
   reader without bloating Layer 1/2 context.
 - [ ] Verify the activated guide procedure remains available after session
   context compaction, while unneeded references remain unloadable/on demand.
 - [x] Remove the current unsupported suggestion that the default session can
   attach a datasource; offer only observed tools or validated guide actions.
-- [ ] Create the first minimal canonical/coverage seam for datasource types so
+- [x] Create the first minimal canonical/coverage seam for datasource types so
   the repaired email guide immediately gains a drift check.
 - [ ] Add balanced trigger evaluations for broad/specific product questions and
   near-miss negatives such as project/codebase onboarding.
@@ -1161,14 +1234,18 @@ configuration.
 **Outcome:** common product drift breaks CI or produces an explicit coverage
 decision instead of silently aging the guide.
 
-- [ ] Create canonical machine-readable inventory seams before using duplicated
-  lists as coverage authorities, starting with datasource types and Cockpit
-  route/action metadata.
+- [x] Create the canonical machine-readable datasource-type inventory and
+  assert backend, Cockpit, agent-grouping, and guide parity.
+- [ ] Create canonical Cockpit route/action metadata before using duplicated
+  route or control lists as coverage authorities.
 - [ ] Map each initial capability to its relevant components, visibility policy, guide
   reference, action ID, and optional visual ID.
-- [ ] Add explicit coverage/exclusion checks for canonical datasource types,
-  bundled disk experts, workflow families, top-level destinations, and major
-  feature flags; dynamic user content is not a release-coverage target.
+- [x] Add explicit guide-coverage decisions for canonical datasource types.
+- [ ] Add explicit coverage/exclusion checks for bundled disk experts, workflow
+  families, top-level destinations, and major feature flags; dynamic user
+  content is not a release-coverage target. M1c covers the selectable live
+  Fleet and Workflow tool groups; disk experts, top-level destinations, flags,
+  and broader workflow inventories remain open.
 - [ ] Add an explicit same-origin help-route/action manifest and validate guide
   paths, translation keys, and actions against it.
 - [ ] Add stable `data-help-id` anchors to high-value workflow controls.

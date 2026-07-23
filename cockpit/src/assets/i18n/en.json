@@ -1872,7 +1872,7 @@
       "emailAccessHintRead": "The agent can list, read, and search messages in the allowed folders. Nothing is modified.",
       "emailAccessHintReadWrite": "Adds moving and flagging messages (mark read/unread, star) within the allowed folders.",
       "emailAccessHintDraft": "Adds composing drafts into your Drafts folder — you review and send them from your own client.",
-      "emailAccessHintSend": "Adds direct SMTP sending. In the current runtime this works only when Send without human approval is enabled; otherwise the agent creates a draft instead.",
+      "emailAccessHintSend": "Adds direct SMTP sending. In the current runtime this works only when Send without human approval is enabled; otherwise the agent must create a draft instead.",
       "emailFoldersLabel": "Folder allowlist",
       "emailFoldersPlaceholder": "AI, AI/Processed",
       "emailFoldersHint": "Comma-separated folders the agent may access. Leave empty for the whole mailbox. Tip: a dedicated \"AI\" folder you move mails into makes you the triage layer.",

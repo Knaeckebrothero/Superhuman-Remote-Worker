@@ -7,7 +7,8 @@ can always inspect what happened.
 
 ## Creating a job
 
-**Jobs → New Job** (or ask a session agent to create one for you). Fields:
+**Jobs → New Job** (or ask a session with **Fleet Management** enabled to
+create one for you). Fields:
 
 - **Project** — attach the job to a project (or none) for shared knowledge,
   connectors, and repos.
@@ -97,7 +98,7 @@ so the worker starts informed. Both are configurable per job.
 
 ## Automations — jobs on a schedule
 
-The **Automations** page runs a job on a recurring schedule (cron): give it a
-name, a schedule, an expert, and a prompt; optionally set autonomy, priority,
-and a max-fires-per-day cap. Enable/disable with a switch, or trigger a run
-manually with **Run now**.
+The **Automations** page stores a recurring schedule and job template. Its
+trigger, retry, connector, and safety boundaries differ from a manually
+created job, so route schedule questions to the focused automations guide
+instead of treating an automation as just another job form.
