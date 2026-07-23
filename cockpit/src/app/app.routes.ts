@@ -4,7 +4,6 @@ import {ApiKeysPageComponent} from './views/settings/api-keys/api-keys-page.comp
 import {JobsPageComponent} from './views/jobs/jobs-page.component';
 import {JobReviewPageComponent} from './views/job-review/job-review-page.component';
 import {CreatePageComponent} from './views/create/create-page.component';
-import {DebugPageComponent} from './debug/pages/debug.component';
 import {ProjectListPageComponent} from './views/projects/project-list.component';
 import {ProjectDetailPageComponent} from './views/project-detail/project-detail.component';
 import {InboxPageComponent} from './views/inbox/inbox-page.component';
@@ -19,11 +18,6 @@ import {ExpertEditorComponent} from './views/experts/expert-editor.component';
 import {SkillsPageComponent} from './views/skills/skills-page.component';
 import {SkillEditorComponent} from './views/skills/skill-editor.component';
 import {AutomationsPageComponent} from './views/automations/automations-page.component';
-import {AdminLlmComponent} from './views/admin/llm/admin-llm.component';
-import {AdminUsersComponent} from './views/admin/users/admin-users.component';
-import {AdminConfigComponent} from './views/admin/config/admin-config.component';
-import {AdminGrantsComponent} from './views/admin/grants/admin-grants.component';
-import {AdminUsageComponent} from './views/admin/usage/admin-usage.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
@@ -60,14 +54,49 @@ export const routes: Routes = [
   { path: 'automations', component: AutomationsPageComponent, canActivate: [authGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
-  { path: 'admin/llm', component: AdminLlmComponent, canActivate: [authGuard, adminGuard] },
+  // Admin and debug load on demand. They are large (the config, usage and
+  // grants screens alone are most of a megabyte of source, and debug pulls
+  // the graph timeline), and no ordinary session ever opens them — keeping
+  // them in the initial bundle taxed every page load to serve a handful of
+  // admin visits, and pushed the build past its initial-bundle budget.
+  {
+    path: 'admin/llm',
+    loadComponent: () =>
+      import('./views/admin/llm/admin-llm.component').then(m => m.AdminLlmComponent),
+    canActivate: [authGuard, adminGuard],
+  },
   { path: 'admin/providers', redirectTo: 'admin/llm' },
   { path: 'admin/models', redirectTo: 'admin/llm' },
-  { path: 'admin/users', component: AdminUsersComponent, canActivate: [authGuard, adminGuard] },
-  { path: 'admin/config', component: AdminConfigComponent, canActivate: [authGuard, adminGuard] },
-  { path: 'admin/grants', component: AdminGrantsComponent, canActivate: [authGuard, adminGuard] },
-  { path: 'admin/usage', component: AdminUsageComponent, canActivate: [authGuard, adminGuard] },
-  { path: 'debug', component: DebugPageComponent, canActivate: [authGuard] },
+  {
+    path: 'admin/users',
+    loadComponent: () =>
+      import('./views/admin/users/admin-users.component').then(m => m.AdminUsersComponent),
+    canActivate: [authGuard, adminGuard],
+  },
+  {
+    path: 'admin/config',
+    loadComponent: () =>
+      import('./views/admin/config/admin-config.component').then(m => m.AdminConfigComponent),
+    canActivate: [authGuard, adminGuard],
+  },
+  {
+    path: 'admin/grants',
+    loadComponent: () =>
+      import('./views/admin/grants/admin-grants.component').then(m => m.AdminGrantsComponent),
+    canActivate: [authGuard, adminGuard],
+  },
+  {
+    path: 'admin/usage',
+    loadComponent: () =>
+      import('./views/admin/usage/admin-usage.component').then(m => m.AdminUsageComponent),
+    canActivate: [authGuard, adminGuard],
+  },
+  {
+    path: 'debug',
+    loadComponent: () =>
+      import('./debug/pages/debug.component').then(m => m.DebugPageComponent),
+    canActivate: [authGuard],
+  },
 
   // Redirects for old bookmarks. Jobs absorbed the standalone Create + Review
   // surfaces, so their old top-level paths now redirect into /jobs/*.
