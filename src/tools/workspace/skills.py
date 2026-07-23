@@ -85,16 +85,30 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
         """
         scoped_skills = context.config.get("_resolved_skills") or {}
         menu = scoped_skills.get("menu") if isinstance(scoped_skills, dict) else None
-        allowed_names = {
-            item.get("name")
-            for item in menu or []
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        }
-        if skill_name not in allowed_names:
+        entry = next(
+            (
+                item
+                for item in menu or []
+                if isinstance(item, dict) and item.get("name") == skill_name
+            ),
+            None,
+        )
+        if entry is None:
             return (
                 f"Skill '{skill_name}' is not available for the current session "
                 "capabilities. Use only skills listed in the current "
                 "available_skills menu, by their exact name."
+            )
+        if (
+            entry.get("system_managed") is True
+            and entry.get("loader_tool") == "read_product_guide"
+            and skill_name == "app-guide"
+        ):
+            return (
+                "Skill 'app-guide' is managed by the running SRW product and is "
+                "not loaded from mutable workspace files. Call "
+                "read_product_guide(topic_id='index'), then read the relevant "
+                "logical topic ID it returns."
             )
 
         skill_md = f"skills/{skill_name}/SKILL.md"

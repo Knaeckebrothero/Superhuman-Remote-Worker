@@ -5,9 +5,14 @@ menu keeps ALL names (bundled is the floor) instead of picking one winner.
 """
 
 from src.core.skill_resolution import (
+    APP_GUIDE_LOADER_TOOL,
+    APP_GUIDE_SKILL,
     add_default_canvas_skill,
+    add_persistent_system_skills,
+    is_reserved_system_skill_name,
     resolve_skill_menu,
     scope_skills_for_tools,
+    skill_bundle_digest,
     skill_files_to_workspace,
 )
 from src.core.expert_resolution import fence_skills_menu
@@ -111,6 +116,106 @@ def test_default_canvas_skill_does_not_override_resolved_replacement():
     assert add_default_canvas_skill(replacement) == replacement
 
 
+def test_persistent_system_floor_replaces_app_guide_shadow_with_running_bundle():
+    replacement = {
+        "menu": [
+            {"name": APP_GUIDE_SKILL, "description": "untrusted replacement"},
+            {"name": "ordinary-skill", "description": "keep"},
+        ],
+        "files": {
+            APP_GUIDE_SKILL: {"SKILL.md": "MUTABLE-OR-STALE"},
+            "ordinary-skill": {"SKILL.md": "ordinary"},
+        },
+    }
+
+    catalog = add_persistent_system_skills(replacement)
+
+    app_entry = next(
+        item for item in catalog["menu"] if item["name"] == APP_GUIDE_SKILL
+    )
+    assert app_entry["system_managed"] is True
+    assert app_entry["loader_tool"] == APP_GUIDE_LOADER_TOOL
+    assert "MUTABLE-OR-STALE" not in catalog["files"][APP_GUIDE_SKILL]["SKILL.md"]
+    assert app_entry["bundle_digest"] == skill_bundle_digest(
+        catalog["files"][APP_GUIDE_SKILL]
+    )
+    assert catalog["files"]["ordinary-skill"]["SKILL.md"] == "ordinary"
+
+
+def test_persistent_system_floor_refreshes_app_guide_digest(tmp_path):
+    root = tmp_path / "skills"
+    app_dir = root / APP_GUIDE_SKILL
+    app_dir.mkdir(parents=True)
+    skill_md = app_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: app-guide\ndescription: current\n---\nVERSION ONE\n",
+        encoding="utf-8",
+    )
+
+    first = add_persistent_system_skills({}, skills_root=root)
+    first_entry = next(
+        item for item in first["menu"] if item["name"] == APP_GUIDE_SKILL
+    )
+
+    skill_md.write_text(
+        "---\nname: app-guide\ndescription: current\n---\nVERSION TWO\n",
+        encoding="utf-8",
+    )
+    second = add_persistent_system_skills(first, skills_root=root)
+    second_entry = next(
+        item for item in second["menu"] if item["name"] == APP_GUIDE_SKILL
+    )
+
+    assert first_entry["bundle_digest"] != second_entry["bundle_digest"]
+    assert "VERSION TWO" in second["files"][APP_GUIDE_SKILL]["SKILL.md"]
+
+
+def test_persistent_system_floor_never_falls_back_to_replacement_if_bundle_missing(
+    tmp_path,
+):
+    replacement = {
+        "menu": [{"name": APP_GUIDE_SKILL, "description": "replacement"}],
+        "files": {APP_GUIDE_SKILL: {"SKILL.md": "UNTRUSTED FALLBACK"}},
+    }
+
+    catalog = add_persistent_system_skills(
+        replacement,
+        skills_root=tmp_path / "missing-skills",
+    )
+
+    assert all(item.get("name") != APP_GUIDE_SKILL for item in catalog["menu"])
+    assert APP_GUIDE_SKILL not in catalog["files"]
+
+
+def test_app_guide_scope_requires_its_dedicated_reader():
+    skills = {
+        "menu": [
+            {"name": APP_GUIDE_SKILL},
+            {"name": "ordinary-skill"},
+        ],
+        "files": {
+            APP_GUIDE_SKILL: {"SKILL.md": "guide"},
+            "ordinary-skill": {"SKILL.md": "ordinary"},
+        },
+    }
+
+    without_reader = scope_skills_for_tools(skills, ["use_skill"])
+    assert [item["name"] for item in without_reader["menu"]] == ["ordinary-skill"]
+    assert set(without_reader["files"]) == {"ordinary-skill"}
+
+    with_reader = scope_skills_for_tools(skills, [APP_GUIDE_LOADER_TOOL])
+    assert [item["name"] for item in with_reader["menu"]] == [
+        APP_GUIDE_SKILL,
+        "ordinary-skill",
+    ]
+    assert set(with_reader["files"]) == {APP_GUIDE_SKILL, "ordinary-skill"}
+
+
+def test_app_guide_name_is_reserved_for_the_running_product():
+    assert is_reserved_system_skill_name(APP_GUIDE_SKILL)
+    assert not is_reserved_system_skill_name("my-app-guide-extension")
+
+
 def test_fence_skills_menu_empty_is_blank():
     assert fence_skills_menu([]) == ""
 
@@ -120,6 +225,24 @@ def test_fence_skills_menu_wraps_and_strips_braces():
     assert "<available_skills" in out and "</available_skills>" in out
     assert "- a: use when ok" in out  # braces stripped
     assert "{" not in out and "}" not in out
+
+
+def test_fence_skills_menu_names_managed_app_guide_reader():
+    out = fence_skills_menu(
+        [
+            {
+                "name": APP_GUIDE_SKILL,
+                "description": "Current product help",
+                "system_managed": True,
+                "loader_tool": APP_GUIDE_LOADER_TOOL,
+            }
+        ]
+    )
+
+    assert (
+        "- app-guide [load with read_product_guide(topic_id)]: Current product help"
+        in out
+    )
 
 
 # --- Slice 3: bound skills are removed from the model-invoked catalog ---

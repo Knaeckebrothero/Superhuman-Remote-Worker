@@ -11,7 +11,7 @@ from src.tools.context import ToolContext
 from src.tools.workspace.skills import create_skill_tools
 
 
-def _use_skill(tmp_path, *, allowed=("hello-skill", "nope")):
+def _use_skill(tmp_path, *, allowed=("hello-skill", "nope"), menu=None):
     ws = WorkspaceManager(
         job_id="t", base_path=tmp_path, backend=FilesystemTestBackend(tmp_path)
     )
@@ -19,7 +19,9 @@ def _use_skill(tmp_path, *, allowed=("hello-skill", "nope")):
         workspace_manager=ws,
         config={
             "_resolved_skills": {
-                "menu": [{"name": name} for name in allowed],
+                "menu": (
+                    menu if menu is not None else [{"name": name} for name in allowed]
+                ),
                 "files": {},
             }
         },
@@ -128,3 +130,27 @@ def test_stale_skill_bytes_are_inert_when_name_leaves_scoped_menu(tmp_path):
 
     assert "not available" in out.lower()
     assert "STALE-CANVAS-GUIDANCE" not in out
+
+
+def test_use_skill_refuses_managed_app_guide_workspace_bytes(tmp_path):
+    ws, use_skill = _use_skill(
+        tmp_path,
+        menu=[
+            {
+                "name": "app-guide",
+                "system_managed": True,
+                "loader_tool": "read_product_guide",
+            }
+        ],
+    )
+    ws.backend.mkdir("skills/app-guide")
+    ws.write_file(
+        "skills/app-guide/SKILL.md",
+        "---\nname: app-guide\n---\nSTALE-OR-USER-CONTROLLED-GUIDANCE",
+    )
+
+    out = use_skill.invoke({"skill_name": "app-guide"})
+
+    assert "read_product_guide" in out
+    assert "managed by the running SRW product" in out
+    assert "STALE-OR-USER-CONTROLLED-GUIDANCE" not in out

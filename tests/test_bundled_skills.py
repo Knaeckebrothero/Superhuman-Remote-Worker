@@ -99,6 +99,9 @@ def test_bundled_app_guide_skill_is_valid_and_indexes_its_references():
     # from the bundled usage docs, never from priors.
     assert "references/" in desc
     assert "priors" in body
+    assert "read_product_guide" in desc and "read_product_guide" in body
+    assert "skills/app-guide/" in body
+    assert "attach the datasource" not in body
     # The body's routing index and the files on disk must agree in both
     # directions: every bundled doc is routable, every routed path exists.
     on_disk = {f"references/{p.name}" for p in (root / "references").glob("*.md")}

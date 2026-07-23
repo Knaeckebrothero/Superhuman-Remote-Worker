@@ -10,9 +10,10 @@ tags:
 
 # SRW Self-Knowledge and App Guide
 
-> **Status**: v1 `app-guide` shipped 2026-07-08; the runtime-aware
-> self-knowledge design and roadmap below are proposed, with a codebase and
-> primary-source review completed 2026-07-22.
+> **Status**: v1 `app-guide` shipped 2026-07-08. M1a managed delivery was
+> implemented 2026-07-23; content repair, the live capability plane, visual
+> help, and the later roadmap remain in progress. The codebase and
+> primary-source review was completed 2026-07-22.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -207,30 +208,42 @@ shape:
 - `tests/test_bundled_skills.py` verifies parsing, budgets, grounding language,
   and agreement between the `SKILL.md` index and reference files.
 
-### Gaps demonstrated by v1
+### Shipped M1a — managed delivery foundation
 
-The v1 guide is useful but not self-maintaining or runtime-aware:
+The first M1 slice makes the guide a persistent-session product floor:
+
+- every persistent session injects the current `app-guide` catalog entry and
+  workspace-independent `read_product_guide(topic_id)` tool after final backend
+  filtering, including the `none` tier and configurations with DB skills or DB
+  experts disabled;
+- ordinary worker catalogs exclude the reserved managed guide by default;
+- the runtime removes frozen/owner/project/global `app-guide` replacements,
+  reloads the running bundle, stamps a deterministic content digest, and scopes
+  the menu entry to successful reader-tool instantiation;
+- the reader accepts only `index` or a bounded logical topic ID, verifies the
+  digest, and returns the procedure plus at most one focused reference;
+- `app-guide` is never materialized as an ordinary workspace skill, while
+  `use_skill` refuses to read a same-name workspace copy;
+- create/import/update validation reserves the `app-guide` name while
+  duplication remains possible under a distinct generated name; and
+- focused resolution, tool, persistent-session, backend-tier, CRUD, and bundle
+  tests cover current delivery, stale-byte rejection, non-shadowing, digest
+  refresh, invalid paths, and fail-closed behavior.
+
+This is not the M1 exit gate. The reference-content audit (especially email and
+OKF), break-glass/degraded-health surface, compaction evaluation, held-out
+trigger/answer evaluations, and fresh/resumed k3d matrix remain open below.
+
+### Remaining gaps after M1a
+
+The guide is now delivered reliably, but it is not yet self-maintaining or
+runtime-aware:
 
 - `references/datasources.md` predates the email and OKF datasource work and is
   already incomplete. This is a concrete example of the drift this feature
   must detect.
 - The reference-index test proves structural consistency, not factual
   freshness.
-- Ordinary resolved-config injection of model-invoked skills, including
-  `app-guide`, currently depends on `SKILLS_DB_ENABLED`; the chart default is
-  off. REST discovery still lists bundled skills, and `present-with-canvas`
-  already has a narrow flag-independent session floor, so this is not a claim
-  that every skill surface disappears.
-- Ordinary skill materialization is add-only in persistent workspaces. A
-  resumed session can therefore retain stale or locally modified guide bytes
-  after an SRW upgrade; only the Canvas companion currently has digest-owned
-  reconciliation.
-- `app-guide` currently depends on `use_skill` and `read_file`. A `none`
-  workspace tier has neither, so "every normal interactive session" cannot be
-  met with the existing workspace-only retrieval path.
-- Existing scope precedence intentionally lets owner/project/global skills
-  shadow bundled skills with the same name. That is suitable for ordinary
-  skills but unsafe for an authoritative product-truth artifact.
 - Static references can describe possible features but cannot inspect flags,
   user grants, service configuration, or the session's attached resources.
 - `get_session_context`, `list_experts`, `list_skills`, workflow tools, and
@@ -254,20 +267,20 @@ The v1 guide is useful but not self-maintaining or runtime-aware:
   cannot yet travel as portable skill files; the bundled scanner also skips
   non-UTF-8 files.
 - There is no structured Cockpit help-card or coach-mark protocol.
-- The current app-guide tests are structural. They do not cover trigger
-  behavior, runtime availability, resumed-session freshness, factual coverage,
-  or the guide's present over-broad suggestion that it may attach a datasource.
+- The current app-guide tests cover managed delivery and structure, but not
+  model trigger behavior, grounded answer quality, factual coverage, or the
+  complete fresh/resumed deployment matrix.
 
 ### Validated repository implementation seams
 
 These are the leading implementation seams as of 2026-07-22. They record why
 the roadmap is sequenced this way; symbols may move during implementation.
 
-| Concern | Existing seam/evidence | Intended change |
+| Concern | Existing seam/evidence | Status / intended change |
 |---|---|---|
-| Managed system-skill floor | `src/core/skill_resolution.py` — `add_default_canvas_skill()` and ordinary precedence | Generalize the narrow Canvas floor with per-system-skill runtime, shadowing, and delivery policy |
-| Persistent delivery/freshness | `src/api/persistent_session.py` — skill scoping/materialization plus Canvas digest reconciliation | Apply managed guide delivery after final tool resolution and reconcile current guide bytes on resume |
-| Guide retrieval | `src/tools/workspace/skills.py` — workspace-only `use_skill`; `src/tools/registry.py` — `none` drops workspace tools | Add backend-independent immutable system-guide reading while preserving ordinary workspace skills |
+| Managed system-skill floor | `src/core/skill_resolution.py` — `add_persistent_system_skills()` plus reserved-name filtering | M1a now replaces any same-name catalog payload with the running digest-stamped guide and keeps it out of worker catalogs |
+| Persistent delivery/freshness | `src/api/persistent_session.py` — post-load skill scoping | M1a now refreshes the managed bundle on every tool setup/rebind and does not materialize it into the workspace |
+| Guide retrieval | `src/tools/product_help.py` and `src/tools/registry.py` | M1a adds bounded `read_product_guide(topic_id)` independent of workspace tier while preserving ordinary workspace skills |
 | Capability service | Existing grants route in `orchestrator/main.py`; `orchestrator/services/grants_service.py` | Put product definitions/evaluation in a dedicated service and small router rather than enlarging the grants endpoint |
 | Thread ownership/scope | `orchestrator/routers/sessions.py` fetch-then-owner checks | Reuse the owned-thread pattern and resolve only the active thread/project scope |
 | Live session overlay | `src/tools/context.py`, `src/api/persistent_session.py`, and `src/tools/orchestrator/jobs.py` | Record final loaded tool names and overlay actual backend/datasource/knowledge/cloud observations in the agent tool |
@@ -275,7 +288,7 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
 | Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; static Canvas rendering strips scripts/interaction | Define a separately validated help-card/App contract; do not smuggle interactive help through arbitrary Canvas HTML |
 | Provenance | Agent-only `BUILD_SHA` in `docker/Dockerfile.agent` and short CI values; independently tagged images in Helm values | Stamp and surface full revision/digest metadata for each relevant component |
-| Tests | `tests/test_bundled_skills.py`, `tests/test_skill_resolution.py`, and `tests/test_persistent_session.py` | Extend structural checks with managed delivery, non-shadowing, flags/tier/resume matrices, triggers, and current-content assertions |
+| Tests | Bundled, resolution, product-help tool, CRUD, backend-tier, and persistent-session suites | M1a covers managed delivery/current bytes; add model triggers, grounded answers, content coverage, compaction, and the k3d resume matrix |
 
 ## Architecture
 
@@ -1056,26 +1069,29 @@ DB-authored-skills or DB-experts features.
   OKF knowledge bases, datasource readiness/scope, automations/workflows,
   fleet/job management, unified loops/campaigns, Canvas, live/shared browser,
   protected cloud review, workspace tiers, and relevant settings.
-- [ ] Run a small delivery spike and record the choice: extend `use_skill` with
+- [x] Run a small delivery spike and record the choice: extend `use_skill` with
   an immutable system-bundle reader or add bounded `read_product_guide`; prove
-  that authoritative bytes do not depend on mutable workspace files.
-- [ ] Generalize the existing Canvas exception into a managed system-skill
+  that authoritative bytes do not depend on mutable workspace files. M1a chose
+  the bounded dedicated reader.
+- [x] Generalize the existing Canvas exception into a managed system-skill
   floor for all user-facing persistent experts, independent of DB skill/expert
   flags; keep it out of autonomous worker catalogs by default.
 - [ ] Add an operator-only break-glass disable and visible degraded-health
   signal without turning the guide back into a normal feature-flag dependency.
-- [ ] Reserve `app-guide` from owner/project/global replacement at resolution
+- [x] Reserve `app-guide` from owner/project/global replacement at resolution
   and create/import/update boundaries; emit a clear collision diagnostic and
   allow extensions only under distinct names.
-- [ ] Add digest-owned guide upgrade/withdraw reconciliation for existing
-  resumed sessions.
+- [x] Add digest-owned guide upgrade/withdraw reconciliation for existing
+  resumed sessions. M1a refreshes the in-memory bundle on every tool rebind and
+  deliberately has no authoritative workspace copy to reconcile.
 - [ ] Update the original references and add the high-value split references
   listed in this design, including content type, capability IDs, and journey
   IDs.
-- [ ] Update `SKILL.md` triggers and routing without bloating Layer 1/2 context.
+- [x] Update `SKILL.md` triggers and logical-topic routing for the managed
+  reader without bloating Layer 1/2 context.
 - [ ] Verify the activated guide procedure remains available after session
   context compaction, while unneeded references remain unloadable/on demand.
-- [ ] Remove the current unsupported suggestion that the default session can
+- [x] Remove the current unsupported suggestion that the default session can
   attach a datasource; offer only observed tools or validated guide actions.
 - [ ] Create the first minimal canonical/coverage seam for datasource types so
   the repaired email guide immediately gains a drift check.
@@ -1393,14 +1409,15 @@ The feature is successful when:
     text/unknown state.
 14. Critical false-positive capability claims are release blockers; one
     aggregate helpfulness score cannot hide them.
+15. M1 uses a dedicated bounded `read_product_guide(topic_id)` tool; ordinary
+    `use_skill` and mutable workspace files are not authoritative for the
+    managed guide.
 
 ## Open implementation decisions
 
 - Capability definitions in Python versus checked YAML/JSON.
-- Whether immutable guide retrieval extends `use_skill` or uses a dedicated
-  `read_product_guide` tool.
-- Exact endpoint/tool names, payload/result limits, cache TTL, and refresh/
-  notification mechanism.
+- Exact Phase 2 capability endpoint/tool names, payload/result limits, cache
+  TTL, and refresh/notification mechanism.
 - Mapping an optional logical release version over independently deployable
   component revisions.
 - The initial list of explicit capability coverage/exclusion registries.

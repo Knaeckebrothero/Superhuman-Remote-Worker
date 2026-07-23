@@ -25047,6 +25047,7 @@ def _validate_skill_frontmatter(frontmatter: dict[str, Any]) -> None:
 
 def _parse_skill_bundle(files: dict[str, str]) -> tuple[str, str, dict[str, str]]:
     """Validate paths, parse SKILL.md, deny-scan. Returns (name, description, files)."""
+    from src.core.skill_resolution import is_reserved_system_skill_name
     from src.core.skill_format import (
         SkillFormatError,
         parse_skill_md,
@@ -25060,6 +25061,14 @@ def _parse_skill_bundle(files: dict[str, str]) -> tuple[str, str, dict[str, str]
         name, description = skill_identity(fm)
     except SkillFormatError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    if is_reserved_system_skill_name(name):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Skill name '{name}' is reserved for a managed SRW product "
+                "artifact; use a distinct name for extensions"
+            ),
+        )
     _validate_skill_frontmatter(fm)
     return name, description, files
 
@@ -25152,7 +25161,10 @@ async def _gather_in_scope_skills(
     """Build the resolved-blob skills payload: the precedence-deduped menu plus
     the file tree for each winning skill. Bundled (disk) + DB (owned + global).
     Returns {} when skills are disabled or there is no user. Slice 2."""
-    from src.core.skill_resolution import resolve_skill_menu
+    from src.core.skill_resolution import (
+        is_reserved_system_skill_name,
+        resolve_skill_menu,
+    )
 
     if not _is_skills_db_enabled() or not user_id:
         return {}
@@ -25163,6 +25175,11 @@ async def _gather_in_scope_skills(
 
     rows: list[dict[str, Any]] = []
     for s in _skills_cache:
+        # Managed system skills are injected only by the persistent-session
+        # runtime. They are intentionally absent from autonomous worker
+        # catalogs and cannot participate in ordinary DB precedence.
+        if is_reserved_system_skill_name(s.name):
+            continue
         rows.append(
             {
                 **s.model_dump(),
@@ -25174,6 +25191,8 @@ async def _gather_in_scope_skills(
             }
         )
     for r in await postgres_db.list_skills_visible(user_id=str(user_id)):
+        if is_reserved_system_skill_name(str(r.get("name", ""))):
+            continue
         rows.append(
             {
                 **_skill_row_to_meta(r),
@@ -25927,6 +25946,16 @@ async def update_skill(
     if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
         raise HTTPException(
             status_code=403, detail="Only the owner may edit this skill"
+        )
+    from src.core.skill_resolution import is_reserved_system_skill_name
+
+    if is_reserved_system_skill_name(str(existing.get("name", ""))):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Skill name '{existing['name']}' is reserved for a managed SRW "
+                "product artifact and cannot be updated"
+            ),
         )
     fields = body.model_dump(exclude_unset=True, exclude={"files"})
     files = body.files
