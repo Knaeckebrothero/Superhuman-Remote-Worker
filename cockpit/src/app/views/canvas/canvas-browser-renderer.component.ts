@@ -21,9 +21,10 @@ import { AppSpinnerComponent } from '../../ui/spinner';
 import {
   BrowserMouseButton,
   BrowserPoint,
+  browserKeyText,
   browserModifiers,
   browserMouseButton,
-  browserPrintableText,
+  browserVirtualKeyCode,
   browserWheelDeltas,
   mapBrowserPoint,
 } from './canvas-browser-input';
@@ -82,6 +83,7 @@ interface PressedBrowserKey {
   readonly key: string;
   readonly code: string;
   readonly location: number;
+  readonly virtualKey: number;
 }
 
 /** Trusted view-only chrome and bitmap surface for the shared browser. */
@@ -493,7 +495,8 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
     ) {
       return;
     }
-    const text = browserPrintableText(event);
+    const text = browserKeyText(event);
+    const virtualKey = browserVirtualKeyCode(event);
     const params = {
       type: 'keyDown',
       key: event.key,
@@ -501,6 +504,7 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
       location: event.location,
       autoRepeat: event.repeat,
       modifiers: browserModifiers(event),
+      ...(virtualKey ? {windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey} : {}),
       ...(text ? {text} : {}),
     };
     if (!this.browser.sendInput({kind: 'key', params})) return;
@@ -508,6 +512,7 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
       key: event.key,
       code: event.code,
       location: event.location,
+      virtualKey,
     });
     event.preventDefault();
   }
@@ -530,6 +535,9 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
           code: pressed.code,
           location: pressed.location,
           modifiers: browserModifiers(event),
+          ...(pressed.virtualKey
+            ? {windowsVirtualKeyCode: pressed.virtualKey, nativeVirtualKeyCode: pressed.virtualKey}
+            : {}),
         },
       })
     ) {
@@ -571,6 +579,9 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
           code: key.code,
           location: key.location,
           modifiers: 0,
+          ...(key.virtualKey
+            ? {windowsVirtualKeyCode: key.virtualKey, nativeVirtualKeyCode: key.virtualKey}
+            : {}),
         },
       });
     }

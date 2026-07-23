@@ -485,6 +485,8 @@ describe('Canvas shared-browser renderer', () => {
         location: 0,
         autoRepeat: false,
         modifiers: 0,
+        windowsVirtualKeyCode: 65,
+        nativeVirtualKeyCode: 65,
         text: 'A',
       },
     });
@@ -500,6 +502,8 @@ describe('Canvas shared-browser renderer', () => {
         code: 'KeyA',
         location: 0,
         modifiers: 0,
+        windowsVirtualKeyCode: 65,
+        nativeVirtualKeyCode: 65,
       },
     });
 
@@ -578,6 +582,8 @@ describe('Canvas shared-browser renderer', () => {
           code: 'ControlLeft',
           location: 1,
           modifiers: 0,
+          windowsVirtualKeyCode: 17,
+          nativeVirtualKeyCode: 17,
         },
       },
     ]);
@@ -604,6 +610,8 @@ describe('Canvas shared-browser renderer', () => {
         code: 'ShiftLeft',
         location: 1,
         modifiers: 0,
+        windowsVirtualKeyCode: 16,
+        nativeVirtualKeyCode: 16,
       },
     });
   });

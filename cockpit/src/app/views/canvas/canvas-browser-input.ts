@@ -105,3 +105,59 @@ export function browserPrintableText(event: BrowserModifierEvent & {readonly key
     ? event.key
     : '';
 }
+
+/**
+ * The CDP-visible text for a key press. Enter must carry '\r': CDP fires the
+ * default action (form submit, newline) only for text-producing keyDowns.
+ */
+export function browserKeyText(event: BrowserModifierEvent & {readonly key: string}): string {
+  if (event.key === 'Enter' && !event.altKey && !event.ctrlKey && !event.metaKey) return '\r';
+  return browserPrintableText(event);
+}
+
+/** Legacy Windows virtual-key codes for keys whose `key` is not a single char. */
+const BROWSER_VIRTUAL_KEYS: Readonly<Record<string, number>> = {
+  Backspace: 8,
+  Tab: 9,
+  Enter: 13,
+  Shift: 16,
+  Control: 17,
+  Alt: 18,
+  Pause: 19,
+  CapsLock: 20,
+  Escape: 27,
+  PageUp: 33,
+  PageDown: 34,
+  End: 35,
+  Home: 36,
+  ArrowLeft: 37,
+  ArrowUp: 38,
+  ArrowRight: 39,
+  ArrowDown: 40,
+  Insert: 45,
+  Delete: 46,
+  Meta: 91,
+  ContextMenu: 93,
+  NumLock: 144,
+  ScrollLock: 145,
+};
+
+/**
+ * Virtual key code for a CDP key event. Without `windowsVirtualKeyCode` the
+ * remote page sees `keyCode: 0` and no default action — sites listening for
+ * keyCode 13 (Enter submits the search) or 8 (Backspace edits) never react.
+ */
+export function browserVirtualKeyCode(event: {readonly key: string; readonly keyCode?: number}): number {
+  if (typeof event.keyCode === 'number' && Number.isInteger(event.keyCode) && event.keyCode > 0) {
+    return event.keyCode;
+  }
+  const named = BROWSER_VIRTUAL_KEYS[event.key];
+  if (named !== undefined) return named;
+  if (event.key.length === 1) {
+    const code = event.key.toUpperCase().charCodeAt(0);
+    return code >= 32 && code < 127 ? code : 0;
+  }
+  const functionKey = /^F([1-9]|1\d|2[0-4])$/.exec(event.key);
+  if (functionKey) return 111 + Number(functionKey[1]);
+  return 0;
+}
