@@ -121,7 +121,9 @@ class _ServerHandle:
     task: asyncio.Task[None] | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     shutdown: asyncio.Event = field(default_factory=asyncio.Event)
+    restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reconnected_once: bool = False
+    generation: int = 0
 
     @property
     def name(self) -> str:
@@ -133,6 +135,7 @@ class MCPManager:
 
     def __init__(self, ds_configs: list[dict[str, Any]]):
         self._handles: list[_ServerHandle] = []
+        self._closing = False
         taken_slugs: set[str] = set()
 
         for ds in ds_configs:
@@ -256,6 +259,7 @@ class MCPManager:
                 from langchain_mcp_adapters.tools import load_mcp_tools
 
                 raw_tools = await load_mcp_tools(session)
+                handle.generation += 1
                 handle.tools = self._namespace_and_wrap(handle, raw_tools)
                 handle.status = "connected"
                 handle.ready.set()
@@ -276,6 +280,7 @@ class MCPManager:
 
     def close(self) -> None:
         """Schedule async teardown when called through the sync close protocol."""
+        self._closing = True
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -288,6 +293,7 @@ class MCPManager:
 
     async def aclose(self) -> None:
         """Signal every owner task and wait for transport/subprocess teardown."""
+        self._closing = True
         for handle in self._handles:
             handle.shutdown.set()
         tasks = [handle.task for handle in self._handles if handle.task is not None]
@@ -342,12 +348,166 @@ class MCPManager:
             )
         return wrapped
 
-    def _guarded(self, handle: _ServerHandle, tool: Any):
-        """Initial call wrapper; timeout/reconnect behavior is added separately."""
+    @staticmethod
+    def _is_live(handle: _ServerHandle) -> bool:
+        return bool(
+            handle.status == "connected"
+            and handle.session is not None
+            and handle.task is not None
+            and not handle.task.done()
+        )
 
-        async def _call(**kwargs):
+    async def _restart_server(
+        self,
+        handle: _ServerHandle,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Perform the server's one permitted reconnect attempt."""
+        async with handle.restart_lock:
+            if self._closing:
+                return False
+            if handle.reconnected_once:
+                return self._is_live(handle)
+            if not force and self._is_live(handle):
+                return True
+
+            handle.reconnected_once = True
+            old_task = handle.task
+            handle.shutdown.set()
+            if old_task is not None and not old_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(old_task),
+                        timeout=MCP_CONNECT_TIMEOUT,
+                    )
+                except TimeoutError:
+                    old_task.cancel()
+                    await asyncio.gather(old_task, return_exceptions=True)
+
+            try:
+                handle.config = parse_mcp_config(handle.ds)
+            except ValueError as exc:
+                handle.status = f"unavailable: invalid config ({exc})"
+                handle.tools = []
+                return False
+
+            handle.status = "pending"
+            handle.tools = []
+            handle.session = None
+            handle.ready = asyncio.Event()
+            handle.shutdown = asyncio.Event()
+            handle.task = asyncio.create_task(
+                self._run_server(handle),
+                name=f"mcp-owner-{handle.slug}-reconnect",
+            )
+            await self._await_ready(handle)
+            return self._is_live(handle)
+
+    async def _call_current_session(
+        self,
+        handle: _ServerHandle,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        result = await handle.session.call_tool(tool_name, arguments)
+        if getattr(result, "isError", False):
+            return _tool_error(handle, tool_name, "server reported an error")
+        return _content_to_str(result)
+
+    def _guarded(self, handle: _ServerHandle, tool: Any):
+        """Bound calls, reconnect one dead server once, and return string errors."""
+        original_name = tool.name
+        wrapper_generation = handle.generation
+
+        async def _invoke(**kwargs):
+            if handle.generation != wrapper_generation:
+                return await self._call_current_session(
+                    handle,
+                    original_name,
+                    kwargs,
+                )
             if tool.coroutine is not None:
                 return await tool.coroutine(**kwargs)
             return await tool.ainvoke(kwargs)
 
+        async def _call(**kwargs):
+            if not self._is_live(handle):
+                if not await self._restart_server(handle):
+                    return _tool_error(handle, original_name, "server unavailable")
+                try:
+                    return await asyncio.wait_for(
+                        self._call_current_session(handle, original_name, kwargs),
+                        timeout=MCP_CALL_TIMEOUT,
+                    )
+                except TimeoutError:
+                    return _tool_error(
+                        handle,
+                        original_name,
+                        f"timed out after {int(MCP_CALL_TIMEOUT)}s",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    handle.status = f"unavailable: {type(exc).__name__}"
+                    return _tool_error(handle, original_name, type(exc).__name__)
+
+            try:
+                return await asyncio.wait_for(
+                    _invoke(**kwargs),
+                    timeout=MCP_CALL_TIMEOUT,
+                )
+            except TimeoutError:
+                return _tool_error(
+                    handle,
+                    original_name,
+                    f"timed out after {int(MCP_CALL_TIMEOUT)}s",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                handle.status = f"unavailable: {type(exc).__name__}"
+                if await self._restart_server(handle, force=True):
+                    try:
+                        return await asyncio.wait_for(
+                            self._call_current_session(handle, original_name, kwargs),
+                            timeout=MCP_CALL_TIMEOUT,
+                        )
+                    except TimeoutError:
+                        return _tool_error(
+                            handle,
+                            original_name,
+                            f"timed out after {int(MCP_CALL_TIMEOUT)}s",
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as retry_exc:
+                        handle.status = f"unavailable: {type(retry_exc).__name__}"
+                        return _tool_error(
+                            handle,
+                            original_name,
+                            type(retry_exc).__name__,
+                        )
+                return _tool_error(handle, original_name, type(exc).__name__)
+
         return _call
+
+
+def _tool_error(handle: _ServerHandle, tool_name: str, detail: str) -> str:
+    """Build a useful error without reflecting transport or credential data."""
+    return (
+        f"MCP tool error ({handle.name}/{tool_name}): {detail}. "
+        "Continue without this tool."
+    )
+
+
+def _content_to_str(result: Any) -> str:
+    """Flatten an MCP ``CallToolResult`` into its textual representation."""
+    try:
+        parts = []
+        for block in getattr(result, "content", []) or []:
+            text = getattr(block, "text", None)
+            parts.append(text if text is not None else str(block))
+        return "\n".join(parts) if parts else str(result)
+    except Exception:
+        return str(result)
