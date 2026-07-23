@@ -807,16 +807,18 @@ class TestMinimaxM3ThinkingToggle:
         assert cap["options"] == ["on", "off"]
 
     @patch("src.core.loader.ReasoningChatOpenAI")
-    def test_default_sends_thinking_enabled(self, mock_chat):
-        """Unset level → family default ON → explicit thinking.type=enabled,
-        robust against an upstream endpoint-default flip (gemma precedent)."""
+    def test_default_sends_thinking_adaptive(self, mock_chat):
+        """Unset level → family default ON → explicit thinking.type=adaptive,
+        robust against an upstream endpoint-default flip (gemma precedent).
+        MiniMax removed "enabled" (live 400 2026-07-23: allowed values are
+        adaptive|disabled), so reasoning-on must send "adaptive"."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="MiniMax-M3")
 
         _create_openai_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert call_kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "adaptive"}
         assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
 
     @patch("src.core.loader.ReasoningChatOpenAI")
@@ -840,7 +842,7 @@ class TestMinimaxM3ThinkingToggle:
         _create_openai_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert call_kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "adaptive"}
         assert call_kwargs["extra_body"]["reasoning_split"] is True
 
 
