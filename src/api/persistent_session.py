@@ -684,7 +684,8 @@ class PersistentSession:
     def _scope_skills_for_tool_names(self, tool_names: List[str]) -> None:
         """Apply capability-aware optional-skill scope without mutating a base config."""
         from src.core.skill_resolution import (
-            add_default_canvas_skill,
+            APP_GUIDE_SKILL,
+            add_persistent_system_skills,
             scope_skills_for_tools,
         )
 
@@ -692,20 +693,61 @@ class PersistentSession:
             "_unscoped_resolved_skills",
             self.config.extra.get("_resolved_skills", {}),
         )
-        # Canvas is available independently of the optional DB skill catalog.
-        # Add exactly its bundled companion as a floor; the scope call below
-        # still withholds it until both tools actually instantiated.
-        skill_catalog = add_default_canvas_skill(skill_catalog)
+        # Persistent product skills are available independently of the optional
+        # DB skill catalog. Re-installing them here also replaces stale frozen
+        # app-guide bytes with the current running bundle on session resume.
+        # The scope call below still withholds each skill until its actual
+        # loader/capability tools instantiate.
+        skill_catalog = add_persistent_system_skills(skill_catalog)
         scoped = scope_skills_for_tools(skill_catalog, tool_names)
         next_extra = {
             **self.config.extra,
             "_unscoped_resolved_skills": skill_catalog,
             "_resolved_skills": scoped,
         }
+        resolved_instructions = next_extra.get("_resolved_instructions")
+        if (
+            isinstance(resolved_instructions, dict)
+            and APP_GUIDE_SKILL in resolved_instructions
+        ):
+            resolved_instructions = dict(resolved_instructions)
+            resolved_instructions.pop(APP_GUIDE_SKILL, None)
+            next_extra["_resolved_instructions"] = resolved_instructions
+
+        # A pre-M1 frozen expert may have bound ``skill: app-guide`` as an
+        # ordinary workspace instruction. Drop that stale delivery/enforcement
+        # path so it cannot force the model to read mutable product guidance.
+        instruction_files = []
+        removed_reserved_binding = False
+        for entry in getattr(self.config, "instruction_files", []) or []:
+            skill_name = (
+                entry.get("skill")
+                if isinstance(entry, dict)
+                else getattr(entry, "skill", None)
+            )
+            entry_path = (
+                entry.get("file", "")
+                if isinstance(entry, dict)
+                else getattr(entry, "path", "")
+            )
+            if skill_name == APP_GUIDE_SKILL or str(entry_path).startswith(
+                f"skills/{APP_GUIDE_SKILL}/"
+            ):
+                removed_reserved_binding = True
+                continue
+            instruction_files.append(entry)
+        if removed_reserved_binding:
+            logger.warning("Ignored reserved mutable app-guide instruction binding")
+
         if _dc_is_dataclass(self.config):
-            self.config = _dc_replace(self.config, extra=next_extra)
+            self.config = _dc_replace(
+                self.config,
+                extra=next_extra,
+                instruction_files=instruction_files,
+            )
         else:  # Lightweight test/config adapters may not be real dataclasses.
             self.config.extra = next_extra
+            self.config.instruction_files = instruction_files
         if self.tool_context is not None:
             # use_skill authorizes by the CURRENT scoped menu, not by stale
             # workspace bytes. Keep its long-lived ToolContext synchronized on
@@ -721,9 +763,12 @@ class PersistentSession:
         The capability-scoped Canvas companion is reconciled in both
         directions: files created by SRW are withdrawn when either required
         tool disappears, while modified files and unrelated files in the same
-        directory are treated as user content and preserved.
+        directory are treated as user content and preserved. The managed
+        app-guide is never materialized here: its dedicated tool reads the
+        current digest-stamped runtime bundle, so stale workspace bytes are
+        inert.
         """
-        from src.core.skill_resolution import skill_files_to_workspace
+        from src.core.skill_resolution import APP_GUIDE_SKILL, skill_files_to_workspace
 
         skills_files = self.config.extra.get("_resolved_skills", {}).get("files", {})
         if only_names is not None:
@@ -735,7 +780,7 @@ class PersistentSession:
         ordinary_files = {
             name: files
             for name, files in skills_files.items()
-            if name != _CANVAS_SKILL_NAME
+            if name not in {_CANVAS_SKILL_NAME, APP_GUIDE_SKILL}
         }
         for ws_path, content in skill_files_to_workspace(ordinary_files).items():
             if self.workspace_manager.exists(ws_path):
@@ -1170,6 +1215,13 @@ class PersistentSession:
         for name in ["task_add", "task_complete", "task_list"]:
             if name not in tool_names:
                 tool_names.append(name)
+
+        # The managed product guide is a persistent-session floor, independent
+        # of expert/catalog feature flags and workspace tier.
+        from src.core.skill_resolution import APP_GUIDE_LOADER_TOOL
+
+        if APP_GUIDE_LOADER_TOOL not in tool_names:
+            tool_names.append(APP_GUIDE_LOADER_TOOL)
 
         # Fleet Management is the UI-facing group for SRW control-plane tools.
         # Experts & Skills and Automations & Loops are separate groups keyed by

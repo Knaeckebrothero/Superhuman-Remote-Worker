@@ -2,15 +2,18 @@
 
 Kept separate from main.py / loader.py so the menu-precedence and workspace-
 mapping logic is small and unit-testable in isolation (mirrors
-``expert_resolution.py``). No DB or framework imports live here; the one disk
-read is the explicit bundled Canvas-skill floor.
+``expert_resolution.py``). No DB or framework imports live here; the disk reads
+are the explicit bundled system-skill floors used by persistent sessions.
 
 Design: docs/features/agent_skills.md (Slice 2).
+Managed product guide: docs/features/app_guide_skill.md (M1).
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -19,7 +22,89 @@ from src.core.expert_resolution import expert_precedence_key
 
 logger = logging.getLogger(__name__)
 
+APP_GUIDE_SKILL = "app-guide"
+APP_GUIDE_LOADER_TOOL = "read_product_guide"
 PRESENT_WITH_CANVAS_SKILL = "present-with-canvas"
+RESERVED_SYSTEM_SKILL_NAMES = frozenset({APP_GUIDE_SKILL})
+
+
+def is_reserved_system_skill_name(name: str) -> bool:
+    """Return whether ``name`` is owned by the running SRW product.
+
+    Reserved product artifacts cannot be created/imported as ordinary DB skills
+    and are replaced from the running bundle at the persistent-session boundary.
+    """
+
+    return name in RESERVED_SYSTEM_SKILL_NAMES
+
+
+def skill_bundle_digest(files: dict[str, str]) -> str:
+    """Return a deterministic digest for a validated text skill bundle."""
+
+    canonical = json.dumps(
+        files,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _read_bundled_skill(
+    skill_name: str, *, skills_root: Path | None = None
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Read and validate one bundled text skill from the running checkout."""
+
+    from src.core.skill_format import (
+        parse_skill_md,
+        skill_identity,
+        validate_skill_path,
+    )
+
+    root = skills_root or Path(__file__).resolve().parents[2] / "config" / "skills"
+    skill_dir = root / skill_name
+    bundled_files: dict[str, str] = {}
+    for path in sorted(skill_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel_path = path.relative_to(skill_dir).as_posix()
+        validate_skill_path(rel_path)
+        bundled_files[rel_path] = path.read_text(encoding="utf-8")
+    frontmatter, _ = parse_skill_md(bundled_files["SKILL.md"])
+    name, _description = skill_identity(frontmatter)
+    if name != skill_name:
+        raise ValueError(f"Bundled skill name must be {skill_name!r} (got {name!r})")
+    return frontmatter, bundled_files
+
+
+def _normalize_catalog(skills: dict[str, Any]) -> tuple[dict[str, Any], list, dict]:
+    """Deep-copy a catalog and ensure its menu/files containers have safe types."""
+
+    catalog = copy.deepcopy(skills or {})
+    menu = catalog.get("menu")
+    files = catalog.get("files")
+    if not isinstance(menu, list):
+        menu = []
+        catalog["menu"] = menu
+    if not isinstance(files, dict):
+        files = {}
+        catalog["files"] = files
+    return catalog, menu, files
+
+
+def _remove_skill(catalog: dict[str, Any], name: str) -> None:
+    """Remove one skill from both sides of a catalog when present."""
+
+    menu = catalog.get("menu")
+    if isinstance(menu, list):
+        catalog["menu"] = [
+            item
+            for item in menu
+            if not isinstance(item, dict) or item.get("name") != name
+        ]
+    files = catalog.get("files")
+    if isinstance(files, dict):
+        files.pop(name, None)
 
 
 def resolve_skill_menu(
@@ -69,15 +154,7 @@ def add_default_canvas_skill(
     of :func:`scope_skills_for_tools` after tools actually instantiate.
     """
 
-    catalog = copy.deepcopy(skills or {})
-    menu = catalog.get("menu")
-    files = catalog.get("files")
-    if not isinstance(menu, list):
-        menu = []
-        catalog["menu"] = menu
-    if not isinstance(files, dict):
-        files = {}
-        catalog["files"] = files
+    catalog, menu, files = _normalize_catalog(skills)
 
     if (
         any(
@@ -88,32 +165,16 @@ def add_default_canvas_skill(
     ):
         return catalog
 
-    root = skills_root or Path(__file__).resolve().parents[2] / "config" / "skills"
-    skill_dir = root / PRESENT_WITH_CANVAS_SKILL
     try:
-        from src.core.skill_format import (
-            parse_skill_md,
-            skill_identity,
-            validate_skill_path,
+        frontmatter, bundled_files = _read_bundled_skill(
+            PRESENT_WITH_CANVAS_SKILL,
+            skills_root=skills_root,
         )
-
-        bundled_files: dict[str, str] = {}
-        for path in sorted(skill_dir.rglob("*")):
-            if not path.is_file():
-                continue
-            rel_path = path.relative_to(skill_dir).as_posix()
-            validate_skill_path(rel_path)
-            bundled_files[rel_path] = path.read_text(encoding="utf-8")
-        frontmatter, _ = parse_skill_md(bundled_files["SKILL.md"])
-        name, description = skill_identity(frontmatter)
-        if name != PRESENT_WITH_CANVAS_SKILL:
-            raise ValueError(
-                f"Bundled Canvas skill name must be {PRESENT_WITH_CANVAS_SKILL!r}"
-            )
     except (KeyError, OSError, UnicodeDecodeError, ValueError) as exc:
         logger.warning("Bundled Canvas companion skill is unavailable: %s", exc)
         return catalog
 
+    description = str(frontmatter.get("description", "") or "").strip()
     menu.append(
         {
             "id": PRESENT_WITH_CANVAS_SKILL,
@@ -132,6 +193,61 @@ def add_default_canvas_skill(
     )
     files[PRESENT_WITH_CANVAS_SKILL] = bundled_files
     return catalog
+
+
+def add_persistent_system_skills(
+    skills: dict[str, Any], *, skills_root: Path | None = None
+) -> dict[str, Any]:
+    """Install the running product's managed skills into a session catalog.
+
+    ``app-guide`` is deliberately unlike an ordinary skill:
+
+    - any frozen/user/global entry with its reserved name is removed;
+    - the current running bundle replaces it on every session tool rebind;
+    - a digest and dedicated loader identify the trusted payload; and
+    - its files are never materialized as the mutable workspace authority.
+
+    Canvas keeps its existing replaceable companion-skill behavior. Capability
+    scoping still happens after tools instantiate.
+    """
+
+    catalog, menu, files = _normalize_catalog(skills)
+    _remove_skill(catalog, APP_GUIDE_SKILL)
+    menu = catalog["menu"]
+    files = catalog["files"]
+
+    try:
+        frontmatter, bundled_files = _read_bundled_skill(
+            APP_GUIDE_SKILL,
+            skills_root=skills_root,
+        )
+    except (KeyError, OSError, UnicodeDecodeError, ValueError) as exc:
+        # Fail closed: never fall back to a same-name user/frozen payload.
+        logger.warning("Managed app guide is unavailable: %s", exc)
+    else:
+        digest = skill_bundle_digest(bundled_files)
+        menu.append(
+            {
+                "id": APP_GUIDE_SKILL,
+                "name": APP_GUIDE_SKILL,
+                "display_name": frontmatter.get("display_name", "App Guide"),
+                "description": str(frontmatter.get("description", "") or "").strip(),
+                "icon": frontmatter.get("icon", "help"),
+                "color": frontmatter.get("color", "#6B7280"),
+                "tags": frontmatter.get("tags", []),
+                "system_managed": True,
+                "loader_tool": APP_GUIDE_LOADER_TOOL,
+                "bundle_digest": digest,
+            }
+        )
+        files[APP_GUIDE_SKILL] = bundled_files
+        menu.sort(
+            key=lambda item: (
+                str(item.get("name", "")) if isinstance(item, dict) else ""
+            )
+        )
+
+    return add_default_canvas_skill(catalog, skills_root=skills_root)
 
 
 def filter_bound_skills(blob: dict[str, Any]) -> dict[str, Any]:
@@ -166,23 +282,19 @@ def scope_skills_for_tools(
 ) -> dict[str, Any]:
     """Return the resolved skill payload allowed by final tool capabilities.
 
-    Most skills are ordinary catalog entries. ``present-with-canvas`` is
-    different: it must not appear in the menu or workspace unless the model can
-    both load skills and actually publish a file Canvas. Keeping this pure lets
-    worker and persistent runtimes apply the rule after their backend gate.
+    Most skills are ordinary catalog entries. Managed skills are different:
+
+    - ``app-guide`` requires its immutable, workspace-independent reader; and
+    - ``present-with-canvas`` requires both the ordinary skill reader and a
+      working file Canvas.
+
+    Keeping this pure lets runtimes apply the rule after their backend gate.
     """
     scoped = copy.deepcopy(skills or {})
     available = set(tool_names)
-    if {"use_skill", "set_canvas"}.issubset(available):
-        return scoped
 
-    name = PRESENT_WITH_CANVAS_SKILL
-    if isinstance(scoped.get("menu"), list):
-        scoped["menu"] = [
-            item
-            for item in scoped["menu"]
-            if not isinstance(item, dict) or item.get("name") != name
-        ]
-    if isinstance(scoped.get("files"), dict):
-        scoped["files"].pop(name, None)
+    if APP_GUIDE_LOADER_TOOL not in available:
+        _remove_skill(scoped, APP_GUIDE_SKILL)
+    if not {"use_skill", "set_canvas"}.issubset(available):
+        _remove_skill(scoped, PRESENT_WITH_CANVAS_SKILL)
     return scoped

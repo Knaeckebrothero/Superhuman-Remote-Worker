@@ -220,6 +220,74 @@ class TestCodexContextWindowCap:
         meta = _endpoint_row_to_meta(self._codex_endpoint_row(None), origin="system")
         assert meta.context_window == 400_000
 
+    def test_null_window_on_sub_cap_family_uses_family_window(self):
+        """A NULL catalog window must not INFLATE a family whose true window is
+        below the cap. The cap is a ceiling, never a floor.
+
+        Regression: job 9a99f433 (2026-07-23). ``gpt-5.3-codex-spark`` is a
+        distilled 128K model; its catalog row had ``context_window = NULL`` so
+        the clamp handed back the 400K cap. That value is injected at dispatch
+        into ``llm.model_max_context_tokens``, where it is *truthy* — so
+        ``loader._apply_settings_matrix`` never fell back to the family matrix's
+        correct 128000 and derived a 320K compaction threshold. Context sailed to
+        ~124K un-compacted and the next turn hard-400'd ``context_too_large``.
+        """
+        row = {
+            "model_id": "gpt-5.3-codex-spark",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "family": "codex-spark",
+            "context_window": None,
+        }
+        meta = _endpoint_row_to_meta(row, origin="system")
+        assert meta.provider == "codex"
+        assert meta.context_window == 128_000
+
+    def test_null_window_on_sub_cap_family_catalog_row(self):
+        # Production shape: catalog row (provider_kind='endpoint') on the codex
+        # proxy — how gpt-5.3-codex-spark is actually stored.
+        row = {
+            "provider_kind": "endpoint",
+            "provider_ref": "e1",
+            "model_id": "gpt-5.3-codex-spark",
+            "endpoint_id": "e1",
+            "endpoint_label": "codex-proxy",
+            "endpoint_base_url": "http://srw-codex-proxy:8317/v1",
+            "family": "codex-spark",
+            "context_window": None,
+        }
+        assert _catalog_row_to_meta(row).context_window == 128_000
+
+    def test_sub_cap_family_still_clamped_by_smaller_env_cap(self, monkeypatch):
+        # The family window is itself subject to the cap — a lowered env cap
+        # below the family's true window still wins.
+        monkeypatch.setenv("CODEX_CONTEXT_WINDOW_CAP", "64000")
+        row = {
+            "model_id": "gpt-5.3-codex-spark",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "family": "codex-spark",
+            "context_window": None,
+        }
+        assert _endpoint_row_to_meta(row, origin="system").context_window == 64_000
+
+    def test_unknown_family_null_window_uses_matrix_default(self):
+        # An unrecognised model resolves to the matrix ``default`` family, whose
+        # declared window (128000) is what loader._apply_settings_matrix would
+        # derive on its own. Registry and matrix now agree instead of the
+        # registry overriding it with the cap — and erring small is the safe
+        # direction for a model whose real window nobody has declared.
+        row = {
+            "model_id": "some-unheard-of-model",
+            "base_url": "http://srw-codex-proxy:8317/v1",
+            "label": "codex-proxy",
+            "endpoint_id": "e1",
+            "context_window": None,
+        }
+        assert _endpoint_row_to_meta(row, origin="system").context_window == 128_000
+
 
 class TestFamilyOf:
     """family_of() — sync prefix-pattern fallback for callers without a row."""

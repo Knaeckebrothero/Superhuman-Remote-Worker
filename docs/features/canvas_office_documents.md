@@ -209,11 +209,17 @@ Touched surfaces (kept in sync, mirroring the Slice-1 pattern):
      applies unchanged — companion guidance: `get_canvas` + fresh
      `read_file` before agent edits).
   2. Agent writes the file via Python, then calls `set_canvas` to republish.
-  3. Cockpit sees the version bump and **remounts the iframe with a fresh
-     token**, reopening the document on the new bytes. Best-effort: the
-     orchestrator also closes the stale Collabora doc session via the admin
-     API where available; the guaranteed fallback is the WOPI
-     version-mismatch conflict dialog on the editor's next save.
+  3. Cockpit sees the version bump and drives the editor through Collabora's
+     **PostMessage API** (the documented hosting-frame contract, negotiated
+     via `Host_PostmessageReady`): `Host_VersionRestore
+     {Status: "Pre_Restore"}` makes Collabora **save any unsaved user edits
+     first, then reload the document** — confirmed by Collabora upstream as
+     the supported "storage changed underneath the editor" flow (discussion
+     #5474). `Action_Save {DontSaveIfUnmodified: true}` is available for
+     explicit pre-agent-write flushes. Known cosmetic cost: a repaint and a
+     brief "user left" tooltip during reload. The guaranteed fallback
+     remains the WOPI version-mismatch conflict dialog on the editor's next
+     save; no admin-websocket dependency exists in this design.
 - Honest-concurrency stance carried over verbatim: this narrows stale-save
   windows, it does not make them impossible. UI and docs must not call it
   race-free.
@@ -258,12 +264,26 @@ Touched surfaces (kept in sync, mirroring the Slice-1 pattern):
   `.xlsx`, agent turn (Python edit → `set_canvas` → editor reopen), and
   `collabora.enabled=false` failing closed with the documented error.
 
-## Open Questions (for the implementation plan, not blockers)
+## Resolved Questions (2026-07-23)
 
-- Exact Collabora admin-API capability for force-closing/saving a doc
-  session in the deployed CODE version; if absent, rely on short autosave
-  interval + conflict dialog and document the staleness bound.
-- Whether `CheckFileInfo` should surface the SRW user's display name into
-  Collabora's presence UI (nice UX, minor identity plumbing).
-- Dev-mode story on local k3d without the tunnel (likely: plain Ingress on
-  a `.localhost` hostname, mirroring the viewer gateway's dev posture).
+- **Editor refresh capability:** resolved — no admin-API dependency. The
+  hosting frame drives save/reload via the PostMessage API
+  (`Host_PostmessageReady` handshake, `Action_Save`,
+  `Host_VersionRestore`), a long-standing documented part of the Collabora
+  SDK; upstream confirms `Host_VersionRestore` flushes unsaved edits before
+  reloading (CollaboraOnline/online discussion #5474). The chart pins a
+  current CODE release; the podman integration test is the compatibility
+  gate for the pinned image.
+- **Presence identity:** yes — `CheckFileInfo` surfaces the SRW user's
+  display name via the standard WOPI `UserFriendlyName` property so
+  Collabora's presence UI shows who is editing.
+- **Local dev posture:** yes — plain Ingress on a `.localhost` hostname on
+  local k3d, mirroring the viewer gateway's dev posture; the Cloudflare
+  Tunnel hostname is production/dev-cluster wiring only.
+
+## Open Verification Items (first live gate)
+
+- Collabora's standard WebSockets through cloudflared (the known headscale
+  breakage is specific to its non-standard upgrade protocol).
+- PostMessage reload UX cost (repaint + transient "user left" tooltip) is
+  acceptable in practice; if not, explore suppressing the tooltip upstream.

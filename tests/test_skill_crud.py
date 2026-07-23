@@ -8,7 +8,9 @@ Local env may be noisy (Py3.14); CI (Py3.12) is the authoritative gate.
 
 import pytest
 from fastapi import HTTPException
+from unittest.mock import AsyncMock
 
+import orchestrator.main as orchestrator_main
 from orchestrator.main import (
     SkillCreate,
     SkillUpdate,
@@ -59,6 +61,20 @@ def test_parse_bundle_rejects_bad_slug():
     assert ei.value.status_code == 422
 
 
+def test_parse_bundle_rejects_managed_app_guide_name():
+    reserved = (
+        "---\nname: app-guide\ndescription: replacement\n---\n"
+        "USER CONTROLLED PRODUCT CLAIMS\n"
+    )
+
+    with pytest.raises(HTTPException) as ei:
+        _parse_skill_bundle({"SKILL.md": reserved})
+
+    assert ei.value.status_code == 422
+    assert "reserved" in str(ei.value.detail).lower()
+    assert "distinct name" in str(ei.value.detail).lower()
+
+
 def test_validate_frontmatter_blocks_credentials():
     with pytest.raises(HTTPException) as ei:
         _validate_skill_frontmatter({"connections": {"token": "secret"}})
@@ -67,3 +83,24 @@ def test_validate_frontmatter_blocks_credentials():
 
 def test_validate_frontmatter_allows_clean():
     _validate_skill_frontmatter({"name": "x", "description": "y"})
+
+
+@pytest.mark.asyncio
+async def test_ordinary_resolved_catalog_excludes_managed_app_guide(monkeypatch):
+    monkeypatch.setattr(orchestrator_main, "_is_skills_db_enabled", lambda: True)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_skills_cache",
+        orchestrator_main._scan_skills(),
+    )
+    monkeypatch.setattr(
+        orchestrator_main.postgres_db,
+        "list_skills_visible",
+        AsyncMock(return_value=[]),
+    )
+
+    payload = await orchestrator_main._gather_in_scope_skills("user-1")
+
+    names = {item["name"] for item in payload["menu"]}
+    assert "app-guide" not in names
+    assert names, "ordinary bundled skills should still resolve"
