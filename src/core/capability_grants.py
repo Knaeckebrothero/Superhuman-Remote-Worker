@@ -170,7 +170,7 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
         _truthy(tools.get(k))
         for k in ("sql", "mongodb", "graph", "webdav", "email", "mcp")
     ):
-        v.append("datasource_tools: datasource tools are not permitted")
+        v.append("datasource_tools: connector tools are not permitted")
     if not grants.get("browser", True) and _truthy(tools.get("browser_direct")):
         v.append("browser: tools.browser_direct is not permitted")
 

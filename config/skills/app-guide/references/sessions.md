@@ -8,7 +8,7 @@ analysis, planning, and light coding.
 
 Start one from **Sessions → New Session**: pick a title, projects to attach,
 an expert, and adjust the agent settings (model, permission mode, tools,
-datasources) if the defaults don't fit.
+connectors) if the defaults don't fit.
 
 ## What the session agent can do
 

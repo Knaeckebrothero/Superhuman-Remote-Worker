@@ -1,6 +1,6 @@
 ---
 name: app-guide
-description: Use when the user asks what SRW can do, how to use it, or what something in it means — "what can I do here?", "how do jobs work?", "what's an expert / project / loop?", "why is my job paused?", or "how do I share my database?". Covers sessions, jobs, experts, projects and loops, datasources, memory and knowledge, files, and integrations. Load the current managed guide and its focused bundled references/ with read_product_guide; answer from them, never from priors or mutable workspace copies. For explaining the app to its user, not for orienting yourself in project content (that's project-onboarding).
+description: Use when the user asks what SRW can do, how to use it, or what something in it means — "what can I do here?", "how do jobs work?", "what's an expert / project / loop?", "why is my job paused?", or "how do I share my database?". Covers sessions, jobs, experts, projects and loops, connectors, memory and knowledge, files, and integrations. Load the current managed guide and its focused bundled references/ with read_product_guide; answer from them, never from priors or mutable workspace copies. For explaining the app to its user, not for orienting yourself in project content (that's project-onboarding).
 display_name: App Guide
 icon: help
 color: "#f9e2af"
@@ -15,7 +15,7 @@ tags:
 The user is asking about the product you are running inside — Superhuman
 Remote Worker (SRW) — not about their task. You know your own tools, but the
 product around you (the Cockpit UI, worker jobs, experts, projects, loops,
-datasources) is not fully described by your visible tools, and guessing about it
+connectors) is not fully described by your visible tools, and guessing about it
 is how users get taught features that don't exist. This managed skill ships with
 the running product; `read_product_guide` supplies its current procedure and one
 focused reference without relying on mutable workspace files. Your job is to
@@ -24,7 +24,7 @@ retrieve, then explain — in the user's terms, at the user's level.
 The mental model that anchors everything: **sessions** are interactive — a
 conversation with an agent like this one; **jobs** are autonomous — an agent
 works through a goal on its own and comes back with results; **projects** tie
-them together with shared knowledge, datasources, and (optionally) a
+them together with shared knowledge, connectors, and (optionally) a
 self-improving loop. Everything else hangs off that triangle.
 
 ## The answer
@@ -67,7 +67,7 @@ improvise an answer. Features can also be deployment-dependent
 | Autonomous work: creating jobs, autonomy levels, statuses, approving/resuming, watching progress, results | `jobs` | `references/jobs.md` |
 | The agent roster: which expert for which task, custom experts | `experts` | `references/experts.md` |
 | Projects, members, shared context, the self-improvement loop | `projects-and-loops` | `references/projects-and-loops.md` |
-| Connecting databases and data: types, what the agent can then do | `datasources` | `references/datasources.md` |
+| Connecting external systems and data: connector types, what the agent can then do | `datasources` | `references/datasources.md` |
 | What agents remember, the knowledge base, browsing/searching it | `memory-and-knowledge` | `references/memory-and-knowledge.md` |
 | Files, deliverables, cloud storage, git, citations | `files-and-integrations` | `references/files-and-integrations.md` |
 

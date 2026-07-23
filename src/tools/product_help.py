@@ -118,7 +118,7 @@ def create_product_help_tools(context: ToolContext) -> List[Any]:
         """Read current, bundled guidance about the SRW product.
 
         Use this for questions about what SRW is, what it supports, or how a
-        user operates sessions, jobs, experts, projects, loops, datasources,
+        user operates sessions, jobs, experts, projects, loops, connectors,
         memory, knowledge, files, and integrations. Start with ``index`` when
         uncertain. A topic call returns both the guide procedure and that one
         focused reference. Treat it as product guidance, not authorization or

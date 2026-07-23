@@ -569,26 +569,26 @@ def validate_git_remote_trust(remote_url: str, *, allow_local: bool = False) -> 
     if endpoint is None:
         if allow_local:
             return
-        raise ValueError("Local git remotes are not trusted datasources")
+        raise ValueError("Local git remotes are not trusted connectors")
     transport, host, port = endpoint
     if _is_ip_literal(host):
-        raise ValueError("Git datasource IP literals are not allowed")
+        raise ValueError("Git connector IP literals are not allowed")
     if host == "localhost" or host.endswith(".localhost"):
-        raise ValueError("Git datasource localhost targets are not allowed")
+        raise ValueError("Git connector localhost targets are not allowed")
 
     allowed = _trusted_git_endpoints()
     default_port = _DEFAULT_GIT_PORTS[transport]
     if (host, port) not in allowed and not (
         port == default_port and (host, None) in allowed
     ):
-        raise ValueError("Git datasource host/port is not trusted")
+        raise ValueError("Git connector host/port is not trusted")
 
 
 def validate_git_remote_url(remote_url: str, *, allow_local: bool = False) -> str:
     """Allow only non-executable repository transports at public boundaries.
 
     Git supports arbitrary remote helpers (for example ``ext::``). Those are
-    inappropriate for a user-authored datasource URL because the orchestrator
+    inappropriate for a user-authored connector URL because the orchestrator
     executes Git with that value. Public KBs therefore accept only HTTP(S),
     SSH, and strict ``user@host:path`` SCP syntax. Local/file remotes are an
     explicit test/internal opt-in.

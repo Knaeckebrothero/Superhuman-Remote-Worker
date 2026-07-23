@@ -28,7 +28,7 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": (
             "Summarize the current persistent session context: thread ID, user "
             "ID, project scope, workspace availability, backend capabilities, "
-            "cloud mount status, and knowledge/datasource availability."
+            "cloud mount status, and knowledge/connector availability."
         ),
         "category": "orchestrator",
         "short_description": "Show current session/project/workspace context.",
@@ -349,7 +349,7 @@ def _format_session_context(context: ToolContext) -> str:
         [
             f"  Shell manager available: {context.has_shell()}",
             f"  Knowledge available: {context.has_knowledge()}",
-            f"  Datasources: {', '.join(datasource_keys) if datasource_keys else 'none'}",
+            f"  Connectors: {', '.join(datasource_keys) if datasource_keys else 'none'}",
             f"  Cloud mount active: {bool(cloud_mount.get('active'))}",
         ]
     )

@@ -17,11 +17,11 @@ Three things, one triangle:
   on its own, and the result comes back for your review. Best for
   well-defined work you don't want to babysit.
 - **Projects** — the container. A project ties sessions and jobs together
-  with a shared goal, team members, knowledge base, memory, datasources, and
+  with a shared goal, team members, knowledge base, memory, connectors, and
   git repos — so work compounds instead of starting from zero each time.
 
 Two more concepts complete the picture: **experts** (preconfigured agent
-roles — who does the work) and **datasources** (stored connections to your
+roles — who does the work) and **connectors** (stored access to your external
 databases, files, and repos — what the agent may touch).
 
 ## The map
@@ -31,7 +31,7 @@ The sidebar:
 - **Sessions** — your conversations; create and resume them here.
 - **Jobs** — all autonomous work: create, watch, pause, review.
 - **Projects** — project homes: goal, jobs, knowledge, members, loop.
-- **Datasources** — connections to databases, cloud folders, repos, and
+- **Connectors** — access to databases, cloud folders, repos, MCP servers, and
   credentials.
 - **Experts** — the agent roster; deployments can allow custom ones.
 - **Skills** — reusable how-to procedures agents can load; same story.

@@ -267,7 +267,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config.",
+          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j connector is attached to the job. Usually left empty in config.",
           "examples": [["cypher_query", "cypher_execute", "get_database_schema"]]
         },
         "sql": {
@@ -275,7 +275,7 @@
           "items": {
             "type": "string"
           },
-          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job.",
+          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL connector is attached to the job.",
           "examples": [["sql_query", "sql_schema", "sql_execute"]]
         },
         "mongodb": {
@@ -283,7 +283,7 @@
           "items": {
             "type": "string"
           },
-          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job.",
+          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB connector is attached to the job.",
           "examples": [["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"]]
         },
         "git": {

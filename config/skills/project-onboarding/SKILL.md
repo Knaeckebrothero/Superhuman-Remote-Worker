@@ -1,6 +1,6 @@
 ---
 name: project-onboarding
-description: Use when you're dropped into an unfamiliar project and need to get your bearings before acting — a code repo, a document corpus or Obsidian vault, a shared folder of decks and protocols, a database, or a mix. Inventory the datasources, find and confirm the real source of truth, learn the structure, conventions, and vocabulary, reuse what prior work already mapped, and build a map you can act from — then stop. For orienting in an existing body of work before you start, not for checking your own finished work (that's verify-before-done) or investigating a research question to produce findings (that's research-guide).
+description: Use when you're dropped into an unfamiliar project and need to get your bearings before acting — a code repo, a document corpus or Obsidian vault, a shared folder of decks and protocols, a database, or a mix. Inventory the connectors, find and confirm the real source of truth, learn the structure, conventions, and vocabulary, reuse what prior work already mapped, and build a map you can act from — then stop. For orienting in an existing body of work before you start, not for checking your own finished work (that's verify-before-done) or investigating a research question to produce findings (that's research-guide).
 display_name: Project Onboarding
 icon: explore
 color: "#89dceb"
@@ -34,9 +34,9 @@ accumulated onboarding of every prior job; so are the prior `notes/`,
 re-discovering what's already recorded is wasted budget. Reuse before rediscover.
 *(But trust it only as far as step 3's freshness check allows.)*
 
-**2. Inventory the datasources.** Find out what's actually attached, and what kind
+**2. Inventory the connectors.** Find out what's actually attached, and what kind
 of project that makes this — a document corpus? a database? a repo? a mix? Don't
-assume it's a repo. Start from the datasource index, not a guess.
+assume it's a repo. Start from the connector index, not a guess.
 
 **3. Find each source's source of truth and conventions — and confirm it's the
 real, current one.** The move differs by type:
@@ -74,7 +74,7 @@ loop-detection counter:
 
 ```
 # Project map — <project>
-- Datasources:        <what's attached, by type>
+- Connectors:         <what's attached, by type>
 - Source of truth:    <the canonical, current source per area — confirmed>
 - Structure:          <the units + how they reference each other>
 - Conventions:        <naming, layout, house style, where decisions live>

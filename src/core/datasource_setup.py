@@ -1020,19 +1020,19 @@ def inject_datasource_index(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
 ) -> None:
-    """Inject a compact datasource index into datasources.md.
+    """Inject a compact connector index into the compatibility file datasources.md.
 
-    Lists every datasource with its specific named access method so the
+    Lists every connector with its specific named access method so the
     agent knows how to connect to each one. The system prompts point the
     agent at datasources.md for connection names.
 
-    Rewrites rather than re-appends: any existing "## Available Datasources"
-    section (historically always the trailing section — it is only ever
-    appended after workspace init) is cut before the new one is written, so
-    live datasource changes (live_session_settings.md Slice B) re-running
-    this injection never duplicate the index.
+    Rewrites rather than re-appends: any existing connector section, including
+    the legacy "## Available Datasources" heading, is cut before the new one is
+    written. The section is historically trailing because it is only appended
+    after workspace init. This keeps live connector changes from duplicating
+    the index.
     """
-    lines = ["\n\n## Available Datasources\n"]
+    lines = ["\n\n## Available Connectors\n"]
 
     # Group by category for readable output
     repos = [ds for ds in ds_configs if ds.get("type") == "repository"]
@@ -1184,7 +1184,7 @@ def inject_datasource_index(
         # A live remove-all still needs the section rewritten — an agent
         # re-reading the file must not act on connection names that no
         # longer resolve.
-        lines.append("_No datasources attached._")
+        lines.append("_No connectors attached._")
         lines.append("")
 
     try:
@@ -1192,16 +1192,20 @@ def inject_datasource_index(
             existing = workspace_manager.read_file("datasources.md")
         except (FileNotFoundError, ValueError, OSError):
             existing = ""
-        marker = existing.find("## Available Datasources")
+        markers = (
+            existing.find(heading)
+            for heading in ("## Available Connectors", "## Available Datasources")
+        )
+        marker = min((position for position in markers if position != -1), default=-1)
         if marker != -1:
             existing = existing[:marker].rstrip("\n")
         workspace_manager.write_file("datasources.md", existing + "\n".join(lines))
         logger.info(
-            "Injected datasource index (%d entries) into datasources.md",
+            "Injected connector index (%d entries) into datasources.md",
             len(ds_configs),
         )
     except Exception as e:
-        logger.warning("Failed to inject datasource index: %s", e)
+        logger.warning("Failed to inject connector index: %s", e)
 
 
 # NOTE: the former _format_rw_cli_entry (PGSERVICE/cypher-shell/mongosh usage

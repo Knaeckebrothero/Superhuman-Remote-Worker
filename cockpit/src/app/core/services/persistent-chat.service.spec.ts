@@ -4,7 +4,12 @@ import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
 import {of, Subject, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
-import {PersistentChatService, historyToTurns, cloudCountFromSummary} from './persistent-chat.service';
+import {
+    PersistentChatService,
+    historyToTurns,
+    cloudCountFromSummary,
+    describeAppliedConfig,
+} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
@@ -248,6 +253,17 @@ describe('cloudCountFromSummary', () => {
 
     it('returns 0 for an all-zero counts summary (empty staging)', () => {
         expect(cloudCountFromSummary(summary({added: 0, modified: 0, deleted: 0}))).toBe(0);
+    });
+});
+
+describe('describeAppliedConfig', () => {
+    it('uses connector terminology for live attachment changes', () => {
+        expect(
+            describeAppliedConfig({}, {added: ['GitHub'], removed: ['Analytics']}),
+        ).toEqual([
+            'connector "GitHub" attached',
+            'connector "Analytics" detached',
+        ]);
     });
 });
 

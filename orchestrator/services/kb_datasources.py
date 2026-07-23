@@ -51,7 +51,7 @@ async def reindex_kb_datasource(
 ) -> dict[str, Any]:
     """Index one external datasource under its stable datasource UUID."""
     if str(datasource.get("type") or "").lower() != "kb":
-        raise ValueError("Datasource is not an OKF Knowledge Base")
+        raise ValueError("Connector is not an OKF Knowledge Base")
     kb_id = uuid.UUID(str(datasource["id"]))
     config = datasource.get("config") or {}
     # Per-KB locks prevent duplicate writers, but create/update/manual requests
