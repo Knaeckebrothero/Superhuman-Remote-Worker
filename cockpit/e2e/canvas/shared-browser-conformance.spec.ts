@@ -293,6 +293,10 @@ test.describe('Shared browser Cockpit handoff', () => {
         },
       },
     });
+    // The virtual key codes are load-bearing, not incidental: without them the
+    // remote page sees keyCode 0 and fires no default action, which is what
+    // made Enter dead in the shared browser. toContainEqual is a deep equality,
+    // so this assertion is also what keeps them from being dropped again.
     await expect.poll(() => harness.decoded(firstSocket)).toContainEqual({
       type: MESSAGE.INPUT,
       body: {
@@ -304,6 +308,8 @@ test.describe('Shared browser Cockpit handoff', () => {
           location: 0,
           autoRepeat: false,
           modifiers: 0,
+          windowsVirtualKeyCode: 65,
+          nativeVirtualKeyCode: 65,
           text: 'a',
         },
       },
