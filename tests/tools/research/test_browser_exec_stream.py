@@ -662,6 +662,66 @@ class TestBatonRefusal:
         asyncio.run(run())
 
 
+class TestColdOpenStartPage:
+    def test_cold_stream_info_lands_on_start_page(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+            navigated = []
+
+            class Session:
+                url = "about:blank"
+
+                async def get_current_page_url(self):
+                    return self.url
+
+                async def navigate_to(self, url):
+                    navigated.append(url)
+                    self.url = url
+
+            session = Session()
+
+            async def get_session():
+                return session
+
+            daemon._get_session = get_session
+            response = await daemon.handle(
+                {"action": "stream_info", "args": {"initial_baton": "user"}}
+            )
+            assert response["generation"]
+            assert daemon._start_page_task is not None
+            await daemon._start_page_task
+            assert navigated == [BE.STREAM_START_URL]
+
+            # Warm stream_info: same generation, no second navigation.
+            again = await daemon.handle({"action": "stream_info", "args": {}})
+            assert again["generation"] == response["generation"]
+            assert navigated == [BE.STREAM_START_URL]
+
+        asyncio.run(run())
+
+    def test_agent_driven_page_is_never_clobbered(self):
+        async def run():
+            daemon = BE.BrowserDaemon()
+            navigated = []
+
+            class Session:
+                async def get_current_page_url(self):
+                    return "https://example.test/agent-was-here"
+
+                async def navigate_to(self, url):
+                    navigated.append(url)
+
+            async def get_session():
+                return Session()
+
+            daemon._get_session = get_session
+            await daemon.handle({"action": "stream_info", "args": {}})
+            await daemon._start_page_task
+            assert navigated == []
+
+        asyncio.run(run())
+
+
 class TestStreamListener:
     @staticmethod
     async def _client(port):
