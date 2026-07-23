@@ -127,8 +127,12 @@ def get_categories() -> set[str]:
     return {meta.get("category", "unknown") for meta in TOOL_REGISTRY.values()}
 
 
-def register_mcp_tools(manager: Any) -> None:
-    """Replace dynamic MCP registry entries with a manager's live tools."""
+def register_mcp_tools(manager: Any | None) -> None:
+    """Replace dynamic MCP registry entries with a manager's live tools.
+
+    Passing ``None`` clears entries when a pooled worker starts a job/session
+    without MCP datasources or a live session detaches its final MCP server.
+    """
     stale_names = [
         name
         for name, metadata in TOOL_REGISTRY.items()
@@ -137,7 +141,7 @@ def register_mcp_tools(manager: Any) -> None:
     for name in stale_names:
         del TOOL_REGISTRY[name]
 
-    tools = manager.get_langchain_tools()
+    tools = manager.get_langchain_tools() if manager is not None else []
     for tool in tools:
         tool_metadata = getattr(tool, "metadata", None) or {}
         TOOL_REGISTRY[tool.name] = {
@@ -152,7 +156,7 @@ def register_mcp_tools(manager: Any) -> None:
     logger.info(
         "Registered %d MCP tools across %d server statuses",
         len(tools),
-        len(getattr(manager, "statuses", {})),
+        len(getattr(manager, "statuses", {})) if manager is not None else 0,
     )
 
 

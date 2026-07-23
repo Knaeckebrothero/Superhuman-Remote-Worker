@@ -484,7 +484,10 @@ def _ds(ds_type, name, read_only=False):
 
 
 class TestResetupDatasources:
-    def test_swaps_registry_in_place_and_returns_stale_for_deferred_close(self):
+    @pytest.mark.asyncio
+    async def test_swaps_registry_in_place_and_returns_stale_for_deferred_close(
+        self,
+    ):
         """ToolContext shares the dict by reference — the swap must mutate in
         place — and the replaced connections must come back UNCLOSED (bound
         tools hold them in closures; the caller closes after turn end)."""
@@ -500,7 +503,7 @@ class TestResetupDatasources:
             "src.core.datasource_setup.process_datasources",
             return_value=({"webdav": new_conn}, {}, []),
         ):
-            summary = session.resetup_datasources([_ds("webdav", "Cloud")])
+            summary = await session.resetup_datasources([_ds("webdav", "Cloud")])
 
         assert session.datasources is registry_ref
         assert session.tool_context.datasources is registry_ref
@@ -510,7 +513,8 @@ class TestResetupDatasources:
         old_conn.close.assert_not_called()
         old_client.close.assert_not_called()
 
-    def test_applies_categories_directly_to_config_tools(self):
+    @pytest.mark.asyncio
+    async def test_applies_categories_directly_to_config_tools(self):
         """sql/graph/mongodb/webdav ride config.tools directly — the validated
         session tools override's closed vocabulary would drop them."""
         session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
@@ -518,7 +522,7 @@ class TestResetupDatasources:
             "src.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
-            session.resetup_datasources([_ds("webdav", "Cloud")])
+            await session.resetup_datasources([_ds("webdav", "Cloud")])
 
         assert "webdav_write" in session.config.tools.webdav
         # Removed type stripped — stale sql tools must not survive.
@@ -526,7 +530,8 @@ class TestResetupDatasources:
         assert session.config.extra["_cli_datasources"] == []
         session.resetup_tools_for_backend.assert_called_once()
 
-    def test_leaves_session_tool_groups_untouched(self):
+    @pytest.mark.asyncio
+    async def test_leaves_session_tool_groups_untouched(self):
         """Pairwise preservation: a datasource change must not clobber a
         prior live tool-group toggle (only the 4 datasource categories are
         written)."""
@@ -536,11 +541,12 @@ class TestResetupDatasources:
             "src.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
-            session.resetup_datasources([_ds("postgresql", "PG")])
+            await session.resetup_datasources([_ds("postgresql", "PG")])
 
         assert session.config.tools.canvas == []
 
-    def test_summary_diff_by_type_and_name(self):
+    @pytest.mark.asyncio
+    async def test_summary_diff_by_type_and_name(self):
         session = _make_session(
             datasource_configs=[_ds("postgresql", "Keep"), _ds("webdav", "Drop")]
         )
@@ -548,27 +554,29 @@ class TestResetupDatasources:
             "src.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ):
-            summary = session.resetup_datasources(
+            summary = await session.resetup_datasources(
                 [_ds("postgresql", "Keep"), _ds("mongodb", "Add")]
             )
 
         assert summary["added"] == ["Add"]
         assert summary["removed"] == ["Drop"]
 
-    def test_kb_entries_skip_processing_and_flag_deferred(self):
+    @pytest.mark.asyncio
+    async def test_kb_entries_skip_processing_and_flag_deferred(self):
         session = _make_session()
         with patch(
             "src.core.datasource_setup.process_datasources",
             return_value=({}, {}, []),
         ) as process:
-            summary = session.resetup_datasources(
+            summary = await session.resetup_datasources(
                 [{"type": "kb", "name": "Docs KB", "datasource_id": "kb-1"}]
             )
 
         assert process.call_args.args[0] == []  # kb never opens a connector
         assert summary["kb_deferred"] is True
 
-    def test_rewrites_index_with_full_new_list(self):
+    @pytest.mark.asyncio
+    async def test_rewrites_index_with_full_new_list(self):
         session = _make_session(datasource_configs=[_ds("postgresql", "PG")])
         new_list = [_ds("postgresql", "PG"), {"type": "kb", "name": "KB"}]
         with (
@@ -578,12 +586,13 @@ class TestResetupDatasources:
             ),
             patch("src.core.datasource_setup.inject_datasource_index") as inject,
         ):
-            session.resetup_datasources(new_list)
+            await session.resetup_datasources(new_list)
 
         inject.assert_called_once_with(new_list, session.workspace_manager)
         assert session.datasource_configs == new_list
 
-    def test_clones_added_repos_and_drops_removed_registration(self):
+    @pytest.mark.asyncio
+    async def test_clones_added_repos_and_drops_removed_registration(self):
         repo_old = {
             "type": "repository",
             "name": "Old Repo",
@@ -604,17 +613,65 @@ class TestResetupDatasources:
             patch("src.core.datasource_setup.clone_repository_datasources") as clone,
             patch("src.core.datasource_setup.inject_datasource_index"),
         ):
-            session.resetup_datasources([repo_new])
+            await session.resetup_datasources([repo_new])
 
         clone.assert_called_once_with([repo_new], session.workspace_manager)
         # Removal keeps the clone on disk (documented) but drops the
         # session-side registration.
         assert "old-repo" not in session.workspace_manager.source_repos
 
-    def test_noop_before_tool_setup(self):
+    @pytest.mark.asyncio
+    async def test_mcp_live_attach_connects_registers_and_grants_wildcard(self):
+        session = _make_session()
+        manager = MagicMock()
+        manager.connect_all = AsyncMock()
+        manager.get_langchain_tools.return_value = []
+        manager.statuses = {"MCP": "connected"}
+
+        with (
+            patch(
+                "src.core.datasource_setup.process_datasources",
+                return_value=({"mcp": manager}, {}, []),
+            ),
+            patch("src.core.datasource_setup.inject_datasource_index"),
+            patch("src.tools.registry.register_mcp_tools") as register,
+        ):
+            await session.resetup_datasources([_ds("mcp", "MCP")])
+
+        manager.connect_all.assert_awaited_once()
+        manager.annotate_configs.assert_called_once()
+        register.assert_called_once_with(manager)
+        assert session.config.tools.mcp == ["*"]
+        session.resetup_tools_for_backend.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mcp_live_detach_purges_registry_and_defers_close(self):
+        old_manager = MagicMock()
+        session = _make_session(
+            datasource_configs=[_ds("mcp", "MCP")],
+            datasources={"mcp": old_manager},
+        )
+
+        with (
+            patch(
+                "src.core.datasource_setup.process_datasources",
+                return_value=({}, {}, []),
+            ),
+            patch("src.core.datasource_setup.inject_datasource_index"),
+            patch("src.tools.registry.register_mcp_tools") as register,
+        ):
+            summary = await session.resetup_datasources([])
+
+        register.assert_called_once_with(None)
+        assert session.config.tools.mcp == []
+        assert summary["stale_connections"] == {"mcp": old_manager}
+        old_manager.close.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_noop_before_tool_setup(self):
         session = _make_session()
         session.tool_context = None
-        summary = session.resetup_datasources([_ds("postgresql", "PG")])
+        summary = await session.resetup_datasources([_ds("postgresql", "PG")])
         assert summary["added"] == []
         session.resetup_tools_for_backend.assert_not_called()
 

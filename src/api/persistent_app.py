@@ -1515,6 +1515,7 @@ async def _attach_session(
     datasource_clients: Dict[str, Any] = {}
     repo_datasources: List[Dict[str, Any]] = []
     kb_datasources: List[Dict[str, Any]] = []
+    mcp_manager = None
     if datasources:
         from ..core.datasource_setup import (
             datasource_tool_categories,
@@ -1531,6 +1532,16 @@ async def _attach_session(
         datasources_dict, datasource_clients, cli_ds_types = process_datasources(
             non_repo_datasources
         )
+        mcp_manager = datasources_dict.get("mcp")
+        if mcp_manager is not None:
+            try:
+                await mcp_manager.connect_all()
+            except Exception as e:
+                logger.warning(
+                    "Unexpected session MCP discovery failure (%s); continuing",
+                    type(e).__name__,
+                )
+            mcp_manager.annotate_configs()
 
         # Inject datasource tool categories so the correct tools are loaded
         # when config is resolved below. Shared map with the orchestrator's
@@ -1562,6 +1573,12 @@ async def _attach_session(
             len(datasources_dict),
             len(cli_ds_types),
         )
+
+    # Pool-mode agents serve sequential sessions. Replace (or clear) the
+    # process-global dynamic entries before config hydration/tool loading.
+    from ..tools.registry import register_mcp_tools
+
+    register_mcp_tools(mcp_manager)
 
     effective_config = _agent.config
     _hydrated = False
@@ -5778,7 +5795,7 @@ async def _handle_config_update(
             # also covers a tools fragment riding the same frame. Replaced
             # connections stay open until the in-flight turn (if any) ends —
             # bound tools captured them in closures at load time.
-            ds_summary = _session.resetup_datasources(new_ds_payload or [])
+            ds_summary = await _session.resetup_datasources(new_ds_payload or [])
             stale_conns = ds_summary.pop("stale_connections", {})
             stale_clients = ds_summary.pop("stale_clients", {})
             if stale_conns or stale_clients:

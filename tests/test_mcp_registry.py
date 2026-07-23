@@ -57,6 +57,12 @@ def test_register_and_purge_idempotent():
     assert "mcp__a__three" in TOOL_REGISTRY
 
 
+def test_register_none_clears_stale_tools():
+    register_mcp_tools(FakeManager(["mcp__a__one"]))
+    register_mcp_tools(None)
+    assert "mcp__a__one" not in TOOL_REGISTRY
+
+
 def test_expand_wildcard():
     register_mcp_tools(FakeManager(["mcp__a__one"]))
     assert expand_tool_wildcards(["read_file", "*"]) == [
