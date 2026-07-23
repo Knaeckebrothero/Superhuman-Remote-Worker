@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BROWSER_MAX_ERROR_CODE_CHARS,
   BROWSER_MAX_ERROR_MESSAGE_CHARS,
+  BROWSER_MAX_INSERT_TEXT_CHARS,
   BROWSER_MAX_JSON_BYTES,
   BROWSER_MAX_SERVER_MESSAGE_BYTES,
   BROWSER_MAX_TITLE_CHARS,
@@ -238,9 +239,31 @@ describe('shared-browser binary protocol', () => {
       body: { kind: 'mouse', params: { type: 'mouseMoved', x: 10.5, y: 20, modifiers: 0 } },
     });
 
+    expect(
+      decodeClient(
+        encodeBrowserInput({ kind: 'insertText', params: { text: 'hunter2' } }),
+      ),
+    ).toEqual({
+      type: BROWSER_MESSAGE_TYPE.INPUT,
+      body: { kind: 'insertText', params: { text: 'hunter2' } },
+    });
+
     expect(() => encodeBrowserControl({ op: 'other' } as never)).toThrow(TypeError);
     expect(() => encodeBrowserControl({ op: 'back', url: 'extra' } as never)).toThrow(TypeError);
     expect(() => encodeBrowserInput({ kind: 'other', params: {} } as never)).toThrow(TypeError);
+    expect(() => encodeBrowserInput({ kind: 'insertText', params: {} } as never)).toThrow(TypeError);
+    expect(() =>
+      encodeBrowserInput({
+        kind: 'insertText',
+        params: { text: 'x'.repeat(BROWSER_MAX_INSERT_TEXT_CHARS + 1) },
+      }),
+    ).toThrow(TypeError);
+    expect(() =>
+      encodeBrowserInput({
+        kind: 'insertText',
+        params: { text: 'ok', extra: 'nope' },
+      }),
+    ).toThrow(TypeError);
     expect(() =>
       encodeBrowserInput({
         kind: 'key',

@@ -64,8 +64,12 @@ export type BrowserControl =
 
 export type BrowserInputParameter = string | number | boolean;
 
+/** Clipboard text cap: bounds the encoded INPUT message far below the relay's
+ * 64 KiB client-message limit even at 4-byte UTF-8 code points. */
+export const BROWSER_MAX_INSERT_TEXT_CHARS = 8000;
+
 export interface BrowserInput {
-  readonly kind: 'mouse' | 'key' | 'wheel';
+  readonly kind: 'mouse' | 'key' | 'wheel' | 'insertText';
   readonly params: Readonly<Record<string, BrowserInputParameter>>;
 }
 
@@ -116,10 +120,19 @@ export function encodeBrowserInput(message: BrowserInput): ArrayBuffer {
     !isRecord(message) ||
     !hasExactKeys(message, ['kind', 'params']) ||
     typeof message['kind'] !== 'string' ||
-    !['mouse', 'key', 'wheel'].includes(message['kind']) ||
+    !['mouse', 'key', 'wheel', 'insertText'].includes(message['kind']) ||
     !isRecord(message['params'])
   ) {
     throw new TypeError('Invalid browser input');
+  }
+  if (message['kind'] === 'insertText') {
+    if (
+      !hasExactKeys(message['params'], ['text']) ||
+      !isBoundedString(message['params']['text'], 1, BROWSER_MAX_INSERT_TEXT_CHARS)
+    ) {
+      throw new TypeError('Invalid browser text insertion');
+    }
+    return encodeClientJson(BROWSER_MESSAGE_TYPE.INPUT, message);
   }
   for (const value of Object.values(message['params'])) {
     if (

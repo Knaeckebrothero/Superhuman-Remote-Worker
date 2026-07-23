@@ -115,6 +115,9 @@ STREAM_MAX_WIDTH = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_WIDTH", "1280"))
 STREAM_MAX_HEIGHT = int(os.environ.get("BROWSER_EXEC_STREAM_MAX_HEIGHT", "720"))
 STREAM_EVERY_NTH = int(os.environ.get("BROWSER_EXEC_STREAM_EVERY_NTH", "2"))
 BATON_GRACE_S = float(os.environ.get("BROWSER_EXEC_BATON_GRACE", "30"))
+# Cap for viewer clipboard paste (Input.insertText). The cockpit enforces its
+# own, tighter cap; this one only bounds hand-rolled clients.
+INSERT_TEXT_MAX_CHARS = 16384
 
 # Framing: [4-byte BE length][1-byte type][payload]; length covers type+payload.
 T_HELLO, T_FRAME, T_STATE, T_INPUT, T_CONTROL, T_ERROR = 1, 2, 3, 4, 5, 6
@@ -553,6 +556,14 @@ class ScreencastCdp:
             await client.send.Input.dispatchKeyEvent(
                 params=params, session_id=session_id
             )
+        elif kind == "insertText":
+            # Viewer clipboard paste. The cockpit caps the text client-side;
+            # this cap is defense in depth against a hand-rolled client.
+            text = str(params.get("text", ""))[:INSERT_TEXT_MAX_CHARS]
+            if text:
+                await client.send.Input.insertText(
+                    params={"text": text}, session_id=session_id
+                )
         elif kind == "wheel":
             await client.send.Input.dispatchMouseEvent(
                 params={**params, "type": "mouseWheel"},
