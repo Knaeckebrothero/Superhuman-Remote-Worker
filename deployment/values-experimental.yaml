@@ -67,11 +67,11 @@ image:
   agent:
     tag: sha-dc58820
   cockpit:
-    tag: sha-52c7103
+    tag: sha-2ea90fe
   mcp:
     tag: sha-52c7103
   workspace:
-    tag: sha-52c7103
+    tag: sha-2ea90fe
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
 # (docs/operations/orchestrator_m1_go_live.md)
