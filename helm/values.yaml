@@ -197,6 +197,11 @@ agent:
   # (prod-safe); the dev/experimental values file turns it on. Mirrors
   # expertsDbEnabled.
   skillsDbEnabled: "false"
+  # -- Enable user-added MCP servers as datasources. Both gates default off;
+  # stdio executes third-party commands in agent pods and should remain off
+  # for hosted/multi-tenant deployments without suitable isolation.
+  mcpDatasourcesEnabled: "false"
+  mcpStdioEnabled: "false"
   # -- Enable protected cloud mode: RO-reader provisioning + capture overlay.
   # Default OFF (prod-safe); the dev/experimental values file turns it on.
   # See docs/design/cloud_access_unification.md §8 Phase 1.
