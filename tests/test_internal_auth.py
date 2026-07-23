@@ -464,7 +464,7 @@ class TestDualCallableEndpoints:
             await create_job(fake_request, body)
 
         assert exc.value.status_code == 403
-        assert exc.value.detail == "One or more selected datasources are unavailable"
+        assert exc.value.detail == "One or more selected connectors are unavailable"
         assert str(datasource_b["id"]) not in exc.value.detail
         fake_db.create_job.assert_not_awaited()
 
@@ -500,7 +500,7 @@ class TestDualCallableEndpoints:
             await create_job(fake_request, body)
 
         assert exc.value.status_code == 403
-        assert exc.value.detail == "One or more selected datasources are unavailable"
+        assert exc.value.detail == "One or more selected connectors are unavailable"
         fake_db.create_job.assert_not_awaited()
 
     @pytest.mark.asyncio

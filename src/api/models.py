@@ -302,7 +302,7 @@ class JobStartRequest(BaseModel):
     )
     datasources: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        description="Resolved datasource connection details (set by orchestrator)",
+        description="Resolved connector details (set by orchestrator)",
     )
     repositories: Optional[List[Dict[str, Any]]] = Field(
         default=None,
@@ -314,7 +314,7 @@ class JobStartRequest(BaseModel):
     )
     project_id: Optional[str] = Field(
         default=None,
-        description="Project ID for datasource scoping",
+        description="Project ID for connector scoping",
     )
 
     model_config = ConfigDict(
@@ -370,7 +370,7 @@ class JobResumeRequest(BaseModel):
     )
     datasources: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        description="Resolved datasource connection details (set by orchestrator)",
+        description="Resolved connector details (set by orchestrator)",
     )
     project_id: Optional[str] = Field(
         default=None,

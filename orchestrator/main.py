@@ -2416,8 +2416,8 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             if repo_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "
-                    f"repository datasource is attached ({', '.join(repo_names)}). "
-                    "Repository datasources need a full workspace — use "
+                    f"repository connector is attached ({', '.join(repo_names)}). "
+                    "Repository connectors need a full workspace — use "
                     "backend='sandbox' or 'vm', or detach the repository."
                 )
                 logger.error("Dispatch: job %s rejected — %s", job_id, msg)
@@ -2825,8 +2825,8 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             if repo_names:
                 msg = (
                     "workspace.backend is a lite tier (virtual/none) but a "
-                    f"repository datasource is attached ({', '.join(repo_names)}). "
-                    "Repository datasources need a full workspace — use "
+                    f"repository connector is attached ({', '.join(repo_names)}). "
+                    "Repository connectors need a full workspace — use "
                     "backend='sandbox' or 'vm', or detach the repository."
                 )
                 logger.error("Resume dispatch: job %s rejected — %s", job_id, msg)
@@ -5802,17 +5802,17 @@ class CodexCallbackRequest(BaseModel):
 
 
 class DatasourceCreate(BaseModel):
-    """Request body for creating a datasource."""
+    """Request body for creating a connector through the datasource API."""
 
     name: str = Field(..., description="User-provided label")
     type: str = Field(
         ...,
-        description="Datasource type: generic, repository, kb, postgresql, neo4j, mongodb, webdav, email, mcp, kubeconfig, ssh_key, generic_file",
+        description="Connector type: generic, repository, kb, postgresql, neo4j, mongodb, webdav, email, mcp, kubeconfig, ssh_key, generic_file",
     )
     connection_url: str | None = Field(
         None, description="Connection string (nullable for generic)"
     )
-    description: str | None = Field(None, description="What this datasource contains")
+    description: str | None = Field(None, description="What this connector contains")
     credentials: dict[str, Any] | None = Field(
         None,
         description="Auth details (env_vars for generic, auth_method+token/ssh_key for repository, type-specific for managed)",
@@ -5833,12 +5833,12 @@ class DatasourceCreate(BaseModel):
         ),
     )
     is_global: bool = Field(
-        False, description="Whether this datasource is visible to all users"
+        False, description="Whether this connector is visible to all users"
     )
     read_only: bool | None = Field(
         None,
         description=(
-            "Declared read-only flag for public datasources (defaults to true "
+            "Declared read-only flag for public connectors (defaults to true "
             "on publish; kb is always read-only). Declarative — credentials "
             "are the enforcement boundary."
         ),
@@ -5846,7 +5846,7 @@ class DatasourceCreate(BaseModel):
 
 
 class DatasourceUpdate(BaseModel):
-    """Request body for updating a datasource."""
+    """Request body for updating a connector through the datasource API."""
 
     name: str | None = Field(None, description="New label")
     description: str | None = Field(None, description="New description")
@@ -5877,11 +5877,11 @@ class DatasourceUpdate(BaseModel):
 
 
 class SSHKeyGenerateRequest(BaseModel):
-    """Request body for generating an SSH keypair for a repository datasource."""
+    """Request body for generating an SSH keypair for a repository connector."""
 
     comment: str | None = Field(
         None,
-        description="Optional comment to embed in the public key (e.g. datasource name)",
+        description="Optional comment to embed in the public key (e.g. connector name)",
         max_length=200,
     )
 
@@ -5896,7 +5896,7 @@ class SSHKeyGenerateResponse(BaseModel):
 
 
 class ProjectDatasourceSettings(BaseModel):
-    """Project-level settings when linking a datasource."""
+    """Project-level settings when linking a connector."""
 
     read_only: bool | None = Field(
         None,
@@ -6004,7 +6004,7 @@ class JobCreate(BaseModel):
         None, description="Opening message to the agent (task brief)"
     )
     datasource_ids: list[str] | None = Field(
-        None, description="Global datasource IDs to clone as job-scoped"
+        None, description="Connector IDs to attach to the job"
     )
     user_id: str | None = Field(None, description="User UUID who created this job")
     project_id: str | None = Field(
@@ -6069,7 +6069,7 @@ class JobStartRequest(BaseModel):
     )
     project_id: str | None = Field(
         default=None,
-        description="Project ID for datasource resolution",
+        description="Project ID for connector resolution",
     )
     delegation_context: str | None = Field(
         default=None,
@@ -8220,10 +8220,10 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     status_code=400,
                     detail=(
                         f"workspace.backend='{lite_backend}' is a lite tier and "
-                        f"cannot use repository datasources "
+                        f"cannot use repository connectors "
                         f"({', '.join(repo_names)}). Use backend='sandbox' or "
                         f"'vm' for coding workloads, or remove the repository "
-                        f"datasource."
+                        f"connector."
                     ),
                 )
 
@@ -15896,7 +15896,7 @@ def _validate_kb_repository_url(connection_url: str | None) -> str:
     if not value:
         raise HTTPException(
             status_code=400,
-            detail="OKF Knowledge Base datasources require a repository URL",
+            detail="OKF Knowledge Base connectors require a repository URL",
         )
     from services.kb_git_source import validate_git_remote_url
 
@@ -15967,7 +15967,7 @@ async def list_datasources(
     ),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List datasources visible to the caller.
+    """List connectors visible to the caller.
 
     F3: each row is scoped (admin / creator / project member) and the
     `credentials` field is stripped from every row.
@@ -15990,17 +15990,17 @@ async def list_eligible_datasources(
     request: Request,
     project_id: list[str] | None = Query(
         default=None,
-        description="Project(s) to include linked datasources for (repeatable)",
+        description="Project(s) to include linked connectors for (repeatable)",
     ),
 ) -> list[dict[str, Any]]:
-    """Datasources the caller may pre-select for a job/session (the picker
+    """Connectors the caller may pre-select for a job/session (the picker
     source of truth).
 
-    Returns the union of: datasources the caller created, global datasources,
-    and datasources linked to any supplied project. Credentials are stripped.
+    Returns the union of: connectors the caller created, public connectors,
+    and connectors linked to any supplied project. Credentials are stripped.
     Membership is required for each supplied project (403 otherwise). Used to
-    seed the create-job / create-session datasource picker; with explicit-only
-    resolution the picker is the only way a job gets datasources.
+    seed the create-job / create-session connector picker; with explicit-only
+    resolution the picker is the only way a job gets connectors.
     """
     user = await require_approved_user(request, postgres_db)
     project_ids = project_id or []
@@ -16019,14 +16019,14 @@ async def list_eligible_datasources(
 
 @app.get("/api/datasources/{datasource_id}")
 async def get_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
-    """Get a single datasource by ID. F3: gated + credentials redacted."""
+    """Get a single connector by ID. F3: gated + credentials redacted."""
     _, ds = await require_datasource_access(request, postgres_db, datasource_id)
     return redact_datasource(ds)
 
 
 @app.post("/api/datasources")
 async def create_datasource(body: DatasourceCreate, request: Request) -> dict[str, Any]:
-    """Create a new datasource owned by the current user."""
+    """Create a new connector owned by the current user."""
     valid_types = {
         "generic",
         "repository",
@@ -16050,15 +16050,15 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         raise HTTPException(
             status_code=400,
             detail=(
-                "OKF Knowledge Base datasources cannot set job_id; attach them "
-                "through the job's explicit datasource selection"
+                "OKF Knowledge Base connectors cannot set job_id; attach them "
+                "through the job's explicit connector selection"
             ),
         )
     if body.type == "mcp":
         if not _mcp_datasources_enabled():
             raise HTTPException(
                 status_code=403,
-                detail="MCP datasources are disabled on this deployment",
+                detail="MCP connectors are disabled on this deployment",
             )
         _validate_mcp_datasource(body.connection_url, body.credentials or {})
 
@@ -16071,7 +16071,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         raise HTTPException(
             status_code=403,
             detail=(
-                "Publishing public datasources requires the "
+                "Publishing public connectors requires the "
                 "'public_datasources' capability"
             ),
         )
@@ -16081,14 +16081,14 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
     if body.type == "email" and body.is_global:
         raise HTTPException(
             status_code=400,
-            detail="Email datasources cannot be published (is_global)",
+            detail="Email connectors cannot be published (is_global)",
         )
     read_only = body.read_only
     if body.type == "kb":
         if read_only is False:
             raise HTTPException(
                 status_code=400,
-                detail="Knowledge-base datasources are always read-only",
+                detail="Knowledge-base connectors are always read-only",
             )
         if body.is_global:
             read_only = True
@@ -16118,7 +16118,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         if body.config:
             raise HTTPException(
                 status_code=400,
-                detail="Datasource config is not supported for MCP datasources",
+                detail="Connector config is not supported for MCP connectors",
             )
         datasource_config = {}
     else:
@@ -16126,8 +16126,8 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Datasource config is only supported for OKF Knowledge "
-                    "Bases and email datasources"
+                    "Connector config is only supported for OKF Knowledge "
+                    "Bases and email connectors"
                 ),
             )
         datasource_config = dict(body.config or {})
@@ -16171,7 +16171,7 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
         if "unique" in error_msg.lower() or "duplicate" in error_msg.lower():
             raise HTTPException(
                 status_code=409,
-                detail=f"A datasource named '{body.name}' of type '{body.type}' already exists",
+                detail=f"A connector named '{body.name}' of type '{body.type}' already exists",
             ) from e
         raise HTTPException(status_code=500, detail=error_msg) from e
     if body.type == "kb":
@@ -16184,14 +16184,14 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
 async def update_datasource(
     request: Request, datasource_id: str, body: DatasourceUpdate
 ) -> dict[str, str]:
-    """Update a datasource. F3: creator/admin only; null/empty credentials preserved."""
+    """Update a connector. F3: creator/admin only; credentials are preserved."""
     user, existing_ds = await require_datasource_owner(
         request, postgres_db, datasource_id
     )
     if existing_ds.get("type") == "mcp" and not _mcp_datasources_enabled():
         raise HTTPException(
             status_code=403,
-            detail="MCP datasources are disabled on this deployment",
+            detail="MCP connectors are disabled on this deployment",
         )
     # Publish gate (spec: docs/features/public_datasources.md). Only the
     # false→true transition needs the capability; unpublishing must always
@@ -16201,7 +16201,7 @@ async def update_datasource(
             raise HTTPException(
                 status_code=403,
                 detail=(
-                    "Publishing public datasources requires the "
+                    "Publishing public connectors requires the "
                     "'public_datasources' capability"
                 ),
             )
@@ -16211,13 +16211,13 @@ async def update_datasource(
     if existing_ds.get("type") == "email" and body.is_global is True:
         raise HTTPException(
             status_code=400,
-            detail="Email datasources cannot be published (is_global)",
+            detail="Email connectors cannot be published (is_global)",
         )
     read_only = body.read_only
     if existing_ds.get("type") == "kb" and read_only is False:
         raise HTTPException(
             status_code=400,
-            detail="Knowledge-base datasources are always read-only",
+            detail="Knowledge-base connectors are always read-only",
         )
     effective_global = (
         body.is_global
@@ -16314,7 +16314,7 @@ async def update_datasource(
         if datasource_config:
             raise HTTPException(
                 status_code=400,
-                detail="Datasource config is not supported for MCP datasources",
+                detail="Connector config is not supported for MCP connectors",
             )
         effective_credentials = (
             credentials
@@ -16338,8 +16338,8 @@ async def update_datasource(
         raise HTTPException(
             status_code=400,
             detail=(
-                "Datasource config is only supported for OKF Knowledge Bases "
-                "and email datasources"
+                "Connector config is only supported for OKF Knowledge Bases "
+                "and email connectors"
             ),
         )
     try:
@@ -16360,7 +16360,7 @@ async def update_datasource(
         success = await postgres_db.update_datasource(**update_kwargs)
         if not success:
             raise HTTPException(
-                status_code=404, detail=f"Datasource '{datasource_id}' not found"
+                status_code=404, detail=f"Connector '{datasource_id}' not found"
             )
 
         # Re-sync knowledge entries for all linked projects
@@ -16384,7 +16384,7 @@ async def update_datasource(
 
 @app.delete("/api/datasources/{datasource_id}")
 async def delete_datasource(request: Request, datasource_id: str) -> dict[str, str]:
-    """Delete a datasource. F3: creator/admin only."""
+    """Delete a connector. F3: creator/admin only."""
     _, datasource = await require_datasource_owner(request, postgres_db, datasource_id)
     try:
         # Clean up knowledge entries for all linked projects before deletion
@@ -16398,7 +16398,7 @@ async def delete_datasource(request: Request, datasource_id: str) -> dict[str, s
             success = await postgres_db.delete_datasource(datasource_id)
         if not success:
             raise HTTPException(
-                status_code=404, detail=f"Datasource '{datasource_id}' not found"
+                status_code=404, detail=f"Connector '{datasource_id}' not found"
             )
         return {"status": "deleted"}
     except HTTPException:
@@ -16409,7 +16409,7 @@ async def delete_datasource(request: Request, datasource_id: str) -> dict[str, s
 
 @app.get("/api/jobs/{job_id}/datasources")
 async def get_job_datasources(request: Request, job_id: str) -> list[dict[str, Any]]:
-    """Get resolved datasources for a job.
+    """Get resolved connectors for a job.
 
     F3: gated by `require_job_access`; credentials redacted in the
     response (the agent process gets them via internal dispatch, not via
@@ -16427,11 +16427,11 @@ async def get_job_datasources(request: Request, job_id: str) -> list[dict[str, A
 async def get_datasource_index_status(
     request: Request, datasource_id: str
 ) -> dict[str, Any]:
-    """Return credential-free indexing state for an OKF KB datasource."""
+    """Return credential-free indexing state for an OKF KB connector."""
     _, datasource = await require_datasource_access(request, postgres_db, datasource_id)
     if datasource.get("type") != "kb":
         raise HTTPException(
-            status_code=400, detail="Datasource is not an OKF Knowledge Base"
+            status_code=400, detail="Connector is not an OKF Knowledge Base"
         )
     try:
         from src.services.knowledge_store import KnowledgeStore
@@ -16456,7 +16456,7 @@ async def reindex_datasource_knowledge(
     _, datasource = await require_datasource_owner(request, postgres_db, datasource_id)
     if datasource.get("type") != "kb":
         raise HTTPException(
-            status_code=400, detail="Datasource is not an OKF Knowledge Base"
+            status_code=400, detail="Connector is not an OKF Knowledge Base"
         )
     try:
         return await _reindex_kb_datasource_now(datasource, force_full=full)
@@ -16577,7 +16577,7 @@ async def _test_mcp_datasource(
 
 @app.post("/api/datasources/{datasource_id}/test")
 async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
-    """Test connectivity to a datasource.
+    """Test connectivity to a connector.
 
     Attempts to connect using the stored connection details and returns
     the result. Does not modify any data. F3: creator/admin only (test
@@ -16603,7 +16603,7 @@ async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any
             if not _mcp_datasources_enabled():
                 raise HTTPException(
                     status_code=403,
-                    detail="MCP datasources are disabled on this deployment",
+                    detail="MCP connectors are disabled on this deployment",
                 )
             _validate_mcp_datasource(url, creds)
             return await _test_mcp_datasource(url, creds)
@@ -16678,11 +16678,11 @@ async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any
         elif ds_type in ("generic", "repository"):
             return {
                 "status": "ok",
-                "message": f"No connectivity test for {ds_type} datasources",
+                "message": f"No connectivity test for {ds_type} connectors",
             }
 
         else:
-            return {"status": "error", "message": f"Unknown datasource type: {ds_type}"}
+            return {"status": "error", "message": f"Unknown connector type: {ds_type}"}
 
     except HTTPException:
         raise
@@ -19116,7 +19116,7 @@ async def _apply_thread_config_update(
                 # Same generic denial as create — no enumeration oracle.
                 raise HTTPException(
                     status_code=403,
-                    detail="One or more selected datasources are unavailable",
+                    detail="One or more selected connectors are unavailable",
                 )
             selected_ds_ids = await _authorize_thread_datasource_ids(
                 owner,
@@ -19794,7 +19794,7 @@ class ThreadCreateRequest(BaseModel):
         None, description="List of project UUIDs to scope"
     )
     datasource_ids: list[str] | None = Field(
-        None, description="Explicit datasource IDs to attach to this thread"
+        None, description="Explicit connector IDs to attach to this thread"
     )
     permission_mode: str | None = Field(
         None,
@@ -19860,7 +19860,7 @@ async def _authorize_thread_datasource_ids(
         if datasource is None:
             raise HTTPException(
                 status_code=403,
-                detail="One or more selected datasources are unavailable",
+                detail="One or more selected connectors are unavailable",
             )
         allowed = bool(datasource.get("is_global")) or (
             await user_can_access_datasource(user, postgres_db, datasource)
@@ -19868,7 +19868,7 @@ async def _authorize_thread_datasource_ids(
         if not allowed:
             raise HTTPException(
                 status_code=403,
-                detail="One or more selected datasources are unavailable",
+                detail="One or more selected connectors are unavailable",
             )
         if (
             workspace_backend in LITE_BACKENDS
@@ -19878,7 +19878,7 @@ async def _authorize_thread_datasource_ids(
                 status_code=400,
                 detail=(
                     "Lite session backends cannot attach clone-based repository "
-                    "datasources; OKF Knowledge Base datasources remain available"
+                    "connectors; OKF Knowledge Base connectors remain available"
                 ),
             )
         normalized_id = str(datasource["id"])
@@ -19917,7 +19917,7 @@ async def _revalidate_thread_datasource_ids(
     if owner is None:
         raise HTTPException(
             status_code=403,
-            detail="One or more selected datasources are unavailable",
+            detail="One or more selected connectors are unavailable",
         )
 
     # workspace_backend=None intentionally skips the create-time lite/repository
@@ -30195,7 +30195,7 @@ async def remove_project_repository(
 async def list_project_datasources(
     request: Request, project_id: str
 ) -> list[dict[str, Any]]:
-    """List datasources linked to a project. F3: project membership required."""
+    """List connectors linked to a project. F3: project membership required."""
     await require_project_member(request, postgres_db, project_id)
     try:
         rows = await postgres_db.list_project_datasources(project_id)
@@ -30211,25 +30211,25 @@ async def link_datasource_to_project(
     datasource_id: str,
     body: ProjectDatasourceSettings | None = None,
 ) -> dict[str, str]:
-    """Link an existing datasource to a project.
+    """Link an existing connector to a project.
 
     F3: caller must be project owner of the target project AND must be
-    able to see the datasource (admin / creator / member of one of its
+    able to see the connector (admin / creator / member of one of its
     projects). Prevents a project owner from probing for stranger
-    datasources by guessing UUIDs.
+    connectors by guessing UUIDs.
 
     Optionally pass project-level overrides (read_only, description).
-    Also creates a knowledge entry so agents discover the datasource.
+    Also creates a knowledge entry so agents discover the connector.
     """
     user, _ = await require_project_owner(request, postgres_db, project_id)
     ds = await postgres_db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
-            status_code=404, detail=f"Datasource '{datasource_id}' not found"
+            status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
     if not await user_can_access_datasource(user, postgres_db, ds):
         raise HTTPException(
-            status_code=403, detail="Not authorized to link this datasource"
+            status_code=403, detail="Not authorized to link this connector"
         )
 
     try:
@@ -30262,15 +30262,15 @@ async def update_project_datasource(
     datasource_id: str,
     body: ProjectDatasourceSettings,
 ) -> dict[str, str]:
-    """Update project-level settings for a linked datasource. F3: project owner only.
+    """Update project-level settings for a linked connector. F3: project owner only.
 
-    Pass null to clear an override and fall back to datasource defaults.
+    Pass null to clear an override and fall back to connector defaults.
     """
     await require_project_owner(request, postgres_db, project_id)
     ds = await postgres_db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
-            status_code=404, detail=f"Datasource '{datasource_id}' not found"
+            status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
     effective_read_only = True if ds.get("type") == "kb" else body.read_only
     success = await postgres_db.update_project_datasource(
@@ -30282,7 +30282,7 @@ async def update_project_datasource(
     if not success:
         raise HTTPException(
             status_code=404,
-            detail=f"Link between project '{project_id}' and datasource '{datasource_id}' not found",
+            detail=f"Link between project '{project_id}' and connector '{datasource_id}' not found",
         )
 
     # Re-sync knowledge entry with updated overrides
@@ -30300,7 +30300,7 @@ async def update_project_datasource(
 async def unlink_datasource_from_project(
     request: Request, project_id: str, datasource_id: str
 ) -> dict[str, str]:
-    """Unlink a datasource from a project. F3: project owner only.
+    """Unlink a connector from a project. F3: project owner only.
 
     Also removes the knowledge entry.
     """
@@ -30311,7 +30311,7 @@ async def unlink_datasource_from_project(
     if not removed:
         raise HTTPException(
             status_code=404,
-            detail=f"Link between project '{project_id}' and datasource '{datasource_id}' not found",
+            detail=f"Link between project '{project_id}' and connector '{datasource_id}' not found",
         )
 
     await _delete_datasource_knowledge(project_id, datasource_id)
@@ -30602,7 +30602,7 @@ def _get_knowledge_graph():
 
 
 def _build_datasource_note_content(ds: dict[str, Any]) -> str:
-    """Build markdown content for a datasource knowledge entry.
+    """Build markdown content for a connector knowledge entry.
 
     Content varies by type and access mode:
     - generic: lists env var names + CLI hint
@@ -30628,7 +30628,7 @@ def _build_datasource_note_content(ds: dict[str, Any]) -> str:
         lines.append("Centrally indexed and read-only to agents in this release.")
         if root:
             lines.append(f"OKF root: `{root}`")
-        lines.append("Attach this datasource explicitly, then use the `kb_*` tools.")
+        lines.append("Attach this connector explicitly, then use the `kb_*` tools.")
         return "\n\n".join(lines)
     elif ds_type == "webdav":
         return _build_webdav_note(ds_name, desc, is_read_only)
@@ -30638,12 +30638,12 @@ def _build_datasource_note_content(ds: dict[str, Any]) -> str:
         else:
             return _build_managed_readwrite_note(ds_name, desc, ds_type)
     else:
-        return f"## Datasource: {ds_name}\n{desc}"
+        return f"## Connector: {ds_name}\n{desc}"
 
 
 def _build_generic_note(name: str, desc: str, ds: dict) -> str:
-    """KB entry for generic datasources."""
-    lines = [f"## Datasource: {name}"]
+    """KB entry for generic connectors."""
+    lines = [f"## Connector: {name}"]
     if desc:
         lines.append(desc)
 
@@ -30672,7 +30672,7 @@ def _build_generic_note(name: str, desc: str, ds: dict) -> str:
 
 
 def _build_repository_note(name: str, desc: str, ds: dict) -> str:
-    """KB entry for repository datasources."""
+    """KB entry for repository connectors."""
     import re
 
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
@@ -30722,7 +30722,7 @@ def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
     }
     info = cli_info.get(ds_type, {})
     lines = [
-        f"## Datasource: {name}",
+        f"## Connector: {name}",
         f"**Type:** {ds_type} | **Access:** full (CLI)",
     ]
     if desc:
@@ -30760,9 +30760,9 @@ def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
             "- `mongo_schema` — collections, fields, indexes",
         ],
     }
-    tools = tool_info.get(ds_type, ["- Check available tools for this datasource type"])
+    tools = tool_info.get(ds_type, ["- Check available tools for this connector type"])
     lines = [
-        f"## Datasource: {name}",
+        f"## Connector: {name}",
         f"**Type:** {ds_type} | **Access:** read-only (tools)",
     ]
     if desc:
@@ -30774,10 +30774,10 @@ def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
 
 
 def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
-    """KB entry for WebDAV datasources (always tools)."""
+    """KB entry for WebDAV connectors (always tools)."""
     access = "read-only" if is_read_only else "read-write"
     lines = [
-        f"## Datasource: {name}",
+        f"## Connector: {name}",
         f"**Type:** webdav | **Access:** {access}",
     ]
     if desc:
@@ -30795,7 +30795,7 @@ def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
 async def _sync_datasource_knowledge(
     project_id: str, datasource: dict[str, Any]
 ) -> None:
-    """Create or update a knowledge entry for a datasource in a project."""
+    """Create or update a connector knowledge entry in a project."""
     ds_id = str(datasource["id"]).replace("-", "")[:8]
     note_id = f"ds-{ds_id}"
     ds_name = datasource.get("name", "Unnamed")
@@ -30819,7 +30819,7 @@ async def _sync_datasource_knowledge(
         retrieval_messages = [
             f"{ds_name} connection",
             f"How to access {ds_name}",
-            "available datasources",
+            "available connectors",
         ]
     else:
         retrieval_messages = [
@@ -30833,7 +30833,7 @@ async def _sync_datasource_knowledge(
     kg = _get_knowledge_graph()
     if kg:
         try:
-            title = f"Datasource: {ds_name} ({ds_type})"
+            title = f"Connector: {ds_name} ({ds_type})"
             from datetime import datetime, timezone
 
             now = datetime.now(timezone.utc).isoformat()
@@ -30897,7 +30897,7 @@ async def _sync_datasource_knowledge(
                 """,
                 note_id,
                 project_id,
-                f"Datasource: {ds_name} ({ds_type})",
+                f"Connector: {ds_name} ({ds_type})",
                 ["datasource", ds_type],
                 content,
                 retrieval_messages,

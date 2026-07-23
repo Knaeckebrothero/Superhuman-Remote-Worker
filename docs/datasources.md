@@ -5,6 +5,7 @@ tags:
   - configuration
   - tool-development
 aliases:
+  - Connectors
   - Datasource Connectors
   - External Databases
   - Database Tools
@@ -14,13 +15,22 @@ related:
   - "[[tool_issues]]"
   - "[[coding_agent]]"
 ---
-# External Datasources
+# Connectors
+
+**Product terminology:** Cockpit and agent-facing guidance call these
+**connectors**. `datasource` remains the internal compatibility term used by
+the database schema, REST routes, code identifiers, feature flags, and the
+`datasources.md` workspace filename.
 
 ## Motivation
 
 The project originally had a tight integration with Neo4j as a first-class knowledge graph for requirement traceability. Since the agent has evolved into a general-purpose worker, the graph database is no longer a core dependency — it's just one possible data source among many.
 
-The goal is to replace the deep Neo4j integration with a generic **datasource connector** system. Users can attach external databases to jobs through the UI, and the agent receives the appropriate tools to interact with them at runtime. This keeps the agent flexible: one job might query a Neo4j graph, another might read from a PostgreSQL analytics database, another might aggregate data across MongoDB collections.
+The goal is to replace the deep Neo4j integration with a generic **connector**
+system. Users can attach external systems and data to jobs through the UI, and
+the agent receives the appropriate tools or workspace access at runtime. This
+keeps the agent flexible: one job might query a Neo4j graph, another might read
+from PostgreSQL, and another might use tools exposed by an MCP server.
 
 ## Supported Types
 
@@ -173,14 +183,15 @@ On `python init.py`, if any `DEFAULT_DS_*_URL` variable is set, the correspondin
 
 ## UI Integration (Cockpit)
 
-The cockpit gets a datasource management workflow:
+Cockpit exposes a connector management workflow:
 
-1. **Datasource library page**: List, create, edit, delete global datasources. Shows name, type, connection status, which jobs use it.
-2. **Job creation/edit**: A dropdown or selector to attach datasources. Options include:
-   - Preconfigured global datasources (from the library)
-   - "Add new" to create a job-specific datasource inline
-3. **Read-only toggle**: Visible per-datasource when attaching to a job.
-4. **Connection test button**: Validates that the connection works before saving.
+1. **Connectors page**: List, create, edit, and delete connectors. Shows name,
+   type, connection status, scope, and available actions.
+2. **Job/session settings**: A selector attaches eligible connectors.
+3. **Project Connectors tab**: Link shared connectors and configure supported
+   per-project access overrides.
+4. **Read-only toggle**: Visible for connector types that support it.
+5. **Test Connection button**: Validates that the connection works before saving.
 
 ## Removing the Baked-In Neo4j Integration
 

@@ -350,7 +350,7 @@ export class App implements OnInit {
 
     this.registry.register({
       type: 'datasource-list',
-      displayName: 'Datasources',
+      displayName: 'Connectors',
       component: DatasourceListComponent,
     });
 

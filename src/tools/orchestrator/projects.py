@@ -73,7 +73,7 @@ def _format_project(project: Dict[str, Any]) -> str:
     if project.get("repo_count") is not None:
         lines.append(f"Repositories: {project['repo_count']}")
     if project.get("datasource_count") is not None:
-        lines.append(f"Datasources: {project['datasource_count']}")
+        lines.append(f"Connectors: {project['datasource_count']}")
     if project.get("job_count") is not None:
         lines.append(f"Jobs: {project['job_count']}")
     if project.get("cloud_storage_url"):

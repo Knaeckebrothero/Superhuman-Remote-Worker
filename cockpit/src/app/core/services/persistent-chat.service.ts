@@ -203,7 +203,7 @@ const TOOL_GROUP_LABELS: Record<string, string> = {
     workflows: 'Automations & Loops',
 };
 
-/** The ack's datasource-change summary (names only — Slice B). */
+/** The ack's connector-change summary (names only — Slice B). */
 export interface AppliedDatasourceChange {
     added?: string[];
     removed?: string[];
@@ -231,10 +231,10 @@ export function describeAppliedConfig(
     if (interactive?.['permission_mode']) parts.push(`mode → ${interactive['permission_mode']}`);
     if (interactive?.['narration_mode']) parts.push(`narration → ${interactive['narration_mode']}`);
     for (const name of datasources?.added ?? []) {
-        parts.push(`datasource "${name}" attached`);
+        parts.push(`connector "${name}" attached`);
     }
     for (const name of datasources?.removed ?? []) {
-        parts.push(`datasource "${name}" detached`);
+        parts.push(`connector "${name}" detached`);
     }
     if (datasources?.kb_deferred) {
         parts.push('knowledge-base change applies on next resume');

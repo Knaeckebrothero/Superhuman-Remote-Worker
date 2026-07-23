@@ -5667,7 +5667,7 @@ async def _handle_config_update(
                 else:
                     if tools_update or ds_update:
                         await _send_error(
-                            "Session datasource update was rejected"
+                            "Session connector update was rejected"
                             if ds_update
                             else "Session tool update was rejected"
                         )
@@ -5686,7 +5686,7 @@ async def _handle_config_update(
             except Exception:
                 if tools_update or ds_update:
                     await _send_error(
-                        "Session datasource update could not be authorized"
+                        "Session connector update could not be authorized"
                         if ds_update
                         else "Session tool update could not be authorized"
                     )
@@ -5697,7 +5697,7 @@ async def _handle_config_update(
             # is unsafe: local loading cannot evaluate owner capability grants,
             # and datasource credentials only exist orchestrator-side.
             await _send_error(
-                "Session datasource update could not be authorized"
+                "Session connector update could not be authorized"
                 if ds_update
                 else "Session tool update could not be authorized"
             )
@@ -5713,9 +5713,9 @@ async def _handle_config_update(
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if not isinstance(ws_info, dict):
                 await _send_error(
-                    "Session datasource update could not be applied",
+                    "Session connector update could not be applied",
                     detail=(
-                        "The change was saved but the refreshed datasource "
+                        "The change was saved but the refreshed connector "
                         "payload could not be fetched; retry, or resume the "
                         "session to converge."
                     ),

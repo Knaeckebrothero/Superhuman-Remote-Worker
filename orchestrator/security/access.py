@@ -962,7 +962,7 @@ async def require_datasource_access(
     ds = await db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
-            status_code=404, detail=f"Datasource '{datasource_id}' not found"
+            status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
     if not await user_can_access_datasource(user, db, ds):
         raise await _denied(
@@ -971,7 +971,7 @@ async def require_datasource_access(
             user,
             resource_type="datasource",
             resource_id=datasource_id,
-            detail="Not authorized to access this datasource",
+            detail="Not authorized to access this connector",
         )
     return user, ds
 
@@ -995,7 +995,7 @@ async def require_datasource_owner(
     ds = await db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
-            status_code=404, detail=f"Datasource '{datasource_id}' not found"
+            status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
     scope_pid = _scope_project_id(user)
     if scope_pid is not None:
@@ -1019,7 +1019,7 @@ async def require_datasource_owner(
         user,
         resource_type="datasource",
         resource_id=datasource_id,
-        detail="Only the datasource creator or an admin can do this",
+        detail="Only the connector creator or an admin can do this",
     )
 
 

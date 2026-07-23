@@ -173,7 +173,7 @@ class EmailConnection:
 
         host = self._imap.get("host")
         if not host:
-            raise EmailToolError("email datasource has no IMAP host configured")
+            raise EmailToolError("email connector has no IMAP host configured")
         port = self._imap.get("port")
         security = str(self._imap.get("security") or "ssl").lower()
         if security in ("ssl", "tls", "ssl/tls", "ssl_tls"):
@@ -357,7 +357,7 @@ class EmailConnection:
         host = self._smtp.get("host")
         if not host:
             raise EmailToolError(
-                "email datasource has no SMTP server configured — sending is "
+                "email connector has no SMTP server configured — sending is "
                 "not possible for this mailbox"
             )
         port = self._smtp.get("port")

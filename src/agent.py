@@ -3288,12 +3288,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             )
 
     def _inject_datasource_index(self, ds_configs: list) -> None:
-        """Inject a compact datasource index into datasources.md.
+        """Inject a compact connector index into the compatibility file datasources.md.
 
-        This ensures the agent always knows what datasources are available,
+        This ensures the agent always knows what connectors are available,
         even before KB retrieval fires. Full details are in the knowledge base.
         """
-        lines = ["\n\n## Available Datasources\n"]
+        lines = ["\n\n## Available Connectors\n"]
         for ds in ds_configs:
             ds_type = ds.get("type", "unknown")
             name = ds.get("name", "Unnamed")
@@ -3327,10 +3327,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 "datasources.md", existing + "\n".join(lines)
             )
             logger.info(
-                f"Injected datasource index ({len(ds_configs)} entries) into datasources.md"
+                f"Injected connector index ({len(ds_configs)} entries) into datasources.md"
             )
         except Exception as e:
-            logger.warning(f"Failed to inject datasource index: {e}")
+            logger.warning(f"Failed to inject connector index: {e}")
 
     @staticmethod
     def _format_rw_cli_block(name: str, ds_type: str) -> str:
