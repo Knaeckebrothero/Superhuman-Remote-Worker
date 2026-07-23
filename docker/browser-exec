@@ -758,6 +758,44 @@ class LocalFileServer:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _parse_chromium_version(version_output: str) -> str | None:
+    """Extract the dotted version from ``chromium --version`` output."""
+    match = re.search(r"(\d+\.\d+\.\d+\.\d+)", version_output or "")
+    return match.group(1) if match else None
+
+
+_UA_CACHE: list = []  # memoized [ua_or_None]; the binary never changes mid-run
+
+
+def _clean_user_agent() -> str | None:
+    """Linux Chrome UA matching the real binary version, minus 'Headless'.
+
+    Deriving the version from the actual binary keeps the UA consistent
+    with what the browser otherwise reports; a mismatched hardcoded
+    version would be a stronger bot signal than the one being removed.
+    """
+    if _UA_CACHE:
+        return _UA_CACHE[0]
+    user_agent = None
+    try:
+        result = subprocess.run(
+            [CHROMIUM_PATH, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        version = _parse_chromium_version(result.stdout)
+        if version:
+            user_agent = (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+            )
+    except Exception as exc:
+        log(f"user-agent probe failed: {exc}")
+    _UA_CACHE.append(user_agent)
+    return user_agent
+
+
 class BrowserDaemon:
     """Owns a single persistent ``BrowserSession`` and runs actions on it."""
 
@@ -793,12 +831,30 @@ class BrowserDaemon:
         # remote debugging. The workspace pod can't run Chromium's sandbox (no user
         # namespaces), so disable it and avoid /dev/shm + GPU — the same flags the
         # old _start_remote_chromium used.
+        #
+        # Fingerprint hygiene: headless Chromium advertises itself twice —
+        # navigator.webdriver=true and a "HeadlessChrome/…" user agent — and
+        # bot checks (e.g. Cloudflare Turnstile) fail the browser on those
+        # before any click lands, no matter WHO is driving. AutomationControlled
+        # clears webdriver; the UA override keeps the real binary's version but
+        # drops the Headless marker. Client-hint brands still expose headless —
+        # the honest fix for the rest is a headful X server, deliberately out
+        # of scope here.
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        user_agent = _clean_user_agent()
+        if user_agent:
+            args.append(f"--user-agent={user_agent}")
         session = BrowserSession(
             headless=True,
             executable_path=CHROMIUM_PATH,
             user_data_dir=PROFILE_DIR,
             chromium_sandbox=False,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            args=args,
         )
         await session.start()
         self._session = session
