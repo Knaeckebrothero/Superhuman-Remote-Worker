@@ -127,6 +127,50 @@ def get_categories() -> set[str]:
     return {meta.get("category", "unknown") for meta in TOOL_REGISTRY.values()}
 
 
+def register_mcp_tools(manager: Any) -> None:
+    """Replace dynamic MCP registry entries with a manager's live tools."""
+    stale_names = [
+        name
+        for name, metadata in TOOL_REGISTRY.items()
+        if metadata.get("category") == "mcp"
+    ]
+    for name in stale_names:
+        del TOOL_REGISTRY[name]
+
+    tools = manager.get_langchain_tools()
+    for tool in tools:
+        tool_metadata = getattr(tool, "metadata", None) or {}
+        TOOL_REGISTRY[tool.name] = {
+            "category": "mcp",
+            "phases": ["strategic", "tactical"],
+            "description": (getattr(tool, "description", None) or "")[:200],
+            "mcp_server": tool_metadata.get("mcp_server"),
+            "mcp_server_slug": tool_metadata.get("mcp_server_slug"),
+            "mcp_tool_name": tool_metadata.get("mcp_tool_name", tool.name),
+        }
+
+    logger.info(
+        "Registered %d MCP tools across %d server statuses",
+        len(tools),
+        len(getattr(manager, "statuses", {})),
+    )
+
+
+def expand_tool_wildcards(tool_names: List[str]) -> List[str]:
+    """Expand the MCP datasource ``"*"`` sentinel after tool discovery."""
+    if "*" not in tool_names:
+        return tool_names
+
+    expanded: List[str] = []
+    for name in [
+        *(name for name in tool_names if name != "*"),
+        *get_tools_by_category("mcp"),
+    ]:
+        if name not in expanded:
+            expanded.append(name)
+    return expanded
+
+
 def filter_tools_by_phase(tool_names: List[str], phase: str) -> List[str]:
     """Filter tool names to only those available in the given phase.
 
@@ -488,6 +532,24 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded webdav tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load webdav tools: {e}")
+
+    # MCP datasource tools are already-live LangChain tools owned by the
+    # per-job/session MCPManager. Missing or failed servers degrade cleanly.
+    if "mcp" in tools_by_category:
+        if not context.has_datasource("mcp"):
+            logger.warning(
+                "MCP tools require an mcp datasource connection in ToolContext"
+            )
+        else:
+            try:
+                manager = context.get_datasource("mcp")
+                requested = set(tools_by_category["mcp"])
+                for tool in manager.get_langchain_tools():
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded MCP tool: {tool.name}")
+            except Exception as e:
+                logger.warning("Could not load MCP tools: %s", type(e).__name__)
 
     # Email datasource tools
     if "email" in tools_by_category:
