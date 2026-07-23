@@ -18,6 +18,11 @@ related:
 
 # MCP Server Connectors (Internal Datasource Type)
 
+> **Status (2026-07-23):** Code complete. Tasks 1–13 of the implementation
+> plan are implemented and automated checks pass. Final acceptance is pending
+> the Task 14 deployed k3d smoke test, so this design remains under
+> `docs/features/` rather than `docs/done/`.
+
 Let every user add external MCP servers to their agents as **connectors**. The
 product section is **Connectors**; an MCP server appears alongside databases,
 repositories, mailboxes, knowledge bases, and credential files.
