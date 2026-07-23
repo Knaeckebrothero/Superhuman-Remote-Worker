@@ -406,6 +406,14 @@ export class PersistentChatService {
             }
         });
 
+        // Mirror the assistant turn's streaming state into the transport
+        // bridge: the shared-browser baton automation hands control to the
+        // user when the agent's turn completes and back when one starts,
+        // without Canvas ever depending on this service.
+        effect(() => {
+            this.threadTransport.setAgentTurnActive(this.isStreaming());
+        });
+
         // Invariant: "Stopping…" (isInterrupting) only makes sense while a turn
         // is actually streaming. Whenever streaming ends — turn completed, the
         // turn closed on disconnect, or a reconnect re-synced past it — clear

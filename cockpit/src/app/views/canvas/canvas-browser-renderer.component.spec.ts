@@ -12,6 +12,7 @@ import {
 } from '@angular/core';
 import { BrowserPageState } from './canvas-browser-protocol';
 import { CanvasService } from '../../core/services/canvas.service';
+import { PersistentThreadTransportBridge } from '../../core/services/persistent-thread-transport-bridge.service';
 import {
   CanvasBrowserConnectionStatus,
   CanvasBrowserController,
@@ -576,6 +577,38 @@ describe('Canvas shared-browser renderer', () => {
         configurable: true,
       });
     }
+  });
+
+  it('automates the baton across agent turn boundaries', () => {
+    const bridge = TestBed.inject(PersistentThreadTransportBridge);
+    controller.connectionStatus.set('ready');
+    controller.pageState.set(page({baton: 'user'}));
+    fixture.detectChanges();
+    TestBed.flushEffects();
+    // The first observation only records the baseline.
+    expect(controller.sendControl).not.toHaveBeenCalled();
+
+    // Agent turn starts (user sent a message) -> control returns to the agent.
+    bridge.setAgentTurnActive(true);
+    TestBed.flushEffects();
+    expect(controller.sendControl).toHaveBeenLastCalledWith({op: 'release_baton'});
+
+    // Agent turn completes while connected -> the user gets the baton.
+    controller.sendControl.mockClear();
+    controller.pageState.set(page({baton: 'agent'}));
+    bridge.setAgentTurnActive(false);
+    TestBed.flushEffects();
+    expect(controller.sendControl).toHaveBeenLastCalledWith({op: 'take_baton'});
+
+    // A turn ending while the surface is not connected takes nothing.
+    controller.sendControl.mockClear();
+    bridge.setAgentTurnActive(true);
+    TestBed.flushEffects();
+    controller.sendControl.mockClear();
+    controller.connectionStatus.set('ended');
+    bridge.setAgentTurnActive(false);
+    TestBed.flushEffects();
+    expect(controller.sendControl).not.toHaveBeenCalledWith({op: 'take_baton'});
   });
 
   it('best-effort releases held pointer and keys on blur or authoritative baton loss', () => {
