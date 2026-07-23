@@ -677,7 +677,7 @@ databases:
     externalDb: "srw"
     image: pgvector/pgvector:pg15
     storageClass: ""
-    storageSize: "10Gi"
+    storageSize: "16Gi"
     resources:
       requests:
         memory: "256Mi"
@@ -695,7 +695,7 @@ databases:
     externalDb: "srw_vector"
     image: pgvector/pgvector:pg15
     storageClass: ""
-    storageSize: "10Gi"
+    storageSize: "16Gi"
     resources:
       requests:
         memory: "256Mi"
@@ -717,7 +717,7 @@ databases:
     # fixes); 15.9+ is compatible if a 15.x is preferred for fleet uniformity.
     image: postgres:16
     storageClass: ""
-    storageSize: "10Gi"
+    storageSize: "16Gi"
     resources:
       requests:
         memory: "256Mi"
@@ -739,7 +739,7 @@ databases:
     externalUrl: ""
     image: postgres:15
     storageClass: ""
-    storageSize: "5Gi"
+    storageSize: "8Gi"
     resources:
       requests:
         memory: "128Mi"
@@ -781,7 +781,7 @@ databases:
     #    based on edition above; override here to pin a specific tag.
     image: ""
     storageClass: ""
-    storageSize: "10Gi"
+    storageSize: "16Gi"
     # -- Neo4j Browser web UI (HTTP/7474) Ingress. Off by default — the DB
     # itself is reachable in-cluster on the Bolt port via the always-on
     # ClusterIP service, which is all the orchestrator/agents need. Turn this
@@ -856,7 +856,7 @@ gitea:
   externalUrl: ""
   image: gitea/gitea:1.22-rootless
   storageClass: ""
-  storageSize: "5Gi"
+  storageSize: "8Gi"
   # Gitea serves every jobs-repo clone the agents make, and pack generation is
   # CPU-bound: a 250m limit throttled clones to ~1-2 MiB/s, slow enough that
   # large project repos outlived the agent-side clone wait. Requests stay small;
