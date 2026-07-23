@@ -175,3 +175,52 @@ async def test_sync_close_inside_running_loop(tmp_path):
     manager.close()
     await asyncio.sleep(0.5)
     assert all(handle.task.done() for handle in manager._handles)
+
+
+@pytest.mark.asyncio
+async def test_tool_error_returns_string_not_raise(tmp_path):
+    script = tmp_path / "echo_server.py"
+    script.write_text(ECHO_SERVER)
+    manager = MCPManager([_stdio_ds(script)])
+    await manager.connect_all()
+    try:
+        echo = next(
+            tool
+            for tool in manager.get_langchain_tools()
+            if tool.name.endswith("__echo")
+        )
+        handle = manager._handles[0]
+        handle.shutdown.set()
+        await asyncio.sleep(0.3)
+        handle.ds["credentials"]["args"] = [str(tmp_path / "gone.py")]
+
+        result = await echo.coroutine(text="hi")
+
+        assert isinstance(result, str)
+        assert "MCP" in result and "error" in result.lower()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_once_revives_tool(tmp_path):
+    script = tmp_path / "echo_server.py"
+    script.write_text(ECHO_SERVER)
+    manager = MCPManager([_stdio_ds(script)])
+    await manager.connect_all()
+    try:
+        echo = next(
+            tool
+            for tool in manager.get_langchain_tools()
+            if tool.name.endswith("__echo")
+        )
+        handle = manager._handles[0]
+        handle.shutdown.set()
+        await asyncio.sleep(0.3)
+
+        result = await echo.coroutine(text="revived")
+
+        assert "echo: revived" in str(result)
+        assert handle.reconnected_once is True
+    finally:
+        await manager.aclose()
