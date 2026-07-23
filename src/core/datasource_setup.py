@@ -242,6 +242,7 @@ def process_datasources(
     cli_ds_types: List[str] = []
 
     generic_list: List[Dict[str, Any]] = []
+    mcp_list: List[Dict[str, Any]] = []
     connector_list: List[Dict[str, Any]] = []
 
     for ds in ds_configs:
@@ -266,6 +267,8 @@ def process_datasources(
                 "OKF Knowledge Base %r handled by KnowledgeStore bindings",
                 ds.get("name", "unnamed"),
             )
+        elif ds_type == "mcp":
+            mcp_list.append(ds)
         else:
             connector_list.append(ds)
 
@@ -304,6 +307,14 @@ def process_datasources(
             )
         except Exception as e:
             logger.warning("Failed to connect to %s datasource: %s", ds_type, e)
+
+    # ToolContext's datasource registry is keyed by type, so one manager must
+    # aggregate every attached MCP server. Construction performs validation
+    # only; callers connect it asynchronously once their runtime is ready.
+    if mcp_list:
+        from src.tools.mcp import MCPManager
+
+        datasources_dict["mcp"] = MCPManager(mcp_list)
 
     return datasources_dict, client_registry, cli_ds_types
 
@@ -1029,6 +1040,7 @@ def inject_datasource_index(
     databases = [
         ds for ds in ds_configs if ds.get("type") in ("postgresql", "neo4j", "mongodb")
     ]
+    mcps = [ds for ds in ds_configs if ds.get("type") == "mcp"]
     creds = [ds for ds in ds_configs if ds.get("type") in CREDENTIAL_FILE_TYPES]
     others = [
         ds
@@ -1040,6 +1052,7 @@ def inject_datasource_index(
             "postgresql",
             "neo4j",
             "mongodb",
+            "mcp",
             "kubeconfig",
             "ssh_key",
             "generic_file",
@@ -1083,6 +1096,28 @@ def inject_datasource_index(
                     f"- **{name}** ({ds_type}, read-write) — query + write tools"
                     + _declared_ro_note(ds)
                 )
+        lines.append("")
+
+    if mcps:
+        lines.append("### MCP Servers")
+        for ds in mcps:
+            name = ds.get("name", "Unnamed")
+            transport = str(
+                (ds.get("credentials") or {}).get("transport") or "http"
+            ).lower()
+            status = ds.get("_mcp_status") or "not connected yet"
+            tools = ds.get("_mcp_tools") or []
+            if status == "connected":
+                shown = ", ".join(f"`{tool_name}`" for tool_name in tools[:40])
+                if not shown:
+                    shown = "_no tools advertised_"
+                more = f" (+{len(tools) - 40} more)" if len(tools) > 40 else ""
+                lines.append(
+                    f"- **{name}** (mcp, {len(tools)} tools) — "
+                    f"{transport}; {shown}{more}"
+                )
+            else:
+                lines.append(f"- **{name}** (mcp, {transport}) — {status}")
         lines.append("")
 
     if creds:
