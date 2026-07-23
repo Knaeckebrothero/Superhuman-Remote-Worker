@@ -241,14 +241,29 @@ class MCPManager:
                         sse_client(config.url, headers=config.headers or None)
                     )
                 else:
-                    from mcp.client.streamable_http import streamablehttp_client
+                    from mcp.client import streamable_http
 
-                    read, write, _ = await stack.enter_async_context(
-                        streamablehttp_client(
+                    http_transport = getattr(
+                        streamable_http,
+                        "streamable_http_client",
+                        None,
+                    )
+                    if http_transport is not None:
+                        from mcp.shared._httpx_utils import create_mcp_http_client
+
+                        http_client = await stack.enter_async_context(
+                            create_mcp_http_client(headers=config.headers or None)
+                        )
+                        transport_context = http_transport(
+                            config.url,
+                            http_client=http_client,
+                        )
+                    else:
+                        transport_context = streamable_http.streamablehttp_client(
                             config.url,
                             headers=config.headers or None,
                         )
-                    )
+                    read, write, _ = await stack.enter_async_context(transport_context)
 
                 from mcp import ClientSession
 

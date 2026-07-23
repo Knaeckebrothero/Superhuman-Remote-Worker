@@ -16466,6 +16466,115 @@ async def reindex_datasource_knowledge(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+async def _test_mcp_datasource(
+    connection_url: str | None,
+    credentials: dict[str, Any],
+) -> dict[str, Any]:
+    """Connect and list MCP tools with a ten-second overall bound."""
+    import shutil
+    from contextlib import AsyncExitStack
+
+    transport = str(credentials.get("transport") or "http").lower()
+    if transport == "stdio" and not shutil.which(credentials.get("command") or ""):
+        return {
+            "status": "ok",
+            "message": (
+                "stdio server untested here (runtime not on the orchestrator); "
+                "it will resolve on the agent at job start"
+            ),
+        }
+
+    async def _probe() -> dict[str, Any]:
+        from src.tools.mcp.sdk import ensure_mcp_sdk
+
+        ensure_mcp_sdk()
+        async with AsyncExitStack() as stack:
+            if transport == "stdio":
+                from mcp import StdioServerParameters
+                from mcp.client.stdio import get_default_environment, stdio_client
+
+                parameters = StdioServerParameters(
+                    command=credentials["command"],
+                    args=credentials.get("args") or [],
+                    env={
+                        **get_default_environment(),
+                        **dict(credentials.get("env") or {}),
+                    },
+                )
+                # Never forward third-party stderr: a server may print its
+                # credential-bearing environment.
+                error_sink = stack.enter_context(open(os.devnull, "w"))
+                read, write = await stack.enter_async_context(
+                    stdio_client(parameters, errlog=error_sink)
+                )
+            else:
+                headers: dict[str, str] = {}
+                auth = credentials.get("auth") or {}
+                if auth.get("type") == "bearer":
+                    headers["Authorization"] = f"Bearer {auth['token']}"
+                elif auth.get("type") == "headers":
+                    headers.update(auth.get("headers") or {})
+
+                if transport == "sse":
+                    from mcp.client.sse import sse_client
+
+                    read, write = await stack.enter_async_context(
+                        sse_client(connection_url, headers=headers or None)
+                    )
+                else:
+                    from mcp.client import streamable_http
+
+                    http_transport = getattr(
+                        streamable_http,
+                        "streamable_http_client",
+                        None,
+                    )
+                    if http_transport is not None:
+                        from mcp.shared._httpx_utils import create_mcp_http_client
+
+                        http_client = await stack.enter_async_context(
+                            create_mcp_http_client(headers=headers or None)
+                        )
+                        transport_context = http_transport(
+                            connection_url,
+                            http_client=http_client,
+                        )
+                    else:
+                        transport_context = streamable_http.streamablehttp_client(
+                            connection_url,
+                            headers=headers or None,
+                        )
+                    read, write, _ = await stack.enter_async_context(transport_context)
+
+            from mcp import ClientSession
+
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            listing = await session.list_tools()
+            names = [tool.name for tool in listing.tools]
+            preview = ", ".join(names[:8])
+            if len(names) > 8:
+                preview += ", …"
+            suffix = f" ({preview})" if preview else ""
+            return {
+                "status": "ok",
+                "message": f"Connected: {len(names)} tools{suffix}",
+            }
+
+    try:
+        return await asyncio.wait_for(_probe(), timeout=10)
+    except TimeoutError:
+        return {"status": "error", "message": "MCP connect timed out after 10s"}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Transport exceptions can contain URLs/headers. Report only the class.
+        return {
+            "status": "error",
+            "message": f"MCP connection failed ({type(exc).__name__})",
+        }
+
+
 @app.post("/api/datasources/{datasource_id}/test")
 async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
     """Test connectivity to a datasource.
@@ -16489,6 +16598,15 @@ async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any
                 return await _test_kb(ds)
             except Exception as e:
                 return {"status": "error", "message": str(e)[-2000:]}
+
+        if ds_type == "mcp":
+            if not _mcp_datasources_enabled():
+                raise HTTPException(
+                    status_code=403,
+                    detail="MCP datasources are disabled on this deployment",
+                )
+            _validate_mcp_datasource(url, creds)
+            return await _test_mcp_datasource(url, creds)
 
         if ds_type == "postgresql":
             try:

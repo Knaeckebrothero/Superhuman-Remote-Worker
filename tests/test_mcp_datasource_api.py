@@ -1,5 +1,7 @@
 """Control-plane validation and dispatch contracts for MCP datasources."""
 
+import sys
+import textwrap
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
@@ -15,7 +17,23 @@ from main import (
     _mcp_stdio_enabled,
     _validate_mcp_datasource,
     create_datasource,
+    test_datasource as probe_datasource_endpoint,
     update_datasource,
+)
+
+ECHO_SERVER = textwrap.dedent(
+    """
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP("echo")
+
+    @mcp.tool()
+    def echo(text: str) -> str:
+        \"\"\"Echo the input back.\"\"\"
+        return f"echo: {text}"
+
+    mcp.run(transport="stdio")
+    """
 )
 
 
@@ -255,3 +273,78 @@ def test_runtime_gates_strip_existing_mcp_rows(monkeypatch):
     monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
     assert _build_datasources_payload([datasource]) is not None
     assert _build_datasource_tool_override([datasource], None)["tools"]["mcp"] == ["*"]
+
+
+class TestMcpConnectionTest:
+    @pytest.mark.asyncio
+    async def test_stdio_echo_server_lists_tools(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
+        script = tmp_path / "echo_server.py"
+        script.write_text(ECHO_SERVER)
+        datasource_id = "11111111-2222-3333-4444-555555555555"
+        datasource = {
+            "id": datasource_id,
+            "type": "mcp",
+            "connection_url": None,
+            "credentials": {
+                "transport": "stdio",
+                "command": sys.executable,
+                "args": [str(script)],
+                "env": {},
+            },
+        }
+
+        with patch(
+            "main.require_datasource_owner",
+            AsyncMock(return_value=({}, datasource)),
+        ):
+            result = await probe_datasource_endpoint(object(), datasource_id)
+
+        assert result["status"] == "ok"
+        assert "echo" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_unreachable_remote_returns_error_not_exception(self, monkeypatch):
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        datasource_id = "11111111-2222-3333-4444-555555555555"
+        datasource = {
+            "id": datasource_id,
+            "type": "mcp",
+            "connection_url": "http://127.0.0.1:9/mcp",
+            "credentials": {"transport": "http"},
+        }
+
+        with patch(
+            "main.require_datasource_owner",
+            AsyncMock(return_value=({}, datasource)),
+        ):
+            result = await probe_datasource_endpoint(object(), datasource_id)
+
+        assert result["status"] == "error"
+        assert "MCP" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_stdio_missing_runtime_reports_untested(self, monkeypatch):
+        monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
+        monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
+        datasource_id = "11111111-2222-3333-4444-555555555555"
+        datasource = {
+            "id": datasource_id,
+            "type": "mcp",
+            "connection_url": None,
+            "credentials": {
+                "transport": "stdio",
+                "command": "definitely-not-a-binary",
+                "args": [],
+            },
+        }
+
+        with patch(
+            "main.require_datasource_owner",
+            AsyncMock(return_value=({}, datasource)),
+        ):
+            result = await probe_datasource_endpoint(object(), datasource_id)
+
+        assert result["status"] == "ok"
+        assert "untested" in result["message"].lower()
