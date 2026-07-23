@@ -118,6 +118,12 @@ BATON_GRACE_S = float(os.environ.get("BROWSER_EXEC_BATON_GRACE", "30"))
 # Cap for viewer clipboard paste (Input.insertText). The cockpit enforces its
 # own, tighter cap; this one only bounds hand-rolled clients.
 INSERT_TEXT_MAX_CHARS = 16384
+# Where a cold-opened shared browser lands instead of a blank void, so the
+# surface is immediately usable like a normal browser. Only applied when the
+# page is still about:blank — an agent-driven page is never clobbered.
+STREAM_START_URL = os.environ.get(
+    "BROWSER_EXEC_START_URL", "https://www.google.com"
+)
 
 # Framing: [4-byte BE length][1-byte type][payload]; length covers type+payload.
 T_HELLO, T_FRAME, T_STATE, T_INPUT, T_CONTROL, T_ERROR = 1, 2, 3, 4, 5, 6
@@ -726,6 +732,7 @@ class BrowserDaemon:
         self._focus_change_task = None
         self._focus_change_revision = 0
         self._focus_handler = None
+        self._start_page_task = None
         self.should_exit = False
         self._files = LocalFileServer()
         self.hub = StreamHub()
@@ -761,6 +768,18 @@ class BrowserDaemon:
         self._install_focus_handler(session)
         log("Chromium session started")
         return session
+
+    async def _open_start_page(self) -> None:
+        """Navigate a still-blank cold-opened browser to the start page."""
+        async with self._lock:
+            try:
+                session = await self._get_session()
+                url = await session.get_current_page_url()
+                if url and url != "about:blank":
+                    return
+                await session.navigate_to(STREAM_START_URL)
+            except Exception as exc:
+                log(f"start page navigation failed: {exc}")
 
     def _install_focus_handler(self, session) -> None:
         """Subscribe once; the event-bus callback itself never awaits locks."""
@@ -1097,6 +1116,13 @@ class BrowserDaemon:
                 if action == "stream_info":
                     if self.hub.generation is None:
                         self.hub.mint_generation(args.get("initial_baton"))
+                        # Cold open: land on the start page in the background
+                        # so the response (and first frame) isn't held behind
+                        # a page load. Lifecycle bootstrap, not agent driving
+                        # — deliberately outside the baton check.
+                        self._start_page_task = asyncio.create_task(
+                            self._open_start_page()
+                        )
                     return {
                         "generation": self.hub.generation,
                         "token": self.hub.token,
