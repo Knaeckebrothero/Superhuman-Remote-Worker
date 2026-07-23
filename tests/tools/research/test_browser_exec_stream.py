@@ -122,11 +122,17 @@ class _FakePageSend:
 
 
 class _FakeInputSend:
+    def __init__(self):
+        self.calls = []
+
     async def dispatchMouseEvent(self, **kwargs):
-        del kwargs
+        self.calls.append(("mouse", kwargs))
 
     async def dispatchKeyEvent(self, **kwargs):
-        del kwargs
+        self.calls.append(("key", kwargs))
+
+    async def insertText(self, *, params, session_id):
+        self.calls.append(("insertText", params, session_id))
 
 
 class _FakeCdpClient:
@@ -392,6 +398,29 @@ class TestScreencastCdp:
                 "frameStartedLoading": 1,
                 "frameStoppedLoading": 1,
             }
+
+        asyncio.run(run())
+
+
+class TestInsertTextDispatch:
+    def test_insert_text_dispatches_capped_and_skips_empty(self):
+        async def run():
+            adapter, session, hub = TestScreencastCdp._adapter()
+            await adapter.start("A")
+
+            await adapter.dispatch_input(
+                {"kind": "insertText", "params": {"text": "hunter2"}}
+            )
+            oversized = "x" * (BE.INSERT_TEXT_MAX_CHARS + 5)
+            await adapter.dispatch_input(
+                {"kind": "insertText", "params": {"text": oversized}}
+            )
+            await adapter.dispatch_input({"kind": "insertText", "params": {}})
+
+            calls = session.client.send.Input.calls
+            assert calls[0] == ("insertText", {"text": "hunter2"}, "session-A")
+            assert calls[1][1] == {"text": "x" * BE.INSERT_TEXT_MAX_CHARS}
+            assert len(calls) == 2
 
         asyncio.run(run())
 

@@ -28,6 +28,7 @@ import {
   browserWheelDeltas,
   mapBrowserPoint,
 } from './canvas-browser-input';
+import { BROWSER_MAX_INSERT_TEXT_CHARS } from './canvas-browser-protocol';
 import {
   CanvasBrowserConnectionStatus,
   CanvasBrowserController,
@@ -186,6 +187,7 @@ interface PressedBrowserKey {
           (wheel)="onWheel($event)"
           (keydown)="onKeyDown($event)"
           (keyup)="onKeyUp($event)"
+          (paste)="onPaste($event)"
           (blur)="releaseHeldInput()"
           (contextmenu)="onContextMenu($event)"
           (compositionstart)="composing = true"
@@ -495,6 +497,15 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
     ) {
       return;
     }
+    // Paste stays a local concern: the user's clipboard lives in THIS
+    // browser, so the chord becomes a remote text insertion instead of a
+    // forwarded Ctrl+V (which would paste the workspace Chromium's own,
+    // usually empty, clipboard).
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'v') {
+      event.preventDefault();
+      this.pasteFromClipboard();
+      return;
+    }
     const text = browserKeyText(event);
     const virtualKey = browserVirtualKeyCode(event);
     const params = {
@@ -547,6 +558,32 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
 
   onContextMenu(event: MouseEvent): void {
     if (this.canDrive() && this.surfaceFocused()) event.preventDefault();
+  }
+
+  /** Browser-menu Edit→Paste path; the keyboard chord never reaches here. */
+  onPaste(event: ClipboardEvent): void {
+    if (!this.canDrive() || !this.surfaceFocused()) return;
+    const text = event.clipboardData?.getData('text/plain') ?? '';
+    if (this.insertRemoteText(text)) event.preventDefault();
+  }
+
+  private pasteFromClipboard(): void {
+    const clipboard = navigator.clipboard;
+    if (!clipboard?.readText) return;
+    clipboard.readText().then(
+      text => {
+        this.insertRemoteText(text);
+      },
+      () => {
+        // Clipboard permission denied — pasting is simply unavailable.
+      },
+    );
+  }
+
+  private insertRemoteText(text: string): boolean {
+    const bounded = text.slice(0, BROWSER_MAX_INSERT_TEXT_CHARS);
+    if (!bounded) return false;
+    return this.browser.sendInput({kind: 'insertText', params: {text: bounded}});
   }
 
   /** Best-effort release for blur, baton/lifecycle changes, and destruction. */

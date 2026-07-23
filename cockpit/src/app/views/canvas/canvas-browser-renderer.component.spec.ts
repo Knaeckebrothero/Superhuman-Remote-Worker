@@ -520,6 +520,64 @@ describe('Canvas shared-browser renderer', () => {
     expect(controller.sendInput).not.toHaveBeenCalled();
   });
 
+  it('pastes the local clipboard as a remote text insertion', async () => {
+    const component = fixture.componentInstance;
+    const surface = fixture.nativeElement.querySelector('canvas') as HTMLCanvasElement;
+    controller.connectionStatus.set('ready');
+    controller.pageState.set(page({baton: 'user'}));
+    fixture.detectChanges();
+    surface.focus();
+
+    const readText = vi.fn().mockResolvedValue('hunter2');
+    Object.defineProperty(navigator, 'clipboard', {
+      value: {readText},
+      configurable: true,
+    });
+    try {
+      const chord = {
+        altKey: false,
+        ctrlKey: true,
+        metaKey: false,
+        shiftKey: false,
+        key: 'v',
+        code: 'KeyV',
+        location: 0,
+        repeat: false,
+        isComposing: false,
+        preventDefault: vi.fn(),
+      } as unknown as KeyboardEvent;
+      component.onKeyDown(chord);
+      expect(chord.preventDefault).toHaveBeenCalledOnce();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(controller.sendInput).toHaveBeenLastCalledWith({
+        kind: 'insertText',
+        params: {text: 'hunter2'},
+      });
+      // The chord itself must never be forwarded as a remote key event.
+      expect(
+        controller.sendInput.mock.calls.every(call => call[0].kind !== 'key'),
+      ).toBe(true);
+
+      controller.sendInput.mockClear();
+      const menuPaste = {
+        clipboardData: {getData: vi.fn(() => 'from-menu')},
+        preventDefault: vi.fn(),
+      } as unknown as ClipboardEvent;
+      component.onPaste(menuPaste);
+      expect(controller.sendInput).toHaveBeenLastCalledWith({
+        kind: 'insertText',
+        params: {text: 'from-menu'},
+      });
+      expect(menuPaste.preventDefault).toHaveBeenCalledOnce();
+    } finally {
+      Object.defineProperty(navigator, 'clipboard', {
+        value: undefined,
+        configurable: true,
+      });
+    }
+  });
+
   it('best-effort releases held pointer and keys on blur or authoritative baton loss', () => {
     const component = fixture.componentInstance;
     const surface = fixture.nativeElement.querySelector('canvas') as HTMLCanvasElement;
