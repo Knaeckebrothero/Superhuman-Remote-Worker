@@ -5,7 +5,8 @@ tags:
   - datasources
   - tooling
 aliases:
-  - MCPs & Data Sources
+  - Connectors
+  - MCP Server Connectors
   - user-added MCP servers
   - agent MCP client
 related:
@@ -15,18 +16,23 @@ related:
   - "[[application_tool_surface_baseline]]"
 ---
 
-# MCP Servers as Datasources (User-Added MCPs)
+# MCP Server Connectors (Internal Datasource Type)
 
-Let every user add external MCP servers to their agents the same way they add
-custom datasources. The datasources section becomes **"MCPs & Data Sources"**;
-an MCP server is a datasource of type `mcp` — user-owned, project-linked,
-credential-encrypted — whose tools are discovered at runtime and bound to the
-agent alongside native tools.
+Let every user add external MCP servers to their agents as **connectors**. The
+product section is **Connectors**; an MCP server appears alongside databases,
+repositories, mailboxes, knowledge bases, and credential files.
+
+`datasource` remains the compatibility-sensitive implementation term in API
+routes, database tables, Python/TypeScript types, feature flags, capability
+names, and the `datasources.md` filename. An MCP connector is therefore stored
+internally as a datasource record with `type='mcp'`: user-owned,
+project-linked, credential-encrypted, and runtime-discovered.
 
 ## Problem
 
-Users can self-serve datasources (generic, repository, managed connectors) but
-have no way to give their agents MCP tools. Some integrations only exist as MCP
+Users can self-serve connectors (generic, repository, managed, and
+credential-file types) but have no way to give their agents MCP tools. Some
+integrations only exist as MCP
 servers, and many are simply easier to consume as MCPs than to wrap manually.
 Meanwhile the ecosystem's hosted-MCP catalog keeps growing (GitHub, Linear,
 Notion, Sentry, and most SaaS vendors now ship official servers).
@@ -43,7 +49,7 @@ and no MCP client library is in `requirements.txt`.
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Architecture | **MCP as a datasource type** (`type='mcp'`), not a parallel subsystem | Reuses ownership, project linking, credential encryption, access control, index surfacing, and the verified dispatch path (`process_datasources` → `ToolContext` → `registry.py`). Matches the product framing "everyone can add a custom datasource, so everyone can add an MCP." |
+| Architecture | **MCP connector backed by a datasource type** (`type='mcp'`), not a parallel subsystem | Reuses ownership, project linking, credential encryption, access control, index surfacing, and the verified dispatch path (`process_datasources` → `ToolContext` → `registry.py`). Matches the product framing "everyone can add a connector, including an MCP server." |
 | Transports | **Both from day one**: streamable-HTTP/SSE (remote) and stdio (local subprocess) | Maximum ecosystem coverage. stdio unlocks the npm/pip server catalog; remote covers hosted servers with zero image changes. |
 | Tool exposure | **Expose all tools** a server offers, namespaced; per-server allow-list is a fast-follow | Simplest form, fastest ship. The pressure valve (enabled-tools allow-list) is additive and only built if bloat bites. |
 | Read-only toggle | **None for MCP** | The server is the access boundary (same argument [[datasource_redesign]] makes for its read-only tools). Behaves like `generic`: access level = whatever the credentials grant. |
@@ -138,13 +144,13 @@ wire call always uses the server's true tool name.
 
 ## Surfacing to the LLM
 
-V1 uses the existing **`datasources.md` index**
+V1 uses the existing **connector index in `datasources.md`**
 (`inject_datasource_index` in `src/core/datasource_setup.py`): one line per
 server with its name, transport, tool count, and namespaced tool names. Lists
 are capped at 40 names with a `+N more` tail. Failed servers appear as
 unavailable so the agent does not hallucinate tools.
 
-There is no generic datasource-to-KB synchronization path in the current
+There is no generic connector-to-KB synchronization path in the current
 codebase; only OKF knowledge-base reindexing exists. A searchable per-server KB
 entry is therefore a fast-follow rather than part of v1. Credential values
 never appear in the index.
@@ -204,8 +210,8 @@ stdio is arbitrary third-party code execution **by design**, in the agent pod:
 
 ## UI (Cockpit)
 
-- Rename the section to **"MCPs & Data Sources"** (`en.json` / `de-DE.json`
-  `datasources` keys; route/internal names unchanged).
+- Name the section **Connectors** (`en.json` / `de-DE.json` `datasources`
+  keys; route/internal names unchanged).
 - Type selector gains **MCP Server** — "Connect an MCP server; its tools become
   available to your agents."
 - Form: Name, Description, Transport toggle:
@@ -229,7 +235,7 @@ stdio is arbitrary third-party code execution **by design**, in the agent pod:
   (spawn, discover, call, teardown); streamable-HTTP against a local test
   server; end-to-end `process_datasources` → `load_tools` → `bind_tools` with
   a fake LLM asserting namespaced tools are bound.
-- **k3d smoke:** add an MCP datasource via cockpit, link to a project, run a
+- **k3d smoke:** add an MCP connector via Cockpit, link it to a project, run a
   job that calls one MCP tool; verify index + audit trail.
 - CI (Py3.12) is the gate, per usual.
 
@@ -246,7 +252,8 @@ stdio is arbitrary third-party code execution **by design**, in the agent pod:
 
 ## Fast-Follows
 
-- **Per-server tool allow-list** — `enabled_tools` on the datasource record
+- **Per-server tool allow-list** — `enabled_tools` on the connector's internal
+  datasource record
   (or per-link on `project_datasources`), with a discovery step in the form.
   The designed answer to tool bloat; build when it bites.
 - **OAuth for remote servers** — hosted MCPs increasingly require OAuth 2.1;
@@ -261,4 +268,4 @@ stdio is arbitrary third-party code execution **by design**, in the agent pod:
 - MCP **sampling** (server-initiated LLM calls) — explicitly rejected.
 - Sandboxing stdio beyond pod isolation (gVisor/nsjail etc.).
 - Per-tool curation UI (fast-follow above).
-- Session-scoped ad-hoc MCPs (add via chat) — datasource records only.
+- Session-scoped ad-hoc MCPs (add via chat) — persisted connector records only.

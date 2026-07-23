@@ -772,13 +772,13 @@ def format_created_job(result: dict[str, Any], config_name: str) -> str:
 
 
 def format_datasource_test(datasource_id: str, result: dict[str, Any]) -> str:
-    """Format datasource test result."""
+    """Format a connector test result."""
     status = result.get("status", "unknown")
     message = result.get("message", "")
     icon = "OK" if status == "ok" else "FAILED"
     lines = [
-        f"Datasource test: {icon}",
-        f"Datasource ID: {datasource_id}",
+        f"Connector test: {icon}",
+        f"Connector ID: {datasource_id}",
         f"Status: {status}",
     ]
     if message:
@@ -1356,12 +1356,12 @@ def format_expert_detail(expert_id: str, data: dict[str, Any]) -> str:
 def format_datasources(
     datasources: list[dict[str, Any]], type_filter: str | None = None
 ) -> str:
-    """Format datasource list."""
+    """Format a connector list."""
     if not datasources:
         filter_msg = f" of type '{type_filter}'" if type_filter else ""
-        return f"No datasources found{filter_msg}."
+        return f"No connectors found{filter_msg}."
 
-    lines = [f"Datasources ({len(datasources)}):\n"]
+    lines = [f"Connectors ({len(datasources)}):\n"]
     for ds in datasources:
         ds_id = str(ds.get("id", "unknown"))[:8]
         name = ds.get("name", "unknown")
@@ -2341,7 +2341,7 @@ def format_project_expert_detail(project_id: str, data: dict[str, Any]) -> str:
 
 
 def format_created_datasource(result: dict[str, Any]) -> str:
-    """Format the result of creating a datasource, masking the connection URL."""
+    """Format a created connector while masking its connection URL."""
     ds_id = str(result.get("id", "unknown"))
     name = result.get("name", "unknown")
     ds_type = result.get("type", "unknown")
@@ -2351,7 +2351,7 @@ def format_created_datasource(result: dict[str, Any]) -> str:
     scope = f"job-scoped ({job_id})" if job_id else "global"
 
     lines = [
-        "Datasource created successfully.",
+        "Connector created successfully.",
         f"ID: {ds_id}",
         f"Name: {name}",
         f"Type: {ds_type}",
@@ -2360,7 +2360,9 @@ def format_created_datasource(result: dict[str, Any]) -> str:
         f"URL: {_mask_url(url)}",
     ]
 
-    lines.append("\nUse test_datasource(datasource_id) to verify connectivity.")
+    lines.append(
+        "\nUse test_datasource(datasource_id) to verify the connector's connectivity."
+    )
     return "\n".join(lines)
 
 

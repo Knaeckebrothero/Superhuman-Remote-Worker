@@ -1,7 +1,7 @@
 # Projects and loops — organizing and compounding work
 
 A **project** is the container that makes work compound: it bundles a team,
-shared knowledge, datasources, git repositories, and jobs around one goal.
+shared knowledge, connectors, git repositories, and jobs around one goal.
 Sessions and jobs attached to a project share its context — what one job
 learns, the next one inherits. Every user also has a **personal project** as
 their default home for unattached work.
@@ -19,7 +19,7 @@ The project page has tabs:
 - **Knowledge** — the shared knowledge base agents read and write: searchable
   notes typed as decisions, learnings, goals, plans, questions, and more (see
   the memory-and-knowledge guide).
-- **Datasources** — link shared connections; per-project access can be
+- **Connectors** — link shared external systems and data; per-project access can be
   overridden (read-only vs read-write).
 - **Repos** — the project's git repositories: the managed jobs repo, plus any
   source or reference repos you add.
@@ -64,4 +64,4 @@ at first.
   knowledge base are what make later jobs smarter.
 - Write the goal as an outcome ("users can X"), not a task list; agents plan
   the tasks themselves.
-- Attach datasources at the project level when several jobs need them.
+- Attach connectors at the project level when several jobs need them.

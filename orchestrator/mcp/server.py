@@ -538,7 +538,7 @@ async def create_job(
     Args:
         description: Natural language task description
         config_name: Expert/agent config to use (default: "worker_base")
-        datasource_ids: List of global datasource UUIDs to clone as job-scoped
+        datasource_ids: Connector UUIDs to attach to the job
         instructions: Additional inline markdown instructions
         config_override: Per-job config overrides as JSON. To set the model,
             use {"llm": {"model": "<model_id>"}} — e.g.
@@ -611,13 +611,13 @@ async def assign_job(job_id: str, agent_id: str) -> str:
 
 @mcp.tool
 async def test_datasource(datasource_id: str) -> str:
-    """Test connectivity to a datasource.
+    """Test connectivity to a connector.
 
-    Attempts to connect to the datasource using stored connection details.
+    Attempts to connect to the connector using stored connection details.
     Supports PostgreSQL, Neo4j, and MongoDB. Does not modify any data.
 
     Args:
-        datasource_id: Datasource UUID to test
+        datasource_id: Connector UUID to test
 
     Returns:
         Test result with status and connection details
@@ -1059,20 +1059,20 @@ async def list_models() -> str:
 
 @mcp.tool
 async def list_datasources(ds_type: str | None = None) -> str:
-    """List configured datasources.
+    """List configured connectors.
 
     Args:
         ds_type: Filter by type (postgresql, neo4j, mongodb)
 
     Returns:
-        Datasource list with ID, name, type, connection info, and scope
+        Connector list with ID, name, type, connection info, and scope
     """
     client = _get_client()
     try:
         datasources = await client.list_datasources(ds_type=ds_type)
         return fmt.format_datasources(datasources, type_filter=ds_type)
     except Exception as e:
-        return fmt.format_monitoring_error("list datasources", e)
+        return fmt.format_monitoring_error("list connectors", e)
 
 
 # =============================================================================
@@ -1941,7 +1941,7 @@ async def create_project_job(
             the model, use {"llm": {"model": "<model_id>"}} — e.g.
             {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
             Use the list_models tool to discover available model IDs.
-        datasource_ids: Global datasource IDs to clone (optional)
+        datasource_ids: Connector IDs to attach (optional)
 
     Returns:
         Created job summary with ID
@@ -2175,24 +2175,24 @@ async def create_datasource(
     cli_hint: str | None = None,
     default_branch: str | None = None,
 ) -> str:
-    """Create a new datasource.
+    """Create a new connector.
 
     Types: generic (CLI via env vars), repository (git repo),
     postgresql, neo4j, mongodb, webdav (managed connectors).
-    Use job_id=null for global datasources available to all jobs.
+    Use job_id=null for a connector available to all jobs.
 
     Args:
         name: User-provided label
-        type: Datasource type (generic, repository, postgresql, neo4j, mongodb, webdav)
+        type: Connector type (generic, repository, postgresql, neo4j, mongodb, webdav)
         connection_url: Connection string (optional for generic)
-        description: What this datasource contains (optional)
+        description: What this connector contains (optional)
         credentials: Auth details (optional)
-        job_id: Job UUID for job-scoped datasource (omit for global)
+        job_id: Job UUID for a job-scoped connector (omit for global)
         cli_hint: Suggested CLI command (optional, for generic type)
         default_branch: Branch to clone (optional, for repository type)
 
     Returns:
-        Created datasource summary with masked URL
+        Created connector summary with masked URL
     """
     client = _get_client()
     result = await client.create_datasource(
@@ -2218,12 +2218,12 @@ async def update_datasource(
     cli_hint: str | None = None,
     default_branch: str | None = None,
 ) -> str:
-    """Update an existing datasource's connection details or metadata.
+    """Update an existing connector's connection details or metadata.
 
     Only provided fields are updated; others remain unchanged.
 
     Args:
-        datasource_id: Datasource UUID
+        datasource_id: Connector UUID
         name: New label (optional)
         description: New description (optional)
         connection_url: New connection string (optional)
@@ -2245,17 +2245,17 @@ async def update_datasource(
         default_branch=default_branch,
     )
     status = result.get("status", "unknown")
-    return f"Datasource {datasource_id} updated ({status})."
+    return f"Connector {datasource_id} updated ({status})."
 
 
 @mcp.tool
 async def delete_datasource(datasource_id: str) -> str:
-    """Permanently delete a datasource.
+    """Permanently delete a connector.
 
     This does not affect jobs that have already cloned it.
 
     Args:
-        datasource_id: Datasource UUID
+        datasource_id: Connector UUID
 
     Returns:
         Deletion confirmation
@@ -2263,7 +2263,7 @@ async def delete_datasource(datasource_id: str) -> str:
     client = _get_client()
     result = await client.delete_datasource(datasource_id)
     status = result.get("status", "unknown")
-    return f"Datasource {datasource_id} deleted ({status})."
+    return f"Connector {datasource_id} deleted ({status})."
 
 
 # =============================================================================
@@ -2273,31 +2273,31 @@ async def delete_datasource(datasource_id: str) -> str:
 
 @mcp.tool
 async def list_project_datasources(project_id: str) -> str:
-    """List datasources linked to a project.
+    """List connectors linked to a project.
 
     Args:
         project_id: Project UUID
 
     Returns:
-        Formatted datasource list
+        Formatted connector list
     """
     client = _get_client()
     datasources = await client.list_project_datasources(project_id)
     if not datasources:
-        return f"No datasources linked to project {project_id}."
+        return f"No connectors linked to project {project_id}."
     return fmt.format_datasources(datasources)
 
 
 @mcp.tool
 async def link_datasource_to_project(project_id: str, datasource_id: str) -> str:
-    """Link a datasource to a project.
+    """Link a connector to a project.
 
-    Creates a knowledge entry so agents can discover the datasource
+    Creates a knowledge entry so agents can discover the connector
     through the project's knowledge base.
 
     Args:
         project_id: Project UUID
-        datasource_id: Datasource UUID
+        datasource_id: Connector UUID
 
     Returns:
         Link confirmation
@@ -2305,18 +2305,18 @@ async def link_datasource_to_project(project_id: str, datasource_id: str) -> str
     client = _get_client()
     result = await client.link_datasource_to_project(project_id, datasource_id)
     status = result.get("status", "unknown")
-    return f"Datasource {datasource_id} linked to project {project_id} ({status})."
+    return f"Connector {datasource_id} linked to project {project_id} ({status})."
 
 
 @mcp.tool
 async def unlink_datasource_from_project(project_id: str, datasource_id: str) -> str:
-    """Unlink a datasource from a project.
+    """Unlink a connector from a project.
 
     Removes the corresponding knowledge entry.
 
     Args:
         project_id: Project UUID
-        datasource_id: Datasource UUID
+        datasource_id: Connector UUID
 
     Returns:
         Unlink confirmation
@@ -2324,7 +2324,7 @@ async def unlink_datasource_from_project(project_id: str, datasource_id: str) ->
     client = _get_client()
     result = await client.unlink_datasource_from_project(project_id, datasource_id)
     status = result.get("status", "unknown")
-    return f"Datasource {datasource_id} unlinked from project {project_id} ({status})."
+    return f"Connector {datasource_id} unlinked from project {project_id} ({status})."
 
 
 # =============================================================================

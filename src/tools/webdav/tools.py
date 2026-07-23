@@ -65,14 +65,14 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
     """Create WebDAV tools with injected context.
 
     Args:
-        context: ToolContext with webdav datasource (webdav3.client.Client)
+        context: ToolContext with a WebDAV connector (webdav3.client.Client)
 
     Returns:
         List of LangChain tool functions
     """
     client = context.get_datasource("webdav")
     if not client:
-        raise ValueError("WebDAV datasource not available in context")
+        raise ValueError("WebDAV connector not available in context")
 
     workspace = context.workspace_manager
 

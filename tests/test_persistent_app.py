@@ -4272,7 +4272,7 @@ class TestHandleConfigUpdateDatasources:
         send.assert_awaited_once()
         event, payload = send.await_args.args[1:]
         assert event == "error"
-        assert "datasource" in payload["message"].lower()
+        assert "connector" in payload["message"].lower()
         assert payload["request_id"] == "req-1"
 
     @pytest.mark.asyncio

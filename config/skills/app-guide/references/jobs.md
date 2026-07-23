@@ -10,14 +10,14 @@ can always inspect what happened.
 **Jobs → New Job** (or ask a session agent to create one for you). Fields:
 
 - **Project** — attach the job to a project (or none) for shared knowledge,
-  datasources, and repos.
+  connectors, and repos.
 - **Description** — the task brief. This is the main input; be concrete about
   the goal and what "done" looks like.
 - **Kick-off message** (optional) — an opening prompt to the agent.
 - **Expert** — who does the work (see the experts guide).
 - **Documents** — upload files the agent should work with.
 - **Priority** — Low (backfill), Normal, or High (may preempt lower).
-- **Agent Settings** — autonomy, models, tool categories, datasources, custom
+- **Agent Settings** — autonomy, models, tool categories, connectors, custom
   instructions, and advanced limits. Defaults are sensible; the most
   important knob is autonomy.
 

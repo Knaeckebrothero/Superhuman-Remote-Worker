@@ -352,7 +352,7 @@ async def test_get_session_context_reports_core_context():
     assert "Thread ID: thread-abc" in result
     assert "User ID: user-xyz" in result
     assert "Primary project ID: project-123" in result
-    assert "Datasources: postgresql" in result
+    assert "Connectors: postgresql" in result
 
 
 @pytest.mark.asyncio

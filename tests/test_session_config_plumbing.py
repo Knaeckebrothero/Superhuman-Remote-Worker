@@ -436,7 +436,7 @@ class TestSendSessionAttachPayload:
         }
         denied = HTTPException(
             status_code=403,
-            detail="One or more selected datasources are unavailable",
+            detail="One or more selected connectors are unavailable",
         )
 
         with (

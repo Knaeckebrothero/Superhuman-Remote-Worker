@@ -292,7 +292,7 @@ async def test_kb_create_rejects_legacy_job_id_auto_attachment():
         await create_datasource(body, object())
 
     assert exc.value.status_code == 400
-    assert "explicit datasource selection" in str(exc.value.detail)
+    assert "explicit connector selection" in str(exc.value.detail)
     assert victim_job_id not in str(exc.value.detail)
     db.create_datasource.assert_not_awaited()
 
@@ -616,7 +616,7 @@ async def test_persisted_thread_datasource_is_denied_after_access_revocation():
         )
 
     assert exc.value.status_code == 403
-    assert exc.value.detail == "One or more selected datasources are unavailable"
+    assert exc.value.detail == "One or more selected connectors are unavailable"
     assert str(datasource_id) not in exc.value.detail
 
 
@@ -732,7 +732,7 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
     db.get_thread = AsyncMock(return_value=thread)
     denied = HTTPException(
         status_code=403,
-        detail="One or more selected datasources are unavailable",
+        detail="One or more selected connectors are unavailable",
     )
 
     with (

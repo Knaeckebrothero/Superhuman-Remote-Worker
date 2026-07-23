@@ -349,14 +349,14 @@ def create_email_tools(context: ToolContext) -> List[Any]:
     express (folder allowlist, tier re-check, uidvalidity, send gate).
 
     Args:
-        context: ToolContext with an email datasource (EmailConnection)
+        context: ToolContext with an email connector (EmailConnection)
 
     Returns:
         List of LangChain tool functions
     """
     conn = context.get_datasource("email")
     if not conn:
-        raise ValueError("Email datasource not available in context")
+        raise ValueError("Email connector not available in context")
 
     workspace = context.workspace_manager
 
@@ -376,7 +376,7 @@ def create_email_tools(context: ToolContext) -> List[Any]:
             return (
                 f"Error: this mailbox is attached with access tier "
                 f"'{conn.access}', which does not permit this operation "
-                f"(requires '{required}'). Ask the datasource owner to raise "
+                f"(requires '{required}'). Ask the connector owner to raise "
                 "the access tier if this is needed."
             )
         return None
@@ -553,7 +553,7 @@ def create_email_tools(context: ToolContext) -> List[Any]:
                 raise EmailToolError(
                     "recipients required: pass reply_to_uid (+ folder) to "
                     "reply in-thread, or 'to' addresses that match the "
-                    "datasource recipient allowlist"
+                    "connector recipient allowlist"
                 )
 
         rejected = [
@@ -567,7 +567,7 @@ def create_email_tools(context: ToolContext) -> List[Any]:
             raise EmailToolError(
                 f"recipient(s) not permitted: {', '.join(rejected)}. "
                 "Recipients must come from the replied-to thread or match "
-                f"the datasource recipient allowlist ({scope})."
+                f"the connector recipient allowlist ({scope})."
             )
 
         subject = _clean_inline(subject, 300) or "(no subject)"

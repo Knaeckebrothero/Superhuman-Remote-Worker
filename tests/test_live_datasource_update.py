@@ -704,7 +704,8 @@ class TestDatasourceIndexRewrite:
         inject_datasource_index([_ds("mongodb", "Second DB")], ws)
 
         content = written["datasources.md"]
-        assert content.count("## Available Datasources") == 1
+        assert content.count("## Available Connectors") == 1
+        assert "## Available Datasources" not in content
         assert "First DB" not in content
         assert "Second DB" in content
 
@@ -728,4 +729,6 @@ class TestDatasourceIndexRewrite:
 
         content = written["datasources.md"]
         assert "Gone" not in content
-        assert "_No datasources attached._" in content
+        assert "## Available Connectors" in content
+        assert "## Available Datasources" not in content
+        assert "_No connectors attached._" in content

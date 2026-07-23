@@ -55,6 +55,8 @@ def test_index_renders_connected_server():
     )
 
     text = workspace.files["datasources.md"]
+    assert "## Available Connectors" in text
+    assert "Available Datasources" not in text
     assert "### MCP Servers" in text
     assert "**GitHub** (mcp, 2 tools)" in text
     assert "http" in text

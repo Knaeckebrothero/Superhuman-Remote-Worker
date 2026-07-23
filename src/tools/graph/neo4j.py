@@ -69,7 +69,7 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
     """Create Neo4j graph tools with injected context.
 
     Args:
-        context: ToolContext with dependencies (must include neo4j datasource)
+        context: ToolContext with dependencies (must include a Neo4j connector)
 
     Returns:
         List of LangChain tool functions
@@ -79,7 +79,7 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
     """
     neo4j = context.get_datasource("neo4j")
     if not neo4j:
-        raise ValueError("Neo4j datasource not available in context")
+        raise ValueError("Neo4j connector not available in context")
 
     # Schema cache
     _schema_cache: Optional[Dict] = None

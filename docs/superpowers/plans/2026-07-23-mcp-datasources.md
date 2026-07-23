@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Users add external MCP servers as datasources (`type='mcp'`); the worker agent connects as an MCP client at job/session start, discovers the server's tools, and binds them alongside native tools.
+**Goal:** Users add external MCP servers as connectors (persisted internally as `type='mcp'` datasources); the worker agent connects as an MCP client at job/session start, discovers the server's tools, and binds them alongside native tools.
 
-**Architecture:** MCP rides the existing datasource pipeline end to end: cockpit form → `datasources` table (encrypted `credentials` JSONB) → `project_datasources` link → `_build_datasources_payload` → agent's `process_datasources()` → a new `MCPManager` (one per job, holding N servers, because `ToolContext` datasource slots are TYPE-keyed) → runtime registration into `TOOL_REGISTRY` under category `mcp` → normal `load_tools()`/`bind_tools()`. Tool names the orchestrator can't know ahead of time are expressed as a `"*"` wildcard in the category override and expanded agent-side after discovery.
+**Architecture:** MCP uses the existing internal datasource pipeline end to end: Cockpit connector form → `datasources` table (encrypted `credentials` JSONB) → `project_datasources` link → `_build_datasources_payload` → agent's `process_datasources()` → a new `MCPManager` (one per job, holding N servers, because `ToolContext` datasource slots are TYPE-keyed) → runtime registration into `TOOL_REGISTRY` under category `mcp` → normal `load_tools()`/`bind_tools()`. Tool names the orchestrator can't know ahead of time are expressed as a `"*"` wildcard in the category override and expanded agent-side after discovery.
 
 **Tech Stack:** Python 3.11 (agent/orchestrator), `mcp` SDK + `langchain-mcp-adapters` (new deps), FastAPI, Angular 20 + transloco (cockpit), Helm.
 
@@ -1888,7 +1888,11 @@ if (this.formData.type === 'mcp') {
 "mcpStdioWarning": "This command runs inside the agent environment with the variables above. Only add servers you trust."
 ```
 
-Rename both section labels (en.json:314 and :1065): `"Data Sources"` → `"MCPs & Data Sources"`. de-DE.json: `"MCPs & Datenquellen"` plus German translations of the new keys (match the file's existing tone; e.g. `"mcpStdioWarning": "Dieser Befehl wird innerhalb der Agent-Umgebung mit den obigen Variablen ausgeführt. Nur vertrauenswürdige Server hinzufügen."`).
+Use **Connectors** for the English section, project tab, form, picker, and
+agent-setting labels; use **Konnektoren** in German. Keep `datasources`
+translation keys, routes, and API/type names for compatibility. Translate the
+new MCP keys in the file's existing tone (for example,
+`"mcpStdioWarning": "Dieser Befehl wird innerhalb der Agent-Umgebung mit den obigen Variablen ausgeführt. Nur vertrauenswürdige Server hinzufügen."`).
 
 - [ ] **Step 6: Run to verify pass**
 
@@ -1899,7 +1903,7 @@ Expected: full suite PASS (~353 tests) including the three new specs.
 
 ```bash
 git add cockpit/src/app/views/datasources/ cockpit/src/assets/i18n/
-git commit -m "feat(mcp-ds): cockpit MCP form, MCPs & Data Sources rename, i18n"
+git commit -m "feat(mcp-ds): add Cockpit MCP connector form and i18n"
 ```
 
 ---
@@ -1909,12 +1913,12 @@ git commit -m "feat(mcp-ds): cockpit MCP form, MCPs & Data Sources rename, i18n"
 No code. Validates the deployed slice end to end on the local k3d stack (`tilt up`, memory: local_tilt_dev_stack_stinkpad + local_k3d_testing_via_orchestrator_api).
 
 - [ ] Set `MCP_DATASOURCES_ENABLED=true` + `MCP_STDIO_ENABLED=true` in the local values overlay (`deployment/values-local.yaml`), `tilt up`, wait for orchestrator + agent images to rebuild (dev Dockerfiles drift — force rebuild if cached).
-- [ ] Cockpit: section reads "MCPs & Data Sources"; create a **remote** MCP datasource (any reachable streamable-HTTP server — e.g. a FastMCP echo server port-forwarded into the cluster) → **Test** shows `Connected: N tools (…)`.
-- [ ] Create a **stdio** MCP datasource (`command: npx`, args `-y`/`@modelcontextprotocol/server-everything`) → Test reports untested-here (orchestrator) — expected.
+- [ ] Cockpit: section reads **Connectors**; create a **remote** MCP connector (any reachable streamable-HTTP server — e.g. a FastMCP echo server port-forwarded into the cluster) → **Test Connection** shows `Connected: N tools (…)`.
+- [ ] Create a **stdio** MCP connector (`command: npx`, args `-y`/`@modelcontextprotocol/server-everything`) → Test reports untested-here (orchestrator) — expected.
 - [ ] Link both to a project; dispatch a job: "List the tools you have from MCP servers, then call one of them."
 - [ ] Verify via MCP/API: `datasources.md` in the job workspace has the `### MCP Servers` section with namespaced tool names; audit trail shows an `mcp__…` tool call succeeding.
-- [ ] Break test: point a third MCP datasource at an unreachable URL, dispatch a job → job runs normally, index shows `unavailable`.
-- [ ] Session test: open a persistent session in a project with an MCP datasource → tools available; detach the datasource live → next turn has no mcp tools.
+- [ ] Break test: point a third MCP connector at an unreachable URL, dispatch a job → job runs normally, index shows `unavailable`.
+- [ ] Session test: open a persistent session in a project with an MCP connector → tools available; detach the connector live → next turn has no mcp tools.
 - [ ] Grants test: restrict `datasource_tools` for a test user → dispatched job binds no `mcp__…` tools.
 
 ---
