@@ -81,6 +81,8 @@ FROM python:3.11-slim
 LABEL maintainer="SRW Team"
 LABEL description="Universal Agent (Tilt dev image)"
 
+ARG UV_VERSION="0.7.12"
+
 RUN groupadd -r srw && useradd -r -g srw -m srw
 
 ENV PYTHONUNBUFFERED=1 \
@@ -131,6 +133,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     zip \
     unzip \
     tmux
+
+# Match the production agent's MCP stdio runtime. node/npm/npx come from the
+# NodeSource nodejs package above; uv provides the exact-pinned uvx launcher.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install "uv==${UV_VERSION}"
 
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin

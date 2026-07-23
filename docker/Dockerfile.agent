@@ -55,6 +55,7 @@ RUN groupadd -r srw && useradd -r -g srw -m srw
 
 # Build SHA for stale-image detection (passed via --build-arg)
 ARG BUILD_SHA=""
+ARG UV_VERSION="0.7.12"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -102,6 +103,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip \
     unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# MCP stdio runtimes: NodeSource's nodejs package supplies node/npm/npx above;
+# uv supplies the Python server launcher (uvx). Keep uv exact-pinned so an
+# agent-image rebuild cannot silently change subprocess behavior.
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
 
 # Copy installed packages from builder (system-owned, read-only is fine)
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
