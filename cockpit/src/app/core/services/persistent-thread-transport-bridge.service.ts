@@ -1,4 +1,4 @@
-import {Injectable} from '@angular/core';
+import {Injectable, signal} from '@angular/core';
 import {filter, map, Observable, Subject} from 'rxjs';
 import {CanvasId, MAIN_CANVAS_ID} from '../models/canvas.model';
 
@@ -103,6 +103,19 @@ export class PersistentThreadTransportBridge {
 
   readonly events$: Observable<PersistentThreadTransportEvent> =
     this.eventSubject.asObservable();
+
+  /**
+   * Whether the active thread's assistant turn is currently streaming.
+   * Mirrored here by the chat transport owner so Canvas consumers (the
+   * shared-browser baton automation) never depend on the chat service.
+   */
+  private readonly agentTurnActiveSignal = signal(false);
+  readonly agentTurnActive = this.agentTurnActiveSignal.asReadonly();
+
+  /** @internal Called only by the existing persistent-thread transport owner. */
+  setAgentTurnActive(active: boolean): void {
+    this.agentTurnActiveSignal.set(active);
+  }
 
   readonly canvasInvalidations$: Observable<CanvasInvalidation> = this.events$.pipe(
     map((event) => this.asCanvasInvalidation(event)),

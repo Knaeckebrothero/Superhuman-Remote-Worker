@@ -11,9 +11,11 @@ import {
   effect,
   inject,
   signal,
+  untracked,
 } from '@angular/core';
 import { TranslocoPipe } from '@jsverse/transloco';
 import { CanvasService } from '../../core/services/canvas.service';
+import { PersistentThreadTransportBridge } from '../../core/services/persistent-thread-transport-bridge.service';
 import { AppButtonComponent } from '../../ui/button';
 import { AppIconComponent } from '../../ui/icon';
 import { AppIconButtonComponent } from '../../ui/icon-button';
@@ -229,6 +231,30 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
   readonly browser = inject(CanvasBrowserController);
   readonly canvas = inject(CanvasService);
   private readonly injector = inject(Injector);
+  private readonly transportBridge = inject(PersistentThreadTransportBridge);
+
+  /**
+   * Turn-boundary baton automation: when the agent's turn starts the baton
+   * returns to the agent; when it completes while this surface is connected
+   * the user gets it, ready to drive. sendControl's own guards make both
+   * no-ops when the baton is already right or a flip is in flight. The
+   * first observation only records the baseline, so opening the pane
+   * mid-turn never steals control.
+   */
+  private lastAgentTurnActive: boolean | null = null;
+  private readonly batonAutomation = effect(() => {
+    const active = this.transportBridge.agentTurnActive();
+    const previous = this.lastAgentTurnActive;
+    this.lastAgentTurnActive = active;
+    if (previous === null || previous === active) return;
+    untracked(() => {
+      if (active) {
+        this.browser.sendControl({op: 'release_baton'});
+      } else if (this.browser.connectionStatus() === 'ready') {
+        this.browser.sendControl({op: 'take_baton'});
+      }
+    });
+  });
   private paintEffect: EffectRef | null = null;
   private pointerFrame: number | null = null;
   private pendingPointerMove: PendingBrowserMove | null = null;
