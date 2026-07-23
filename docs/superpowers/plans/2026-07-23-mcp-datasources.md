@@ -10,6 +10,25 @@
 
 **Spec:** `docs/features/mcp_datasources.md` (all decisions locked there).
 
+## Status — Code Complete, Live Gate Pending
+
+Tasks 1–13 were implemented and committed on 2026-07-23. The product-facing
+name is now **Connectors** while `datasource` remains the compatibility term in
+APIs, schemas, feature flags, and the `datasources.md` workspace filename.
+
+Latest automated verification:
+
+- 472 MCP and adjacent Python tests passed;
+- 26 focused Cockpit connector tests passed;
+- both supported Helm lint configurations passed;
+- the full Cockpit suite, TypeScript check, i18n check, Ruff, and the broader
+  affected Python suite passed during implementation.
+
+Task 14 remains the release acceptance gate. The local k3d containers and both
+MCP feature flags are present, but the Kubernetes API was unresponsive and
+Tilt was not running when closure was audited. Do not move this plan to
+`docs/done/` until the live checklist below has been completed.
+
 ## Global Constraints
 
 - Work directly on `develop`; commit per task; **NEVER push without asking**.
@@ -35,7 +54,7 @@
 **Interfaces:**
 - Produces: `mcp_server_slug(name: str, max_len: int = 16) -> str`; `namespace_mcp_tool(server_slug: str, tool_name: str, taken: set[str]) -> str` (deterministic, ≤64 chars, collision-safe). Package `src.tools.mcp` importable.
 
-- [ ] **Step 1: Add pinned dependencies**
+- [x] **Step 1: Add pinned dependencies**
 
 Append to `requirements.txt` after the `langgraph-checkpoint-postgres` line:
 
@@ -46,7 +65,7 @@ langchain-mcp-adapters>=0.1.9,<0.2  # load_mcp_tools: MCP tool -> LangChain Base
 
 Install locally: `pip install 'mcp>=1.9,<2.0' 'langchain-mcp-adapters>=0.1.9,<0.2'`
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 `tests/test_mcp_naming.py`:
 
@@ -104,12 +123,12 @@ class TestNamespaceTool:
         assert a == b
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 Run: `python -m pytest tests/test_mcp_naming.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'src.tools.mcp'`
 
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 `src/tools/mcp/naming.py`:
 
@@ -171,12 +190,12 @@ from .naming import mcp_server_slug, namespace_mcp_tool
 __all__ = ["mcp_server_slug", "namespace_mcp_tool"]
 ```
 
-- [ ] **Step 5: Run to verify pass**
+- [x] **Step 5: Run to verify pass**
 
 Run: `python -m pytest tests/test_mcp_naming.py -v`
 Expected: all PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add requirements.txt src/tools/mcp/ tests/test_mcp_naming.py
@@ -195,7 +214,7 @@ git commit -m "feat(mcp-ds): add MCP client deps and tool-name namespacing"
 - Consumes: nothing new.
 - Produces: `DATASOURCE_TOOL_MAP["mcp"] == {"category": "mcp", "dynamic": True}`; `datasource_tool_categories(...)` yields `{"mcp": ["*"]}` when any MCP datasource is attached, `{"mcp": []}` when none. The `"*"` sentinel is what Task 5's `expand_tool_wildcards` resolves agent-side.
 
-- [ ] **Step 1: Extend the existing tests**
+- [x] **Step 1: Extend the existing tests**
 
 `tests/test_datasource_tool_categories.py` asserts exact dicts (e.g. `test_no_datasources_strips_all_categories` compares `== {...}`). Every exact-dict assertion gains `"mcp": []` (or `["*"]` where an mcp datasource is in the input). Then add:
 
@@ -213,12 +232,12 @@ git commit -m "feat(mcp-ds): add MCP client deps and tool-name namespacing"
         assert cats["mcp"] == ["*"]
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_datasource_tool_categories.py -v`
 Expected: new tests FAIL (`KeyError: 'mcp'`); updated exact-dict tests FAIL until implementation.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `DATASOURCE_TOOL_MAP` (after the `"email"` entry, keeping the closing brace):
 
@@ -241,17 +260,17 @@ In `datasource_tool_categories`, insert a `dynamic` branch after the `if not ds_
             categories[category] = ["*"]
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_datasource_tool_categories.py -v`
 Expected: all PASS
 
-- [ ] **Step 5: Check the other exact-dict consumers**
+- [x] **Step 5: Check the other exact-dict consumers**
 
 Run: `python -m pytest tests/test_live_datasource_update.py tests/test_datasource_redesign.py -v`
 Expected: PASS. If any test asserts the full category dict, add `"mcp": []` there too.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/core/datasource_setup.py tests/test_datasource_tool_categories.py tests/test_live_datasource_update.py tests/test_datasource_redesign.py
@@ -275,7 +294,7 @@ git commit -m "feat(mcp-ds): mcp entry in DATASOURCE_TOOL_MAP with dynamic wildc
 
 **The cancel-scope rule (why owner tasks):** `mcp`'s transport contexts use anyio cancel scopes, which raise if exited from a different task than entered them. Each server therefore gets ONE owner task that enters the transport + session contexts, signals readiness, parks on a shutdown `Event`, and exits its own contexts. Cross-task `session.call_tool(...)` is safe; cross-task context exit is not.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_mcp_manager.py`:
 
@@ -428,12 +447,12 @@ async def test_sync_close_inside_running_loop(tmp_path):
 
 Note: if `pytest.mark.asyncio` isn't configured project-wide, check how other async tests declare it (`rg -l asyncio_mode pytest.ini pyproject.toml setup.cfg tests/conftest.py`) and mirror that.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_mcp_manager.py -v`
 Expected: FAIL — `ImportError: cannot import name 'MCPManager'`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `src/tools/mcp/manager.py`:
 
@@ -703,12 +722,12 @@ from .naming import mcp_server_slug, namespace_mcp_tool
 __all__ = ["MCPManager", "parse_mcp_config", "mcp_server_slug", "namespace_mcp_tool"]
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_mcp_manager.py -v`
 Expected: all PASS. If `StructuredTool(...)` construction complains about the args_schema type, switch to `StructuredTool.from_function(coroutine=..., name=..., description=..., args_schema=tool.args_schema)` — same shape, both are current langchain-core API.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/tools/mcp/ tests/test_mcp_manager.py
@@ -726,7 +745,7 @@ git commit -m "feat(mcp-ds): MCPManager with owner-task lifecycle and stdio/http
 **Interfaces:**
 - Produces: guarded tool coroutines that (a) bound each call at `MCP_CALL_TIMEOUT` (60s), (b) on a dead server attempt ONE reconnect then retry once, (c) always return an error **string** rather than raising (standard tool-error result into the graph — never kills the run).
 
-- [ ] **Step 1: Write the failing tests** (append to `tests/test_mcp_manager.py`)
+- [x] **Step 1: Write the failing tests** (append to `tests/test_mcp_manager.py`)
 
 ```python
 @pytest.mark.asyncio
@@ -770,12 +789,12 @@ async def test_reconnect_once_revives_tool(tmp_path):
         await manager.aclose()
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_mcp_manager.py -k "reconnect or error_returns" -v`
 Expected: FAIL (bare `_call` passthrough raises / no reconnect).
 
-- [ ] **Step 3: Implement** — replace `_guarded` and add `_restart_server`:
+- [x] **Step 3: Implement** — replace `_guarded` and add `_restart_server`:
 
 ```python
     async def _restart_server(self, h: _ServerHandle) -> bool:
@@ -865,12 +884,12 @@ def _content_to_str(result: Any) -> str:
         return str(result)
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_mcp_manager.py -v`
 Expected: all PASS (including Task 3's).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/tools/mcp/manager.py tests/test_mcp_manager.py
@@ -892,7 +911,7 @@ git commit -m "feat(mcp-ds): guard MCP tool calls — 60s bound, one reconnect, 
   - `expand_tool_wildcards(tool_names: List[str]) -> List[str]` — replaces `"*"` with all registered mcp-category names (deduped). MUST run before `load_tools` (which raises on unknown names, registry.py:~323) and before `filter_tools_by_phase` (which silently drops unknown names).
   - `load_tools` handles an `"mcp"` category group by pulling live tools from `context.get_datasource("mcp")` (warn-not-raise when absent, matching the sibling branches).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_mcp_registry.py`:
 
@@ -973,12 +992,12 @@ def test_load_tools_without_manager_warns_not_raises():
 
 Check `ToolContext`'s datasource-holding field name first: `rg -n "datasources" src/tools/context.py | head -5` — the constructor kwarg above must match (it backs `has_datasource`/`get_datasource`, context.py:221/232). Adjust the fixture if the field is named differently.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_mcp_registry.py -v`
 Expected: FAIL — `ImportError: cannot import name 'register_mcp_tools'`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `src/tools/registry.py`, after `get_categories()` (~line 127):
 
@@ -1037,12 +1056,12 @@ In `load_tools`, insert an `mcp` branch alongside the sibling category branches 
                     logger.debug(f"Loaded MCP tool: {tool.name}")
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_mcp_registry.py -v`
 Expected: all PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/tools/registry.py tests/test_mcp_registry.py
@@ -1062,7 +1081,7 @@ git commit -m "feat(mcp-ds): dynamic MCP tool registration, load_tools branch, w
 - Consumes: `MCPManager` (Task 3).
 - Produces: `process_datasources` returns `datasources_dict["mcp"] = MCPManager(mcp_list)` (constructor only — **no I/O**; the async connect happens in Task 7's agent hook). `inject_datasource_index` renders an `### MCP Servers` section from the `_mcp_status`/`_mcp_tools` annotations.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_mcp_datasource_setup.py`:
 
@@ -1141,12 +1160,12 @@ def test_index_caps_long_tool_lists_at_40():
 
 Check `inject_datasource_index`'s workspace-manager usage first (`sed -n '997,1010p' src/core/datasource_setup.py` shows `read_file`/`write_file` via the rewrite logic) — align `FakeWS` with the methods actually called.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_mcp_datasource_setup.py -v`
 Expected: FAIL — no `"mcp"` key in connections; no MCP section in index output.
 
-- [ ] **Step 3: Implement routing** — in `process_datasources`, add an `mcp_list` accumulator next to `generic_list` (~line 233), route in the type dispatch (after the `elif ds_type == "kb":` branch):
+- [x] **Step 3: Implement routing** — in `process_datasources`, add an `mcp_list` accumulator next to `generic_list` (~line 233), route in the type dispatch (after the `elif ds_type == "kb":` branch):
 
 ```python
         elif ds_type == "mcp":
@@ -1165,7 +1184,7 @@ After the connector loop (before `return`):
         datasources_dict["mcp"] = MCPManager(mcp_list)
 ```
 
-- [ ] **Step 4: Implement index section** — in `inject_datasource_index`: add `mcps = [ds for ds in ds_configs if ds.get("type") == "mcp"]` next to the other buckets, add `"mcp"` to the `others` exclusion tuple, and render after the `databases` block:
+- [x] **Step 4: Implement index section** — in `inject_datasource_index`: add `mcps = [ds for ds in ds_configs if ds.get("type") == "mcp"]` next to the other buckets, add `"mcp"` to the `others` exclusion tuple, and render after the `databases` block:
 
 ```python
     if mcps:
@@ -1183,14 +1202,14 @@ After the connector loop (before `return`):
         lines.append("")
 ```
 
-- [ ] **Step 5: Truth-up the design doc** — in `docs/features/mcp_datasources.md`, "Surfacing to the LLM": no generic datasource→KB-entry machinery exists in the codebase (only OKF-kb reindex paths), so change the KB-entry bullet to a **Fast-Follows** item and state that v1 surfaces tools via the `datasources.md` index only (capped at 40 names per server).
+- [x] **Step 5: Truth-up the design doc** — in `docs/features/mcp_datasources.md`, "Surfacing to the LLM": no generic datasource→KB-entry machinery exists in the codebase (only OKF-kb reindex paths), so change the KB-entry bullet to a **Fast-Follows** item and state that v1 surfaces tools via the `datasources.md` index only (capped at 40 names per server).
 
-- [ ] **Step 6: Run to verify pass**
+- [x] **Step 6: Run to verify pass**
 
 Run: `python -m pytest tests/test_mcp_datasource_setup.py tests/test_datasource_tool_categories.py -v`
 Expected: all PASS
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/core/datasource_setup.py tests/test_mcp_datasource_setup.py docs/features/mcp_datasources.md
@@ -1209,7 +1228,7 @@ git commit -m "feat(mcp-ds): route mcp datasources into MCPManager + index secti
 - Consumes: `MCPManager.connect_all/annotate_configs` (Task 3), `register_mcp_tools`, `expand_tool_wildcards` (Task 5), `get_all_tool_names` (`src/core/loader.py`, existing).
 - Produces: a running job connects MCP servers before the index is written and binds discovered tools; `_close_datasource_connections` (agent.py:3374) needs **no change** — `MCPManager.close()` satisfies its `hasattr(conn, "close")` protocol.
 
-- [ ] **Step 1: Write the failing test** — an end-to-end slice below the agent class: config dicts → process → connect → register → expand → load, using the Task 3 echo server.
+- [x] **Step 1: Write the failing test** — an end-to-end slice below the agent class: config dicts → process → connect → register → expand → load, using the Task 3 echo server.
 
 `tests/test_mcp_agent_wiring.py`:
 
@@ -1283,12 +1302,12 @@ async def test_full_job_path_slice(tmp_path):
 
 (Adjust the `ToolContext(datasources=...)` kwarg to the field name confirmed in Task 5.)
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_mcp_agent_wiring.py -v`
 Expected: PASS is actually possible here since Tasks 3–6 landed — if it passes, good: it pins the contract. The agent wiring itself (next step) is covered by this plus manual k3d (Task 14).
 
-- [ ] **Step 3: Wire the agent** — in `_setup_job_tools`, immediately after the `self._datasource_connections.update(datasources_dict)` / `self._datasource_clients.update(client_registry)` pair and **before** `inject_datasource_index(ds_configs, ws)`:
+- [x] **Step 3: Wire the agent** — in `_setup_job_tools`, immediately after the `self._datasource_connections.update(datasources_dict)` / `self._datasource_clients.update(client_registry)` pair and **before** `inject_datasource_index(ds_configs, ws)`:
 
 ```python
         # MCP servers: async connect + dynamic tool registration must happen
@@ -1313,16 +1332,16 @@ In the tool-name assembly (~line 2795), wrap with expansion:
 
 (`filter_tools_by_backend` is already imported there — merge the import line.)
 
-- [ ] **Step 4: Verify cleanup path needs no change**
+- [x] **Step 4: Verify cleanup path needs no change**
 
 Read `src/agent.py:3374` `_close_datasource_connections`: the `hasattr(conn, "close")` loop covers the manager (sync `close()` schedules `aclose()` on the running loop). Confirm no separate client entry exists for `"mcp"` (Task 6 never fills `client_registry`).
 
-- [ ] **Step 5: Run the affected suites**
+- [x] **Step 5: Run the affected suites**
 
 Run: `python -m pytest tests/test_mcp_agent_wiring.py tests/test_mcp_manager.py tests/test_mcp_registry.py -v`
 Expected: all PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/agent.py tests/test_mcp_agent_wiring.py
@@ -1342,12 +1361,12 @@ git commit -m "feat(mcp-ds): job-path wiring — connect MCP servers, register +
 - Consumes: same as Task 7.
 - Produces: sessions get MCP tools at thread start and on live datasource attach; live detach closes the manager.
 
-- [ ] **Step 1: Locate the seams**
+- [x] **Step 1: Locate the seams**
 
 Run: `rg -n "process_datasources|get_all_tool_names|load_tools" src/api/persistent_app.py src/api/persistent_session.py`
 Expected: one `process_datasources(...)` call in each file (persistent_app thread start; persistent_session `_apply_live_datasources`-style attach around its `new_conns, new_clients, ...` unpack), plus the session tool-loading site (`_load_tools_for_backend` in persistent_session.py).
 
-- [ ] **Step 2: Apply the same three additions in BOTH files**
+- [x] **Step 2: Apply the same three additions in BOTH files**
 
 Directly after each `process_datasources(...)` result is stored (both call sites are in async functions — verify with the surrounding `async def`):
 
@@ -1371,14 +1390,14 @@ At the session's tool-name assembly (wherever the flattened name list feeds `loa
 
 For live detach: confirm the detach path funnels through `close_datasource_connections` (datasource_setup.py:300) or the same `hasattr(conn, "close")` idiom — if yes, no change (manager.close() handles it). If the session path closes by type-specific code, add the same `hasattr` treatment for the `"mcp"` key.
 
-- [ ] **Step 3: Watch out for `_apply_datasource_enrichment_to_resolved`** (persistent_app.py:1241): it folds `ds_tool_categories` into the resolved config's `agent.tools` dict — the `["*"]` sentinel flows through it as data, no change needed. Confirm by reading it; if any code path validates tool names before the agent expands, apply `expand_tool_wildcards` there instead.
+- [x] **Step 3: Watch out for `_apply_datasource_enrichment_to_resolved`** (persistent_app.py:1241): it folds `ds_tool_categories` into the resolved config's `agent.tools` dict — the `["*"]` sentinel flows through it as data, no change needed. Confirm by reading it; if any code path validates tool names before the agent expands, apply `expand_tool_wildcards` there instead.
 
-- [ ] **Step 4: Run session-adjacent suites**
+- [x] **Step 4: Run session-adjacent suites**
 
 Run: `python -m pytest tests/test_live_datasource_update.py tests/test_mcp_agent_wiring.py -v`
 Expected: PASS (live-update tests confirm the category dict changes didn't break attach plumbing).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/api/persistent_app.py src/api/persistent_session.py
@@ -1397,7 +1416,7 @@ git commit -m "feat(mcp-ds): session thread-start and live-attach MCP wiring"
 - Consumes: env vars `MCP_DATASOURCES_ENABLED`, `MCP_STDIO_ENABLED`.
 - Produces: `_mcp_datasources_enabled() -> bool`, `_mcp_stdio_enabled() -> bool`, `_validate_mcp_datasource(connection_url, credentials) -> None` (raises `HTTPException(400)`); type `mcp` accepted when gated on; `_build_datasources_payload` passes mcp credentials through untouched (mcp is NOT in `managed_types`, main.py:~15515 — verify, don't change).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/test_mcp_datasource_api.py` — mirror the fixture/bootstrap pattern of `tests/test_kb_datasource_api.py` (read it first; reuse its app/client fixtures). Test bodies:
 
@@ -1467,12 +1486,12 @@ def test_payload_forwards_mcp_credentials():
 
 (If importing `orchestrator.main` at module scope is heavy in the existing suite, mirror however `test_kb_datasource_api.py` imports orchestrator internals.)
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_mcp_datasource_api.py -v`
 Expected: FAIL — `Invalid type 'mcp'` (400 instead of 403/201 paths).
 
-- [ ] **Step 3: Implement** — next to the `SKILLS_DB_ENABLED` helper (main.py:1292 pattern):
+- [x] **Step 3: Implement** — next to the `SKILLS_DB_ENABLED` helper (main.py:1292 pattern):
 
 ```python
 def _mcp_datasources_enabled() -> bool:
@@ -1522,16 +1541,16 @@ In `create_datasource`: add `"mcp"` to `valid_types`, then after the existing kb
 
 In the PUT update endpoint: apply the same block when the (possibly updated) type is `mcp`, validating the merged connection_url/credentials.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_mcp_datasource_api.py tests/test_datasource_access.py tests/test_datasource_credentials_encryption.py -v`
 Expected: all PASS (encryption tests confirm mcp credentials ride the existing encrypt-at-rest path with zero changes).
 
-- [ ] **Step 5: Verify the capability grant covers MCP** — `rg -n "datasource_tools" src/core/capability_grants.py` and read the enforcement: it keys off datasource-derived tool categories generically. If any hardcoded type/category set exists there, add `"mcp"`; otherwise no change. Note the finding in the commit message.
+- [x] **Step 5: Verify the capability grant covers MCP** — `rg -n "datasource_tools" src/core/capability_grants.py` and read the enforcement: it keys off datasource-derived tool categories generically. If any hardcoded type/category set exists there, add `"mcp"`; otherwise no change. Note the finding in the commit message.
 
-- [ ] **Step 5b: Verify `connection_url` is nullable** — stdio datasources store `connection_url = NULL`. Run `rg -n "connection_url" orchestrator/init.py | head -5` and check the `datasources` CREATE TABLE / migration: if the column is `NOT NULL`, add a migration dropping the constraint (the datasource redesign spec already required this for `generic` — it may have landed; the Step 1 stdio-creation test will catch it either way).
+- [x] **Step 5b: Verify `connection_url` is nullable** — stdio datasources store `connection_url = NULL`. Run `rg -n "connection_url" orchestrator/init.py | head -5` and check the `datasources` CREATE TABLE / migration: if the column is `NOT NULL`, add a migration dropping the constraint (the datasource redesign spec already required this for `generic` — it may have landed; the Step 1 stdio-creation test will catch it either way).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add orchestrator/main.py tests/test_mcp_datasource_api.py
@@ -1549,7 +1568,7 @@ git commit -m "feat(mcp-ds): orchestrator gates + mcp type validation (create/up
 **Interfaces:**
 - Produces: `POST /api/datasources/{id}/test` for mcp returns `{"status": "ok", "message": "Connected: N tools (a, b, c…)"}` / `{"status": "error", ...}` / `{"status": "ok", "message": "…untested here…"}` for stdio when the runtime is absent on the orchestrator.
 
-- [ ] **Step 1: Write the failing tests** (append; reuse Task 9 fixtures + the Task 3 echo-server constant):
+- [x] **Step 1: Write the failing tests** (append; reuse Task 9 fixtures + the Task 3 echo-server constant):
 
 ```python
 class TestMcpConnectionTest:
@@ -1586,12 +1605,12 @@ class TestMcpConnectionTest:
 
 Write the `make_mcp_ds` factory fixture against the same DB/bootstrap the file's other fixtures use.
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `python -m pytest tests/test_mcp_datasource_api.py -k McpConnectionTest -v`
 Expected: FAIL — mcp falls through to the generic branch.
 
-- [ ] **Step 3: Implement** — insert before the `elif ds_type in ("generic", "repository"):` branch:
+- [x] **Step 3: Implement** — insert before the `elif ds_type in ("generic", "repository"):` branch:
 
 ```python
         elif ds_type == "mcp":
@@ -1663,12 +1682,12 @@ async def _test_mcp_datasource(url: str | None, creds: dict) -> dict[str, Any]:
         return {"status": "error", "message": str(e)[-2000:]}
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `python -m pytest tests/test_mcp_datasource_api.py -v`
 Expected: all PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add orchestrator/main.py tests/test_mcp_datasource_api.py
@@ -1684,7 +1703,7 @@ git commit -m "feat(mcp-ds): MCP branch in the connection-test endpoint"
 - Modify: `helm/templates/configmap.yaml` (next to the `SKILLS_DB_ENABLED` entry)
 - Modify: `helm/templates/orchestrator/deployment.yaml` (env list, after `SKILLS_DB_ENABLED` ~line 114)
 
-- [ ] **Step 1: values.yaml** — under the same block as `skillsDbEnabled`:
+- [x] **Step 1: values.yaml** — under the same block as `skillsDbEnabled`:
 
 ```yaml
   # User-added MCP servers as datasources (docs/features/mcp_datasources.md).
@@ -1694,14 +1713,14 @@ git commit -m "feat(mcp-ds): MCP branch in the connection-test endpoint"
   mcpStdioEnabled: "false"
 ```
 
-- [ ] **Step 2: configmap.yaml** — mirror the `SKILLS_DB_ENABLED` line's exact idiom:
+- [x] **Step 2: configmap.yaml** — mirror the `SKILLS_DB_ENABLED` line's exact idiom:
 
 ```yaml
   MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}
   MCP_STDIO_ENABLED: {{ .Values.agent.mcpStdioEnabled | default "false" | quote }}
 ```
 
-- [ ] **Step 3: orchestrator deployment env** — after the `SKILLS_DB_ENABLED` block:
+- [x] **Step 3: orchestrator deployment env** — after the `SKILLS_DB_ENABLED` block:
 
 ```yaml
             - name: MCP_DATASOURCES_ENABLED
@@ -1716,12 +1735,12 @@ git commit -m "feat(mcp-ds): MCP branch in the connection-test endpoint"
                   key: MCP_STDIO_ENABLED
 ```
 
-- [ ] **Step 4: Verify rendering**
+- [x] **Step 4: Verify rendering**
 
 Run: `helm template helm/ 2>/dev/null | grep -A3 MCP_DATASOURCES_ENABLED`
 Expected: the configmap entry (`"false"`) and both env blocks render. (If `helm template` needs required values, use the same invocation the repo's chart CI/docs use — check `helm/README.md`.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add helm/values.yaml helm/templates/configmap.yaml helm/templates/orchestrator/deployment.yaml
@@ -1737,7 +1756,7 @@ Note: enabling on dev happens in the GitOps values overlay (deployment repo), no
 **Files:**
 - Modify: `docker/Dockerfile.agent` (production stage — the second `FROM python:3.11-slim`)
 
-- [ ] **Step 1: Add runtimes** — in the production stage, alongside its existing `apt-get install` run (merge into it if one exists; otherwise add after the user-creation step):
+- [x] **Step 1: Add runtimes** — in the production stage, alongside its existing `apt-get install` run (merge into it if one exists; otherwise add after the user-creation step):
 
 ```dockerfile
 # MCP stdio runtimes (docs/features/mcp_datasources.md): npx for npm-ecosystem
@@ -1750,12 +1769,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && pip install --no-cache-dir uv
 ```
 
-- [ ] **Step 2: Build + verify**
+- [x] **Step 2: Build + verify**
 
 Run: `podman build -t srw-agent-mcp-test -f docker/Dockerfile.agent . && podman run --rm srw-agent-mcp-test sh -c 'npx --version && uvx --version && python -c "import mcp, langchain_mcp_adapters; print(\"deps ok\")"'`
 Expected: three version/ok lines, exit 0. (Heavy pip installs can false-flag the shell stall detector — it keeps running; wait it out.)
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docker/Dockerfile.agent
@@ -1772,9 +1791,9 @@ git commit -m "feat(mcp-ds): node/npx + uv/uvx in agent image for stdio MCP serv
 - Modify: `cockpit/src/assets/i18n/de-DE.json` (same keys)
 - Test: `cockpit/src/app/views/datasources/datasource-list.component.spec.ts`
 
-- [ ] **Step 1: Read the component first** — locate: the optgroup list (`typeGroupCli` etc.), the `formData` initializer + reset, `onTypeSelect`, `saveForm`'s credentials assembly per type, and whether a reusable key-value row editor exists (the generic type's env-var editor). Mirror those exact patterns; the snippets below follow the component's visible style (`app-form-field`/`app-input`/`app-select`, `@if` control flow, transloco pipes) — adapt names to what you find.
+- [x] **Step 1: Read the component first** — locate: the optgroup list (`typeGroupCli` etc.), the `formData` initializer + reset, `onTypeSelect`, `saveForm`'s credentials assembly per type, and whether a reusable key-value row editor exists (the generic type's env-var editor). Mirror those exact patterns; the snippets below follow the component's visible style (`app-form-field`/`app-input`/`app-select`, `@if` control flow, transloco pipes) — adapt names to what you find.
 
-- [ ] **Step 2: Write failing specs** (mirror the existing spec file's harness):
+- [x] **Step 2: Write failing specs** (mirror the existing spec file's harness):
 
 ```typescript
   it('offers the MCP type option', () => {
@@ -1798,7 +1817,7 @@ Fill the bodies using the spec file's existing render/interaction helpers.
 Run: `cd cockpit && npx vitest run src/app/views/datasources/datasource-list.component.spec.ts`
 Expected: new specs FAIL.
 
-- [ ] **Step 3: Template additions**
+- [x] **Step 3: Template additions**
 
 New optgroup after the existing groups in the type select:
 
@@ -1848,7 +1867,7 @@ MCP form section (inside the form, alongside the per-type `@if` sections):
 
 Ensure the connection-URL field's visibility condition includes mcp-with-http/sse and excludes mcp-with-stdio (extend `hasConnectionUrl()` or the surrounding `@if`).
 
-- [ ] **Step 4: TS additions** — `formData` gains `mcpTransport: 'http'`, `mcpToken: ''`, `mcpHeaders: <kv-rows>`, `mcpCommand: ''`, `mcpArgs: ''`, `mcpEnv: <kv-rows>` (same defaults in the reset path). In `saveForm`'s credentials assembly:
+- [x] **Step 4: TS additions** — `formData` gains `mcpTransport: 'http'`, `mcpToken: ''`, `mcpHeaders: <kv-rows>`, `mcpCommand: ''`, `mcpArgs: ''`, `mcpEnv: <kv-rows>` (same defaults in the reset path). In `saveForm`'s credentials assembly:
 
 ```typescript
 if (this.formData.type === 'mcp') {
@@ -1868,7 +1887,7 @@ if (this.formData.type === 'mcp') {
 
 (`kvRowsToObject` = whatever the generic env-var editor already uses — reuse, don't duplicate.)
 
-- [ ] **Step 5: i18n** — in `en.json` `datasources.form` block:
+- [x] **Step 5: i18n** — in `en.json` `datasources.form` block:
 
 ```json
 "typeGroupMcp": "MCP",
@@ -1894,12 +1913,12 @@ translation keys, routes, and API/type names for compatibility. Translate the
 new MCP keys in the file's existing tone (for example,
 `"mcpStdioWarning": "Dieser Befehl wird innerhalb der Agent-Umgebung mit den obigen Variablen ausgeführt. Nur vertrauenswürdige Server hinzufügen."`).
 
-- [ ] **Step 6: Run to verify pass**
+- [x] **Step 6: Run to verify pass**
 
 Run: `cd cockpit && npx vitest run`
 Expected: full suite PASS (~353 tests) including the three new specs.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add cockpit/src/app/views/datasources/ cockpit/src/assets/i18n/
