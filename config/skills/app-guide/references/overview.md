@@ -58,9 +58,10 @@ models, users, configuration, capability grants, usage and cost).
 4. **Make a project** for anything ongoing, and create the next jobs inside
    it. From here on, agents inherit what earlier work learned.
 
-A useful shortcut: the session agent can do the driving — it can create and
-manage jobs for you, so "please run this as a background job and tell me
-when it's ready for review" works as a chat message.
+A useful shortcut: when the session's **Fleet Management** tools are enabled,
+the agent can create and steer worker jobs for you. Ask it to “run this as a
+background job,” then follow the durable progress and review from **Jobs** and
+the **Inbox**. Without those tools, use **Jobs → New Job** yourself.
 
 ## How much autonomy to give
 

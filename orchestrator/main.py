@@ -247,6 +247,10 @@ from src.core.backends.factory import LITE_BACKENDS  # noqa: E402
 
 # Datasource type → tool-category map, shared with the agent's session attach
 # path so the two boundaries can't drift (live_session_settings.md P0.2).
+from src.core.datasource_catalog import (  # noqa: E402
+    DATASOURCE_TYPE_IDS,
+    DATASOURCE_TYPES,
+)
 from src.core.datasource_setup import datasource_tool_categories  # noqa: E402
 from src.core.session_tool_overrides import (  # noqa: E402
     SESSION_TOOL_OVERRIDE_NAMES,
@@ -5807,7 +5811,7 @@ class DatasourceCreate(BaseModel):
     name: str = Field(..., description="User-provided label")
     type: str = Field(
         ...,
-        description="Connector type: generic, repository, kb, postgresql, neo4j, mongodb, webdav, email, mcp, kubeconfig, ssh_key, generic_file",
+        description=f"Connector type: {', '.join(DATASOURCE_TYPE_IDS)}",
     )
     connection_url: str | None = Field(
         None, description="Connection string (nullable for generic)"
@@ -16027,20 +16031,7 @@ async def get_datasource(request: Request, datasource_id: str) -> dict[str, Any]
 @app.post("/api/datasources")
 async def create_datasource(body: DatasourceCreate, request: Request) -> dict[str, Any]:
     """Create a new connector owned by the current user."""
-    valid_types = {
-        "generic",
-        "repository",
-        "kb",
-        "postgresql",
-        "neo4j",
-        "mongodb",
-        "webdav",
-        "email",
-        "mcp",
-        "kubeconfig",
-        "ssh_key",
-        "generic_file",
-    }
+    valid_types = DATASOURCE_TYPES
     if body.type not in valid_types:
         raise HTTPException(
             status_code=400,

@@ -1,6 +1,6 @@
 ---
 name: app-guide
-description: Use when the user asks what SRW can do, how to use it, or what something in it means — "what can I do here?", "how do jobs work?", "what's an expert / project / loop?", "why is my job paused?", or "how do I share my database?". Covers sessions, jobs, experts, projects and loops, connectors, memory and knowledge, files, and integrations. Load the current managed guide and its focused bundled references/ with read_product_guide; answer from them, never from priors or mutable workspace copies. For explaining the app to its user, not for orienting yourself in project content (that's project-onboarding).
+description: Use when the user asks what SRW can do, how to use it, or what something in it means — "what can I do here?", "how do jobs work?", "can you run this in the background?", "how do I schedule it?", "what's an expert / project / loop?", "why is my job paused?", "how do I share my email?", or "how do I share my database?". Covers sessions, jobs, fleet/delegation, automations, experts, projects and loops, connectors, memory and knowledge, files, and integrations. Load the current managed guide and its focused bundled references/ with read_product_guide; answer from them, never from priors or mutable workspace copies. For explaining the app to its user, not for orienting yourself in project content (that's project-onboarding).
 display_name: App Guide
 icon: help
 color: "#f9e2af"
@@ -65,9 +65,13 @@ improvise an answer. Features can also be deployment-dependent
 | First orientation, "what is this / what can I do here?", how the pieces fit | `overview` | `references/overview.md` |
 | This chat: what you can do here, permission modes, files, models, skills, interrupting | `sessions` | `references/sessions.md` |
 | Autonomous work: creating jobs, autonomy levels, statuses, approving/resuming, watching progress, results | `jobs` | `references/jobs.md` |
+| Sending background work from a session, Fleet Management, parallel jobs, worker subagent delegation | `fleet-and-delegation` | `references/fleet-and-delegation.md` |
+| Scheduled jobs: creating, testing, pausing, catchup, safety limits, current trigger and connector limits | `automations` | `references/automations.md` |
 | The agent roster: which expert for which task, custom experts | `experts` | `references/experts.md` |
 | Projects, members, shared context, the self-improvement loop | `projects-and-loops` | `references/projects-and-loops.md` |
-| Connecting external systems and data: connector types, what the agent can then do | `datasources` | `references/datasources.md` |
+| Connector overview: supported types, access, attachment, databases, WebDAV, repositories, MCP, credential files | `datasources` | `references/datasources.md` |
+| Connecting Email: providers, app passwords, access tiers, folder and recipient limits, attaching a mailbox | `datasources-email` | `references/datasources-email.md` |
+| Connecting an external OKF Knowledge Base: Git source, indexing, readiness, reindexing, read-only behavior | `datasources-okf` | `references/datasources-okf.md` |
 | What agents remember, the knowledge base, browsing/searching it | `memory-and-knowledge` | `references/memory-and-knowledge.md` |
 | Files, deliverables, cloud storage, git, citations | `files-and-integrations` | `references/files-and-integrations.md` |
 

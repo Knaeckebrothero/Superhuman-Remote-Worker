@@ -1872,7 +1872,7 @@
       "emailAccessHintRead": "Der Agent kann Nachrichten in den erlaubten Ordnern auflisten, lesen und durchsuchen. Es wird nichts verändert.",
       "emailAccessHintReadWrite": "Zusätzlich kann der Agent Nachrichten in den erlaubten Ordnern verschieben und markieren (gelesen/ungelesen, Stern).",
       "emailAccessHintDraft": "Zusätzlich legt der Agent Entwürfe in Ihrem Entwürfe-Ordner ab — Sie prüfen und senden sie aus Ihrem eigenen Programm.",
-      "emailAccessHintSend": "Fügt direkten SMTP-Versand hinzu. In der aktuellen Laufzeit funktioniert dies nur, wenn „Ohne menschliche Freigabe senden“ aktiviert ist; andernfalls erstellt der Agent stattdessen einen Entwurf.",
+      "emailAccessHintSend": "Fügt direkten SMTP-Versand hinzu. In der aktuellen Laufzeit funktioniert dies nur, wenn „Ohne menschliche Freigabe senden“ aktiviert ist; andernfalls muss der Agent stattdessen einen Entwurf erstellen.",
       "emailFoldersLabel": "Ordner-Allowlist",
       "emailFoldersPlaceholder": "AI, AI/Processed",
       "emailFoldersHint": "Kommagetrennte Ordner, auf die der Agent zugreifen darf. Leer lassen für das gesamte Postfach. Tipp: Ein eigener \"AI\"-Ordner, in den Sie Mails verschieben, macht Sie zur Vorsortier-Instanz.",

@@ -22,9 +22,11 @@ connectors) if the defaults don't fit.
 - **Cite as it writes** — sources are tracked and referenced inline as `[N]`
   markers you can click.
 - **Read and write the project knowledge base**, and read git history.
-- **Create and manage jobs for you** — the agent can hand heavy work to the
-  autonomous worker pool (create, check, approve, resume, pause, cancel
-  jobs) while you keep chatting.
+- **Create and manage jobs for you when Fleet Management is enabled** — the
+  agent can hand heavy work to the autonomous worker pool (create, check,
+  approve, resume, pause, cancel jobs) while you keep chatting. The guide does
+  not grant those tools; enable the group in Agent Settings and check the
+  current session's actual tool list.
 - **Use skills** — bundled how-to procedures it loads when relevant.
 
 ## Permission modes — how much it asks first
