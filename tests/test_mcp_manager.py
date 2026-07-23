@@ -1,0 +1,177 @@
+"""MCPManager lifecycle: parse, connect, discover, degrade, and close.
+
+Integration tests run a real stdio MCP server as a subprocess via
+``sys.executable``. They require no external network or service.
+"""
+
+import asyncio
+import sys
+import textwrap
+
+import pytest
+
+from src.tools.mcp.manager import MCPManager, parse_mcp_config
+
+ECHO_SERVER = textwrap.dedent(
+    """
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP("echo")
+
+    @mcp.tool()
+    def echo(text: str) -> str:
+        \"\"\"Echo the input back.\"\"\"
+        return f"echo: {text}"
+
+    @mcp.tool()
+    def add(a: int, b: int) -> int:
+        \"\"\"Add two integers.\"\"\"
+        return a + b
+
+    mcp.run(transport="stdio")
+    """
+)
+
+
+def _stdio_ds(script_path, name="Echo Server"):
+    return {
+        "type": "mcp",
+        "name": name,
+        "connection_url": None,
+        "credentials": {
+            "transport": "stdio",
+            "command": sys.executable,
+            "args": [str(script_path)],
+            "env": {},
+        },
+    }
+
+
+class TestParseConfig:
+    def test_http_requires_url(self):
+        with pytest.raises(ValueError, match="connection_url"):
+            parse_mcp_config(
+                {
+                    "type": "mcp",
+                    "name": "x",
+                    "connection_url": None,
+                    "credentials": {"transport": "http"},
+                }
+            )
+
+    def test_stdio_requires_command(self):
+        with pytest.raises(ValueError, match="command"):
+            parse_mcp_config(
+                {
+                    "type": "mcp",
+                    "name": "x",
+                    "connection_url": None,
+                    "credentials": {"transport": "stdio"},
+                }
+            )
+
+    def test_unknown_transport_rejected(self):
+        with pytest.raises(ValueError, match="transport"):
+            parse_mcp_config(
+                {
+                    "type": "mcp",
+                    "name": "x",
+                    "connection_url": "http://h",
+                    "credentials": {"transport": "carrier-pigeon"},
+                }
+            )
+
+    def test_bearer_auth_becomes_header(self):
+        cfg = parse_mcp_config(
+            {
+                "type": "mcp",
+                "name": "x",
+                "connection_url": "https://h/mcp",
+                "credentials": {
+                    "transport": "http",
+                    "auth": {"type": "bearer", "token": "tok123"},
+                },
+            }
+        )
+        assert cfg.headers == {"Authorization": "Bearer tok123"}
+
+    def test_defaults_to_http_transport(self):
+        cfg = parse_mcp_config(
+            {
+                "type": "mcp",
+                "name": "x",
+                "connection_url": "https://h/mcp",
+                "credentials": {},
+            }
+        )
+        assert cfg.transport == "http"
+
+
+@pytest.mark.asyncio
+async def test_connect_discover_call_close(tmp_path):
+    script = tmp_path / "echo_server.py"
+    script.write_text(ECHO_SERVER)
+    ds = _stdio_ds(script)
+    manager = MCPManager([ds])
+    await manager.connect_all()
+    try:
+        tools = manager.get_langchain_tools()
+        names = {tool.name for tool in tools}
+        assert "mcp__echo_server__echo" in names
+        assert "mcp__echo_server__add" in names
+        echo = next(tool for tool in tools if tool.name.endswith("__echo"))
+        result = await echo.coroutine(text="hi")
+        assert "echo: hi" in str(result)
+        manager.annotate_configs()
+        assert ds["_mcp_status"] == "connected"
+        assert "mcp__echo_server__echo" in ds["_mcp_tools"]
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unreachable_server_degrades_not_raises(tmp_path):
+    broken = _stdio_ds(tmp_path / "nonexistent.py", name="Broken")
+    good_script = tmp_path / "echo_server.py"
+    good_script.write_text(ECHO_SERVER)
+    good = _stdio_ds(good_script, name="Good")
+    manager = MCPManager([broken, good])
+    await manager.connect_all()
+    try:
+        manager.annotate_configs()
+        assert broken["_mcp_status"].startswith("unavailable")
+        assert good["_mcp_status"] == "connected"
+        assert all(
+            tool.name.startswith("mcp__good__")
+            for tool in manager.get_langchain_tools()
+        )
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_config_marked_invalid():
+    manager = MCPManager(
+        [
+            {
+                "type": "mcp",
+                "name": "bad",
+                "connection_url": None,
+                "credentials": {},
+            }
+        ]
+    )
+    await manager.connect_all()
+    assert manager.statuses["bad"].startswith("unavailable")
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sync_close_inside_running_loop(tmp_path):
+    script = tmp_path / "echo_server.py"
+    script.write_text(ECHO_SERVER)
+    manager = MCPManager([_stdio_ds(script)])
+    await manager.connect_all()
+    manager.close()
+    await asyncio.sleep(0.5)
+    assert all(handle.task.done() for handle in manager._handles)
