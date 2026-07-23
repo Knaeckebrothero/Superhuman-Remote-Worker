@@ -29,6 +29,7 @@ class TestDatasourceToolCategories:
             "mongodb": [],
             "webdav": [],
             "email": [],
+            "mcp": [],
         }
 
     def test_read_only_managed_connector_gets_read_tools(self):
@@ -89,7 +90,20 @@ class TestDatasourceToolCategories:
             "mongodb": [],
             "webdav": [],
             "email": [],
+            "mcp": [],
         }
+
+    def test_mcp_attached_yields_wildcard(self):
+        cats = datasource_tool_categories([_ds("mcp")])
+        assert cats["mcp"] == ["*"]
+
+    def test_mcp_absent_strips_category(self):
+        assert datasource_tool_categories([])["mcp"] == []
+
+    def test_mcp_read_only_link_still_wildcard(self):
+        # No read-only mode for MCP: the server is the access boundary.
+        cats = datasource_tool_categories([_ds("mcp", read_only=True)])
+        assert cats["mcp"] == ["*"]
 
     def test_returns_copies_not_map_references(self):
         cats = datasource_tool_categories([_ds("webdav", read_only=True)])
