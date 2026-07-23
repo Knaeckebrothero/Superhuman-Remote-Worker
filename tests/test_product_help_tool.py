@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from src.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
+    add_persistent_system_skills,
     skill_bundle_digest,
 )
 from src.tools.context import ToolContext
@@ -65,6 +66,32 @@ def test_reader_returns_procedure_and_one_focused_reference():
     assert "[product guide topic: sessions]" in out
     assert "CURRENT SESSION HELP" in out
     assert "CURRENT OVERVIEW" not in out
+
+
+def test_reader_serves_current_email_and_okf_topics_independently():
+    catalog = add_persistent_system_skills({})
+    reader = _reader(ToolContext(config={"_resolved_skills": catalog}))
+
+    email = reader.invoke({"topic_id": "datasources-email"})
+    okf = reader.invoke({"topic_id": "datasources-okf"})
+
+    assert "Folder allowlist" in email
+    assert "OKF Root Path" not in email
+    assert "OKF Root Path" in okf
+    assert "Folder allowlist" not in okf
+
+
+def test_reader_serves_current_automation_and_fleet_topics_independently():
+    catalog = add_persistent_system_skills({})
+    reader = _reader(ToolContext(config={"_resolved_skills": catalog}))
+
+    automations = reader.invoke({"topic_id": "automations"})
+    fleet = reader.invoke({"topic_id": "fleet-and-delegation"})
+
+    assert "Scheduled delivery is at-least-once" in automations
+    assert "Fleet Management does not delete jobs" not in automations
+    assert "Fleet Management does not delete jobs" in fleet
+    assert "Scheduled delivery is at-least-once" not in fleet
 
 
 def test_reader_rejects_paths_and_unknown_topics_without_reading_them():
