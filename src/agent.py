@@ -2592,6 +2592,28 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._datasource_connections.update(datasources_dict)
         self._datasource_clients.update(client_registry)
 
+        # Discovery must finish before rendering datasources.md and loading
+        # tools. MCPManager degrades individual server failures internally.
+        mcp_manager = datasources_dict.get("mcp")
+        if mcp_manager is not None:
+            from .tools.registry import register_mcp_tools
+
+            try:
+                await mcp_manager.connect_all()
+            except Exception as e:
+                logger.warning(
+                    "Unexpected MCP discovery failure (%s); continuing without MCP",
+                    type(e).__name__,
+                )
+            try:
+                register_mcp_tools(mcp_manager)
+                mcp_manager.annotate_configs()
+            except Exception as e:
+                logger.warning(
+                    "Could not register MCP tools (%s); continuing without MCP",
+                    type(e).__name__,
+                )
+
         if repo_datasources:
             clone_repository_datasources(repo_datasources, ws)
 
@@ -2790,9 +2812,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # declare supports_shell=False so shell/browser/git are dropped, and
         # none's ScratchBackend (supports_file_tools=False) also drops the file
         # tools — enforcement-by-construction, independent of the config lists.
-        from .tools.registry import filter_tools_by_backend
+        from .tools.registry import expand_tool_wildcards, filter_tools_by_backend
 
-        tool_names = get_all_tool_names(self.config)
+        tool_names = expand_tool_wildcards(get_all_tool_names(self.config))
         tool_names = filter_tools_by_backend(
             tool_names, self._workspace_manager.backend
         )
