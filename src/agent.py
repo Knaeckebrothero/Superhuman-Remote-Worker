@@ -2592,12 +2592,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._datasource_connections.update(datasources_dict)
         self._datasource_clients.update(client_registry)
 
+        from .tools.registry import register_mcp_tools
+
         # Discovery must finish before rendering datasources.md and loading
         # tools. MCPManager degrades individual server failures internally.
         mcp_manager = datasources_dict.get("mcp")
         if mcp_manager is not None:
-            from .tools.registry import register_mcp_tools
-
             try:
                 await mcp_manager.connect_all()
             except Exception as e:
@@ -2613,6 +2613,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     "Could not register MCP tools (%s); continuing without MCP",
                     type(e).__name__,
                 )
+        else:
+            # Loop-mode workers are process-reused; do not retain the prior
+            # job's dynamic registry entries.
+            register_mcp_tools(None)
 
         if repo_datasources:
             clone_repository_datasources(repo_datasources, ws)

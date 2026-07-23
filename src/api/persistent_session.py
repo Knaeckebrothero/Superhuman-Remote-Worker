@@ -1161,7 +1161,9 @@ class PersistentSession:
         ``cloud_mount_manager``), so it is safe to call again post-swap.
         """
         # Get all tool names and filter out phase-specific ones
-        all_names = get_all_tool_names(self.config)
+        from ..tools.registry import expand_tool_wildcards
+
+        all_names = expand_tool_wildcards(get_all_tool_names(self.config))
         tool_names = [n for n in all_names if n not in _EXCLUDED_TOOLS]
 
         # Always include session task tools in persistent mode
@@ -1387,7 +1389,7 @@ class PersistentSession:
             f"Re-derived {len(self.tools)} tools after backend swap ({backend_name})"
         )
 
-    def resetup_datasources(
+    async def resetup_datasources(
         self, new_datasources: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Apply a live datasource selection change (live_session_settings.md
@@ -1474,6 +1476,20 @@ class PersistentSession:
             ds for ds in new_configs if ds.get("type") not in ("repository", "kb")
         ]
         new_conns, new_clients, cli_ds_types = process_datasources(non_repo)
+
+        from ..tools.registry import register_mcp_tools
+
+        mcp_manager = new_conns.get("mcp")
+        if mcp_manager is not None:
+            try:
+                await mcp_manager.connect_all()
+            except Exception as e:
+                logger.warning(
+                    "Unexpected live MCP discovery failure (%s); continuing",
+                    type(e).__name__,
+                )
+            mcp_manager.annotate_configs()
+        register_mcp_tools(mcp_manager)
 
         stale_connections = dict(self.datasources)
         stale_clients = dict(self._datasource_clients)
