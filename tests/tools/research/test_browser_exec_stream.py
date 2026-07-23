@@ -273,8 +273,7 @@ class TestStreamHub:
             hub.add_viewer(queue, 3)
             state = BE.encode_stream_frame(BE.T_STATE, b'{"s":1}')
             frames = [
-                BE.encode_stream_frame(BE.T_FRAME, b"jpeg-%d" % i)
-                for i in range(3)
+                BE.encode_stream_frame(BE.T_FRAME, b"jpeg-%d" % i) for i in range(3)
             ]
             hub.broadcast(state)
             for frame in frames:
@@ -294,8 +293,7 @@ class TestStreamHub:
             queue = asyncio.Queue(maxsize=2)
             hub.add_viewer(queue, 3)
             frames = [
-                BE.encode_stream_frame(BE.T_FRAME, b"jpeg-%d" % i)
-                for i in range(3)
+                BE.encode_stream_frame(BE.T_FRAME, b"jpeg-%d" % i) for i in range(3)
             ]
             for frame in frames:
                 hub.broadcast_frame(frame)
@@ -703,8 +701,7 @@ class TestBatonRefusal:
 class TestLaunchHygiene:
     def test_parse_chromium_version(self):
         assert (
-            BE._parse_chromium_version("Chromium 138.0.7204.15 \n")
-            == "138.0.7204.15"
+            BE._parse_chromium_version("Chromium 138.0.7204.15 \n") == "138.0.7204.15"
         )
         assert BE._parse_chromium_version("") is None
         assert BE._parse_chromium_version("garbage") is None
@@ -729,8 +726,10 @@ class TestLaunchHygiene:
 
     def test_clean_user_agent_none_when_probe_fails(self, monkeypatch):
         monkeypatch.setattr(BE, "_UA_CACHE", [])
+
         def boom(*a, **k):
             raise OSError("no binary")
+
         monkeypatch.setattr(BE.subprocess, "run", boom)
         assert BE._clean_user_agent() is None
 
