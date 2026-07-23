@@ -266,6 +266,44 @@ class TestStreamHub:
 
         asyncio.run(run())
 
+    def test_frame_broadcast_supersedes_queued_frame(self):
+        async def run():
+            hub = BE.StreamHub()
+            queue = BE.ViewerQueue(maxsize=4)
+            hub.add_viewer(queue, 3)
+            state = BE.encode_stream_frame(BE.T_STATE, b'{"s":1}')
+            frames = [
+                BE.encode_stream_frame(BE.T_FRAME, b"jpeg-%d" % i)
+                for i in range(3)
+            ]
+            hub.broadcast(state)
+            for frame in frames:
+                hub.broadcast_frame(frame)
+
+            # The two older frames were superseded in place: the viewer sees
+            # ordered state plus only the newest frame, never a backlog.
+            assert queue.qsize() == 2
+            assert queue.get_nowait() == state
+            assert queue.get_nowait() == frames[-1]
+
+        asyncio.run(run())
+
+    def test_frame_broadcast_drop_oldest_fallback_for_plain_queue(self):
+        async def run():
+            hub = BE.StreamHub()
+            queue = asyncio.Queue(maxsize=2)
+            hub.add_viewer(queue, 3)
+            frames = [
+                BE.encode_stream_frame(BE.T_FRAME, b"jpeg-%d" % i)
+                for i in range(3)
+            ]
+            for frame in frames:
+                hub.broadcast_frame(frame)
+            assert queue.get_nowait() == frames[1]
+            assert queue.get_nowait() == frames[2]
+
+        asyncio.run(run())
+
     def test_mixed_replica_limits_only_tighten_until_zero_viewers(self):
         hub = BE.StreamHub()
         first = hub.add_viewer(asyncio.Queue(), 5)
