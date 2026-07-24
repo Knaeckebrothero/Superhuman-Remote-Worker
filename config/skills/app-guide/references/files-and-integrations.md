@@ -1,23 +1,25 @@
 # Files, git, cloud, and citations — where work lives
 
-Agents work in isolated workspaces, but nothing is locked in: everything is
-versioned in git, deliverables can flow to shared cloud storage, and you can
-open any workspace in a browser IDE.
+Agents can work with isolated files, but the available storage, git, and IDE
+surfaces depend on the workspace tier. Deliverables can also flow to shared
+cloud storage.
 
 ## The agent workspace
 
-Every job and session gets an isolated workspace with a simple structure:
-`documents/` (inputs you provided), `notes/` (the agent's working notes), and
-`output/` (deliverables). Workspaces are git-versioned — the agent commits as
-it works, so its history is inspectable.
+Jobs and sessions with file tools use a simple structure: `documents/`
+(inputs you provided), `notes/` (the agent's working notes), and `output/`
+(deliverables). Virtual sessions keep durable cloud-backed files but do not
+have git. Container and VM workspaces can be git-versioned. None sessions are
+chat-only and have no workspace files.
 
 ## Git
 
-The built-in git server hosts every workspace repository:
+The built-in git server hosts repositories for git-capable workspaces:
 
 - **Workspace / Git buttons** (on job rows, in the chat header, in reviews)
   open the repository — browse files, commits, phase tags, and branches.
-- Each root job gets its own repository; delegated subjobs work on branches.
+- Each git-capable root job gets its own repository; delegated subjobs work on
+  branches.
 - **Projects** carry repositories too: a managed jobs repo plus any source or
   reference repos you add on the Repos tab. Project membership grants
   matching git access automatically.
@@ -41,10 +43,11 @@ Same single sign-on as the app.
 
 ## The in-browser IDE
 
-**IDE** buttons (jobs list, chat header, job review) open the agent's
-workspace in a browser-based code editor — the fastest way to poke through
-what an agent actually produced, or to make a quick edit yourself. It starts
-on demand, so give it a moment on first open.
+When a full workspace supports it, **IDE** buttons (jobs list, chat header,
+job review) open the agent's workspace in a browser-based code editor—the
+fastest way to inspect what an agent produced or make a quick edit. It starts
+on demand, so give it a moment on first open. Virtual and None sessions do not
+provide this workspace IDE.
 
 ## Citations
 

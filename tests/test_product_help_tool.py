@@ -94,6 +94,19 @@ def test_reader_serves_current_automation_and_fleet_topics_independently():
     assert "Scheduled delivery is at-least-once" not in fleet
 
 
+def test_reader_serves_canvas_and_permissions_topics_independently():
+    catalog = add_persistent_system_skills({})
+    reader = _reader(ToolContext(config={"_resolved_skills": catalog}))
+
+    canvas = reader.invoke({"topic_id": "canvas-and-browser"})
+    permissions = reader.invoke({"topic_id": "permissions-and-availability"})
+
+    assert "Take control" in canvas
+    assert "global, project, and user scope" not in canvas
+    assert "global, project, and user scope" in permissions
+    assert "Take control" not in permissions
+
+
 def test_reader_rejects_paths_and_unknown_topics_without_reading_them():
     reader = _reader(_context())
 

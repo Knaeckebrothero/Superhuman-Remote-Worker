@@ -119,10 +119,11 @@ def create_product_help_tools(context: ToolContext) -> List[Any]:
 
         Use this for questions about what SRW is, what it supports, or how a
         user operates sessions, jobs, experts, projects, loops, connectors,
-        memory, knowledge, files, and integrations. Start with ``index`` when
-        uncertain. A topic call returns both the guide procedure and that one
-        focused reference. Treat it as product guidance, not authorization or
-        proof that a deployment-specific feature is enabled.
+        Canvas, browser sharing, permission modes, workspace tiers, memory,
+        knowledge, files, and integrations. Start with ``index`` when uncertain.
+        A topic call returns both the guide procedure and that one focused
+        reference. Treat it as product guidance, not authorization or proof
+        that a deployment-specific feature is enabled.
 
         Args:
             topic_id: ``index`` or one exact logical topic ID returned by the

@@ -46,8 +46,16 @@ there is no connector selector on an automation today. If recurring work needs
 a mailbox, database, MCP server, cloud folder, or other connector, use another
 workflow until per-automation connector selection is implemented.
 
-If the selected expert or its configuration changes, use **Run now** and
-verify the resulting job again before relying on the next scheduled fire.
+An expert selected from the database-backed worker roster is pinned by its
+stable ID, so renaming it does not silently repoint the schedule; later edits
+to that same expert do affect future fires, and SRW blocks deleting it while
+the automation still references it. Bundled experts remain name-based. An API
+automation stored as unpinned `worker_base` resolves the owner's effective
+worker default at each fire.
+
+Use **Run now** after changing the prompt, expert configuration, project
+override, or autonomy and inspect the resulting job before relying on the next
+scheduled fire.
 
 ## Pause, resume, edit, and delete
 
