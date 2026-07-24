@@ -241,7 +241,9 @@ stdio is arbitrary third-party code execution **by design**, in the agent pod:
   server; end-to-end `process_datasources` → `load_tools` → `bind_tools` with
   a fake LLM asserting namespaced tools are bound.
 - **k3d smoke:** add an MCP connector via Cockpit, link it to a project, run a
-  job that calls one MCP tool; verify index + audit trail.
+  job that calls one MCP tool; verify index + audit trail. The complete pending
+  deployment, security, lifecycle, and rollout matrix is maintained in
+  `tests/mcp_connectors_live_validation.md`.
 - CI (Py3.12) is the gate, per usual.
 
 ## Rollout
