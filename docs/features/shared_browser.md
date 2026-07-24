@@ -72,6 +72,41 @@ implementation plan is
 redacted evidence and exact limitations are in
 `docs/tests/shared_browser_verification.md`.
 
+### Usability batch (2026-07-23)
+
+First real use on the dev cluster (informal; not a Task-14 gate claim) showed
+the pipe working end to end — user and agent sharing one browser — and
+surfaced six usability defects, all fixed on develop
+(`96324917..e77d6c87`, plus the unrelated MiniMax `thinking.type` fix):
+
+- **Key defaults fire.** Cockpit key events now carry
+  `windowsVirtualKeyCode`/`nativeVirtualKeyCode` (and `text: '\r'` for Enter);
+  without them CDP delivers `keyCode: 0` and pages never see Enter/Backspace
+  defaults.
+- **Clipboard paste in.** `INPUT` gained an `insertText` kind: Ctrl/Cmd+V is
+  intercepted locally and the viewer's clipboard text is inserted remotely via
+  CDP `Input.insertText` (caps: 8k chars cockpit, 16k daemon). Copy *out* of
+  the remote browser remains deferred.
+- **Cold open lands somewhere.** A cold `stream_info` kicks a background
+  navigation to `BROWSER_EXEC_START_URL` (default google.com) — only while the
+  page is still `about:blank`, so agent-driven pages are never clobbered.
+- **Newest-frame delivery.** Per-viewer queues supersede a queued unsent FRAME
+  in place (`ViewerQueue.put_frame`); STATE/ERROR keep bounded FIFO order.
+  With backpressure handled by replacement, the screencast captures every
+  compositor frame (`everyNthFrame` default 2 → 1).
+- **Baton follows the turn.** The chat service mirrors assistant-turn
+  streaming into `PersistentThreadTransportBridge.agentTurnActive`; the
+  renderer releases the baton when a turn starts and takes it for the user
+  when a turn completes while the surface is connected. The explicit baton
+  controls and daemon authority are unchanged — this is client-side
+  automation on top.
+- **Launch fingerprint hygiene.** Chromium starts with
+  `--disable-blink-features=AutomationControlled` and a user agent rebuilt
+  from the real binary's `--version` minus the `Headless` marker, so
+  human-driven clicks stop failing bot checks on the two loudest signals.
+  Client-hint brands still expose headless; the complete fix (headful under
+  Xvfb) is deliberately deferred.
+
 Still deferred are the stage-2 VM artifact run and deployment-specific VM
 binding/routing attestation. Live prompt-driven handoff also needs a working
 LLM endpoint, and this host's k3d CNI prevented a replacement orchestrator pod
@@ -282,7 +317,7 @@ length][1-byte type][payload]`. Types:
 | `HELLO` | in | JSON `{token, min_protocol}` | First message. Token authenticates the broker (see below); daemon replies `STATE`. Wrong/missing token → connection closed |
 | `FRAME` | out | `[2-byte BE header length][header JSON {generation, w, h, ts}][raw JPEG bytes]` | One screencast frame |
 | `STATE` | out | JSON `{generation, url, title, loading, baton, viewport}` | Sent on connect and on every change (navigation, title, baton flip) |
-| `INPUT` | in | JSON mouse/key/wheel event (CDP-shaped) | Honored only while `baton == "user"` |
+| `INPUT` | in | JSON mouse/key/wheel/insertText event (CDP-shaped) | Honored only while `baton == "user"` |
 | `CONTROL` | in | JSON `{op: "take_baton" \| "release_baton" \| "navigate" \| "back" \| "reload", ...}` | Viewer commands |
 | `ERROR` | out | JSON `{code, message}` | e.g. `navigation_rejected`, `browser_gone` |
 

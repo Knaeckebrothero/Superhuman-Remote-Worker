@@ -2731,7 +2731,10 @@ orchestrator routing; building the golden image would not claim either.
 
 The precise current boundary, protocol, and redacted evidence are in
 `shared_browser.md`, `docs/tests/shared_browser_verification.md`, and the two
-execution plans.
+execution plans. A 2026-07-23 usability batch from first dev-cluster use
+(Enter virtual key codes, clipboard paste-in, cold-open start page,
+newest-frame delivery, turn-following baton automation, launch fingerprint
+hygiene) is recorded in the spec's "Usability batch (2026-07-23)" section.
 
 The next shared-browser checkpoint is **Plan 3 — release and enablement**. It
 will carry the four unfinished Plan-2 acceptance gates: reproducible live k3d
