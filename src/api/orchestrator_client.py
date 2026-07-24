@@ -111,6 +111,9 @@ _CANVAS_PUBLIC_ERROR_MESSAGES = {
     "canvas_file_too_large": "Canvas content is too large",
     "canvas_image_too_large": "Canvas image is too large",
     "canvas_not_file": "Canvas is not file-backed",
+    "canvas_office_unavailable": (
+        "Office document viewing is not enabled or currently available"
+    ),
     "canvas_precondition_failed": "Canvas state changed; inspect it and try again",
     "canvas_precondition_required": "Canvas state must be inspected before changing it",
     "canvas_presentation_changed": "Canvas presentation changed; inspect it and try again",

@@ -8,6 +8,7 @@ import json
 import posixpath
 import stat
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -231,6 +232,47 @@ async def test_gateway_rechecks_hash_then_writes_and_validates_readback(
 
     with pytest.raises(CanvasFileError, match="UTF-8"):
         await gateway.validate_edit_candidate(_record(), b"\xff")
+
+
+@pytest.mark.asyncio
+async def test_office_renderer_stays_closed_at_gateway_and_coordinator_gates() -> None:
+    gateway = ThreadWorkspaceFileGateway(
+        remote_writer=lambda *args: asyncio.sleep(0),
+    )
+    office = replace(
+        _record(),
+        renderer="office",
+        editable=True,
+    )
+
+    assert gateway.supports_editing(_thread(), office) is False
+    with pytest.raises(CanvasFileError) as candidate:
+        await gateway.validate_edit_candidate(office, b"PK\x03\x04office")
+    assert candidate.value.code == "canvas_not_editable"
+
+    db = _EditDB()
+    db.row.update(renderer="office", editable=True)
+    writer_called = False
+
+    async def writer(record, thread):
+        nonlocal writer_called
+        del record, thread
+        writer_called = True
+        return "sha256:" + "f" * 64
+
+    fingerprint = _record().source_fingerprint
+    assert fingerprint is not None
+    with pytest.raises(CanvasEditError) as coordinator:
+        await CanvasService(db).edit_file(
+            THREAD_ID,
+            expected_presentation_revision=1,
+            expected_source_fingerprint=fingerprint,
+            expected_source_version=OLD_VERSION,
+            expected_thread_user_id=USER_ID,
+            writer=writer,
+        )
+    assert coordinator.value.code == "canvas_not_editable"
+    assert writer_called is False
 
 
 @pytest.mark.asyncio

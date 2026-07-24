@@ -151,7 +151,8 @@ from security.anti_framing import (  # noqa: E402
 )
 from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
-from routers import canvases_router, internal_canvases_router  # noqa: E402
+from routers import canvases_router, internal_canvases_router, wopi_router  # noqa: E402
+from services.canvas_office import warm_collabora_discovery  # noqa: E402
 from routers import project_loops_router  # noqa: E402
 from routers import shared_browser_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
@@ -6692,6 +6693,19 @@ async def lifespan(app: FastAPI):
     # Connect to databases
     await postgres_db.connect()
     await vector_db.connect()
+    if os.getenv("COLLABORA_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        if await warm_collabora_discovery():
+            logger.info("Collabora discovery cache warmed")
+        else:
+            logger.warning(
+                "Collabora is enabled but discovery is unavailable; "
+                "Office Canvas capability remains dark"
+            )
 
     # Audit DB is the non-load-bearing observability tier: a connect failure
     # must NOT abort startup (unlike the control-plane + vector DBs above).
@@ -7521,6 +7535,7 @@ app.include_router(uploads_router)
 app.include_router(automations_router)
 app.include_router(canvases_router)
 app.include_router(internal_canvases_router)
+app.include_router(wopi_router)
 app.include_router(project_loops_router)
 app.include_router(shared_browser_router)
 app.include_router(sessions_router)

@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 MAX_TEXT_BYTES = int(os.getenv("CANVAS_MAX_TEXT_BYTES", str(2 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(os.getenv("CANVAS_MAX_IMAGE_BYTES", str(25 * 1024 * 1024)))
+MAX_OFFICE_BYTES = int(os.getenv("CANVAS_MAX_OFFICE_BYTES", str(25 * 1024 * 1024)))
 MAX_FILE_BYTES = int(os.getenv("CANVAS_MAX_FILE_BYTES", str(50 * 1024 * 1024)))
 MAX_IMAGE_PIXELS = int(os.getenv("CANVAS_MAX_IMAGE_PIXELS", "40000000"))
 MAX_IMAGE_FRAMES = int(os.getenv("CANVAS_MAX_IMAGE_FRAMES", "1000"))
@@ -117,6 +118,20 @@ _TEXT_EXTENSIONS = frozenset(
 )
 _HTML_EXTENSIONS = frozenset({".html", ".htm"})
 _IMAGE_EXTENSIONS = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
+_OFFICE_MEDIA_BY_EXTENSION = {
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ),
+    ".xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ".pptx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ),
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+}
+_OFFICE_EXTENSIONS = frozenset(_OFFICE_MEDIA_BY_EXTENSION)
+_OFFICE_VENDOR_MEDIA = frozenset(_OFFICE_MEDIA_BY_EXTENSION.values())
 _IMAGE_MEDIA = {
     "PNG": "image/png",
     "JPEG": "image/jpeg",
@@ -247,7 +262,7 @@ class ValidatedCanvasFile:
     path: str
     data: bytes
     media_type: str
-    renderer: Literal["markdown", "text", "html", "html-interactive", "image"]
+    renderer: Literal["markdown", "text", "html", "html-interactive", "image", "office"]
     source_version: str
     last_modified: datetime | None
 
@@ -308,6 +323,8 @@ def _workspace_read_limit(path: str) -> int:
     extension = PurePosixPath(path).suffix.lower()
     if extension in _TEXT_EXTENSIONS or extension in _HTML_EXTENSIONS:
         return min(MAX_TEXT_BYTES, MAX_FILE_BYTES)
+    if extension in _OFFICE_EXTENSIONS:
+        return min(MAX_OFFICE_BYTES, MAX_FILE_BYTES)
     if extension in _IMAGE_EXTENSIONS:
         return min(MAX_IMAGE_BYTES, MAX_FILE_BYTES)
     # Known raster extensions use the image ceiling. Unknown extensions can
@@ -397,6 +414,68 @@ def _validate_image(data: bytes) -> tuple[str, int]:
     return media_type, pixels
 
 
+def _office_media_type(extension: str, detected: str) -> str | None:
+    """Resolve one exact Office extension/MIME pair, rejecting cross-format lies."""
+
+    expected = _OFFICE_MEDIA_BY_EXTENSION.get(extension)
+    if expected is not None:
+        if detected not in {expected, "application/zip"}:
+            raise CanvasFileError(
+                422,
+                "mime_renderer_mismatch",
+                "Office extension does not match the detected document bytes",
+            )
+        return expected
+    if detected in _OFFICE_VENDOR_MEDIA:
+        raise CanvasFileError(
+            422,
+            "mime_renderer_mismatch",
+            "Office document bytes require a matching supported Office extension",
+        )
+    return None
+
+
+def _validated_office_file(
+    path: str,
+    data: bytes,
+    *,
+    detected: str,
+    expected_source_version: str | None = None,
+) -> ValidatedCanvasFile:
+    """Validate only the bounded binary Office branch (never the UTF-8 path)."""
+
+    extension = PurePosixPath(path).suffix.lower()
+    media_type = _office_media_type(extension, detected)
+    if media_type is None:
+        raise CanvasFileError(
+            422,
+            "unsupported_canvas_file",
+            "File is not a supported Office document",
+        )
+    if len(data) > MAX_OFFICE_BYTES:
+        raise CanvasFileError(
+            413, "canvas_file_too_large", "Office document is too large"
+        )
+    source_version = _sha256(data)
+    if (
+        expected_source_version is not None
+        and source_version != expected_source_version
+    ):
+        raise CanvasFileError(
+            409,
+            "source_changed",
+            "Workspace bytes changed; republish the Canvas to adopt them",
+        )
+    return ValidatedCanvasFile(
+        path=path,
+        data=data,
+        media_type=media_type,
+        renderer="office",
+        source_version=source_version,
+        last_modified=None,
+    )
+
+
 def validate_canvas_bytes(
     path: str,
     data: bytes,
@@ -412,11 +491,15 @@ def validate_canvas_bytes(
 
     extension = PurePosixPath(path).suffix.lower()
     detected = _magic_media_type(data)
-    renderer: Literal["markdown", "text", "html", "html-interactive", "image"]
+    renderer: Literal["markdown", "text", "html", "html-interactive", "image", "office"]
     media_type: str
 
-    is_likely_image = detected.startswith("image/")
-    if is_likely_image:
+    office_media_type = _office_media_type(extension, detected)
+    if office_media_type is not None:
+        office = _validated_office_file(path, data, detected=detected)
+        renderer = office.renderer
+        media_type = office.media_type
+    elif detected.startswith("image/"):
         if len(data) > MAX_IMAGE_BYTES:
             raise CanvasFileError(
                 413, "canvas_file_too_large", "Encoded image is too large"
@@ -479,6 +562,7 @@ def validate_canvas_bytes(
         "text": {"text"},
         "html": {"html", "html-interactive", "text"},
         "image": {"image"},
+        "office": {"office"},
     }
     if requested_renderer != "auto":
         if requested_renderer not in compatible[renderer]:
@@ -538,6 +622,37 @@ async def _validate_materialized_bytes_async(
             data,
             requested_renderer,
             alt_text,
+            expected_source_version,
+        )
+
+
+def _validate_materialized_office_bytes(
+    path: str,
+    data: bytes,
+    expected_source_version: str | None,
+) -> ValidatedCanvasFile:
+    """CPU-bound Office-only magic/hash validation for the WOPI read path."""
+
+    if len(data) > MAX_FILE_BYTES:
+        raise CanvasFileError(413, "canvas_file_too_large", "File is too large")
+    return _validated_office_file(
+        path,
+        data,
+        detected=_magic_media_type(data),
+        expected_source_version=expected_source_version,
+    )
+
+
+async def _validate_materialized_office_bytes_async(
+    path: str,
+    data: bytes,
+    expected_source_version: str | None,
+) -> ValidatedCanvasFile:
+    async with _materialization_slot(_VALIDATION_SEMAPHORE):
+        return await _run_blocking(
+            _validate_materialized_office_bytes,
+            path,
+            data,
             expected_source_version,
         )
 
@@ -1087,6 +1202,34 @@ class ThreadWorkspaceFileGateway:
             expected_source_version=record.source_version,
         )
 
+    async def materialize_binary(
+        self, thread: dict[str, Any], record: CanvasRecord
+    ) -> ValidatedCanvasFile:
+        """Materialize one current Office file through the binary-only validator."""
+
+        source = record.source
+        if not isinstance(source, WorkspaceFileSource) or record.renderer != "office":
+            raise CanvasFileError(
+                422,
+                "canvas_not_office",
+                "The current Canvas is not an Office document",
+            )
+        if current_workspace_generation(thread) != source.workspace_generation:
+            raise CanvasFileError(
+                409,
+                "workspace_generation_changed",
+                "The selected workspace generation is no longer current",
+            )
+        return await self._materialize(
+            thread,
+            source.path,
+            source.workspace_generation,
+            requested_renderer="office",
+            alt_text=None,
+            expected_source_version=record.source_version,
+            office_only=True,
+        )
+
     async def materialize_for_refresh(
         self, thread: dict[str, Any], record: CanvasRecord
     ) -> ValidatedCanvasFile:
@@ -1256,6 +1399,7 @@ class ThreadWorkspaceFileGateway:
         requested_renderer: CanvasRenderer,
         alt_text: str | None,
         expected_source_version: str | None = None,
+        office_only: bool = False,
     ) -> ValidatedCanvasFile:
         path = canonical_workspace_path(path)
         thread = await self._authoritative_thread(thread)
@@ -1288,13 +1432,20 @@ class ThreadWorkspaceFileGateway:
                     "workspace_generation_changed",
                     "The selected workspace generation is no longer current",
                 )
-            validated = await _validate_materialized_bytes_async(
-                path,
-                raw.data,
-                requested_renderer,
-                alt_text,
-                expected_source_version,
-            )
+            if office_only:
+                validated = await _validate_materialized_office_bytes_async(
+                    path,
+                    raw.data,
+                    expected_source_version,
+                )
+            else:
+                validated = await _validate_materialized_bytes_async(
+                    path,
+                    raw.data,
+                    requested_renderer,
+                    alt_text,
+                    expected_source_version,
+                )
         return ValidatedCanvasFile(
             path=validated.path,
             data=validated.data,
