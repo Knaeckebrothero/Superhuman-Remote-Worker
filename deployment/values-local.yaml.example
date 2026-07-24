@@ -6,6 +6,7 @@
 #
 #   cp deployment/values-local.yaml.example deployment/values-local.yaml
 #   $EDITOR deployment/values-local.yaml   # paste at least one LLM key
+#   helm dependency build ./helm
 #   helm install srw ./helm -n srw --create-namespace -f deployment/values-local.yaml
 #
 # Everything else here is dev-only defaults that just work after `helm install`:
