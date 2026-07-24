@@ -33,16 +33,24 @@ better inline in chat out of Canvas.
    `alt_text`. Give images embedded in Markdown their own inline alt text.
 6. Tell the user what is on the stage and what feedback would be useful.
 
-For static HTML, make one script-free document with simple, bounded inline
-styles. Style blocks, animations, filters, scripts, forms, and embedded or
-external resources are removed. Do not embed images or fonts, including data
-URLs, and do not use relative resources because the Slice 1 renderer never
-resolves sibling workspace files. Present a raster image as its own Canvas
-source. Keep generated markup reasonably small and structurally simple so it
-stays within renderer complexity limits. Do not claim that static HTML is a
-live application. Use only source types and fields present in the current
-`set_canvas` schema; never guess app, port, browser, or routing fields that are
-not advertised.
+For strict static HTML, use `renderer="html"` or `auto` and make one script-free
+document with simple, bounded inline styles. Style blocks, animations, filters,
+scripts, forms, and embedded or external resources are removed. Do not embed
+images or fonts, including data URLs, and do not use relative resources because
+the strict renderer never resolves sibling workspace files. Present a raster
+image as its own Canvas source.
+
+For a self-contained HTML mockup, visualization, widget, or small game that
+needs style blocks or inline JavaScript, explicitly choose
+`renderer="html-interactive"`. This mode preserves the document's HTML, CSS, and
+inline scripts inside an opaque-origin sandbox. It has no network access, forms,
+popups, storage, parent-page access, or external/relative resources, so inline
+every required CSS, script, image, and font. `auto` never selects this mode.
+Keep the file bounded and self-contained, and do not describe it as a live
+workspace application.
+
+Use only source types and fields present in the current `set_canvas` schema;
+never guess app, port, browser, or routing fields that are not advertised.
 
 ## Refresh Without Losing User Work
 

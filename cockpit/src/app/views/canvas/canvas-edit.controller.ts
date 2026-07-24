@@ -342,7 +342,10 @@ export class CanvasEditController {
       source?.type !== 'workspace_file' ||
       typeof source.path !== 'string' ||
       !contentUrl ||
-      (renderer !== 'markdown' && renderer !== 'text' && renderer !== 'html')
+      renderer !== 'markdown' &&
+      renderer !== 'text' &&
+      renderer !== 'html' &&
+      renderer !== 'html-interactive'
     ) {
       this.saveStatus.set('error');
       this.conflict.set('save_failed');
@@ -549,7 +552,10 @@ function snapshotFrom(
     !state.capabilities.can_edit ||
     !sourceKey ||
     !contentUrl ||
-    (renderer !== 'markdown' && renderer !== 'text' && renderer !== 'html')
+    renderer !== 'markdown' &&
+    renderer !== 'text' &&
+    renderer !== 'html' &&
+    renderer !== 'html-interactive'
   ) {
     return null;
   }

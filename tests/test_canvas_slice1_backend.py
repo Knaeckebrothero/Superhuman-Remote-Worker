@@ -180,6 +180,25 @@ def test_path_and_byte_validation_fail_closed(monkeypatch) -> None:
         )
 
 
+def test_interactive_html_renderer_is_explicit_and_html_only() -> None:
+    data = b"<!doctype html><style>.card{color:green}</style><div class=card>Safe</div>"
+    detected = validate_canvas_bytes("output/mockup.html", data)
+    interactive = validate_canvas_bytes(
+        "output/mockup.html",
+        data,
+        requested_renderer="html-interactive",
+    )
+
+    assert detected.renderer == "html"
+    assert interactive.renderer == "html-interactive"
+    with pytest.raises(CanvasFileError, match="incompatible"):
+        validate_canvas_bytes(
+            "output/mockup.md",
+            b"# Mockup\n",
+            requested_renderer="html-interactive",
+        )
+
+
 def test_javascript_mime_is_narrowly_treated_as_text(monkeypatch) -> None:
     from services import canvas_files
 

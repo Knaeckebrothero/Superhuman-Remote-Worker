@@ -97,6 +97,7 @@
       "markdown": "Markdown",
       "text": "Text",
       "html": "Static HTML",
+      "html-interactive": "Interactive HTML",
       "image": "Image",
       "app": "Live app",
       "browser": "Shared browser",
@@ -121,7 +122,8 @@
       "missingAlt": "Image with no description provided"
     },
     "html": {
-      "frameTitle": "Static Canvas preview: {{title}}"
+      "frameTitle": "Static Canvas preview: {{title}}",
+      "interactiveFrameTitle": "Interactive Canvas preview: {{title}}"
     },
     "browser": {
       "source": "Current shared browser",

@@ -7,8 +7,11 @@ import {
   CANVAS_RENDER_MAX_NODES,
   CANVAS_RENDER_MAX_OUTPUT_CHARS,
   CANVAS_STATIC_MAX_TOTAL_STYLE_CHARS,
+  INTERACTIVE_HTML_CSP,
   STATIC_HTML_CSP,
+  buildCanvasFrameWrapper,
   canvasSourceKey,
+  renderCanvasInteractiveHtml,
   renderCanvasMarkdown,
   renderCanvasStaticHtml,
   resolveCanvasContentUrl,
@@ -37,7 +40,7 @@ function state(renderer: CanvasState['renderer'], sourceType = 'workspace_file')
 }
 
 describe('Dynamic Canvas rendering trust boundary', () => {
-  it.each(['markdown', 'text', 'html', 'image'] as const)(
+  it.each(['markdown', 'text', 'html', 'html-interactive', 'image'] as const)(
     'selects the trusted %s renderer only for workspace files',
     renderer => {
       expect(selectCanvasRenderer(state(renderer))).toBe(renderer);
@@ -247,6 +250,54 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     expect(parsed.querySelector('style')).toBeNull();
     expect(content?.getAttribute('style')).toBe('color: red;');
     expect(srcdoc).not.toMatch(/animation|filter|background-image/i);
+  });
+
+  it('preserves self-contained interactive HTML behind the injected no-network CSP', () => {
+    const result = renderCanvasInteractiveHtml(`
+      <!doctype html>
+      <html>
+        <head>
+          <style>:root { --accent: green } .card { color: var(--accent) }</style>
+        </head>
+        <body>
+          <a href="#dashboard">Dashboard</a>
+          <section id="dashboard" class="card">Ready</section>
+          <script>document.body.dataset.ready = 'true'</script>
+        </body>
+      </html>
+    `);
+    expect(result.errorCode).toBeNull();
+    const parsed = new DOMParser().parseFromString(result.html, 'text/html');
+    const firstHeadElement = parsed.head.firstElementChild;
+    expect(firstHeadElement?.getAttribute('http-equiv')).toBe('Content-Security-Policy');
+    expect(firstHeadElement?.getAttribute('content')).toBe(INTERACTIVE_HTML_CSP);
+    expect(parsed.querySelector('style')?.textContent).toContain('var(--accent)');
+    expect(parsed.querySelector('script')?.textContent).toContain('dataset.ready');
+    expect(parsed.querySelector('a')?.getAttribute('href')).toBe('#dashboard');
+  });
+
+  it('loads Canvas documents from Blob URLs inside a navigation-blocking wrapper', () => {
+    const staticWrapper = new DOMParser().parseFromString(
+      buildCanvasFrameWrapper('blob:https://cockpit.test/static', 'Static preview', false),
+      'text/html',
+    );
+    const staticFrame = staticWrapper.querySelector('iframe');
+    expect(staticFrame?.getAttribute('src')).toBe('blob:https://cockpit.test/static');
+    expect(staticFrame?.getAttribute('sandbox')).toBe('');
+    expect(staticWrapper.querySelector('meta[http-equiv="Content-Security-Policy"]')
+      ?.getAttribute('content')).toContain('frame-src blob:');
+
+    const interactiveWrapper = new DOMParser().parseFromString(
+      buildCanvasFrameWrapper(
+        'blob:https://cockpit.test/interactive',
+        'Interactive preview',
+        true,
+      ),
+      'text/html',
+    );
+    const interactiveFrame = interactiveWrapper.querySelector('iframe');
+    expect(interactiveFrame?.getAttribute('sandbox')).toBe('allow-scripts');
+    expect(interactiveFrame?.getAttribute('allow')).toContain("camera 'none'");
   });
 
   it('rejects Markdown token bombs before lexing while accepting plain text at the file ceiling', () => {
