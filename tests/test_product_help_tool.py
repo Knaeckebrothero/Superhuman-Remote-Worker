@@ -107,6 +107,20 @@ def test_reader_serves_canvas_and_permissions_topics_independently():
     assert "Take control" not in permissions
 
 
+def test_reader_serves_project_loop_and_protected_cloud_topics_independently():
+    catalog = add_persistent_system_skills({})
+    reader = _reader(ToolContext(config={"_resolved_skills": catalog}))
+
+    loop = reader.invoke({"topic_id": "project-loops"})
+    protected = reader.invoke({"topic_id": "protected-cloud"})
+
+    assert "close the campaign, not the overall project loop" in loop
+    assert "Reject is permanent" not in loop
+    assert "Cloud changes (N)" in protected
+    assert "Reject is permanent" in protected
+    assert "close the campaign, not the overall project loop" not in protected
+
+
 def test_reader_rejects_paths_and_unknown_topics_without_reading_them():
     reader = _reader(_context())
 

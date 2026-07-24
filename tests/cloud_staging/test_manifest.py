@@ -157,8 +157,18 @@ def test_select_protected_mount_picks_first_nextcloud_with_handle():
     rows = [
         {"backend_id": "opencloud", "cloud_handle": "h0"},
         {"backend_id": "nextcloud", "cloud_handle": None},
-        {"backend_id": "nextcloud", "cloud_handle": "h1", "mountpoint": "Proj"},
-        {"backend_id": "nextcloud", "cloud_handle": "h2"},
+        {
+            "mount_kind": "project_default",
+            "backend_id": "nextcloud",
+            "cloud_handle": "personal-home",
+        },
+        {
+            "mount_kind": "project",
+            "backend_id": "nextcloud",
+            "cloud_handle": "h1",
+            "mountpoint": "Proj",
+        },
+        {"mount_kind": "project", "backend_id": "nextcloud", "cloud_handle": "h2"},
     ]
     assert select_protected_mount(rows)["cloud_handle"] == "h1"
     assert select_protected_mount([]) is None
