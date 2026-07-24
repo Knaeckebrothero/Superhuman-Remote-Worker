@@ -71,9 +71,15 @@ export class CanvasContentController {
       return;
     }
 
-    // Live apps own an attachment/session lifecycle, not file bytes. Keep this
-    // controller file-only so it never treats a viewer bootstrap as content.
-    if (renderer === 'app' || renderer === 'unsupported' || !sourceKey || !visualKey) {
+    // Live apps and Office own separate session lifecycles, not Canvas content
+    // bytes. Office binaries must only flow through Collabora's WOPI GetFile.
+    if (
+      renderer === 'app' ||
+      renderer === 'office' ||
+      renderer === 'unsupported' ||
+      !sourceKey ||
+      !visualKey
+    ) {
       this.clearVisual();
       return;
     }

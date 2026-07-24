@@ -99,6 +99,7 @@
       "html": "Static HTML",
       "html-interactive": "Interactive HTML",
       "image": "Image",
+      "office": "Office document",
       "app": "Live app",
       "browser": "Shared browser",
       "unsupported": "Unsupported source"
@@ -124,6 +125,11 @@
     "html": {
       "frameTitle": "Static Canvas preview: {{title}}",
       "interactiveFrameTitle": "Interactive Canvas preview: {{title}}"
+    },
+    "office": {
+      "frameTitle": "Office document: {{title}}",
+      "connecting": "Opening the Office document…",
+      "unavailable": "The Office document could not be opened."
     },
     "browser": {
       "source": "Current shared browser",

@@ -43,6 +43,8 @@ import {
   canvasBrowserStatusKey,
 } from './canvas-browser-renderer.component';
 import {CanvasLiveAppRendererComponent} from './canvas-live-app-renderer.component';
+import {CanvasOfficeController} from './canvas-office.controller';
+import {CanvasOfficeRendererComponent} from './canvas-office-renderer.component';
 import {
   CanvasLiveAppUnavailableComponent,
   canvasLiveAppFailureKind,
@@ -100,6 +102,7 @@ export function browserOpenErrorKey(code: string | null): string {
     CanvasBrowserController,
     CanvasContentController,
     CanvasEditController,
+    CanvasOfficeController,
     CanvasViewerController,
   ],
   imports: [
@@ -116,6 +119,7 @@ export function browserOpenErrorKey(code: string | null): string {
     CanvasInteractiveHtmlRendererComponent,
     CanvasLiveAppRendererComponent,
     CanvasLiveAppUnavailableComponent,
+    CanvasOfficeRendererComponent,
     CanvasMarkdownRendererComponent,
     CanvasTextRendererComponent,
     CanvasEditorComponent,
@@ -314,6 +318,13 @@ export function browserOpenErrorKey(code: string | null): string {
                                               (frameUnbound)="viewer.unbindFrame($event)"
                                               (frameMessage)="viewer.handleFrameMessage($event)" />
               }
+              @case ('office') {
+                <app-canvas-office-renderer
+                  [session]="office.session()!"
+                  [officeOrigin]="office.officeOrigin()!"
+                  [title]="officeFrameTitle()"
+                  (documentLoaded)="office.markDocumentLoaded()" />
+              }
               @case ('browser') {
                 <app-canvas-browser-renderer />
               }
@@ -321,7 +332,8 @@ export function browserOpenErrorKey(code: string | null): string {
             @if (showOverlay()) {
               <div class="canvas-overlay" role="status">
                 @if (contentStatus() === 'loading' || canvas.loadStatus() === 'loading' ||
-                     viewer.viewerStatus() === 'loading' || viewer.viewerStatus() === 'renewing') {
+                     viewer.viewerStatus() === 'loading' || viewer.viewerStatus() === 'renewing' ||
+                     office.officeStatus() === 'loading') {
                   <app-spinner size="sm" tone="accent" />
                 } @else {
                   <app-icon size="sm">info</app-icon>
@@ -355,7 +367,8 @@ export function browserOpenErrorKey(code: string | null): string {
                 </div>
               } @else {
                 @if (contentStatus() === 'loading' || canvas.loadStatus() === 'loading' ||
-                     viewer.viewerStatus() === 'loading' || viewer.viewerStatus() === 'renewing') {
+                     viewer.viewerStatus() === 'loading' || viewer.viewerStatus() === 'renewing' ||
+                     office.officeStatus() === 'loading') {
                   <app-spinner size="md" tone="accent" />
                 } @else {
                   <app-icon size="xl">preview</app-icon>
@@ -382,6 +395,7 @@ export class CanvasPaneComponent {
   private readonly content = inject(CanvasContentController);
   readonly editor = inject(CanvasEditController);
   readonly viewer = inject(CanvasViewerController);
+  readonly office = inject(CanvasOfficeController);
   readonly browser = inject(CanvasBrowserController);
   private readonly transloco = inject(TranslocoService);
   private readonly router = inject(Router);
@@ -416,7 +430,9 @@ export class CanvasPaneComponent {
       return this.editor.sessionRenderer();
     }
     const selected = selectCanvasRenderer(this.state());
-    return selected === 'app' || selected === 'browser' ? selected : this.displayRenderer();
+    return selected === 'app' || selected === 'office' || selected === 'browser'
+      ? selected
+      : this.displayRenderer();
   });
   readonly previewContent = computed(() =>
     this.editor.hasSession() && this.editor.dirty()
@@ -426,6 +442,7 @@ export class CanvasPaneComponent {
   readonly hasVisual = computed(() => {
     if (this.editor.editMode() && this.editor.hasSession()) return true;
     if (this.effectiveRenderer() === 'app') return this.viewer.frameUrl() !== null;
+    if (this.effectiveRenderer() === 'office') return this.office.session() !== null;
     if (this.effectiveRenderer() === 'browser') return true;
     if (this.effectiveRenderer() === 'image') return this.imageUrl() !== null;
     return this.effectiveRenderer() !== 'unsupported' &&
@@ -500,6 +517,9 @@ export class CanvasPaneComponent {
   readonly liveAppFrameTitle = computed(() =>
     this.transloco.translate('canvas.app.frameTitle', {title: this.title()}),
   );
+  readonly officeFrameTitle = computed(() =>
+    this.transloco.translate('canvas.office.frameTitle', {title: this.title()}),
+  );
   readonly sourceNeedsRefresh = computed(() =>
     this.state()?.status === 'source_changed' || this.contentStatus() === 'source_changed',
   );
@@ -539,6 +559,8 @@ export class CanvasPaneComponent {
         this.viewer.viewerStatus() === 'loading' ||
         this.viewer.viewerStatus() === 'renewing' ||
         this.viewer.viewerStatus() === 'error' ||
+        this.office.officeStatus() === 'loading' ||
+        this.office.officeStatus() === 'error' ||
         this.canvas.loadStatus() === 'loading' ||
         state?.status === 'source_changed' ||
         state?.status === 'unavailable' ||
@@ -579,6 +601,12 @@ export class CanvasPaneComponent {
     if (this.viewer.viewerStatus() === 'error') {
       return this.transloco.translate('canvas.app.unavailable');
     }
+    if (this.effectiveRenderer() === 'office' && this.office.officeStatus() === 'loading') {
+      return this.transloco.translate('canvas.office.connecting');
+    }
+    if (this.effectiveRenderer() === 'office' && this.office.officeStatus() === 'error') {
+      return this.transloco.translate('canvas.office.unavailable');
+    }
     if (this.canvas.loadStatus() === 'loading') {
       return this.transloco.translate(this.hasVisual() ? 'canvas.status.updating' : 'canvas.status.loading');
     }
@@ -596,6 +624,9 @@ export class CanvasPaneComponent {
   readonly emptyText = computed(() => {
     if (this.isLiveAppSource() && this.state()?.status !== 'ready') {
       return this.statusText() || this.transloco.translate('canvas.app.unavailable');
+    }
+    if (this.effectiveRenderer() === 'office' && this.office.officeStatus() !== 'ready') {
+      return this.statusText() || this.transloco.translate('canvas.office.unavailable');
     }
     if (selectCanvasRenderer(this.state()) === 'unsupported') {
       return this.transloco.translate('canvas.unsupported');
@@ -626,6 +657,12 @@ export class CanvasPaneComponent {
     ));
     effect(() => this.viewer.syncPresentation(
       this.active() && this.effectiveRenderer() === 'app',
+      this.canvas.threadId(),
+      this.state(),
+      this.canvas.stateEtag(),
+    ));
+    effect(() => this.office.syncPresentation(
+      this.active() && this.effectiveRenderer() === 'office',
       this.canvas.threadId(),
       this.state(),
       this.canvas.stateEtag(),

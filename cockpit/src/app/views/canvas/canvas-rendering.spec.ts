@@ -52,6 +52,26 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     expect(selectCanvasRenderer(state('auto'))).toBe('unsupported');
   });
 
+  it('selects Office only with the positive view capability', () => {
+    const unavailable = state('office');
+    const available: CanvasState = {
+      ...unavailable,
+      capabilities: {
+        ...unavailable.capabilities,
+        can_view_office: true,
+      },
+    };
+
+    expect(selectCanvasRenderer(unavailable)).toBe('unsupported');
+    expect(selectCanvasRenderer({
+      ...available,
+      capabilities: {...available.capabilities, can_view_office: false},
+    })).toBe('unsupported');
+    expect(selectCanvasRenderer(available)).toBe('office');
+    expect(selectCanvasRenderer({...available, source: {type: 'workspace_app'}}))
+      .toBe('unsupported');
+  });
+
   it('selects a live app only with the positive viewer-session capability', () => {
     const unavailable = state('auto', 'workspace_app');
     const available: CanvasState = {

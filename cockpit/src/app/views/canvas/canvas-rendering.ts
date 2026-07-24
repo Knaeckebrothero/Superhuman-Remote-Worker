@@ -11,6 +11,7 @@ export type CanvasTrustedRenderer =
   | 'html'
   | 'html-interactive'
   | 'image'
+  | 'office'
   | 'app'
   | 'browser'
   | 'unsupported';
@@ -188,6 +189,9 @@ export function selectCanvasRenderer(state: CanvasState | null): CanvasTrustedRe
     return 'app';
   }
   if (!state?.source || state.source.type !== 'workspace_file') return 'unsupported';
+  if (state.renderer === 'office') {
+    return state.capabilities.can_view_office === true ? 'office' : 'unsupported';
+  }
   switch (state.renderer) {
     case 'markdown':
     case 'text':

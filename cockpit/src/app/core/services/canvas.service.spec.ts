@@ -53,6 +53,28 @@ function browserCapability(
 }
 
 describe('Canvas state validation', () => {
+  it('accepts the office renderer and only a boolean optional office capability', () => {
+    const office = canvasState(1, {
+      renderer: 'office',
+      capabilities: {
+        can_edit: false,
+        can_pop_out: true,
+        can_take_control: false,
+        can_view_office: true,
+      },
+    });
+
+    expect(isCanvasState(office)).toBe(true);
+    expect(isCanvasState({
+      ...office,
+      capabilities: {...office.capabilities, can_view_office: false},
+    })).toBe(true);
+    expect(isCanvasState({
+      ...office,
+      capabilities: {...office.capabilities, can_view_office: 'true'},
+    })).toBe(false);
+  });
+
   it('accepts only a boolean optional browser-stream capability', () => {
     const base = canvasState(1);
     expect(isCanvasState(base)).toBe(true);

@@ -823,6 +823,7 @@ const CANVAS_RENDERERS = new Set([
   'html',
   'html-interactive',
   'image',
+  'office',
 ]);
 const CANVAS_STATUSES = new Set([
   'ready',
@@ -897,6 +898,8 @@ export function isCanvasState(value: unknown): value is CanvasState {
     typeof capabilities['can_edit'] === 'boolean' &&
     typeof capabilities['can_pop_out'] === 'boolean' &&
     typeof capabilities['can_take_control'] === 'boolean' &&
+    (capabilities['can_view_office'] === undefined ||
+      typeof capabilities['can_view_office'] === 'boolean') &&
     (capabilities['can_stream_browser'] === undefined ||
       typeof capabilities['can_stream_browser'] === 'boolean') &&
     typeof value['updated_at'] === 'string'

@@ -50,7 +50,8 @@ export type CanvasRenderer =
   | 'text'
   | 'html'
   | 'html-interactive'
-  | 'image';
+  | 'image'
+  | 'office';
 
 export type CanvasStatus =
   | 'ready'
@@ -65,6 +66,8 @@ export interface CanvasCapabilities {
   readonly can_edit: boolean;
   readonly can_pop_out: boolean;
   readonly can_take_control: boolean;
+  /** Positive server capability for launching this Office presentation. */
+  readonly can_view_office?: boolean;
   /**
    * Positive server capability for creating an isolated live-app attachment.
    * Optional while older/default-off orchestrators still return the Slice 3A
@@ -73,6 +76,15 @@ export interface CanvasCapabilities {
   readonly can_create_viewer_session?: boolean;
   /** Positive authority for attaching to an already-staged shared browser. */
   readonly can_stream_browser?: boolean;
+}
+
+/** Standard Collabora form-post parameters minted by the cookie-authenticated BFF. */
+export interface CanvasOfficeSession {
+  readonly urlsrc: string;
+  readonly WOPISrc: string;
+  readonly access_token: string;
+  /** Absolute epoch milliseconds, as required by the Collabora launch form. */
+  readonly access_token_ttl: number;
 }
 
 export type BrowserCapabilityReason =

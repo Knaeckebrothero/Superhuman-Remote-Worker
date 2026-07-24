@@ -10,6 +10,7 @@ import {CanvasService} from '../../core/services/canvas.service';
 import {CanvasContentController} from './canvas-content.controller';
 import {CanvasBrowserController} from './canvas-browser.controller';
 import {CanvasEditController} from './canvas-edit.controller';
+import {CanvasOfficeController} from './canvas-office.controller';
 import {
   CanvasPaneComponent,
   canvasResetTargetMatches,
@@ -159,6 +160,24 @@ describe('Canvas pane content lifecycle', () => {
     expect(component.contentErrorCode()).toBe('invalid_content_url');
     expect(component.displayRenderer()).toBe('unsupported');
     expect(component.imageUrl()).toBeNull();
+  });
+
+  it('never fetches Office bytes through the Canvas content route', () => {
+    canvas.state.set(canvasState(1, 'office', {
+      content_url: null,
+      capabilities: {
+        can_edit: false,
+        can_pop_out: true,
+        can_take_control: false,
+        can_view_office: true,
+      },
+    }));
+    sync();
+
+    http.expectNone(request => request.url.includes('/canvases/main/content'));
+    expect(component.textContent()).toBe('');
+    expect(component.imageUrl()).toBeNull();
+    expect(component.contentStatus()).toBe('idle');
   });
 
   it('preserves scroll while a same-source text presentation refreshes', async () => {
@@ -333,6 +352,13 @@ describe('Canvas pane trusted chrome', () => {
       sync: vi.fn(),
     };
     const viewer = {syncPresentation: vi.fn()};
+    const office = {
+      syncPresentation: vi.fn(),
+      session: signal(null),
+      officeOrigin: signal<string | null>(null),
+      officeStatus: signal<'idle'>('idle'),
+      officeErrorCode: signal<string | null>(null),
+    };
 
     TestBed.configureTestingModule({
       providers: [
@@ -340,6 +366,7 @@ describe('Canvas pane trusted chrome', () => {
         {provide: CanvasContentController, useValue: content},
         {provide: CanvasEditController, useValue: editor},
         {provide: CanvasViewerController, useValue: viewer},
+        {provide: CanvasOfficeController, useValue: office},
         {provide: CanvasBrowserController, useValue: browser},
         {provide: TranslocoService, useValue: {translate: (key: string) => key}},
         {provide: Router, useValue: {}},
@@ -356,6 +383,12 @@ describe('Canvas pane trusted chrome', () => {
       expect(pane.statusText()).toBe('canvas.browser.status.connecting');
       expect(browser.syncPresentation).toHaveBeenCalledWith(true, 'thread-1', state());
       expect(viewer.syncPresentation).toHaveBeenCalledWith(
+        false,
+        'thread-1',
+        state(),
+        '"canvas:4:browser"',
+      );
+      expect(office.syncPresentation).toHaveBeenCalledWith(
         false,
         'thread-1',
         state(),
