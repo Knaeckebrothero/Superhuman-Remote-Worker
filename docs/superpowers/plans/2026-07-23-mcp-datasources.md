@@ -1930,6 +1930,10 @@ git commit -m "feat(mcp-ds): add Cockpit MCP connector form and i18n"
 ### Task 14: k3d live gate (manual checklist)
 
 No code. Validates the deployed slice end to end on the local k3d stack (`tilt up`, memory: local_tilt_dev_stack_stinkpad + local_k3d_testing_via_orchestrator_api).
+The expanded evidence runbook is
+`tests/mcp_connectors_live_validation.md`; its P0 section is authoritative for
+closing this task, while P1/P2 record the wider rollout matrix and hardening
+work.
 
 - [ ] Set `MCP_DATASOURCES_ENABLED=true` + `MCP_STDIO_ENABLED=true` in the local values overlay (`deployment/values-local.yaml`), `tilt up`, wait for orchestrator + agent images to rebuild (dev Dockerfiles drift — force rebuild if cached).
 - [ ] Cockpit: section reads **Connectors**; create a **remote** MCP connector (any reachable streamable-HTTP server — e.g. a FastMCP echo server port-forwarded into the cluster) → **Test Connection** shows `Connected: N tools (…)`.
