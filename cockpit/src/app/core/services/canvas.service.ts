@@ -816,7 +816,14 @@ export function parseCanvasBroadcastInvalidation(
     : null;
 }
 
-const CANVAS_RENDERERS = new Set(['auto', 'markdown', 'text', 'html', 'image']);
+const CANVAS_RENDERERS = new Set([
+  'auto',
+  'markdown',
+  'text',
+  'html',
+  'html-interactive',
+  'image',
+]);
 const CANVAS_STATUSES = new Set([
   'ready',
   'starting',

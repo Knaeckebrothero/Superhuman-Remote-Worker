@@ -247,7 +247,7 @@ class ValidatedCanvasFile:
     path: str
     data: bytes
     media_type: str
-    renderer: Literal["markdown", "text", "html", "image"]
+    renderer: Literal["markdown", "text", "html", "html-interactive", "image"]
     source_version: str
     last_modified: datetime | None
 
@@ -412,7 +412,7 @@ def validate_canvas_bytes(
 
     extension = PurePosixPath(path).suffix.lower()
     detected = _magic_media_type(data)
-    renderer: Literal["markdown", "text", "html", "image"]
+    renderer: Literal["markdown", "text", "html", "html-interactive", "image"]
     media_type: str
 
     is_likely_image = detected.startswith("image/")
@@ -477,7 +477,7 @@ def validate_canvas_bytes(
     compatible: dict[str, set[str]] = {
         "markdown": {"markdown", "text"},
         "text": {"text"},
-        "html": {"html", "text"},
+        "html": {"html", "html-interactive", "text"},
         "image": {"image"},
     }
     if requested_renderer != "auto":
@@ -1119,7 +1119,12 @@ class ThreadWorkspaceFileGateway:
         if record is not None:
             if not isinstance(record.source, WorkspaceFileSource):
                 return False
-            if record.renderer not in {"markdown", "text", "html"}:
+            if record.renderer not in {
+                "markdown",
+                "text",
+                "html",
+                "html-interactive",
+            }:
                 return False
             try:
                 if (
@@ -1150,7 +1155,12 @@ class ThreadWorkspaceFileGateway:
     ) -> ValidatedCanvasFile:
         """Validate bounded candidate bytes against the selected text renderer."""
 
-        if not record.editable or record.renderer not in {"markdown", "text", "html"}:
+        if not record.editable or record.renderer not in {
+            "markdown",
+            "text",
+            "html",
+            "html-interactive",
+        }:
             raise CanvasFileError(
                 409,
                 "canvas_not_editable",

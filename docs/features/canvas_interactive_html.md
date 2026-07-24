@@ -1,6 +1,6 @@
 # Canvas Slice 1.5 — Interactive HTML Renderer
 
-**Status:** PROPOSED (2026-07-17, revised after 6-agent codebase+web research pass)
+**Status:** IMPLEMENTED (2026-07-24; isolated renderer core and agent guidance)
 **Parent:** `docs/features/dynamic_canvas.md` (authority for Canvas architecture;
 this doc adds one renderer mode and changes nothing about pointers, storage, or
 the gateway).

@@ -98,9 +98,15 @@ class _SetFileCanvasArguments(BaseModel):
         max_length=200,
         description="Optional descriptive stage title; defaults to the filename.",
     )
-    renderer: Literal["auto", "markdown", "text", "html", "image"] = Field(
+    renderer: Literal[
+        "auto", "markdown", "text", "html", "html-interactive", "image"
+    ] = Field(
         default="auto",
-        description="Trusted installed renderer, or 'auto' for server detection.",
+        description=(
+            "Trusted installed renderer. 'auto' detects strict HTML, which strips "
+            "style blocks and scripts; explicitly choose 'html-interactive' for a "
+            "self-contained HTML artifact needing full CSS or inline JavaScript."
+        ),
     )
     editable: bool = Field(
         default=False,
@@ -149,9 +155,15 @@ class _SetLiveCanvasArguments(BaseModel):
         max_length=200,
         description="Optional descriptive stage title.",
     )
-    renderer: Literal["auto", "markdown", "text", "html", "image"] = Field(
+    renderer: Literal[
+        "auto", "markdown", "text", "html", "html-interactive", "image"
+    ] = Field(
         default="auto",
-        description="File renderer. Live applications require 'auto'.",
+        description=(
+            "File renderer. 'html' is strict and inert; 'html-interactive' preserves "
+            "self-contained CSS and inline scripts in a no-network sandbox. Live "
+            "applications require 'auto'."
+        ),
     )
     editable: bool = Field(
         default=False,
@@ -217,9 +229,15 @@ class _SetBrowserCanvasArguments(BaseModel):
         max_length=200,
         description="Optional descriptive stage title.",
     )
-    renderer: Literal["auto", "markdown", "text", "html", "image"] = Field(
+    renderer: Literal[
+        "auto", "markdown", "text", "html", "html-interactive", "image"
+    ] = Field(
         default="auto",
-        description="File renderer. Browser presentation requires 'auto'.",
+        description=(
+            "File renderer. 'html' is strict and inert; 'html-interactive' preserves "
+            "self-contained CSS and inline scripts in a no-network sandbox. Browser "
+            "presentation requires 'auto'."
+        ),
     )
     editable: bool = Field(
         default=False,
@@ -290,9 +308,15 @@ class _SetLiveBrowserCanvasArguments(BaseModel):
         max_length=200,
         description="Optional descriptive stage title.",
     )
-    renderer: Literal["auto", "markdown", "text", "html", "image"] = Field(
+    renderer: Literal[
+        "auto", "markdown", "text", "html", "html-interactive", "image"
+    ] = Field(
         default="auto",
-        description="File renderer. Live applications and browser require 'auto'.",
+        description=(
+            "File renderer. 'html' is strict and inert; 'html-interactive' preserves "
+            "self-contained CSS and inline scripts in a no-network sandbox. Live "
+            "applications and browser require 'auto'."
+        ),
     )
     editable: bool = Field(
         default=False,
@@ -508,7 +532,9 @@ def create_canvas_tools(context: ToolContext) -> list[Any]:
         source_type: Literal["workspace_file", "workspace_port", "browser"],
         path: str | None = None,
         title: str | None = None,
-        renderer: Literal["auto", "markdown", "text", "html", "image"] = "auto",
+        renderer: Literal[
+            "auto", "markdown", "text", "html", "html-interactive", "image"
+        ] = "auto",
         editable: bool = False,
         alt_text: str | None = None,
         port: int | None = None,
@@ -519,7 +545,9 @@ def create_canvas_tools(context: ToolContext) -> list[Any]:
         """Present a file, attested app, or current browser when advertised.
 
         ``browser_id='current'`` resolves at call time. Presenting it does not
-        take the control baton away from a user who already holds it.
+        take the control baton away from a user who already holds it. Strict
+        ``html`` strips style blocks and scripts; ``html-interactive`` runs a
+        self-contained document in an opaque, no-network sandbox.
         """
         thread_id, user_id = _require_persistent_identity(context)
         if source_type == "workspace_file":

@@ -9,6 +9,7 @@ export type CanvasTrustedRenderer =
   | 'markdown'
   | 'text'
   | 'html'
+  | 'html-interactive'
   | 'image'
   | 'app'
   | 'browser'
@@ -47,6 +48,15 @@ export const STATIC_HTML_CSP =
   "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; " +
   "img-src 'none'; font-src 'none'; connect-src 'none'; form-action 'none'; " +
   "base-uri 'none'; object-src 'none';";
+
+export const INTERACTIVE_HTML_CSP =
+  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+  "img-src data:; font-src data:; media-src data:; connect-src 'none'; " +
+  "form-action 'none'; base-uri 'none'; object-src 'none'; child-src 'none'; " +
+  "frame-src 'none'; webrtc 'block';";
+
+const CANVAS_FRAME_WRAPPER_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; frame-src blob:; child-src blob:;";
 
 export const CANVAS_MATH_MAX_EXPRESSIONS = 256;
 export const CANVAS_MATH_MAX_EXPRESSION_CHARS = 4_096;
@@ -182,6 +192,7 @@ export function selectCanvasRenderer(state: CanvasState | null): CanvasTrustedRe
     case 'markdown':
     case 'text':
     case 'html':
+    case 'html-interactive':
     case 'image':
       return state.renderer;
     default:
@@ -506,7 +517,7 @@ function exceedsStaticHtmlDelimiterBudget(source: string): boolean {
 }
 
 /**
- * Strict static HTML becomes an opaque, script-free srcdoc. Sanitization and
+ * Strict static HTML becomes an opaque, script-free Blob document. Sanitization and
  * CSP are both required; neither is treated as a substitute for the other.
  */
 export function renderCanvasStaticHtml(source: string): CanvasRenderResult {
@@ -577,4 +588,72 @@ function wrapStaticHtml(body: string): string {
     body +
     '</body></html>'
   );
+}
+
+/**
+ * Full-fidelity, self-contained HTML runs under isolation rather than
+ * sanitization. The CSP is inserted before every agent-provided head child so
+ * the preload scanner cannot start an external request first.
+ */
+export function renderCanvasInteractiveHtml(source: string): CanvasRenderResult {
+  if (
+    source.length > CANVAS_RENDER_MAX_OUTPUT_CHARS ||
+    typeof DOMParser === 'undefined'
+  ) {
+    return CANVAS_CONTENT_TOO_COMPLEX;
+  }
+
+  const parsed = new DOMParser().parseFromString(source, 'text/html');
+  const csp = parsed.createElement('meta');
+  csp.httpEquiv = 'Content-Security-Policy';
+  csp.content = INTERACTIVE_HTML_CSP;
+  const referrer = parsed.createElement('meta');
+  referrer.name = 'referrer';
+  referrer.content = 'no-referrer';
+  parsed.head.insertBefore(referrer, parsed.head.firstChild);
+  parsed.head.insertBefore(csp, parsed.head.firstChild);
+
+  const html = `<!doctype html>${parsed.documentElement.outerHTML}`;
+  if (html.length > CANVAS_RENDER_MAX_OUTPUT_CHARS) return CANVAS_CONTENT_TOO_COMPLEX;
+  return {html, errorCode: null};
+}
+
+/**
+ * Build the trusted outer document for a Blob-backed Canvas document. The
+ * nested frame gives fragment links a real document URL while the outer CSP
+ * blocks any attempted navigation away from Blob documents.
+ */
+export function buildCanvasFrameWrapper(
+  contentUrl: string,
+  title: string,
+  allowScripts: boolean,
+): string {
+  if (typeof document === 'undefined' || !contentUrl.startsWith('blob:')) return '';
+
+  const wrapper = document.implementation.createHTMLDocument('');
+  const csp = wrapper.createElement('meta');
+  csp.httpEquiv = 'Content-Security-Policy';
+  csp.content = CANVAS_FRAME_WRAPPER_CSP;
+  const referrer = wrapper.createElement('meta');
+  referrer.name = 'referrer';
+  referrer.content = 'no-referrer';
+  const style = wrapper.createElement('style');
+  style.textContent =
+    'html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#fff}' +
+    'iframe{display:block;width:100%;height:100%;border:0;background:#fff}';
+  wrapper.head.replaceChildren(csp, referrer, style);
+
+  const frame = wrapper.createElement('iframe');
+  frame.src = contentUrl;
+  frame.title = title.trim() || 'Canvas preview';
+  frame.loading = 'lazy';
+  frame.referrerPolicy = 'no-referrer';
+  frame.setAttribute('sandbox', allowScripts ? 'allow-scripts' : '');
+  frame.setAttribute(
+    'allow',
+    "camera 'none'; microphone 'none'; geolocation 'none'; " +
+      "clipboard-read 'none'; clipboard-write 'none'",
+  );
+  wrapper.body.replaceChildren(frame);
+  return `<!doctype html>${wrapper.documentElement.outerHTML}`;
 }

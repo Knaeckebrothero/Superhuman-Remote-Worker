@@ -44,7 +44,13 @@ export type CanvasSource =
   | BrowserCanvasSource
   | UnknownCanvasSource;
 
-export type CanvasRenderer = 'auto' | 'markdown' | 'text' | 'html' | 'image';
+export type CanvasRenderer =
+  | 'auto'
+  | 'markdown'
+  | 'text'
+  | 'html'
+  | 'html-interactive'
+  | 'image';
 
 export type CanvasStatus =
   | 'ready'
