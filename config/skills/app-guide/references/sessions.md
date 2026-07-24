@@ -12,16 +12,21 @@ connectors) if the defaults don't fit.
 
 ## What the session agent can do
 
-- **Work with files** in its own isolated workspace (`documents/`, `notes/`,
-  `output/`) — read, write, edit, search; the workspace is git-versioned.
-- **Run shell commands** in a sandbox.
+- **Work with files** when the session uses a Virtual or full workspace.
+  Container and VM workspaces add git; None is chat-only.
+- **Run shell commands** when a shell-capable Container or VM workspace, the
+  expert configuration, and the user's grants all allow it.
 - **Research the web** — search, read pages, crawl sites, find and download
   academic papers.
-- **Drive a browser** step by step (navigate, click, type, screenshot) for
-  pages that need real interaction.
+- **Drive a browser** step by step for pages that need real interaction when
+  direct browser tools are loaded. Web research can exist without them.
+- **Present files on Canvas** and, on deployments that enable it, share the
+  workspace browser. Those are persistent-session capabilities with their own
+  workspace and deployment requirements.
 - **Cite as it writes** — sources are tracked and referenced inline as `[N]`
   markers you can click.
-- **Read and write the project knowledge base**, and read git history.
+- **Read and write project knowledge** when the project and Knowledge tools are
+  attached; read git history only on a git-capable workspace.
 - **Create and manage jobs for you when Fleet Management is enabled** — the
   agent can hand heavy work to the autonomous worker pool (create, check,
   approve, resume, pause, cancel jobs) while you keep chatting. The guide does
@@ -34,13 +39,15 @@ connectors) if the defaults don't fit.
 - **Supervised** — every tool call waits for your approval. An inline card
   shows what the agent wants to do, with **Approve**, **Auto-accept**
   (approve and switch modes), or **Stop**.
-- **Auto-accept** — file reads and writes run without asking; shell commands
-  still wait for approval.
+- **Auto-accept** — non-shell tools run without asking; shell tools still wait
+  for approval.
 - **Autonomous** — everything runs unattended.
 
 Switch modes anytime in the chat's settings panel or with `/supervised`,
 `/auto`, `/autonomous`. Higher modes may be restricted by your account's
-grants — options you can't use appear disabled.
+grants — options you can't use appear disabled. Permission mode controls
+approval prompts; it does not add tools or bypass connector, project, or
+deployment authorization.
 
 ## The chat view
 
@@ -57,10 +64,15 @@ grants — options you can't use appear disabled.
 - **Progress**: a collapsible checklist shows the agent's current todos; a
   token-usage panel shows context fill; reasoning and tool calls can be
   expanded or collapsed.
-- **Header buttons**: **Settings** (model, temperature, narration, display,
-  permission mode), **Citations** (the source panel, once anything is cited),
-  **Files** (the session's cloud folder), **Git** (the workspace's commit
-  history), and **IDE** (an in-browser code editor on the agent's workspace).
+- **Header buttons**: **Settings** (including the live workspace and tool
+  controls), **Citations** (once anything is cited), **Files** (when a cloud
+  folder is available), and workspace-dependent **Git**, **IDE**, **Canvas**,
+  or shared-browser actions.
+
+Changes in the current session's **Settings** panel apply with the next
+response. Only Canvas, Fleet Management, Experts & Skills, and Automations &
+Loops can be toggled as live tool groups. Workspace changes are upgrade-only;
+use a new session to move down to Virtual or None.
 
 ## Session lifecycle
 
