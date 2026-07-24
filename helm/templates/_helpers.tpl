@@ -212,6 +212,27 @@ the in-cluster CA bundle doesn't trust.
 {{- end }}
 
 {{/*
+Replicate the aliased official subchart's fullname helper so the orchestrator
+can fetch discovery over the exact generated ClusterIP Service name.
+*/}}
+{{- define "srw.collaboraServiceName" -}}
+{{- if .Values.collabora.fullnameOverride -}}
+{{- .Values.collabora.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default "collabora" .Values.collabora.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.collaboraInternalUrl" -}}
+{{- printf "http://%s:9980" (include "srw.collaboraServiceName" .) -}}
+{{- end }}
+
+{{/*
 Internal cluster URL for Keycloak — used by orchestrator for back-channel JWKS fetches.
 */}}
 {{- define "srw.keycloakInternalUrl" -}}

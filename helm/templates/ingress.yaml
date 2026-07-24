@@ -143,6 +143,61 @@ spec:
                 name: {{ $fullName }}-orchestrator
                 port:
                   number: 8085
+{{- if .Values.collabora.enabled }}
+---
+# WOPI is token-authenticated but deliberately cluster-only. This higher
+# priority route prevents the public API Ingress from forwarding /wopi while
+# Collabora continues to use the in-cluster orchestrator Service directly.
+# A tunnel which bypasses Traefik must apply the same path deny at its edge.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullName }}-block-public-wopi
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      - 127.0.0.99/32
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-api-ingress-blocked-wopi
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.priority: "110"
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-block-public-wopi@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      secretName: {{ $fullName }}-api-tls
+  {{- end }}
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          - path: /wopi
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+{{- end }}
 {{- if .Values.ingress.internalPathBlock.enabled }}
 ---
 # Track B (P4b) — Layer 1 (opt-in). Block /api/agents/* and /api/internal/*

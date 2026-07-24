@@ -309,6 +309,7 @@ $EDITOR deployment/values-local.yaml
 # - paste at least one LLM key (OPENAI_API_KEY / ANTHROPIC_API_KEY / GROQ_API_KEY)
 # - paste the Traefik ClusterIP from step 2 into opencloud.hostAliases[0].ip
 
+helm dependency build ./helm
 helm install srw ./helm -n srw --kube-context=k3d-srw -f deployment/values-local.yaml
 ```
 

@@ -382,6 +382,76 @@
         }
       }
     },
+    "collabora": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "publicUrl": {
+          "type": "string",
+          "pattern": "^$|^https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$"
+        },
+        "tokenTtlSeconds": {
+          "type": "integer",
+          "minimum": 3600,
+          "maximum": 86400
+        },
+        "discoveryCacheTtlSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 86400
+        },
+        "discoveryTimeoutSeconds": {
+          "type": "number",
+          "minimum": 0.25,
+          "maximum": 30
+        },
+        "maxOfficeBytes": {
+          "type": "integer",
+          "minimum": 1048576,
+          "maximum": 104857600
+        },
+        "replicaCount": { "type": "integer", "const": 1 },
+        "autoscaling": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "const": false }
+          }
+        },
+        "collabora": {
+          "type": "object",
+          "properties": {
+            "server_name": { "type": "string" },
+            "aliasgroups": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "host": { "type": "string" },
+                  "aliases": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                  }
+                },
+                "required": ["host"]
+              }
+            },
+            "extra_params": { "type": "string" }
+          }
+        },
+        "networkPolicy": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean", "const": false },
+            "edgeNamespaceSelector": {
+              "$ref": "#/definitions/labelSelector"
+            },
+            "edgePodSelector": {
+              "$ref": "#/definitions/labelSelector"
+            }
+          }
+        }
+      }
+    },
     "ingress": {
       "type": "object",
       "properties": {

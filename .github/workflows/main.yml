@@ -90,6 +90,9 @@ jobs:
         with:
           version: v3.17.0
 
+      - name: Build Helm dependencies
+        run: helm dependency build helm/
+
       - name: Install kubeconform
         run: |
           curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
@@ -130,6 +133,9 @@ jobs:
         with:
           version: v3.17.0
 
+      - name: Build Helm dependencies
+        run: helm dependency build helm/
+
       - name: Assert invalid values are rejected by the schema
         run: |
           if helm template srw helm/ -f helm/ci/invalid-values.yaml >/dev/null 2>&1; then
@@ -157,6 +163,8 @@ jobs:
         uses: azure/setup-helm@v4
         with:
           version: v3.17.0
+      - name: Build Helm dependencies
+        run: helm dependency build helm/
       - name: Install kubeconform
         run: |
           curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
@@ -1062,6 +1070,7 @@ jobs:
           version: v3.17.0
       - name: Package both charts
         run: |
+          helm dependency build helm/
           mkdir -p dist
           for chart_dir in helm helm-vm-cluster; do
             helm package "${chart_dir}/" \
