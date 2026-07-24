@@ -1,0 +1,240 @@
+"""Tests for the pod workspace-recovery arm (probe / counter reset / no-leak).
+
+docs/issues/maxsessions_parallel_tools_false_workspace_death.md (slice D):
+
+1. Probe before punch — on a ``workspace_unavailable`` report the orchestrator
+   TCP-probes the workspace sshd; a listening pod is NOT deleted (the report
+   was a misclassification or a transient), only paused + re-dispatched. The
+   attempts counter still increments either way so a report-loop stays bounded.
+2. Counter reset — a handled completion that is not ``workspace_unavailable``
+   resets ``recovery_attempts`` (one recovered blip must not poison the job).
+3. No leak on fail-loud — exhausting the cap deletes the just-provisioned pod
+   (PVC kept) instead of orphaning it.
+"""
+
+import asyncio
+import socket
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+project_root = Path(__file__).parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from orchestrator.services.completion import (  # noqa: E402
+    handle_pod_workspace_recovery,
+    probe_workspace_ssh,
+    should_reset_recovery_counter,
+)
+
+
+# =============================================================================
+# probe_workspace_ssh
+# =============================================================================
+
+
+class TestProbeWorkspaceSsh:
+    @pytest.mark.asyncio
+    async def test_listening_port_probes_true(self):
+        server = await asyncio.start_server(
+            lambda r, w: w.close(), host="127.0.0.1", port=0
+        )
+        port = server.sockets[0].getsockname()[1]
+        try:
+            assert await probe_workspace_ssh("127.0.0.1", port) is True
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_closed_port_probes_false(self):
+        # Bind-then-close to find a port that is definitely not listening.
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        assert await probe_workspace_ssh("127.0.0.1", port) is False
+
+    @pytest.mark.asyncio
+    async def test_unroutable_host_times_out_false(self):
+        assert (
+            await probe_workspace_ssh("10.255.255.1", 30022, timeout=0.2) is False
+        )
+
+
+# =============================================================================
+# should_reset_recovery_counter
+# =============================================================================
+
+
+class TestShouldResetRecoveryCounter:
+    def test_resets_after_clean_completion(self):
+        assert should_reset_recovery_counter({"recovery_attempts": 2}, None) is True
+
+    def test_resets_after_ordinary_job_error(self):
+        assert (
+            should_reset_recovery_counter(
+                {"recovery_attempts": 1}, {"type": "job_error", "message": "boom"}
+            )
+            is True
+        )
+
+    def test_does_not_reset_on_workspace_unavailable(self):
+        assert (
+            should_reset_recovery_counter(
+                {"recovery_attempts": 1},
+                {"type": "workspace_unavailable", "message": "ssh"},
+            )
+            is False
+        )
+
+    def test_no_reset_needed_at_zero(self):
+        assert should_reset_recovery_counter({}, None) is False
+        assert should_reset_recovery_counter({"recovery_attempts": 0}, None) is False
+
+
+# =============================================================================
+# handle_pod_workspace_recovery
+# =============================================================================
+
+
+def _make_deps(*, pod_alive: bool, pause_ok: bool = True):
+    db = AsyncMock()
+    db.pause_job.return_value = pause_ok
+    delete_workspace = AsyncMock()
+    trigger_dispatch = MagicMock()
+
+    async def probe(_host, _port, timeout=3.0):
+        return pod_alive
+
+    return db, delete_workspace, trigger_dispatch, probe
+
+
+def _job(attempts: int = 0) -> dict:
+    ctx = {
+        "host": "workspace-aaaa.svc.cluster.local",
+        "port": 30022,
+        "status": "ready",
+        "pod_ip": "10.42.0.1",
+    }
+    if attempts:
+        ctx["recovery_attempts"] = attempts
+    return {
+        "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "context": {"workspace_container": ctx},
+    }
+
+
+_ERROR = {"type": "workspace_unavailable", "message": "SSH command failed"}
+
+
+class TestHandlePodWorkspaceRecovery:
+    @pytest.mark.asyncio
+    async def test_live_pod_is_not_deleted(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=True)
+        job = _job()
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        delete_workspace.assert_not_awaited()
+        merged = db.merge_workspace_container_context.await_args.args[1]
+        # The warm pod stays adoptable: no teardown markers.
+        assert merged.get("status") != "deleted"
+        assert "pod_ip" not in merged
+        assert merged["recovery_attempts"] == 1
+        assert result["new_status"] == "paused"
+        trigger_dispatch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dead_pod_is_deleted_and_invalidated(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        job = _job()
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        delete_workspace.assert_awaited_once_with(job["id"])
+        merged = db.merge_workspace_container_context.await_args.args[1]
+        assert merged["status"] == "deleted"
+        assert merged["pod_ip"] is None
+        assert merged["recovery_attempts"] == 1
+        assert result["new_status"] == "paused"
+
+    @pytest.mark.asyncio
+    async def test_counter_increments_even_when_pod_alive(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=True)
+        job = _job(attempts=1)
+
+        await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        merged = db.merge_workspace_container_context.await_args.args[1]
+        assert merged["recovery_attempts"] == 2
+
+    @pytest.mark.asyncio
+    async def test_exhausted_cap_fails_loud_and_deletes_pod(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=True)
+        job = _job(attempts=3)
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        assert result["new_status"] == "failed"
+        # No leak: the just-provisioned pod is torn down (PVC kept).
+        delete_workspace.assert_awaited_once_with(job["id"])
+        db.update_job_status.assert_awaited_once()
+        kwargs = db.update_job_status.await_args.kwargs
+        assert kwargs["status"] == "failed"
+        assert kwargs["freeze_data"]["recovery_attempts"] == 4
+        db.pause_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_dispatch_when_pause_loses_race(self):
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(
+            pod_alive=False, pause_ok=False
+        )
+        job = _job()
+
+        await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        trigger_dispatch.assert_not_called()

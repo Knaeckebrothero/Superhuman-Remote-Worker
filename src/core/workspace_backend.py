@@ -55,6 +55,19 @@ class RemoteCommandTimeoutError(Exception):
     pass
 
 
+class RemoteChannelBusyError(Exception):
+    """sshd refused a session-channel open on a live transport.
+
+    Deliberately NOT a WorkspaceUnavailableError: a per-connection session
+    limit (OpenSSH MaxSessions) is a transient concurrency condition, not a
+    dead workspace — misclassifying it triggers destructive pod recovery
+    against a healthy pod. Surfaces to the model as an ordinary tool error.
+    docs/issues/maxsessions_parallel_tools_false_workspace_death.md.
+    """
+
+    pass
+
+
 # Server-side cap on search_files matches. The display layer shows at most
 # max_search_results (default 50); this bounds what backends ship over the
 # wire. filesystem.py renders "N+ (capped)" when a result set hits this.

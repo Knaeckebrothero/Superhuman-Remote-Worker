@@ -11,6 +11,7 @@ See docs/features/vm_backend.md for the full design.
 import errno
 import fnmatch
 import logging
+import os
 import posixpath
 import re
 import socket
@@ -43,6 +44,7 @@ from ...tools.shell.shell_manager import (
 )
 from ..workspace_backend import (
     SEARCH_RESULT_HARD_CAP,
+    RemoteChannelBusyError,
     RemoteCommandTimeoutError,
     WorkspaceBackend,
     WorkspaceUnavailableError,
@@ -62,6 +64,13 @@ _GONE_ERRNOS = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN}
 # channel keeps draining so the remote command can finish. Guards agent RAM.
 _EXEC_MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 _EXEC_POLL_SECONDS = 0.05
+
+# Session-channel opens refused by sshd on a LIVE transport (MaxSessions) are
+# transient concurrency refusals, not workspace death: retry briefly, then
+# surface as RemoteChannelBusyError (an ordinary tool error).
+# docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+_CHANNEL_OPEN_RETRIES = 3
+_CHANNEL_OPEN_BACKOFF_SECONDS = 0.25
 
 # shell_cancel: seconds to wait after a Ctrl+C before re-checking whether the
 # tab returned to a prompt. Two attempts, then fall back to a tab reset.
@@ -222,6 +231,16 @@ class RemoteBackend(WorkspaceBackend):
         self._tabs: OrderedDict[str, _RemoteTab] = OrderedDict()
         self._sync_lock = threading.Lock()
         self._shell_initialized = False
+
+        # Bound concurrent short-lived exec channels so a wide parallel tool
+        # batch can never trip the workspace sshd's per-connection MaxSessions
+        # limit (excess execs queue for the next free slot). Long-lived
+        # channels (persistent SFTP, shell tabs) are the headroom between this
+        # cap and MaxSessions.
+        # docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+        self._channel_slots = threading.Semaphore(
+            max(1, int(os.environ.get("WORKSPACE_SSH_MAX_CONCURRENT_CHANNELS", "10")))
+        )
 
         # Reconnect hook: fired after a genuine reconnect in _ensure_connected
         # (NOT the initial connect()). Lets the agent re-assert files it wrote on
@@ -510,66 +529,112 @@ class RemoteBackend(WorkspaceBackend):
         (docs/issues/remote_backend_indefinite_wait_deadlock.md), and enforces
         ``timeout`` as a wall-clock deadline on the whole command.
 
-        Raises WorkspaceUnavailableError on connection failure and
-        RemoteCommandTimeoutError when the deadline expires.
+        Raises WorkspaceUnavailableError on connection failure,
+        RemoteCommandTimeoutError when the deadline expires, and
+        RemoteChannelBusyError when sshd keeps refusing session channels on a
+        live transport (MaxSessions saturation — NOT workspace death; see
+        docs/issues/maxsessions_parallel_tools_false_workspace_death.md).
         """
         self._ensure_connected()
-        try:
+        last_refusal: Optional[paramiko.ChannelException] = None
+        for attempt in range(_CHANNEL_OPEN_RETRIES + 1):
+            try:
+                return self._exec_once(command, timeout)
+            except paramiko.ChannelException as e:
+                # A clean CHANNEL_OPEN_FAILURE arrives over a working
+                # transport. Dead transport → genuine workspace loss; live
+                # transport → per-connection session-limit refusal, retryable
+                # in milliseconds once a running command finishes.
+                transport = self._ssh.get_transport() if self._ssh else None
+                if transport is None or not transport.is_active():
+                    raise WorkspaceUnavailableError(
+                        f"SSH command failed on {self._host}: {e}"
+                    ) from e
+                last_refusal = e
+                if attempt < _CHANNEL_OPEN_RETRIES:
+                    logger.warning(
+                        f"sshd refused session channel on live transport to "
+                        f"{self._host} (attempt {attempt + 1}/"
+                        f"{_CHANNEL_OPEN_RETRIES + 1}) — retrying"
+                    )
+                    time.sleep(_CHANNEL_OPEN_BACKOFF_SECONDS * (2**attempt))
+            except (paramiko.SSHException, socket.error, EOFError, OSError) as e:
+                raise WorkspaceUnavailableError(
+                    f"SSH command failed on {self._host}: {e}"
+                ) from e
+        raise RemoteChannelBusyError(
+            f"sshd on {self._host} refused a session channel "
+            f"{_CHANNEL_OPEN_RETRIES + 1} times while the transport stayed "
+            f"active (too many concurrent SSH sessions). The workspace is "
+            f"healthy — retry the command."
+        ) from last_refusal
+
+    def _exec_once(self, command: str, timeout: int) -> str:
+        """Single exec attempt — open channel, drain, return stdout.
+
+        Raises paramiko/socket errors raw; ``_exec`` owns classification.
+        Holds a ``_channel_slots`` permit for the channel's whole lifetime and
+        closes the channel explicitly so the server-side session slot frees
+        as soon as the command is done.
+        """
+        with self._channel_slots:
             _, stdout, _ = self._ssh.exec_command(command, timeout=timeout)
             chan = stdout.channel
-            out_chunks: list[bytes] = []
-            err_chunks: list[bytes] = []
-            out_size = 0
-            err_size = 0
-            truncated = False
-            deadline = time.monotonic() + timeout
-            while True:
-                # Bound the inner drains by the deadline too: a producer
-                # that keeps recv_ready() True (output arriving faster than
-                # we can be pre-empted) would otherwise evade the timeout
-                # forever, since the deadline check below only ran once
-                # BOTH buffers went momentarily empty.
-                while chan.recv_ready() and time.monotonic() <= deadline:
-                    chunk = chan.recv(65536)
-                    if out_size < _EXEC_MAX_OUTPUT_BYTES:
-                        out_chunks.append(chunk)
-                    else:
-                        truncated = True
-                    out_size += len(chunk)
-                while chan.recv_stderr_ready() and time.monotonic() <= deadline:
-                    chunk = chan.recv_stderr(65536)
-                    if err_size < _EXEC_MAX_OUTPUT_BYTES:
-                        err_chunks.append(chunk)
-                    err_size += len(chunk)
-                if (
-                    chan.exit_status_ready()
-                    and not chan.recv_ready()
-                    and not chan.recv_stderr_ready()
-                ):
-                    break
-                if time.monotonic() > deadline:
-                    chan.close()  # frees the remote side before we bail
-                    raise RemoteCommandTimeoutError(
-                        f"Remote command timed out after {timeout}s on "
-                        f"{self._host}: {command[:80]}"
-                    )
-                time.sleep(_EXEC_POLL_SECONDS)
-            exit_code = chan.recv_exit_status()  # ready — returns immediately
-            output = b"".join(out_chunks).decode("utf-8", errors="replace")
-            if truncated:
-                output += "\n[output truncated at 5 MiB]"
-            if exit_code != 0:
-                err = b"".join(err_chunks).decode("utf-8", errors="replace")
-                # Some commands (grep with no match, tmux has-session) use non-zero
-                # exit codes for normal conditions — callers check output.
-                logger.debug(
-                    f"Remote command exit {exit_code}: {command[:80]} | stderr: {err[:200]}"
+            try:
+                return self._drain_exec_channel(chan, command, timeout)
+            finally:
+                chan.close()
+
+    def _drain_exec_channel(self, chan, command: str, timeout: int) -> str:
+        """Drain stdout/stderr until exit under a wall-clock deadline."""
+        out_chunks: list[bytes] = []
+        err_chunks: list[bytes] = []
+        out_size = 0
+        err_size = 0
+        truncated = False
+        deadline = time.monotonic() + timeout
+        while True:
+            # Bound the inner drains by the deadline too: a producer
+            # that keeps recv_ready() True (output arriving faster than
+            # we can be pre-empted) would otherwise evade the timeout
+            # forever, since the deadline check below only ran once
+            # BOTH buffers went momentarily empty.
+            while chan.recv_ready() and time.monotonic() <= deadline:
+                chunk = chan.recv(65536)
+                if out_size < _EXEC_MAX_OUTPUT_BYTES:
+                    out_chunks.append(chunk)
+                else:
+                    truncated = True
+                out_size += len(chunk)
+            while chan.recv_stderr_ready() and time.monotonic() <= deadline:
+                chunk = chan.recv_stderr(65536)
+                if err_size < _EXEC_MAX_OUTPUT_BYTES:
+                    err_chunks.append(chunk)
+                err_size += len(chunk)
+            if (
+                chan.exit_status_ready()
+                and not chan.recv_ready()
+                and not chan.recv_stderr_ready()
+            ):
+                break
+            if time.monotonic() > deadline:
+                raise RemoteCommandTimeoutError(
+                    f"Remote command timed out after {timeout}s on "
+                    f"{self._host}: {command[:80]}"
                 )
-            return output
-        except (paramiko.SSHException, socket.error, EOFError, OSError) as e:
-            raise WorkspaceUnavailableError(
-                f"SSH command failed on {self._host}: {e}"
-            ) from e
+            time.sleep(_EXEC_POLL_SECONDS)
+        exit_code = chan.recv_exit_status()  # ready — returns immediately
+        output = b"".join(out_chunks).decode("utf-8", errors="replace")
+        if truncated:
+            output += "\n[output truncated at 5 MiB]"
+        if exit_code != 0:
+            err = b"".join(err_chunks).decode("utf-8", errors="replace")
+            # Some commands (grep with no match, tmux has-session) use non-zero
+            # exit codes for normal conditions — callers check output.
+            logger.debug(
+                f"Remote command exit {exit_code}: {command[:80]} | stderr: {err[:200]}"
+            )
+        return output
 
     # =========================================================================
     # Path utilities
