@@ -144,6 +144,7 @@ def test_set_schema_is_flat_file_only_and_exposes_conditional_editing():
         "alt_text",
     }
     assert schema["properties"]["source_type"]["const"] == "workspace_file"
+    assert "html-interactive" in schema["properties"]["renderer"]["enum"]
     parsed = set_canvas.args_schema.model_validate(
         {
             "source_type": "workspace_file",

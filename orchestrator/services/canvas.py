@@ -48,7 +48,9 @@ _EDIT_COORDINATOR_QUEUE_TIMEOUT = float(
     os.getenv("CANVAS_EDIT_COORDINATOR_QUEUE_TIMEOUT", "5")
 )
 
-CanvasRenderer = Literal["auto", "markdown", "text", "html", "image"]
+CanvasRenderer = Literal[
+    "auto", "markdown", "text", "html", "html-interactive", "image"
+]
 CanvasStatus = Literal[
     "ready",
     "starting",
@@ -149,7 +151,9 @@ class CanvasSetInput(_StrictFrozenModel):
         if self.new_app and not is_app:
             raise ValueError("new_app is supported only for workspace_app")
         if self.editable and (
-            not is_file or self.renderer not in {"markdown", "text", "html"}
+            not is_file
+            or self.renderer
+            not in {"markdown", "text", "html", "html-interactive"}
         ):
             raise ValueError(
                 "editable Canvas sources require a validated text or HTML renderer"
@@ -937,7 +941,12 @@ class CanvasService:
                 "canvas_not_editable",
                 "The current Canvas presentation is not editable",
             )
-        if record.renderer not in {"markdown", "text", "html"}:
+        if record.renderer not in {
+            "markdown",
+            "text",
+            "html",
+            "html-interactive",
+        }:
             raise CanvasEditError(
                 409,
                 "canvas_not_editable",

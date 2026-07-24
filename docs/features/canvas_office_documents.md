@@ -234,6 +234,11 @@ Touched surfaces (kept in sync, mirroring the Slice-1 pattern):
   sketched in [[dynamic_canvas]].
 - Legacy `.doc/.xls/.ppt`; Collabora `convert-to` REST for thumbnails or a
   PDF viewer; multi-document canvases.
+- **Agent visual self-review via `convert-to`** — the AI edits `.pptx`
+  (and `.docx`) blind to rendering; Collabora's stateless `convert-to`
+  endpoint can produce page/slide PNGs so the agent inspects its own
+  rendered output with vision before ending its turn. High-leverage for
+  deck quality; needs the same token-gated, bounded posture as WOPI reads.
 
 ## Security Notes
 

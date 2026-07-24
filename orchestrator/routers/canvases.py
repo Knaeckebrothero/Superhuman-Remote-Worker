@@ -892,7 +892,11 @@ def _if_range_allows(value: str | None, file: ValidatedCanvasFile) -> bool:
 
 
 def _content_headers(file: ValidatedCanvasFile, *, length: int) -> dict[str, str]:
-    disposition = "attachment" if file.renderer == "html" else "inline"
+    disposition = (
+        "attachment"
+        if file.renderer in {"html", "html-interactive"}
+        else "inline"
+    )
     headers = {
         "ETag": f'"{file.source_version}"',
         "Content-Type": file.media_type,
@@ -907,7 +911,7 @@ def _content_headers(file: ValidatedCanvasFile, *, length: int) -> dict[str, str
     }
     if file.last_modified is not None:
         headers["Last-Modified"] = format_datetime(file.last_modified, usegmt=True)
-    if file.renderer == "html":
+    if file.renderer in {"html", "html-interactive"}:
         headers["Content-Security-Policy"] = (
             "default-src 'none'; script-src 'none'; style-src 'none'; "
             "img-src 'none'; connect-src 'none'; form-action 'none'; "
@@ -1465,7 +1469,8 @@ async def internal_set_main_canvas(
             alt_text=body.alt_text,
         )
         if body.editable and (
-            file.renderer not in {"markdown", "text", "html"}
+            file.renderer
+            not in {"markdown", "text", "html", "html-interactive"}
             or not gateway.supports_editing(thread)
         ):
             raise CanvasFileError(

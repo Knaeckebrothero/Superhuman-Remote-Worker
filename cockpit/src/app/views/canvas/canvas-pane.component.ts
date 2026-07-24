@@ -24,6 +24,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {
   CanvasHtmlRendererComponent,
   CanvasImageRendererComponent,
+  CanvasInteractiveHtmlRendererComponent,
   CanvasMarkdownRendererComponent,
   CanvasTextRendererComponent,
 } from './canvas-renderers.component';
@@ -112,6 +113,7 @@ export function browserOpenErrorKey(code: string | null): string {
     CanvasBrowserRendererComponent,
     CanvasHtmlRendererComponent,
     CanvasImageRendererComponent,
+    CanvasInteractiveHtmlRendererComponent,
     CanvasLiveAppRendererComponent,
     CanvasLiveAppUnavailableComponent,
     CanvasMarkdownRendererComponent,
@@ -294,6 +296,11 @@ export function browserOpenErrorKey(code: string | null): string {
               }
               @case ('html') {
                 <app-canvas-html-renderer [content]="previewContent()" [title]="frameTitle()" />
+              }
+              @case ('html-interactive') {
+                <app-canvas-interactive-html-renderer
+                  [content]="previewContent()"
+                  [title]="interactiveFrameTitle()" />
               }
               @case ('image') {
                 <app-canvas-image-renderer [src]="imageUrl()!" [alt]="imageAlt()"
@@ -486,6 +493,9 @@ export class CanvasPaneComponent {
   );
   readonly frameTitle = computed(() =>
     this.transloco.translate('canvas.html.frameTitle', {title: this.title()}),
+  );
+  readonly interactiveFrameTitle = computed(() =>
+    this.transloco.translate('canvas.html.interactiveFrameTitle', {title: this.title()}),
   );
   readonly liveAppFrameTitle = computed(() =>
     this.transloco.translate('canvas.app.frameTitle', {title: this.title()}),

@@ -4,10 +4,29 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {
+  buildCanvasFrameWrapper,
+  renderCanvasInteractiveHtml,
   renderCanvasMarkdown,
   renderCanvasStaticHtml,
   shouldResetCanvasImageZoom,
 } from './canvas-rendering';
+
+const CANVAS_DOCUMENT_BLOB_TYPE = 'text/html;charset=utf-8';
+
+function createCanvasDocumentUrl(html: string): string | null {
+  if (
+    typeof Blob === 'undefined' ||
+    typeof URL === 'undefined' ||
+    typeof URL.createObjectURL !== 'function'
+  ) {
+    return null;
+  }
+  return URL.createObjectURL(new Blob([html], {type: CANVAS_DOCUMENT_BLOB_TYPE}));
+}
+
+function revokeCanvasDocumentUrl(url: string): void {
+  if (typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url);
+}
 
 @Component({
   selector: 'app-canvas-markdown-renderer',
@@ -142,9 +161,9 @@ export class CanvasImageRendererComponent {
   template: `
     @if (rendered().errorCode) {
       <div class="canvas-render-limit" role="alert">{{ 'canvas.contentTooComplex' | transloco }}</div>
-    } @else {
+    } @else if (srcdoc(); as frameDocument) {
       <iframe sandbox loading="lazy" referrerpolicy="no-referrer"
-              [title]="title()" [srcdoc]="srcdoc()"></iframe>
+              [title]="title()" [srcdoc]="frameDocument"></iframe>
     }
   `,
   styles: `
@@ -158,7 +177,82 @@ export class CanvasHtmlRendererComponent {
   readonly title = input('');
   private readonly sanitizer = inject(DomSanitizer);
   readonly rendered = computed(() => renderCanvasStaticHtml(this.content()));
-  readonly srcdoc = computed<SafeHtml>(() =>
-    this.sanitizer.bypassSecurityTrustHtml(this.rendered().html),
-  );
+  readonly srcdoc = signal<SafeHtml | null>(null);
+
+  constructor() {
+    effect(onCleanup => {
+      const rendered = this.rendered();
+      const title = this.title();
+      if (rendered.errorCode) {
+        this.srcdoc.set(null);
+        return;
+      }
+      const contentUrl = createCanvasDocumentUrl(rendered.html);
+      if (!contentUrl) {
+        this.srcdoc.set(null);
+        return;
+      }
+      const wrapper = buildCanvasFrameWrapper(contentUrl, title, false);
+      if (!wrapper) {
+        revokeCanvasDocumentUrl(contentUrl);
+        this.srcdoc.set(null);
+        return;
+      }
+      this.srcdoc.set(this.sanitizer.bypassSecurityTrustHtml(wrapper));
+      onCleanup(() => revokeCanvasDocumentUrl(contentUrl));
+    });
+  }
+}
+
+@Component({
+  selector: 'app-canvas-interactive-html-renderer',
+  standalone: true,
+  imports: [TranslocoPipe],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    @if (rendered().errorCode) {
+      <div class="canvas-render-limit" role="alert">{{ 'canvas.contentTooComplex' | transloco }}</div>
+    } @else if (srcdoc(); as frameDocument) {
+      <iframe sandbox="allow-scripts" loading="lazy" referrerpolicy="no-referrer"
+              allow="camera 'none'; microphone 'none'; geolocation 'none';
+                     clipboard-read 'none'; clipboard-write 'none'"
+              [title]="title()" [srcdoc]="frameDocument"></iframe>
+    }
+  `,
+  styles: `
+    :host { display: block; width: 100%; height: 100%; min-height: 320px; }
+    iframe { display: block; width: 100%; height: 100%; min-height: 320px; border: 0; background: white; }
+    .canvas-render-limit { padding: 20px; color: var(--text-muted); }
+  `,
+})
+export class CanvasInteractiveHtmlRendererComponent {
+  readonly content = input('');
+  readonly title = input('');
+  private readonly sanitizer = inject(DomSanitizer);
+  readonly rendered = computed(() => renderCanvasInteractiveHtml(this.content()));
+  readonly srcdoc = signal<SafeHtml | null>(null);
+
+  constructor() {
+    effect(onCleanup => {
+      const rendered = this.rendered();
+      const title = this.title();
+      if (rendered.errorCode) {
+        this.srcdoc.set(null);
+        return;
+      }
+      const contentUrl = createCanvasDocumentUrl(rendered.html);
+      if (!contentUrl) {
+        this.srcdoc.set(null);
+        return;
+      }
+      const wrapper = buildCanvasFrameWrapper(contentUrl, title, true);
+      if (!wrapper) {
+        revokeCanvasDocumentUrl(contentUrl);
+        this.srcdoc.set(null);
+        return;
+      }
+      this.srcdoc.set(this.sanitizer.bypassSecurityTrustHtml(wrapper));
+      onCleanup(() => revokeCanvasDocumentUrl(contentUrl));
+    });
+  }
 }
