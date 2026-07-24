@@ -350,6 +350,200 @@ def is_teardown_infra_error(message: str | None) -> bool:
     return any(pattern in low for pattern in _TEARDOWN_ERROR_PATTERNS)
 
 
+async def probe_workspace_ssh(host: str, port: int, timeout: float = 3.0) -> bool:
+    """TCP-probe the workspace sshd; True means something accepted the connect.
+
+    Used by the recovery arm to distinguish "pod is gone" from "agent
+    misclassified a live pod" (e.g. an sshd MaxSessions refusal) before doing
+    anything destructive. Any failure — refused, unroutable, timeout — is
+    False; a False probe degrades safely to the old delete-and-reprovision
+    path. docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+    """
+    import asyncio
+
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout
+        )
+    except Exception:
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+    return True
+
+
+def should_reset_recovery_counter(
+    container_ctx: dict[str, Any], error: Any
+) -> bool:
+    """True when a handled completion should zero ``recovery_attempts``.
+
+    The counter only ever incremented before, so a single recovered blip
+    stayed on the job forever and made a later, unrelated blip fail faster.
+    Any completion the agent managed to report that is NOT another
+    ``workspace_unavailable`` proves the workspace connection works — reset.
+    """
+    if int(container_ctx.get("recovery_attempts") or 0) <= 0:
+        return False
+    if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
+        return False
+    return True
+
+
+async def handle_pod_workspace_recovery(
+    job: dict[str, Any],
+    job_id: str,
+    error: dict[str, Any],
+    *,
+    db: Any,
+    delete_workspace: Callable[[str], Any],
+    trigger_dispatch: Callable[[], None],
+    probe: Callable[..., Any] = probe_workspace_ssh,
+) -> dict[str, Any]:
+    """G1 pod (sandbox/PVC) workspace recovery — the ``workspace_unavailable``
+    arm of the completion endpoint, extracted for testability.
+
+    Re-dispatch through the POD arm: ensure_workspace → _create →
+    create_workspace 409-reuses the deterministic PVC (= reattach), and the
+    agent resumes from the Postgres checkpoint on the intact files. Bounded:
+    at the cap, fail LOUD instead of looping back into the same grave — and
+    delete the last-provisioned pod so it does not leak.
+
+    Probe-before-punch: a TCP probe of the workspace sshd guards the delete.
+    A live pod is kept warm (its context stays ``ready`` so the re-dispatch
+    adopts it); only a dead probe tears the pod down. The attempts counter
+    increments either way so a pathological report-loop stays bounded.
+    See docs/features/workspace_pvc_branch_a_implementation.md (G1) and
+    docs/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
+    """
+    container_ctx = _get_ctx(job)
+    attempts = int(container_ctx.get("recovery_attempts") or 0) + 1
+    cap = int(os.environ.get("WORKSPACE_RECOVERY_MAX_ATTEMPTS", "3"))
+    if attempts > cap:
+        logger.error(
+            f"Job {job_id}: workspace recovery exhausted after "
+            f"{cap} attempts — failing loud"
+        )
+        await db.update_job_status(
+            job_id,
+            status="failed",
+            error_message=(
+                f"workspace unavailable; recovery exhausted after "
+                f"{cap} attempts: {error.get('message') or ''}"
+            ).strip(),
+            freeze_data={
+                "freeze_type": "workspace_unavailable",
+                "recovery_attempts": attempts,
+                "detail": error.get("message"),
+            },
+        )
+        # No leak on fail-loud: the pod provisioned by the previous attempt
+        # would otherwise run orphaned forever (PVC is never touched here).
+        try:
+            await delete_workspace(job_id)
+        except Exception:
+            logger.exception(
+                f"Job {job_id}: error deleting workspace pod after "
+                f"exhausted recovery (job already failed)"
+            )
+        return {
+            "status": "handled",
+            "job_id": job_id,
+            "new_status": "failed",
+            "actions": [
+                f"workspace recovery exhausted after {cap} attempts — failed loud"
+            ],
+        }
+
+    host = container_ctx.get("host")
+    port = int(container_ctx.get("port") or 30022)
+    pod_alive = bool(host) and await probe(host, port)
+
+    if pod_alive:
+        # The workspace answers — the report was a misclassification or a
+        # transient. Keep the warm pod (context stays ready → the re-dispatch
+        # adopts it); only record the attempt + discriminating cause.
+        logger.warning(
+            f"Job {job_id}: workspace reported unavailable but sshd probe on "
+            f"{host}:{port} succeeded — keeping pod, re-dispatch "
+            f"(attempt {attempts}/{cap})"
+        )
+        await db.merge_workspace_container_context(
+            job_id,
+            {
+                "recovery_attempts": attempts,
+                "previous_error": error.get("message") or "workspace_unavailable",
+            },
+        )
+        action = (
+            f"workspace recovery: pod alive on probe — kept, re-dispatch "
+            f"(attempt {attempts}/{cap})"
+        )
+    else:
+        logger.warning(
+            f"Job {job_id}: workspace unavailable — pod recovery "
+            f"attempt {attempts}/{cap} (PVC reattach)"
+        )
+        # Invalidate the stale container so the re-dispatch RECREATES it
+        # (and reattaches the PVC) instead of reusing the dead pod:
+        #   * status="deleted" — `_job_needs_sandbox` returns False while
+        #     status=="ready", short-circuiting before ensure_workspace's
+        #     drift probe; and delete_workspace's 404/"already deleted"
+        #     branch does NOT set the status, so we must set it here.
+        #   * pod_ip=None — drop the dead IP the resume path would dial.
+        await db.merge_workspace_container_context(
+            job_id,
+            {
+                "status": "deleted",
+                "pod_ip": None,
+                "recovery_attempts": attempts,
+                "previous_error": error.get("message") or "workspace_unavailable",
+            },
+        )
+        # Delete the dead pod so create_workspace does not ADOPT the Failed
+        # tombstone (restartPolicy:Never → not "terminating"). The PVC is
+        # retained (delete_workspace never touches it) and reattaches by
+        # name on recreate.
+        try:
+            await delete_workspace(job_id)
+        except Exception:
+            logger.exception(
+                f"Job {job_id}: error deleting dead workspace pod "
+                f"(continuing to re-dispatch)"
+            )
+        action = (
+            f"workspace recovery: dead pod deleted (PVC kept), "
+            f"re-dispatch for reattach (attempt {attempts}/{cap})"
+        )
+
+    # pause_job clears the agent + flips to paused (→ resume=True on
+    # re-dispatch). Gate the dispatch on the processing→paused transition so
+    # a duplicate completion can't double-dispatch.
+    if await db.pause_job(job_id):
+        trigger_dispatch()
+    return {
+        "status": "handled",
+        "job_id": job_id,
+        "new_status": "paused",
+        "actions": [action],
+    }
+
+
+def _get_ctx(job: dict[str, Any]) -> dict[str, Any]:
+    """workspace_container sub-dict from a job row's context JSONB."""
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    if not isinstance(ctx, dict):
+        return {}
+    return ctx.get("workspace_container", {}) or {}
+
+
 def classify_workspace_death(
     termination: dict[str, Any] | None,
 ) -> tuple[str, bool]:
