@@ -177,7 +177,7 @@ export class AutomationsPageComponent implements OnInit {
     // otherwise the editor's `expert` field seeds to '' (this.experts() is
     // empty until the API resolves) and save-time validation rejects the
     // row even though the <select> shows the right native default.
-    this.api.getExperts().subscribe({
+    this.api.getExperts('worker').subscribe({
       next: (list) => {
         this.experts.set(list);
         if (pending && !this.editor()) {
@@ -238,7 +238,7 @@ export class AutomationsPageComponent implements OnInit {
         time,
         customCron: automation.cron_expr ?? '',
         timezone: automation.timezone,
-        expert: automation.expert,
+        expert: this._expertSelectionValue(automation),
         prompt: automation.prompt,
         enabled: automation.enabled,
         autonomy: automation.autonomy,
@@ -290,13 +290,15 @@ export class AutomationsPageComponent implements OnInit {
       this.errorMessage.set(this.transloco.translate('automations.editor.requiredMissing'));
       return;
     }
+    const expertSelection = this._expertRequestFields(e.expert);
     const body: CreateAutomationRequest = {
       name: e.name.trim(),
       description: e.description.trim() || null,
       cron_expr: cron,
       timezone: e.timezone,
       catchup_window_seconds: Math.max(0, e.catchupWindowHours * 3600),
-      expert: e.expert,
+      expert: expertSelection.expert,
+      expert_id: expertSelection.expert_id,
       prompt: e.prompt.trim(),
       autonomy: e.autonomy,
       priority: e.priority,
@@ -342,6 +344,38 @@ export class AutomationsPageComponent implements OnInit {
     this.service.delete(row.id).subscribe({
       error: (err) => this.errorMessage.set(this._formatError(err)),
     });
+  }
+
+  expertLabel(row: Automation): string {
+    const selected = this.experts().find(
+      (expert) =>
+        expert.id === row.expert_id ||
+        expert.id === row.expert ||
+        expert.name === row.expert,
+    );
+    return selected?.display_name ?? row.expert;
+  }
+
+  private _expertSelectionValue(automation: Automation): string {
+    if (automation.expert_id) return automation.expert_id;
+    const selected = this.experts().find(
+      (expert) => expert.id === automation.expert || expert.name === automation.expert,
+    );
+    return selected?.id ?? automation.expert;
+  }
+
+  private _expertRequestFields(selectionValue: string): {
+    expert: string;
+    expert_id: string | null;
+  } {
+    const selected = this.experts().find((expert) => expert.id === selectionValue);
+    if (selected?.storage_kind === 'db') {
+      return {expert: 'worker_base', expert_id: selected.id};
+    }
+    return {
+      expert: selected?.name ?? selected?.id ?? selectionValue,
+      expert_id: null,
+    };
   }
 
   private _defaultTimezone(): string {

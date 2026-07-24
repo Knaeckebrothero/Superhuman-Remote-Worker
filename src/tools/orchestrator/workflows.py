@@ -113,6 +113,7 @@ _AUTOMATION_CREATE_FIELDS = {
     "timezone",
     "catchup_window_seconds",
     "expert",
+    "expert_id",
     "prompt",
     "config_override",
     "autonomy",
@@ -295,6 +296,8 @@ def _format_automation(item: Dict[str, Any]) -> List[str]:
         lines.append(f"  Next run: {item['next_run_at']}")
     if item.get("expert"):
         lines.append(f"  Expert: {item['expert']}")
+    if item.get("expert_id"):
+        lines.append(f"  Expert ID: {item['expert_id']}")
     if item.get("autonomy"):
         lines.append(f"  Autonomy: {item['autonomy']}")
     if item.get("priority") is not None:

@@ -27,6 +27,7 @@ export interface Automation {
   enabled: boolean;
 
   expert: string;
+  expert_id: string | null;
   prompt: string;
   config_override: Record<string, unknown>;
   autonomy: 'full' | 'review' | 'partial' | 'guided' | 'dependent';
@@ -57,6 +58,7 @@ export interface CreateAutomationRequest {
   timezone?: string;
   catchup_window_seconds?: number;
   expert: string;
+  expert_id?: string | null;
   prompt: string;
   config_override?: Record<string, unknown> | null;
   autonomy?: 'full' | 'review' | 'partial' | 'guided' | 'dependent';
