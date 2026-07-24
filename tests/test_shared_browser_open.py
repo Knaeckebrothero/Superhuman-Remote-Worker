@@ -211,6 +211,7 @@ def test_ready_open_returns_redacted_canvas_state_and_headers(
         "can_take_control": True,
         "can_create_viewer_session": False,
         "can_stream_browser": True,
+        "can_view_office": False,
     }
     serialized = response.text
     assert str(_BROWSER_GENERATION) not in serialized

@@ -99,7 +99,7 @@ class _SetFileCanvasArguments(BaseModel):
         description="Optional descriptive stage title; defaults to the filename.",
     )
     renderer: Literal[
-        "auto", "markdown", "text", "html", "html-interactive", "image"
+        "auto", "markdown", "text", "html", "html-interactive", "image", "office"
     ] = Field(
         default="auto",
         description=(
@@ -112,14 +112,18 @@ class _SetFileCanvasArguments(BaseModel):
         default=False,
         description=(
             "Allow conditional user saves for validated writable text sources. "
-            "Images and unavailable/read-only workspaces are rejected."
+            "Office documents are view-only in this slice; images and "
+            "unavailable/read-only workspaces are rejected."
         ),
     )
     alt_text: str | None = Field(
         default=None,
         min_length=1,
         max_length=1000,
-        description="Concise meaningful alternative text; required for images.",
+        description=(
+            "Concise meaningful alternative text; required for images and not "
+            "used for Office documents."
+        ),
     )
 
 
@@ -156,7 +160,7 @@ class _SetLiveCanvasArguments(BaseModel):
         description="Optional descriptive stage title.",
     )
     renderer: Literal[
-        "auto", "markdown", "text", "html", "html-interactive", "image"
+        "auto", "markdown", "text", "html", "html-interactive", "image", "office"
     ] = Field(
         default="auto",
         description=(
@@ -167,13 +171,18 @@ class _SetLiveCanvasArguments(BaseModel):
     )
     editable: bool = Field(
         default=False,
-        description="Conditional file editing. Live applications are never source-editable.",
+        description=(
+            "Conditional file editing. Office documents are view-only in this "
+            "slice and live applications are never source-editable."
+        ),
     )
     alt_text: str | None = Field(
         default=None,
         min_length=1,
         max_length=1000,
-        description="Meaningful image description; workspace_file only.",
+        description=(
+            "Meaningful image description; workspace_file only and unused for Office."
+        ),
     )
     new_app: bool = Field(
         default=False,
@@ -230,7 +239,7 @@ class _SetBrowserCanvasArguments(BaseModel):
         description="Optional descriptive stage title.",
     )
     renderer: Literal[
-        "auto", "markdown", "text", "html", "html-interactive", "image"
+        "auto", "markdown", "text", "html", "html-interactive", "image", "office"
     ] = Field(
         default="auto",
         description=(
@@ -241,13 +250,18 @@ class _SetBrowserCanvasArguments(BaseModel):
     )
     editable: bool = Field(
         default=False,
-        description="Conditional file editing. Browser presentation is never editable.",
+        description=(
+            "Conditional file editing. Office documents are view-only in this "
+            "slice and browser presentation is never editable."
+        ),
     )
     alt_text: str | None = Field(
         default=None,
         min_length=1,
         max_length=1000,
-        description="Meaningful image description; workspace_file only.",
+        description=(
+            "Meaningful image description; workspace_file only and unused for Office."
+        ),
     )
 
     @model_validator(mode="after")
@@ -309,7 +323,7 @@ class _SetLiveBrowserCanvasArguments(BaseModel):
         description="Optional descriptive stage title.",
     )
     renderer: Literal[
-        "auto", "markdown", "text", "html", "html-interactive", "image"
+        "auto", "markdown", "text", "html", "html-interactive", "image", "office"
     ] = Field(
         default="auto",
         description=(
@@ -322,13 +336,16 @@ class _SetLiveBrowserCanvasArguments(BaseModel):
         default=False,
         description=(
             "Conditional file editing. Applications and browser are never editable."
+            " Office documents are view-only in this slice."
         ),
     )
     alt_text: str | None = Field(
         default=None,
         min_length=1,
         max_length=1000,
-        description="Meaningful image description; workspace_file only.",
+        description=(
+            "Meaningful image description; workspace_file only and unused for Office."
+        ),
     )
     new_app: bool = Field(
         default=False,
@@ -533,7 +550,13 @@ def create_canvas_tools(context: ToolContext) -> list[Any]:
         path: str | None = None,
         title: str | None = None,
         renderer: Literal[
-            "auto", "markdown", "text", "html", "html-interactive", "image"
+            "auto",
+            "markdown",
+            "text",
+            "html",
+            "html-interactive",
+            "image",
+            "office",
         ] = "auto",
         editable: bool = False,
         alt_text: str | None = None,

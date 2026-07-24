@@ -79,6 +79,21 @@ def _file(data: bytes = b"# Canvas\n") -> ValidatedCanvasFile:
     )
 
 
+def _office_file(data: bytes = b"PK\x03\x04office") -> ValidatedCanvasFile:
+    import hashlib
+
+    return ValidatedCanvasFile(
+        path="output/report.docx",
+        data=data,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ),
+        renderer="office",
+        source_version="sha256:" + hashlib.sha256(data).hexdigest(),
+        last_modified=NOW,
+    )
+
+
 def _record(
     data: bytes = b"# Canvas\n", revision: int = 1, *, editable: bool = False
 ) -> CanvasRecord:
@@ -180,7 +195,129 @@ def test_path_and_byte_validation_fail_closed(monkeypatch) -> None:
         )
 
 
-def test_interactive_html_renderer_is_explicit_and_html_only() -> None:
+@pytest.mark.parametrize(
+    ("path", "detected", "media_type"),
+    [
+        (
+            "output/report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            "output/budget.xlsx",
+            "application/zip",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+        (
+            "output/slides.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        (
+            "output/letter.odt",
+            "application/vnd.oasis.opendocument.text",
+            "application/vnd.oasis.opendocument.text",
+        ),
+        (
+            "output/table.ods",
+            "application/vnd.oasis.opendocument.spreadsheet",
+            "application/vnd.oasis.opendocument.spreadsheet",
+        ),
+        (
+            "output/deck.odp",
+            "application/zip",
+            "application/vnd.oasis.opendocument.presentation",
+        ),
+    ],
+)
+def test_office_detection_requires_matching_extension_and_magic(
+    monkeypatch, path: str, detected: str, media_type: str
+) -> None:
+    from services import canvas_files
+
+    class OfficeMagic:
+        @staticmethod
+        def from_buffer(data: bytes, mime: bool = False) -> str:
+            del data, mime
+            return detected
+
+    monkeypatch.setattr(canvas_files, "magic", OfficeMagic)
+    validated = validate_canvas_bytes(path, b"PK\x03\x04office bytes")
+
+    assert validated.renderer == "office"
+    assert validated.media_type == media_type
+    assert validated.data == b"PK\x03\x04office bytes"
+
+
+@pytest.mark.parametrize(
+    ("path", "detected"),
+    [
+        (
+            "output/not-a-sheet.xlsx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        ("output/not-office.txt", "application/zip"),
+        ("output/legacy.doc", "application/zip"),
+        ("output/not-odt.odt", "application/octet-stream"),
+    ],
+)
+def test_office_detection_rejects_ambiguous_or_mismatched_bytes(
+    monkeypatch, path: str, detected: str
+) -> None:
+    from services import canvas_files
+
+    class OfficeMagic:
+        @staticmethod
+        def from_buffer(data: bytes, mime: bool = False) -> str:
+            del data, mime
+            return detected
+
+    monkeypatch.setattr(canvas_files, "magic", OfficeMagic)
+    with pytest.raises(CanvasFileError) as error:
+        validate_canvas_bytes(path, b"PK\x03\x04mismatch")
+    assert error.value.code in {"mime_renderer_mismatch", "unsupported_canvas_file"}
+
+
+def test_office_renderer_is_closed_and_office_size_is_independent(monkeypatch) -> None:
+    from services import canvas_files
+
+    class OfficeMagic:
+        @staticmethod
+        def from_buffer(data: bytes, mime: bool = False) -> str:
+            del data, mime
+            return "application/zip"
+
+    monkeypatch.setattr(canvas_files, "magic", OfficeMagic)
+    monkeypatch.setattr(canvas_files, "MAX_TEXT_BYTES", 4)
+    monkeypatch.setattr(canvas_files, "MAX_OFFICE_BYTES", 16)
+    monkeypatch.setattr(canvas_files, "MAX_FILE_BYTES", 32)
+    payload = b"PK\x03\x04office"
+
+    assert (
+        validate_canvas_bytes(
+            "output/report.docx",
+            payload,
+            requested_renderer="office",
+        ).renderer
+        == "office"
+    )
+    with pytest.raises(CanvasFileError) as mismatch:
+        validate_canvas_bytes(
+            "output/report.docx",
+            payload,
+            requested_renderer="text",
+        )
+    assert mismatch.value.code == "mime_renderer_mismatch"
+
+    with pytest.raises(CanvasFileError) as too_large:
+        validate_canvas_bytes("output/report.docx", b"PK" + b"x" * 15)
+    assert too_large.value.status_code == 413
+
+
+def test_interactive_html_renderer_is_explicit_and_html_only(monkeypatch) -> None:
+    from services import canvas_files
+
+    monkeypatch.setattr(canvas_files, "magic", _Magic)
     data = b"<!doctype html><style>.card{color:green}</style><div class=card>Safe</div>"
     detected = validate_canvas_bytes("output/mockup.html", data)
     interactive = validate_canvas_bytes(
@@ -265,6 +402,7 @@ async def test_sftp_reader_rejects_root_and_source_symlinks(symlink_path) -> Non
     [
         ("output/report.md", 12),
         ("output/preview.html", 12),
+        ("output/report.docx", 24),
         ("output/image.png", 18),
         ("output/unknown.bin", 18),
     ],
@@ -277,6 +415,7 @@ async def test_sftp_transport_uses_renderer_specific_read_ceiling(
     from services import canvas_files
 
     monkeypatch.setattr(canvas_files, "MAX_TEXT_BYTES", 11)
+    monkeypatch.setattr(canvas_files, "MAX_OFFICE_BYTES", 23)
     monkeypatch.setattr(canvas_files, "MAX_IMAGE_BYTES", 17)
     monkeypatch.setattr(canvas_files, "MAX_FILE_BYTES", 100)
     reads: list[int] = []
@@ -927,12 +1066,14 @@ class _RouteDB:
 class _RouteGateway:
     def __init__(self, file: ValidatedCanvasFile) -> None:
         self.file = file
+        self.materialize_calls = 0
         self.error: CanvasFileError | None = None
         self.after_materialize = None
         self.after_validate = None
 
     async def materialize_current(self, thread, record):
         del thread, record
+        self.materialize_calls += 1
         if self.error:
             raise self.error
         if self.after_materialize:
@@ -1086,12 +1227,17 @@ class _RouteService:
         return CanvasMutation(changed=True, record=self.record)
 
 
-def _route_client(monkeypatch, *, record: CanvasRecord | None = None):
+def _route_client(
+    monkeypatch,
+    *,
+    record: CanvasRecord | None = None,
+    file: ValidatedCanvasFile | None = None,
+):
     from routers import canvases
 
     db = _RouteDB(_thread())
     service = _RouteService(record)
-    gateway = _RouteGateway(_file())
+    gateway = _RouteGateway(file or _file())
 
     async def owner(request, received_db, thread_id):
         assert received_db is db and thread_id == THREAD_ID
@@ -1340,6 +1486,205 @@ def test_internal_file_set_contract_and_serializer_boundary(monkeypatch) -> None
         headers={"X-Internal-Key": "test-key", "X-MCP-User-Id": "wrong"},
     )
     assert mismatch.status_code == 401
+
+
+def test_internal_office_set_is_enabled_only_with_live_collabora(
+    monkeypatch,
+) -> None:
+    from routers import canvases
+    from services.canvas_office import CollaboraConfig
+
+    office = _office_file()
+    client, service, _, _ = _route_client(monkeypatch, file=office)
+    url = f"/api/internal/persistent/threads/{THREAD_ID}/canvases/main/set"
+    headers = {"X-Internal-Key": "test-key", "X-MCP-User-Id": USER_ID}
+    base_config = dict(
+        internal_url="http://collabora:9980",
+        public_origin="https://office.example.test",
+        wopi_base_url="http://orchestrator:8085",
+        cockpit_origin="https://cockpit.example.test",
+        token_ttl_seconds=36_000,
+        discovery_cache_ttl_seconds=60,
+        request_timeout_seconds=2.0,
+    )
+
+    monkeypatch.setattr(
+        canvases,
+        "_get_collabora_config",
+        lambda: CollaboraConfig(enabled=False, **base_config),
+    )
+    disabled = client.post(
+        url,
+        headers=headers,
+        json={"source_type": "workspace_file", "path": office.path},
+    )
+    assert disabled.status_code == 422
+    assert disabled.json()["detail"]["code"] == "canvas_office_unavailable"
+    assert service.record is None
+
+    class Discovery:
+        async def get_urlsrc(self, extension):
+            assert extension == ".docx"
+            return "https://office.example.test/browser/hash/cool.html?"
+
+    monkeypatch.setattr(
+        canvases,
+        "_get_collabora_config",
+        lambda: CollaboraConfig(enabled=True, **base_config),
+    )
+    monkeypatch.setattr(canvases, "_get_office_discovery", Discovery)
+    editable = client.post(
+        url,
+        headers=headers,
+        json={
+            "source_type": "workspace_file",
+            "path": office.path,
+            "editable": True,
+        },
+    )
+    assert editable.status_code == 422
+    assert "view-only" in editable.json()["detail"]["message"]
+    assert service.record is None
+
+    accepted = client.post(
+        url,
+        headers=headers,
+        json={"source_type": "workspace_file", "path": office.path},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["renderer"] == "office"
+    assert accepted.json()["content_url"] is None
+    assert accepted.json()["capabilities"]["can_view_office"] is True
+    assert accepted.json()["editable"] is False
+
+
+def test_office_bytes_never_use_the_generic_canvas_content_route(monkeypatch) -> None:
+    office = _office_file()
+    source = WorkspaceFileSource(path=office.path, workspace_generation=GENERATION)
+    record = CanvasRecord(
+        thread_id=THREAD_ID,
+        canvas_id="main",
+        source=source,
+        title="Office report",
+        renderer="office",
+        editable=False,
+        alt_text=None,
+        presentation_revision=3,
+        source_fingerprint=canonical_source_fingerprint(source),
+        source_version=office.source_version,
+        origin_generation=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    client, _, gateway, _ = _route_client(
+        monkeypatch,
+        record=record,
+        file=office,
+    )
+    response = client.get(
+        f"/api/persistent/threads/{THREAD_ID}/canvases/main/content",
+        params={
+            "presentation_revision": record.presentation_revision,
+            "source_fingerprint": record.source_fingerprint,
+            "source_version": record.source_version,
+            "ngsw-bypass": "true",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "canvas_office_content_unavailable"
+    assert gateway.materialize_calls == 0
+
+
+def test_office_session_mint_requires_bff_cookie_and_returns_form_contract(
+    monkeypatch,
+) -> None:
+    from routers import canvases
+    from services.canvas_office import CollaboraConfig, WopiTokenGrant
+
+    office = _office_file()
+    source = WorkspaceFileSource(path=office.path, workspace_generation=GENERATION)
+    record = CanvasRecord(
+        thread_id=THREAD_ID,
+        canvas_id="main",
+        source=source,
+        title="Office report",
+        renderer="office",
+        editable=False,
+        alt_text=None,
+        presentation_revision=3,
+        source_fingerprint=canonical_source_fingerprint(source),
+        source_version=office.source_version,
+        origin_generation=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    client, _, _, _ = _route_client(monkeypatch, record=record, file=office)
+    config = CollaboraConfig(
+        enabled=True,
+        internal_url="http://collabora:9980",
+        public_origin="https://office.example.test",
+        wopi_base_url="http://orchestrator:8085",
+        cockpit_origin="https://cockpit.example.test",
+        token_ttl_seconds=36_000,
+        discovery_cache_ttl_seconds=60,
+        request_timeout_seconds=2.0,
+    )
+
+    class Discovery:
+        async def get_urlsrc(self, extension):
+            assert extension == ".docx"
+            return "https://office.example.test/browser/hash/cool.html?"
+
+    class Tokens:
+        def mint(self, **kwargs):
+            assert kwargs == {
+                "user_id": USER_ID,
+                "thread_id": THREAD_ID,
+                "path": office.path,
+                "write_flag": False,
+            }
+            return WopiTokenGrant(
+                access_token="signed-token",
+                file_id="f" * 64,
+                expires_at_ms=1_721_858_400_000,
+            )
+
+    monkeypatch.setattr(canvases, "_get_collabora_config", lambda: config)
+    monkeypatch.setattr(canvases, "_get_office_discovery", Discovery)
+    monkeypatch.setattr(canvases, "_get_wopi_token_service", lambda db: Tokens())
+
+    state_url = f"/api/persistent/threads/{THREAD_ID}/canvases/main"
+    state = client.get(state_url)
+    assert state.status_code == 200
+    session_url = f"{state_url}/office-session"
+    missing_cookie = client.post(
+        session_url,
+        headers={
+            "If-Match": state.headers["etag"],
+            "Origin": config.cockpit_origin,
+        },
+        content=b"",
+    )
+    assert missing_cookie.status_code == 401
+
+    session = client.post(
+        session_url,
+        headers={
+            "If-Match": state.headers["etag"],
+            "Origin": config.cockpit_origin,
+        },
+        cookies={"srw_session": "33333333-3333-4333-8333-333333333333"},
+        content=b"",
+    )
+    assert session.status_code == 200
+    assert session.headers["cache-control"] == "private, no-store"
+    assert session.json() == {
+        "urlsrc": "https://office.example.test/browser/hash/cool.html?",
+        "WOPISrc": f"http://orchestrator:8085/wopi/files/{'f' * 64}",
+        "access_token": "signed-token",
+        "access_token_ttl": 1_721_858_400_000,
+    }
 
 
 def test_internal_set_rechecks_delegated_owner_before_commit(monkeypatch) -> None:
