@@ -21,12 +21,17 @@ from pydantic import BaseModel, Field
 
 from security.access import require_project_member
 from security.auth import require_approved_user
-from services.automations import create_job_from_automation
+from services.automations import (
+    create_job_from_automation,
+    validate_automation_expert_selection,
+)
 from services.cron_dispatcher import (
     compute_initial_next_run,
     validate_cron_expr,
     validate_timezone,
 )
+from services.default_experts import ExpertSelectionError
+from src.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,7 @@ class AutomationCreate(BaseModel):
     catchup_window_seconds: int = Field(86400, ge=0, le=7 * 86400)
 
     expert: str = Field(..., min_length=1, max_length=120)
+    expert_id: str | None = Field(None, max_length=64)
     prompt: str = Field(..., min_length=1)
     config_override: dict[str, Any] | None = None
     autonomy: str = Field("review", pattern=r"^(full|review|partial|guided|dependent)$")
@@ -78,6 +84,7 @@ class AutomationUpdate(BaseModel):
     timezone: str | None = Field(None, max_length=64)
     catchup_window_seconds: int | None = Field(None, ge=0, le=7 * 86400)
     expert: str | None = Field(None, min_length=1, max_length=120)
+    expert_id: str | None = Field(None, max_length=64)
     prompt: str | None = Field(None, min_length=1)
     config_override: dict[str, Any] | None = None
     autonomy: str | None = Field(
@@ -158,6 +165,17 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
             request, postgres_db, body.project_id, min_role="editor"
         )
 
+    try:
+        expert = await validate_automation_expert_selection(
+            postgres_db,
+            owner_id=str(caller["id"]),
+            project_id=body.project_id,
+            expert=body.expert,
+            expert_id=body.expert_id,
+        )
+    except ExpertSelectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     next_run = (
         compute_initial_next_run(body.cron_expr, body.timezone)
         if body.enabled
@@ -174,7 +192,8 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
         timezone=body.timezone,
         catchup_window_seconds=body.catchup_window_seconds,
         enabled=body.enabled,
-        expert=body.expert,
+        expert=expert,
+        expert_id=body.expert_id,
         prompt=body.prompt,
         config_override=body.config_override or {},
         autonomy=body.autonomy,
@@ -250,6 +269,28 @@ async def update_automation(
             validate_timezone(fields["timezone"])
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    selection_changed = bool({"expert", "expert_id"} & set(fields))
+    if "expert" in fields:
+        fields["expert"] = canonical_config_name(fields["expert"])
+        # Selecting a bundled expert through a partial PATCH also unpins a
+        # previously selected DB expert unless the request explicitly supplied
+        # its own expert_id (which validation below rejects as ambiguous).
+        if fields["expert"] != "worker_base" and "expert_id" not in fields:
+            fields["expert_id"] = None
+    if selection_changed:
+        effective_expert = fields.get("expert", row["expert"])
+        effective_expert_id = fields.get("expert_id", row.get("expert_id"))
+        try:
+            fields["expert"] = await validate_automation_expert_selection(
+                postgres_db,
+                owner_id=str(row["owner_id"]),
+                project_id=str(row["project_id"]) if row.get("project_id") else None,
+                expert=effective_expert,
+                expert_id=effective_expert_id,
+            )
+        except ExpertSelectionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Recompute next_run_at when the schedule shape or enable state changes.
     # Pull the effective post-patch values from `fields` falling back to row.
