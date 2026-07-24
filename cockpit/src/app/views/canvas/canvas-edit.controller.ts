@@ -25,7 +25,7 @@ interface CanvasEditSnapshot {
   readonly state: CanvasState;
   readonly sourceKey: string;
   readonly path: string;
-  readonly renderer: Exclude<CanvasTrustedRenderer, 'image' | 'unsupported'>;
+  readonly renderer: Exclude<CanvasTrustedRenderer, 'image' | 'office' | 'unsupported'>;
   readonly contentUrl: string;
   readonly contentEtag: string;
   readonly content: string;
