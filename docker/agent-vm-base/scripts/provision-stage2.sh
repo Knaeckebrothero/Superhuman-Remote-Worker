@@ -101,6 +101,11 @@ PermitTunnel no
 ClientAliveInterval 60
 ClientAliveCountMax 720
 MaxStartups 10:30:100
+# Above the OpenSSH default (10): the agent multiplexes parallel tool execs
+# plus persistent SFTP/shell channels over ONE transport; mirrors
+# docker/Dockerfile.workspace. See
+# docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+MaxSessions 16
 SSHEOF
 
 sudo systemctl enable ssh

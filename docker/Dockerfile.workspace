@@ -285,6 +285,13 @@ PermitTunnel no
 ClientAliveInterval 60
 ClientAliveCountMax 720
 MaxStartups 10:30:100
+# Above the OpenSSH default (10): the agent multiplexes parallel tool execs
+# plus persistent SFTP/shell channels over ONE transport, and a 14-wide tool
+# batch at the default limit masqueraded as workspace death. The backend caps
+# concurrent execs at WORKSPACE_SSH_MAX_CONCURRENT_CHANNELS (10); 16 leaves
+# headroom for the long-lived channels.
+# docs/issues/maxsessions_parallel_tools_false_workspace_death.md
+MaxSessions 16
 SSHEOF
 
 # Host keys are generated at runtime into the workspace-system volume. Baking
