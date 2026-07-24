@@ -375,9 +375,7 @@ async def probe_workspace_ssh(host: str, port: int, timeout: float = 3.0) -> boo
     return True
 
 
-def should_reset_recovery_counter(
-    container_ctx: dict[str, Any], error: Any
-) -> bool:
+def should_reset_recovery_counter(container_ctx: dict[str, Any], error: Any) -> bool:
     """True when a handled completion should zero ``recovery_attempts``.
 
     The counter only ever incremented before, so a single recovered blip

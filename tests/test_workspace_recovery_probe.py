@@ -60,9 +60,7 @@ class TestProbeWorkspaceSsh:
 
     @pytest.mark.asyncio
     async def test_unroutable_host_times_out_false(self):
-        assert (
-            await probe_workspace_ssh("10.255.255.1", 30022, timeout=0.2) is False
-        )
+        assert await probe_workspace_ssh("10.255.255.1", 30022, timeout=0.2) is False
 
 
 # =============================================================================
