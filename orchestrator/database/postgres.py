@@ -8149,9 +8149,12 @@ class PostgresDB:
         return dict(row) if row else None
 
     async def expert_delete_blockers(self, expert_id: str) -> List[Dict[str, Any]]:
-        """Live references that block deletion (decision 15): active (non-ended)
-        threads carrying metadata.expert_id, and pending/unstarted jobs with this
-        expert_id. Finished/running jobs never block (resolved_config frozen)."""
+        """Live references that block deletion (decision 15).
+
+        Active threads, pending/unstarted jobs, pinned automations, and default
+        pointers must be repointed first. Finished/running jobs never block
+        because their resolved config is already frozen.
+        """
         blockers: List[Dict[str, Any]] = []
         threads = await self.fetch(
             """
@@ -8176,6 +8179,18 @@ class PostgresDB:
         blockers += [
             {"type": "job", "id": str(j["id"]), "label": (j["description"] or "")[:80]}
             for j in jobs
+        ]
+        automations = await self.fetch(
+            "SELECT id, name FROM automations WHERE expert_id = $1",
+            UUID(str(expert_id)),
+        )
+        blockers += [
+            {
+                "type": "automation",
+                "id": str(automation["id"]),
+                "label": automation["name"],
+            }
+            for automation in automations
         ]
         app_defaults = await self.fetch(
             "SELECT expert_type FROM application_expert_defaults WHERE expert_id = $1",
@@ -11696,6 +11711,7 @@ class PostgresDB:
         trigger_type: str,
         expert: str,
         prompt: str,
+        expert_id: str | None = None,
         description: str | None = None,
         project_id: str | None = None,
         cron_expr: str | None = None,
@@ -11724,7 +11740,7 @@ class PostgresDB:
                     owner_id, project_id, name, description, trigger_type,
                     cron_expr, timezone, catchup_window_seconds,
                     event_filter, enabled,
-                    expert, prompt, config_override, autonomy, priority,
+                    expert, expert_id, prompt, config_override, autonomy, priority,
                     max_chain_depth, max_fires_per_day,
                     next_run_at
                 )
@@ -11732,9 +11748,9 @@ class PostgresDB:
                     $1, $2, $3, $4, $5,
                     $6, $7, $8,
                     $9::jsonb, $10,
-                    $11, $12, $13::jsonb, $14, $15,
-                    $16, $17,
-                    $18
+                    $11, $12, $13, $14::jsonb, $15, $16,
+                    $17, $18,
+                    $19
                 )
                 RETURNING *
                 """,
@@ -11749,6 +11765,7 @@ class PostgresDB:
                 json.dumps(event_filter) if event_filter else None,
                 enabled,
                 expert,
+                UUID(expert_id) if expert_id else None,
                 prompt,
                 json.dumps(config_override or {}),
                 autonomy,
@@ -11808,6 +11825,7 @@ class PostgresDB:
             "catchup_window_seconds",
             "enabled",
             "expert",
+            "expert_id",
             "prompt",
             "config_override",
             "autonomy",
@@ -11844,6 +11862,9 @@ class PostgresDB:
             if key == "config_override":
                 params.append(json.dumps(value or {}))
                 sets.append(f"{key} = ${len(params)}::jsonb")
+            elif key == "expert_id":
+                params.append(UUID(str(value)) if value else None)
+                sets.append(f"{key} = ${len(params)}")
             else:
                 params.append(value)
                 sets.append(f"{key} = ${len(params)}")

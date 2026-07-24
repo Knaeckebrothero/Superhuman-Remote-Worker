@@ -8,11 +8,19 @@ this is the unit boundary for the helper.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator.services.automations import create_job_from_automation
+from orchestrator.services.automations import (
+    create_job_from_automation,
+    validate_automation_expert_selection,
+)
+from orchestrator.services.default_experts import ExpertSelectionError
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _mock_db_returning_job(job_id: str = "j0000001-0000-0000-0000-000000000000"):
@@ -148,3 +156,81 @@ class TestCreateJobFromAutomation:
             "source": "application",
             "expert_id": expert_id,
         }
+
+    @pytest.mark.asyncio
+    async def test_pinned_db_expert_uses_explicit_expert_id(self, monkeypatch) -> None:
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
+        db = _mock_db_returning_job()
+        owner_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        expert_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        db.get_user = AsyncMock(return_value={"id": owner_id, "is_admin": False})
+        db.get_expert_visible_by_id = AsyncMock(
+            return_value={
+                "id": expert_id,
+                "expert_type": "worker",
+                "owner_id": owner_id,
+            }
+        )
+
+        await create_job_from_automation(
+            db,
+            _make_automation_row(expert="worker_base", expert_id=expert_id),
+        )
+
+        kwargs = db.create_job.await_args.kwargs
+        assert kwargs["config_name"] == "worker_base"
+        assert kwargs["expert_id"] == expert_id
+        assert kwargs["context"]["expert_selection"] == {
+            "source": "explicit",
+            "expert_id": expert_id,
+        }
+
+    @pytest.mark.asyncio
+    async def test_legacy_uuid_in_expert_column_is_recovered(self, monkeypatch) -> None:
+        """Rows created by the old Cockpit still run before migration/backfill."""
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
+        db = _mock_db_returning_job()
+        owner_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        expert_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        db.get_user = AsyncMock(return_value={"id": owner_id, "is_admin": False})
+        db.get_expert_visible_by_id = AsyncMock(
+            return_value={
+                "id": expert_id,
+                "expert_type": "worker",
+                "owner_id": owner_id,
+            }
+        )
+
+        await create_job_from_automation(
+            db,
+            _make_automation_row(expert=expert_id),
+        )
+
+        kwargs = db.create_job.await_args.kwargs
+        assert kwargs["config_name"] == "worker_base"
+        assert kwargs["expert_id"] == expert_id
+
+
+@pytest.mark.asyncio
+async def test_automation_expert_validation_rejects_ambiguous_sources(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
+    with pytest.raises(ExpertSelectionError, match="select one expert source"):
+        await validate_automation_expert_selection(
+            MagicMock(),
+            owner_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            project_id=None,
+            expert="scholar",
+            expert_id="dddddddd-dddd-dddd-dddd-dddddddddddd",
+        )
+
+
+def test_automation_expert_id_migration_shape() -> None:
+    sql = (
+        ROOT / "orchestrator/database/migrations/app/0069_automation_expert_id.sql"
+    ).read_text()
+    assert "ADD COLUMN IF NOT EXISTS expert_id UUID" in sql
+    assert "experts.expert_type = 'worker'" in sql
+    assert "REFERENCES experts(id) ON DELETE RESTRICT" in sql
+    assert "expert_id IS NULL OR expert = 'worker_base'" in sql
