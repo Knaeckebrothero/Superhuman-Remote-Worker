@@ -2,8 +2,9 @@
 
 **Superhuman Remote Worker (SRW)** runs AI agents that do real work for you:
 research, writing, analysis, design, and software development. Agents work in
-isolated, git-versioned workspaces, can be given access to your data, check
-in with you as much or as little as you choose, and get smarter over time
+isolated environments ranging from instant cloud-backed files to full
+git-versioned containers and VMs. They can be given scoped access to your data,
+check in with you as much or as little as you choose, and get smarter over time
 through shared project memory.
 
 ## The mental model
@@ -74,7 +75,9 @@ you see them) is on by default and stays available at every autonomy level.
 
 ## Where results live
 
-Agent work lands as files in the job's `output/` folder, git commits you can
-browse, citations for anything researched, and knowledge notes on the
-project. Deliverables can be exported to shared cloud storage, and any
-workspace opens in an in-browser IDE.
+Depending on its workspace and tools, agent work can land as files in
+`output/`, git commits you can browse, citations for researched material, and
+project knowledge notes. The exact surfaces depend on the selected workspace:
+Virtual has durable files but no git, Container and VM add git and IDE-style
+access, and None has no workspace files. Deliverables can also be exported to
+shared cloud storage.

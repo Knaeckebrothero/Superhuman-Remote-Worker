@@ -11,11 +11,12 @@ tags:
 # SRW Self-Knowledge and App Guide
 
 > **Status**: v1 `app-guide` shipped 2026-07-08. M1a managed delivery, M1b
-> Email/OKF guidance plus the connector-type drift gate, and M1c
-> Automations/Fleet guidance plus live tool-group coverage were implemented
-> 2026-07-23. The broader content audit, live capability plane, visual help,
-> and later roadmap remain in progress. The codebase and primary-source review
-> was completed 2026-07-22.
+> Email/OKF guidance plus the connector-type drift gate, M1c
+> Automations/Fleet guidance plus live tool-group coverage, and M1d
+> Canvas/browser plus permission/workspace guidance were implemented through
+> 2026-07-24. M1d also repaired the automation expert-selection contract that
+> the guide audit exposed. The remaining content audit, live capability plane,
+> visual help, and later roadmap remain in progress.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -295,7 +296,48 @@ Like M1b, these are static build-level claims. The guide tells the model to
 check its actual visible tools, but the Phase 2 capability plane is still
 needed to explain deployment, user, and current-session state reliably.
 
-### Remaining gaps after M1c
+### Shipped M1d — Canvas/browser and permission/workspace truthfulness
+
+This slice repairs the two most failure-prone “can I do this here?” journeys
+and closes the automation prerequisite discovered during the audit:
+
+- `canvas-and-browser` distinguishes Canvas as a shared stage, direct browser
+  tools, web research, and the default-off shared-browser view instead of
+  treating them as one generic browser feature;
+- it documents the current file renderer allowlist, editable-source refresh
+  contract, close-versus-clear lifecycle, strict-versus-schema-advertised
+  interactive HTML boundary, deployment-gated Live Preview, shared-browser
+  baton/cookie handoff, native dialog gaps, persistent-session-only host
+  surface, reason codes, and the currently proven shared-browser
+  Container—not VM—path;
+- `permissions-and-availability` documents the runtime's shipped permission
+  modes rather than the proposed tier design, the restrict-only grant
+  hierarchy and full current grant catalog, all four workspace tiers, live
+  settings limitations, upgrade-only workspace changes, and a layered
+  diagnosis path that refuses to infer current state from static prose;
+- the sessions, overview, and file/integration references no longer promise
+  git, shell, browser, IDE, or workspace files on tiers that do not provide
+  them;
+- the automation editor now filters to worker experts and persists
+  database-backed selections with `expert_id` while keeping bundled configs in
+  `expert`; fire-time resolution preserves pinned IDs, resolves an unpinned
+  `worker_base` default intentionally, and fails loud instead of silently
+  changing an explicit selection;
+- migration `0069_automation_expert_id.sql` backfills the old UUID-in-name
+  editor bug and adds the foreign-key/check/index contract, while create,
+  update, delete-blocker, portable-bundle, Cockpit, and fire-time paths share
+  the new representation; and
+- focused tests pin the two guide metadata contracts, Canvas/direct-browser
+  tool and renderer inventories, every shared-browser reason code, every
+  current capability-grant key, current approval and workspace boundaries,
+  independent managed-reader retrieval, and the automation selection
+  regression.
+
+These remain static, reviewed build-level claims. They can interpret an
+observed control reason or visible tool, but the guide cannot yet query the
+complete effective deployment/user/session state; that remains Phase 2.
+
+### Remaining gaps after M1d
 
 The guide is now delivered reliably, but it is not yet self-maintaining or
 runtime-aware:
@@ -304,8 +346,9 @@ runtime-aware:
   covers MCP, credential-file, repository, WebDAV, and managed database
   connectors. The new catalog catches type-list drift, but it does not verify
   every workflow sentence against implementation.
-- The reference-index and connector-catalog tests prove structure, coverage
-  decisions, and selected consumer parity—not end-to-end factual freshness.
+- The reference-index, connector-catalog, grant-catalog, and selected
+  tool-inventory tests prove structure, coverage decisions, and selected
+  consumer parity—not end-to-end factual freshness.
 - Static references can describe possible features but cannot inspect flags,
   user grants, service configuration, or the session's attached resources.
 - `get_session_context`, `list_experts`, `list_skills`, workflow tools, and
@@ -320,14 +363,10 @@ runtime-aware:
   local development by design. It is not an orchestrator, Cockpit, guide, or
   release identity, and SRW supports independently tagged component images.
 - Cockpit still repeats connector IDs in TypeScript/UI source, but the canonical
-  Python inventory now drives backend acceptance and CI asserts parity. Other
-  user-visible inventories and Cockpit route/actions still lack canonical
-  seams.
-- The automation editor currently loads the unfiltered expert list and submits
-  the selected `Expert.id`, while the fire-time service documents and resolves
-  `automation.expert` as a worker expert name/config. DB-backed and
-  worker-only selection needs a dedicated product fix and regression test; the
-  guide therefore requires a Run-now verification before trusting a schedule.
+  Python inventory now drives backend acceptance and CI asserts parity.
+  Canvas/direct-browser and grant coverage consume current Python
+  inventories, but other user-visible inventories and Cockpit route/actions
+  still lack canonical seams.
 - The proposed `/datasources?new=email` target is not implemented today. The
   current route is `/datasources`, and creation is opened by local component
   state rather than a query parameter.
@@ -341,7 +380,7 @@ runtime-aware:
 
 ### Validated repository implementation seams
 
-These are the leading implementation seams as of 2026-07-22. They record why
+These are the leading implementation seams as of 2026-07-24. They record why
 the roadmap is sequenced this way; symbols may move during implementation.
 
 | Concern | Existing seam/evidence | Status / intended change |
@@ -354,10 +393,13 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Live session overlay | `src/tools/context.py`, `src/api/persistent_session.py`, and `src/tools/orchestrator/jobs.py` | Record final loaded tool names and overlay actual backend/datasource/knowledge/cloud observations in the agent tool |
 | Datasource inventory | `src/core/datasource_catalog.py`, validation in `orchestrator/main.py`, agent mapping in `src/core/datasource_setup.py`, and Cockpit types/filters | M1b makes the Python catalog authoritative for backend acceptance and asserts guide/Cockpit/agent parity; runtime availability remains Phase 2 |
 | Session work control groups | `src/core/session_tool_overrides.py`, `src/tools/orchestrator/jobs.py`, and `src/tools/orchestrator/workflows.py` | M1c gives every currently selectable Fleet/Workflow tool a focused guide-topic decision; route/action and runtime-state registries remain later work |
+| Canvas/browser inventories | `src/tools/canvas`, `src/tools/research/browser_direct.py`, `src/core/session_tool_overrides.py`, `orchestrator/services/canvas.py`, and `orchestrator/services/shared_browser_canvas.py` | M1d gives every current Canvas/direct-browser tool, file renderer, and shared-browser reason code a focused-topic decision; feature/runtime state remains Phase 2 |
+| Permissions/workspaces | `src/core/capability_grants.py`, `src/api/persistent_app.py`, session workspace constants in `orchestrator/main.py`, and Cockpit live settings | M1d covers every current grant key and shipped approval/workspace behavior; a complete effective-state query remains Phase 2 |
+| Automation expert selection | `orchestrator/services/automations.py`, `orchestrator/routers/automations.py`, migration `0069`, and the Cockpit editor | M1d adds explicit DB `expert_id`, worker-only validation, pinned/default fire semantics, delete blockers, and backend/Cockpit regressions |
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
-| Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; static Canvas rendering strips scripts/interaction | Define a separately validated help-card/App contract; do not smuggle interactive help through arbitrary Canvas HTML |
+| Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; strict Canvas HTML is inert while schema-advertised interactive HTML is an isolated, untrusted artifact | Define a separately validated help-card/App contract; do not treat arbitrary interactive Canvas HTML as trusted product UI |
 | Provenance | Agent-only `BUILD_SHA` in `docker/Dockerfile.agent` and short CI values; independently tagged images in Helm values | Stamp and surface full revision/digest metadata for each relevant component |
-| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, and persistent-session suites | M1a covers managed delivery/current bytes; M1b/M1c add focused content and inventory/group coverage; add model triggers, grounded answers, compaction, and the k3d resume matrix |
+| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, and persistent-session suites | M1a covers managed delivery/current bytes; M1b–M1d add focused content plus datasource, Fleet/Workflow, Canvas/browser, and grant-catalog coverage; add model triggers, grounded answers, compaction, and the k3d resume matrix |
 
 ## Architecture
 
@@ -443,11 +485,11 @@ to the v1 reference set are:
 | Reference | Purpose |
 |---|---|
 | `automations.md` (shipped M1c) | Scheduled jobs, enable/disable semantics, runs, and safe authoring |
-| `canvas-and-browser.md` | File/app/browser presentation, shared browsing, and availability requirements |
+| `canvas-and-browser.md` (shipped M1d) | File/app/browser presentation, shared browsing, and availability requirements |
 | `datasources-email.md` (shipped M1b) | Provider support, app passwords, access tiers, folder/recipient allowlists, attachment |
 | `datasources-okf.md` (shipped M1b) | OKF knowledge bases, repositories, indexing readiness, and read-only behavior |
 | `fleet-and-delegation.md` (shipped M1c) | What the session can delegate, inspect, approve, resume, pause, and cancel |
-| `permissions-and-availability.md` | Grants, feature flags, workspace tiers, and how to interpret disabled controls |
+| `permissions-and-availability.md` (shipped M1d) | Grants, feature flags, workspace tiers, and how to interpret disabled controls |
 
 The exact split is an implementation-time content decision. `SKILL.md` remains
 the authoritative routing index; the capability registry remains the
@@ -467,6 +509,8 @@ stable dotted ID such as:
 - `datasources.okf`
 - `canvas.files`
 - `canvas.browser`
+- `sessions.permission-mode`
+- `workspaces.select`
 - `sessions.delegate`
 
 Each definition carries descriptive metadata, not secret configuration:
@@ -764,9 +808,11 @@ Visual help should progress from durable and cheap to richer and more fragile:
    communicates something text, a screenshot, and a live coach mark cannot.
 
 Do not make an animated mockup the default. It can drift independently of the
-real UI, duplicates localization and accessibility work, and current static
-Canvas HTML intentionally strips scripts and animations. Coach marks on the
-actual UI are the more reliable interactive end state.
+real UI and duplicates localization and accessibility work. Strict Canvas HTML
+intentionally strips scripts and animations; the explicit interactive renderer
+can run a self-contained mockup, but it remains an isolated, untrusted artifact
+without a trusted product-action contract. Coach marks on the actual UI are the
+more reliable interactive end state.
 
 #### Help UX and accessibility contract
 
@@ -1139,7 +1185,9 @@ DB-authored-skills or DB-experts features.
   fleet/job management, unified loops/campaigns, Canvas, live/shared browser,
   protected cloud review, workspace tiers, and relevant settings. Email and
   OKF were audited in M1b; Automations and Fleet/job management were audited in
-  M1c; the remaining areas are still open.
+  M1c; Canvas/browser, permission modes, grants, workspace tiers, and related
+  session settings were audited in M1d. Unified loops/campaigns, protected
+  cloud review, and the remaining original-reference sweep are still open.
 - [x] Run a small delivery spike and record the choice: extend `use_skill` with
   an immutable system-bundle reader or add bounded `read_product_guide`; prove
   that authoritative bytes do not depend on mutable workspace files. M1a chose
@@ -1155,11 +1203,18 @@ DB-authored-skills or DB-experts features.
 - [x] Add digest-owned guide upgrade/withdraw reconciliation for existing
   resumed sessions. M1a refreshes the in-memory bundle on every tool rebind and
   deliberately has no authoritative workspace copy to reconcile.
-- [ ] Update the original references and add the high-value split references
-  listed in this design, including content type, capability IDs, and journey
-  IDs. The Email and OKF splits shipped in M1b; Automations and
-  Fleet/delegation shipped in M1c; Canvas/browser and
-  permissions/availability remain open.
+- [x] Add the high-value split references listed in this design, including
+  content type, capability IDs, and journey IDs. Email and OKF shipped in M1b,
+  Automations and Fleet/delegation in M1c, and Canvas/browser plus
+  permissions/availability in M1d.
+- [ ] Complete the remaining original-reference audit. M1d corrected the
+  broad session, overview, and file/workspace claims touched by the new focused
+  guides; unified loops/campaigns and protected-cloud review still need their
+  own pass.
+- [x] Repair automation worker-expert selection uncovered by the guide audit:
+  filter the Cockpit picker, persist DB experts by UUID, define pinned versus
+  effective-default fire semantics, backfill legacy rows, and cover
+  create/edit/fire/delete/bundle paths.
 - [x] Update `SKILL.md` triggers and logical-topic routing for the managed
   reader without bloating Layer 1/2 context.
 - [ ] Verify the activated guide procedure remains available after session
@@ -1244,8 +1299,9 @@ decision instead of silently aging the guide.
 - [ ] Add explicit coverage/exclusion checks for bundled disk experts, workflow
   families, top-level destinations, and major feature flags; dynamic user
   content is not a release-coverage target. M1c covers the selectable live
-  Fleet and Workflow tool groups; disk experts, top-level destinations, flags,
-  and broader workflow inventories remain open.
+  Fleet and Workflow tool groups; M1d covers the Canvas and direct-browser tool
+  inventories plus every current capability-grant key. Disk experts,
+  top-level destinations, flags, and broader workflow inventories remain open.
 - [ ] Add an explicit same-origin help-route/action manifest and validate guide
   paths, translation keys, and actions against it.
 - [ ] Add stable `data-help-id` anchors to high-value workflow controls.

@@ -155,6 +155,29 @@ GET  /api/automations/{id}/runs
 
 Body shape mirrors `AutomationCreate` (see Swagger).
 
+The expert selection has two unambiguous forms:
+
+```json
+{"expert": "scholar", "expert_id": null}
+```
+
+selects a bundled worker expert by config name, while:
+
+```json
+{
+  "expert": "worker_base",
+  "expert_id": "11111111-1111-1111-1111-111111111111"
+}
+```
+
+pins one visible database-backed worker expert by ID. Do not combine a
+non-`worker_base` name with `expert_id`; the API rejects mixed sources with
+422. On `PATCH`, send `"expert_id": null` when switching a pinned automation
+back to a bundled expert. An unpinned `worker_base` resolves the automation
+owner's effective worker default at fire time. Pinned expert IDs are
+re-authorized when the automation fires and fail loudly if no longer
+available; they do not silently fall back to another expert.
+
 ## 4. Recipes
 
 ### n8n — "When new email arrives, kick off a scholar job"
