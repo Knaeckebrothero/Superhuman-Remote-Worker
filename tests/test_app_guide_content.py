@@ -14,6 +14,12 @@ from typing import get_args
 import yaml
 
 from services.canvas import CanvasRenderer
+from services.cloud_staging import select_protected_mount
+from services.project_loops import (
+    LOOP_ANALYSIS_ROLES,
+    LOOP_CAMPAIGN_BUDGET_RESERVE,
+    LOOP_CAMPAIGN_DEFAULT_CAPS,
+)
 from services.shared_browser_canvas import BrowserCapabilityReason
 from src.core.capability_grants import CATALOG
 from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
@@ -60,6 +66,22 @@ def test_focused_guides_keep_metadata_contracts():
             "journey_ids": {
                 "sessions.configure-permissions",
                 "sessions.choose-workspace",
+            },
+        },
+        "project-loops": {
+            "guide_id": "projects.loops.run",
+            "capability_ids": {"projects.loops"},
+            "journey_ids": {
+                "projects.loops.start",
+                "projects.loops.monitor",
+            },
+        },
+        "protected-cloud": {
+            "guide_id": "sessions.protected-cloud",
+            "capability_ids": {"sessions.protected-cloud"},
+            "journey_ids": {
+                "sessions.protected-cloud.create",
+                "sessions.protected-cloud.review",
             },
         },
     }
@@ -154,6 +176,108 @@ def test_permissions_guide_keeps_current_policy_and_workspace_boundaries():
     assert "do not recommend switching to autonomous" in body
 
 
+def test_project_loop_guide_keeps_current_budget_control_and_action_boundaries():
+    _, body = _focused_topic("project-loops")
+
+    assert "projects → choose a project → loop" in body
+    assert "experimental, unattended feature" in body
+    assert "**standard** or **campaign**" in body
+    assert "at least one is required" in body
+    assert "one completed stage/turn" in body
+    assert "several jobs while spending one iteration" in body
+    assert "does **not** stop the loop automatically" in body
+    assert "only when every member fails" in body
+    assert "exactly one critic as its own stage" in body
+    assert "file no campaign" in body and "falls back" in body
+    assert "close the campaign, not the overall project loop" in body
+    for outcome in ("ship", "extend", "kill"):
+        assert f"**{outcome}**" in body
+    assert "**pause** is graceful" in body
+    assert "**stop** is permanent" in body
+    assert "default group cannot start, pause, resume, stop, or reconfigure" in body
+    assert "app guide itself grants no loop tools" in body
+
+
+def test_project_loop_guide_covers_current_parallel_roles_and_campaign_defaults():
+    _, body = _focused_topic("project-loops")
+
+    for role in LOOP_ANALYSIS_ROLES:
+        assert f"**{role}**" in body, role
+    assert (
+        f"up to **{LOOP_CAMPAIGN_DEFAULT_CAPS['max_stages']} stages** by default"
+        in body
+    )
+    assert f"reserves {LOOP_CAMPAIGN_BUDGET_RESERVE} remaining iterations" in body
+    assert (
+        f"extended {LOOP_CAMPAIGN_DEFAULT_CAPS['max_extensions']} times by default"
+        in body
+    )
+    assert (
+        f"{LOOP_CAMPAIGN_DEFAULT_CAPS['abort_failures']} consecutive failed "
+        "campaign members abort it" in body
+    )
+
+
+def test_protected_cloud_guide_keeps_current_eligibility_review_and_safety_boundaries():
+    _, body = _focused_topic("protected-cloud")
+
+    assert "ordinary writable cloud mount is **live**" in body
+    assert "read-only view" in body and "private staging layer" in body
+    assert "non-default nextcloud" in body
+    assert "uses the **container** workspace" in body
+    for unsupported in (
+        "personal/default project",
+        "opencloud",
+        "google drive",
+        "microsoft 365",
+        "virtual",
+        "none",
+        "vm",
+    ):
+        assert unsupported in body
+    assert "creation-time choice" in body
+    assert "cannot be switched during a session" in body
+    assert "cloud changes (n)" in body
+    assert "**apply to cloud**" in body and "**reject all**" in body
+    assert "whole-diff in v1" in body
+    assert "agent cannot apply or reject" in body
+    assert "reject is permanent" in body
+    assert "fail-closed" in body
+    assert "never falls back to a live writable mount" in body
+    assert "exact staged epoch" in body
+    assert "changed a touched cloud path externally" in body
+    assert "partial apply" in body and "safe to repeat" in body
+    assert "badge appears only when the staged count is greater than zero" in body
+    assert "do not look for a force button" in body
+
+
+def test_protected_cloud_guide_matches_the_current_mount_selection_rule():
+    _, body = _focused_topic("protected-cloud")
+    rows = [
+        {
+            "id": "personal-home",
+            "mount_kind": "project_default",
+            "backend_id": "nextcloud",
+            "cloud_handle": "home",
+        },
+        {
+            "id": "nc-first",
+            "mount_kind": "project",
+            "backend_id": "nextcloud",
+            "cloud_handle": "nc-1",
+        },
+        {
+            "id": "nc-second",
+            "mount_kind": "project",
+            "backend_id": "nextcloud",
+            "cloud_handle": "nc-2",
+        },
+    ]
+
+    assert select_protected_mount(rows)["id"] == "nc-first"
+    assert "first eligible nextcloud project mount" in body
+
+
 def test_permissions_guide_covers_the_current_grant_catalog():
     _, body = _focused_topic("permissions-and-availability")
 
@@ -219,7 +343,7 @@ def test_every_live_workflow_tool_has_an_explicit_guide_topic():
             "list_automation_runs",
             "propose_automation",
         },
-        "projects-and-loops": {
+        "project-loops": {
             "get_project_loop",
             "list_project_loop_jobs",
             "explain_project_loop",

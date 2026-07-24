@@ -31,7 +31,8 @@ The sidebar:
 
 - **Sessions** — your conversations; create and resume them here.
 - **Jobs** — all autonomous work: create, watch, pause, review.
-- **Projects** — project homes: goal, jobs, knowledge, members, loop.
+- **Projects** — project homes: goal, jobs, knowledge, members, and bounded
+  continuous loops/campaigns.
 - **Connectors** — access to databases, cloud folders, repos, MCP servers, and
   credentials.
 - **Experts** — the agent roster; deployments can allow custom ones.

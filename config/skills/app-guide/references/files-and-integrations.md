@@ -41,6 +41,13 @@ can open:
 
 Same single sign-on as the app.
 
+A normal writable session mount is live. On deployments that enable it,
+**Protected Cloud** is a separate creation-time session mode: an eligible
+Nextcloud project folder is exposed through a private staging layer, and the
+user applies or rejects the whole diff from the session's **Cloud changes**
+review panel. It currently requires a Container workspace; route setup,
+review, and failure questions to the focused protected-cloud guide.
+
 ## The in-browser IDE
 
 When a full workspace supports it, **IDE** buttons (jobs list, chat header,

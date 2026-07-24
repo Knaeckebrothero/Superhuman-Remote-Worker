@@ -12,11 +12,13 @@ tags:
 
 > **Status**: v1 `app-guide` shipped 2026-07-08. M1a managed delivery, M1b
 > Email/OKF guidance plus the connector-type drift gate, M1c
-> Automations/Fleet guidance plus live tool-group coverage, and M1d
-> Canvas/browser plus permission/workspace guidance were implemented through
+> Automations/Fleet guidance plus live tool-group coverage, M1d
+> Canvas/browser plus permission/workspace guidance, and M1e project
+> loops/campaigns plus Protected Cloud guidance were implemented through
 > 2026-07-24. M1d also repaired the automation expert-selection contract that
-> the guide audit exposed. The remaining content audit, live capability plane,
-> visual help, and later roadmap remain in progress.
+> the guide audit exposed. The remaining original-reference sweep, M1
+> evaluation/deployment gates, live capability plane, visual help, and later
+> roadmap remain in progress.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -337,7 +339,48 @@ These remain static, reviewed build-level claims. They can interpret an
 observed control reason or visible tool, but the guide cannot yet query the
 complete effective deployment/user/session state; that remains Phase 2.
 
-### Remaining gaps after M1d
+### Shipped M1e — unified loops/campaigns and Protected Cloud
+
+This slice repairs the two remaining post-v1 feature journeys whose shipped
+behavior had outgrown the original broad references:
+
+- `project-loops` separates continuous work from general project organization
+  and documents the unified stage/barrier engine's Standard and Campaign
+  modes, preset/custom cycles, analysis-only fan-out, campaign plan and
+  disposition flow, budget/failure guardrails, monitoring, and graceful
+  pause/resume/stop semantics;
+- it corrects two especially consequential false impressions: Definition of
+  Done is a steering quality bar rather than an automatic stop condition, and
+  `max_iterations` is charged per completed stage/turn, so a parallel fan-out
+  can create more jobs than the iteration budget;
+- the Loop Cockpit copy now reports jobs started separately from the remaining
+  iteration budget and states those two semantics in the start form;
+- `protected-cloud` distinguishes an ordinary live mount, read-only project
+  access, project-job diff review, and the protected persistent-session
+  overlay; it covers the deployment flag, non-default Nextcloud and Container
+  requirements, creation-time immutability, first-eligible-mount rule,
+  turn-end staging, whole-diff text/binary review, owner-only apply/reject,
+  fail-closed engage, epoch/external-change gates, partial writes, quota, and
+  the accepted dead-pod resume edge case;
+- the same audit closes a mixed-project selector gap by excluding
+  `project_default` user-home rows in the shared server-side protected-mount
+  selector, rather than relying only on the Cockpit checkbox gate;
+- projects, sessions, overview, files/cloud, and workspace references now route
+  to those focused topics without duplicating their detailed workflows;
+- both references carry content-type, capability-ID, and journey-ID metadata
+  and remain one hop below the compact `SKILL.md` router; and
+- focused tests pin loop actionability and safety claims against the current
+  analysis-role and campaign-default constants, pin Protected Cloud's
+  eligibility/review/fail-closed claims and first-Nextcloud-mount selector,
+  preserve workflow-tool coverage, and prove independent managed-reader
+  retrieval.
+
+These are still static build-level instructions. The Protected Cloud guide can
+interpret an observed checkbox, badge, error, or workspace, but it cannot query
+the feature flag, engage health, staging freshness, or current user's effective
+state itself; that remains Phase 2.
+
+### Remaining gaps after M1e
 
 The guide is now delivered reliably, but it is not yet self-maintaining or
 runtime-aware:
@@ -347,8 +390,9 @@ runtime-aware:
   connectors. The new catalog catches type-list drift, but it does not verify
   every workflow sentence against implementation.
 - The reference-index, connector-catalog, grant-catalog, and selected
-  tool-inventory tests prove structure, coverage decisions, and selected
-  consumer parity—not end-to-end factual freshness.
+  tool/loop/protected-cloud contract tests prove structure, coverage decisions,
+  selected consumer parity, and critical safety boundaries—not end-to-end
+  factual freshness.
 - Static references can describe possible features but cannot inspect flags,
   user grants, service configuration, or the session's attached resources.
 - `get_session_context`, `list_experts`, `list_skills`, workflow tools, and
@@ -396,10 +440,12 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Canvas/browser inventories | `src/tools/canvas`, `src/tools/research/browser_direct.py`, `src/core/session_tool_overrides.py`, `orchestrator/services/canvas.py`, and `orchestrator/services/shared_browser_canvas.py` | M1d gives every current Canvas/direct-browser tool, file renderer, and shared-browser reason code a focused-topic decision; feature/runtime state remains Phase 2 |
 | Permissions/workspaces | `src/core/capability_grants.py`, `src/api/persistent_app.py`, session workspace constants in `orchestrator/main.py`, and Cockpit live settings | M1d covers every current grant key and shipped approval/workspace behavior; a complete effective-state query remains Phase 2 |
 | Automation expert selection | `orchestrator/services/automations.py`, `orchestrator/routers/automations.py`, migration `0069`, and the Cockpit editor | M1d adds explicit DB `expert_id`, worker-only validation, pinned/default fire semantics, delete blockers, and backend/Cockpit regressions |
+| Project loops/campaigns | `orchestrator/routers/project_loops.py`, `orchestrator/services/project_loops.py`, the unified advance path in `orchestrator/main.py`, and `cockpit/.../project-loop.component.ts` | M1e documents Standard versus Campaign scheduling, stage-barrier budgeting, campaign guardrails, controls, and the inspection-only live workflow tools; complete runtime state remains Phase 2 |
+| Protected Cloud review | `orchestrator/services/cloud_staging/`, `orchestrator/services/diff_source.py`, protected mount/endpoint wiring in `orchestrator/main.py`, and the session-create/chat/diff-review Cockpit surfaces | M1e documents the shipped flag/backend/workspace gates, staging and whole-diff decision contract, fail-closed posture, conflicts, and recovery boundaries; live evaluation remains Phase 2 |
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
 | Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; strict Canvas HTML is inert while schema-advertised interactive HTML is an isolated, untrusted artifact | Define a separately validated help-card/App contract; do not treat arbitrary interactive Canvas HTML as trusted product UI |
 | Provenance | Agent-only `BUILD_SHA` in `docker/Dockerfile.agent` and short CI values; independently tagged images in Helm values | Stamp and surface full revision/digest metadata for each relevant component |
-| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, and persistent-session suites | M1a covers managed delivery/current bytes; M1b–M1d add focused content plus datasource, Fleet/Workflow, Canvas/browser, and grant-catalog coverage; add model triggers, grounded answers, compaction, and the k3d resume matrix |
+| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, and persistent-session suites | M1a covers managed delivery/current bytes; M1b–M1e add focused content plus datasource, Fleet/Workflow, Canvas/browser, grant-catalog, loop/campaign, and Protected Cloud boundaries; add model triggers, grounded answers, compaction, and the k3d resume matrix |
 
 ## Architecture
 
@@ -490,6 +536,8 @@ to the v1 reference set are:
 | `datasources-okf.md` (shipped M1b) | OKF knowledge bases, repositories, indexing readiness, and read-only behavior |
 | `fleet-and-delegation.md` (shipped M1c) | What the session can delegate, inspect, approve, resume, pause, and cancel |
 | `permissions-and-availability.md` (shipped M1d) | Grants, feature flags, workspace tiers, and how to interpret disabled controls |
+| `project-loops.md` (shipped M1e) | Standard/parallel and Campaign scheduling, iteration semantics, controls, and agent actionability |
+| `protected-cloud.md` (shipped M1e) | Eligible protected sessions, staged review/apply/reject, safety gates, and troubleshooting |
 
 The exact split is an implementation-time content decision. `SKILL.md` remains
 the authoritative routing index; the capability registry remains the
@@ -1180,14 +1228,14 @@ Do not log raw user questions by default.
 fresh and resumed sessions, including `none` workspaces, without requiring the
 DB-authored-skills or DB-experts features.
 
-- [ ] Audit user-visible changes since the v1 guide shipped, including email,
+- [x] Audit user-visible changes since the v1 guide shipped, including email,
   OKF knowledge bases, datasource readiness/scope, automations/workflows,
   fleet/job management, unified loops/campaigns, Canvas, live/shared browser,
   protected cloud review, workspace tiers, and relevant settings. Email and
   OKF were audited in M1b; Automations and Fleet/job management were audited in
   M1c; Canvas/browser, permission modes, grants, workspace tiers, and related
-  session settings were audited in M1d. Unified loops/campaigns, protected
-  cloud review, and the remaining original-reference sweep are still open.
+  session settings were audited in M1d; unified loops/campaigns and Protected
+  Cloud review were audited in M1e.
 - [x] Run a small delivery spike and record the choice: extend `use_skill` with
   an immutable system-bundle reader or add bounded `read_product_guide`; prove
   that authoritative bytes do not depend on mutable workspace files. M1a chose
@@ -1206,11 +1254,13 @@ DB-authored-skills or DB-experts features.
 - [x] Add the high-value split references listed in this design, including
   content type, capability IDs, and journey IDs. Email and OKF shipped in M1b,
   Automations and Fleet/delegation in M1c, and Canvas/browser plus
-  permissions/availability in M1d.
+  permissions/availability in M1d; project loops/campaigns and Protected Cloud
+  shipped in M1e.
 - [ ] Complete the remaining original-reference audit. M1d corrected the
   broad session, overview, and file/workspace claims touched by the new focused
-  guides; unified loops/campaigns and protected-cloud review still need their
-  own pass.
+  guides; M1e corrected project organization, loop, session/cloud, and
+  workspace overlaps. Jobs, experts, memory/knowledge, and the remaining broad
+  reference claims still need a final sweep.
 - [x] Repair automation worker-expert selection uncovered by the guide audit:
   filter the Cockpit picker, persist DB experts by UUID, define pinned versus
   effective-default fire semantics, backfill legacy rows, and cover
@@ -1300,8 +1350,10 @@ decision instead of silently aging the guide.
   families, top-level destinations, and major feature flags; dynamic user
   content is not a release-coverage target. M1c covers the selectable live
   Fleet and Workflow tool groups; M1d covers the Canvas and direct-browser tool
-  inventories plus every current capability-grant key. Disk experts,
-  top-level destinations, flags, and broader workflow inventories remain open.
+  inventories plus every current capability-grant key; M1e pins the loop
+  analysis-role/campaign-default constants and the Protected Cloud mount
+  selection boundary. Disk experts, top-level destinations, flags, and broader
+  workflow inventories remain open.
 - [ ] Add an explicit same-origin help-route/action manifest and validate guide
   paths, translation keys, and actions against it.
 - [ ] Add stable `data-help-id` anchors to high-value workflow controls.
