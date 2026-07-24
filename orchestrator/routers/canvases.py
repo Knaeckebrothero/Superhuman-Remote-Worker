@@ -46,6 +46,13 @@ from services.canvas_files import (
     acquire_canvas_response_lease,
     current_workspace_generation,
 )
+from services.canvas_office import (
+    CanvasOfficeError,
+    WopiTokenGrant,
+    collabora_config,
+    create_wopi_token_service,
+    get_collabora_discovery_service,
+)
 from services.canvas_viewer_config import (
     CanvasViewerConfigurationError,
     canvas_viewer_config,
@@ -205,6 +212,18 @@ def _get_viewer_service(db: Any) -> CanvasViewerSessionService:
     return CanvasViewerSessionService(db)
 
 
+def _get_collabora_config():
+    return collabora_config()
+
+
+def _get_office_discovery():
+    return get_collabora_discovery_service()
+
+
+def _get_wopi_token_service(db: Any):
+    return create_wopi_token_service(db)
+
+
 def _state_response(
     payload: bytes,
     etag: str,
@@ -272,6 +291,13 @@ def _raise_viewer_error(error: CanvasViewerError) -> None:
     raise HTTPException(
         status_code=error.status_code,
         detail=canvas_viewer_error_detail(error),
+    ) from error
+
+
+def _raise_office_error(error: CanvasOfficeError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": error.message},
     ) from error
 
 
@@ -459,6 +485,38 @@ async def _require_empty_refresh_body(request: Request) -> None:
             )
 
 
+def _office_file_error(error: CanvasOfficeError) -> CanvasFileError:
+    """Translate deployment availability into the closed tool-facing vocabulary."""
+
+    return CanvasFileError(
+        422 if error.code == "canvas_office_unavailable" else error.status_code,
+        error.code,
+        error.message,
+    )
+
+
+async def _require_office_view(path: str) -> str:
+    try:
+        _get_collabora_config().require_enabled()
+        return await _get_office_discovery().get_urlsrc(PurePosixPath(path).suffix)
+    except CanvasOfficeError as exc:
+        raise _office_file_error(exc) from exc
+
+
+def _build_office_session_payload(
+    *,
+    urlsrc: str,
+    wopi_base_url: str,
+    grant: WopiTokenGrant,
+) -> dict[str, str | int]:
+    return {
+        "urlsrc": urlsrc,
+        "WOPISrc": f"{wopi_base_url.rstrip('/')}/wopi/files/{grant.file_id}",
+        "access_token": grant.access_token,
+        "access_token_ttl": grant.expires_at_ms,
+    }
+
+
 def _content_url(thread_id: str, record: CanvasRecord) -> str:
     assert record.source_fingerprint is not None
     assert record.source_version is not None
@@ -494,14 +552,26 @@ async def _represent(
             )
             if materialized.source_version == record.source_version:
                 status = "ready"
-                capabilities = CanvasCapabilities(
-                    can_edit=(
-                        record.editable
-                        and _get_file_gateway(db).supports_editing(thread, record)
-                    ),
-                    can_pop_out=True,
-                )
-                if browser_content_url:
+                if record.renderer == "office":
+                    can_view_office = False
+                    try:
+                        await _require_office_view(record.source.path)
+                        can_view_office = True
+                    except CanvasFileError:
+                        pass
+                    capabilities = CanvasCapabilities(
+                        can_pop_out=True,
+                        can_view_office=can_view_office,
+                    )
+                else:
+                    capabilities = CanvasCapabilities(
+                        can_edit=(
+                            record.editable
+                            and _get_file_gateway(db).supports_editing(thread, record)
+                        ),
+                        can_pop_out=True,
+                    )
+                if browser_content_url and record.renderer != "office":
                     content_url = _content_url(thread_id, record)
             else:
                 status = "source_changed"
@@ -818,6 +888,128 @@ async def close_main_canvas_view_attachment(
     return Response(status_code=204, headers={"Cache-Control": "private, no-store"})
 
 
+@router.post(
+    "/main/office-session",
+    responses={401: {}, 403: {}, 409: {}, 412: {}, 428: {}, 503: {}},
+)
+async def create_main_canvas_office_session(
+    thread_id: str,
+    request: Request,
+) -> Response:
+    """Mint one form-post WOPI session from exact current Office Canvas state."""
+
+    _required_parent_session_id(request)
+    try:
+        await _require_empty_refresh_body(request)
+        config = _get_collabora_config().require_enabled()
+        config.require_cockpit_origin(request.headers.get("Origin"))
+    except CanvasFileError as exc:
+        _raise_file_error(exc)
+    except CanvasOfficeError as exc:
+        _raise_office_error(exc)
+
+    db = _get_db()
+    user, thread = await require_thread_owner(request, db, thread_id)
+    service = _get_canvas_service(db)
+    record = await service.get(thread_id)
+    if (
+        record is None
+        or record.renderer != "office"
+        or record.editable
+        or not isinstance(record.source, WorkspaceFileSource)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "canvas_not_office",
+                "message": "The current Canvas is not a view-only Office document",
+            },
+        )
+
+    visible = await _represent(
+        thread_id,
+        thread,
+        record,
+        browser_content_url=False,
+        db=db,
+    )
+    expected = request.headers.get("If-Match")
+    if expected is None:
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "code": "canvas_precondition_required",
+                "message": "If-Match is required to open an Office Canvas session",
+            },
+        )
+    if not secrets.compare_digest(expected.strip(), visible.etag):
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "code": "canvas_precondition_failed",
+                "message": "Canvas state ETag is stale",
+            },
+        )
+    if (
+        visible.state.status != "ready"
+        or not visible.state.capabilities.can_view_office
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "canvas_office_unavailable",
+                "message": "Office document viewing is currently unavailable",
+            },
+        )
+
+    try:
+        urlsrc = await _get_office_discovery().get_urlsrc(
+            PurePosixPath(record.source.path).suffix
+        )
+    except CanvasOfficeError as exc:
+        _raise_office_error(exc)
+
+    # Discovery and workspace reads can race a clear/replacement or membership
+    # change. Re-admit and bind the token to the exact current path immediately
+    # before minting it.
+    user, _ = await require_thread_owner(request, db, thread_id)
+    current = await service.get(thread_id)
+    if (
+        current is None
+        or current.presentation_revision != record.presentation_revision
+        or current.source_fingerprint != record.source_fingerprint
+        or current.source_version != record.source_version
+        or current.renderer != "office"
+        or current.editable
+        or not isinstance(current.source, WorkspaceFileSource)
+        or current.source.path != record.source.path
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "canvas_presentation_changed",
+                "message": "Canvas presentation changed while opening Office",
+            },
+        )
+    try:
+        grant = _get_wopi_token_service(db).mint(
+            user_id=str(user["id"]),
+            thread_id=thread_id,
+            path=current.source.path,
+            write_flag=False,
+        )
+    except CanvasOfficeError as exc:
+        _raise_office_error(exc)
+    return JSONResponse(
+        _build_office_session_payload(
+            urlsrc=urlsrc,
+            wopi_base_url=config.wopi_base_url,
+            grant=grant,
+        ),
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
 def _verify_content_identity(
     record: CanvasRecord | None,
     *,
@@ -893,9 +1085,7 @@ def _if_range_allows(value: str | None, file: ValidatedCanvasFile) -> bool:
 
 def _content_headers(file: ValidatedCanvasFile, *, length: int) -> dict[str, str]:
     disposition = (
-        "attachment"
-        if file.renderer in {"html", "html-interactive"}
-        else "inline"
+        "attachment" if file.renderer in {"html", "html-interactive"} else "inline"
     )
     headers = {
         "ETag": f'"{file.source_version}"',
@@ -963,6 +1153,12 @@ async def get_main_canvas_content(
                 source_fingerprint=source_fingerprint,
                 source_version=source_version,
             )
+            if record.renderer == "office":
+                raise CanvasFileError(
+                    409,
+                    "canvas_office_content_unavailable",
+                    "Office bytes are available only through the WOPI read path",
+                )
             # Reserve a bounded response slot before retaining workspace bytes.
             # Its lifetime transfers to the response for non-empty GET bodies.
             response_lease = await acquire_canvas_response_lease()
@@ -1468,9 +1664,16 @@ async def internal_set_main_canvas(
             requested_renderer=body.renderer,
             alt_text=body.alt_text,
         )
+        if file.renderer == "office":
+            await _require_office_view(file.path)
+            if body.editable:
+                raise CanvasFileError(
+                    422,
+                    "canvas_editing_unsupported",
+                    "Office Canvas documents are view-only in Slice 1",
+                )
         if body.editable and (
-            file.renderer
-            not in {"markdown", "text", "html", "html-interactive"}
+            file.renderer not in {"markdown", "text", "html", "html-interactive"}
             or not gateway.supports_editing(thread)
         ):
             raise CanvasFileError(
@@ -1492,6 +1695,8 @@ async def internal_set_main_canvas(
                 "workspace_generation_changed",
                 "The workspace changed while the Canvas file was being validated",
             )
+        if file.renderer == "office":
+            await _require_office_view(file.path)
         if body.editable and not gateway.supports_editing(fresh_thread):
             raise CanvasFileError(
                 422,
@@ -1518,6 +1723,7 @@ async def internal_set_main_canvas(
         capabilities=CanvasCapabilities(
             can_edit=mutation.record.editable,
             can_pop_out=True,
+            can_view_office=mutation.record.renderer == "office",
         ),
     )
     return _state_response(

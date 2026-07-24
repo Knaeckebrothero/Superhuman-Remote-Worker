@@ -274,6 +274,7 @@ def test_workspace_port_set_normalizes_and_returns_status_without_viewer_data(
         "can_take_control": False,
         "can_create_viewer_session": False,
         "can_stream_browser": False,
+        "can_view_office": False,
     }
     assert gateway.validation_calls == [(db.thread, 8501, "/demo")]
     assert len(gateway.revalidation_calls) == 1

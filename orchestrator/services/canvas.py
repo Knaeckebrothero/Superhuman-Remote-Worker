@@ -49,7 +49,7 @@ _EDIT_COORDINATOR_QUEUE_TIMEOUT = float(
 )
 
 CanvasRenderer = Literal[
-    "auto", "markdown", "text", "html", "html-interactive", "image"
+    "auto", "markdown", "text", "html", "html-interactive", "image", "office"
 ]
 CanvasStatus = Literal[
     "ready",
@@ -152,9 +152,10 @@ class CanvasSetInput(_StrictFrozenModel):
             raise ValueError("new_app is supported only for workspace_app")
         if self.editable and (
             not is_file
-            or self.renderer
-            not in {"markdown", "text", "html", "html-interactive"}
+            or self.renderer not in {"markdown", "text", "html", "html-interactive"}
         ):
+            if is_file and self.renderer == "office":
+                raise ValueError("Office Canvas sources are view-only in Slice 1")
             raise ValueError(
                 "editable Canvas sources require a validated text or HTML renderer"
             )
@@ -167,6 +168,7 @@ class CanvasCapabilities(_StrictFrozenModel):
     can_take_control: bool = False
     can_create_viewer_session: bool = False
     can_stream_browser: bool = False
+    can_view_office: bool = False
 
 
 class PublicWorkspaceFileSource(_StrictFrozenModel):

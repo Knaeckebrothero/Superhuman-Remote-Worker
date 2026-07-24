@@ -216,6 +216,30 @@ def _browser_set(
     )
 
 
+def test_office_renderer_is_view_only_in_slice_one() -> None:
+    source = WorkspaceFileSource(
+        path="output/report.docx",
+        workspace_generation=_WORKSPACE_GENERATION,
+    )
+    view = CanvasSetInput(
+        source=source,
+        title="Office report",
+        renderer="office",
+        source_version=_SOURCE_VERSION,
+    )
+
+    assert view.renderer == "office"
+    assert view.editable is False
+    with pytest.raises(ValueError, match="view-only"):
+        CanvasSetInput(
+            source=source,
+            title="Office report",
+            renderer="office",
+            editable=True,
+            source_version=_SOURCE_VERSION,
+        )
+
+
 def _seed_presented(db: _FakeCanvasDB) -> None:
     asyncio.run(CanvasService(db).set(_THREAD_ID, _file_set()))
 
@@ -586,6 +610,7 @@ def test_get_route_returns_204_for_absent_and_revalidates_present_state(
         "can_take_control": False,
         "can_create_viewer_session": False,
         "can_stream_browser": False,
+        "can_view_office": False,
     }
 
     not_modified = client.get(

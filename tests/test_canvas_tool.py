@@ -145,6 +145,9 @@ def test_set_schema_is_flat_file_only_and_exposes_conditional_editing():
     }
     assert schema["properties"]["source_type"]["const"] == "workspace_file"
     assert "html-interactive" in schema["properties"]["renderer"]["enum"]
+    assert "office" in schema["properties"]["renderer"]["enum"]
+    assert "view-only" in schema["properties"]["editable"]["description"].lower()
+    assert "office" in schema["properties"]["alt_text"]["description"].lower()
     parsed = set_canvas.args_schema.model_validate(
         {
             "source_type": "workspace_file",
