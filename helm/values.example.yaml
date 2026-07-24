@@ -66,6 +66,35 @@ orchestrator:
   kbReindexSweepSeconds: 900
 
 # -----------------------------------------------------------------------------
+# Office Canvas — Collabora Online remains dark until every exact-origin and
+# network boundary below is supplied. Keep Cloudflare Access off the Office
+# hostname; it breaks Collabora WebSockets and WOPI callbacks.
+# -----------------------------------------------------------------------------
+collabora:
+  enabled: false
+  publicUrl: ""
+  # A configured sessionRouter.jwtSecret or jwtSecretName is also mandatory;
+  # Office WOPI tokens reuse that existing HS256 secret boundary.
+  # Enabling also requires these values (see values.yaml for the full block):
+  # collabora:
+  #   server_name: "office.srw.example.com"
+  #   aliasgroups:
+  #     - host: "http://<release>-superhuman-remote-worker-orchestrator:8085"
+  #   extra_params: >-
+  #     --o:ssl.enable=false
+  #     --o:ssl.termination=true
+  #     --o:per_document.always_save_on_exit=true
+  #     --o:admin_console.enable=false
+  #     --o:net.content_security_policy=frame-ancestors https://cockpit.srw.example.com;
+  # networkPolicy:
+  #   edgeNamespaceSelector:
+  #     matchLabels:
+  #       kubernetes.io/metadata.name: cloudflare-tunnel
+  #   edgePodSelector:
+  #     matchLabels:
+  #       app: cloudflared
+
+# -----------------------------------------------------------------------------
 # Databases — external managed instances. See README for required Secret keys.
 # -----------------------------------------------------------------------------
 databases:

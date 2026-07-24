@@ -259,6 +259,52 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CANVAS_VIEWER_EXCHANGE_TIMEOUT_SECONDS
+            # Read-only Office Canvas / Collabora discovery and WOPI host.
+            - name: COLLABORA_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_ENABLED
+            - name: COLLABORA_INTERNAL_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_INTERNAL_URL
+            - name: COLLABORA_PUBLIC_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_PUBLIC_URL
+            - name: COLLABORA_WOPI_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_WOPI_BASE_URL
+            - name: COLLABORA_COCKPIT_ORIGIN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_COCKPIT_ORIGIN
+            - name: COLLABORA_TOKEN_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_TOKEN_TTL_SECONDS
+            - name: COLLABORA_DISCOVERY_CACHE_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_DISCOVERY_CACHE_TTL_SECONDS
+            - name: COLLABORA_DISCOVERY_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: COLLABORA_DISCOVERY_TIMEOUT_SECONDS
+            - name: CANVAS_MAX_OFFICE_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CANVAS_MAX_OFFICE_BYTES
             - name: VECTOR_POSTGRES_USER
               valueFrom:
                 secretKeyRef:

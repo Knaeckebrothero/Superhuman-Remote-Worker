@@ -463,6 +463,80 @@ canvas:
         extraEgress: []
 
 # =============================================================================
+# Collabora Online — Office documents in Dynamic Canvas
+# =============================================================================
+# Official collabora-online dependency. This surface is deliberately dark by
+# default: enabling it also requires an exact public origin, WOPI aliasgroup,
+# Cockpit frame-ancestor CSP, and edge selectors (validated by the parent
+# chart), plus one of the sessionRouter JWT-secret layouts below. Keep one
+# replica and no HPA until a document-affinity design exists.
+collabora:
+  enabled: false
+  # -- Exact browser-visible Collabora origin, without a trailing slash.
+  # Example: https://office.example.com
+  publicUrl: ""
+  # Session-length read token; live user/thread/path checks remain the actual
+  # revocation boundary on every WOPI request.
+  tokenTtlSeconds: 36000
+  discoveryCacheTtlSeconds: 21600
+  discoveryTimeoutSeconds: 5
+  maxOfficeBytes: 26214400
+
+  # Official subchart values.
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+    # Preserve the upstream value to make the required HPA override explicit.
+    minReplicas: 2
+    maxReplicas: 100
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 50
+    scaleDownDisabled: false
+  terminationGracePeriodSeconds: 60
+  image:
+    repository: docker.io/collabora/code
+    pullPolicy: IfNotPresent
+    # Empty pins to the dependency's 26.04.x appVersion.
+    tag: ""
+  collabora:
+    # Required when enabled. Must equal the host[:port] in publicUrl.
+    server_name: ""
+    # Required when enabled. aliasgroup1.host must exactly equal the rendered
+    # in-cluster orchestrator URL printed by the validation error/NOTES.
+    aliasgroups: []
+    # When enabling, append the exact rendered Cockpit origin after
+    # `frame-ancestors`, followed by `;`. The parent chart validates it.
+    extra_params: >-
+      --o:ssl.enable=false
+      --o:ssl.termination=true
+      --o:per_document.always_save_on_exit=true
+      --o:admin_console.enable=false
+      --o:net.content_security_policy=frame-ancestors
+    proofKeysSecretRef: ""
+    proofKeyGeneration:
+      enabled: false
+      secretName: ""
+  resources:
+    requests:
+      cpu: 1800m
+      memory: 2Gi
+    limits:
+      cpu: 1800m
+      memory: 2Gi
+  ingress:
+    enabled: false
+  route:
+    enabled: false
+  podLabels:
+    srw.io/component: collabora
+  # The dependency's generic policy stays off; the parent renders a stricter
+  # DNS + WOPI-only policy with an ANDed edge namespace/pod selector.
+  networkPolicy:
+    enabled: false
+    edgeNamespaceSelector: {}
+    edgePodSelector: {}
+
+# =============================================================================
 # Auth — cockpit cookie BFF + (future) PAT system
 # =============================================================================
 # Knobs for the orchestrator's cookie-backed session layer for the cockpit.
