@@ -1,4 +1,4 @@
-# Projects and loops — organizing and compounding work
+# Projects — organizing and compounding work
 
 A **project** is the container that makes work compound: it bundles a team,
 shared knowledge, connectors, git repositories, and jobs around one goal.
@@ -26,37 +26,16 @@ The project page has tabs:
 - **Experts** — experts available to this project.
 - **Members** — add people as **Owner**, **Editor**, or **Viewer**; membership
   also grants matching access to the project's git repositories.
-- **Loop** — see below.
+- **Loop** — configure and monitor continuous project improvement. Route setup,
+  campaign, budget, and control questions to the focused project-loops guide.
 - **Settings** — rename, default agent config, memory sharing across jobs,
   cloud storage folder and its read-only toggle, archive/delete. Workspace
   network access is admin-controlled.
 
-## The self-improvement loop
-
-The **Loop** tab runs jobs *continuously* against the project goal — no human
-in the loop between iterations. Agents take turns in a cycle, coordinating
-through the project knowledge base: researchers propose, critics evaluate,
-an execution role builds. Each iteration compounds on the last.
-
-**Starting a loop**: pick a model and workspace type, choose a cycle —
-presets **Build** (scholar → critic → developer), **Write** (scholar → critic
-→ general), **Research** (scholar → critic) — or build a **Custom** sequence.
-Custom steps can fan out **analysis roles in parallel** (e.g. scholar and
-product-qa investigating simultaneously, shown as `scholar ∥ product-qa`);
-the execution step always runs alone. Then set the stop conditions:
-
-- **Max iterations** and/or a **time limit** — a loop is always bounded.
-- **Definition of done** — what outcome would finish the work.
-- **Extra steering** — standing guidance injected into every iteration.
-
-**While it runs**: the tab shows status, the current role and job, iterations
-left, and the jobs of the current run. **Pause**, **Resume**, or **Stop** at
-any time — stopping is graceful (the in-flight job finishes; nothing new is
-spawned). Loops also stop themselves after too many consecutive failures.
-
-The loop is the app's flagship "agents improving a thing over time" feature —
-and it's marked **experimental**; expect rough edges and keep budgets modest
-at first.
+The Settings **read-only** cloud toggle prevents project work from writing to
+that folder. It is not Protected Cloud review: Protected Cloud is an eligible
+persistent session's creation-time staging workflow and has its own focused
+guide.
 
 ## Practical guidance
 
@@ -65,3 +44,5 @@ at first.
 - Write the goal as an outcome ("users can X"), not a task list; agents plan
   the tasks themselves.
 - Attach connectors at the project level when several jobs need them.
+- Use the focused project-loops guide before starting unattended continuous
+  work; its Definition of Done is steering, not an automatic stop condition.

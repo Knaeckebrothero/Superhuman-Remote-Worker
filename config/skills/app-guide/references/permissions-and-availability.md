@@ -88,7 +88,7 @@ The platform default is Virtual.
 | Workspace | What it provides | Important limits |
 |---|---|---|
 | **Virtual** | Fast, durable cloud-backed file tools without starting a workspace container; file Canvas can work when the backing store is materializable by the orchestrator | No shell, direct browser, git, repository checkout, live application, or shared browser. A process-local development store cannot be presented on Canvas. |
-| **Container** (`sandbox` internally) | Isolated files plus shell, git, repository checkout, and direct browser support | Slower cold start. Individual tools still depend on the expert, tool selection, grants, and service configuration. This is the proven live-app/shared-browser path. |
+| **Container** (`sandbox` internally) | Isolated files plus shell, git, repository checkout, and direct browser support; the current Protected Cloud session path also requires this tier | Slower cold start. Individual tools still depend on the expert, tool selection, grants, and service configuration. This is the proven live-app/shared-browser path. |
 | **None** | Chat with no workspace | No workspace file, shell, direct browser, git, or repository tools. Web research, databases, and knowledge may still work when independently configured and attached. |
 | **VM** | A full per-session virtual machine for work that needs VM isolation or sudo/root access | Per-session opt-in only; never a saved default. Requires the `vm_workspace` grant, operator enablement, and an available VM provisioner. Current file Canvas and shared-browser VM support are not promised. |
 

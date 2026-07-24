@@ -8,7 +8,9 @@ analysis, planning, and light coding.
 
 Start one from **Sessions → New Session**: pick a title, projects to attach,
 an expert, and adjust the agent settings (model, permission mode, tools,
-connectors) if the defaults don't fit.
+connectors) if the defaults don't fit. Eligible deployments also offer a
+creation-time **Protected cloud** checkbox for staging changes to a
+non-default Nextcloud project; use its focused guide before relying on it.
 
 ## What the session agent can do
 

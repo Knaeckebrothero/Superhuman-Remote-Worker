@@ -31,6 +31,10 @@ Nextcloud-only (§9.2: OpenCloud dropped from protected mode). Jobs stay on Mode
 ## 4. Toggle UI
 
 - Checkbox in `cockpit/src/app/views/session-create/` — label "Protected cloud — agent writes are staged for your review". Shown/enabled only when: the selected project is **not** a default project, its `main_cloud_backend == "nextcloud"`, and the orchestrator reports the feature flag on (`PROTECTED_CLOUD_MODE_ENABLED`, helm `agent.protectedCloudModeEnabled` — dev ON / prod OFF; surfaced to Cockpit via the existing config/capabilities payload the create view already reads, or added to it).
+- The shared mount selector also excludes `project_default` rows server-side.
+  This closes the mixed-selection case (default project plus an eligible
+  project), where relying on the checkbox gate alone could otherwise protect
+  the personal-home mount if it appeared first.
 - Sets `ThreadCreateRequest.protected_cloud` (exists since Slice B task B8). **Immutable** for the thread's life; no mid-session flip in v1 (§9.10).
 - `persistent-chat` header: "Cloud changes (N)" badge for protected threads — count from `staged_summary`, tooltip shows last-staged timestamp and, for multi-mount threads, **which** mount is protected (the v1 single-protected-mount signal, deferral #5). Click opens the review panel.
 - Engage failure surfacing already exists from Slice B (`protected_cloud_error` on the thread); the create view keeps its current behavior (fail-closed: no live fallback).

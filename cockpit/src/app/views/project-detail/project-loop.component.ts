@@ -224,7 +224,7 @@ export function buildRoleSequence(
               <div class="loop-status-row">
                 <span class="loop-badge" [attr.data-status]="l.status">{{ l.status }}</span>
                 <span class="loop-step">
-                  {{ currentRole() }} · job {{ l.total_jobs_run }}{{ l.max_iterations ? ' of ' + l.max_iterations : '' }}
+                  {{ currentRole() }} · {{ l.total_jobs_run }} job(s) started
                 </span>
                 @if (l.consecutive_failures > 0) {
                   <span class="loop-warn">{{ l.consecutive_failures }} consecutive failure(s)</span>
@@ -479,7 +479,7 @@ export function buildRoleSequence(
             }
 
             <div class="loop-budget">
-              <app-form-field label="Max iterations" hint="Total jobs to run (≈ this ÷ roles = cycles).">
+              <app-form-field label="Max iterations" hint="Completed turns/stages to budget; a parallel fan-out may start several jobs in one iteration.">
                 <app-input type="number" [value]="fMaxIterations()" (changed)="fMaxIterations.set($event)" />
               </app-form-field>
               <app-form-field label="Time limit (hours)" hint="Optional — also stop after this many hours.">
@@ -487,7 +487,7 @@ export function buildRoleSequence(
               </app-form-field>
             </div>
 
-            <app-form-field label="Definition of done" hint="What 'finished' means — the Critic checks against this. Optional.">
+            <app-form-field label="Definition of done" hint="Quality bar for the Critic and later stages; it does not stop the loop automatically. Optional.">
               <app-textarea [rows]="2" [value]="fAcceptance()" (changed)="fAcceptance.set($event)" />
             </app-form-field>
 
