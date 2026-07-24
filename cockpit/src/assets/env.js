@@ -3,6 +3,8 @@
   window['env']['apiUrl'] = 'http://localhost:8085/api';
   // Remains null until an isolated wildcard viewer domain is provisioned.
   window['env']['canvasViewerHostSuffix'] = null;
+  // Remains null until the Collabora hostname is provisioned.
+  window['env']['canvasOfficeOrigin'] = null;
   window['env']['giteaUrl'] = 'http://localhost:3000/srw';
   window['env']['dozzleUrl'] = 'http://localhost:9999';
   window['env']['minioConsoleUrl'] = 'http://localhost:9001';

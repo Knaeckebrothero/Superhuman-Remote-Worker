@@ -18,6 +18,8 @@ export const environment = {
   // Isolated Dynamic Canvas viewer suffix (for example
   // `.canvas.example-userland.com`). Null keeps live apps dark-shipped.
   canvasViewerHostSuffix: getEnvOrNull('canvasViewerHostSuffix'),
+  // Exact public Collabora origin. Null keeps Office Canvas viewing disabled.
+  canvasOfficeOrigin: getEnvOrNull('canvasOfficeOrigin'),
 
   // External tools
   giteaUrl: getEnv('giteaUrl', 'http://localhost:3000/srw'),
