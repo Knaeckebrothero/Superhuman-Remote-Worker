@@ -53,6 +53,8 @@ def test_guide_requires_outcome_level_coverage_and_honest_combination_gaps():
     assert "the currently proven path requires a **container workspace**" in body
     assert "virtual and none cannot host it" in body
     assert "the guide does not document this exact workflow" in body
+    assert "is covered by the `automations` limitation row" in body
+    assert "load `automations` and explain the connector boundary" in body
     assert (
         "a schedule, connector, prompt, expert, or permission documented separately"
         in body
@@ -198,6 +200,15 @@ def test_jobs_guide_keeps_current_workspace_review_and_pause_boundaries():
     assert "do not promise this review mode for every project" in body
     assert "critic review and the scholar research pre-pass are configurable" in body
     assert "neither should be described as running for every job" in body
+
+
+def test_sessions_guide_requires_current_capability_qualification():
+    _, body = _focused_topic("sessions")
+
+    assert "possible session capabilities, not proof" in body
+    assert "current workspace" in body and "selected tools" in body
+    assert "effective grants" in body and "deployment configuration" in body
+    assert "check the current tool list or **settings** panel" in body
 
 
 def test_experts_guide_covers_current_bundled_roster_and_selection_rules():

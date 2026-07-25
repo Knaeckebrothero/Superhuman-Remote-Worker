@@ -327,6 +327,56 @@ def test_tool_schema_exposes_only_logical_topic_id(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_case_uses_and_closes_a_fresh_client_each_time(monkeypatch, cases):
+    import eval.app_guide.run as harness
+
+    created = []
+
+    class Client:
+        def __init__(self):
+            self.entered = False
+            self.exited = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            self.exited = True
+
+    def client_factory(_route, *, timeout):
+        assert timeout == 17
+        client = Client()
+        created.append(client)
+        return client
+
+    async def fake_model_answer(**kwargs):
+        assert kwargs["client"] is created[-1]
+        return "Canvas and SVG have different models.", [], {}
+
+    monkeypatch.setattr(LLMRoute, "client", client_factory)
+    monkeypatch.setattr(harness, "model_answer", fake_model_answer)
+    case = _case(cases, "near-miss-html-canvas")
+    arm = parse_arm_spec("no-skill")
+    catalog = catalog_for_arm(arm)
+
+    for _ in range(2):
+        row = await harness.run_case(
+            case=case,
+            arm=arm,
+            catalog=catalog,
+            route=LLMRoute(model="fake", base_url=None, api_key="not-recorded"),
+            timeout=17,
+            max_tool_rounds=2,
+            max_tokens=200,
+        )
+        assert row["passed"] is True
+
+    assert len(created) == 2
+    assert all(client.entered and client.exited for client in created)
+
+
+@pytest.mark.asyncio
 async def test_live_loop_calls_real_reader_but_keeps_trajectory_bounded(monkeypatch):
     monkeypatch.delenv("APP_GUIDE_BREAK_GLASS_DISABLED", raising=False)
     catalog = catalog_for_arm(parse_arm_spec("current"))

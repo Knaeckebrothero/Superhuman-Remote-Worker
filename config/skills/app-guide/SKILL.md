@@ -52,6 +52,10 @@ covers the outcome, call `index` only, state an explicit guide gap, and stop;
 do not load the nearest topic to manufacture a setup. Questions that explicitly
 ask about several individually documented topics may still need those focused
 topics, but never claim the combination works unless a reference says it does.
+A scheduled or recurring outcome that reads from or writes through a connector
+is covered by the `automations` limitation row: load `automations` and explain
+the connector boundary rather than treating the outcome as an unknown guide
+gap.
 `permissions-and-availability` explains a known SRW session feature's current
 gates; it is not a catch-all place to search for a feature absent from the
 index.

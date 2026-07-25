@@ -25,6 +25,12 @@ non-default Nextcloud project; use its focused guide before relying on it.
 
 ## What the session agent can do
 
+Treat the list below as possible session capabilities, not proof of what this
+particular session can do. In a broad capability answer, explicitly say that
+the current workspace, selected tools in **Agent Settings**, effective grants,
+and deployment configuration decide what is actually available; tell the user
+to check the current tool list or **Settings** panel before offering to act.
+
 - **Work with files** when the session uses a Virtual or full workspace.
   Container and VM workspaces add git; None is chat-only.
 - **Run shell commands** when a shell-capable Container or VM workspace, the
