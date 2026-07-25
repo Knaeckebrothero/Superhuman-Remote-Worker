@@ -129,7 +129,12 @@
     "office": {
       "frameTitle": "Office document: {{title}}",
       "connecting": "Opening the Office document…",
-      "unavailable": "The Office document could not be opened."
+      "unavailable": "The Office document could not be opened.",
+      "conflict": {
+        "title": "Office changes need attention",
+        "body": "The editor could not complete the save or refresh for this turn. Reload the current workspace version before continuing; another writer may still update it during the handoff.",
+        "reload": "Reload document"
+      }
     },
     "browser": {
       "source": "Current shared browser",

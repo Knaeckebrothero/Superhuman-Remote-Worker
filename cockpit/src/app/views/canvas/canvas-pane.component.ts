@@ -258,6 +258,20 @@ export function browserOpenErrorKey(code: string | null): string {
           </div>
         </div>
       }
+      @if (office.conflictCode()) {
+        <div class="canvas-edit-notice" role="alert">
+          <app-icon size="sm">warning</app-icon>
+          <div class="canvas-edit-notice__copy">
+            <strong>{{ 'canvas.office.conflict.title' | transloco }}</strong>
+            <span>{{ 'canvas.office.conflict.body' | transloco }}</span>
+          </div>
+          <div class="canvas-edit-notice__actions">
+            <app-button size="sm" variant="warning" (clicked)="office.reloadSession()">
+              {{ 'canvas.office.conflict.reload' | transloco }}
+            </app-button>
+          </div>
+        </div>
+      }
       @if (editor.remoteEditing()) {
         <div class="canvas-remote-editing" role="status">
           <app-icon size="sm">edit_note</app-icon>
@@ -323,7 +337,13 @@ export function browserOpenErrorKey(code: string | null): string {
                   [session]="office.session()!"
                   [officeOrigin]="office.officeOrigin()!"
                   [title]="officeFrameTitle()"
-                  (documentLoaded)="office.markDocumentLoaded()" />
+                  [editable]="state()?.editable === true"
+                  [presentationRevision]="state()?.presentation_revision ?? 0"
+                  [refreshToken]="office.refreshToken"
+                  [reloadSession]="office.reloadSession"
+                  (documentLoaded)="office.markDocumentLoaded()"
+                  (modifiedChange)="office.markModified($event)"
+                  (conflict)="office.markConflict($event)" />
               }
               @case ('browser') {
                 <app-canvas-browser-renderer />
@@ -590,7 +610,9 @@ export class CanvasPaneComponent {
     if (this.editor.saveStatus() === 'saved') {
       return this.transloco.translate('canvas.editor.saved');
     }
-    if (this.editor.dirty()) return this.transloco.translate('canvas.editor.unsaved');
+    if (this.editor.dirty() || this.office.modified()) {
+      return this.transloco.translate('canvas.editor.unsaved');
+    }
     if (this.contentStatus() === 'loading') return this.transloco.translate('canvas.status.loading');
     if (this.viewer.viewerStatus() === 'loading') {
       return this.transloco.translate('canvas.app.connecting');
@@ -672,7 +694,7 @@ export class CanvasPaneComponent {
       this.canvas.threadId(),
       this.state(),
     ));
-    effect(() => this.dirtyChange.emit(this.editor.dirty()));
+    effect(() => this.dirtyChange.emit(this.editor.dirty() || this.office.modified()));
     effect(() => {
       if (!this.isLiveAppSource() && this.resetStatus() !== 'idle') {
         this.resetStatus.set('idle');

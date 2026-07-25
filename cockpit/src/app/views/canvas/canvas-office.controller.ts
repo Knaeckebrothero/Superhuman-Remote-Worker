@@ -1,6 +1,6 @@
 import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {DestroyRef, Injectable, inject, signal} from '@angular/core';
-import {Subscription} from 'rxjs';
+import {firstValueFrom, Subscription} from 'rxjs';
 import {
   CanvasOfficeSession,
   CanvasState,
@@ -16,9 +16,10 @@ interface DesiredOfficeSession {
   readonly sourceKey: string;
   readonly revision: number;
   readonly stateEtag: string;
+  readonly editable: boolean;
 }
 
-/** Pane-local lifecycle for a read-only Collabora launch token and frame. */
+/** Pane-local lifecycle for a Collabora launch token and frame. */
 @Injectable()
 export class CanvasOfficeController {
   private readonly http = inject(HttpClient);
@@ -28,6 +29,8 @@ export class CanvasOfficeController {
   readonly officeOrigin = signal<string | null>(environment.canvasOfficeOrigin);
   readonly officeStatus = signal<CanvasOfficeStatus>('idle');
   readonly officeErrorCode = signal<string | null>(null);
+  readonly modified = signal(false);
+  readonly conflictCode = signal<string | null>(null);
 
   private desired: DesiredOfficeSession | null = null;
   private request: Subscription | null = null;
@@ -61,9 +64,13 @@ export class CanvasOfficeController {
 
     if (
       this.desired &&
-      sameDesired(this.desired, desired) &&
+      sameOfficeDocument(this.desired, desired) &&
       (this.request !== null || this.session() !== null)
     ) {
+      // A source revision bump belongs to the mounted editor's version-restore
+      // protocol. Keep its WindowProxy and token session intact while exposing
+      // the latest precondition to renewal or a fallback remount.
+      this.desired = desired;
       return;
     }
 
@@ -78,13 +85,50 @@ export class CanvasOfficeController {
     this.officeErrorCode.set(null);
   }
 
-  retry(): void {
+  markModified(modified: boolean): void {
+    this.modified.set(modified);
+  }
+
+  markConflict(code: string): void {
+    this.conflictCode.set(code);
+  }
+
+  readonly refreshToken = async (): Promise<CanvasOfficeSession | null> => {
     const desired = this.desired;
     const origin = this.officeOrigin();
-    if (!desired || !isCanonicalOrigin(origin) || this.officeStatus() === 'loading') return;
+    if (!desired || !isCanonicalOrigin(origin)) return null;
+    try {
+      const response = await firstValueFrom(
+        this.http.post<CanvasOfficeSession>(
+          officeSessionUrl(desired.threadId),
+          null,
+          {headers: {'If-Match': desired.stateEtag}},
+        ),
+      );
+      if (!this.desired || !sameOfficeDocument(this.desired, desired)) return null;
+      return parseOfficeSession(response, origin);
+    } catch {
+      return null;
+    }
+  };
+
+  readonly reloadSession = (): void => {
+    const desired = this.desired;
+    const origin = this.officeOrigin();
+    if (!desired || !isCanonicalOrigin(origin)) {
+      this.fail('canvas_office_session_failed');
+      return;
+    }
+    this.conflictCode.set(null);
+    this.modified.set(false);
     this.resetRequestAndSession();
     this.desired = desired;
     this.mint(desired, origin);
+  };
+
+  retry(): void {
+    if (this.officeStatus() === 'loading') return;
+    this.reloadSession();
   }
 
   private toDesired(
@@ -99,8 +143,8 @@ export class CanvasOfficeController {
       !stateEtag ||
       state?.source?.type !== 'workspace_file' ||
       state.renderer !== 'office' ||
-      state.editable ||
       state.capabilities.can_view_office !== true ||
+      (state.editable && state.capabilities.can_edit !== true) ||
       state.status !== 'ready' ||
       selectCanvasRenderer(state) !== 'office'
     ) {
@@ -113,6 +157,7 @@ export class CanvasOfficeController {
           sourceKey,
           revision: state.presentation_revision,
           stateEtag,
+          editable: state.editable,
         }
       : null;
   }
@@ -123,10 +168,7 @@ export class CanvasOfficeController {
     this.officeStatus.set('loading');
     this.officeErrorCode.set(null);
     const request = this.http.post<CanvasOfficeSession>(
-      (
-        `${environment.apiUrl}/persistent/threads/${encodeURIComponent(desired.threadId)}` +
-        `/canvases/${MAIN_CANVAS_ID}/office-session`
-      ),
+      officeSessionUrl(desired.threadId),
       null,
       {headers: {'If-Match': desired.stateEtag}},
     ).subscribe({
@@ -161,7 +203,7 @@ export class CanvasOfficeController {
   private isCurrent(token: symbol, desired: DesiredOfficeSession): boolean {
     return this.requestToken === token &&
       this.desired !== null &&
-      sameDesired(this.desired, desired);
+      sameOfficeDocument(this.desired, desired);
   }
 
   private completeRequest(token: symbol): void {
@@ -186,6 +228,8 @@ export class CanvasOfficeController {
     this.resetRequestAndSession();
     this.officeStatus.set('idle');
     this.officeErrorCode.set(null);
+    this.modified.set(false);
+    this.conflictCode.set(null);
   }
 
   private fail(code: string): void {
@@ -194,11 +238,20 @@ export class CanvasOfficeController {
   }
 }
 
-function sameDesired(left: DesiredOfficeSession, right: DesiredOfficeSession): boolean {
+function sameOfficeDocument(
+  left: DesiredOfficeSession,
+  right: DesiredOfficeSession,
+): boolean {
   return left.threadId === right.threadId &&
     left.sourceKey === right.sourceKey &&
-    left.revision === right.revision &&
-    left.stateEtag === right.stateEtag;
+    left.editable === right.editable;
+}
+
+function officeSessionUrl(threadId: string): string {
+  return (
+    `${environment.apiUrl}/persistent/threads/${encodeURIComponent(threadId)}` +
+    `/canvases/${MAIN_CANVAS_ID}/office-session`
+  );
 }
 
 function parseOfficeSession(
