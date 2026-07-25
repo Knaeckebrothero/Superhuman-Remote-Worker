@@ -441,6 +441,77 @@ class PersistentLoopCallbacks:
 # badly with the Future machinery.
 _STREAM_DONE = object()
 
+# Transient-LLM-error retry budget for a session turn. Worker jobs get this from
+# `config.limits.llm_inproc_retries`; a session turn is interactive, so the ceiling
+# is deliberately lower — a user is watching, and a turn that cannot recover in a
+# few seconds is better surfaced than silently retried for a minute.
+_SESSION_LLM_MAX_ATTEMPTS = 3
+# Exponential base: sleeps _BASE * 2**attempt between attempts (2s, 4s).
+_SESSION_LLM_RETRY_BASE_DELAY = 2.0
+
+
+# Classifications worth another attempt. Deliberately the complement of the
+# fail-fast verdicts (`permanent`, `quota_exhausted`, `cooldown`): those are
+# states no retry inside a turn can fix, and the worker path already fails fast
+# on them for reasons documented in `_classify_llm_error`.
+_SESSION_RETRYABLE_CLASSIFICATIONS = frozenset(
+    {"transient", "rate_limit", "auth_unavailable"}
+)
+
+
+def _is_context_overflow(error: BaseException) -> bool:
+    """True if ``error`` is a deterministic "request too big" failure.
+
+    `_classify_llm_error`'s catch-all verdict is `transient`, and the synthetic
+    413 that `reasoning_chat` raises for a pre-flight overflow carries a status
+    the classifier has no rule for — so it lands on that catch-all. Retrying it
+    re-sends the identical oversized body, which is precisely the retry storm
+    docs/issues/session_silent_failure_audit.md #3 removed. Detected three ways
+    because the overflow reaches us typed, wrapped, or as the synthetic 413.
+    """
+    for candidate in (error, getattr(error, "__cause__", None)):
+        if isinstance(candidate, ContextOverflowError):
+            return True
+        body = getattr(candidate, "body", None)
+        if isinstance(body, dict):
+            err_obj = body.get("error")
+            if isinstance(err_obj, dict) and err_obj.get("code") == "context_overflow":
+                return True
+    return "context_overflow" in str(error)
+
+
+def _is_retryable_llm_error(error: BaseException) -> bool:
+    """True if the shared classifier says this LLM failure is worth retrying.
+
+    Sessions and worker jobs deliberately call the *same* `_classify_llm_error`
+    so a given provider failure gets one verdict product-wide — the worker path
+    accumulated that triage across several incidents (see its docstring) and
+    sessions had none of it.
+
+    Imported lazily: `src.graph` is a heavy module and nothing else in the
+    session path needs it at import time.
+    """
+    if _is_context_overflow(error):
+        return False
+
+    from .graph import _classify_llm_error
+
+    return _classify_llm_error(error) in _SESSION_RETRYABLE_CLASSIFICATIONS
+
+
+def _session_llm_retry_delay(attempt: int, error: BaseException) -> float:
+    """Backoff before the next attempt, floored by any provider Retry-After."""
+    delay = _SESSION_LLM_RETRY_BASE_DELAY * (2**attempt)
+    try:
+        from .graph import _extract_rate_limit_delay
+
+        provider_delay = _extract_rate_limit_delay(error)
+    except Exception:  # pragma: no cover - defensive
+        provider_delay = None
+    if provider_delay is not None:
+        delay = max(delay, provider_delay)
+    return delay
+
 
 async def _safe_anext(aiter: Any) -> Any:
     """``__anext__`` that returns ``_STREAM_DONE`` on exhaustion instead of
@@ -1325,10 +1396,54 @@ async def _execute_turn(
                 # the next chunk to arrive before the cooperative check below.
                 _stream = llm_with_tools.astream(prepared)
                 _aiter = _stream.__aiter__()
+                _llm_attempt = 0
                 while True:
-                    chunk, _stream_status = await _stream_next_or_hard_interrupt(
-                        _aiter, callbacks.hard_interrupt_event
-                    )
+                    try:
+                        chunk, _stream_status = await _stream_next_or_hard_interrupt(
+                            _aiter, callbacks.hard_interrupt_event
+                        )
+                    except Exception as chunk_err:
+                        # A provider failure *inside* an already-200 SSE body:
+                        # the openai SDK raises a bare APIError here (base class,
+                        # no status_code) and its own max_retries no longer
+                        # applies because the response body had already started.
+                        # Worker jobs classify these and retry; sessions used to
+                        # push the raw provider string at the user (incident
+                        # 2026-07-25, session b1758f38). Same classifier now.
+                        #
+                        # Only safe while nothing has reached the client — a
+                        # retry restarts the stream from scratch, so replaying
+                        # after tokens were painted would duplicate them.
+                        _nothing_shown = not (
+                            response_content or reasoning_streamed or reasoning_emitted
+                        )
+                        if (
+                            _llm_attempt + 1 < _SESSION_LLM_MAX_ATTEMPTS
+                            and _nothing_shown
+                            and _is_retryable_llm_error(chunk_err)
+                        ):
+                            _delay = _session_llm_retry_delay(_llm_attempt, chunk_err)
+                            logger.warning(
+                                "Transient LLM stream error (attempt %d/%d), "
+                                "retrying in %.1fs: %s: %s",
+                                _llm_attempt + 1,
+                                _SESSION_LLM_MAX_ATTEMPTS,
+                                _delay,
+                                type(chunk_err).__name__,
+                                chunk_err,
+                            )
+                            await asyncio.sleep(_delay)
+                            _llm_attempt += 1
+                            # Restart cleanly: drop partial stream state so the
+                            # fresh attempt cannot merge with the dead one.
+                            chunks = []
+                            stream_finish_reason = None
+                            response = None
+                            _reasoning_buf.clear()
+                            _stream = llm_with_tools.astream(prepared)
+                            _aiter = _stream.__aiter__()
+                            continue
+                        raise
                     if _stream_status == "interrupt":
                         logger.info(
                             "Hard interrupt during LLM streaming — cancelling stream"
