@@ -156,8 +156,8 @@ Failure semantics (engine-wide): `consecutive_failures` increments only when **a
 
 ### Cycles, backend-wide
 
-- Columns rename: `max_iterations → max_cycles`, `remaining_iterations → remaining_cycles` (migration `0063_loop_unified_engine.sql`; `project_loop_has_budget` CHECK re-created; `schema_current.sql` regenerated). Full consumer blast-radius is mapped in the budget audit — DB layer allowlist (`_PROJECT_LOOP_UPDATABLE_FIELDS`), heal writers, spawn/writeback kwargs, `validate_loop_plan`, `_format_budget` UI strings, sweeper, MCP formatters, cockpit models/labels, API request model **[A2]**.
-- **One billing point.** Today the decrement is duplicated per-path and computed *before* the wrap index is known (main.py:12752 vs 12845; `next_index` only exists inside `_rotate_loop_to_next_stage`) **[A2]**. The engine's `charge_cycle()` step owns it, and the wrap is computed before stop-evaluation, so the budget stop always sees the post-charge value.
+- Columns rename: `max_iterations → max_cycles`, `remaining_iterations → remaining_cycles` (migration **`0070`** — 0063 went to Phase 1, 0064–0069 to unrelated work; `project_loop_has_budget` CHECK re-created; `schema_current.sql` regenerated). Full consumer blast-radius is mapped in the budget audit — DB layer allowlist (`_PROJECT_LOOP_UPDATABLE_FIELDS`), heal writers, spawn/writeback kwargs, `validate_loop_plan`, `_format_budget` UI strings, sweeper, MCP formatters, cockpit models/labels, API request model **[A2]**. Scope guard: agent-side `max_iterations` (aux tool loops, subagent caps, loader config) is an unrelated concept — never sweep it.
+- **One billing point.** *(Partly delivered by Phase 1: the decrement is now single — `_advance_loop_member`, main.py:13279 — and the stop check already sees the post-charge value.)* What remains is the *timing*: the charge fires per turn, upstream of the wrap index (`next_index`, main.py:13037, computed inside `_rotate_loop_to_next_stage`). The engine's `charge_cycle()` step must know the wrap before charging, so the wrap computation moves ahead of the charge/stop-evaluation pair **[A2]**.
 - **Per-mode cycle semantics** (each mode charges 1 at its natural boundary):
   - `standard`, sequential: at sequence wrap (stage 0 due next) — exactly where the KB cycle-TTL decrement already fires; the two decrements unify into **one wrap hook** so loop cycles and KB TTLs tick in lockstep (they finally denote the same unit).
   - `standard`, overlap: once per turn (fill turns count; each steady-state turn retires ≈ one generation).
@@ -188,7 +188,11 @@ Campaign **advance compatibility lands in Phase 1** (threading `completed_job` t
 
 ## Data model & code surface
 
-- **Migration 0063**: `loop_handovers` table (id, loop_id FK, job_id, cycle, stage_index, member_index, role, status TEXT CHECK (green/watch/blocked), baseline_sha, content TEXT, created_at; index on (loop_id, cycle, stage_index)); `scheduling` value rename + CHECK; `max_cycles`/`remaining_cycles` rename + per-mode conversion; `overlap BOOLEAN NOT NULL DEFAULT FALSE` on `project_loops`. House style per `0035`/`0050`.
+- **Migrations** (originally sketched as one `0063`; split per phase as the work landed). House style per `0035`/`0050`:
+  - `0063` — **shipped (Phase 1)**: `scheduling` value rename + CHECK swap, width-1 barrier membership backfill, column comments.
+  - `0070` — **Phase 2**: `max_cycles`/`remaining_cycles` rename + per-mode conversion; `project_loop_has_budget` CHECK re-created.
+  - Phase 3 — `loop_handovers` table (id, loop_id FK, job_id, cycle, stage_index, member_index, role, status TEXT CHECK (green/watch/blocked), baseline_sha, content TEXT, created_at; index on (loop_id, cycle, stage_index)).
+  - Phase 4 — `overlap BOOLEAN NOT NULL DEFAULT FALSE` on `project_loops`.
 - `orchestrator/services/project_loops.py`: stage-object `normalize_stage`/`validate_role_sequence`; `validate_loop_handover` (envelope headings, size cap, path@sha spot-check); brief part in `build_loop_kickoff`; instance stamping + unconditional `tools.loop` injection in `create_loop_job`.
 - `orchestrator/main.py`: `_advance_project_loop` becomes engine steps 1–5 with the [A1] work items; `POST /api/jobs/{job_id}/loop-handover`; completion gate in `complete_job`; scheduler functions per mode.
 - `orchestrator/database/postgres.py`: barrier claim reused as-is; heal unification; `loop_handovers` CRUD; updatable-fields allowlist rename.
@@ -200,9 +204,16 @@ Campaign **advance compatibility lands in Phase 1** (threading `completed_job` t
 
 Order note: the engine comes **before** cycles — decrement-at-wrap needs the wrap computed ahead of stop-evaluation, which is exactly the restructuring the engine does; building it into the two legacy paths first would implement it twice on code about to be deleted **[A2]**.
 
-**Phase 1 — unified engine (behavior-preserving).** All spawns through the barrier path; the [A1] work-item list (writeback, heal, campaign threading, plan-filing gate, stop-writes, resume, display); legacy rotate deleted; mode renames. Billing stays per-advance. AC: full loop + campaign suites green with the legacy path gone; tear drills at width 1 and width N; k3d smoke of a migrated sequential loop with identical observable behavior; k3d planner smoke proving campaign advance through the barrier.
+**Phase 1 — unified engine (behavior-preserving). ✅ DONE (migration 0063; deployed dev 2026-07-21, validated through 2026-07-25).** All spawns through the barrier path; the [A1] work-item list (writeback, heal, campaign threading, plan-filing gate, stop-writes, resume, display); legacy rotate deleted; mode renames. Billing stays per-advance. AC met, with one substitution: the k3d smokes were superseded by validation on live dev loops (standard rotation through failures, consecutive-failure stop, tear drill ×2, a 14-turn campaign chaining through the barrier) — see [Status](#status). Unplanned addendum shipped in the same arc: dispose-only campaign filing + `loop_campaign_review_skipped`, closing an accountability hole the validation surfaced.
 
-**Phase 2 — cycles backend-wide.** `charge_cycle()` at the engine; unified wrap hook (loop budget + KB TTL); per-mode conversion migration; sweeper fallback; renames through DB/API/MCP/cockpit. AC: conversion correct on live-shaped fixtures (rotation ÷ entries, planner identity, NULL/0/empty guards); budget stop fires on the post-charge value; campaign affordability arithmetic unchanged.
+**Phase 2 — cycles backend-wide. ← NEXT.** `charge_cycle()` at the engine; unified wrap hook (loop budget + KB TTL); per-mode conversion migration; sweeper fallback; renames through DB/API/MCP/cockpit. AC: conversion correct on live-shaped fixtures (rotation ÷ entries, planner identity, NULL/0/empty guards); budget stop fires on the post-charge value; campaign affordability arithmetic unchanged.
+
+*Post-Phase-1 corrections to the Phase-2 brief (the audit predates unification):*
+
+- **Migration number is `0070`**, not 0063 — Phase 1 consumed 0063, and 0064–0069 went to unrelated expert/automation work.
+- **The decrement is no longer duplicated.** Phase 1 collapsed the two per-path decrements into exactly one (`_advance_loop_member`, main.py:13279), and the stop check already reads the post-charge value. The remaining Phase-2 work is therefore *charge-at-wrap*, not de-duplication: the charge still fires per **turn** and still precedes the wrap computation (`next_index`, main.py:13037, lives inside `_rotate_loop_to_next_stage`, downstream of the charge and of `_loop_stop_reason`).
+- **The KB TTL hook is the wrap the loop budget must join** (main.py:13046, gated on `next_index == 0`). Note it sits *after* the campaign branch's early return, so campaign advances never tick it today — preserve that, or decide it deliberately.
+- **`max_iterations` is an overloaded name.** Agent-side `max_iterations` (auxiliary tool loops `src/services/auxiliary.py`, light-runner/subagent caps `src/tools/delegation/`, `src/core/loader.py:1797`, `src/agent.py:560`) is an unrelated concept. A repo-wide rename sweep WILL break the agent — the rename is scoped to `project_loops` columns and their consumers only.
 
 **Phase 3 — handover briefs.** Tool + endpoint + table + orchestrator gate + ring injection + retro mirror + receiver-synthesis kickoff line + per-stage instruction field. AC: gate drills (reject→re-dispatch→fail-loud; stop-without-job_complete path caught; waiting_for_reply untouched); envelope validation (headings, 8k cap, oversize round-trip); k3d smoke where a critic's brief verbatim reaches the developer kickoff and the developer report reaches the next scholar.
 
@@ -213,6 +224,8 @@ Order note: the engine comes **before** cycles — decrement-at-wrap needs the w
 **Phase 6 — cockpit.** Stage builder, ramp preview, briefs viewer, cycles vocabulary. AC: component tests; k3d Playwright pass building a 3-stage loop with a duplicated developer and reading its briefs.
 
 **Phase 7 — live validation.** Better Resavio in standard mode with briefs (sequential), then flip `overlap:true`. AC: one full overnight run where every handoff is brief-carried, every stage outcome visible in retros + briefs, and cost per cycle readable.
+
+*Phases 3–7 are not started.* Each gets its own plan under `docs/superpowers/plans/` at the time it is picked up (Phase 1's is `2026-07-19-loop-unified-engine-phase1.md`). Phase 7 note: the Better Resavio dev loop is currently `failed` (`stop_reason=failures`, three consecutive VM-provisioning failures on 2026-07-24) — it needs the workspace/VM provisioning issues resolved before it can serve as the validation vehicle.
 
 ## Open questions
 
