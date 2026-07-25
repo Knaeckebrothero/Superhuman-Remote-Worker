@@ -258,6 +258,25 @@ def validate_corpus(
             raise ValueError(
                 f"{location}.expected_topic {expected_topic!r} is not a current topic"
             )
+        allowed_topics = case.get("allowed_topics", [])
+        if (
+            not isinstance(allowed_topics, list)
+            or any(not isinstance(topic, str) for topic in allowed_topics)
+            or len(set(allowed_topics)) != len(allowed_topics)
+        ):
+            raise ValueError(
+                f"{location}.allowed_topics must be a unique list of strings"
+            )
+        unknown_allowed_topics = sorted(set(allowed_topics) - topics)
+        if unknown_allowed_topics:
+            raise ValueError(
+                f"{location}.allowed_topics contains unknown topic(s): "
+                + ", ".join(unknown_allowed_topics)
+            )
+        if expected_topic in allowed_topics:
+            raise ValueError(
+                f"{location}.allowed_topics must not repeat expected_topic"
+            )
 
         _validate_expectations(
             case["required_facts"],
@@ -281,6 +300,8 @@ def validate_corpus(
                 raise ValueError(f"{location} positive case needs required_facts")
         elif expected_topic is not None:
             raise ValueError(f"{location} negative case must use a null topic")
+        elif allowed_topics:
+            raise ValueError(f"{location} negative case cannot allow topics")
 
         if category == "near_miss" and case["expected_trigger"]:
             raise ValueError(f"{location} near_miss must not trigger")
@@ -504,7 +525,11 @@ def score_case(
         topic_pass = not observed_topics
         unexpected_topics: list[str] = observed_topics
     else:
-        allowed_topics = {expected_topic, "index"}
+        allowed_topics = {
+            expected_topic,
+            "index",
+            *case.get("allowed_topics", []),
+        }
         unexpected_topics = [
             topic for topic in observed_topics if topic not in allowed_topics
         ]
@@ -536,6 +561,7 @@ def score_case(
             "observed_trigger": observed_trigger,
             "trigger_pass": trigger_pass,
             "expected_topic": expected_topic,
+            "allowed_topics": case.get("allowed_topics", []),
             "observed_topics": observed_topics,
             "unexpected_topics": unexpected_topics,
             "topic_pass": topic_pass,

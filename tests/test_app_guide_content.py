@@ -48,6 +48,8 @@ def test_guide_requires_outcome_level_coverage_and_honest_combination_gaps():
     )
     assert "call `index` only, state an explicit guide gap, and stop" in body
     assert "do not load the nearest topic to manufacture a setup" in body
+    assert "it is not a catch-all place to search for a feature absent" in body
+    assert "route to `memory-and-knowledge`" in body
     assert "the guide does not document this exact workflow" in body
     assert (
         "a schedule, connector, prompt, expert, or permission documented separately"
@@ -247,6 +249,15 @@ def test_memory_guide_separates_compaction_recall_native_kb_and_external_okf():
     assert "do not use memory as the only record of something critical" in body
 
 
+def test_email_guide_requires_both_scope_and_explicit_attachment():
+    _, body = _focused_topic("datasources-email")
+
+    assert "folder allowlist" in body
+    assert "leaving this empty shares the whole mailbox" in body
+    assert "it does **not** attach the connector" in body
+    assert "finish by selecting it for this session" in body
+
+
 def test_automation_guide_keeps_current_safety_and_actionability_boundaries():
     _, body = _focused_topic("automations")
 
@@ -275,6 +286,7 @@ def test_fleet_guide_keeps_current_scope_and_fallback_boundaries():
     assert "jobs → new job" in body
     assert "normally inherits this session's selected connectors" in body
     assert "app guide does not grant fleet management" in body
+    assert "parallel only when fleet capacity permits" in body
     assert "does not delete jobs" in body
     assert "does not" in body and "continuously monitor a job" in body
     assert "delegation" in body and "different ways srw can split work" in body
@@ -294,6 +306,7 @@ def test_canvas_guide_keeps_renderer_handoff_and_availability_boundaries():
     assert "closing the pane is local" in body
     assert "does not delete the file" in body
     assert "take control" in body and "release control" in body
+    assert "required workspace" in body and "container workspace" in body
     assert "user_is_driving" in body
     assert "same dom, cookies, and authenticated state" in body
     assert "closing the canvas pane merely detaches your viewer" in body

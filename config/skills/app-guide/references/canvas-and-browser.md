@@ -78,8 +78,14 @@ different workspace bytes under the old presentation.
 
 ## Share the browser with the agent
 
+**Required workspace:** start with or upgrade to a **Container workspace**.
+Virtual and None cannot host the shared browser, and VM support must not be
+promised.
+
 Shared browser is default-off and deployment-dependent. If it is enabled for a
-compatible full workspace, use the web icon in the session header or
+compatible full workspace, the currently proven path is a **Container
+workspace**; Virtual and None do not provide the required browser workspace,
+and VM support must not be promised. Use the web icon in the session header or
 **Open browser** in the Canvas empty state:
 
 1. Choose **Open browser**. A cold Container session may first show

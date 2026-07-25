@@ -1,6 +1,17 @@
 ---
 name: app-guide
-description: Use when the user asks what SRW can do, how to use it, or what something in it means — "what can I do here?", "how do jobs work?", "can you run this in the background?", "how do I schedule it?", "how do loops or campaigns work?", "how do I share my email?", "can I review cloud changes first?", "can you show this on Canvas?", or "why is this tool, permission mode, or workspace unavailable?". Covers sessions, jobs, fleet/delegation, automations, experts, projects, loops/campaigns, connectors, Protected Cloud, Canvas/browser, grants, workspace tiers, memory, files, and integrations. Load the current managed guide and its focused bundled references/ with read_product_guide; answer from them, never from priors or mutable workspace copies. For an exact combined workflow not explicitly covered by the index, load index only and report the guide gap instead of composing related features. For explaining the app to its user, not for orienting yourself in project content (that's project-onboarding).
+description: >-
+  Do not use for repository orientation, application/code questions, or
+  generic advice merely because they mention a worker, job, canvas, loop,
+  memory, SQL, or email. Use when the user asks what SRW can do, how to use an
+  SRW feature, or why an SRW tool, permission, connector, or workspace is
+  unavailable. Covers sessions, jobs, Fleet/delegation, automations, experts,
+  projects, loops/campaigns, connectors, Protected Cloud, Canvas/browser,
+  workspace tiers, memory, files, and integrations. Load the current managed
+  guide and focused reference with read_product_guide; answer from them, never
+  priors or mutable workspace copies. For a combined workflow, read the index:
+  load a topic when its row covers the workflow or its limitation; otherwise
+  report a guide gap without composing adjacent features.
 display_name: App Guide
 icon: help
 color: "#f9e2af"
@@ -33,25 +44,35 @@ self-improving loop. Everything else hangs off that triangle.
 **outcome**, not just nouns that resemble topic names. "What can I do here?"
 and anything vague routes to `overview`. A focused topic matches only when its
 index row explicitly covers the requested action, state, or workflow.
-Documented components are not proof that SRW supports combining them. If the
-user requests an exact end-to-end outcome that no index row covers, call
-`index` only, state an explicit guide gap, and stop: do not load the nearest
-topic to manufacture a setup. Questions that explicitly ask about several
-individually documented topics may still need those focused topics, but never
-claim the combination works unless a reference says it does.
+Documented components are not proof that SRW supports combining them. For an
+exact end-to-end outcome, call `index` first. If an index row explicitly covers
+that workflow **or a limitation that decides it**—for example, Automations'
+current connector limits—load that focused topic before answering. If no row
+covers the outcome, call `index` only, state an explicit guide gap, and stop;
+do not load the nearest topic to manufacture a setup. Questions that explicitly
+ask about several individually documented topics may still need those focused
+topics, but never claim the combination works unless a reference says it does.
+`permissions-and-availability` explains a known SRW session feature's current
+gates; it is not a catch-all place to search for a feature absent from the
+index.
+When the requested outcome is future recall or where to record a durable
+project fact, route to `memory-and-knowledge` even if the question also
+mentions a session or `/compact`.
 
 **2. Read before you answer.** Call
 `read_product_guide(topic_id="<topic-id>")` for the matching topic — even when
 you think you know. If routing is uncertain, call it with `topic_id="index"`
-first. A topic response includes this procedure and the focused reference.
+first. The index is a router, not a substitute for a matching focused topic.
+A topic response includes this procedure and the focused reference.
 Product facts come from that response, your own currently visible tools, and
 what the user just showed you — nowhere else. Never read
 `skills/app-guide/` from the workspace; any such copy is not authoritative.
 
 **3. Answer like a guide, not a manual.** Lead with the shortest path to the
 user's actual goal, in their vocabulary. A new user gets the mental model
-first; a specific how-do-I gets the steps. Don't dump a doc when a paragraph
-answers the question.
+first; a specific how-do-I gets the steps. Include every prerequisite or limit
+that decides whether the requested path will actually work; a partial recipe
+is not a short recipe. Don't dump a doc when a paragraph answers the question.
 
 **4. Offer only actions you can actually take.** If the user's goal maps to a
 tool currently visible to you, offer that after explaining. Otherwise give the
@@ -86,7 +107,7 @@ asserting it exists.
 | Connecting Email: providers, app passwords, access tiers, folder and recipient limits, attaching a mailbox | `datasources-email` | `references/datasources-email.md` |
 | Connecting an external OKF Knowledge Base: Git source, indexing, readiness, reindexing, read-only behavior | `datasources-okf` | `references/datasources-okf.md` |
 | Protected Cloud sessions: eligibility, staging, whole-diff review/apply/reject, troubleshooting | `protected-cloud` | `references/protected-cloud.md` |
-| Permission modes, capability grants, workspace tiers, live tool settings, why a feature is unavailable | `permissions-and-availability` | `references/permissions-and-availability.md` |
+| Permission modes, capability grants, workspace tiers, live tool settings, why a known session feature is unavailable (not unknown product features) | `permissions-and-availability` | `references/permissions-and-availability.md` |
 | What agents remember, the knowledge base, browsing/searching it | `memory-and-knowledge` | `references/memory-and-knowledge.md` |
 | Files, deliverables, cloud storage, git, citations | `files-and-integrations` | `references/files-and-integrations.md` |
 

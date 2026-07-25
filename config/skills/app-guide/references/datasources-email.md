@@ -15,6 +15,14 @@ move or flag messages, create drafts, and—under the strictest settings—send
 mail. Creating the connector does not give every agent access: you must also
 select it for a project, job, or session.
 
+Sharing only part of a mailbox therefore has two required parts: restrict the
+connector with **Folder allowlist**, then explicitly select that connector for
+the project, job, or session that needs it. Do not stop after saving the
+allowlist.
+
+The folder allowlist scopes the saved connector; it does **not** attach the
+connector. Finish by selecting it for this session or other intended run.
+
 ## Shortest safe setup
 
 1. Open **Connectors** in Cockpit and choose **New Connector**.
