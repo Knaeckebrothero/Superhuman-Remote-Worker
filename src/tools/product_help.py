@@ -39,7 +39,10 @@ PRODUCT_HELP_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": (
             "Read the current SRW product guide without relying on workspace "
             "files. Pass topic_id='index' to load its procedure and current "
-            "topic IDs, then read the one topic relevant to the user's question."
+            "topic IDs, then read the one topic that explicitly covers the "
+            "user's requested outcome. If no index row covers an exact combined "
+            "workflow, stop after index and report the guide gap instead of "
+            "composing adjacent features."
         ),
         "category": "product_help",
         "phases": ["strategic", "tactical"],
@@ -127,7 +130,10 @@ def create_product_help_tools(context: ToolContext) -> List[Any]:
         knowledge, files, and integrations. Start with ``index`` when uncertain.
         A topic call returns both the guide procedure and that one focused
         reference. Treat it as product guidance, not authorization or proof
-        that a deployment-specific feature is enabled.
+        that a deployment-specific feature is enabled. Related documented
+        components do not prove an exact combined workflow is supported; when
+        no index row covers that outcome, stop after ``index`` and report the
+        guide gap rather than selecting the nearest topic.
 
         Args:
             topic_id: ``index`` or one exact logical topic ID returned by the

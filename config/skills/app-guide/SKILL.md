@@ -1,6 +1,6 @@
 ---
 name: app-guide
-description: Use when the user asks what SRW can do, how to use it, or what something in it means — "what can I do here?", "how do jobs work?", "can you run this in the background?", "how do I schedule it?", "how do loops or campaigns work?", "how do I share my email?", "can I review cloud changes first?", "can you show this on Canvas?", or "why is this tool, permission mode, or workspace unavailable?". Covers sessions, jobs, fleet/delegation, automations, experts, projects, loops/campaigns, connectors, Protected Cloud, Canvas/browser, grants, workspace tiers, memory, files, and integrations. Load the current managed guide and its focused bundled references/ with read_product_guide; answer from them, never from priors or mutable workspace copies. For explaining the app to its user, not for orienting yourself in project content (that's project-onboarding).
+description: Use when the user asks what SRW can do, how to use it, or what something in it means — "what can I do here?", "how do jobs work?", "can you run this in the background?", "how do I schedule it?", "how do loops or campaigns work?", "how do I share my email?", "can I review cloud changes first?", "can you show this on Canvas?", or "why is this tool, permission mode, or workspace unavailable?". Covers sessions, jobs, fleet/delegation, automations, experts, projects, loops/campaigns, connectors, Protected Cloud, Canvas/browser, grants, workspace tiers, memory, files, and integrations. Load the current managed guide and its focused bundled references/ with read_product_guide; answer from them, never from priors or mutable workspace copies. For an exact combined workflow not explicitly covered by the index, load index only and report the guide gap instead of composing related features. For explaining the app to its user, not for orienting yourself in project content (that's project-onboarding).
 display_name: App Guide
 icon: help
 color: "#f9e2af"
@@ -29,10 +29,16 @@ self-improving loop. Everything else hangs off that triangle.
 
 ## The answer
 
-**1. Route the question.** Find the logical topic ID in the index below. "What
-can I do here?" and anything vague routes to `overview`. Questions spanning
-topics (e.g. "how do I set up a research pipeline?") may need more than one
-focused topic.
+**1. Make a coverage decision, then route.** Match the user's requested
+**outcome**, not just nouns that resemble topic names. "What can I do here?"
+and anything vague routes to `overview`. A focused topic matches only when its
+index row explicitly covers the requested action, state, or workflow.
+Documented components are not proof that SRW supports combining them. If the
+user requests an exact end-to-end outcome that no index row covers, call
+`index` only, state an explicit guide gap, and stop: do not load the nearest
+topic to manufacture a setup. Questions that explicitly ask about several
+individually documented topics may still need those focused topics, but never
+claim the combination works unless a reference says it does.
 
 **2. Read before you answer.** Call
 `read_product_guide(topic_id="<topic-id>")` for the matching topic — even when
@@ -52,11 +58,16 @@ tool currently visible to you, offer that after explaining. Otherwise give the
 reviewed Cockpit path from the reference. Do not imply that explaining a
 feature means this session can configure or operate it.
 
-**5. If the docs don't cover it, say so.** Name what you looked in, give your
-best pointer (a cockpit page, an admin, the project README) — and don't
-improvise an answer. Features can also be deployment-dependent
-(admin-configured or flag-gated); when a doc marks something that way, say
-"your deployment may not have this enabled" instead of asserting it exists.
+**5. If the docs don't cover the exact outcome, say so.** Use direct language
+such as "the guide does not document this exact workflow" or "I cannot confirm
+an exact Cockpit setup from the guide." Name what you looked in and give your
+best verified pointer (a Cockpit page, an admin, the project README), but do not
+turn adjacent documented features into a recipe. Related primitives may be
+mentioned only as clearly labelled possibilities that still need verification,
+not as steps, supported composition, or current UI. Features can also be
+deployment-dependent (admin-configured or flag-gated); when a doc marks
+something that way, say "your deployment may not have this enabled" instead of
+asserting it exists.
 
 ## The index
 
@@ -85,6 +96,8 @@ improvise an answer. Features can also be deployment-dependent
 - **Load this skill with `use_skill` or `read_file`** — only
   `read_product_guide` supplies the current managed bytes.
 - **Invent UI labels, buttons, or features** — if you didn't read it in a reference or see it in your own tools, it doesn't exist.
+- **Compose undocumented workflows** — a schedule, connector, prompt, expert,
+  or permission documented separately does not prove they work together.
 - **Assert deployment-dependent features** — flag-gated or admin-configured items are "may be available", not "is".
 - **Lecture past the question** — answer what was asked; offer the next-most-useful thing as a follow-up, not a wall of text.
 - **Confuse this with project-onboarding** — that skill orients *you* in the user's project content; this one explains *the app* to the user.
