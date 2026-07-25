@@ -17,11 +17,14 @@ router.
 
 ## Status
 
-In progress. M1a–M1e are shipped. Work packages 1 and 2, plus the deterministic
-portion of work package 3, were implemented 2026-07-25. Their focused suites
-pass, while the full combined content command still exposes an unrelated
-concurrent Canvas/Office renderer-coverage gap. The first live-model run and
-the fresh/resumed k3d matrix remain release evidence, not inferred passes.
+Final verification in progress. M1a–M1e are shipped and work packages 1–3 are
+implemented. A first complete live-model run and all six fresh/resumed k3d
+delivery cells ran 2026-07-25; their failures and observations drove a final
+routing/prerequisite hardening pass. The clean final source/image now has a
+recorded identity, but its deployed current-arm evaluation and final-digest
+fresh/resumed confirmation still gate M1. The focused suites pass, while the
+full combined content command still exposes an unrelated concurrent
+Canvas/Office renderer-coverage gap.
 
 ## Non-negotiable boundaries
 
@@ -222,7 +225,7 @@ but no raw secrets or private session content.
 
 Implementation-time evidence (2026-07-25):
 
-- The versioned corpus contains **29** synthetic cases: 16 product positives
+- The versioned corpus contains **30** synthetic cases: 17 product positives
   and 13 near-miss negatives, including two broad questions, two availability
   questions, paraphrases, all four required near-miss classes, and one honest
   off-document case.
@@ -230,20 +233,25 @@ Implementation-time evidence (2026-07-25):
 - The full work-package regression command above: **230 passed**, with three
   pre-existing warnings.
 - Ruff check/format and `git diff --check` pass for the work-package files.
-- No `APP_GUIDE_EVAL_*`, fallback eval, or OpenAI route is exported in this
-  workspace, so a live-model artifact has **not** been produced and is not
-  counted as a pass.
+- A supported in-memory credential handoff from an authorized synthetic session
+  allowed the first complete current-arm run without persisting a key or base
+  URL. It scored 18/30 with no provider errors or critical forbidden claims,
+  correctly failing the release gate and exposing routing/grounding weaknesses.
+- A later candidate-snapshot run scored 29/30, but it is diagnostic rather
+  than release evidence. The complete final deployed current arm must still
+  pass against the exact final bundle.
 
 ## Work package 4 — fresh/resumed k3d acceptance matrix
 
 **Preflight**
 
-- [ ] Confirm `kubectl config current-context` is the intended local k3d
+- [x] Confirm `kubectl config current-context` is the intended local k3d
   context, the cluster responds, and Tilt or the selected image deployment path
-  is current.
-- [ ] Record full source revision and relevant deployed image IDs. Do not
+  is current. The host endpoint was unavailable, so the responding direct k3d
+  API endpoint and image-import path were recorded instead.
+- [x] Record full source revision and relevant deployed image IDs. Do not
   silently treat a dirty live-mounted tree as a committed image.
-- [ ] Use synthetic users/projects/questions only. Never print datasource
+- [x] Use synthetic users/projects/questions only. Never print datasource
   credentials or private environment values.
 
 **Matrix**
@@ -257,22 +265,27 @@ Implementation-time evidence (2026-07-25):
 | Resumed pre-M1f thread | off | off | Virtual | Current digest replaces frozen/stale catalog bytes |
 | Resumed pre-M1f thread | off | off | Container | Current guide remains authoritative across workspace persistence |
 
+Checkpoint result: all six cells passed against deployed guide digest
+`7d16da6338f4e6bc1a50b3c1ab20e6da3a2d0405f6815998ecc506d82d744dc0`.
+The later routing hardening produced final digest `20974f2e...`, so the matrix
+remains open until live paths confirm that exact digest.
+
 **Behavioral probes**
 
 - [ ] Ask the core broad question and the Email folder-allowlist question in at
   least one fresh and one resumed session; confirm the reader trajectory and
   grounded answer.
-- [ ] Force a context compaction, ask a second product question, and confirm
+- [x] Force a context compaction, ask a second product question, and confirm
   the guide is retrieved again from the current bundle.
-- [ ] Enable the break-glass value in the local test deployment, confirm the
+- [x] Enable the break-glass value in the local test deployment, confirm the
   guide/tool disappear and health reports `operator_break_glass`, then disable
   it and confirm a rebind restores the guide.
-- [ ] Ask the held-out off-document question and confirm the answer names the
+- [x] Ask the held-out off-document question and confirm the answer names the
   guide gap rather than inventing UI or support.
 
 **Evidence**
 
-- Create `docs/tests/app_guide_m1_verification.md` with date, source revision,
+- [x] Create `docs/tests/app_guide_m1_verification.md` with date, source revision,
   deployment identity, matrix results, commands, bounded output excerpts, and
   any accepted warnings.
 - Do not mark the matrix complete from unit mocks, direct function calls, or a
