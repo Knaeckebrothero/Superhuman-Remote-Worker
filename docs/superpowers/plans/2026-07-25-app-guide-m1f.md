@@ -17,11 +17,11 @@ router.
 
 ## Status
 
-In progress. M1a–M1e are shipped. Work packages 1 and 2 were implemented
-2026-07-25. Their focused suites pass, while the full combined content command
-still exposes an unrelated concurrent Canvas/Office renderer-coverage gap.
-None of the remaining Phase 1 boxes assigned below should be checked until
-its named automated or live evidence exists.
+In progress. M1a–M1e are shipped. Work packages 1 and 2, plus the deterministic
+portion of work package 3, were implemented 2026-07-25. Their focused suites
+pass, while the full combined content command still exposes an unrelated
+concurrent Canvas/Office renderer-coverage gap. The first live-model run and
+the fresh/resumed k3d matrix remain release evidence, not inferred passes.
 
 ## Non-negotiable boundaries
 
@@ -172,36 +172,36 @@ Implementation-time evidence (2026-07-25):
 - Create: `eval/app_guide/README.md` only if required to operate the standalone
   evaluation harness; runtime skill folders must not gain auxiliary docs
 - Create: `tests/test_app_guide_eval_harness.py`
-- Modify: a focused compaction or persistent-graph test
+- Create: `tests/test_app_guide_compaction.py`
 - Modify: `config/skills/app-guide/SKILL.md` only when an observed evaluation
   failure requires a general routing/grounding correction
 
 **Corpus contract**
 
-- [ ] Include balanced broad product questions, focused workflow questions,
+- [x] Include balanced broad product questions, focused workflow questions,
   availability questions, and paraphrases.
-- [ ] Include near-miss negatives for repository/codebase onboarding,
+- [x] Include near-miss negatives for repository/codebase onboarding,
   application code questions, generic productivity advice, and similarly named
   non-SRW concepts.
-- [ ] Include at least one genuine off-document question whose correct result
+- [x] Include at least one genuine off-document question whose correct result
   is an explicit guide gap, not an answer reconstructed from model priors.
-- [ ] Store expected trigger decision, expected topic ID or negative decision,
+- [x] Store expected trigger decision, expected topic ID or negative decision,
   required facts, forbidden claims, and criticality per case.
-- [ ] Validate corpus schema, unique IDs, class balance, known topic IDs, and
+- [x] Validate corpus schema, unique IDs, class balance, known topic IDs, and
   required negative/off-document coverage in ordinary CI.
 
 **Execution contract**
 
-- [ ] The standalone runner uses a fresh context per case, records tool
+- [x] The standalone runner uses a fresh context per case, records tool
   trajectory separately from answer scoring, and supports comparing the
   current skill to a no-skill or previous-skill arm.
-- [ ] Treat a product-positive case as a trigger success only when the model
+- [x] Treat a product-positive case as a trigger success only when the model
   calls `read_product_guide`; prose that happens to be correct from priors is
   not a routing pass.
-- [ ] Treat a near-miss as a pass only when it does not call the product reader.
-- [ ] Score critical forbidden claims at zero tolerance. Keep ordinary wording
+- [x] Treat a near-miss as a pass only when it does not call the product reader.
+- [x] Score critical forbidden claims at zero tolerance. Keep ordinary wording
   quality separate from grounding and trajectory.
-- [ ] Add a deterministic compaction test proving that after old tool results
+- [x] Add a deterministic compaction test proving that after old tool results
   are compacted the managed catalog description is still injected and the
   current reader/topic can be called again; unrelated references remain
   unloaded until requested.
@@ -211,6 +211,7 @@ Implementation-time evidence (2026-07-25):
 ```bash
 .venv/bin/pytest \
   tests/test_app_guide_eval_harness.py \
+  tests/test_app_guide_compaction.py \
   tests/test_persistent_graph.py \
   tests/test_persistent_session.py -q
 ```
@@ -218,6 +219,20 @@ Implementation-time evidence (2026-07-25):
 The live-model command and selected model are recorded by the runner. The
 result artifact must include per-case trajectory and critical-failure counts,
 but no raw secrets or private session content.
+
+Implementation-time evidence (2026-07-25):
+
+- The versioned corpus contains **29** synthetic cases: 16 product positives
+  and 13 near-miss negatives, including two broad questions, two availability
+  questions, paraphrases, all four required near-miss classes, and one honest
+  off-document case.
+- Harness/compaction unit tests: **12 passed**.
+- The full work-package regression command above: **230 passed**, with three
+  pre-existing warnings.
+- Ruff check/format and `git diff --check` pass for the work-package files.
+- No `APP_GUIDE_EVAL_*`, fallback eval, or OpenAI route is exported in this
+  workspace, so a live-model artifact has **not** been produced and is not
+  counted as a pass.
 
 ## Work package 4 — fresh/resumed k3d acceptance matrix
 
