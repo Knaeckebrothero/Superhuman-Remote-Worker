@@ -257,6 +257,28 @@ class TestValidateLoopPlan:
         )
         assert ok["disposition"]["outcome"] == "extend"
 
+    def test_dispose_only_ship_and_kill_accepted(self):
+        # Closing without opening: a bare disposition (no initiative, no
+        # stages) is a legal filing while a campaign awaits review.
+        loop = _loop(campaign=_campaign(status="review"))
+        for outcome in ("ship", "kill"):
+            out = validate_loop_plan(
+                {"disposition": {"outcome": outcome, "notes": "  checked  "}}, loop
+            )
+            assert out["initiative"] is None
+            assert out["stages"] == []
+            assert out["acceptance"] == []
+            assert out["disposition"] == {"outcome": outcome, "notes": "checked"}
+
+    def test_dispose_only_extend_rejected(self):
+        loop = _loop(campaign=_campaign(status="review"))
+        with pytest.raises(ValueError, match="extend requires stages"):
+            validate_loop_plan({"disposition": {"outcome": "extend"}}, loop)
+
+    def test_dispose_only_without_pending_campaign_rejected(self):
+        with pytest.raises(ValueError, match="no campaign is awaiting review"):
+            validate_loop_plan({"disposition": {"outcome": "ship"}}, _loop())
+
 
 class TestCampaignStamps:
     @pytest.mark.asyncio
@@ -750,6 +772,83 @@ async def test_history_is_capped():
 
 
 @pytest.mark.asyncio
+async def test_dispose_only_plan_closes_campaign_and_rotates():
+    """Ship/kill without a successor: history written, campaign cleared in the
+    same pre-spawn write, then plain K=1 rotation — no new campaign opened."""
+    from main import _rotate_loop_to_next_stage
+
+    db = AsyncMock()
+    spawn = _spawn_mock()
+    actions: list[str] = []
+    prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+    reviewed = _campaign(
+        status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
+    )
+    plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
+    with _patched_main(db, spawn):
+        await _rotate_loop_to_next_stage(
+            _loop(campaign=reviewed),
+            seq_index_completed=1,
+            base_total=13,
+            next_remaining=16,
+            consecutive=0,
+            last_error=None,
+            actions=actions,
+            completed_job=_critic_job(plan),
+            completed_ctx=_critic_job(plan)["context"],
+            completed_failed=False,
+        )
+    pre_spawn = db.update_project_loop.call_args_list[0].kwargs
+    assert pre_spawn["campaign"] is None
+    history = pre_spawn["campaign_history"]
+    assert history[-1]["outcome"] == "ship"
+    assert history[-1]["disposed_by"] == CRITIC_JOB_ID
+    # Falls back to plain rotation with no campaign stamps...
+    spawn.assert_awaited_once()
+    assert spawn.call_args.kwargs["stage"] == "developer"
+    assert spawn.call_args.kwargs.get("extra_context") is None
+    # ...and the rotation write-back does not resurrect a campaign.
+    assert "campaign" not in db.update_project_loop.call_args_list[-1].kwargs
+    assert any("disposed" in a for a in actions)
+
+
+@pytest.mark.asyncio
+async def test_skipped_review_is_loud_and_leaves_campaign_parked():
+    """A checkpoint critic that files nothing while a campaign awaits review
+    still falls back to rotation — but the skip is surfaced, not silent."""
+    from main import _rotate_loop_to_next_stage
+
+    db = AsyncMock()
+    spawn = _spawn_mock()
+    notify = AsyncMock()
+    actions: list[str] = []
+    reviewed = _campaign(status="review", stages_done=3)
+    with _patched_main(db, spawn):
+        with patch("main._notify_loop_event", notify):
+            await _rotate_loop_to_next_stage(
+                _loop(campaign=reviewed),
+                seq_index_completed=1,
+                base_total=13,
+                next_remaining=16,
+                consecutive=0,
+                last_error=None,
+                actions=actions,
+                completed_job=_critic_job(None),
+                completed_ctx=_critic_job(None)["context"],
+                completed_failed=False,
+            )
+    spawn.assert_awaited_once()
+    assert spawn.call_args.kwargs["stage"] == "developer"
+    assert any("awaits disposition" in a for a in actions)
+    notify.assert_awaited_once()
+    assert notify.call_args.kwargs["event_type"] == "loop_campaign_review_skipped"
+    # The parked campaign itself is untouched.
+    assert all(
+        "campaign" not in c.kwargs for c in db.update_project_loop.call_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_apply_time_rejection_degrades_to_rotation():
     """The budget may shrink between intake and apply; a now-unaffordable plan
     must degrade to the K=1 rotation fallback, not wedge or spawn anyway."""
@@ -882,6 +981,33 @@ async def test_intake_accepts_member_when_display_pointer_absent():
     db.merge_job_context.assert_awaited_once()
     stored = db.merge_job_context.call_args.args[1]["loop_plan"]
     assert stored["stages"] == [{"role": "developer"}, {"role": "developer"}]
+
+
+@pytest.mark.asyncio
+async def test_intake_accepts_dispose_only_plan_and_skips_kb_check():
+    # A dispose-only filing has no initiative — the KB existence check must be
+    # skipped (nothing to verify), not crash on initiative=None.
+    from main import LoopPlanRequest, file_loop_plan
+
+    job = _critic_job(None)
+    loop = _loop(
+        project_id="11111111-2222-3333-4444-555555555555",
+        campaign=_campaign(status="review"),
+    )
+    db = _intake_db(job, loop)
+    kb_fetchrow = AsyncMock(return_value=None)  # would reject if consulted
+    with _intake_patches(db, vector_db=_FakeAcquire(kb_fetchrow)):
+        out = await file_loop_plan(
+            MagicMock(),
+            CRITIC_JOB_ID,
+            LoopPlanRequest(plan={"disposition": {"outcome": "kill", "notes": "dead end"}}),
+        )
+    assert out["status"] == "accepted"
+    kb_fetchrow.assert_not_awaited()
+    stored = db.merge_job_context.call_args.args[1]["loop_plan"]
+    assert stored["initiative"] is None
+    assert stored["stages"] == []
+    assert stored["disposition"]["outcome"] == "kill"
 
 
 @pytest.mark.asyncio
@@ -1505,3 +1631,66 @@ class TestAgentLoaderBindsLoopCategory:
                 f"tools.{name} was dropped by the loader — add the kwarg to "
                 "both ToolsConfig(...) construction sites in src/core/loader.py"
             )
+
+
+# =============================================================================
+# 5. Agent-side tool (src/tools/loop/plan.py) — dispose-only filing
+# =============================================================================
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int = 200, payload: dict | None = None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+
+@pytest.mark.asyncio
+async def test_tool_supports_dispose_only_filing():
+    """The critic must be able to close a reviewed campaign without opening a
+    new one: no initiative, no stages, just the disposition."""
+    from src.tools.loop.plan import create_loop_plan_tools
+
+    context = MagicMock()
+    context.job_id = CRITIC_JOB_ID
+    (plan_tool,) = create_loop_plan_tools(context)
+
+    posted: dict = {}
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            posted["body"] = json
+            return _FakeResponse(
+                payload={
+                    "status": "accepted",
+                    "plan": {
+                        "initiative": None,
+                        "stages": [],
+                        "acceptance": [],
+                        "disposition": {"outcome": "ship", "notes": "done"},
+                    },
+                }
+            )
+
+    with patch("src.tools.loop.plan.httpx.AsyncClient", _FakeClient):
+        out = await plan_tool.ainvoke(
+            {"disposition_outcome": "ship", "disposition_notes": "done"}
+        )
+
+    assert posted["body"]["plan"] == {
+        "disposition": {"outcome": "ship", "notes": "done"}
+    }
+    assert "ACCEPTED" in out
+    assert "dispose" in out.lower()
