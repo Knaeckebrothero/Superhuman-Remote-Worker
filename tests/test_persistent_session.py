@@ -160,6 +160,34 @@ class TestCapabilityScopedCanvasSkillDeployment:
             for item in session.config.extra["_resolved_skills"]["menu"]
         )
 
+    def test_break_glass_removes_stale_guide_during_session_rebind(self, monkeypatch):
+        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+
+        cfg = _make_config(
+            extra={
+                "_resolved_skills": {
+                    "menu": [{"name": "app-guide", "description": "stale"}],
+                    "files": {"app-guide": {"SKILL.md": "STALE"}},
+                }
+            }
+        )
+        session = _make_session(config=cfg)
+        monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
+
+        session._scope_skills_for_tool_names(["read_product_guide"])
+
+        scoped = session.config.extra["_resolved_skills"]
+        assert all(item["name"] != "app-guide" for item in scoped["menu"])
+        assert "app-guide" not in scoped["files"]
+
+        monkeypatch.delenv(APP_GUIDE_BREAK_GLASS_ENV)
+        session._scope_skills_for_tool_names(["read_product_guide"])
+        restored = session.config.extra["_resolved_skills"]
+        entry = next(item for item in restored["menu"] if item["name"] == "app-guide")
+        assert entry["system_managed"] is True
+        assert entry["bundle_digest"]
+        assert "STALE" not in restored["files"]["app-guide"]["SKILL.md"]
+
     def test_stale_bound_app_guide_instruction_is_removed(self):
         from src.core.loader import InstructionFileEntry
 
@@ -628,6 +656,41 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
         assert any(
             "read_product_guide" in names
             for names in captured_context["tool_name_calls"]
+        )
+
+    def test_setup_tools_withholds_product_reader_during_break_glass(self, monkeypatch):
+        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+
+        cfg = _make_config()
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        captured_calls: list[list[str]] = []
+        monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
+
+        def spy_load_tools(names, _ctx):
+            captured_calls.append(list(names))
+            return []
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=["read_product_guide"],
+            ),
+            patch("src.api.persistent_session.load_tools", side_effect=spy_load_tools),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+        ):
+            session._setup_tools(None)
+
+        assert captured_calls
+        assert all(
+            "read_product_guide" not in tool_names for tool_names in captured_calls
         )
 
 

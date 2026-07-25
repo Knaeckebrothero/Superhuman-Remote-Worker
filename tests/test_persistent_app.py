@@ -18,6 +18,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.api.persistent_app import (
+    _app_guide_health,
     _auto_title_after_first_turn,
     _draft_title_from_prompt,
     _early_title_from_prompt,
@@ -3754,6 +3755,76 @@ class TestCreatePersistentApp:
 
         create_persistent_app("config")
         assert mod._thread_id is None
+
+    @pytest.mark.asyncio
+    async def test_health_reports_ready_app_guide_without_changing_liveness(
+        self, monkeypatch
+    ):
+        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+
+        monkeypatch.delenv(APP_GUIDE_BREAK_GLASS_ENV, raising=False)
+        app = create_persistent_app("config", "tid")
+        route = next(route for route in app.routes if route.path == "/health")
+
+        response = await route.endpoint()
+        payload = json.loads(response.body)
+
+        assert response.status_code == 200
+        assert payload["status"] == "healthy"
+        assert payload["app_guide"] == {"state": "ready"}
+
+    @pytest.mark.asyncio
+    async def test_break_glass_health_is_bounded_degraded_and_still_live(
+        self, monkeypatch
+    ):
+        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+
+        monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
+        app = create_persistent_app("config", "tid")
+        route = next(route for route in app.routes if route.path == "/health")
+
+        response = await route.endpoint()
+        payload = json.loads(response.body)
+
+        assert response.status_code == 200
+        assert payload["status"] == "degraded"
+        assert payload["app_guide"] == {
+            "state": "disabled",
+            "reason": "operator_break_glass",
+        }
+        assert set(payload["app_guide"]) == {"state", "reason"}
+
+    @pytest.mark.asyncio
+    async def test_break_glass_does_not_change_chat_readiness(self, monkeypatch):
+        import src.api.persistent_app as mod
+        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+
+        monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
+        monkeypatch.setattr(mod, "_session_ready", lambda: True)
+        app = create_persistent_app("config", "tid")
+        route = next(route for route in app.routes if route.path == "/ready")
+
+        response = await route.endpoint()
+        payload = json.loads(response.body)
+
+        assert response.status_code == 200
+        assert payload == {"ready": True, "mode": "persistent", "thread_id": "tid"}
+
+    def test_app_guide_health_reports_reader_registration_loss(self, monkeypatch):
+        import src.api.persistent_app as mod
+        from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+
+        monkeypatch.delenv(APP_GUIDE_BREAK_GLASS_ENV, raising=False)
+        monkeypatch.delitem(
+            mod.TOOL_REGISTRY,
+            "read_product_guide",
+            raising=False,
+        )
+
+        assert _app_guide_health() == {
+            "state": "unavailable",
+            "reason": "reader_unavailable",
+        }
 
 
 class TestCanvasControlMessages:

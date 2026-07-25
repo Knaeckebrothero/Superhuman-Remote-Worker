@@ -38,6 +38,10 @@ from .persistent_session import (
 from ..tools.registry import TOOL_REGISTRY
 from ..core.archiver import inflight_tool_call
 from ..core.context import extract_summary_text, repair_tool_pairing
+from ..core.skill_resolution import (
+    APP_GUIDE_LOADER_TOOL,
+    app_guide_health_snapshot,
+)
 from ..core.session_tool_overrides import validate_session_tool_overrides
 from ..core.workspace_backend import WorkspaceUnavailableError
 from ..agent import UniversalAgent
@@ -337,6 +341,16 @@ def _turn_in_flight() -> bool:
     (docs/issues/session_silent_failure_audit.md #11).
     """
     return _loop_task is not None and not _loop_task.done() and not _awaiting_input
+
+
+def _app_guide_health() -> dict[str, str]:
+    """Return bounded product-guide delivery health for agent diagnostics."""
+
+    metadata = TOOL_REGISTRY.get(APP_GUIDE_LOADER_TOOL)
+    reader_available = (
+        isinstance(metadata, dict) and metadata.get("category") == "product_help"
+    )
+    return app_guide_health_snapshot(reader_available=reader_available)
 
 
 def _session_ready() -> bool:
@@ -2268,14 +2282,18 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.get("/health")
     async def health():
+        app_guide = _app_guide_health()
         return JSONResponse(
             {
-                "status": "healthy",
+                "status": (
+                    "healthy" if app_guide.get("state") == "ready" else "degraded"
+                ),
                 "mode": "persistent",
                 "thread_id": _thread_id,
                 "uptime_seconds": (datetime.now() - _started_at).total_seconds()
                 if _started_at
                 else 0,
+                "app_guide": app_guide,
             }
         )
 
@@ -2308,6 +2326,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 "embedding": emb_service.health_snapshot()
                 if emb_service is not None
                 else None,
+                "app_guide": _app_guide_health(),
             }
         )
 

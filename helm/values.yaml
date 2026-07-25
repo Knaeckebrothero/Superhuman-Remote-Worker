@@ -197,6 +197,11 @@ agent:
   # (prod-safe); the dev/experimental values file turns it on. Mirrors
   # expertsDbEnabled.
   skillsDbEnabled: "false"
+  # -- Emergency operator-only withdrawal of the managed in-product App Guide.
+  # Default OFF. This is not a user preference or normal feature gate; enable
+  # only to contain a broken guide/reader, then disable it after rollback or
+  # repair. Persistent-agent health reports operator_break_glass while active.
+  appGuideBreakGlassDisabled: "false"
   # -- Enable user-added MCP servers as datasources. Both gates default off;
   # stdio executes third-party commands in agent pods and should remain off
   # for hosted/multi-tenant deployments without suitable isolation.

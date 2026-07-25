@@ -1218,9 +1218,16 @@ class PersistentSession:
 
         # The managed product guide is a persistent-session floor, independent
         # of expert/catalog feature flags and workspace tier.
-        from src.core.skill_resolution import APP_GUIDE_LOADER_TOOL
+        from src.core.skill_resolution import (
+            APP_GUIDE_LOADER_TOOL,
+            app_guide_break_glass_disabled,
+        )
 
-        if APP_GUIDE_LOADER_TOOL not in tool_names:
+        if app_guide_break_glass_disabled():
+            # The operator escape hatch is fail-closed even when a frozen
+            # expert explicitly requested the reader.
+            tool_names = [name for name in tool_names if name != APP_GUIDE_LOADER_TOOL]
+        elif APP_GUIDE_LOADER_TOOL not in tool_names:
             tool_names.append(APP_GUIDE_LOADER_TOOL)
 
         # Fleet Management is the UI-facing group for SRW control-plane tools.
