@@ -192,3 +192,57 @@ async def test_user_experts_kill_switch_disabled(monkeypatch):
     fake.get_system_setting = AsyncMock(return_value={"value": {"enabled": False}})
     monkeypatch.setattr(m, "postgres_db", fake)
     assert await m._user_experts_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_enforce_job_create_grants_raises_422_for_ungranted(monkeypatch):
+    # Job submit-time PEP: an ungranted override is refused at create. Without
+    # it the job is accepted and only denied at dispatch, which marks it failed
+    # — so a session agent that created it has already reported success.
+    fake = AsyncMock()
+    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": False})
+    fake.list_grants_for_scopes = AsyncMock(
+        return_value={"user": [], "project": [], "global": []}
+    )
+    monkeypatch.setattr(m, "postgres_db", fake)
+    with pytest.raises(HTTPException) as ei:
+        await m._enforce_job_create_grants(
+            {"workspace": {"backend": "vm"}}, user_id=_UID, project_ids=[]
+        )
+    assert ei.value.status_code == 422
+    assert "vm_workspace" in str(ei.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_enforce_job_create_grants_allows_granted_override(monkeypatch):
+    _patch_grants_db(
+        monkeypatch,
+        user_rows=[{"key": "vm_workspace", "value_json": True}],
+    )
+    await m._enforce_job_create_grants(
+        {"workspace": {"backend": "vm"}}, user_id=_UID, project_ids=[]
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_job_create_grants_admin_bypass(monkeypatch):
+    fake = AsyncMock()
+    fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": True})
+    monkeypatch.setattr(m, "postgres_db", fake)
+    await m._enforce_job_create_grants(
+        {"autonomy": "full"}, user_id=_UID, project_ids=[]
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_job_create_grants_skips_userless_and_empty(monkeypatch):
+    """Userless system children have no principal whose grants to resolve, and
+    an empty override has nothing to check — neither may touch the DB."""
+    fake = AsyncMock()
+    fake.get_user = AsyncMock(side_effect=AssertionError("must not hit the DB"))
+    monkeypatch.setattr(m, "postgres_db", fake)
+    await m._enforce_job_create_grants(
+        {"workspace": {"backend": "vm"}}, user_id=None, project_ids=[]
+    )
+    await m._enforce_job_create_grants(None, user_id=_UID, project_ids=[])
+    await m._enforce_job_create_grants({}, user_id=_UID, project_ids=[])

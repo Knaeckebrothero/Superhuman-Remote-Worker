@@ -4369,6 +4369,38 @@ async def _enforce_session_create_grants(
         ) from gd
 
 
+async def _enforce_job_create_grants(
+    config_override: dict | None, *, user_id: str | None, project_ids: list[str]
+) -> None:
+    """Submit-time PEP for jobs — the session counterpart above, for the job path.
+
+    Without it, an over-reaching ``config_override`` (autonomy past the ceiling,
+    an ungranted model, shell tools) is accepted at create and only denied at
+    dispatch, which marks the job ``failed``. A session agent that created the
+    job has already reported success by then, so the failure surfaces as a dead
+    job rather than a refused request.
+
+    Scoped to the OVERRIDE only: an expert's own fragment is resolved
+    server-side after this point and is already PDP-checked at expert save
+    (``_enforce_expert_save``). Grant scoping is the request's project rather
+    than the fully resolved job scope, so this can allow something dispatch
+    later denies — it fails callers early, it never grants.
+    ``_enforce_dispatch_grants`` on the full merged config stays authoritative.
+
+    No-ops for a userless system child (no principal whose grants to resolve).
+    """
+    if not user_id or not config_override:
+        return
+    try:
+        await _enforce_dispatch_grants(
+            config_override, runner_user_id=user_id, project_ids=project_ids
+        )
+    except GrantDenied as gd:
+        raise HTTPException(
+            status_code=422, detail=_grant_violations_detail(gd.violations)
+        ) from gd
+
+
 async def _check_vm_permission(
     user: dict | None,
     *,
@@ -8235,6 +8267,16 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 except Exception:
                     creator = None
             await _check_vm_permission(creator, job_needs_vm=True)
+
+        # Capability PEP on the merged override — same fail-fast rationale as
+        # the VM gate above, so an over-reaching override is refused here
+        # instead of dying at dispatch. See the helper for what it deliberately
+        # does not cover.
+        await _enforce_job_create_grants(
+            config_override,
+            user_id=str(effective_user_id) if effective_user_id else None,
+            project_ids=[project_id] if project_id else [],
+        )
 
         # Resolve and authorize the effective selection before type inspection
         # or job persistence. This prevents both datasource UUID attachment and
