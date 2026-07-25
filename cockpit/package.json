@@ -89,10 +89,11 @@
     "vite": "^7.3.5",
     "ws": "^8.21.0",
     "@babel/core": "^7.29.7",
-    "brace-expansion": "^5.0.7",
+    "brace-expansion": "^5.0.8",
     "js-yaml": "^4.3.0",
     "tar": "^7.5.20",
     "fast-uri": "^3.1.4",
-    "immutable": "^5.1.9"
+    "immutable": "^5.1.9",
+    "postcss": "^8.5.18"
   }
 }
