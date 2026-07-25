@@ -19,7 +19,7 @@ cases:
       - id: jobs-are-autonomous
         any_of: ["jobs are autonomous", "jobs (autonomous)", "autonomous work", "background job"]
       - id: projects-share-context
-        any_of: ["shared goal", "shared context", "shared knowledge base", "knowledge and connectors"]
+        any_of: ["shared goal", "shared context", "shared knowledge", "knowledge and connectors"]
     forbidden_claims:
       - id: all-workspaces-have-shell
         severity: critical
@@ -150,7 +150,7 @@ cases:
       - id: empty-means-all
         any_of: ["leaving this empty shares the whole mailbox", "empty", "whole mailbox"]
       - id: attach-explicitly
-        any_of: ["select the connector", "selection is required", "explicitly select this specific connector", "attach", "link it to a project"]
+        any_of: ["select the connector", "selection is required", "explicitly select it", "select it for", "attach", "link it to a project"]
     forbidden_claims:
       - id: password-sharing
         severity: critical

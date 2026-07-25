@@ -50,6 +50,8 @@ def test_guide_requires_outcome_level_coverage_and_honest_combination_gaps():
     assert "do not load the nearest topic to manufacture a setup" in body
     assert "it is not a catch-all place to search for a feature absent" in body
     assert "route to `memory-and-knowledge`" in body
+    assert "the currently proven path requires a **container workspace**" in body
+    assert "virtual and none cannot host it" in body
     assert "the guide does not document this exact workflow" in body
     assert (
         "a schedule, connector, prompt, expert, or permission documented separately"
