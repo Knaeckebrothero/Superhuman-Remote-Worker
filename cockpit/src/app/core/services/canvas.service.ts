@@ -251,11 +251,13 @@ export class CanvasService {
     const response = await firstValueFrom(
       this.http.get<CanvasState>(url, {observe: 'response'}),
     );
+    const source = response.body?.source;
     if (
       this.threadId() !== threadId ||
       !isCanvasState(response.body) ||
       response.body.renderer !== 'office' ||
-      response.body.source?.type !== 'workspace_file' ||
+      source?.type !== 'workspace_file' ||
+      typeof source.path !== 'string' ||
       !response.body.source_version
     ) {
       return null;
@@ -297,7 +299,7 @@ export class CanvasService {
       this.transport.sendCanvasControl(threadId, {
         method: 'canvas.source_updated',
         canvas_id: MAIN_CANVAS_ID,
-        path: response.body.source.path,
+        path: source.path,
         presentation_revision: response.body.presentation_revision,
         source_version: response.body.source_version,
       });
