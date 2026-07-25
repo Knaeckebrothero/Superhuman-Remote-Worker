@@ -17,9 +17,10 @@ tags:
 > loops/campaigns plus Protected Cloud guidance were implemented through
 > 2026-07-24. M1d also repaired the automation expert-selection contract that
 > the guide audit exposed. The M1f closure plan was defined 2026-07-25 and is
-> now in progress. Its core-reference and operator break-glass/health packages
-> completed 2026-07-25; M1 evaluation/deployment gates, the live capability
-> plane, visual help, and the later roadmap remain open.
+> now in progress. Its core-reference, operator break-glass/health, and
+> deterministic routing/compaction evaluation packages completed 2026-07-25.
+> The first live-model run and fresh/resumed deployment matrix still gate M1;
+> the live capability plane, visual help, and the later roadmap remain open.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -444,7 +445,45 @@ The managed guide now has one explicit emergency withdrawal path:
   denial, session disable/re-enable, bounded degradation, and readiness
   independence. Both chart lint profiles and false/true ConfigMap renders pass.
 
-### Remaining gaps after M1f work package 2
+### Implemented M1f work package 3 — held-out routing and compaction evaluation
+
+The deterministic evaluation foundation is now implemented:
+
+- `eval/app_guide/cases.yaml` keeps 29 held-out synthetic questions outside the
+  runtime skill: 16 product positives and 13 near-miss negatives, balanced
+  across broad orientation, focused workflows, availability, paraphrases,
+  repository/codebase onboarding, application code, generic advice, similar
+  non-SRW terms, and a genuine undocumented billing/invoice request.
+- Every case declares the expected reader decision, focused topic or negative
+  decision, required fact alternatives, forbidden claims with severity,
+  case criticality, and explicit honest-gap state. Corpus validation rejects
+  schema drift, duplicate IDs/prompts, unknown topics, imbalance, or missing
+  required coverage in ordinary CI.
+- `eval/app_guide/run.py` exercises the real managed catalog, production-fenced
+  menu, and production reader with a fresh message list and `ToolContext` per
+  case. It supports `current`, `no-skill`, and a prior skills-root arm.
+- A product-positive route passes only after an actual
+  `read_product_guide` call to the expected topic (optionally preceded by
+  `index`); a near miss passes only without that reader. Tool trajectory keeps
+  bounded arguments, status, size, and digest rather than copied guide text.
+- Required/forbidden fact scoring is deterministic and separate from
+  trajectory. Wording quality is explicitly outside that score, while any
+  forbidden hit fails its case and critical forbidden claims have zero
+  tolerance.
+- Run artifacts record source/model/corpus/harness/guide identities and
+  per-case trajectory without keys, base URLs, prior-snapshot paths, private
+  sessions, raw provider exceptions, or full guide tool results.
+- A focused context test compacts an old guide ToolMessage, rebuilds the
+  managed menu independently, calls the current reader again, and proves the
+  newly requested Jobs topic does not pull Email or OKF reference text.
+
+The harness/compaction tests pass (**12 passed**), and their union with the
+persistent graph/session regressions passes (**230 passed**, three pre-existing
+warnings). No live-eval model or credential route is exported in this
+workspace, so these deterministic results do not substitute for the required
+first live-model artifact.
+
+### Remaining gaps after M1f work package 3
 
 The guide is now delivered reliably, but it is not yet self-maintaining or
 runtime-aware:
@@ -482,9 +521,11 @@ runtime-aware:
   cannot yet travel as portable skill files; the bundled scanner also skips
   non-UTF-8 files.
 - There is no structured Cockpit help-card or coach-mark protocol.
-- The current app-guide tests cover managed delivery and structure, but not
-  model trigger behavior, grounded answer quality, factual coverage, or the
-  complete fresh/resumed deployment matrix.
+- The held-out harness now defines model trigger, topic, deterministic
+  grounding, near-miss, and honest-gap measurements, but no live model has run
+  it in this workspace yet. Deterministic harness tests are not model-quality
+  evidence.
+- The complete fresh/resumed deployment matrix is still open.
 
 ### Planned M1f — close the reliable text-guide milestone
 
@@ -499,7 +540,7 @@ The work is deliberately ordered:
 2. add the operator-only `APP_GUIDE_BREAK_GLASS_DISABLED` escape hatch and a
    bounded persistent-agent health signal (implemented 2026-07-25);
 3. add a held-out routing/answer corpus plus compaction and honest-gap
-   evaluation;
+   evaluation (deterministic harness implemented; first live run pending);
 4. run the fresh/resumed `none`, `virtual`, and Container k3d matrix with DB
    skills and experts disabled; and
 5. record evidence and close the Phase 1 boxes only after the chart-default
@@ -531,11 +572,11 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Protected Cloud review | `orchestrator/services/cloud_staging/`, `orchestrator/services/diff_source.py`, protected mount/endpoint wiring in `orchestrator/main.py`, and the session-create/chat/diff-review Cockpit surfaces | M1e documents the shipped flag/backend/workspace gates, staging and whole-diff decision contract, fail-closed posture, conflicts, and recovery boundaries; live evaluation remains Phase 2 |
 | Core Jobs/Experts/Memory references | Current Cockpit create/list/project surfaces, `orchestrator/services/default_experts.py`, bundled expert YAML, `src/services/recall_store.py`, the configured memory pipeline, and native/OKF knowledge paths | M1f work package 1 corrects the original references and their broad overlaps, adds metadata, and pins consequential scope/action/degradation claims plus the complete bundled roster |
 | M1 break-glass/health | `src/core/skill_resolution.py`, `src/tools/product_help.py`, the persistent-agent health route in `src/api/persistent_app.py`, and the shared Helm ConfigMap | M1f now provides one default-off negative operator escape hatch, withholds both guide and reader when active, preserves chat readiness, restores the current digest on rebind, and reports a bounded degraded reason without reviving mutable fallback content |
-| M1 evaluation/acceptance | `eval/app_guide/`, persistent graph/session tests, and `docs/tests/app_guide_m1_verification.md` | M1f separates trigger trajectory, topic routing, grounded facts, near-miss negatives, honest gaps, compaction recovery, and the fresh/resumed live matrix |
+| M1 evaluation/acceptance | `eval/app_guide/`, persistent graph/session tests, and `docs/tests/app_guide_m1_verification.md` | M1f now implements held-out trigger trajectory, topic routing, grounded facts, near-miss negatives, honest gaps, and deterministic compaction recovery; the live-model artifact and fresh/resumed matrix remain open |
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
 | Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; strict Canvas HTML is inert while schema-advertised interactive HTML is an isolated, untrusted artifact | Define a separately validated help-card/App contract; do not treat arbitrary interactive Canvas HTML as trusted product UI |
 | Provenance | Agent-only `BUILD_SHA` in `docker/Dockerfile.agent` and short CI values; independently tagged images in Helm values | Stamp and surface full revision/digest metadata for each relevant component |
-| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, and persistent-session suites | M1a covers managed delivery/current bytes; M1b–M1e add focused content plus datasource, Fleet/Workflow, Canvas/browser, grant-catalog, loop/campaign, and Protected Cloud boundaries; add model triggers, grounded answers, compaction, and the k3d resume matrix |
+| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, persistent-session, and held-out App Guide harness suites | M1a covers managed delivery/current bytes; M1b–M1e add focused content plus datasource, Fleet/Workflow, Canvas/browser, grant-catalog, loop/campaign, and Protected Cloud boundaries; M1f adds deterministic trigger/topic/grounding contracts and post-compaction reload, while live model behavior and the k3d resume matrix remain open |
 
 ## Architecture
 
@@ -1175,12 +1216,13 @@ non-blocking, and reopenable; SRW does not force a first-run tour.
 
 ### Agent behavior evaluations
 
-Keep the evaluation corpus outside the runtime skill (provisionally under
-`tests/fixtures/app_guide_evals/`) so expected answers and judge criteria cannot
-leak into model context. Use a fixed held-out validation split, fresh sessions,
-several runs for stochastic triggers, and roughly balanced positive versus
-near-miss negative prompts. Compare the new guide to no skill and the previous
-guide version; record trigger rate, quality, latency, and token cost.
+Keep the evaluation corpus outside the runtime skill (now
+`eval/app_guide/cases.yaml`) so expected answers and criteria cannot leak into
+model context. Use fresh contexts, several runs when measuring stochastic
+triggers, and roughly balanced positive versus near-miss negative prompts.
+Compare the new guide to no skill or the previous guide version; record trigger
+rate, topic choice, grounding, latency, and token cost. Keep reviewed wording
+quality separate from the deterministic release assertions.
 
 At minimum cover:
 
@@ -1358,14 +1400,18 @@ DB-authored-skills or DB-experts features.
   create/edit/fire/delete/bundle paths.
 - [x] Update `SKILL.md` triggers and logical-topic routing for the managed
   reader without bloating Layer 1/2 context.
-- [ ] Verify the activated guide procedure remains available after session
+- [x] Verify the activated guide procedure remains available after session
   context compaction, while unneeded references remain unloadable/on demand.
+  M1f adds a deterministic real-reader/tool-result compaction regression; the
+  live forced-compaction probe remains part of the k3d matrix.
 - [x] Remove the current unsupported suggestion that the default session can
   attach a datasource; offer only observed tools or validated guide actions.
 - [x] Create the first minimal canonical/coverage seam for datasource types so
   the repaired email guide immediately gains a drift check.
-- [ ] Add balanced trigger evaluations for broad/specific product questions and
-  near-miss negatives such as project/codebase onboarding.
+- [x] Add balanced trigger evaluations for broad/specific product questions and
+  near-miss negatives such as project/codebase onboarding. The 29-case
+  held-out corpus and live-capable runner are implemented; the first recorded
+  model run remains an M1 exit-gate requirement.
 - [ ] Verify fresh and pre-existing resumed k3d sessions with DB skills and DB
   experts disabled, including `none`, `virtual`, and normal shell workspaces.
 - [ ] Verify an off-doc question produces an honest gap instead of a guess.

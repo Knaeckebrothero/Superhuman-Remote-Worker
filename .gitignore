@@ -216,5 +216,8 @@ target/
 eval/memory/data/
 eval/memory/runs/
 
+# App Guide model-eval artifacts (the held-out corpus and harness are tracked)
+eval/app_guide/runs/
+
 # Superpowers brainstorm companion (local mockups)
 .superpowers/
