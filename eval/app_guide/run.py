@@ -757,8 +757,8 @@ async def run_case(
     case: dict[str, Any],
     arm: Arm,
     catalog: dict[str, Any],
-    client: Any,
     route: LLMRoute,
+    timeout: float,
     max_tool_rounds: int,
     max_tokens: int,
 ) -> dict[str, Any]:
@@ -766,18 +766,20 @@ async def run_case(
 
     started = time.perf_counter()
     # ToolContext is deliberately rebound for every case. Together with the
-    # new message list in model_answer this prevents cross-case state leakage.
+    # new message list and client in model_answer this prevents cross-case
+    # state leakage.
     reader = reader_for_catalog(catalog)
     try:
-        answer, calls, usage = await model_answer(
-            client=client,
-            route=route,
-            catalog=catalog,
-            reader=reader,
-            prompt=case["prompt"],
-            max_tool_rounds=max_tool_rounds,
-            max_tokens=max_tokens,
-        )
+        async with route.client(timeout=timeout) as client:
+            answer, calls, usage = await model_answer(
+                client=client,
+                route=route,
+                catalog=catalog,
+                reader=reader,
+                prompt=case["prompt"],
+                max_tool_rounds=max_tool_rounds,
+                max_tokens=max_tokens,
+            )
         error_type = None
     except Exception as exc:  # provider errors become bounded result rows
         answer, calls, usage = "", [], {}
@@ -979,7 +981,6 @@ async def run(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
         raise ValueError("arm names must be unique in one run")
 
     route = LLMRoute.from_env()
-    client = route.client(timeout=args.timeout)
     catalogs = {arm.name: catalog_for_arm(arm) for arm in arms}
     readers = {arm.name: reader_for_catalog(catalogs[arm.name]) for arm in arms}
     for arm in arms:
@@ -1002,8 +1003,8 @@ async def run(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
                 case=case,
                 arm=arm,
                 catalog=catalogs[arm.name],
-                client=client,
                 route=route,
+                timeout=args.timeout,
                 max_tool_rounds=args.max_tool_rounds,
                 max_tokens=args.max_tokens,
             )
