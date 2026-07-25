@@ -37,7 +37,16 @@ Decisions locked:
 
 Implements, in user-configurable form, the control-plane assessment's top P0 (typed selection→mission→outcome handoff + refuse-to-advance on missing output — `docs/issues/loop_control_plane_assessment.md`) and closes findings **F15** (budget unit), **F23** (handoff by similarity luck), and **F32** (outcome-blind advance) for the brief-carried path; see [[loop_review]].
 
-**Phase 1 implemented on develop (2026-07-19)** — unified engine live in code: every turn barrier-tracked (width 1 included; `current_job_id` = display mirror), campaign advance threaded through the barrier, legacy rotate path + `claim_project_loop_advance` + pointer heal deleted, modes renamed `standard`/`campaign` (migration 0063). Phase-1 k3d smoke (sequential + campaign) pending. Phases 2–7 not started; their schema lands in later migrations (0064+), not 0063 as originally sketched.
+**Phase 1 implemented on develop (2026-07-19)** — unified engine live in code: every turn barrier-tracked (width 1 included; `current_job_id` = display mirror), campaign advance threaded through the barrier, legacy rotate path + `claim_project_loop_advance` + pointer heal deleted, modes renamed `standard`/`campaign` (migration 0063). Phases 2–7 not started; their schema lands in later migrations (0064+), not 0063 as originally sketched.
+
+**Phase 1 deployed to dev and live-validated (2026-07-21 → 2026-07-25).** Migration 0063 applied cleanly on dev (CHECK swap, defaults, in-place rename of pre-migration rows). The planned k3d smoke was superseded by live validation on real dev loops, all against the deployed images:
+
+- **Standard rotation through failures** — a 4-turn width-1 loop advanced scholar→critic→scholar→critic through 3 member failures and 1 success (`consecutive_failures` reset on success), then budget-stopped with both pointer columns cleared.
+- **Consecutive-failure stop** — a separate standard loop stopped itself with `stop_reason=failures` after 3 consecutive VM-provisioning member failures; the guardrail fired exactly at `max_consecutive_failures`.
+- **Torn-advance heal (tear drill, run twice)** — manually nulling both pointer columns and backdating `updated_at` 20 min on an in-flight loop was healed by the sweeper within one 60 s tick: membership + display mirror restored to the in-flight member, counters re-derived unchanged, **no advance and no duplicate spawn** (the member was still running), with the expected `healed torn advance` warning on the leader replica.
+- **Campaign chain through the barrier** — a live campaign loop ran 14 barrier turns: checkpoint critic filed a plan, members (developer → product-qa) chained through the barrier path, `campaign.cursor` advanced 0→2, a failed member was tolerated per design (consecutive `member_failures` reset by the next success, stage counted done), and the review critic spawned immediately after the chain. This confirms the **[A1]** campaign-threading risk closed in production.
+
+**Open observation from live validation (pre-existing, agent-side — not the engine):** the validated campaign has sat in `status="review"` with an empty `campaign_history` across three subsequent critic checkpoints — no critic ever filed a disposition, while standard rotation continued around the parked campaign. The engine's half (spawning the review critic, holding campaign state) works; the disposition itself never lands. Tracked as a follow-up on the critic's campaign-review prompt/tooling.
 
 ## Motivation
 
