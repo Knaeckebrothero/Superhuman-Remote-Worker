@@ -157,6 +157,24 @@ def test_positive_case_can_allow_a_second_relevant_topic(cases):
     assert score["passed"] is True
 
 
+def test_grounding_normalization_ignores_markdown_bold(cases):
+    case = _case(cases, "workflow-share-email-folder")
+    answer = (
+        "Open **Connectors** and use the **Folder allowlist**. Leaving this "
+        "empty shares the whole mailbox. You must explicitly **select it** "
+        "for the intended session, job, or project."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "datasources-email"}],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
 def test_near_miss_passes_only_without_product_reader(cases):
     case = _case(cases, "near-miss-html-canvas")
 

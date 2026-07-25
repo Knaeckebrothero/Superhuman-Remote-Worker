@@ -468,6 +468,8 @@ def _normalized_text(value: str) -> str:
         .replace("“", '"')
         .replace("”", '"')
         .replace("→", "->")
+        .replace("**", "")
+        .replace("__", "")
     )
     return " ".join(value.split())
 
