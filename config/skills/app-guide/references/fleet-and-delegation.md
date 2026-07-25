@@ -19,9 +19,14 @@ There are two different ways SRW can split work:
   subagents. It is an expert/job capability, not another independent chat.
 
 For “run this in the background while we keep talking,” Fleet Management is
-the direct path.
+the direct path. Several independent jobs can be queued together, but they run
+in parallel only when fleet capacity permits; never promise simultaneous
+starts.
 
 ## Launch a worker job from a session
+
+**Capacity:** three independent jobs may be queued together, but they run in
+parallel only when fleet capacity permits.
 
 1. In a new session's **Agent Settings**, or the current chat's **Settings**,
    open **Tools** and enable **Fleet Management**.

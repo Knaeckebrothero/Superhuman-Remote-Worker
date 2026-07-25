@@ -75,6 +75,14 @@ def test_schema_validation_rejects_duplicate_ids(cases):
         validate_corpus(document)
 
 
+def test_schema_validation_rejects_unknown_allowed_topic(cases):
+    document = {"schema_version": 1, "cases": copy.deepcopy(cases)}
+    document["cases"][0]["allowed_topics"] = ["not-a-current-topic"]
+
+    with pytest.raises(ValueError, match="allowed_topics contains unknown"):
+        validate_corpus(document)
+
+
 def test_positive_prose_from_priors_is_not_a_routing_pass(cases):
     case = _case(cases, "workflow-share-email-folder")
     answer = (
@@ -123,6 +131,30 @@ def test_positive_case_requires_the_expected_focused_topic(cases):
     assert correct["passed"] is True
     assert overbroad["trajectory"]["topic_pass"] is False
     assert overbroad["trajectory"]["unexpected_topics"] == ["datasources"]
+
+
+def test_positive_case_can_allow_a_second_relevant_topic(cases):
+    case = _case(cases, "workflow-preserve-important-fact")
+    answer = (
+        "Compaction is not enough for future work. Write a project knowledge "
+        "note instead."
+    )
+    score = score_case(
+        case,
+        [
+            {"name": APP_GUIDE_LOADER_TOOL, "topic_id": "index"},
+            {"name": APP_GUIDE_LOADER_TOOL, "topic_id": "sessions"},
+            {
+                "name": APP_GUIDE_LOADER_TOOL,
+                "topic_id": "memory-and-knowledge",
+            },
+        ],
+        answer,
+    )
+
+    assert score["trajectory"]["allowed_topics"] == ["sessions"]
+    assert score["trajectory"]["topic_pass"] is True
+    assert score["passed"] is True
 
 
 def test_near_miss_passes_only_without_product_reader(cases):

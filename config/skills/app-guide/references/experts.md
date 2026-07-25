@@ -53,7 +53,9 @@ every installation or user still defaults to the two seed profiles.
 
 ## Create or adapt an expert
 
-When DB-backed user experts are enabled, open **Experts**:
+Bundled disk experts are read-only. When DB-backed user experts are enabled,
+open **Experts** and use **Duplicate** to turn a bundled profile into an owned,
+editable copy; customize the copy rather than the bundled original.
 
 - **New** creates an owned worker or session expert. Choose the type carefully;
   it is immutable after creation.
@@ -61,8 +63,7 @@ When DB-backed user experts are enabled, open **Experts**:
   copy. This is the normal way to customize a bundled profile.
 - **Import** creates an owned copy from an expert JSON bundle; **Export**
   downloads a portable bundle.
-- Bundled disk experts are read-only. Owned database experts can be edited by
-  their owner or an administrator.
+- Owned database experts can be edited by their owner or an administrator.
 - Managed platform defaults can be edited by their administrator/owner policy
   but cannot be deleted. Other database experts cannot be deleted while jobs,
   sessions, automations, project links, or default pointers still depend on
