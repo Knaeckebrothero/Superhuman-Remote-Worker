@@ -252,7 +252,7 @@ def test_automation_guide_keeps_current_safety_and_actionability_boundaries():
 
     assert "current built-in automation surface is schedule-only" in body
     assert "related features are not proof of a supported combined workflow" in body
-    assert "emailing an invoice" in body
+    assert "scheduled work that reads a mailbox or database" in body
     assert "automation-fired jobs attach no connectors" in body
     assert "do not invent a connector attachment through project linkage" in body
     assert "run now" in body and "does not move the next scheduled run" in body
