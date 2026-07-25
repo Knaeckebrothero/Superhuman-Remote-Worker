@@ -352,6 +352,8 @@ CREATE TABLE public.automations (
     run_count integer DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    expert_id uuid,
+    CONSTRAINT automations_expert_source_check CHECK (((expert_id IS NULL) OR (expert = 'worker_base'::text))),
     CONSTRAINT automations_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['cron'::text, 'event'::text]))),
     CONSTRAINT cron_trigger_has_expr CHECK (((trigger_type <> 'cron'::text) OR (cron_expr IS NOT NULL))),
     CONSTRAINT event_trigger_has_filter CHECK (((trigger_type <> 'event'::text) OR (event_filter IS NOT NULL)))
@@ -405,6 +407,13 @@ COMMENT ON COLUMN public.automations.last_scheduled_at IS 'Cron-canonical time o
 --
 
 COMMENT ON COLUMN public.automations.last_dispatched_at IS 'Wall-clock time the dispatcher actually fired the last run. Usually within seconds of last_scheduled_at; large drift = orchestrator was down or the dispatcher was lagging.';
+
+
+--
+-- Name: COLUMN automations.expert_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.automations.expert_id IS 'Pinned DB-backed worker expert. NULL means `expert` is a bundled config name, or worker_base should resolve the owner''s effective default at fire time.';
 
 
 --
@@ -2802,6 +2811,13 @@ CREATE INDEX idx_automations_event ON public.automations USING gin (event_filter
 
 
 --
+-- Name: idx_automations_expert_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_automations_expert_id ON public.automations USING btree (expert_id) WHERE (expert_id IS NOT NULL);
+
+
+--
 -- Name: idx_automations_owner; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3692,6 +3708,14 @@ ALTER TABLE ONLY public.application_expert_defaults
 
 ALTER TABLE ONLY public.auth_tokens
     ADD CONSTRAINT auth_tokens_superseded_by_fkey FOREIGN KEY (superseded_by) REFERENCES public.auth_tokens(id) ON DELETE SET NULL;
+
+
+--
+-- Name: automations automations_expert_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.automations
+    ADD CONSTRAINT automations_expert_id_fkey FOREIGN KEY (expert_id) REFERENCES public.experts(id) ON DELETE RESTRICT;
 
 
 --
