@@ -68,6 +68,9 @@ deployment authorization.
   and paste work too; on mobile you can take a photo), and use slash commands:
   `/compact` (condense the conversation), `/done` (end the session), `/undo`,
   `/auto`, `/supervised`, `/autonomous`, `/silent`, `/verbose`.
+  Compaction is a context-window operation, not a durable-recording answer;
+  questions about future recall or preserving a project decision require the
+  focused **Memory and knowledge** guide.
 - **Voice**: a mic button dictates your message (speech-to-text), and
   finished agent replies have a read-aloud button. Both depend on your
   deployment having voice models configured; the voice and speaking style are

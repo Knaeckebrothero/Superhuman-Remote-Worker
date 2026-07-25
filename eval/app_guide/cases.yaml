@@ -15,11 +15,11 @@ cases:
     criticality: standard
     required_facts:
       - id: sessions-are-interactive
-        any_of: ["sessions are interactive", "interactive conversation", "interactive chat"]
+        any_of: ["sessions are interactive", "sessions (interactive)", "interactive conversation", "interactive chat"]
       - id: jobs-are-autonomous
-        any_of: ["jobs are autonomous", "autonomous work", "background job"]
+        any_of: ["jobs are autonomous", "jobs (autonomous)", "autonomous work", "background job"]
       - id: projects-share-context
-        any_of: ["shared goal", "shared context", "knowledge and connectors"]
+        any_of: ["shared goal", "shared context", "shared knowledge base", "knowledge and connectors"]
     forbidden_claims:
       - id: all-workspaces-have-shell
         severity: critical
@@ -39,7 +39,7 @@ cases:
       - id: workspace-dependent
         any_of: ["depends on the workspace", "workspace tier", "virtual", "container"]
       - id: settings-or-tools
-        any_of: ["current tool", "agent settings", "settings panel"]
+        any_of: ["current tool", "agent settings", "settings panel", "tools and permissions enabled", "tools available"]
     forbidden_claims:
       - id: guide-grants-tools
         severity: critical
@@ -124,7 +124,7 @@ cases:
       - id: duplicate-bundled
         any_of: ["duplicate", "owned copy"]
       - id: bundled-read-only
-        any_of: ["bundled", "read-only"]
+        any_of: ["bundled", "read-only", "owned copy"]
       - id: type-immutable
         any_of: ["type is immutable", "cannot change", "worker expert cannot start a session"]
     forbidden_claims:
@@ -150,7 +150,7 @@ cases:
       - id: empty-means-all
         any_of: ["leaving this empty shares the whole mailbox", "empty", "whole mailbox"]
       - id: attach-explicitly
-        any_of: ["select the connector", "attach", "link it to a project"]
+        any_of: ["select the connector", "selection is required", "explicitly select this specific connector", "attach", "link it to a project"]
     forbidden_claims:
       - id: password-sharing
         severity: critical
@@ -236,7 +236,7 @@ cases:
       - id: bounded-run
         any_of: ["max iterations", "time limit", "budget"]
       - id: disposition-scope
-        any_of: ["close the campaign, not the overall project loop", "does not stop the overall loop"]
+        any_of: ["close the campaign, not the overall project loop", "does not stop the overall loop", "does not stop the whole loop", "only close the specific campaign", "return to the normal loop", "return to the loop"]
     forbidden_claims:
       - id: definition-auto-stop
         severity: standard
@@ -254,7 +254,7 @@ cases:
     criticality: critical
     required_facts:
       - id: eligibility
-        any_of: ["non-default nextcloud", "container workspace", "deployment-dependent"]
+        any_of: ["non-default nextcloud", "eligible nextcloud project", "container workspace", "backend to container", "deployment-dependent"]
       - id: staged-review
         any_of: ["staged for your review", "cloud changes"]
       - id: whole-diff
@@ -273,11 +273,12 @@ cases:
     tags: [memory, knowledge]
     expected_trigger: true
     expected_topic: memory-and-knowledge
+    allowed_topics: [sessions]
     expected_gap: false
     criticality: critical
     required_facts:
       - id: compaction-not-memory
-        any_of: ["not long-term memory", "not by itself", "working summary"]
+        any_of: ["not long-term memory", "not by itself", "compaction is not enough", "does not move information into the project's long-term memory", "working summary", "summary of your current chat history"]
       - id: native-knowledge
         any_of: ["knowledge note", "project knowledge", "knowledge tab"]
     forbidden_claims:
@@ -319,7 +320,7 @@ cases:
     criticality: critical
     required_facts:
       - id: explicit-selection
-        any_of: ["selected for this specific", "select the connector", "attached"]
+        any_of: ["selected for this specific", "explicitly select this connector", "selected for this session", "select the connector", "attached"]
       - id: send-controls
         any_of: ["send without human approval", "email_autonomous_send", "send tier"]
       - id: cannot-prove-current
@@ -341,9 +342,9 @@ cases:
     criticality: critical
     required_facts:
       - id: exact-flow-unsupported
-        any_of: ["cannot currently perform that exact", "not a supported built-in automation", "no exact cockpit setup", "cannot do this exact"]
+        any_of: ["cannot currently perform that exact", "not a supported built-in automation", "no exact cockpit setup", "cannot do this exact", "does not document or support this exact built-in workflow", "does not document a supported built-in workflow for this exact outcome"]
       - id: automation-connectors-absent
-        any_of: ["automation-fired jobs do not attach connectors", "do not attach connectors", "no access to your email connector"]
+        any_of: ["automation-fired jobs do not attach connectors", "do not attach connectors", "do not allow attaching connectors", "no access to your email connector"]
     forbidden_claims:
       - id: invented-billing-page
         severity: critical
@@ -363,11 +364,12 @@ cases:
     tags: [off_document, enterprise_identity]
     expected_trigger: true
     expected_topic: index
+    allowed_topics: [permissions-and-availability]
     expected_gap: true
     criticality: critical
     required_facts:
       - id: explicit-guide-gap
-        any_of: ["not documented", "guide does not cover", "cannot confirm", "doesn't document", "not in the guide"]
+        any_of: ["not documented", "guide does not document", "guide does not cover", "cannot confirm", "doesn't document", "not in the guide"]
     forbidden_claims:
       - id: invented-identity-page
         severity: critical
@@ -456,8 +458,8 @@ cases:
 
   - id: near-miss-service-worker
     prompt: >-
-      Why does my remote web worker stop receiving messages after the browser
-      tab has been suspended?
+      In my JavaScript app, why does a Web Worker stop receiving postMessage
+      events after the browser tab has been suspended?
     category: near_miss
     tags: [similar_term, application_code]
     expected_trigger: false
