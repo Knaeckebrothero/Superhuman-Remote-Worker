@@ -603,6 +603,10 @@ class TestDualCallableEndpoints:
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             _patch_caller_and_db(user_a, fake_db),
             patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            # Orthogonal gate: this test is about marker stripping, and the
+            # submit-time capability PEP would 422 on the `autonomy: full`
+            # override for a mocked user with no grant rows.
+            patch("main._enforce_job_create_grants", AsyncMock(return_value=None)),
             patch("services.job_provisioning.provision_job_repo", AsyncMock()),
         ):
             await create_job(fake_request, body)

@@ -386,3 +386,224 @@ async def test_get_worker_job_forwards_user_id_from_context(monkeypatch):
     await get.ainvoke({"job_id": "j-1"})
 
     assert captured["user_id"] == "user-xyz"
+
+
+# ---------------------------------------------------------------------------
+# config_override / expert_id passthrough
+#
+# The tool deliberately takes config_override as a raw dict rather than typed
+# params: the capability PDP (src/core/capability_grants.py) gates every
+# escalation axis against the owner's grants, so the agent cannot exceed its
+# owner regardless of the JSON it writes. Transport keys are the exception the
+# PDP does not cover, so they are rejected here, before any HTTP.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_forwards_config_override(capturing_client):
+    """The override must ride into the body verbatim — the orchestrator merges
+    it last (over project + expert defaults), so any mangling here silently
+    changes what the worker runs."""
+    ctx = ToolContext(_thread_id="thread-abc")
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    override = {"llm": {"model": "gpt-5.6"}, "workspace": {"backend": "vm"}}
+    await create.ainvoke({"description": "heavy job", "config_override": override})
+
+    _, body = capturing_client.posted[0]
+    assert body["config_override"] == override
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_omits_absent_config_override(capturing_client):
+    """No override => the key is absent, so the server's own resolution
+    (project default, then expert) is untouched."""
+    ctx = ToolContext(_thread_id="thread-abc")
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    await create.ainvoke({"description": "plain job"})
+
+    _, body = capturing_client.posted[0]
+    assert "config_override" not in body
+    assert "expert_id" not in body
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_rejects_nested_transport_keys(capturing_client):
+    """A base_url nested under llm would survive redaction and dispatch
+    injection, letting a prompt-injected session route the worker's LLM to an
+    arbitrary host. Reject before the request is sent, and name the path."""
+    ctx = ToolContext(_thread_id="thread-abc")
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    result = await create.ainvoke(
+        {
+            "description": "exfil attempt",
+            "config_override": {"llm": {"model": "x", "base_url": "http://evil"}},
+        }
+    )
+
+    assert capturing_client.posted == []
+    assert "llm.base_url" in result
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_rejects_env_keys_and_api_key_suffix(
+    capturing_client,
+):
+    """env_keys carries transport for the auxiliary/embedding slots, and any
+    *_api_key is a credential — both are refused with every offending path
+    named, not just the first."""
+    ctx = ToolContext(_thread_id="thread-abc")
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    result = await create.ainvoke(
+        {
+            "description": "job",
+            "config_override": {
+                "env_keys": {"EMBEDDING_BASE_URL": "http://evil"},
+                "auxiliary": {"openai_api_key": "sk-x"},
+            },
+        }
+    )
+
+    assert capturing_client.posted == []
+    assert "env_keys" in result
+    assert "auxiliary.openai_api_key" in result
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_forwards_expert_id(capturing_client):
+    ctx = ToolContext(_thread_id="thread-abc")
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    expert_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    await create.ainvoke({"description": "job", "expert_id": expert_id})
+
+    _, body = capturing_client.posted[0]
+    assert body["expert_id"] == expert_id
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_rejects_expert_id_with_bundled_config_name(
+    capturing_client,
+):
+    """The API 400s on this pairing (one expert source at a time); catching it
+    here turns an opaque status into a reason the agent can act on."""
+    ctx = ToolContext(_thread_id="thread-abc")
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    result = await create.ainvoke(
+        {
+            "description": "job",
+            "config_name": "developer",
+            "expert_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        }
+    )
+
+    assert capturing_client.posted == []
+    assert "expert_id" in result
+
+
+# ---------------------------------------------------------------------------
+# get_session_context discovery
+# ---------------------------------------------------------------------------
+
+
+class _DiscoveryClient(_CapturingClient):
+    """Serves /api/models and /api/users/me/capabilities so the context tool can
+    render the two lines a config_override needs."""
+
+    async def get(self, url, params=None, **kwargs):
+        self.gets.append((url, params or {}))
+        if url.endswith("/api/models"):
+            payload = {
+                "groups": [
+                    {"models": ["gpt-5.6", "claude-opus-5"]},
+                    {"models": ["gemma-3"]},
+                ]
+            }
+        elif url.endswith("/api/users/me/capabilities"):
+            payload = {
+                "is_admin": False,
+                "grants": {"vm_workspace": False, "shell_tools": True},
+            }
+        else:
+            payload = {}
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=payload)
+        return resp
+
+
+@pytest.mark.asyncio
+async def test_get_session_context_reports_models_and_grants(monkeypatch):
+    """Model IDs are per-deployment and grants decide whether an override is
+    accepted, so both must reach the agent before it writes one."""
+    cap = _DiscoveryClient()
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda *a, **kw: cap)
+    ctx = ToolContext(_thread_id="thread-abc", user_id="user-xyz")
+    tools = create_orchestrator_tools(ctx)
+    get_context = _tool_by_name(tools, "get_session_context")
+
+    result = await get_context.ainvoke({})
+
+    assert "Available chat models:" in result
+    assert "gpt-5.6" in result and "gemma-3" in result
+    assert "vm_workspace: False" in result
+    assert "shell_tools: True" in result
+
+
+@pytest.mark.asyncio
+async def test_get_session_context_survives_lookup_failure(monkeypatch):
+    """A context report must never break the session: an unreachable
+    orchestrator drops the two discovery lines and keeps the rest."""
+
+    class _ExplodingClient(_CapturingClient):
+        async def get(self, url, params=None, **kwargs):
+            raise RuntimeError("orchestrator down")
+
+    monkeypatch.setattr(
+        "src.tools.orchestrator.jobs._get_client",
+        lambda *a, **kw: _ExplodingClient(),
+    )
+    ctx = ToolContext(_thread_id="thread-abc", user_id="user-xyz")
+    tools = create_orchestrator_tools(ctx)
+    get_context = _tool_by_name(tools, "get_session_context")
+
+    result = await get_context.ainvoke({})
+
+    assert "Thread ID: thread-abc" in result
+    assert "Available chat models:" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_session_context_reports_admin_as_unrestricted(monkeypatch):
+    class _AdminClient(_CapturingClient):
+        async def get(self, url, params=None, **kwargs):
+            payload = (
+                {"is_admin": True, "grants": None}
+                if url.endswith("/capabilities")
+                else {"groups": []}
+            )
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json = MagicMock(return_value=payload)
+            return resp
+
+    monkeypatch.setattr(
+        "src.tools.orchestrator.jobs._get_client", lambda *a, **kw: _AdminClient()
+    )
+    ctx = ToolContext(user_id="admin-1")
+    tools = create_orchestrator_tools(ctx)
+    get_context = _tool_by_name(tools, "get_session_context")
+
+    result = await get_context.ainvoke({})
+
+    assert "admin (unrestricted)" in result

@@ -8,6 +8,7 @@ The orchestrator URL is read from the ORCHESTRATOR_URL environment variable
 (same as the worker's orchestrator_client.py).
 """
 
+import json
 import logging
 import os
 from uuid import UUID
@@ -28,7 +29,8 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": (
             "Summarize the current persistent session context: thread ID, user "
             "ID, project scope, workspace availability, backend capabilities, "
-            "cloud mount status, and knowledge/connector availability."
+            "cloud mount status, knowledge/connector availability, the chat "
+            "models this deployment routes, and the caller's effective grants."
         ),
         "category": "orchestrator",
         "short_description": "Show current session/project/workspace context.",
@@ -41,7 +43,9 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Create a new worker job on the orchestrator. A worker agent will "
             "pick it up and execute it autonomously. Returns the job ID for "
             "monitoring. Use config_name to select an expert (developer, scholar, "
-            "critic) or 'worker_base' for the framework fallback."
+            "critic) or 'worker_base' for the framework fallback, expert_id for a "
+            "DB-backed expert, and config_override to pin the job's model or "
+            "workspace backend."
         ),
         "category": "orchestrator",
         "short_description": "Delegate work to a worker agent via the orchestrator.",
@@ -155,6 +159,46 @@ def _get_client(*, user_id: Optional[str] = None) -> httpx.AsyncClient:
     if user_id:
         headers["X-MCP-User-Id"] = user_id
     return httpx.AsyncClient(timeout=30.0, headers=headers)
+
+
+# Credential/transport keys an agent may never set on a job it creates. The
+# capability PDP (src/core/capability_grants.py) gates the escalation axes —
+# vm backend, shell, delegation, connectors, model allowlist, autonomy and
+# permission ceilings — so a raw config_override cannot exceed its owner. It
+# does NOT gate transport: redact_config_override deliberately preserves
+# base_url, and dispatch only overwrites it when the pinned model resolves to a
+# known endpoint. Left open, a prompt-injected session could point a spawned
+# job's LLM at an arbitrary host. Mirrors the key semantics of
+# orchestrator.security.access._is_secret_key, redeclared here because the
+# agent image does not ship the orchestrator package.
+_TRANSPORT_DENY = frozenset({"api_key", "base_url", "env_keys"})
+_TRANSPORT_DENY_SUFFIX = "_api_key"
+
+
+def _is_transport_key(key: str) -> bool:
+    k = str(key).lower()
+    return k in _TRANSPORT_DENY or k.endswith(_TRANSPORT_DENY_SUFFIX)
+
+
+def _transport_key_paths(value: Any, prefix: str = "") -> List[str]:
+    """Dotted paths of every transport/credential key inside a config_override.
+
+    Recursive over dicts and lists. Returns [] for a clean override. Callers
+    REJECT on a non-empty result rather than stripping — silently dropping the
+    key would leave the agent believing its override applied.
+    """
+    found: List[str] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            if _is_transport_key(k):
+                found.append(path)
+                continue
+            found.extend(_transport_key_paths(v, path))
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            found.extend(_transport_key_paths(item, f"{prefix}[{i}]"))
+    return found
 
 
 def _short_id(value: Any) -> str:
@@ -321,7 +365,37 @@ def _format_job_list_item(job: Dict[str, Any]) -> List[str]:
     return lines
 
 
-def _format_session_context(context: ToolContext) -> str:
+def _format_grants(capabilities: Dict[str, Any]) -> List[str]:
+    """Render the caller's effective grants for the session-context report.
+
+    Shape comes from ``GET /api/users/me/capabilities``: admins get
+    ``grants: None`` (unrestricted). Only the capabilities that decide whether a
+    ``create_worker_job`` override will be accepted are surfaced — the full
+    catalog would bloat the tool result for no decision value.
+    """
+    if capabilities.get("is_admin"):
+        return ["  Grants: admin (unrestricted)"]
+    grants = capabilities.get("grants")
+    if not isinstance(grants, dict):
+        return []
+    lines = ["  Grants:"]
+    for key in ("vm_workspace", "shell_tools", "delegation", "datasource_tools"):
+        if key in grants:
+            lines.append(f"    {key}: {grants[key]}")
+    allowed_models = grants.get("model_selection")
+    if allowed_models is not None:
+        lines.append(
+            f"    model_selection: {', '.join(str(m) for m in allowed_models)}"
+        )
+    return lines
+
+
+def _format_session_context(
+    context: ToolContext,
+    *,
+    chat_models: Optional[List[str]] = None,
+    capabilities: Optional[Dict[str, Any]] = None,
+) -> str:
     workspace = context.workspace_manager
     backend = getattr(workspace, "backend", None) if workspace else None
     cloud_mount = context.config.get("cloud_mount") or {}
@@ -357,6 +431,14 @@ def _format_session_context(context: ToolContext) -> str:
         lines.append(
             f"  Cloud workspace entry: {cloud_mount.get('workspace_entry', '/workspace/cloud')}"
         )
+    # Everything a create_worker_job config_override needs to be written without
+    # guessing: the model IDs this deployment actually routes, and the grants
+    # that decide whether an override is accepted. Both are omitted (not faked)
+    # when the lookup failed — see get_session_context.
+    if chat_models:
+        lines.append(f"  Available chat models: {', '.join(chat_models)}")
+    if capabilities:
+        lines.extend(_format_grants(capabilities))
     return "\n".join(lines)
 
 
@@ -370,8 +452,42 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
 
         Use this before project/job/repository actions when you need to know
         which thread, user, project, and workspace backend this session is using.
+        Also reports the chat models this deployment routes and your effective
+        grants — read both before pinning a model or workspace backend in a
+        create_worker_job config_override.
         """
-        return _format_session_context(context)
+        # Fail-soft: a context report must never break the session, so a models
+        # or capabilities lookup that errors simply omits its line.
+        chat_models: Optional[List[str]] = None
+        capabilities: Optional[Dict[str, Any]] = None
+        try:
+            async with _get_client(user_id=context.user_id) as client:
+                try:
+                    resp = await client.get(f"{base_url}/api/models")
+                    resp.raise_for_status()
+                    groups = resp.json().get("groups") or []
+                    models = [
+                        str(model_id)
+                        for group in groups
+                        for model_id in (group.get("models") or [])
+                    ]
+                    chat_models = sorted(dict.fromkeys(models)) or None
+                except Exception as e:
+                    logger.debug("get_session_context: model lookup failed: %s", e)
+                try:
+                    resp = await client.get(f"{base_url}/api/users/me/capabilities")
+                    resp.raise_for_status()
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        capabilities = payload
+                except Exception as e:
+                    logger.debug("get_session_context: capability lookup failed: %s", e)
+        except Exception as e:
+            logger.debug("get_session_context: orchestrator unreachable: %s", e)
+
+        return _format_session_context(
+            context, chat_models=chat_models, capabilities=capabilities
+        )
 
     @tool
     async def create_worker_job(
@@ -381,6 +497,8 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         priority: int = 5,
         project_id: Optional[str] = None,
         datasource_ids: Optional[List[str]] = None,
+        config_override: Optional[Dict[str, Any]] = None,
+        expert_id: Optional[str] = None,
     ) -> str:
         """Create a new worker job on the orchestrator.
 
@@ -392,10 +510,40 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             project_id: Optional project to scope the job to
             datasource_ids: Optional explicit datasource selection. Omit to
                 inherit this session's datasources; pass [] to attach none.
+            config_override: Per-job config as JSON, merged last so it wins over
+                project and expert defaults. Common knobs:
+                {"llm": {"model": "<id>"}} to pin the worker's model, and
+                {"workspace": {"backend": "vm"}} for a root VM instead of the
+                default sandbox. Call get_session_context for valid model IDs
+                and your grants; use_skill("delegate-a-job") for the full
+                recipe. Credential/transport keys (api_key, base_url,
+                env_keys) are rejected.
+            expert_id: DB-backed expert UUID from list_experts. Carries its own
+                model, backend, and prompts. Cannot be combined with a
+                config_name other than worker_base.
 
         Returns:
             Job creation result with job ID
         """
+        # Reject transport/credential keys before any HTTP: the PDP gates
+        # capability escalation but not where the model is routed.
+        offending = _transport_key_paths(config_override)
+        if offending:
+            return (
+                "Refusing to create job: config_override may not set credential "
+                f"or transport keys ({', '.join(sorted(offending))}). Routing is "
+                "resolved server-side from the model ID — pass "
+                '{"llm": {"model": "<id>"}} and drop these keys.'
+            )
+        # The API rejects this pairing with a 400 (one expert source at a time);
+        # catch it here so the agent gets the reason instead of a bare status.
+        if expert_id and config_name and config_name != "worker_base":
+            return (
+                f"Refusing to create job: expert_id cannot be combined with "
+                f"config_name={config_name!r}. Pass expert_id alone (it selects "
+                "a DB expert) or config_name alone (a bundled one)."
+            )
+
         payload: Dict[str, Any] = {
             "description": description,
             "config_name": config_name,
@@ -405,6 +553,10 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             payload["instructions"] = instructions
         if project_id:
             payload["project_id"] = project_id
+        if config_override:
+            payload["config_override"] = config_override
+        if expert_id:
+            payload["expert_id"] = expert_id
         # Explicit selection overrides inheritance; [] means "attach none".
         # Omitting it lets the orchestrator inherit the parent session/job's
         # selection (server-side, keyed off thread_id below).
@@ -436,15 +588,25 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
                 resp.raise_for_status()
                 data = resp.json()
                 job_id = data.get("id") or data.get("job_id", "unknown")
-                return (
-                    f"Job created successfully.\n"
-                    f"Job ID: {job_id}\n"
-                    f"Config: {config_name}\n"
-                    f"Priority: {priority}\n"
-                    f"Description: {description}\n\n"
-                    f"A worker agent will pick this up from the dispatch queue. "
-                    f"Use get_worker_job('{job_id}') to check progress."
+                lines = [
+                    "Job created successfully.",
+                    f"Job ID: {job_id}",
+                    f"Config: {config_name}",
+                ]
+                if expert_id:
+                    lines.append(f"Expert: {expert_id}")
+                if config_override:
+                    lines.append(f"Overrides: {json.dumps(config_override)}")
+                lines.extend(
+                    [
+                        f"Priority: {priority}",
+                        f"Description: {description}",
+                        "",
+                        "A worker agent will pick this up from the dispatch "
+                        f"queue. Use get_worker_job('{job_id}') to check progress.",
+                    ]
                 )
+                return "\n".join(lines)
             except httpx.HTTPStatusError as e:
                 return f"Failed to create job: HTTP {e.response.status_code} — {e.response.text}"
             except httpx.RequestError as e:
