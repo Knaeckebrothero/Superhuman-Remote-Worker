@@ -59,6 +59,11 @@ gap.
 `permissions-and-availability` explains a known SRW session feature's current
 gates; it is not a catch-all place to search for a feature absent from the
 index.
+Enterprise identity administration terms such as SSO, SCIM, SAML, Okta,
+directory sync, and identity or group mapping are not project-group or
+datasource workflows. The current index has no built-in Cockpit setup for
+them: after reading `index`, state the guide gap and stop unless the index
+gains an explicit identity-administration row.
 When the requested outcome is future recall or where to record a durable
 project fact, route to `memory-and-knowledge` even if the question also
 mentions a session or `/compact`.

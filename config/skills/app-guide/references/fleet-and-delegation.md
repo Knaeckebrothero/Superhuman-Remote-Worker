@@ -26,7 +26,9 @@ starts.
 ## Launch a worker job from a session
 
 **Capacity:** three independent jobs may be queued together, but they run in
-parallel only when fleet capacity permits.
+parallel only when fleet capacity permits. Always surface that distinction in
+the answer: queueing three jobs is supported; three simultaneous starts are
+not guaranteed.
 
 1. In a new session's **Agent Settings**, or the current chat's **Settings**,
    open **Tools** and enable **Fleet Management**.
