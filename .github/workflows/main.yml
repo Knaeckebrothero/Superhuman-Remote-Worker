@@ -91,7 +91,9 @@ jobs:
           version: v3.17.0
 
       - name: Build Helm dependencies
-        run: helm dependency build helm/
+        run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm dependency build helm/
 
       - name: Install kubeconform
         run: |
@@ -134,7 +136,9 @@ jobs:
           version: v3.17.0
 
       - name: Build Helm dependencies
-        run: helm dependency build helm/
+        run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm dependency build helm/
 
       - name: Assert invalid values are rejected by the schema
         run: |
@@ -164,7 +168,9 @@ jobs:
         with:
           version: v3.17.0
       - name: Build Helm dependencies
-        run: helm dependency build helm/
+        run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm dependency build helm/
       - name: Install kubeconform
         run: |
           curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
@@ -1070,6 +1076,7 @@ jobs:
           version: v3.17.0
       - name: Package both charts
         run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
           mkdir -p dist
           for chart_dir in helm helm-vm-cluster; do

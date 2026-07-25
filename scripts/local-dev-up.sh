@@ -158,6 +158,7 @@ $(printf '\033[1;32m✓ Local cluster ready.\033[0m')
 Next:
   cp deployment/values-local.yaml.example deployment/values-local.yaml
   \$EDITOR deployment/values-local.yaml      # paste at least one LLM key
+  helm repo add collabora https://collaboraonline.github.io/online --force-update
   helm dependency build ./helm
   helm install srw ./helm -n $NAMESPACE -f deployment/values-local.yaml
 
