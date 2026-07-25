@@ -124,7 +124,7 @@ cases:
       - id: duplicate-bundled
         any_of: ["duplicate", "owned copy"]
       - id: bundled-read-only
-        any_of: ["bundled", "read-only", "owned copy", "owned, editable copy"]
+        any_of: ["bundled", "read-only", "owned copy"]
       - id: type-immutable
         any_of: ["type is immutable", "cannot change", "worker expert cannot start a session"]
     forbidden_claims:
@@ -344,7 +344,7 @@ cases:
       - id: exact-flow-unsupported
         any_of: ["cannot currently perform that exact", "not a supported built-in automation", "no exact cockpit setup", "cannot do this exact", "does not document or support this exact built-in workflow", "does not document a supported built-in workflow for this exact outcome"]
       - id: automation-connectors-absent
-        any_of: ["automation-fired jobs do not attach connectors", "do not currently attach connectors", "do not allow attaching connectors", "no access to your email connector"]
+        any_of: ["automation-fired jobs do not attach connectors", "do not attach connectors", "do not allow attaching connectors", "no access to your email connector"]
     forbidden_claims:
       - id: invented-billing-page
         severity: critical

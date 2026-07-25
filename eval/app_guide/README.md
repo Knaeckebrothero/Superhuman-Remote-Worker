@@ -72,8 +72,12 @@ answer from model priors is not a routing pass. A near miss passes routing only
 if it does not call that reader. Trajectory rows retain topic, result status,
 size, and digest—not the full guide result.
 
-Required facts and forbidden claims are deterministic substring alternatives,
-not an LLM judge. They measure grounding rather than prose quality. Any
+Required facts and forbidden claims use deterministic normalized phrase
+alternatives, not an LLM judge. Required facts permit at most three
+intervening modifier tokens between expected tokens, which accepts faithful
+wording without becoming an unbounded semantic matcher. Forbidden claims
+remain contiguous phrase matches so inserted negation is not mistaken for a
+forbidden claim. They measure grounding rather than prose quality. Any
 forbidden hit fails its case, and `critical_forbidden_count` has zero
 tolerance. `release_gate_pass` additionally requires the complete corpus, no
 provider errors, and every case passing. Review failures rather than loosening
