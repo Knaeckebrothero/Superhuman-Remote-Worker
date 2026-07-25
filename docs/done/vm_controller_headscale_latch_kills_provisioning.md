@@ -9,10 +9,11 @@ tags:
 
 # vm-controller latches "Headscale unavailable" at init and never retries — after a host reboot every VM boots keyless and provisioning fails 100%
 
-**Status:** RECURRED 2026-07-25 (second occurrence). Root cause re-confirmed
-end-to-end with live evidence. **Durable fix now IMPLEMENTED on `develop`
-(uncommitted at time of writing) — NOT yet deployed.** Dev cluster unblocked
-by the operational remedy and live-verified.
+**Status:** RESOLVED 2026-07-25. Recurred that morning (second occurrence),
+root cause re-confirmed end-to-end with live evidence, durable fix shipped
+in `92662dee` and **deployed to dev in `sha-9710244`** (both vm-controller
+and orchestrator). Deploy verified against the running images and by a live
+provisioning run — see "Deploy verification" below.
 **Severity:** high for the RSI loop — one host reboot with unlucky pod
 ordering stalls the entire VM backend until someone manually restarts the
 controller; each doomed VM burns a full ~30-min provisioning cycle × 3
@@ -134,8 +135,28 @@ backoff throttle, teardown-after-failed-init), `test_vm_controller.py`
 confirmed to FAIL against the pre-fix source. 1107 passed in the filtered
 local sweep; ruff clean.
 
-**Still owed:** commit + CI build of `vm-controller` and `orchestrator`
-images, deploy, then move this file to `docs/done/`.
+## Deploy verification (2026-07-25 16:23Z)
+
+Shipped as `92662dee` on `develop`; CI built `sha-9710244`, deployed to both
+`srw-vm-vm-controller` (context `vm`) and `srw-orchestrator` (context
+`main`).
+
+Confirmed *in the running images*, not just in git:
+
+- vm-controller `/app/headscale_client.py`: `_available = False` → **0**
+  occurrences (the latch is gone), `_ensure_user_id` → 3.
+- vm-controller `/app/controller.py`: `waiting_headscale` present.
+- orchestrator: `VM_HEADSCALE_POLL`/`VM_PARK_HEADSCALE` → 4 in `main.py`,
+  2 in `services/dispatch_guards.py`.
+
+Live happy-path run on the deployed images (job `5d187e1b`): pre-auth key
+minted (`POST /api/v1/preauthkey` 200) → VM created 16:18:19Z → `ready`
+16:23:07Z (~4m48s) with `ssh_host 100.64.0.27`, a real tailnet IP. Teardown
+was clean: VM deleted and Headscale node `8884` removed, nothing leaked.
+
+The deferral path itself (`waiting_headscale` → poll → park) is covered by
+unit tests only; it was not exercised live, since that would mean breaking
+Headscale on the dev cluster on purpose.
 
 ## Related
 
