@@ -12804,7 +12804,41 @@ async def _advance_planner_campaign(
 
     plan = completed_ctx.get("loop_plan")
     if not isinstance(plan, dict):
-        return False, _WB_UNSET  # no plan filed → implicit K=1 rotation fallback
+        # No plan filed → implicit K=1 rotation fallback. Legal — but if a
+        # campaign is awaiting disposition, the skip must be loud: silent
+        # fallbacks are how a campaign parks in review forever while its
+        # verdict lives only in a KB note the engine cannot read.
+        if campaign and campaign.get("status") in ("review", "aborted"):
+            skipped_label = (
+                campaign.get("title") or campaign.get("initiative_note_id") or "?"
+            )
+            logger.warning(
+                "project loop %s: checkpoint critic %s filed no plan while "
+                "campaign '%s' awaits disposition — campaign stays parked",
+                loop_id[:8],
+                str(completed_job["id"])[:8],
+                skipped_label,
+            )
+            actions.append(
+                f"project loop {loop_id[:8]}: campaign '{skipped_label}' still "
+                "awaits disposition — checkpoint critic filed no plan; "
+                "dispose-only filing is allowed (disposition without stages)"
+            )
+            await _notify_loop_event(
+                loop,
+                job_id=str(completed_job["id"]),
+                event_type="loop_campaign_review_skipped",
+                subject=f"Loop campaign review skipped: {skipped_label}",
+                message=(
+                    f"The checkpoint critic completed without disposing campaign "
+                    f"'{skipped_label}' (status {campaign.get('status')}, "
+                    f"{campaign.get('stages_done', '?')} of "
+                    f"{len(campaign.get('stages') or [])} stages done). The "
+                    "campaign stays parked until a critic files a disposition — "
+                    "ship/kill may be filed without opening a new campaign."
+                ),
+            )
+        return False, _WB_UNSET
 
     # Idempotency (healed re-run of the same critic advance): the plan was
     # already applied — resume spawning at the persisted cursor instead.
@@ -12887,6 +12921,22 @@ async def _advance_planner_campaign(
                 )
             ),
         )
+
+    if not normalized["stages"]:
+        # Dispose-only filing: the campaign was closed above; open nothing and
+        # fall back to plain rotation for the next turn. Persisted in its own
+        # write like the plan-apply path (persist-before-spawn). A healed
+        # re-run is safe: with the campaign already cleared, re-validation
+        # rejects the stored dispose-only plan (nothing awaiting review) and
+        # the advance degrades to the same rotation fallback.
+        await postgres_db.update_project_loop(
+            loop_id, campaign=None, campaign_history=history
+        )
+        actions.append(
+            f"project loop {loop_id[:8]}: no successor campaign opened — "
+            "returning to rotation"
+        )
+        return False, _WB_UNSET
 
     new_campaign = {
         # Deterministic id = the plan job — a healed re-run recreates the SAME
@@ -13375,7 +13425,7 @@ async def file_loop_plan(
     # a down/absent vector store accepts the plan (KB failures are non-fatal by
     # convention) — a present store that can't find the note rejects it.
     project_id = loop.get("project_id")
-    if project_id and vector_db is not None:
+    if project_id and vector_db is not None and normalized["initiative"] is not None:
         note_id = normalized["initiative"]["kb_note_id"]
         try:
             async with vector_db.acquire() as conn:
@@ -13402,13 +13452,21 @@ async def file_loop_plan(
 
     if not await postgres_db.merge_job_context(job_id, {"loop_plan": normalized}):
         raise HTTPException(status_code=500, detail="Failed to store the plan")
-    logger.info(
-        "project loop %s: critic job %s filed a %d-stage campaign plan (%s)",
-        str(loop_id)[:8],
-        job_id[:8],
-        len(normalized["stages"]),
-        normalized["initiative"]["kb_note_id"],
-    )
+    if normalized["initiative"] is None:
+        logger.info(
+            "project loop %s: critic job %s filed a dispose-only plan (%s)",
+            str(loop_id)[:8],
+            job_id[:8],
+            normalized["disposition"]["outcome"],
+        )
+    else:
+        logger.info(
+            "project loop %s: critic job %s filed a %d-stage campaign plan (%s)",
+            str(loop_id)[:8],
+            job_id[:8],
+            len(normalized["stages"]),
+            normalized["initiative"]["kb_note_id"],
+        )
     return {"status": "accepted", "plan": normalized}
 
 

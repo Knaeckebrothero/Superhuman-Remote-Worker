@@ -30,8 +30,10 @@ LOOP_PLAN_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "existing KB note), schedule 1..K execution stages toward it, "
             "pre-register the acceptance evidence the closing critic will "
             "check, and dispose the previous campaign (ship/extend/kill) if "
-            "one awaits review. The plan is applied when this job completes; "
-            "re-filing replaces the previous plan."
+            "one awaits review. To close a reviewed campaign WITHOUT opening "
+            "a new one, call with only disposition_outcome=ship|kill (no "
+            "initiative, no stages). The plan is applied when this job "
+            "completes; re-filing replaces the previous plan."
         ),
         "category": "loop",
         "short_description": "File the next campaign plan (checkpoint critic only).",
@@ -45,8 +47,8 @@ def create_loop_plan_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def loop_plan(
-        initiative_note_id: str,
-        stages: List[str],
+        initiative_note_id: str = "",
+        stages: Optional[List[str]] = None,
         title: str = "",
         acceptance: Optional[List[str]] = None,
         disposition_outcome: Optional[str] = None,
@@ -60,13 +62,20 @@ def create_loop_plan_tools(context: ToolContext) -> List[Any]:
         order, then returns control to the next critic checkpoint, which
         judges the campaign against your pre-registered acceptance evidence.
 
+        Dispose-only filing: to close a campaign awaiting review WITHOUT
+        opening a new one, call with ONLY disposition_outcome ("ship" or
+        "kill") and disposition_notes — omit initiative_note_id and stages.
+        The loop then returns to plain rotation. A KB note is NOT a
+        disposition; only this tool delivers the verdict to the engine.
+
         Args:
             initiative_note_id: KB note id of the chosen initiative (must
                 exist in the project knowledge base — kb_write it first if
-                your verdict note isn't saved yet).
+                your verdict note isn't saved yet). Omit for a dispose-only
+                filing.
             stages: Roles to run in order, e.g. ["developer", "developer",
                 "product-qa"]. Each entry is one job. Budget: each stage
-                costs one loop iteration.
+                costs one loop iteration. Omit for a dispose-only filing.
             title: Short human-readable campaign title (shown in the cockpit
                 and notifications).
             acceptance: Commands/checks the CLOSING critic will run to judge
@@ -84,22 +93,39 @@ def create_loop_plan_tools(context: ToolContext) -> List[Any]:
         job_id = context.job_id
         if not job_id:
             return "Error: no job_id available in this session."
-        if not stages:
-            return "Error: stages must list at least one role."
+        dispose_only = (
+            not (initiative_note_id or "").strip()
+            and not stages
+            and bool(disposition_outcome)
+        )
+        if not dispose_only and not stages:
+            return (
+                "Error: stages must list at least one role — or, to close the "
+                "reviewed campaign without opening a new one, call with only "
+                "disposition_outcome (ship|kill)."
+            )
 
-        plan: Dict[str, Any] = {
-            "initiative": {
-                "kb_note_id": (initiative_note_id or "").strip(),
-                "title": (title or "").strip(),
-            },
-            "stages": [{"role": str(r).strip()} for r in stages],
-            "acceptance": [str(a) for a in (acceptance or [])],
-        }
-        if disposition_outcome:
-            plan["disposition"] = {
-                "outcome": disposition_outcome.strip().lower(),
-                "notes": (disposition_notes or "").strip(),
+        if dispose_only:
+            plan: Dict[str, Any] = {
+                "disposition": {
+                    "outcome": disposition_outcome.strip().lower(),
+                    "notes": (disposition_notes or "").strip(),
+                }
             }
+        else:
+            plan = {
+                "initiative": {
+                    "kb_note_id": (initiative_note_id or "").strip(),
+                    "title": (title or "").strip(),
+                },
+                "stages": [{"role": str(r).strip()} for r in stages],
+                "acceptance": [str(a) for a in (acceptance or [])],
+            }
+            if disposition_outcome:
+                plan["disposition"] = {
+                    "outcome": disposition_outcome.strip().lower(),
+                    "notes": (disposition_notes or "").strip(),
+                }
 
         orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
         api_url = f"{orchestrator_url}/api/jobs/{job_id}/loop-plan"
@@ -131,9 +157,16 @@ def create_loop_plan_tools(context: ToolContext) -> List[Any]:
 
         data = resp.json()
         accepted = data.get("plan", plan)
+        disposition = accepted.get("disposition")
+        if not accepted.get("initiative"):
+            return (
+                "Dispose-only plan ACCEPTED: the reviewed campaign will be "
+                f"disposed ({(disposition or {}).get('outcome', '?')}) when "
+                "this job completes, and the loop returns to plain rotation. "
+                "Re-filing loop_plan replaces this filing."
+            )
         n = len(accepted.get("stages", []))
         roles = ", ".join(s.get("role", "?") for s in accepted.get("stages", []))
-        disposition = accepted.get("disposition")
         lines = [
             f"Plan ACCEPTED: {n}-stage campaign ({roles}) toward "
             f"'{accepted.get('initiative', {}).get('kb_note_id', '?')}'.",
