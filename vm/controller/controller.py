@@ -262,15 +262,30 @@ class VMController:
                 )
                 return {"job_id": job_id, "status": "waiting_golden", **waiting}
 
+        # Mesh VPN is how the orchestrator reaches the guest: a VM that boots
+        # without a pre-auth key never joins the tailnet, so its daemon
+        # registers with the QEMU-NAT address and ssh_ready=false forever. It
+        # looks alive (it heartbeats) but is unreachable, and burns the full
+        # provisioning budget — 3 × 10 min — before the job fails. Defer the
+        # create instead, mirroring waiting_golden: no VM is built, so the
+        # dispatcher polls without consuming a provision attempt. See
+        # docs/issues/vm_controller_headscale_latch_kills_provisioning.md.
         tailscale_auth_key = ""
         if self.headscale.is_available:
             tailscale_auth_key = await self.headscale.create_auth_key(job_id) or ""
             if not tailscale_auth_key:
+                headscale_error = self.headscale.last_error or "Headscale unavailable"
                 log.warning(
-                    "Failed to get Headscale auth key for job %s — "
-                    "VM will boot without mesh VPN",
+                    "No Headscale auth key for job %s (%s) — deferring VM create; "
+                    "a keyless VM could never be reached",
                     job_id,
+                    headscale_error,
                 )
+                return {
+                    "job_id": job_id,
+                    "status": "waiting_headscale",
+                    "headscale_error": headscale_error,
+                }
 
         manifest = self.render_template(job_config, tailscale_auth_key)
         vm_name = manifest["metadata"]["name"]
