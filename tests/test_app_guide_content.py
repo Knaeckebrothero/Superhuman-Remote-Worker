@@ -37,6 +37,24 @@ def _focused_topic(topic: str) -> tuple[dict, str]:
     return yaml.safe_load(metadata_text), " ".join(body.lower().split())
 
 
+def test_guide_requires_outcome_level_coverage_and_honest_combination_gaps():
+    text = (_GUIDE / "SKILL.md").read_text(encoding="utf-8")
+    _, body = text.removeprefix("---\n").split("\n---\n", 1)
+    body = " ".join(body.lower().split())
+
+    assert "match the user's requested **outcome**, not just nouns" in body
+    assert (
+        "documented components are not proof that srw supports combining them" in body
+    )
+    assert "call `index` only, state an explicit guide gap, and stop" in body
+    assert "do not load the nearest topic to manufacture a setup" in body
+    assert "the guide does not document this exact workflow" in body
+    assert (
+        "a schedule, connector, prompt, expert, or permission documented separately"
+        in body
+    )
+
+
 def test_focused_guides_keep_metadata_contracts():
     expected = {
         "overview": {
@@ -215,9 +233,14 @@ def test_memory_guide_separates_compaction_recall_native_kb_and_external_okf():
     assert "failures can degrade the feature" in body
     assert "a run configured to require memory may pause or fail loudly" in body
     assert "**share memories across jobs** / `project_scoped` enabled" in body
-    assert "without a project scope, memory stays with the current job or session" in body
+    assert (
+        "without a project scope, memory stays with the current job or session" in body
+    )
     assert "memory has no general cockpit browsing/editor surface" in body
-    assert "the current knowledge tab does not provide a free-form create/content editor" in body
+    assert (
+        "the current knowledge tab does not provide a free-form create/content editor"
+        in body
+    )
     assert "verify that the session actually has knowledge tools" in body
     assert "additional, reusable, read-only library" in body
     assert "does not merge it into the writable native project knowledge base" in body
@@ -228,6 +251,10 @@ def test_automation_guide_keeps_current_safety_and_actionability_boundaries():
     _, body = _focused_topic("automations")
 
     assert "current built-in automation surface is schedule-only" in body
+    assert "related features are not proof of a supported combined workflow" in body
+    assert "emailing an invoice" in body
+    assert "automation-fired jobs attach no connectors" in body
+    assert "do not invent a connector attachment through project linkage" in body
     assert "run now" in body and "does not move the next scheduled run" in body
     assert "automation-fired jobs do not attach connectors" in body
     assert "automatically pauses the automation" in body

@@ -15,6 +15,21 @@ The current built-in automation surface is schedule-only: it does not provide
 event triggers, inbound-email triggers, webhooks, branching, or a workflow
 graph.
 
+## Coverage boundary: a schedule does not attach other features
+
+An automation can schedule a worker job with a prompt, expert, autonomy,
+priority, and optional project. Mentioning a connector or product feature in
+the prompt does not attach it to the resulting job. Related features are not
+proof of a supported combined workflow.
+
+In particular, an exact recurring flow that needs any connector—such as
+emailing an invoice, scheduled mailbox triage, or querying a database for a
+report—is not a supported built-in Automation setup today because
+automation-fired jobs attach no connectors. Say that the guide does not
+document or support that exact built-in flow. Do not invent a connector
+attachment through project linkage, **Review** autonomy, the Inbox, or prompt
+wording. Those controls do not make the connector available to the fired job.
+
 ## Create and test one
 
 1. Open **Automations** and choose **New automation**. To keep it inside a
