@@ -1,3 +1,12 @@
+---
+guide_id: workspaces.files-and-results
+content_type: explanation
+capability_ids:
+  - workspaces.select
+journey_ids:
+  - workspaces.find-results
+---
+
 # Files, git, cloud, and citations — where work lives
 
 Agents can work with isolated files, but the available storage, git, and IDE
@@ -6,20 +15,22 @@ cloud storage.
 
 ## The agent workspace
 
-Jobs and sessions with file tools use a simple structure: `documents/`
+Jobs and sessions with file tools commonly use a structure with `documents/`
 (inputs you provided), `notes/` (the agent's working notes), and `output/`
-(deliverables). Virtual sessions keep durable cloud-backed files but do not
-have git. Container and VM workspaces can be git-versioned. None sessions are
-chat-only and have no workspace files.
+(deliverables), though an expert/task may add other files. Virtual workspaces
+keep durable cloud-backed files but do not have git. Container and VM
+workspaces can be git-versioned. None workspaces have no workspace files.
 
 ## Git
 
 The built-in git server hosts repositories for git-capable workspaces:
 
 - **Workspace / Git buttons** (on job rows, in the chat header, in reviews)
-  open the repository — browse files, commits, phase tags, and branches.
-- Each git-capable root job gets its own repository; delegated subjobs work on
-  branches.
+  appear when that record actually has a repository and open its files,
+  commits, phase tags, and branches.
+- Standalone and project jobs can use different repository/branch layouts;
+  delegated work may share a parent workspace. Use the links shown on the
+  current record rather than assuming one repository per job.
 - **Projects** carry repositories too: a managed jobs repo plus any source or
   reference repos you add on the Repos tab. Project membership grants
   matching git access automatically.

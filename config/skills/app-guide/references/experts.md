@@ -1,34 +1,78 @@
+---
+guide_id: experts.choose-and-customize
+content_type: reference
+capability_ids:
+  - experts.select
+  - experts.manage
+journey_ids:
+  - experts.choose
+  - experts.customize
+---
+
 # Experts — which agent for which task
 
-An **expert** is a preconfigured agent role: a persona, a toolset, and working
-instructions tuned for one kind of work. You pick an expert when you create a
-job (and some experts power interactive sessions). If you're unsure, the
-default worker config is a capable generalist, and the **Assistant** is the
-default for sessions.
+An **expert** is a reusable agent profile: it fixes whether the profile is for
+an autonomous **worker job** or an interactive **session**, then supplies a
+persona, instructions, tools, and configuration. The type matters: a worker
+expert cannot start a session, and a session expert cannot run a job.
 
-## The roster
+## Bundled roster
 
-| Expert | Use it for |
-|---|---|
-| **Assistant** | The default session agent — turn-by-turn collaboration on research, writing, analysis, planning, and light coding. |
-| **Scholar** | Exploration and research — scans the web and codebases, runs experiments, produces a high volume of idea and finding artifacts. |
-| **Critic** | Quality gatekeeping — reviews diffs and proposals, audits for problems, runs tests. Harsh and evidence-based by design. Also runs automatically as the built-in reviewer of other jobs. |
-| **Developer** | Implementation — turns acceptance criteria into failing tests, then minimum code to pass, then refactors. Test-driven throughout. |
-| **Curator** | Knowledge extraction — distills a job's findings into structured notes in the project knowledge base. Usually runs automatically alongside other jobs when enabled. |
-| **Designer** | UI/UX design — self-contained HTML/CSS mockups and design specs for developers to implement. |
-| **Design Studio** | The interactive version of Designer — iterate on mockups and specs with you in a session. |
-| **Bug Hunter** | Adversarial QA — picks a surface and tries to break it. Every finding comes with a reproduction. Hunts bugs; doesn't fix them. |
-| **Product QA** | Product-level audit — uses the app like a customer would and reports broken setup, missing pieces, and doc gaps as evidence-backed issues. |
+| Expert | Type | Use it for |
+|---|---|---|
+| **General Worker** | Worker | Safe general-purpose research, writing, analysis, planning, and file deliverables. This is the initial application worker default. |
+| **Assistant** | Session | General turn-by-turn research, writing, analysis, planning, and light coding. This is the initial application session default. |
+| **Scholar** | Worker | Broad exploration: web/codebase research, experiments, and high-volume findings for later evaluation. |
+| **Critic** | Worker | Evidence-based review of diffs, proposals, tests, and quality. It is also used by the optional job verification workflow. |
+| **Developer** | Worker | Test-driven implementation using specification, red, green, and refactor phases. |
+| **Curator** | Worker | Extracting structured, reusable notes from job artifacts into project knowledge. It may be launched by curation workflows when configured; it does not run beside every job. |
+| **Designer** | Worker | UI/UX analysis, self-contained HTML/CSS mockups, and implementation specifications. |
+| **Design Studio** | Session | Interactive iteration on mockups and design specifications. |
+| **Bug Hunter** | Worker | Adversarial testing with a reproduction for each finding; it hunts rather than fixes. |
+| **Product QA Tester** | Worker | Product-level usability and integration auditing with evidence-backed issue candidates; it does not fix them. |
 
-Worker experts (Scholar, Critic, Developer, Curator, Designer, Bug Hunter,
-Product QA) run autonomous jobs; Assistant and Design Studio are session
-experts you chat with.
+Choose **General Worker** or **Assistant** when the task does not need a
+specialized role. Choose the role from the work you want performed, not from
+the model name: model and tool choices can be inherited or overridden
+separately in Agent Settings.
 
-## Custom experts
+## Which default wins
 
-Deployments can enable an expert editor in the cockpit where you create,
-duplicate, edit, import, and export your own experts (persona, instructions,
-and configuration). This is admin-enabled per deployment — if you don't see
-an Experts editing area, your deployment ships the bundled roster only.
+Assistant and General Worker are seeded as the initial managed application
+defaults, but an operator can replace either pointer. For a new root job or
+session, the selection order is:
 
-Projects can also carry their own experts, so a team shares tuned roles.
+1. the expert explicitly selected for this run;
+2. the selected project's default for that expert type;
+3. your personal default, when personal defaults are allowed; then
+4. the application default.
+
+The create form shows the effective selection and its source. A project
+override can further tune an expert used in that project. Do not promise that
+every installation or user still defaults to the two seed profiles.
+
+## Create or adapt an expert
+
+When DB-backed user experts are enabled, open **Experts**:
+
+- **New** creates an owned worker or session expert. Choose the type carefully;
+  it is immutable after creation.
+- **Duplicate** forks any visible bundled or database expert into an owned
+  copy. This is the normal way to customize a bundled profile.
+- **Import** creates an owned copy from an expert JSON bundle; **Export**
+  downloads a portable bundle.
+- Bundled disk experts are read-only. Owned database experts can be edited by
+  their owner or an administrator.
+- Managed platform defaults can be edited by their administrator/owner policy
+  but cannot be deleted. Other database experts cannot be deleted while jobs,
+  sessions, automations, project links, or default pointers still depend on
+  them; repoint or remove those blockers first.
+
+The editor can change persona, instructions, prompts, tools, models, workspace,
+and other allowed configuration. Capability grants still restrict what the
+saved expert may enable, and credential-bearing configuration is rejected.
+
+If **New**, **Import**, or editing is unavailable, the deployment may have
+DB-backed experts or user expert authoring disabled. This static guide cannot
+inspect that state. Bundled experts remain usable, and project repositories can
+also expose project-owned expert definitions under `experts/`.
