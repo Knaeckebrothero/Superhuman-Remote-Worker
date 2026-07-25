@@ -16,11 +16,13 @@ tags:
 > Canvas/browser plus permission/workspace guidance, and M1e project
 > loops/campaigns plus Protected Cloud guidance were implemented through
 > 2026-07-24. M1d also repaired the automation expert-selection contract that
-> the guide audit exposed. The M1f closure plan was defined 2026-07-25 and is
-> now in progress. Its core-reference, operator break-glass/health, and
-> deterministic routing/compaction evaluation packages completed 2026-07-25.
-> The first live-model run and fresh/resumed deployment matrix still gate M1;
-> the live capability plane, visual help, and the later roadmap remain open.
+> the guide audit exposed. The M1f closure plan was defined 2026-07-25. Its
+> core-reference, operator break-glass/health, and routing/compaction
+> evaluation packages are implemented. A first complete live-model run and
+> six-cell fresh/resumed deployment checkpoint drove final routing and
+> prerequisite hardening; the exact final bundle's deployed current-arm run
+> and final-digest session confirmation still gate M1. The live capability
+> plane, visual help, and the later roadmap remain open.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -447,10 +449,10 @@ The managed guide now has one explicit emergency withdrawal path:
 
 ### Implemented M1f work package 3 — held-out routing and compaction evaluation
 
-The deterministic evaluation foundation is now implemented:
+The evaluation foundation and first live diagnostic are now implemented:
 
-- `eval/app_guide/cases.yaml` keeps 29 held-out synthetic questions outside the
-  runtime skill: 16 product positives and 13 near-miss negatives, balanced
+- `eval/app_guide/cases.yaml` keeps 30 held-out synthetic questions outside the
+  runtime skill: 17 product positives and 13 near-miss negatives, balanced
   across broad orientation, focused workflows, availability, paraphrases,
   repository/codebase onboarding, application code, generic advice, similar
   non-SRW terms, and a genuine undocumented billing/invoice request.
@@ -464,8 +466,10 @@ The deterministic evaluation foundation is now implemented:
   case. It supports `current`, `no-skill`, and a prior skills-root arm.
 - A product-positive route passes only after an actual
   `read_product_guide` call to the expected topic (optionally preceded by
-  `index`); a near miss passes only without that reader. Tool trajectory keeps
-  bounded arguments, status, size, and digest rather than copied guide text.
+  `index`); explicitly allowed secondary topics support genuine cross-topic
+  questions without weakening unrelated routing. A near miss passes only
+  without that reader. Tool trajectory keeps bounded arguments, status, size,
+  and digest rather than copied guide text.
 - Required/forbidden fact scoring is deterministic and separate from
   trajectory. Wording quality is explicitly outside that score, while any
   forbidden hit fails its case and critical forbidden claims have zero
@@ -479,11 +483,16 @@ The deterministic evaluation foundation is now implemented:
 
 The harness/compaction tests pass (**12 passed**), and their union with the
 persistent graph/session regressions passes (**230 passed**, three pre-existing
-warnings). No live-eval model or credential route is exported in this
-workspace, so these deterministic results do not substitute for the required
-first live-model artifact.
+warnings). The first complete deployed current-arm run scored 18/30 with no
+provider errors or critical forbidden claims. It correctly failed the release
+gate and exposed ambiguous near-miss routing, missing prerequisite emphasis,
+and unsafe composition of separately documented features. The resulting
+hardening narrows the skill trigger, makes `index` a router rather than an
+answer substitute, requires prerequisites/limits in answers, and explicitly
+abstains on undocumented combinations. A candidate-snapshot rerun reached
+29/30; the exact final deployed current arm remains the release gate.
 
-### Remaining gaps after M1f work package 3
+### Remaining closure gates and later gaps
 
 The guide is now delivered reliably, but it is not yet self-maintaining or
 runtime-aware:
@@ -522,12 +531,14 @@ runtime-aware:
   non-UTF-8 files.
 - There is no structured Cockpit help-card or coach-mark protocol.
 - The held-out harness now defines model trigger, topic, deterministic
-  grounding, near-miss, and honest-gap measurements, but no live model has run
-  it in this workspace yet. Deterministic harness tests are not model-quality
-  evidence.
-- The complete fresh/resumed deployment matrix is still open.
+  grounding, near-miss, and honest-gap measurements. A live model has exercised
+  it, but the hardened final deployed `current` arm has not yet produced a
+  complete passing release artifact.
+- All six fresh/resumed delivery cells passed on the preceding managed digest,
+  including real persisted compaction and a stale mutable sandbox guide. The
+  final hardened digest still needs live confirmation before the matrix closes.
 
-### Planned M1f — close the reliable text-guide milestone
+### M1f verification — close the reliable text-guide milestone
 
 M1f is the closure slice for Phase 1, not an expansion into the runtime
 capability plane. Its executable plan is
@@ -536,13 +547,14 @@ capability plane. Its executable plan is
 The work is deliberately ordered:
 
 1. finish the original Jobs, Experts, and Memory/Knowledge reference audit
-   (implemented 2026-07-25);
+   (implemented);
 2. add the operator-only `APP_GUIDE_BREAK_GLASS_DISABLED` escape hatch and a
-   bounded persistent-agent health signal (implemented 2026-07-25);
+   bounded persistent-agent health signal (implemented and live-probed);
 3. add a held-out routing/answer corpus plus compaction and honest-gap
-   evaluation (deterministic harness implemented; first live run pending);
+   evaluation (implemented; first full live diagnostic completed);
 4. run the fresh/resumed `none`, `virtual`, and Container k3d matrix with DB
-   skills and experts disabled; and
+   skills and experts disabled (checkpoint matrix completed; final-digest
+   confirmation pending); and
 5. record evidence and close the Phase 1 boxes only after the chart-default
    and pre-upgrade-resume exit gate passes.
 
@@ -572,7 +584,7 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Protected Cloud review | `orchestrator/services/cloud_staging/`, `orchestrator/services/diff_source.py`, protected mount/endpoint wiring in `orchestrator/main.py`, and the session-create/chat/diff-review Cockpit surfaces | M1e documents the shipped flag/backend/workspace gates, staging and whole-diff decision contract, fail-closed posture, conflicts, and recovery boundaries; live evaluation remains Phase 2 |
 | Core Jobs/Experts/Memory references | Current Cockpit create/list/project surfaces, `orchestrator/services/default_experts.py`, bundled expert YAML, `src/services/recall_store.py`, the configured memory pipeline, and native/OKF knowledge paths | M1f work package 1 corrects the original references and their broad overlaps, adds metadata, and pins consequential scope/action/degradation claims plus the complete bundled roster |
 | M1 break-glass/health | `src/core/skill_resolution.py`, `src/tools/product_help.py`, the persistent-agent health route in `src/api/persistent_app.py`, and the shared Helm ConfigMap | M1f now provides one default-off negative operator escape hatch, withholds both guide and reader when active, preserves chat readiness, restores the current digest on rebind, and reports a bounded degraded reason without reviving mutable fallback content |
-| M1 evaluation/acceptance | `eval/app_guide/`, persistent graph/session tests, and `docs/tests/app_guide_m1_verification.md` | M1f now implements held-out trigger trajectory, topic routing, grounded facts, near-miss negatives, honest gaps, and deterministic compaction recovery; the live-model artifact and fresh/resumed matrix remain open |
+| M1 evaluation/acceptance | `eval/app_guide/`, persistent graph/session tests, and `docs/tests/app_guide_m1_verification.md` | M1f implements held-out trigger trajectory, topic routing, grounded facts, near-miss negatives, honest gaps, and deterministic compaction recovery. The first live diagnostic and six-cell deployment checkpoint are recorded; a passing final deployed current arm and final-digest session confirmation remain open |
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
 | Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; strict Canvas HTML is inert while schema-advertised interactive HTML is an isolated, untrusted artifact | Define a separately validated help-card/App contract; do not treat arbitrary interactive Canvas HTML as trusted product UI |
 | Provenance | Agent-only `BUILD_SHA` in `docker/Dockerfile.agent` and short CI values; independently tagged images in Helm values | Stamp and surface full revision/digest metadata for each relevant component |
@@ -1409,12 +1421,15 @@ DB-authored-skills or DB-experts features.
 - [x] Create the first minimal canonical/coverage seam for datasource types so
   the repaired email guide immediately gains a drift check.
 - [x] Add balanced trigger evaluations for broad/specific product questions and
-  near-miss negatives such as project/codebase onboarding. The 29-case
-  held-out corpus and live-capable runner are implemented; the first recorded
-  model run remains an M1 exit-gate requirement.
+  near-miss negatives such as project/codebase onboarding. The 30-case
+  held-out corpus and live-capable runner are implemented, and the first
+  recorded full run drove routing/grounding hardening. A passing final deployed
+  current arm remains an M1 exit-gate requirement.
 - [ ] Verify fresh and pre-existing resumed k3d sessions with DB skills and DB
   experts disabled, including `none`, `virtual`, and normal shell workspaces.
-- [ ] Verify an off-doc question produces an honest gap instead of a guess.
+  All six paths passed on the preceding digest; confirm the hardened final
+  digest before checking this box.
+- [x] Verify an off-doc question produces an honest gap instead of a guess.
 
 **Exit gate:** the chart-default deployment and a session created before an
 upgrade answer the core evaluation set from the same current immutable guide,
