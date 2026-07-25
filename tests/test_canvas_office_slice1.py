@@ -360,14 +360,15 @@ def test_check_file_info_shape_and_get_file_are_read_only(monkeypatch) -> None:
     assert gateway.binary_calls == 2
 
 
-def test_wopi_router_has_no_slice_two_putfile_route(monkeypatch) -> None:
+def test_wopi_router_rejects_non_put_override(monkeypatch) -> None:
     client, _, _ = _wopi_client(monkeypatch)
     response = client.post(
         f"/wopi/files/{FILE_ID}/contents?access_token=wopi-token",
-        headers={"X-WOPI-Override": "PUT"},
+        headers={"X-WOPI-Override": "DELETE"},
         content=OFFICE_BYTES,
     )
-    assert response.status_code == 405
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "wopi_override_invalid"
 
 
 def test_office_session_payload_uses_discovery_and_epoch_milliseconds() -> None:

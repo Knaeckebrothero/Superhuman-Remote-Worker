@@ -235,20 +235,36 @@ async def test_gateway_rechecks_hash_then_writes_and_validates_readback(
 
 
 @pytest.mark.asyncio
-async def test_office_renderer_stays_closed_at_gateway_and_coordinator_gates() -> None:
+async def test_office_renderer_enters_gateway_and_existing_coordinator(
+    monkeypatch,
+) -> None:
+    from services import canvas_files
+
+    class _OfficeMagic:
+        @staticmethod
+        def from_buffer(data: bytes, mime: bool = False) -> str:
+            del data, mime
+            return "application/zip"
+
+    monkeypatch.setattr(canvas_files, "magic", _OfficeMagic)
     gateway = ThreadWorkspaceFileGateway(
         remote_writer=lambda *args: asyncio.sleep(0),
     )
+    source = WorkspaceFileSource(
+        path="output/report.docx",
+        workspace_generation=GENERATION,
+    )
     office = replace(
         _record(),
+        source=source,
+        source_fingerprint=canonical_source_fingerprint(source),
         renderer="office",
         editable=True,
     )
 
-    assert gateway.supports_editing(_thread(), office) is False
-    with pytest.raises(CanvasFileError) as candidate:
-        await gateway.validate_edit_candidate(office, b"PK\x03\x04office")
-    assert candidate.value.code == "canvas_not_editable"
+    assert gateway.supports_editing(_thread(), office) is True
+    candidate = await gateway.validate_edit_candidate(office, b"PK\x03\x04office")
+    assert candidate.renderer == "office"
 
     db = _EditDB()
     db.row.update(renderer="office", editable=True)
@@ -262,17 +278,17 @@ async def test_office_renderer_stays_closed_at_gateway_and_coordinator_gates() -
 
     fingerprint = _record().source_fingerprint
     assert fingerprint is not None
-    with pytest.raises(CanvasEditError) as coordinator:
-        await CanvasService(db).edit_file(
-            THREAD_ID,
-            expected_presentation_revision=1,
-            expected_source_fingerprint=fingerprint,
-            expected_source_version=OLD_VERSION,
-            expected_thread_user_id=USER_ID,
-            writer=writer,
-        )
-    assert coordinator.value.code == "canvas_not_editable"
-    assert writer_called is False
+    mutation = await CanvasService(db).edit_file(
+        THREAD_ID,
+        expected_presentation_revision=1,
+        expected_source_fingerprint=fingerprint,
+        expected_source_version=OLD_VERSION,
+        expected_thread_user_id=USER_ID,
+        writer=writer,
+    )
+    assert mutation.record is not None
+    assert mutation.record.presentation_revision == 2
+    assert writer_called is True
 
 
 @pytest.mark.asyncio
