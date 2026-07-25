@@ -178,6 +178,8 @@ def make_nats_msg_raw(raw_bytes: bytes, reply: str | None = None) -> MagicMock:
 def _make_headscale_mock(available: bool = True):
     hs = MagicMock()
     hs.is_available = available
+    hs.is_ready = available
+    hs.last_error = None
     hs.init = AsyncMock()
     hs.close = AsyncMock()
     if available:
@@ -618,15 +620,38 @@ class TestHandleCreate:
         assert payload["status"] == "created"
 
     @pytest.mark.asyncio
-    async def test_create_vm_headscale_key_failure(self, controller):
-        """VM creation continues when Headscale key generation returns None."""
+    async def test_create_vm_defers_when_headscale_key_unavailable(self, controller):
+        """No key → defer the create instead of building an unreachable VM.
+
+        Regression for the 2026-07-17/07-25 outage: a VM built without a
+        tailnet pre-auth key boots and heartbeats but can never be reached
+        over SSH, so it silently burned the whole 3 × 10 min provisioning
+        budget before failing the job. See docs/issues/
+        vm_controller_headscale_latch_kills_provisioning.md.
+        """
         controller.headscale.create_auth_key = AsyncMock(return_value=None)
+        controller.headscale.last_error = "ConnectError: connection refused"
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
         await controller.handle_create(msg)
 
-        controller.k8s_client.create_namespaced_custom_object.assert_called_once()
+        controller.k8s_client.create_namespaced_custom_object.assert_not_called()
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
-        assert payload["status"] == "created"
+        assert payload["status"] == "waiting_headscale"
+        assert payload["job_id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert "connection refused" in payload["headscale_error"]
+
+    @pytest.mark.asyncio
+    async def test_create_vm_defers_without_last_error(self, controller):
+        """Deferral still carries a usable reason when last_error is unset."""
+        controller.headscale.create_auth_key = AsyncMock(return_value=None)
+        controller.headscale.last_error = None
+        msg = make_nats_msg(SAMPLE_JOB_CONFIG)
+        await controller.handle_create(msg)
+
+        controller.k8s_client.create_namespaced_custom_object.assert_not_called()
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "waiting_headscale"
+        assert payload["headscale_error"]
 
     @pytest.mark.asyncio
     async def test_create_vm_renders_manifest_correctly(self, controller):

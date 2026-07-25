@@ -273,13 +273,16 @@ class VMProvisioner:
 
         Args:
             fresh: True (default) for a genuine (re)provision. False for a
-                golden-poll re-issue — the controller answered ``waiting_golden``
-                (no VM exists yet, a shared golden image is importing) and the
-                dispatcher re-sends create as the poll. A poll must NOT reset
-                the provision context: ``golden_wait_started_at`` anchors the
-                golden budget across polls, and the context status must stay
-                ``waiting_golden`` (not flip to 'provisioning') so the decision
-                logic keeps polling instead of burning boot-budget waits.
+                deferred-create poll re-issue — the controller answered
+                ``waiting_golden`` (a shared golden image is importing) or
+                ``waiting_headscale`` (the mesh VPN is down, so a VM would be
+                unreachable), no VM exists yet, and the dispatcher re-sends
+                create as the poll. A poll must NOT reset the provision
+                context: ``golden_wait_started_at`` /
+                ``headscale_wait_started_at`` anchor those budgets across
+                polls, and the context status must stay ``waiting_*`` (not
+                flip to 'provisioning') so the decision logic keeps polling
+                instead of burning boot-budget waits.
                 ``provisioned_at`` alone is rolled forward so that when the
                 golden completes and the create finally builds the VM, the boot
                 budget starts from ≈ that moment, not from the first poll.
@@ -692,9 +695,15 @@ class VMProvisioner:
                 "namespace": data.get("namespace"),
                 "provisioned_by": "http",
             }
-            # waiting_golden responses carry golden import telemetry instead
-            # of a VM name; surface it for the dispatcher's poll logging.
-            for key in ("golden", "golden_phase", "golden_progress"):
+            # Deferred-create responses carry telemetry instead of a VM name
+            # (golden import progress, or why the mesh VPN is unreachable);
+            # surface it for the dispatcher's poll logging and park message.
+            for key in (
+                "golden",
+                "golden_phase",
+                "golden_progress",
+                "headscale_error",
+            ):
                 if data.get(key) is not None:
                     updates[key] = data[key]
             await self._set_context(entity_type, job_id, updates)
@@ -702,6 +711,13 @@ class VMProvisioner:
                 logger.info(
                     "VM create deferred (http): golden %s importing (%s %s)",
                     data.get("golden"),
+                    entity_type,
+                    job_id,
+                )
+            elif data.get("status") == "waiting_headscale":
+                logger.info(
+                    "VM create deferred (http): Headscale unavailable (%s) (%s %s)",
+                    data.get("headscale_error"),
                     entity_type,
                     job_id,
                 )
@@ -870,8 +886,11 @@ class VMProvisioner:
             CANVAS_WORKSPACE_GENERATION_KEY: None,
             # Golden-wait anchor from a previous incarnation must not cap this
             # provision's patience for a cold golden import (dispatcher stamps
-            # it again on the first waiting_golden it sees).
+            # it again on the first waiting_golden it sees). Same for the
+            # Headscale-wait anchor.
             "golden_wait_started_at": None,
+            "headscale_wait_started_at": None,
+            "headscale_error": None,
             "provisioned_at": time.time(),
         }
 

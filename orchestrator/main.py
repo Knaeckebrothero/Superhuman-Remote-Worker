@@ -163,8 +163,10 @@ from services.stale_verification_sweeper import (  # noqa: E402
 )
 from services.dispatch_guards import (  # noqa: E402
     VM_GOLDEN_POLL,
+    VM_HEADSCALE_POLL,
     VM_PARK_EXHAUSTED,
     VM_PARK_GOLDEN,
+    VM_PARK_HEADSCALE,
     VM_PARKED,
     VM_PROVISION,
     VM_RECYCLE,
@@ -5248,6 +5250,9 @@ async def _try_dispatch_pending_jobs() -> None:
                     golden_timeout_s = int(
                         os.environ.get("VM_GOLDEN_WAIT_TIMEOUT_S", "2700")
                     )
+                    headscale_timeout_s = int(
+                        os.environ.get("VM_HEADSCALE_WAIT_TIMEOUT_S", "900")
+                    )
                     vm_decision = vm_provisioning_decision(
                         vm_ctx,
                         provision_attempts=provision_attempts,
@@ -5255,6 +5260,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         now=time.time(),
                         timeout_s=timeout_s,
                         golden_timeout_s=golden_timeout_s,
+                        headscale_timeout_s=headscale_timeout_s,
                     )
                     if vm_decision == VM_PARK_EXHAUSTED:
                         # Retries used up — park the VM context AND fail the job.
@@ -5420,6 +5426,66 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         logger.warning(
                             "Dispatcher: job %s golden wait exhausted — "
+                            "failing job (%s)",
+                            job_id,
+                            park_error,
+                        )
+                        await postgres_db.merge_vm_context(
+                            job_id,
+                            {"status": "failed", "error": park_error},
+                        )
+                        await _fail_vm_parked_job(job_id, park_error)
+                        continue
+                    if vm_decision == VM_HEADSCALE_POLL:
+                        # No VM exists yet — the controller refused to build one
+                        # while Headscale is unreachable, because a VM with no
+                        # tailnet pre-auth key boots and heartbeats but is never
+                        # reachable over SSH. Poll create (fresh=False, no
+                        # attempt consumed) until the mesh recovers; the
+                        # controller then builds the VM on the very next poll.
+                        if not vm_ctx.get("headscale_wait_started_at"):
+                            await postgres_db.merge_vm_context(
+                                job_id,
+                                {"headscale_wait_started_at": time.time()},
+                            )
+                        config_override = job.get("config_override") or {}
+                        if isinstance(config_override, str):
+                            config_override = json.loads(config_override)
+                        vm_cfg = config_override.get("workspace", {}).get("vm", {})
+                        await vm_provisioner.create_vm(
+                            job_id=job_id,
+                            agent_config=canonical_config_name(
+                                job.get("config_name", "worker_base")
+                            ),
+                            vm_image=vm_cfg.get("image"),
+                            cpu_cores=vm_cfg.get("cpu_cores", 8),
+                            memory=vm_cfg.get("memory", "16Gi"),
+                            description=job.get("description", ""),
+                            fresh=False,
+                        )
+                        logger.info(
+                            "Dispatcher: job %s waiting on Headscale (%s) — polling",
+                            job_id,
+                            vm_ctx.get("headscale_error") or "mesh VPN unavailable",
+                        )
+                        continue
+                    if vm_decision == VM_PARK_HEADSCALE:
+                        # Headscale never came back inside its budget. No VM was
+                        # ever created, so there is nothing to recycle — fail
+                        # with the real cause rather than the misleading
+                        # "provisioning exhausted after N attempts".
+                        elapsed = int(
+                            time.time()
+                            - float(vm_ctx.get("headscale_wait_started_at") or 0)
+                        )
+                        park_error = (
+                            f"Headscale (mesh VPN) unavailable for {elapsed}s "
+                            f"(budget {headscale_timeout_s}s, last error: "
+                            f"{vm_ctx.get('headscale_error') or 'unknown'}) — "
+                            f"VM never created"
+                        )
+                        logger.warning(
+                            "Dispatcher: job %s Headscale wait exhausted — "
                             "failing job (%s)",
                             job_id,
                             park_error,
