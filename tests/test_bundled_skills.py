@@ -95,10 +95,11 @@ def test_bundled_app_guide_skill_is_valid_and_indexes_its_references():
     assert name == "app-guide"
     # Trigger scopes to the USER asking about the product and disambiguates
     # from orienting yourself in the user's project content.
-    assert "project-onboarding" in desc
+    assert "repository orientation" in desc
+    assert "application/code questions" in desc
     # The grounding contract is the skill's whole point: retrieve-then-answer
     # from the bundled usage docs, never from priors.
-    assert "references/" in desc
+    assert "focused reference" in desc
     assert "priors" in body
     assert "read_product_guide" in desc and "read_product_guide" in body
     assert "skills/app-guide/" in body
