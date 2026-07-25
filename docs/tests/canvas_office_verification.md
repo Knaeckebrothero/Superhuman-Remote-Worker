@@ -24,6 +24,26 @@ rollout with `collabora.enabled=true`.** Design:
 | A | Local k3d (`k3d srw` + tilt) with `collabora.enabled=true`, `.localhost` Ingress | Everything except tunnel |
 | B | Dev cluster (`office.srw.works` via Cloudflare Tunnel) | Tunnel-specific items |
 
+### Enablement inputs (per environment)
+
+No new Vault leaves. Preconditions and values:
+
+- **Secret precondition:** the `sessionRouter` JWT secret
+  (`SESSION_JWT_SECRET`) must already exist in the env — WOPI tokens sign
+  with it. Verify the Vault/ESO leaf or values entry BEFORE enabling
+  (absent secret = the canvas-gateway `CreateContainerConfigError` class).
+- **Values:** `collabora.enabled=true`, `collabora.publicUrl`,
+  `collabora.collabora.server_name` (= publicUrl host),
+  `collabora.collabora.aliasgroups[0].host` (= in-cluster orchestrator
+  URL — the chart's validation error/NOTES prints the exact string),
+  `extra_params` with the Cockpit origin appended after `frame-ancestors`
+  (trailing `;`), `collabora.networkPolicy.enabled` + edge selectors.
+- **Outside the chart:** cloudflared ingress rule `office.<domain>` →
+  collabora service `:9980`; DNS via tunnel; hostname NOT behind
+  Cloudflare Access. Local k3d uses `collabora.ingress.enabled` with a
+  `.localhost` host instead.
+- No admin-console secret (console disabled) and no proof keys in v1.
+
 Prep notes (from research, unverified live):
 - The `collabora/code` 26.04 image is **distroless** — no `kubectl exec`
   shell. Debug via `kubectl logs` and coolwsd's websocket log level only.
