@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 from src.core.skill_resolution import (
+    APP_GUIDE_BREAK_GLASS_ENV,
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
     add_persistent_system_skills,
@@ -159,6 +160,14 @@ def test_reader_fails_closed_when_bundle_digest_changes():
 
     assert "unavailable" in out.lower()
     assert "MUTATED AFTER RESOLUTION" not in out
+
+
+def test_break_glass_withholds_reader_even_from_a_direct_loader_request(monkeypatch):
+    monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
+    context = _context()
+
+    assert create_product_help_tools(context) == []
+    assert load_tools([APP_GUIDE_LOADER_TOOL], context) == []
 
 
 def test_product_help_tool_survives_none_backend_filter_and_loads():

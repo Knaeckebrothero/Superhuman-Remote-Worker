@@ -17,9 +17,9 @@ tags:
 > loops/campaigns plus Protected Cloud guidance were implemented through
 > 2026-07-24. M1d also repaired the automation expert-selection contract that
 > the guide audit exposed. The M1f closure plan was defined 2026-07-25 and is
-> now in progress. Its core-reference implementation completed 2026-07-25;
-> break-glass health, M1 evaluation/deployment gates, the live capability plane,
-> visual help, and the later roadmap remain open.
+> now in progress. Its core-reference and operator break-glass/health packages
+> completed 2026-07-25; M1 evaluation/deployment gates, the live capability
+> plane, visual help, and the later roadmap remain open.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -415,7 +415,36 @@ failure (`CanvasRenderer` includes `office` while the Canvas guide-coverage
 test has not yet classified it); that external drift remains visible and is
 not counted as a pass for the M1 exit gate.
 
-### Remaining gaps after M1f work package 1
+### Implemented M1f work package 2 — operator break-glass and health
+
+The managed guide now has one explicit emergency withdrawal path:
+
+- `APP_GUIDE_BREAK_GLASS_DISABLED` uses one shared truthy policy and defaults
+  off. It is intentionally operator-only and negative, not a user preference
+  or ordinary capability flag.
+- While active, persistent skill resolution still removes any frozen,
+  owner/project/global, or workspace `app-guide` replacement, but it does not
+  install the trusted bundle. Persistent tool setup also removes
+  `read_product_guide`, and the reader factory independently refuses direct
+  instantiation. The ordinary Canvas companion and unrelated skills remain
+  unchanged.
+- Re-enabling and rebinding the same session reloads the current running bundle
+  and digest rather than restoring stale bytes.
+- Persistent-agent `/health` remains HTTP 200 for liveness and reports
+  `status: degraded` plus only bounded App Guide states/reasons:
+  `ready`, `disabled/operator_break_glass`,
+  `unavailable/bundle_unavailable`, `unavailable/bundle_invalid`, or
+  `unavailable/reader_unavailable`. `/ready` remains tied only to chat-runtime
+  readiness.
+- The negative Helm value lives under `agent`, renders through the shared
+  ConfigMap inherited by dynamically provisioned agents, and is documented in
+  `.env.example` as emergency containment only.
+- Focused resolution, reader, persistent-session, and health tests cover
+  truthy parsing, no mutable fallback, Canvas preservation, direct-reader
+  denial, session disable/re-enable, bounded degradation, and readiness
+  independence. Both chart lint profiles and false/true ConfigMap renders pass.
+
+### Remaining gaps after M1f work package 2
 
 The guide is now delivered reliably, but it is not yet self-maintaining or
 runtime-aware:
@@ -468,7 +497,7 @@ The work is deliberately ordered:
 1. finish the original Jobs, Experts, and Memory/Knowledge reference audit
    (implemented 2026-07-25);
 2. add the operator-only `APP_GUIDE_BREAK_GLASS_DISABLED` escape hatch and a
-   bounded persistent-agent health signal;
+   bounded persistent-agent health signal (implemented 2026-07-25);
 3. add a held-out routing/answer corpus plus compaction and honest-gap
    evaluation;
 4. run the fresh/resumed `none`, `virtual`, and Container k3d matrix with DB
@@ -501,7 +530,7 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Project loops/campaigns | `orchestrator/routers/project_loops.py`, `orchestrator/services/project_loops.py`, the unified advance path in `orchestrator/main.py`, and `cockpit/.../project-loop.component.ts` | M1e documents Standard versus Campaign scheduling, stage-barrier budgeting, campaign guardrails, controls, and the inspection-only live workflow tools; complete runtime state remains Phase 2 |
 | Protected Cloud review | `orchestrator/services/cloud_staging/`, `orchestrator/services/diff_source.py`, protected mount/endpoint wiring in `orchestrator/main.py`, and the session-create/chat/diff-review Cockpit surfaces | M1e documents the shipped flag/backend/workspace gates, staging and whole-diff decision contract, fail-closed posture, conflicts, and recovery boundaries; live evaluation remains Phase 2 |
 | Core Jobs/Experts/Memory references | Current Cockpit create/list/project surfaces, `orchestrator/services/default_experts.py`, bundled expert YAML, `src/services/recall_store.py`, the configured memory pipeline, and native/OKF knowledge paths | M1f work package 1 corrects the original references and their broad overlaps, adds metadata, and pins consequential scope/action/degradation claims plus the complete bundled roster |
-| M1 break-glass/health | `src/core/skill_resolution.py`, `src/tools/product_help.py`, the persistent-agent health route in `src/api/persistent_app.py`, and the shared Helm ConfigMap | M1f adds one default-off negative operator escape hatch, withholds both guide and reader when active, and reports a bounded degraded reason without reviving mutable fallback content |
+| M1 break-glass/health | `src/core/skill_resolution.py`, `src/tools/product_help.py`, the persistent-agent health route in `src/api/persistent_app.py`, and the shared Helm ConfigMap | M1f now provides one default-off negative operator escape hatch, withholds both guide and reader when active, preserves chat readiness, restores the current digest on rebind, and reports a bounded degraded reason without reviving mutable fallback content |
 | M1 evaluation/acceptance | `eval/app_guide/`, persistent graph/session tests, and `docs/tests/app_guide_m1_verification.md` | M1f separates trigger trajectory, topic routing, grounded facts, near-miss negatives, honest gaps, compaction recovery, and the fresh/resumed live matrix |
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
 | Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; strict Canvas HTML is inert while schema-advertised interactive HTML is an isolated, untrusted artifact | Define a separately validated help-card/App contract; do not treat arbitrary interactive Canvas HTML as trusted product UI |
@@ -1304,7 +1333,7 @@ DB-authored-skills or DB-experts features.
 - [x] Generalize the existing Canvas exception into a managed system-skill
   floor for all user-facing persistent experts, independent of DB skill/expert
   flags; keep it out of autonomous worker catalogs by default.
-- [ ] Add an operator-only break-glass disable and visible degraded-health
+- [x] Add an operator-only break-glass disable and visible degraded-health
   signal without turning the guide back into a normal feature-flag dependency.
 - [x] Reserve `app-guide` from owner/project/global replacement at resolution
   and create/import/update boundaries; emit a clear collision diagnostic and

@@ -4,11 +4,16 @@ Mirrors the experts precedence model (src/core/expert_resolution.py) but the
 menu keeps ALL names (bundled is the floor) instead of picking one winner.
 """
 
+import pytest
+
 from src.core.skill_resolution import (
+    APP_GUIDE_BREAK_GLASS_ENV,
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
     add_default_canvas_skill,
     add_persistent_system_skills,
+    app_guide_break_glass_disabled,
+    app_guide_health_snapshot,
     is_reserved_system_skill_name,
     resolve_skill_menu,
     scope_skills_for_tools,
@@ -185,6 +190,78 @@ def test_persistent_system_floor_never_falls_back_to_replacement_if_bundle_missi
 
     assert all(item.get("name") != APP_GUIDE_SKILL for item in catalog["menu"])
     assert APP_GUIDE_SKILL not in catalog["files"]
+
+
+@pytest.mark.parametrize("value", ["1", "TRUE", " yes ", "On"])
+def test_app_guide_break_glass_uses_one_bounded_truthy_policy(value):
+    assert app_guide_break_glass_disabled({APP_GUIDE_BREAK_GLASS_ENV: value})
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "unexpected"])
+def test_app_guide_break_glass_defaults_and_false_values_stay_enabled(value):
+    assert not app_guide_break_glass_disabled({APP_GUIDE_BREAK_GLASS_ENV: value})
+
+
+def test_break_glass_removes_untrusted_guide_but_preserves_other_catalog_floors(
+    monkeypatch,
+):
+    replacement = {
+        "menu": [
+            {"name": APP_GUIDE_SKILL, "description": "untrusted"},
+            {"name": "ordinary-skill", "description": "keep"},
+        ],
+        "files": {
+            APP_GUIDE_SKILL: {"SKILL.md": "UNTRUSTED"},
+            "ordinary-skill": {"SKILL.md": "ordinary"},
+        },
+    }
+    monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
+
+    catalog = add_persistent_system_skills(replacement)
+
+    names = {item["name"] for item in catalog["menu"]}
+    assert APP_GUIDE_SKILL not in names
+    assert names == {"ordinary-skill", "present-with-canvas"}
+    assert APP_GUIDE_SKILL not in catalog["files"]
+    assert catalog["files"]["ordinary-skill"]["SKILL.md"] == "ordinary"
+
+
+def test_reenable_rebind_restores_current_managed_digest(monkeypatch):
+    replacement = {
+        "menu": [{"name": APP_GUIDE_SKILL, "description": "stale"}],
+        "files": {APP_GUIDE_SKILL: {"SKILL.md": "STALE"}},
+    }
+    monkeypatch.setenv(APP_GUIDE_BREAK_GLASS_ENV, "true")
+    disabled = add_persistent_system_skills(replacement)
+    assert APP_GUIDE_SKILL not in disabled["files"]
+
+    monkeypatch.delenv(APP_GUIDE_BREAK_GLASS_ENV)
+    restored = add_persistent_system_skills(disabled)
+    entry = next(item for item in restored["menu"] if item["name"] == APP_GUIDE_SKILL)
+
+    assert entry["system_managed"] is True
+    assert entry["bundle_digest"] == skill_bundle_digest(
+        restored["files"][APP_GUIDE_SKILL]
+    )
+    assert "STALE" not in restored["files"][APP_GUIDE_SKILL]["SKILL.md"]
+
+
+def test_app_guide_health_snapshot_is_bounded_and_distinguishes_failure_modes(
+    tmp_path,
+):
+    assert app_guide_health_snapshot(environ={}) == {"state": "ready"}
+    assert app_guide_health_snapshot(environ={APP_GUIDE_BREAK_GLASS_ENV: "true"}) == {
+        "state": "disabled",
+        "reason": "operator_break_glass",
+    }
+    assert app_guide_health_snapshot(
+        skills_root=tmp_path / "missing",
+        environ={},
+    ) == {"state": "unavailable", "reason": "bundle_unavailable"}
+    assert app_guide_health_snapshot(
+        reader_available=False,
+        environ={},
+    ) == {"state": "unavailable", "reason": "reader_unavailable"}
 
 
 def test_app_guide_scope_requires_its_dedicated_reader():
