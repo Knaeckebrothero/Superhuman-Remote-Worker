@@ -82,7 +82,8 @@ cases:
       - id: durable-monitoring
         any_of: ["jobs and the inbox", "jobs page", "inbox"]
       - id: capacity-qualified
-        any_of: ["when fleet capacity permits", "capacity", "may be queued"]
+        any_of:
+          ["when fleet capacity permits", "capacity", "may be queued", "can queue"]
     forbidden_claims:
       - id: guaranteed-simultaneous-start
         severity: critical

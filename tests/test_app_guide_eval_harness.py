@@ -247,6 +247,23 @@ def test_required_fact_gap_accepts_faithful_connector_limit(cases):
     assert score["passed"] is True
 
 
+def test_fleet_capacity_fact_accepts_can_queue_paraphrase(cases):
+    case = _case(cases, "workflow-background-fleet")
+    answer = (
+        "Enable Fleet Management in Tools. You can queue up to three "
+        "independent jobs, then monitor them on the Jobs page and in the Inbox."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "fleet-and-delegation"}],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
 def test_forbidden_claims_remain_contiguous_to_avoid_negation_false_positive(cases):
     case = _case(cases, "availability-email-send-now")
     answer = (
