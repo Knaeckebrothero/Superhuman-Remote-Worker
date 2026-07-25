@@ -28,6 +28,10 @@ the direct path.
 2. Tell the session the outcome, which worker expert to use, the project if
    any, what “done” means, and whether the job should have normal or high
    priority.
+   You can also ask for a specific model, or for a VM-backed job when the work
+   needs root — the session applies those as per-job settings, and anything
+   above your permissions is refused when the job is created rather than
+   failing later.
 3. If connector access matters, say which of this session's selected
    connectors the worker needs.
 4. Ask the session to create the job. It should return the job ID; the job
