@@ -123,6 +123,17 @@ previous plan and its acceptance evidence. Its disposition verbs:
 - **kill** — dead end; record why in the KB (feeds the tried-and-rejected
   guard already in the kickoff), plan something else.
 
+**Dispose-only filing (added 2026-07-25):** ship/kill may be filed WITHOUT
+opening a successor campaign — a bare `{"disposition": {outcome, notes}}` plan
+(no `initiative`, no `stages`); the loop then returns to plain rotation.
+`extend` still requires stages (an extension *is* stages). Without this shape,
+a critic whose verdict was "done, nothing new to start" had no legal filing —
+the observed live failure was the verdict landing only in a KB note (which the
+engine cannot read) while the campaign sat parked in `review` across multiple
+checkpoints. A checkpoint critic that files nothing while a campaign awaits
+review now also triggers a loud `loop_campaign_review_skipped` event instead
+of a silent rotation fallback.
+
 ## The plan object
 
 Filed by the Critic during its job via a new **`loop_plan` tool**
@@ -309,6 +320,11 @@ surface, the bell renders `AppNotification`s generically:
   campaign title, outcome, stages used. Also appended to the loop's timeline
   `actions` strings as today. This is the "what did the loop do overnight"
   signal without KB archaeology.
+- **`loop_campaign_review_skipped`** (added 2026-07-25) — emitted when a
+  checkpoint critic completes without filing any plan while a campaign sits
+  in `review`/`aborted`. The rotation fallback still happens, but the skip is
+  surfaced (event + action line + orchestrator warning) so a campaign parked
+  in review is visible instead of silently accumulating skipped checkpoints.
 - **`loop_user_question`** — emitted when a loop job files a KB note tagged
   `user-question` (detected in the orchestrator's KB-write path for loop
   jobs). The tag convention is fixed here; the richer answer-back flow

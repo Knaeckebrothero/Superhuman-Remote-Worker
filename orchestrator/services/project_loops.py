@@ -248,6 +248,51 @@ def validate_loop_plan(plan: Any, loop: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("plan must be a JSON object")
     caps = resolve_campaign_caps(loop)
 
+    campaign = loop.get("campaign") or None
+    pending_review = bool(campaign) and campaign.get("status") in ("review", "aborted")
+
+    def _normalize_disposition(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValueError("plan.disposition must be an object")
+        outcome = str(raw.get("outcome") or "").strip()
+        if outcome not in _PLAN_OUTCOMES:
+            raise ValueError(
+                f"plan.disposition.outcome must be one of {sorted(_PLAN_OUTCOMES)}"
+            )
+        if not pending_review:
+            raise ValueError(
+                "plan.disposition given but no campaign is awaiting review — "
+                "omit disposition"
+            )
+        return {
+            "outcome": outcome,
+            "notes": str(raw.get("notes") or "").strip()[:2000],
+        }
+
+    # Dispose-only filing: close the reviewed campaign without opening a new
+    # one. Without this shape, a critic whose verdict is ship/kill with no
+    # successor campaign has no legal way to deliver it — the observed failure
+    # mode is the verdict landing in a KB note the engine cannot read while
+    # the campaign stays parked in review.
+    if (
+        plan.get("disposition") is not None
+        and plan.get("initiative") is None
+        and not plan.get("stages")
+    ):
+        disposition = _normalize_disposition(plan.get("disposition"))
+        if disposition["outcome"] == "extend":
+            raise ValueError(
+                "extend requires stages — an extension continues the same "
+                "initiative; include plan.initiative (same kb_note_id) and "
+                "plan.stages, or dispose with ship|kill"
+            )
+        return {
+            "initiative": None,
+            "stages": [],
+            "acceptance": [],
+            "disposition": disposition,
+        }
+
     initiative = plan.get("initiative")
     if not isinstance(initiative, dict):
         raise ValueError("plan.initiative must be an object with kb_note_id")
@@ -294,27 +339,10 @@ def validate_loop_plan(plan: Any, loop: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("plan.acceptance is capped at 10 entries")
     acceptance = [str(a).strip()[:2000] for a in raw_acceptance if str(a).strip()]
 
-    campaign = loop.get("campaign") or None
-    pending_review = bool(campaign) and campaign.get("status") in ("review", "aborted")
     raw_disposition = plan.get("disposition")
     disposition: dict[str, Any] | None = None
     if raw_disposition is not None:
-        if not isinstance(raw_disposition, dict):
-            raise ValueError("plan.disposition must be an object")
-        outcome = str(raw_disposition.get("outcome") or "").strip()
-        if outcome not in _PLAN_OUTCOMES:
-            raise ValueError(
-                f"plan.disposition.outcome must be one of {sorted(_PLAN_OUTCOMES)}"
-            )
-        if not pending_review:
-            raise ValueError(
-                "plan.disposition given but no campaign is awaiting review — "
-                "omit disposition"
-            )
-        disposition = {
-            "outcome": outcome,
-            "notes": str(raw_disposition.get("notes") or "").strip()[:2000],
-        }
+        disposition = _normalize_disposition(raw_disposition)
     elif pending_review:
         raise ValueError(
             f"campaign '{campaign.get('title') or campaign.get('id')}' is in "
@@ -521,7 +549,8 @@ def _planner_critic_block(loop: dict[str, Any], budget_line: str) -> str:
         "stage = one job = one iteration of budget) toward ONE initiative — "
         "an EXISTING KB note, so kb_write your verdict note BEFORE filing — "
         "plus the acceptance evidence the closing critic will check. If you "
-        "file no plan, the loop falls back to a single follow-up job.",
+        "file no plan, the loop falls back to a single follow-up job — but "
+        "filing nothing NEVER discharges a pending disposition duty.",
         f"- Budget arithmetic: {budget_line} A k-stage campaign costs k "
         "iterations — spend accordingly.",
         "- A multi-job campaign is how high-value work that cannot be proven "
@@ -555,7 +584,10 @@ def _planner_critic_block(loop: dict[str, Any], budget_line: str) -> str:
             "(alive but unfinished — your stages continue the SAME "
             "initiative), or kill (dead end — record why in the KB). A plan "
             "without a disposition will be rejected while this campaign is "
-            "pending.",
+            "pending. If you have no new campaign to open, file ONLY the "
+            'disposition: `{"disposition": {"outcome": "ship|kill", "notes": '
+            '"..."}}` — a KB note is NOT a disposition, and filing nothing '
+            "leaves this campaign parked.",
         )
     return "\n".join(lines)
 
