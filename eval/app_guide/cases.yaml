@@ -212,7 +212,7 @@ cases:
     criticality: critical
     required_facts:
       - id: autonomous-not-capability
-        any_of: ["does not add tools", "approval policy", "changes approval prompts only"]
+        any_of: ["does not add tools", "approval policy", "changes approval prompts only", "will not make the shell appear", "not the available tools"]
       - id: inspect-current-state
         any_of: ["actual tool", "settings", "workspace", "capability grant"]
     forbidden_claims:

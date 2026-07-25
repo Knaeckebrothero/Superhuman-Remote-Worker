@@ -207,6 +207,29 @@ def test_required_facts_allow_only_a_bounded_modifier_gap(cases):
     assert too_far_apart["passed"] is False
 
 
+def test_availability_fact_accepts_tool_inventory_wording(cases):
+    case = _case(cases, "availability-missing-shell")
+    answer = (
+        "Switching to Autonomous will not make the shell appear. It changes "
+        "permission mode, not the available tools. Check the workspace and "
+        "capability grant."
+    )
+
+    score = score_case(
+        case,
+        [
+            {
+                "name": APP_GUIDE_LOADER_TOOL,
+                "topic_id": "permissions-and-availability",
+            }
+        ],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
 def test_required_fact_gap_accepts_faithful_connector_limit(cases):
     case = _case(cases, "workflow-weekly-invoice-connector-limit")
     answer = (
