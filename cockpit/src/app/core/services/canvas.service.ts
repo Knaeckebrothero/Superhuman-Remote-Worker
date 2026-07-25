@@ -1,7 +1,7 @@
 import {HttpClient, HttpErrorResponse, HttpResponse} from '@angular/common/http';
 import {DestroyRef, inject, Injectable, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
-import {map, Observable, Subscription, tap, throwError} from 'rxjs';
+import {firstValueFrom, map, Observable, Subscription, tap, throwError} from 'rxjs';
 import {
   BrowserCapability,
   BrowserCapabilityStatus,
@@ -26,6 +26,10 @@ export const CANVAS_BROADCAST_CHANNEL = 'srw.canvas.presentation.v1';
 export const BROWSER_OPEN_TIMEOUT_MS = 5 * 60_000;
 export const BROWSER_OPEN_RETRY_DEFAULT_MS = 1_000;
 export const BROWSER_OPEN_RETRY_MAX_MS = 10_000;
+
+export interface CanvasOfficeTurnAdapter {
+  saveBeforeUserMessage(): Promise<boolean>;
+}
 
 interface CanvasBroadcastInvalidation {
   readonly type: 'canvas.presentation_invalidated';
@@ -85,6 +89,10 @@ export class CanvasService {
   private browserOpenTimer: ReturnType<typeof setTimeout> | null = null;
   private browserOpenStartedAt = 0;
   private browserOpenTitle: string | undefined;
+  private officeTurnAdapter: CanvasOfficeTurnAdapter | null = null;
+  private lastOfficeRuntimeUpdate:
+    | {readonly threadId: string; readonly revision: number; readonly sourceVersion: string}
+    | null = null;
 
   constructor() {
     this.transport.canvasInvalidations$
@@ -149,6 +157,7 @@ export class CanvasService {
     this.pendingRevision = null;
     this.pendingRevisionFollowUpAllowed = false;
     this.pendingForcedReconcile = false;
+    this.lastOfficeRuntimeUpdate = null;
     this.lastSuccessfulSyncAt.set(null);
     this.threadId.set(threadId);
     this.state.set(null);
@@ -202,6 +211,99 @@ export class CanvasService {
   retryOpenBrowser(): void {
     if (this.browserOpenToken || this.browserOpenStatus() !== 'error') return;
     this.openBrowser(this.browserOpenTitle);
+  }
+
+  /**
+   * Register the one mounted Office frame that can flush edits before a turn.
+   *
+   * The identity guard prevents a retiring frame from detaching its successor.
+   */
+  registerOfficeTurnAdapter(adapter: CanvasOfficeTurnAdapter): () => void {
+    this.officeTurnAdapter = adapter;
+    return () => {
+      if (this.officeTurnAdapter === adapter) this.officeTurnAdapter = null;
+    };
+  }
+
+  async prepareOfficeForUserMessage(): Promise<boolean> {
+    const adapter = this.officeTurnAdapter;
+    if (!adapter) return true;
+    try {
+      return await adapter.saveBeforeUserMessage();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Reconcile a completed WOPI save and invalidate the agent's recent read.
+   *
+   * PutFile is called by Collabora rather than this Angular app, so its compact
+   * response cannot carry the new Canvas state. This authoritative GET closes
+   * that bridge before the pending chat turn is admitted.
+   */
+  async reconcileOfficeSave(): Promise<number | null> {
+    const threadId = this.threadId();
+    if (!threadId) return null;
+    const url =
+      `${environment.apiUrl}/persistent/threads/${encodeURIComponent(threadId)}` +
+      `/canvases/${MAIN_CANVAS_ID}`;
+    const response = await firstValueFrom(
+      this.http.get<CanvasState>(url, {observe: 'response'}),
+    );
+    if (
+      this.threadId() !== threadId ||
+      !isCanvasState(response.body) ||
+      response.body.renderer !== 'office' ||
+      response.body.source?.type !== 'workspace_file' ||
+      !response.body.source_version
+    ) {
+      return null;
+    }
+    const stateEtag = response.headers.get('ETag');
+    if (!stateEtag) return null;
+
+    const currentRevision = this.state()?.presentation_revision ?? 0;
+    if (response.body.presentation_revision < currentRevision) {
+      // Preserve the newer mounted pointer and let the renderer treat this
+      // completed save as the older version it actually observed. It will run
+      // the restore handshake for the already-known newer presentation.
+      return response.body.presentation_revision;
+    }
+    if (response.body.presentation_revision >= currentRevision) {
+      this.state.set(response.body);
+      this.stateEtag.set(stateEtag);
+      this.loadStatus.set('ready');
+      this.requestError.set(null);
+      this.lastSuccessfulSyncAt.set(Date.now());
+    }
+    if (response.body.presentation_revision > currentRevision) {
+      this.broadcastPresentationInvalidation(
+        threadId,
+        response.body.presentation_revision,
+      );
+    }
+
+    const update = {
+      threadId,
+      revision: response.body.presentation_revision,
+      sourceVersion: response.body.source_version,
+    };
+    if (
+      this.lastOfficeRuntimeUpdate?.threadId !== update.threadId ||
+      this.lastOfficeRuntimeUpdate.revision !== update.revision ||
+      this.lastOfficeRuntimeUpdate.sourceVersion !== update.sourceVersion
+    ) {
+      this.transport.sendCanvasControl(threadId, {
+        method: 'canvas.source_updated',
+        canvas_id: MAIN_CANVAS_ID,
+        path: response.body.source.path,
+        presentation_revision: response.body.presentation_revision,
+        source_version: response.body.source_version,
+      });
+      this.lastOfficeRuntimeUpdate = update;
+    }
+    return response.body.presentation_revision;
   }
 
   /**

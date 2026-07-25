@@ -129,7 +129,12 @@
     "office": {
       "frameTitle": "Office-Dokument: {{title}}",
       "connecting": "Office-Dokument wird geöffnet…",
-      "unavailable": "Das Office-Dokument konnte nicht geöffnet werden."
+      "unavailable": "Das Office-Dokument konnte nicht geöffnet werden.",
+      "conflict": {
+        "title": "Office-Änderungen benötigen Aufmerksamkeit",
+        "body": "Der Editor konnte das Speichern oder Aktualisieren für diesen Turn nicht abschließen. Laden Sie vor dem Fortfahren die aktuelle Workspace-Version; während der Übergabe kann sie weiterhin von einem anderen Writer geändert werden.",
+        "reload": "Dokument neu laden"
+      }
     },
     "browser": {
       "source": "Aktueller geteilter Browser",

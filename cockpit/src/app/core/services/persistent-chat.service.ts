@@ -26,6 +26,7 @@ import {
     CanvasSourceUpdatedControl,
     PersistentThreadTransportBridge,
 } from './persistent-thread-transport-bridge.service';
+import {CanvasService} from './canvas.service';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -348,6 +349,7 @@ export class PersistentChatService {
     private readonly transloco = inject(TranslocoService);
     private readonly destroyRef = inject(DestroyRef);
     private readonly threadTransport = inject(PersistentThreadTransportBridge);
+    private readonly canvas = inject(CanvasService);
 
     constructor() {
         // PersistentChatService remains the sole SSE/WebSocket lifecycle owner.
@@ -2170,6 +2172,11 @@ export class PersistentChatService {
 
         const queued = this.pendingAttachments();
         if (!trimmed && queued.length === 0) return true;
+
+        // An editable Office frame owns its current in-memory document. Flush
+        // that turn first so the agent's next read observes the coordinator-
+        // committed revision rather than an older workspace snapshot.
+        if (!(await this.canvas.prepareOfficeForUserMessage())) return false;
 
         let uploaded: ThreadUploadedFile[] = [];
         if (queued.length > 0) {
