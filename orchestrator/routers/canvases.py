@@ -547,9 +547,8 @@ async def _represent(
     content_url = None
     if isinstance(record.source, WorkspaceFileSource):
         try:
-            materialized = await _get_file_gateway(db).materialize_current(
-                thread, record
-            )
+            gateway = _get_file_gateway(db)
+            materialized = await gateway.materialize_current(thread, record)
             if materialized.source_version == record.source_version:
                 status = "ready"
                 if record.renderer == "office":
@@ -560,14 +559,18 @@ async def _represent(
                     except CanvasFileError:
                         pass
                     capabilities = CanvasCapabilities(
+                        can_edit=(
+                            can_view_office
+                            and record.editable
+                            and gateway.supports_editing(thread, record)
+                        ),
                         can_pop_out=True,
                         can_view_office=can_view_office,
                     )
                 else:
                     capabilities = CanvasCapabilities(
                         can_edit=(
-                            record.editable
-                            and _get_file_gateway(db).supports_editing(thread, record)
+                            record.editable and gateway.supports_editing(thread, record)
                         ),
                         can_pop_out=True,
                     )
@@ -915,14 +918,13 @@ async def create_main_canvas_office_session(
     if (
         record is None
         or record.renderer != "office"
-        or record.editable
         or not isinstance(record.source, WorkspaceFileSource)
     ):
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "canvas_not_office",
-                "message": "The current Canvas is not a view-only Office document",
+                "message": "The current Canvas is not an Office document",
             },
         )
 
@@ -953,12 +955,13 @@ async def create_main_canvas_office_session(
     if (
         visible.state.status != "ready"
         or not visible.state.capabilities.can_view_office
+        or (record.editable and not visible.state.capabilities.can_edit)
     ):
         raise HTTPException(
             status_code=503,
             detail={
                 "code": "canvas_office_unavailable",
-                "message": "Office document viewing is currently unavailable",
+                "message": "Office document viewing or editing is currently unavailable",
             },
         )
 
@@ -972,7 +975,7 @@ async def create_main_canvas_office_session(
     # Discovery and workspace reads can race a clear/replacement or membership
     # change. Re-admit and bind the token to the exact current path immediately
     # before minting it.
-    user, _ = await require_thread_owner(request, db, thread_id)
+    user, fresh_thread = await require_thread_owner(request, db, thread_id)
     current = await service.get(thread_id)
     if (
         current is None
@@ -980,9 +983,13 @@ async def create_main_canvas_office_session(
         or current.source_fingerprint != record.source_fingerprint
         or current.source_version != record.source_version
         or current.renderer != "office"
-        or current.editable
+        or current.editable is not record.editable
         or not isinstance(current.source, WorkspaceFileSource)
         or current.source.path != record.source.path
+        or (
+            current.editable
+            and not _get_file_gateway(db).supports_editing(fresh_thread, current)
+        )
     ):
         raise HTTPException(
             status_code=409,
@@ -996,7 +1003,7 @@ async def create_main_canvas_office_session(
             user_id=str(user["id"]),
             thread_id=thread_id,
             path=current.source.path,
-            write_flag=False,
+            write_flag=current.editable,
         )
     except CanvasOfficeError as exc:
         _raise_office_error(exc)
@@ -1260,6 +1267,12 @@ async def put_main_canvas_content(
             source_fingerprint=source_fingerprint,
             source_version=source_version,
         )
+        if record.renderer == "office":
+            raise CanvasFileError(
+                409,
+                "canvas_office_content_unavailable",
+                "Office bytes are writable only through the WOPI PutFile path",
+            )
         if expected_revision != record.presentation_revision:
             raise CanvasEditError(
                 409,
@@ -1666,20 +1679,15 @@ async def internal_set_main_canvas(
         )
         if file.renderer == "office":
             await _require_office_view(file.path)
-            if body.editable:
-                raise CanvasFileError(
-                    422,
-                    "canvas_editing_unsupported",
-                    "Office Canvas documents are view-only in Slice 1",
-                )
         if body.editable and (
-            file.renderer not in {"markdown", "text", "html", "html-interactive"}
+            file.renderer
+            not in {"markdown", "text", "html", "html-interactive", "office"}
             or not gateway.supports_editing(thread)
         ):
             raise CanvasFileError(
                 422,
                 "canvas_editing_unsupported",
-                "This Canvas source or workspace does not support text editing",
+                "This Canvas source or workspace does not support editing",
             )
     except CanvasFileError as exc:
         _raise_file_error(exc)
@@ -1721,7 +1729,10 @@ async def internal_set_main_canvas(
         mutation.record,
         status="ready",
         capabilities=CanvasCapabilities(
-            can_edit=mutation.record.editable,
+            can_edit=(
+                mutation.record.editable
+                and gateway.supports_editing(fresh_thread, mutation.record)
+            ),
             can_pop_out=True,
             can_view_office=mutation.record.renderer == "office",
         ),

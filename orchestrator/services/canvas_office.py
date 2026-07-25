@@ -22,7 +22,7 @@ import httpx
 import jwt
 
 from services.canvas import CanvasRecord, WorkspaceFileSource
-from services.canvas_files import canonical_workspace_path
+from services.canvas_files import ThreadWorkspaceFileGateway, canonical_workspace_path
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _OFFICE_EXTENSIONS = frozenset({"docx", "xlsx", "pptx", "odt", "ods", "odp"})
@@ -388,6 +388,7 @@ class WopiAccess:
 UserLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
 ThreadLoader = Callable[[str], Awaitable[dict[str, Any] | None]]
 CanvasLoader = Callable[[str], Awaitable[CanvasRecord | None]]
+EditingChecker = Callable[[dict[str, Any], CanvasRecord], bool]
 
 
 def wopi_file_id(thread_id: str, path: str) -> str:
@@ -416,6 +417,7 @@ class WopiTokenService:
         user_loader: UserLoader,
         thread_loader: ThreadLoader,
         canvas_loader: CanvasLoader,
+        editing_checker: EditingChecker | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not secret:
@@ -431,6 +433,7 @@ class WopiTokenService:
         self._user_loader = user_loader
         self._thread_loader = thread_loader
         self._canvas_loader = canvas_loader
+        self._editing_checker = editing_checker
         self._clock = clock
 
     def mint(
@@ -521,7 +524,9 @@ class WopiTokenService:
                 401, "wopi_token_invalid", "WOPI file identity is invalid"
             )
         claims = self.validate(token)
-        if type(require_write) is not bool or claims["write_flag"] is not require_write:
+        if type(require_write) is not bool or (
+            require_write and claims["write_flag"] is not True
+        ):
             raise CanvasOfficeError(
                 403, "wopi_access_denied", "WOPI token scope does not permit this call"
             )
@@ -548,10 +553,17 @@ class WopiTokenService:
             )
             or record is None
             or record.renderer != "office"
-            or record.editable
+            or record.editable is not claims["write_flag"]
             or not isinstance(record.source, WorkspaceFileSource)
             or record.source.path != claims["path"]
             or record.thread_id != claims["tid"]
+            or (
+                record.editable
+                and (
+                    self._editing_checker is None
+                    or not self._editing_checker(thread, record)
+                )
+            )
         ):
             raise CanvasOfficeError(
                 403,
@@ -590,12 +602,16 @@ def create_wopi_token_service(db: Any) -> WopiTokenService:
     from services.canvas import CanvasService
 
     config = collabora_config().require_enabled()
+    gateway = ThreadWorkspaceFileGateway(
+        thread_loader=getattr(db, "get_thread", None),
+    )
     return WopiTokenService(
         os.getenv("SESSION_JWT_SECRET", ""),
         ttl_seconds=config.token_ttl_seconds,
         user_loader=db.get_user,
         thread_loader=db.get_thread,
         canvas_loader=CanvasService(db).get,
+        editing_checker=gateway.supports_editing,
     )
 
 

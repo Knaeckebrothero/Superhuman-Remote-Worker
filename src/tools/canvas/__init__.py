@@ -111,9 +111,10 @@ class _SetFileCanvasArguments(BaseModel):
     editable: bool = Field(
         default=False,
         description=(
-            "Allow conditional user saves for validated writable text sources. "
-            "Office documents are view-only in this slice; images and "
-            "unavailable/read-only workspaces are rejected."
+            "Allow coordinated user saves for validated writable text, HTML, "
+            "or Office sources. Office editing additionally requires the "
+            "deployment's Collabora service; images and read-only workspaces "
+            "are rejected."
         ),
     )
     alt_text: str | None = Field(
@@ -172,8 +173,9 @@ class _SetLiveCanvasArguments(BaseModel):
     editable: bool = Field(
         default=False,
         description=(
-            "Conditional file editing. Office documents are view-only in this "
-            "slice and live applications are never source-editable."
+            "Coordinated file editing for validated writable text, HTML, or "
+            "Office sources. Office requires Collabora; live applications are "
+            "never source-editable."
         ),
     )
     alt_text: str | None = Field(
@@ -251,8 +253,9 @@ class _SetBrowserCanvasArguments(BaseModel):
     editable: bool = Field(
         default=False,
         description=(
-            "Conditional file editing. Office documents are view-only in this "
-            "slice and browser presentation is never editable."
+            "Coordinated file editing for validated writable text, HTML, or "
+            "Office sources. Office requires Collabora; browser presentation "
+            "is never editable."
         ),
     )
     alt_text: str | None = Field(
@@ -335,8 +338,9 @@ class _SetLiveBrowserCanvasArguments(BaseModel):
     editable: bool = Field(
         default=False,
         description=(
-            "Conditional file editing. Applications and browser are never editable."
-            " Office documents are view-only in this slice."
+            "Coordinated editing for validated writable text, HTML, or Office "
+            "files; Office requires Collabora. Applications and browser are "
+            "never editable."
         ),
     )
     alt_text: str | None = Field(
