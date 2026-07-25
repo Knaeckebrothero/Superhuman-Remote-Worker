@@ -11,19 +11,19 @@ import {CanvasOfficeController} from './canvas-office.controller';
 
 const OFFICE_ORIGIN = 'https://office.example.test';
 
-function officeState(revision = 1): CanvasState {
+function officeState(revision = 1, editable = false): CanvasState {
   return {
     canvas_id: 'main',
     source: {type: 'workspace_file', path: 'output/report.docx'},
     title: 'Report',
     renderer: 'office',
-    editable: false,
+    editable,
     alt_text: null,
     presentation_revision: revision,
     source_version: `sha256:${revision}`,
     status: 'ready',
     capabilities: {
-      can_edit: false,
+      can_edit: editable,
       can_pop_out: true,
       can_take_control: false,
       can_view_office: true,
@@ -101,5 +101,53 @@ describe('Canvas Office session lifecycle', () => {
     });
     expect(controller.session()).toBeNull();
     expect(controller.officeErrorCode()).toBe('invalid_office_session');
+  });
+
+  it('keeps an editable frame mounted across revisions and renews against the latest state', async () => {
+    const initial = officeState(1, true);
+    controller.syncPresentation(true, 'thread-1', initial, '"canvas:1:office"');
+    http.expectOne(request => request.url.endsWith('/office-session')).flush({
+      urlsrc: `${OFFICE_ORIGIN}/browser/version/cool.html?`,
+      WOPISrc: 'http://srw-orchestrator:8085/wopi/files/abc123',
+      access_token: 'write-token',
+      access_token_ttl: 1_721_858_400_000,
+    });
+
+    controller.syncPresentation(
+      true,
+      'thread-1',
+      officeState(2, true),
+      '"canvas:2:office"',
+    );
+    http.expectNone(() => true);
+    expect(controller.session()?.access_token).toBe('write-token');
+
+    const renewal = controller.refreshToken();
+    const request = http.expectOne(request => request.url.endsWith('/office-session'));
+    expect(request.request.headers.get('If-Match')).toBe('"canvas:2:office"');
+    request.flush({
+      urlsrc: `${OFFICE_ORIGIN}/browser/version/cool.html?`,
+      WOPISrc: 'http://srw-orchestrator:8085/wopi/files/abc123',
+      access_token: 'renewed-write-token',
+      access_token_ttl: 1_721_858_999_000,
+    });
+    await expect(renewal).resolves.toMatchObject({
+      access_token: 'renewed-write-token',
+    });
+  });
+
+  it('rejects an editable Office state without the positive edit capability', () => {
+    const state = {
+      ...officeState(1, true),
+      capabilities: {
+        ...officeState(1, true).capabilities,
+        can_edit: false,
+      },
+    };
+    controller.syncPresentation(true, 'thread-1', state, '"canvas:1:office"');
+
+    http.expectNone(() => true);
+    expect(controller.session()).toBeNull();
+    expect(controller.officeStatus()).toBe('idle');
   });
 });

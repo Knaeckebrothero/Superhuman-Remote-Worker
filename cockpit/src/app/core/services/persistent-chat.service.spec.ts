@@ -26,6 +26,7 @@ import {
 } from '../models/turn.model';
 import {ThreadCloudDiffSummary} from '../models/api.model';
 import {PersistentThreadTransportBridge} from './persistent-thread-transport-bridge.service';
+import {CanvasService} from './canvas.service';
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -215,9 +216,11 @@ function createService(opts: {
     });
     const service = TestBed.inject(PersistentChatService);
     const threadTransport = TestBed.inject(PersistentThreadTransportBridge);
+    const canvas = TestBed.inject(CanvasService);
     return {
         service,
         threadTransport,
+        canvas,
         mockHttp,
         mockApi,
         mockCache,
@@ -1730,6 +1733,38 @@ describe('PersistentChatService — REST sends', () => {
         const userTurns = ctx.service.turns().filter(isUserTurn);
         const last = userTurns[userTurns.length - 1] as UserTurn;
         expect(last.content).toBe('hello');
+    });
+
+    it('waits for the mounted Office editor save before accepting a user turn', async () => {
+        const ctx = await readySession();
+        const order: string[] = [];
+        let resolveSave!: (value: boolean) => void;
+        const save = new Promise<boolean>(resolve => {
+            resolveSave = resolve;
+        });
+        ctx.canvas.registerOfficeTurnAdapter({
+            saveBeforeUserMessage: () => {
+                order.push('Action_Save');
+                return save;
+            },
+        });
+
+        const sending = ctx.service.sendMessage('use my spreadsheet changes');
+        await Promise.resolve();
+        expect(order).toEqual(['Action_Save']);
+        expect(ctx.service.outbox()).toEqual([]);
+        expect(ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+            String(call[0]).endsWith('/persistent/threads/thread-r/input'),
+        )).toBe(false);
+
+        resolveSave(true);
+        await expect(sending).resolves.toBe(true);
+        await Promise.resolve();
+        order.push('message');
+        expect(order).toEqual(['Action_Save', 'message']);
+        expect(ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+            String(call[0]).endsWith('/persistent/threads/thread-r/input'),
+        )).toBe(true);
     });
 
     it('sendMessage queues content if session is not yet ready', async () => {

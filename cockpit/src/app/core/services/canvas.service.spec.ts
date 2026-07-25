@@ -422,6 +422,85 @@ describe('CanvasService', () => {
     });
   });
 
+  it('reconciles a WOPI save and invalidates the agent read cache once per revision', async () => {
+    const office = canvasState(1, {
+      source: {type: 'workspace_file', path: 'output/report.docx'},
+      renderer: 'office',
+      editable: true,
+      status: 'ready',
+      capabilities: {
+        can_edit: true,
+        can_pop_out: true,
+        can_take_control: false,
+        can_view_office: true,
+      },
+    });
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      office,
+      {headers: {ETag: '"canvas:1:office"'}},
+    );
+    const sender = vi.fn().mockReturnValue(true);
+    transport.attachControlSender(sender);
+
+    const first = service.reconcileOfficeSave();
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      {
+        ...office,
+        presentation_revision: 2,
+        source_version: 'sha256:office-two',
+      },
+      {headers: {ETag: '"canvas:2:office"'}},
+    );
+    await expect(first).resolves.toBe(2);
+    expect(sender).toHaveBeenCalledWith('thread-1', {
+      method: 'canvas.source_updated',
+      canvas_id: 'main',
+      path: 'output/report.docx',
+      presentation_revision: 2,
+      source_version: 'sha256:office-two',
+    });
+
+    const duplicate = service.reconcileOfficeSave();
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      {
+        ...office,
+        presentation_revision: 2,
+        source_version: 'sha256:office-two',
+      },
+      {headers: {ETag: '"canvas:2:office"'}},
+    );
+    await expect(duplicate).resolves.toBe(2);
+    expect(sender).toHaveBeenCalledTimes(1);
+
+    transport.forwardEvent('thread-1', {
+      method: 'canvas.updated',
+      params: {canvas_id: 'main', presentation_revision: 3},
+    });
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      {
+        ...office,
+        presentation_revision: 3,
+        source_version: 'sha256:agent-three',
+      },
+      {headers: {ETag: '"canvas:3:office"'}},
+    );
+    sender.mockClear();
+
+    const stale = service.reconcileOfficeSave();
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      {
+        ...office,
+        presentation_revision: 2,
+        source_version: 'sha256:office-two',
+      },
+      {headers: {ETag: '"canvas:2:office"'}},
+    );
+    await expect(stale).resolves.toBe(2);
+    expect(service.state()?.presentation_revision).toBe(3);
+    expect(sender).not.toHaveBeenCalled();
+  });
+
   it('conditionally adopts current workspace bytes and invalidates the runtime cache', () => {
     service.selectThread('thread-1');
     http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(

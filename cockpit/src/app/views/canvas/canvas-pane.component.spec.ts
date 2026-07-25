@@ -358,6 +358,13 @@ describe('Canvas pane trusted chrome', () => {
       officeOrigin: signal<string | null>(null),
       officeStatus: signal<'idle'>('idle'),
       officeErrorCode: signal<string | null>(null),
+      modified: signal(false),
+      conflictCode: signal<string | null>(null),
+      refreshToken: vi.fn(),
+      reloadSession: vi.fn(),
+      markDocumentLoaded: vi.fn(),
+      markModified: vi.fn(),
+      markConflict: vi.fn(),
     };
 
     TestBed.configureTestingModule({
