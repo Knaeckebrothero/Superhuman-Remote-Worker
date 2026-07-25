@@ -1,10 +1,22 @@
+---
+guide_id: projects.organize
+content_type: how_to
+capability_ids:
+  - projects.manage
+journey_ids:
+  - projects.create
+  - projects.configure
+---
+
 # Projects — organizing and compounding work
 
 A **project** is the container that makes work compound: it bundles a team,
 shared knowledge, connectors, git repositories, and jobs around one goal.
-Sessions and jobs attached to a project share its context — what one job
-learns, the next one inherits. Every user also has a **personal project** as
-their default home for unattached work.
+Attached sessions and jobs can read explicit project context. Automatic
+cross-run memory is additional and applies only when project-scoped memory is
+enabled and healthy; do not assume every observation from one run reaches the
+next. Every user also has a **personal project** as their default home for
+one-off work.
 
 Create one from **Projects → New Project** (name, description, goal), or
 **promote** a finished job into a project to keep building on its results.
@@ -39,8 +51,9 @@ guide.
 
 ## Practical guidance
 
-- Put ongoing work in a project even if you're solo — the shared memory and
-  knowledge base are what make later jobs smarter.
+- Put ongoing work in a project even if you're solo—the knowledge base
+  provides durable context, and optional shared memory can add automatic
+  recall.
 - Write the goal as an outcome ("users can X"), not a task list; agents plan
   the tasks themselves.
 - Attach connectors at the project level when several jobs need them.

@@ -1,52 +1,102 @@
-# Memory and knowledge — what agents remember
+---
+guide_id: memory-and-knowledge.understand
+content_type: explanation
+capability_ids:
+  - memory.recall
+  - projects.knowledge
+journey_ids:
+  - memory.configure-scope
+  - projects.knowledge.browse
+  - projects.knowledge.record
+---
 
-Two systems make agents smarter over time, both scoped to a project so
-context stays where it belongs.
+# Memory and knowledge — what persists
 
-## Memory — automatic recall
+SRW has three related but different mechanisms:
 
-Agents remember automatically. As they work, a background process extracts
-durable facts — your preferences, decisions made, things that turned out to
-be true or false — and stores them as memories. On later jobs and sessions
-in the same project, relevant memories are retrieved and injected into the
-agent's context each turn. You don't manage this; it just makes the third
-job in a project noticeably less repetitive than the first.
+1. **Conversation context** is the messages currently available to one running
+   job or session.
+2. **Memory** is automatic, fact-sized extraction and retrieval when the
+   memory pipeline is enabled and healthy.
+3. A project's **native knowledge base** is deliberate, typed, browsable
+   project documentation.
 
-Memory is **project-scoped**: a project's memories are shared across its
-jobs and sessions (there's a "share memories across jobs" toggle in project
-settings). Stale or contradicted memories are retired over time.
+Do not treat any one of these as a guaranteed substitute for the others.
 
-## The knowledge base — deliberate, browsable notes
+## Context compaction is not long-term memory
 
-Where memory is automatic and behind the scenes, the **knowledge base (KB)**
-is deliberate and visible. Agents write structured notes — decisions,
-learnings, goals, plans, open questions, code insights, retrospectives — and
-read them back in later work. In loops, the KB is the blackboard the roles
-coordinate through: the scholar's findings, the critic's verdicts, and the
-developer's outcomes all land here.
+As a conversation grows, SRW can compact older messages into a summary so the
+agent stays within its model context window. In a session, `/compact` requests
+that condensation. The configured memory pipeline may extract facts before
+compaction and may store a compaction summary, but those writes depend on the
+memory and embedding services succeeding.
 
-**Browse it** on the project page's **Knowledge** tab:
+Compaction therefore preserves a working summary for this conversation; it is
+not by itself a promise that a fact will be recalled by a future job or
+session.
 
-- Summary stats and full-text **search**.
-- Filter by **type** (decision, learning, goal, plan, code, question, state,
-  source, retrospective) and **status** (active, resolved, superseded,
-  archived).
-- Open a note to read its content, tags, and relationships; change its
-  status or delete it.
-- **Export** the whole knowledge base.
+## Memory — automatic, scoped recall
 
-Notes have lifecycle: agents supersede outdated notes and resolve answered
-questions, so the KB converges on what's currently true rather than piling
-up history.
+When memory is enabled and its database, embedding, reranking, and extraction
+dependencies are available, SRW can extract reusable facts from work and
+retrieve relevant records into later model context. Extraction is selective,
+retrieval is relevance-based, and failures can degrade the feature. A run
+configured to require memory may pause or fail loudly instead of continuing
+without it. This static guide cannot tell which state the current deployment
+is in.
 
-## How they differ
+Memory scope follows the effective configuration:
 
-| | Memory | Knowledge base |
-|---|---|---|
-| Written | automatically, in the background | deliberately, by agents as part of the work |
-| Visible | injected into agent context; not a browsing surface | browsable, searchable, editable on the project page |
-| Best for | preferences, corrections, small durable facts | findings, decisions, plans — the project's shared brain |
+- With **Share memories across jobs** / `project_scoped` enabled and a project
+  attached, retrieval uses that project (or the attached projects for a
+  multi-project session).
+- With project sharing disabled, or without a project scope, memory stays with
+  the current job or session thread.
 
-If you want an agent to "remember" something specific, the reliable move is
-to say it in a session or put it in the project's goal/description — it will
-land in memory and/or the KB from there.
+The project setting is under **Projects → choose a project → Settings**. A
+project job can also expose a project-memory override in **Agent Settings**.
+Memory has no general Cockpit browsing/editor surface, and no guide should
+promise that a later run will recall a particular sentence.
+
+## Native project knowledge — explicit, browsable notes
+
+The native knowledge base is project-scoped. Agents whose actual tool list
+includes the **Knowledge** tools can write, update, read, list, search, and
+relate typed notes such as goals, plans, decisions, learnings, code insights,
+sources, questions, state, and retrospectives. Project loops use these notes as
+a coordination surface, but only work that actually writes notes appears
+there.
+
+Open **Projects → choose a project → Knowledge** to:
+
+- see summary counts, search, and page through notes;
+- filter the list by the displayed note types and by **Active**, **Resolved**,
+  **Superseded**, or **Archived**;
+- open content, tags, confidence, phase, and relationships;
+- change a note's status or delete it; and
+- **Export** the knowledge base.
+
+The current Knowledge tab does not provide a free-form create/content editor.
+To record a new durable note conversationally, ask a session attached to the
+project to write it and verify that the session actually has Knowledge tools.
+Notes can be resolved, superseded, or archived, but convergence still depends
+on agents and users maintaining them.
+
+## Native knowledge is not an external OKF connector
+
+An **OKF Knowledge Base** connector indexes Markdown/OKF notes from an external
+Git repository. It is an additional, reusable, read-only library for agents in
+this release; its repository remains the source of truth. Linking or selecting
+one does not merge it into the writable native project knowledge base. Route
+connection, readiness, and reindexing questions to the focused **external OKF
+Knowledge Base** guide.
+
+## Where to put something important
+
+| Need | Best current surface |
+|---|---|
+| Keep steering this conversation | Say it in the session; compact when needed, understanding that compaction is a summary |
+| Preserve a reviewed project fact or decision | Ask an attached, Knowledge-enabled session to write a native knowledge note, then verify it on the project Knowledge tab |
+| Keep the project's durable purpose visible | Put the outcome in the project goal/description |
+| Let automatic recall help when available | Enable project memory and state the fact clearly, but do not use memory as the only record of something critical |
+| Search an existing external notes repository | Connect/select an OKF Knowledge Base and use its focused guide |

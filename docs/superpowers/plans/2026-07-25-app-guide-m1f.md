@@ -17,8 +17,11 @@ router.
 
 ## Status
 
-Planned 2026-07-25. M1a–M1e are shipped. None of the Phase 1 boxes assigned
-below should be checked until its named automated or live evidence exists.
+In progress. M1a–M1e are shipped. Work package 1 was implemented 2026-07-25;
+its App Guide-specific suites pass, while the full combined content command
+still exposes an unrelated concurrent Canvas/Office renderer-coverage gap.
+None of the remaining Phase 1 boxes assigned below should be checked until its
+named automated or live evidence exists.
 
 ## Non-negotiable boundaries
 
@@ -58,21 +61,21 @@ below should be checked until its named automated or live evidence exists.
 
 **Implementation**
 
-- [ ] Compare the Jobs guide to the current job lifecycle, review states,
+- [x] Compare the Jobs guide to the current job lifecycle, review states,
   workspace choices, Fleet tool actionability, and Cockpit labels. Remove
   historical queue/review/branch claims that are no longer true.
-- [ ] Compare the Experts guide to bundled versus DB-authored experts,
+- [x] Compare the Experts guide to bundled versus DB-authored experts,
   persistent versus worker eligibility, selection defaults, project scope, and
   current create/edit/delete constraints.
-- [ ] Compare the Memory/Knowledge guide to persistent context compaction,
+- [x] Compare the Memory/Knowledge guide to persistent context compaction,
   Memory Light, project knowledge, external OKF knowledge bases, agent tools,
   and the current distinction between automatic recall and explicit search.
-- [ ] Sweep the remaining broad references for duplicated or conflicting
+- [x] Sweep the remaining broad references for duplicated or conflicting
   claims exposed by those three audits. Route detail to existing focused
   topics instead of copying it.
-- [ ] Add content metadata where a touched reference lacks it, without
+- [x] Add content metadata where a touched reference lacks it, without
   inventing Phase 2 capability state.
-- [ ] Add focused contract assertions for consequential safety and
+- [x] Add focused contract assertions for consequential safety and
   actionability claims. Prefer assertions tied to canonical Python constants or
   registries where one already exists; do not create a second inventory solely
   to test prose.
@@ -85,6 +88,19 @@ below should be checked until its named automated or live evidence exists.
   tests/test_product_help_tool.py \
   tests/test_bundled_skills.py -q
 ```
+
+Implementation-time evidence (2026-07-25):
+
+- `tests/test_product_help_tool.py` plus `tests/test_bundled_skills.py`:
+  **16 passed**.
+- `tests/test_app_guide_content.py`, excluding the unrelated
+  `test_canvas_and_direct_browser_tool_inventories_have_guide_coverage`:
+  **16 passed, 1 deselected**.
+- The unfiltered union is deliberately not recorded as green: it reports one
+  Canvas contract failure because the current `CanvasRenderer` contains the
+  concurrently introduced `office` value but that separate feature's guide
+  coverage set has not yet classified it. Work package 5 must rerun the
+  unfiltered command.
 
 ## Work package 2 — operator break-glass and degraded health
 

@@ -15,6 +15,7 @@ import yaml
 
 from services.canvas import CanvasRenderer
 from services.cloud_staging import select_protected_mount
+from services.default_experts import MANAGED_SEEDS
 from services.project_loops import (
     LOOP_ANALYSIS_ROLES,
     LOOP_CAMPAIGN_BUDGET_RESERVE,
@@ -38,13 +39,40 @@ def _focused_topic(topic: str) -> tuple[dict, str]:
 
 def test_focused_guides_keep_metadata_contracts():
     expected = {
+        "overview": {
+            "guide_id": "product.overview",
+            "content_type": "explanation",
+            "capability_ids": {
+                "jobs.create",
+                "sessions.permission-mode",
+                "projects.manage",
+            },
+            "journey_ids": {"product.first-run"},
+        },
+        "sessions": {
+            "guide_id": "sessions.use",
+            "content_type": "how_to",
+            "capability_ids": {
+                "sessions.permission-mode",
+                "workspaces.select",
+            },
+            "journey_ids": {"sessions.start", "sessions.resume"},
+        },
+        "jobs": {
+            "guide_id": "jobs.run",
+            "content_type": "how_to",
+            "capability_ids": {"jobs.create", "jobs.review"},
+            "journey_ids": {"jobs.create", "jobs.monitor", "jobs.review"},
+        },
         "automations": {
             "guide_id": "automations.schedule",
+            "content_type": "how_to",
             "capability_ids": {"automations.manage"},
             "journey_ids": {"automations.create"},
         },
         "fleet-and-delegation": {
             "guide_id": "sessions.delegate",
+            "content_type": "how_to",
             "capability_ids": {
                 "sessions.delegate",
                 "jobs.create",
@@ -54,11 +82,25 @@ def test_focused_guides_keep_metadata_contracts():
         },
         "canvas-and-browser": {
             "guide_id": "canvas.present-and-browse",
+            "content_type": "how_to",
             "capability_ids": {"canvas.files", "canvas.browser"},
             "journey_ids": {"canvas.present-file", "canvas.share-browser"},
         },
+        "experts": {
+            "guide_id": "experts.choose-and-customize",
+            "content_type": "reference",
+            "capability_ids": {"experts.select", "experts.manage"},
+            "journey_ids": {"experts.choose", "experts.customize"},
+        },
+        "projects-and-loops": {
+            "guide_id": "projects.organize",
+            "content_type": "how_to",
+            "capability_ids": {"projects.manage"},
+            "journey_ids": {"projects.create", "projects.configure"},
+        },
         "permissions-and-availability": {
             "guide_id": "sessions.permissions-and-workspaces",
+            "content_type": "how_to",
             "capability_ids": {
                 "sessions.permission-mode",
                 "workspaces.select",
@@ -70,6 +112,7 @@ def test_focused_guides_keep_metadata_contracts():
         },
         "project-loops": {
             "guide_id": "projects.loops.run",
+            "content_type": "how_to",
             "capability_ids": {"projects.loops"},
             "journey_ids": {
                 "projects.loops.start",
@@ -78,20 +121,107 @@ def test_focused_guides_keep_metadata_contracts():
         },
         "protected-cloud": {
             "guide_id": "sessions.protected-cloud",
+            "content_type": "how_to",
             "capability_ids": {"sessions.protected-cloud"},
             "journey_ids": {
                 "sessions.protected-cloud.create",
                 "sessions.protected-cloud.review",
             },
         },
+        "memory-and-knowledge": {
+            "guide_id": "memory-and-knowledge.understand",
+            "content_type": "explanation",
+            "capability_ids": {"memory.recall", "projects.knowledge"},
+            "journey_ids": {
+                "memory.configure-scope",
+                "projects.knowledge.browse",
+                "projects.knowledge.record",
+            },
+        },
+        "files-and-integrations": {
+            "guide_id": "workspaces.files-and-results",
+            "content_type": "explanation",
+            "capability_ids": {"workspaces.select"},
+            "journey_ids": {"workspaces.find-results"},
+        },
     }
 
     for topic, wanted in expected.items():
         metadata, _ = _focused_topic(topic)
         assert metadata["guide_id"] == wanted["guide_id"]
-        assert metadata["content_type"] == "how_to"
+        assert metadata["content_type"] == wanted["content_type"]
         assert set(metadata["capability_ids"]) == wanted["capability_ids"]
         assert set(metadata["journey_ids"]) == wanted["journey_ids"]
+
+
+def test_jobs_guide_keeps_current_workspace_review_and_pause_boundaries():
+    _, body = _focused_topic("jobs")
+
+    assert "loading this app guide does not grant those tools" in body
+    assert "worker expert; session experts are not eligible for jobs" in body
+    for label in (
+        "**container**",
+        "**vm (qemu)**",
+        "**virtual (cloud files)**",
+        "**none (no workspace)**",
+    ):
+        assert label in body
+    assert "virtual keeps file tools but disables shell, browser, and git" in body
+    assert "none also disables file tools" in body
+    assert "autonomy controls normal phase-boundary check-ins" in body
+    assert "**partial** — freezes at phase boundaries and at completion" in body
+    assert "**guided** — freezes after every tactical phase" in body
+    assert "some pause reasons are retried or redispatched automatically" in body
+    assert "instead of assuming capacity is the cause" in body
+    assert "do not promise this review mode for every project" in body
+    assert "critic review and the scholar research pre-pass are configurable" in body
+    assert "neither should be described as running for every job" in body
+
+
+def test_experts_guide_covers_current_bundled_roster_and_selection_rules():
+    _, body = _focused_topic("experts")
+
+    for config_path in sorted((_ROOT / "config" / "experts").glob("*/config.yaml")):
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        expert_type = (
+            "session" if config.get("$extends") == "session_base" else "worker"
+        )
+        row = f"| **{config['display_name'].lower()}** | {expert_type} |"
+        assert row in body, config_path.parent.name
+
+    assert {seed["directory"] for seed in MANAGED_SEEDS} == {
+        "assistant",
+        "general-worker",
+    }
+    assert "initial application worker default" in body
+    assert "initial application session default" in body
+    assert "explicitly selected for this run" in body
+    assert "selected project's default" in body
+    assert "your personal default" in body
+    assert "the application default" in body
+    assert "it is immutable after creation" in body
+    assert "bundled disk experts are read-only" in body
+    assert "duplicate" in body and "owned copy" in body
+    assert "cannot be deleted while jobs, sessions, automations" in body
+    assert "this static guide cannot inspect that state" in body
+
+
+def test_memory_guide_separates_compaction_recall_native_kb_and_external_okf():
+    _, body = _focused_topic("memory-and-knowledge")
+
+    assert "context compaction is not long-term memory" in body
+    assert "it is not by itself a promise" in body
+    assert "when memory is enabled" in body
+    assert "failures can degrade the feature" in body
+    assert "a run configured to require memory may pause or fail loudly" in body
+    assert "**share memories across jobs** / `project_scoped` enabled" in body
+    assert "without a project scope, memory stays with the current job or session" in body
+    assert "memory has no general cockpit browsing/editor surface" in body
+    assert "the current knowledge tab does not provide a free-form create/content editor" in body
+    assert "verify that the session actually has knowledge tools" in body
+    assert "additional, reusable, read-only library" in body
+    assert "does not merge it into the writable native project knowledge base" in body
+    assert "do not use memory as the only record of something critical" in body
 
 
 def test_automation_guide_keeps_current_safety_and_actionability_boundaries():

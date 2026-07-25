@@ -1,104 +1,128 @@
+---
+guide_id: jobs.run
+content_type: how_to
+capability_ids:
+  - jobs.create
+  - jobs.review
+journey_ids:
+  - jobs.create
+  - jobs.monitor
+  - jobs.review
+---
+
 # Jobs — autonomous work
 
-A **job** is a task an agent works through on its own: you describe the goal,
-pick an expert, and the agent plans, executes, and comes back with results.
-Jobs run in isolated workspaces and everything they do is versioned, so you
-can always inspect what happened.
+A **job** is a durable task an agent works through away from the chat: you
+describe the outcome, choose a worker expert and settings, and review the
+result when the job checks in or finishes. A job can use a full isolated
+workspace, lightweight cloud files, or no filesystem at all. Do not assume
+that every job has git, shell access, an IDE, or files.
 
-## Creating a job
+## Create a job
 
-**Jobs → New Job** (or ask a session with **Fleet Management** enabled to
-create one for you). Fields:
+Open **Jobs → New Job**. A session can create one for you only when its actual
+tool list includes Fleet Management; loading this App Guide does not grant
+those tools. The form includes:
 
-- **Project** — attach the job to a project (or none) for shared knowledge,
-  connectors, and repos.
-- **Description** — the task brief. This is the main input; be concrete about
-  the goal and what "done" looks like.
-- **Kick-off message** (optional) — an opening prompt to the agent.
-- **Expert** — who does the work (see the experts guide).
-- **Documents** — upload files the agent should work with.
-- **Priority** — Low (backfill), Normal, or High (may preempt lower).
-- **Agent Settings** — autonomy, models, tool categories, connectors, custom
-  instructions, and advanced limits. Defaults are sensible; the most
-  important knob is autonomy.
+- **Project** — use a project when the work should share its goal, eligible
+  connectors, repositories, knowledge, and (when enabled) project memory.
+- **Description** — the main task brief. State the desired outcome,
+  constraints, and what evidence would count as done.
+- **Kick-off message** — an optional first instruction sent when work starts.
+- **Expert** — a worker expert; session experts are not eligible for jobs.
+- **Documents** — optional input files.
+- **Priority** — **Low (backfill)**, **Normal (default)**, or **High (preempts
+  lower)**.
+- Project cloud access, when the selected project has cloud storage.
+- **Agent Settings** — autonomy, models, tool categories, selected connectors,
+  custom instructions, memory, quality helpers, limits, and the workspace
+  backend.
 
-## Autonomy — when the job comes back to you
+The advanced workspace choices are **Container**, eligible **VM (QEMU)**,
+**Virtual (cloud files)**, and **None (no workspace)**. Virtual keeps file
+tools but disables shell, browser, and git tools. None also disables file
+tools. Container and VM are the full workspace tiers; their exact tools still
+depend on the expert and grants.
 
-- **Full** — never asks; completes on its own.
-- **Review** — runs all the way through, then asks you to review the finished
-  work before it counts as completed.
-- **Partial** — checks in once after its initial plan, then again at the end.
-- **Guided** — checks in before every new phase of work.
-- **Dependent** — checks in at every boundary; maximum hand-holding.
+## Choose the review cadence
 
-## Statuses you'll see
+Autonomy controls normal phase-boundary check-ins. It does not bypass tool
+authorization, privileged-command approval, service failures, or other safety
+pauses.
 
-**Created** (queued, waiting for an agent) → **Processing** (an agent is
-working) → then one of: **Pending review** (waiting on you), **Reviewing**
-(the built-in critic is checking the work before you see it), **Completed**,
-**Failed**, **Cancelled**. **Paused** jobs are parked and resume
-automatically when an agent frees up; **Waiting** means the job is holding
-for a subtask (like a research pre-pass) or a reply.
+- **Full** — no planned freeze; runs toward completion autonomously.
+- **Review** — freezes at job completion for human review.
+- **Partial** — freezes at phase boundaries and at completion.
+- **Guided** — freezes after every tactical phase.
+- **Dependent** — freezes after every strategic and tactical phase.
 
-## How the agent works — and how to watch it
+## Read the status
 
-Agents alternate **planning phases** (write/update a plan, stage a todo list)
-with **execution phases** (work through the todos, write results to files).
-You can watch this live: the job's workspace shows `plan.md`, the current
-todo list, and an `output/` folder where deliverables accumulate. Use the
-**Workspace** button to browse the job's git repository (every phase is
-committed), or **IDE** to open the workspace in an in-browser editor.
+- **Created** — ready or queued for dispatch.
+- **Processing** — an agent is currently assigned and working.
+- **Reviewing** — an enabled Critic is evaluating the result.
+- **Pending review** — waiting for your review or a configured check-in.
+- **Waiting** — a parent job is waiting for a Scholar/delegated child or
+  another orchestration dependency.
+- **Paused** — parked. Some pause reasons are retried or redispatched
+  automatically; others need a reply, approval, configuration repair, or
+  manual resume. Read the reason or Inbox item instead of assuming capacity is
+  the cause.
+- **Completed**, **Failed**, or **Cancelled** — terminal outcomes.
 
-## When a job needs you
+## Watch the work
 
-Everything that needs your attention lands in the **Inbox**: reviews, agent
-messages, and permission requests. From there (or the job's Review page) you
-can:
+Workspace-backed worker jobs normally alternate strategic planning and
+tactical execution. With file tools, the workspace can contain `plan.md`,
+todos, archives, inputs, notes, and `output/` deliverables. The exact files
+depend on the expert and task.
 
-- **Approve** — accept finished work (or press **Continue** at a phase-boundary
-  check-in). Optionally leave notes.
-- **Continue with feedback** — send the agent corrections. It condenses its
-  prior context, takes your feedback on board, and re-plans. This also works
-  on failed or paused jobs to get them going again.
-- **Reply to messages** — agents can ask you questions mid-job; blocking
-  questions hold the job until you answer, async ones are picked up at the
-  next planning phase.
-- **Approve or deny privileged commands** — if the agent needs elevated
-  (sudo) access, you get a request showing the exact command. You can also
-  maintain auto-approve/deny rules for command patterns.
-- **Upgrade to a VM** — some work needs a full virtual machine instead of the
-  standard sandbox; you'll be offered the upgrade and can accept or resume
-  without it.
-- **Pause / Cancel** — from the Jobs list at any time.
+Use **View** for the durable job record. **Workspace** appears when a repository
+URL is available, and **IDE** appears only for eligible live, snapshotted, or
+repository-backed root jobs. Git commits and phase tags exist only when the
+chosen workspace/config enables git versioning; Virtual and None jobs do not
+gain git merely because they are jobs.
 
-For project jobs that change project files, the review can include a **diff
-view**: a file-by-file comparison of what the agent wants to change, which
-you **Accept** (applied to the project) or **Reject** (discarded, with the
-work still preserved in git for audit).
+## Respond when the job needs you
 
-## What you get out
+Reviews, agent messages, and permission requests appear in the **Inbox** and
+the relevant job view. Depending on the reason, you can:
 
-- **Deliverables** — named files in the job's `output/` folder, listed in the
-  review together with the agent's **summary** and a **confidence** score.
-- **Git history** — every phase committed and tagged in the job's repository.
-- **Citations and sources** — everything the agent cited, browsable and
-  searchable.
-- **Knowledge notes** — on project jobs with curation enabled, reusable
-  findings are filed into the project knowledge base automatically.
-- **Promote** — turn a finished job into a full project to keep building on
-  it. **Export to Cloud** copies deliverables to a shared cloud folder.
+- **Approve** a finished result or **Continue** a phase-boundary check-in.
+- **Continue with feedback** to resume with corrections; failed and paused
+  jobs can also be resumed when their underlying blocker is resolved.
+- Reply to blocking agent messages.
+- Approve or deny the exact privileged command requested.
+- Approve a requested workspace/VM upgrade, or continue without it when that
+  option is offered.
+- **Pause**, **Resume**, **Cancel**, or, when the job is inactive, **Delete**
+  from the Jobs surface.
 
-## Built-in quality control
+Some project jobs use a file-by-file **diff view** at review time. **Accept**
+lands the proposed change set in the project; **Reject** declines that landing.
+Do not promise this review mode for every project, cloud provider, or
+workspace.
 
-By default, when a job finishes, a **Critic** agent reviews the work first
-(status **Reviewing**). If it finds problems, it sends the job back with
-feedback for another round — several rounds if needed — before the result
-reaches you. A research pre-pass (**Scholar**) can also run before big jobs
-so the worker starts informed. Both are configurable per job.
+## Find and reuse the result
 
-## Automations — jobs on a schedule
+- The review records the agent summary, confidence, and declared
+  deliverables. File deliverables live under `output/` only when the job had a
+  file-capable workspace.
+- Citations are available when the agent used the citation system.
+- Project knowledge notes may be written when knowledge curation and its
+  backing services are enabled; this is not guaranteed for every job.
+- **Promote to project** is for an eligible completed one-off/default-project
+  job and creates a dedicated project from it.
+- **Export to Cloud** appears only for an eligible completed job in the
+  open-folder cloud workflow. Use the button's presence as the current UI
+  signal rather than assuming every deliverable can be exported.
 
-The **Automations** page stores a recurring schedule and job template. Its
-trigger, retry, connector, and safety boundaries differ from a manually
-created job, so route schedule questions to the focused automations guide
-instead of treating an automation as just another job form.
+## Optional quality helpers
+
+Critic review and the Scholar research pre-pass are configurable; neither
+should be described as running for every job. When Critic is enabled, the job
+can enter **Reviewing** and cycle through feedback rounds before reaching you.
+When Scholar is enabled, the parent can wait while the research pre-pass runs.
+
+Scheduled jobs have additional trigger, catch-up, retry, connector, and safety
+rules. Route those questions to the focused **Automations** guide.

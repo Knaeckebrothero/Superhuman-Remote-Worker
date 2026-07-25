@@ -17,9 +17,9 @@ tags:
 > loops/campaigns plus Protected Cloud guidance were implemented through
 > 2026-07-24. M1d also repaired the automation expert-selection contract that
 > the guide audit exposed. The M1f closure plan was defined 2026-07-25 and is
-> now in progress; the remaining original-reference sweep, break-glass health
-> contract, M1 evaluation/deployment gates, live capability plane, visual help,
-> and later roadmap remain open.
+> now in progress. Its core-reference implementation completed 2026-07-25;
+> break-glass health, M1 evaluation/deployment gates, the live capability plane,
+> visual help, and the later roadmap remain open.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -381,7 +381,41 @@ interpret an observed checkbox, badge, error, or workspace, but it cannot query
 the feature flag, engage health, staging freshness, or current user's effective
 state itself; that remains Phase 2.
 
-### Remaining gaps after M1e
+### Implemented M1f work package 1 — core-reference closure
+
+The final original-reference audit is implemented:
+
+- `jobs` now matches the current create form, worker/session eligibility,
+  autonomy boundaries, internal review/wait/pause states, all four workspace
+  tiers, optional Critic/Scholar behavior, conditional Workspace/IDE/diff/cloud
+  actions, and Fleet's actual tool dependency. It no longer promises git,
+  files, automatic pause recovery, or critic review for every job.
+- `experts` now covers the complete bundled roster including General Worker
+  and Product QA Tester, worker versus session type compatibility, the
+  explicit → project → personal → application default chain, managed seed
+  defaults, and current create/duplicate/import/export/edit/delete constraints.
+- `memory-and-knowledge` now separates live conversation context and
+  compaction, optional automatic RecallStore memory, writable native project
+  knowledge, and external read-only OKF knowledge. It documents scope and
+  degraded/required behavior without promising that a particular fact will be
+  extracted or recalled.
+- The overview, sessions, projects, and files references no longer imply a
+  fixed Assistant default, supervised platform default, default Critic,
+  universal project-memory inheritance, one git repository per job, or a
+  filesystem on every workspace tier.
+- Every touched reference now declares content type, capability IDs, and
+  journey IDs, while remaining one hop below the compact router.
+- Focused contracts enumerate the bundled expert roster from current YAML,
+  pin consequential Jobs/Experts/Memory boundaries, and prove that the managed
+  reader loads those topics independently.
+
+The App Guide-specific tests pass. The repository's full combined content
+command currently also observes an unrelated concurrent Canvas/Office coverage
+failure (`CanvasRenderer` includes `office` while the Canvas guide-coverage
+test has not yet classified it); that external drift remains visible and is
+not counted as a pass for the M1 exit gate.
+
+### Remaining gaps after M1f work package 1
 
 The guide is now delivered reliably, but it is not yet self-maintaining or
 runtime-aware:
@@ -431,7 +465,8 @@ capability plane. Its executable plan is
 
 The work is deliberately ordered:
 
-1. finish the original Jobs, Experts, and Memory/Knowledge reference audit;
+1. finish the original Jobs, Experts, and Memory/Knowledge reference audit
+   (implemented 2026-07-25);
 2. add the operator-only `APP_GUIDE_BREAK_GLASS_DISABLED` escape hatch and a
    bounded persistent-agent health signal;
 3. add a held-out routing/answer corpus plus compaction and honest-gap
@@ -465,6 +500,7 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Automation expert selection | `orchestrator/services/automations.py`, `orchestrator/routers/automations.py`, migration `0069`, and the Cockpit editor | M1d adds explicit DB `expert_id`, worker-only validation, pinned/default fire semantics, delete blockers, and backend/Cockpit regressions |
 | Project loops/campaigns | `orchestrator/routers/project_loops.py`, `orchestrator/services/project_loops.py`, the unified advance path in `orchestrator/main.py`, and `cockpit/.../project-loop.component.ts` | M1e documents Standard versus Campaign scheduling, stage-barrier budgeting, campaign guardrails, controls, and the inspection-only live workflow tools; complete runtime state remains Phase 2 |
 | Protected Cloud review | `orchestrator/services/cloud_staging/`, `orchestrator/services/diff_source.py`, protected mount/endpoint wiring in `orchestrator/main.py`, and the session-create/chat/diff-review Cockpit surfaces | M1e documents the shipped flag/backend/workspace gates, staging and whole-diff decision contract, fail-closed posture, conflicts, and recovery boundaries; live evaluation remains Phase 2 |
+| Core Jobs/Experts/Memory references | Current Cockpit create/list/project surfaces, `orchestrator/services/default_experts.py`, bundled expert YAML, `src/services/recall_store.py`, the configured memory pipeline, and native/OKF knowledge paths | M1f work package 1 corrects the original references and their broad overlaps, adds metadata, and pins consequential scope/action/degradation claims plus the complete bundled roster |
 | M1 break-glass/health | `src/core/skill_resolution.py`, `src/tools/product_help.py`, the persistent-agent health route in `src/api/persistent_app.py`, and the shared Helm ConfigMap | M1f adds one default-off negative operator escape hatch, withholds both guide and reader when active, and reports a bounded degraded reason without reviving mutable fallback content |
 | M1 evaluation/acceptance | `eval/app_guide/`, persistent graph/session tests, and `docs/tests/app_guide_m1_verification.md` | M1f separates trigger trajectory, topic routing, grounded facts, near-miss negatives, honest gaps, compaction recovery, and the fresh/resumed live matrix |
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
@@ -1281,11 +1317,12 @@ DB-authored-skills or DB-experts features.
   Automations and Fleet/delegation in M1c, and Canvas/browser plus
   permissions/availability in M1d; project loops/campaigns and Protected Cloud
   shipped in M1e.
-- [ ] Complete the remaining original-reference audit. M1d corrected the
+- [x] Complete the remaining original-reference audit. M1d corrected the
   broad session, overview, and file/workspace claims touched by the new focused
   guides; M1e corrected project organization, loop, session/cloud, and
-  workspace overlaps. Jobs, experts, memory/knowledge, and the remaining broad
-  reference claims still need a final sweep.
+  workspace overlaps. M1f work package 1 corrected Jobs, Experts,
+  Memory/Knowledge, and the remaining broad reference conflicts, added
+  metadata, and pinned their consequential contracts.
 - [x] Repair automation worker-expert selection uncovered by the guide audit:
   filter the Cockpit picker, persist DB experts by UUID, define pinned versus
   effective-default fire semantics, backfill legacy rows, and cover
