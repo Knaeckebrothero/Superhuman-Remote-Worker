@@ -152,12 +152,12 @@ class CanvasSetInput(_StrictFrozenModel):
             raise ValueError("new_app is supported only for workspace_app")
         if self.editable and (
             not is_file
-            or self.renderer not in {"markdown", "text", "html", "html-interactive"}
+            or self.renderer
+            not in {"markdown", "text", "html", "html-interactive", "office"}
         ):
-            if is_file and self.renderer == "office":
-                raise ValueError("Office Canvas sources are view-only in Slice 1")
             raise ValueError(
-                "editable Canvas sources require a validated text or HTML renderer"
+                "editable Canvas sources require a validated text, HTML, or "
+                "Office renderer"
             )
         return self
 
@@ -948,6 +948,7 @@ class CanvasService:
             "text",
             "html",
             "html-interactive",
+            "office",
         }:
             raise CanvasEditError(
                 409,

@@ -1070,6 +1070,8 @@ class _RouteGateway:
         self.error: CanvasFileError | None = None
         self.after_materialize = None
         self.after_validate = None
+        self.editing_supported = True
+        self.edit_candidate_calls = 0
 
     async def materialize_current(self, thread, record):
         del thread, record
@@ -1090,10 +1092,11 @@ class _RouteGateway:
 
     def supports_editing(self, thread, record=None):
         del thread, record
-        return True
+        return self.editing_supported
 
     async def validate_edit_candidate(self, record, data):
         del record
+        self.edit_candidate_calls += 1
         return replace(self.file, data=data, source_version=_file(data).source_version)
 
     async def replace_current(self, thread, record, data, *, expected_source_version):
@@ -1495,7 +1498,7 @@ def test_internal_office_set_is_enabled_only_with_live_collabora(
     from services.canvas_office import CollaboraConfig
 
     office = _office_file()
-    client, service, _, _ = _route_client(monkeypatch, file=office)
+    client, service, gateway, _ = _route_client(monkeypatch, file=office)
     url = f"/api/internal/persistent/threads/{THREAD_ID}/canvases/main/set"
     headers = {"X-Internal-Key": "test-key", "X-MCP-User-Id": USER_ID}
     base_config = dict(
@@ -1533,6 +1536,21 @@ def test_internal_office_set_is_enabled_only_with_live_collabora(
         lambda: CollaboraConfig(enabled=True, **base_config),
     )
     monkeypatch.setattr(canvases, "_get_office_discovery", Discovery)
+    gateway.editing_supported = False
+    unwritable = client.post(
+        url,
+        headers=headers,
+        json={
+            "source_type": "workspace_file",
+            "path": office.path,
+            "editable": True,
+        },
+    )
+    assert unwritable.status_code == 422
+    assert unwritable.json()["detail"]["code"] == "canvas_editing_unsupported"
+    assert service.record is None
+
+    gateway.editing_supported = True
     editable = client.post(
         url,
         headers=headers,
@@ -1542,9 +1560,12 @@ def test_internal_office_set_is_enabled_only_with_live_collabora(
             "editable": True,
         },
     )
-    assert editable.status_code == 422
-    assert "view-only" in editable.json()["detail"]["message"]
-    assert service.record is None
+    assert editable.status_code == 200
+    assert editable.json()["renderer"] == "office"
+    assert editable.json()["editable"] is True
+    assert editable.json()["capabilities"]["can_edit"] is True
+    assert editable.json()["capabilities"]["can_view_office"] is True
+    assert service.record is not None
 
     accepted = client.post(
         url,
@@ -1594,6 +1615,25 @@ def test_office_bytes_never_use_the_generic_canvas_content_route(monkeypatch) ->
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "canvas_office_content_unavailable"
     assert gateway.materialize_calls == 0
+
+    put = client.put(
+        f"/api/persistent/threads/{THREAD_ID}/canvases/main/content",
+        params={
+            "presentation_revision": record.presentation_revision,
+            "source_fingerprint": record.source_fingerprint,
+            "source_version": record.source_version,
+            "ngsw-bypass": "true",
+        },
+        headers={
+            "If-Match": f'"{record.source_version}"',
+            "X-Canvas-Presentation-Revision": str(record.presentation_revision),
+            "Content-Type": "application/octet-stream",
+        },
+        content=office.data,
+    )
+    assert put.status_code == 409
+    assert put.json()["detail"]["code"] == "canvas_office_content_unavailable"
+    assert gateway.edit_candidate_calls == 0
 
 
 def test_office_session_mint_requires_bff_cookie_and_returns_form_contract(
@@ -1685,6 +1725,82 @@ def test_office_session_mint_requires_bff_cookie_and_returns_form_contract(
         "access_token": "signed-token",
         "access_token_ttl": 1_721_858_400_000,
     }
+
+
+def test_editable_office_session_mints_write_scope_and_capability(monkeypatch) -> None:
+    from routers import canvases
+    from services.canvas_office import CollaboraConfig, WopiTokenGrant
+
+    office = _office_file()
+    source = WorkspaceFileSource(path=office.path, workspace_generation=GENERATION)
+    record = CanvasRecord(
+        thread_id=THREAD_ID,
+        canvas_id="main",
+        source=source,
+        title="Office report",
+        renderer="office",
+        editable=True,
+        alt_text=None,
+        presentation_revision=3,
+        source_fingerprint=canonical_source_fingerprint(source),
+        source_version=office.source_version,
+        origin_generation=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    client, _, _, _ = _route_client(monkeypatch, record=record, file=office)
+    config = CollaboraConfig(
+        enabled=True,
+        internal_url="http://collabora:9980",
+        public_origin="https://office.example.test",
+        wopi_base_url="http://orchestrator:8085",
+        cockpit_origin="https://cockpit.example.test",
+        token_ttl_seconds=36_000,
+        discovery_cache_ttl_seconds=60,
+        request_timeout_seconds=2.0,
+    )
+    minted: list[dict[str, Any]] = []
+
+    class Discovery:
+        async def get_urlsrc(self, extension):
+            assert extension == ".docx"
+            return "https://office.example.test/browser/hash/cool.html?"
+
+    class Tokens:
+        def mint(self, **kwargs):
+            minted.append(kwargs)
+            return WopiTokenGrant(
+                access_token="write-token",
+                file_id="e" * 64,
+                expires_at_ms=1_721_858_400_000,
+            )
+
+    monkeypatch.setattr(canvases, "_get_collabora_config", lambda: config)
+    monkeypatch.setattr(canvases, "_get_office_discovery", Discovery)
+    monkeypatch.setattr(canvases, "_get_wopi_token_service", lambda db: Tokens())
+
+    state_url = f"/api/persistent/threads/{THREAD_ID}/canvases/main"
+    state = client.get(state_url)
+    assert state.status_code == 200
+    assert state.json()["capabilities"]["can_edit"] is True
+    session = client.post(
+        f"{state_url}/office-session",
+        headers={
+            "If-Match": state.headers["etag"],
+            "Origin": config.cockpit_origin,
+        },
+        cookies={"srw_session": "33333333-3333-4333-8333-333333333333"},
+        content=b"",
+    )
+    assert session.status_code == 200
+    assert minted == [
+        {
+            "user_id": USER_ID,
+            "thread_id": THREAD_ID,
+            "path": office.path,
+            "write_flag": True,
+        }
+    ]
 
 
 def test_internal_set_rechecks_delegated_owner_before_commit(monkeypatch) -> None:

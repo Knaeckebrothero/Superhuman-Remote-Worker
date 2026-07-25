@@ -1267,6 +1267,7 @@ class ThreadWorkspaceFileGateway:
                 "text",
                 "html",
                 "html-interactive",
+                "office",
             }:
                 return False
             try:
@@ -1296,13 +1297,14 @@ class ThreadWorkspaceFileGateway:
     async def validate_edit_candidate(
         self, record: CanvasRecord, data: bytes
     ) -> ValidatedCanvasFile:
-        """Validate bounded candidate bytes against the selected text renderer."""
+        """Validate bounded candidate bytes without crossing renderer branches."""
 
         if not record.editable or record.renderer not in {
             "markdown",
             "text",
             "html",
             "html-interactive",
+            "office",
         }:
             raise CanvasFileError(
                 409,
@@ -1312,6 +1314,12 @@ class ThreadWorkspaceFileGateway:
         source = record.source
         if not isinstance(source, WorkspaceFileSource):
             raise CanvasFileError(409, "canvas_replaced", "Canvas source was replaced")
+        if record.renderer == "office":
+            return await _validate_materialized_office_bytes_async(
+                source.path,
+                data,
+                None,
+            )
         return await _validate_materialized_bytes_async(
             source.path,
             data,
@@ -1333,6 +1341,17 @@ class ThreadWorkspaceFileGateway:
         source = record.source
         if not isinstance(source, WorkspaceFileSource):
             raise CanvasFileError(409, "canvas_replaced", "Canvas source was replaced")
+        if record.renderer not in {
+            "markdown",
+            "text",
+            "html",
+            "html-interactive",
+        }:
+            raise CanvasFileError(
+                409,
+                "canvas_not_editable",
+                "The text Canvas content route cannot save this renderer",
+            )
         await self.validate_edit_candidate(record, data)
         current = await self.materialize_for_refresh(thread, record)
         if not secrets.compare_digest(current.source_version, expected_source_version):
@@ -1348,6 +1367,63 @@ class ThreadWorkspaceFileGateway:
             data,
         )
         return await self.materialize_for_refresh(thread, record)
+
+    async def replace_current_binary(
+        self,
+        thread: dict[str, Any],
+        record: CanvasRecord,
+        data: bytes,
+        *,
+        expected_source_version: str,
+    ) -> ValidatedCanvasFile:
+        """Recheck, replace, and read back one coordinator-locked Office file."""
+
+        source = record.source
+        if (
+            not isinstance(source, WorkspaceFileSource)
+            or record.renderer != "office"
+            or not record.editable
+        ):
+            raise CanvasFileError(
+                409,
+                "canvas_not_editable",
+                "The current Canvas is not an editable Office document",
+            )
+        # Keep binary validation on the Office-only magic path. This repeats the
+        # pre-lock admission check just as the text writer does; the immutable
+        # private spool is cheap to revalidate and never enters UTF-8 handling.
+        await self.validate_edit_candidate(record, data)
+        current = await self._materialize(
+            thread,
+            source.path,
+            source.workspace_generation,
+            requested_renderer="office",
+            alt_text=None,
+            office_only=True,
+        )
+        if not secrets.compare_digest(
+            current.source_version,
+            expected_source_version,
+        ):
+            raise CanvasFileError(
+                412,
+                "canvas_content_precondition_failed",
+                "Canvas content changed; reload before saving",
+            )
+        await self._write(
+            thread,
+            source.path,
+            source.workspace_generation,
+            data,
+        )
+        return await self._materialize(
+            thread,
+            source.path,
+            source.workspace_generation,
+            requested_renderer="office",
+            alt_text=None,
+            office_only=True,
+        )
 
     async def _write(
         self,

@@ -216,7 +216,7 @@ def _browser_set(
     )
 
 
-def test_office_renderer_is_view_only_in_slice_one() -> None:
+def test_office_renderer_can_be_declared_editable_in_slice_two() -> None:
     source = WorkspaceFileSource(
         path="output/report.docx",
         workspace_generation=_WORKSPACE_GENERATION,
@@ -230,14 +230,14 @@ def test_office_renderer_is_view_only_in_slice_one() -> None:
 
     assert view.renderer == "office"
     assert view.editable is False
-    with pytest.raises(ValueError, match="view-only"):
-        CanvasSetInput(
-            source=source,
-            title="Office report",
-            renderer="office",
-            editable=True,
-            source_version=_SOURCE_VERSION,
-        )
+    editable = CanvasSetInput(
+        source=source,
+        title="Office report",
+        renderer="office",
+        editable=True,
+        source_version=_SOURCE_VERSION,
+    )
+    assert editable.editable is True
 
 
 def _seed_presented(db: _FakeCanvasDB) -> None:
