@@ -485,9 +485,15 @@ class NatsBridge:
                 updates["pod_ip"] = data["pod_ip"]
             if data.get("ssh_nodeport"):
                 updates["ssh_nodeport"] = data["ssh_nodeport"]
-            # waiting_golden telemetry — golden DV name + import progress, used
-            # by the dispatcher's poll logging and park error message.
-            for key in ("golden", "golden_phase", "golden_progress"):
+            # Deferred-create telemetry — golden DV name + import progress, or
+            # why Headscale is unreachable. Used by the dispatcher's poll
+            # logging and park error message.
+            for key in (
+                "golden",
+                "golden_phase",
+                "golden_progress",
+                "headscale_error",
+            ):
                 if data.get(key) is not None:
                     updates[key] = data[key]
 

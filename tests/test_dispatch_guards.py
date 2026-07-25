@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from orchestrator.services.dispatch_guards import (
     VM_GOLDEN_POLL,
+    VM_HEADSCALE_POLL,
     VM_PARK_EXHAUSTED,
     VM_PARK_GOLDEN,
+    VM_PARK_HEADSCALE,
     VM_PARKED,
     VM_PROVISION,
     VM_READY,
@@ -181,3 +183,71 @@ class TestVmGoldenWaitDecision:
         ctx = {"status": "waiting_golden", "golden_wait_started_at": 100.0}
         assert self._decide(ctx, now=2800.0, golden_timeout_s=2700.0) == VM_GOLDEN_POLL
         assert self._decide(ctx, now=2800.1, golden_timeout_s=2700.0) == VM_PARK_GOLDEN
+
+
+class TestVmHeadscaleWaitDecision:
+    """waiting_headscale — a mesh-VPN outage must not burn boot budget.
+
+    The controller has NOT created a VM: it refuses to build one it cannot
+    hand a tailnet pre-auth key to, because such a VM boots and heartbeats
+    but is unreachable over SSH forever. Same shape as waiting_golden —
+    polling must not consume provision attempts, and recycling is meaningless
+    (nothing exists to tear down). Regression for docs/issues/
+    vm_controller_headscale_latch_kills_provisioning.md.
+    """
+
+    def _decide(
+        self,
+        vm_ctx,
+        *,
+        attempts=0,
+        cap=3,
+        now=1000.0,
+        timeout_s=600.0,
+        headscale_timeout_s=900.0,
+    ):
+        return vm_provisioning_decision(
+            vm_ctx,
+            provision_attempts=attempts,
+            max_provision_attempts=cap,
+            now=now,
+            timeout_s=timeout_s,
+            headscale_timeout_s=headscale_timeout_s,
+        )
+
+    def test_waiting_headscale_polls_within_budget(self):
+        ctx = {"status": "waiting_headscale", "headscale_wait_started_at": 900.0}
+        assert self._decide(ctx, now=1000.0) == VM_HEADSCALE_POLL
+
+    def test_waiting_headscale_polls_before_anchor_stamped(self):
+        # First sighting: the dispatcher stamps the anchor in the poll branch.
+        assert self._decide({"status": "waiting_headscale"}) == VM_HEADSCALE_POLL
+
+    def test_waiting_headscale_outlives_boot_budget(self):
+        # 700s in with a 600s boot budget — POLL, not RECYCLE: no VM is
+        # booting, so the boot budget does not apply.
+        ctx = {
+            "status": "waiting_headscale",
+            "headscale_wait_started_at": 300.0,
+            "provisioned_at": 300.0,
+        }
+        assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_HEADSCALE_POLL
+
+    def test_waiting_headscale_ignores_attempt_exhaustion(self):
+        # Attempts bound VM boots; polling is not a boot. Without this, a job
+        # dispatched into a Headscale outage parks instantly on retry cap.
+        ctx = {"status": "waiting_headscale", "headscale_wait_started_at": 900.0}
+        assert self._decide(ctx, attempts=3, cap=3, now=1000.0) == VM_HEADSCALE_POLL
+
+    def test_waiting_headscale_parks_past_budget(self):
+        # Mesh genuinely dead — fail decisively with the real cause rather
+        # than the misleading "provisioning exhausted after N attempts".
+        ctx = {"status": "waiting_headscale", "headscale_wait_started_at": 100.0}
+        assert (
+            self._decide(ctx, now=1000.0, headscale_timeout_s=900.0)
+            == VM_HEADSCALE_POLL
+        )
+        assert (
+            self._decide(ctx, now=1000.1, headscale_timeout_s=900.0)
+            == VM_PARK_HEADSCALE
+        )

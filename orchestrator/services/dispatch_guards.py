@@ -49,6 +49,8 @@ VM_RECYCLE = "recycle"  # stuck past budget → tear down so it re-provisions
 VM_READY = "ready"  # VM booted → proceed to claim/dispatch
 VM_GOLDEN_POLL = "golden_poll"  # golden image importing → re-poll create, free
 VM_PARK_GOLDEN = "park_golden"  # golden import never finished → fail + park
+VM_HEADSCALE_POLL = "headscale_poll"  # mesh VPN down → re-poll create, free
+VM_PARK_HEADSCALE = "park_headscale"  # mesh VPN never recovered → fail + park
 
 # Bounded patience for a cold golden-image import (an agent-vm-base bump).
 # Observed cold import on the shared VM cluster: ~30 min — deliberately above
@@ -56,6 +58,13 @@ VM_PARK_GOLDEN = "park_golden"  # golden import never finished → fail + park
 # (900), which is the misalignment that burned a loop iteration (see
 # docs/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
 DEFAULT_GOLDEN_WAIT_TIMEOUT_S = 2700.0
+
+# Bounded patience for a Headscale outage. The controller refuses to build a
+# VM it cannot hand a tailnet key to, so this budget covers "how long might
+# Headscale plausibly be down". Observed worst case: a full homelab reboot,
+# where Headscale trailed the VM controller by ~8 min. 15 min leaves margin
+# without stalling a loop iteration on a genuinely dead mesh.
+DEFAULT_HEADSCALE_WAIT_TIMEOUT_S = 900.0
 
 
 def vm_provisioning_decision(
@@ -66,6 +75,7 @@ def vm_provisioning_decision(
     now: float,
     timeout_s: float,
     golden_timeout_s: float = DEFAULT_GOLDEN_WAIT_TIMEOUT_S,
+    headscale_timeout_s: float = DEFAULT_HEADSCALE_WAIT_TIMEOUT_S,
 ) -> str:
     """Decide what the dispatcher should do with a VM-backed job's VM.
 
@@ -95,6 +105,15 @@ def vm_provisioning_decision(
                            counting attempts would park every job dispatched
                            into the import window — the exact failure this
                            branch removes.
+      'waiting_headscale'→ HEADSCALE_POLL within ``headscale_timeout_s`` of
+                           ``headscale_wait_started_at``, else PARK_HEADSCALE.
+                           Same shape as waiting_golden and for the same
+                           reason: no VM exists, so polling re-issues create
+                           WITHOUT consuming a provision attempt. The
+                           controller refuses to build a VM while Headscale
+                           is down, because a VM with no tailnet pre-auth key
+                           boots fine but is unreachable forever — it would
+                           silently burn the whole attempt budget.
       not-yet-'ready'    → RECYCLE if stuck past ``timeout_s``, else WAIT
       'ready'            → READY (proceed to claim)
     """
@@ -112,6 +131,11 @@ def vm_provisioning_decision(
         if started and (now - float(started)) > golden_timeout_s:
             return VM_PARK_GOLDEN
         return VM_GOLDEN_POLL
+    if status == "waiting_headscale":
+        started = vm_ctx.get("headscale_wait_started_at")
+        if started and (now - float(started)) > headscale_timeout_s:
+            return VM_PARK_HEADSCALE
+        return VM_HEADSCALE_POLL
     if status != "ready":
         provisioned_at = vm_ctx.get("provisioned_at")
         if provisioned_at and (now - float(provisioned_at)) > timeout_s:
