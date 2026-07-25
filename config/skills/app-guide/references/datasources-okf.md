@@ -19,6 +19,11 @@ External OKF knowledge bases are read-only to agents in this release. Their Git
 credentials remain on the orchestrator's indexing path, and agents receive
 search/read access rather than repository credentials.
 
+A complete setup has two separate checks: **Test Connection** validates the
+source, then the connector's index state must reach **Ready** (or the user must
+account for **Indexing** or **Partial**). Creating or successfully testing the
+connector does not mean that every note is searchable yet.
+
 ## Connect one
 
 1. Open **Connectors** in Cockpit and choose **New Connector**.

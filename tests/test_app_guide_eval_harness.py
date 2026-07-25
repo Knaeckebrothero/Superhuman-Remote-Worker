@@ -175,6 +175,74 @@ def test_grounding_normalization_ignores_markdown_bold(cases):
     assert score["passed"] is True
 
 
+def test_required_facts_allow_only_a_bounded_modifier_gap(cases):
+    shell_case = _case(cases, "availability-missing-shell")
+    shell_calls = [
+        {
+            "name": APP_GUIDE_LOADER_TOOL,
+            "topic_id": "permissions-and-availability",
+        }
+    ]
+
+    faithful = score_case(
+        shell_case,
+        shell_calls,
+        (
+            "Autonomous does not add new tools. Inspect the current workspace "
+            "and capability grant."
+        ),
+    )
+    too_far_apart = score_case(
+        shell_case,
+        shell_calls,
+        (
+            "Autonomous does not add a completely different collection of "
+            "tools. Inspect the current workspace and capability grant."
+        ),
+    )
+
+    assert faithful["answer_score"]["grounding_pass"] is True
+    assert faithful["passed"] is True
+    assert too_far_apart["answer_score"]["grounding_pass"] is False
+    assert too_far_apart["passed"] is False
+
+
+def test_required_fact_gap_accepts_faithful_connector_limit(cases):
+    case = _case(cases, "workflow-weekly-invoice-connector-limit")
+    answer = (
+        "There is no exact Cockpit setup. Automation-fired jobs do not allow "
+        "you to attach connectors to the jobs they create."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "automations"}],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
+def test_forbidden_claims_remain_contiguous_to_avoid_negation_false_positive(cases):
+    case = _case(cases, "availability-email-send-now")
+    answer = (
+        "The connector must be explicitly selected for this session. Check "
+        "the send tier; creating it does not prove access. It can not "
+        "definitely send right now."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "datasources-email"}],
+        answer,
+    )
+
+    assert score["answer_score"]["critical_forbidden_hits"] == []
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
 def test_near_miss_passes_only_without_product_reader(cases):
     case = _case(cases, "near-miss-html-canvas")
 

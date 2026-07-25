@@ -260,6 +260,16 @@ def test_email_guide_requires_both_scope_and_explicit_attachment():
     assert "finish by selecting it for this session" in body
 
 
+def test_okf_guide_separates_source_validation_from_index_readiness():
+    _, body = _focused_topic("datasources-okf")
+
+    assert "a complete setup has two separate checks" in body
+    assert "test connection" in body and "validates the source" in body
+    assert "index state must reach **ready**" in body
+    assert "does not mean that every note is searchable yet" in body
+    assert "initial indexing starts in the background" in body
+
+
 def test_automation_guide_keeps_current_safety_and_actionability_boundaries():
     _, body = _focused_topic("automations")
 
