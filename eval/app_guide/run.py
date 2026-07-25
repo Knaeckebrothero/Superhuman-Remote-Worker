@@ -50,6 +50,8 @@ REQUIRED_NEAR_MISS_TAGS = frozenset(
     {"repository_onboarding", "application_code", "generic_advice", "similar_term"}
 )
 CASE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,79}$")
+PHRASE_TOKEN_RE = re.compile(r"[a-z0-9]+")
+MAX_REQUIRED_FACT_TOKEN_GAP = 3
 
 SYSTEM_FRAME = """\
 You are an assistant running inside Superhuman Remote Worker (SRW). Answer the
@@ -474,6 +476,37 @@ def _normalized_text(value: str) -> str:
     return " ".join(value.split())
 
 
+def _contains_required_fact(normalized_answer: str, alternative: str) -> bool:
+    """Match one required fact while allowing a few intervening modifiers."""
+
+    normalized_alternative = _normalized_text(alternative)
+    if normalized_alternative in normalized_answer:
+        return True
+
+    answer_tokens = PHRASE_TOKEN_RE.findall(normalized_answer)
+    alternative_tokens = PHRASE_TOKEN_RE.findall(normalized_alternative)
+    if not alternative_tokens:
+        return False
+
+    for start, token in enumerate(answer_tokens):
+        if token != alternative_tokens[0]:
+            continue
+        position = start
+        for wanted in alternative_tokens[1:]:
+            window_end = min(
+                len(answer_tokens),
+                position + MAX_REQUIRED_FACT_TOKEN_GAP + 2,
+            )
+            try:
+                relative = answer_tokens[position + 1 : window_end].index(wanted)
+            except ValueError:
+                break
+            position += relative + 1
+        else:
+            return True
+    return False
+
+
 def _score_expectations(
     answer: str,
     expectations: Sequence[dict[str, Any]],
@@ -487,7 +520,11 @@ def _score_expectations(
             (
                 alternative
                 for alternative in expectation["any_of"]
-                if _normalized_text(alternative) in normalized
+                if (
+                    _normalized_text(alternative) in normalized
+                    if forbidden
+                    else _contains_required_fact(normalized, alternative)
+                )
             ),
             None,
         )
