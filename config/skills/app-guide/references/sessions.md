@@ -1,10 +1,21 @@
+---
+guide_id: sessions.use
+content_type: how_to
+capability_ids:
+  - sessions.permission-mode
+  - workspaces.select
+journey_ids:
+  - sessions.start
+  - sessions.resume
+---
+
 # Sessions — working with an agent interactively
 
 A **session** is a live, turn-by-turn conversation with an agent. Unlike a
 job (which runs off on its own), a session keeps you in the loop: you steer,
-the agent works, you see everything as it happens. New sessions use the
-**Assistant** expert by default — a generalist for research, writing,
-analysis, planning, and light coding.
+the agent works, you see everything as it happens. **Assistant** is the initial
+application session default, but an explicit selection, project default,
+personal default, or operator-chosen application default can replace it.
 
 Start one from **Sessions → New Session**: pick a title, projects to attach,
 an expert, and adjust the agent settings (model, permission mode, tools,

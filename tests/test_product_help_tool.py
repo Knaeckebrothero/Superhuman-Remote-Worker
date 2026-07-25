@@ -121,6 +121,22 @@ def test_reader_serves_project_loop_and_protected_cloud_topics_independently():
     assert "close the campaign, not the overall project loop" not in protected
 
 
+def test_reader_serves_jobs_experts_and_memory_topics_independently():
+    catalog = add_persistent_system_skills({})
+    reader = _reader(ToolContext(config={"_resolved_skills": catalog}))
+
+    jobs = reader.invoke({"topic_id": "jobs"})
+    experts = reader.invoke({"topic_id": "experts"})
+    memory = reader.invoke({"topic_id": "memory-and-knowledge"})
+
+    assert "Some pause reasons are retried or redispatched" in jobs
+    assert "Which default wins" not in jobs
+    assert "Which default wins" in experts
+    assert "Context compaction is not long-term memory" not in experts
+    assert "Context compaction is not long-term memory" in memory
+    assert "Some pause reasons are retried or redispatched" not in memory
+
+
 def test_reader_rejects_paths_and_unknown_topics_without_reading_them():
     reader = _reader(_context())
 
