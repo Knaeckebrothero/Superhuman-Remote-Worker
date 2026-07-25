@@ -1,5 +1,7 @@
 # Loop Unified Engine — Phase 1 Implementation Plan
 
+> **EXECUTED AND CLOSED (2026-07-25).** All 8 tasks implemented, reviewed, and merged to `develop` (`737d2888..65fea459` after the push rewrite), deployed to dev and live-validated. The Deploy Notes below were followed with one exception: running loops were NOT paused for the rolling window (no harm observed; the guarded CAS writes held). Task 8's k3d smoke was never run — live dev-loop validation replaced it. Current state lives in `docs/features/loop_unified_engine.md`; this file is kept as the execution record, not as instructions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the parallel-stage barrier the ONLY advance path for project loops (width-1 turns included), thread campaign advance through it, delete the legacy single-job rotate path, and rename the scheduling modes (`rotation → standard`, `planner → campaign`) — with byte-identical observable loop behavior.
