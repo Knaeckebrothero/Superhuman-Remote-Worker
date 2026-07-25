@@ -49,6 +49,9 @@ def test_guide_requires_outcome_level_coverage_and_honest_combination_gaps():
     assert "call `index` only, state an explicit guide gap, and stop" in body
     assert "do not load the nearest topic to manufacture a setup" in body
     assert "it is not a catch-all place to search for a feature absent" in body
+    assert "enterprise identity administration terms such as sso, scim, saml" in body
+    assert "are not project-group or datasource workflows" in body
+    assert "state the guide gap and stop" in body
     assert "route to `memory-and-knowledge`" in body
     assert "the currently proven path requires a **container workspace**" in body
     assert "virtual and none cannot host it" in body
@@ -310,6 +313,7 @@ def test_fleet_guide_keeps_current_scope_and_fallback_boundaries():
     assert "normally inherits this session's selected connectors" in body
     assert "app guide does not grant fleet management" in body
     assert "parallel only when fleet capacity permits" in body
+    assert "three simultaneous starts are not guaranteed" in body
     assert "does not delete jobs" in body
     assert "does not" in body and "continuously monitor a job" in body
     assert "delegation" in body and "different ways srw can split work" in body
