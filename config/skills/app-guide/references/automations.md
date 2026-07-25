@@ -22,9 +22,9 @@ priority, and optional project. Mentioning a connector or product feature in
 the prompt does not attach it to the resulting job. Related features are not
 proof of a supported combined workflow.
 
-In particular, an exact recurring flow that needs any connector—such as
-emailing an invoice, scheduled mailbox triage, or querying a database for a
-report—is not a supported built-in Automation setup today because
+In particular, an exact recurring flow that needs any connector—for example,
+scheduled work that reads a mailbox or database, or sends through
+email—is not a supported built-in Automation setup today because
 automation-fired jobs attach no connectors. Say that the guide does not
 document or support that exact built-in flow. Do not invent a connector
 attachment through project linkage, **Review** autonomy, the Inbox, or prompt

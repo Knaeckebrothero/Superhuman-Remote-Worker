@@ -46,6 +46,11 @@ def test_corpus_is_balanced_and_covers_required_case_classes(cases):
     assert REQUIRED_NEAR_MISS_TAGS <= tags
     assert sum("paraphrase" in case["tags"] for case in cases) >= 3
     assert any(case["expected_gap"] for case in cases)
+    assert (
+        _case(cases, "workflow-weekly-invoice-connector-limit")["expected_topic"]
+        == "automations"
+    )
+    assert _case(cases, "honest-gap-enterprise-identity")["expected_topic"] == "index"
     assert all(case["expected_topic"] is None for case in negatives)
 
 
@@ -136,10 +141,10 @@ def test_near_miss_passes_only_without_product_reader(cases):
 
 
 def test_critical_forbidden_claim_has_zero_tolerance(cases):
-    case = _case(cases, "honest-gap-weekly-invoice")
+    case = _case(cases, "workflow-weekly-invoice-connector-limit")
     score = score_case(
         case,
-        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "index"}],
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "automations"}],
         (
             "The guide does not cover this, but use the weekly invoice toggle "
             "to configure it."

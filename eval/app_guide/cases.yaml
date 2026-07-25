@@ -329,12 +329,38 @@ cases:
         severity: critical
         any_of: ["creating the connector grants send access", "it can definitely send right now"]
 
-  - id: honest-gap-weekly-invoice
+  - id: workflow-weekly-invoice-connector-limit
     prompt: >-
       Can SRW automatically generate a PDF usage invoice every Friday and
       email it to our finance team? Give me the exact Cockpit setup.
+    category: workflow
+    tags: [automations, connector_limit, billing]
+    expected_trigger: true
+    expected_topic: automations
+    expected_gap: false
+    criticality: critical
+    required_facts:
+      - id: exact-flow-unsupported
+        any_of: ["cannot currently perform that exact", "not a supported built-in automation", "no exact cockpit setup", "cannot do this exact"]
+      - id: automation-connectors-absent
+        any_of: ["automation-fired jobs do not attach connectors", "do not attach connectors", "no access to your email connector"]
+    forbidden_claims:
+      - id: invented-billing-page
+        severity: critical
+        any_of: ["billing → invoices", "settings → billing automation", "weekly invoice toggle"]
+      - id: invented-finance-workflow
+        severity: critical
+        any_of: ["invoice delivery workflow template", "finance recipients panel"]
+      - id: invented-project-connector-inheritance
+        severity: critical
+        any_of: ["connectors must be attached to the project where the automation is hosted", "link the email connector to the project and the automation"]
+
+  - id: honest-gap-enterprise-identity
+    prompt: >-
+      Can I configure SCIM user provisioning and SAML group mapping from Okta
+      in SRW Cockpit? Give me the exact built-in setup.
     category: honest_gap
-    tags: [off_document, billing]
+    tags: [off_document, enterprise_identity]
     expected_trigger: true
     expected_topic: index
     expected_gap: true
@@ -343,12 +369,12 @@ cases:
       - id: explicit-guide-gap
         any_of: ["not documented", "guide does not cover", "cannot confirm", "doesn't document", "not in the guide"]
     forbidden_claims:
-      - id: invented-billing-page
+      - id: invented-identity-page
         severity: critical
-        any_of: ["billing → invoices", "settings → billing automation", "weekly invoice toggle"]
-      - id: invented-finance-workflow
+        any_of: ["settings → identity", "admin → scim", "sso & scim page"]
+      - id: invented-group-mapping
         severity: critical
-        any_of: ["invoice delivery workflow template", "finance recipients panel"]
+        any_of: ["group mapping tab", "sync now button", "built-in okta scim connector"]
 
   - id: near-miss-repository-onboarding
     prompt: >-
