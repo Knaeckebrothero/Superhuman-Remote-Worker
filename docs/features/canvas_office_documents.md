@@ -32,7 +32,13 @@ related:
 research pass (three codebase inventories + three web lanes source-verified
 against `CollaboraOnline/online.mirror` current `main`, the SDK 25.04 manual,
 `nextcloud/richdocuments`, `cs3org/wopiserver`, the official
-`collabora-online` Helm chart, and Microsoft's WOPI docs). Not implemented.
+`collabora-online` Helm chart, and Microsoft's WOPI docs).
+**Slices 1+2 IMPLEMENTED on develop 2026-07-25** (Slice 1:
+`dc683398..30be0d18`; Slice 2: `33837e2b..f210dfc9`; unit/spec green —
+152 Python office/canvas tests, 1381 Cockpit tests). **Live gate NOT RUN**
+— the mandatory pre-rollout checklist is
+`docs/tests/canvas_office_verification.md`; do not enable
+`collabora.enabled` on any shared environment before it passes.
 
 ## Motivation
 
