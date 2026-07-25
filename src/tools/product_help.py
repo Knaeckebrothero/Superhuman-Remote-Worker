@@ -19,6 +19,7 @@ from src.core.skill_format import SkillFormatError, parse_skill_md
 from src.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
+    app_guide_break_glass_disabled,
     skill_bundle_digest,
 )
 
@@ -54,6 +55,9 @@ def get_product_help_metadata() -> Dict[str, Dict[str, Any]]:
 
 def create_product_help_tools(context: ToolContext) -> List[Any]:
     """Create managed product-help tools with no workspace dependency."""
+
+    if app_guide_break_glass_disabled():
+        return []
 
     def _current_bundle() -> tuple[str, str, dict[str, str]] | None:
         resolved = context.config.get("_resolved_skills")

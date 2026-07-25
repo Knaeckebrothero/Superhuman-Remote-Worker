@@ -93,6 +93,10 @@ data:
   # DB-backed Agent Skills (skills + skill_files). Read by the orchestrator's
   # skill CRUD/list endpoints. Default-off chart-wide (prod-safe); dev turns it on.
   SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}
+  # Emergency operator-only withdrawal of the immutable App Guide + reader.
+  # Negative/default-off by design; provisioned agent pods inherit this value
+  # via envFrom and expose operator_break_glass in persistent-agent health.
+  APP_GUIDE_BREAK_GLASS_DISABLED: {{ .Values.agent.appGuideBreakGlassDisabled | default "false" | quote }}
   # User-added MCP servers. stdio is separately gated because it runs
   # third-party commands inside dynamically provisioned agent pods.
   MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}

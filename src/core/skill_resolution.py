@@ -15,6 +15,8 @@ import copy
 import hashlib
 import json
 import logging
+import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +26,28 @@ logger = logging.getLogger(__name__)
 
 APP_GUIDE_SKILL = "app-guide"
 APP_GUIDE_LOADER_TOOL = "read_product_guide"
+APP_GUIDE_BREAK_GLASS_ENV = "APP_GUIDE_BREAK_GLASS_DISABLED"
 PRESENT_WITH_CANVAS_SKILL = "present-with-canvas"
 RESERVED_SYSTEM_SKILL_NAMES = frozenset({APP_GUIDE_SKILL})
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def app_guide_break_glass_disabled(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return the operator-owned emergency-disable policy.
+
+    This is deliberately a negative, default-off switch rather than an
+    ordinary user/deployment capability flag. All delivery seams call this
+    helper so catalog installation, reader instantiation, and health reporting
+    cannot interpret the environment differently.
+    """
+
+    env = os.environ if environ is None else environ
+    return (
+        str(env.get(APP_GUIDE_BREAK_GLASS_ENV, "")).strip().lower()
+        in _TRUTHY_ENV_VALUES
+    )
 
 
 def is_reserved_system_skill_name(name: str) -> bool:
@@ -75,6 +97,38 @@ def _read_bundled_skill(
     if name != skill_name:
         raise ValueError(f"Bundled skill name must be {skill_name!r} (got {name!r})")
     return frontmatter, bundled_files
+
+
+def app_guide_health_snapshot(
+    *,
+    skills_root: Path | None = None,
+    reader_available: bool = True,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return the bounded managed-guide delivery state for health surfaces.
+
+    No exception text or filesystem path is returned. Readiness for the chat
+    runtime is intentionally outside this snapshot.
+    """
+
+    if app_guide_break_glass_disabled(environ):
+        return {"state": "disabled", "reason": "operator_break_glass"}
+
+    try:
+        _frontmatter, bundled_files = _read_bundled_skill(
+            APP_GUIDE_SKILL,
+            skills_root=skills_root,
+        )
+        # Exercise the same deterministic digest path the reader verifies.
+        skill_bundle_digest(bundled_files)
+    except (KeyError, OSError):
+        return {"state": "unavailable", "reason": "bundle_unavailable"}
+    except (UnicodeDecodeError, ValueError):
+        return {"state": "unavailable", "reason": "bundle_invalid"}
+
+    if not reader_available:
+        return {"state": "unavailable", "reason": "reader_unavailable"}
+    return {"state": "ready"}
 
 
 def _normalize_catalog(skills: dict[str, Any]) -> tuple[dict[str, Any], list, dict]:
@@ -216,36 +270,41 @@ def add_persistent_system_skills(
     menu = catalog["menu"]
     files = catalog["files"]
 
-    try:
-        frontmatter, bundled_files = _read_bundled_skill(
-            APP_GUIDE_SKILL,
-            skills_root=skills_root,
-        )
-    except (KeyError, OSError, UnicodeDecodeError, ValueError) as exc:
-        # Fail closed: never fall back to a same-name user/frozen payload.
-        logger.warning("Managed app guide is unavailable: %s", exc)
+    if app_guide_break_glass_disabled():
+        logger.warning("Managed app guide disabled by %s", APP_GUIDE_BREAK_GLASS_ENV)
     else:
-        digest = skill_bundle_digest(bundled_files)
-        menu.append(
-            {
-                "id": APP_GUIDE_SKILL,
-                "name": APP_GUIDE_SKILL,
-                "display_name": frontmatter.get("display_name", "App Guide"),
-                "description": str(frontmatter.get("description", "") or "").strip(),
-                "icon": frontmatter.get("icon", "help"),
-                "color": frontmatter.get("color", "#6B7280"),
-                "tags": frontmatter.get("tags", []),
-                "system_managed": True,
-                "loader_tool": APP_GUIDE_LOADER_TOOL,
-                "bundle_digest": digest,
-            }
-        )
-        files[APP_GUIDE_SKILL] = bundled_files
-        menu.sort(
-            key=lambda item: (
-                str(item.get("name", "")) if isinstance(item, dict) else ""
+        try:
+            frontmatter, bundled_files = _read_bundled_skill(
+                APP_GUIDE_SKILL,
+                skills_root=skills_root,
             )
-        )
+        except (KeyError, OSError, UnicodeDecodeError, ValueError) as exc:
+            # Fail closed: never fall back to a same-name user/frozen payload.
+            logger.warning("Managed app guide is unavailable: %s", exc)
+        else:
+            digest = skill_bundle_digest(bundled_files)
+            menu.append(
+                {
+                    "id": APP_GUIDE_SKILL,
+                    "name": APP_GUIDE_SKILL,
+                    "display_name": frontmatter.get("display_name", "App Guide"),
+                    "description": str(
+                        frontmatter.get("description", "") or ""
+                    ).strip(),
+                    "icon": frontmatter.get("icon", "help"),
+                    "color": frontmatter.get("color", "#6B7280"),
+                    "tags": frontmatter.get("tags", []),
+                    "system_managed": True,
+                    "loader_tool": APP_GUIDE_LOADER_TOOL,
+                    "bundle_digest": digest,
+                }
+            )
+            files[APP_GUIDE_SKILL] = bundled_files
+            menu.sort(
+                key=lambda item: (
+                    str(item.get("name", "")) if isinstance(item, dict) else ""
+                )
+            )
 
     return add_default_canvas_skill(catalog, skills_root=skills_root)
 

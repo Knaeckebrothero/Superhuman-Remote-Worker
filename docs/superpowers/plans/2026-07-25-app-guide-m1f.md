@@ -17,11 +17,11 @@ router.
 
 ## Status
 
-In progress. M1a–M1e are shipped. Work package 1 was implemented 2026-07-25;
-its App Guide-specific suites pass, while the full combined content command
+In progress. M1a–M1e are shipped. Work packages 1 and 2 were implemented
+2026-07-25. Their focused suites pass, while the full combined content command
 still exposes an unrelated concurrent Canvas/Office renderer-coverage gap.
-None of the remaining Phase 1 boxes assigned below should be checked until its
-named automated or live evidence exists.
+None of the remaining Phase 1 boxes assigned below should be checked until
+its named automated or live evidence exists.
 
 ## Non-negotiable boundaries
 
@@ -121,23 +121,23 @@ Implementation-time evidence (2026-07-25):
 
 **Runtime contract**
 
-- [ ] Add one shared truthy parser/policy seam for
+- [x] Add one shared truthy parser/policy seam for
   `APP_GUIDE_BREAK_GLASS_DISABLED`; default is false.
-- [ ] When disabled, remove any same-name untrusted entry as today, do not add
+- [x] When disabled, remove any same-name untrusted entry as today, do not add
   the managed bundle, and do not instantiate `read_product_guide`.
-- [ ] Preserve the ordinary Canvas companion and unrelated skill behavior.
-- [ ] Report App Guide state from the persistent agent health surface with one
+- [x] Preserve the ordinary Canvas companion and unrelated skill behavior.
+- [x] Report App Guide state from the persistent agent health surface with one
   of:
   - `ready`;
   - `disabled` / `operator_break_glass`; or
   - `unavailable` / a bounded bundle or reader reason.
-- [ ] Return HTTP 200 for liveness while representing the overall health as
+- [x] Return HTTP 200 for liveness while representing the overall health as
   degraded when the guide is disabled or unavailable. Readiness for the chat
   runtime remains independent.
-- [ ] Expose the negative Helm value under `agent`, render it into the shared
+- [x] Expose the negative Helm value under `agent`, render it into the shared
   ConfigMap inherited by provisioned agents, and document it as emergency
   rollback only.
-- [ ] Prove that re-enabling and rebinding a session restores the current
+- [x] Prove that re-enabling and rebinding a session restores the current
   digest-stamped bundle rather than stale or mutable bytes.
 
 **Automated evidence**
@@ -152,6 +152,16 @@ Implementation-time evidence (2026-07-25):
 helm lint helm/ -f helm/ci/test-values.yaml
 helm lint helm/ -f helm/ci/customer-external-values.yaml
 ```
+
+Implementation-time evidence (2026-07-25):
+
+- Focused Python union: **401 passed**, with four pre-existing warnings.
+- Ruff check and format check pass for all affected Python files.
+- Both Helm lint profiles pass (the existing optional icon recommendation is
+  informational).
+- Rendered shared ConfigMap contains
+  `APP_GUIDE_BREAK_GLASS_DISABLED: "false"` by default and `"true"` under the
+  explicit Helm override.
 
 ## Work package 3 — compaction, routing, and honest-gap evaluations
 
