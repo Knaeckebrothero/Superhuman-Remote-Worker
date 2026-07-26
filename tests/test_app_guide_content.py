@@ -512,6 +512,7 @@ def test_canvas_and_direct_browser_tool_inventories_have_guide_coverage():
             "html",
             "html-interactive",
             "image",
+            "office",
         }
     }
 
