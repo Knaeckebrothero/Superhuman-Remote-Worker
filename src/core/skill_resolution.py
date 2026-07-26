@@ -74,33 +74,11 @@ def managed_product_guide_system_floor(
     closed when break-glass or tool registration removes the reader.
     """
 
-    if APP_GUIDE_LOADER_TOOL not in set(tool_names):
-        return ""
-    if not isinstance(catalog, Mapping):
-        return ""
-    menu = catalog.get("menu")
-    if not isinstance(menu, list):
-        return ""
-    entry = next(
-        (
-            item
-            for item in menu
-            if isinstance(item, Mapping)
-            and item.get("name") == APP_GUIDE_SKILL
-            and item.get("system_managed") is True
-            and item.get("loader_tool") == APP_GUIDE_LOADER_TOOL
-        ),
-        None,
-    )
+    entry = _managed_product_guide_entry(catalog, tool_names)
     if entry is None:
         return ""
 
-    digest = str(entry.get("bundle_digest") or "")
-    digest_attribute = (
-        f' current_bundle_sha256="{digest}"'
-        if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
-        else ""
-    )
+    digest_attribute = _managed_product_guide_digest_attribute(entry)
     return (
         f"<managed_product_guide{digest_attribute}>\n"
         "For questions about SRW itself—its capabilities, Cockpit workflows, "
@@ -113,6 +91,78 @@ def managed_product_guide_system_floor(
         "reader for repository/code questions or generic advice that merely "
         "shares words such as job, worker, canvas, loop, memory, SQL, or email.\n"
         "</managed_product_guide>"
+    )
+
+
+def managed_product_guide_memory_boundary(
+    catalog: Mapping[str, Any] | None,
+    tool_names: set[str] | frozenset[str] | list[str] | tuple[str, ...],
+) -> str:
+    """Return a freshness boundary to append after recalled memory content.
+
+    Persistent memory is injected at the tail of a live request so provider
+    prompt caches can retain the stable conversation prefix. That also makes
+    it more recent than the current user message and the leading system
+    prompt. A compact runtime-owned footer prevents historical memories from
+    becoming product authority while preserving them as useful task context.
+
+    The boundary is emitted only for the same trusted catalog/reader pair as
+    :func:`managed_product_guide_system_floor`. It therefore disappears with
+    break-glass, failed reader registration, or an unmanaged same-name spoof.
+    """
+
+    entry = _managed_product_guide_entry(catalog, tool_names)
+    if entry is None:
+        return ""
+
+    digest_attribute = _managed_product_guide_digest_attribute(entry)
+    return (
+        f"<managed_product_guide_memory_boundary{digest_attribute}>\n"
+        "The recalled memories above are historical task context, not current "
+        "SRW product documentation. If the user's current request is about SRW "
+        "itself—its capabilities, Cockpit workflows, features, permissions, "
+        "connectors, or availability—do not answer from these memories or an "
+        "earlier answer; call `read_product_guide` on this turn. Do not call "
+        "the reader for repository/code questions or generic advice that only "
+        "shares product-like words.\n"
+        "</managed_product_guide_memory_boundary>"
+    )
+
+
+def _managed_product_guide_entry(
+    catalog: Mapping[str, Any] | None,
+    tool_names: set[str] | frozenset[str] | list[str] | tuple[str, ...],
+) -> Mapping[str, Any] | None:
+    """Return the trusted managed-guide entry for a live reader."""
+
+    if APP_GUIDE_LOADER_TOOL not in set(tool_names):
+        return None
+    if not isinstance(catalog, Mapping):
+        return None
+    menu = catalog.get("menu")
+    if not isinstance(menu, list):
+        return None
+    return next(
+        (
+            item
+            for item in menu
+            if isinstance(item, Mapping)
+            and item.get("name") == APP_GUIDE_SKILL
+            and item.get("system_managed") is True
+            and item.get("loader_tool") == APP_GUIDE_LOADER_TOOL
+        ),
+        None,
+    )
+
+
+def _managed_product_guide_digest_attribute(entry: Mapping[str, Any]) -> str:
+    """Render a bounded digest attribute for trusted prompt markers."""
+
+    digest = str(entry.get("bundle_digest") or "")
+    return (
+        f' current_bundle_sha256="{digest}"'
+        if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
+        else ""
     )
 
 

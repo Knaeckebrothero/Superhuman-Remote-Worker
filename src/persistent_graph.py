@@ -89,6 +89,8 @@ def _inject_context_pairs(
     memory_block: str,
     knowledge_block: str,
     citation_feedback_block: str = "",
+    *,
+    product_guide_memory_boundary: str = "",
 ) -> int:
     """Insert transient memory/knowledge/citation context pairs into ``prepared``.
 
@@ -107,14 +109,45 @@ def _inject_context_pairs(
     base_inject_idx = _injection_anchor_index(prepared)
 
     if manager_injection:
-        prepared[base_inject_idx:base_inject_idx] = manager_injection
-        injected_count += len(manager_injection)
+        manager_messages = manager_injection
+        if product_guide_memory_boundary:
+            from .core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
+
+            # Do not mutate the MemoryManager payload: the same messages are
+            # reused on every inner-loop LLM call in this turn.
+            manager_messages = [
+                message.model_copy(
+                    update={
+                        "content": (
+                            f"{message.content}\n\n{product_guide_memory_boundary}"
+                        )
+                    }
+                )
+                if isinstance(message, ToolMessage)
+                and str(getattr(message, "tool_call_id", "")).startswith(
+                    MEMORY_TOOL_CALL_ID_PREFIX
+                )
+                and isinstance(message.content, str)
+                and product_guide_memory_boundary not in message.content
+                else message
+                for message in manager_injection
+            ]
+        prepared[base_inject_idx:base_inject_idx] = manager_messages
+        injected_count += len(manager_messages)
 
     if memory_block:
         try:
             from .core.memory_injection import create_memory_injection_messages
 
             mem_ai, mem_tool = create_memory_injection_messages(memory_block)
+            if product_guide_memory_boundary:
+                mem_tool = mem_tool.model_copy(
+                    update={
+                        "content": (
+                            f"{mem_tool.content}\n\n{product_guide_memory_boundary}"
+                        )
+                    }
+                )
             # Front of the injection zone, before the manager pairs (legacy
             # order preserved).
             prepared.insert(base_inject_idx, mem_ai)
@@ -975,8 +1008,17 @@ async def _execute_turn(
     citation_feedback_block = ""
 
     from .core.knowledge_injection import selected_knowledge_bindings
+    from .core.skill_resolution import (
+        managed_product_guide_memory_boundary as _product_guide_memory_boundary,
+    )
 
     kb_bindings = selected_knowledge_bindings(tool_context)
+    product_guide_memory_nudge = _product_guide_memory_boundary(
+        getattr(config, "extra", {}).get("_resolved_skills")
+        if isinstance(getattr(config, "extra", {}), dict)
+        else None,
+        list(tool_map),
+    )
 
     # Memory/knowledge retrieval with timeout — must never block the LLM call
     _RETRIEVAL_TIMEOUT = 5  # seconds
@@ -1311,6 +1353,7 @@ async def _execute_turn(
             memory_block,
             knowledge_block,
             citation_feedback_block,
+            product_guide_memory_boundary=product_guide_memory_nudge,
         )
 
         # Repair tool-call pairing before the LLM call. Compaction thrash, an

@@ -1,14 +1,17 @@
 """The managed product guide remains callable after message compaction."""
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.core.context import ContextConfig, ContextManager
 from src.core.expert_resolution import fence_skills_menu
 from src.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     add_persistent_system_skills,
+    managed_product_guide_memory_boundary,
     managed_product_guide_system_floor,
 )
+from src.core.memory_injection import create_memory_injection_messages
+from src.persistent_graph import _inject_context_pairs
 from src.tools.context import ToolContext
 from src.tools.product_help import create_product_help_tools
 
@@ -92,6 +95,30 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
     )
     assert "on every relevant turn" in current_floor
     assert "summaries, memories, prior tool results" in current_floor
+
+    # Resume-time memory is tail-injected after the user's current question.
+    # It must end with a current-digest freshness boundary so historical
+    # workspace/product facts cannot become the most recent instruction.
+    current_boundary = managed_product_guide_memory_boundary(
+        catalog,
+        [APP_GUIDE_LOADER_TOOL],
+    )
+    prepared = [
+        SystemMessage(content=current_floor),
+        *compacted,
+        HumanMessage(content="What can this SRW session do now?"),
+    ]
+    recalled = list(create_memory_injection_messages("Old workspace notes"))
+    _inject_context_pairs(
+        prepared,
+        recalled,
+        "",
+        "",
+        product_guide_memory_boundary=current_boundary,
+    )
+    assert isinstance(prepared[-1], ToolMessage)
+    assert prepared[-1].content.endswith(current_boundary)
+    assert catalog["menu"][0]["bundle_digest"] in current_boundary
 
     current_jobs = reader.invoke({"topic_id": "jobs"})
     assert "[product guide topic: jobs]" in current_jobs
