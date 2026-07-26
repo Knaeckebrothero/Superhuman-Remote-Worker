@@ -301,6 +301,8 @@ def test_app_guide_turn_boundary_requires_trusted_live_reader():
     assert entry["bundle_digest"] in boundary
     assert "not current SRW product documentation" in boundary
     assert "must call `read_product_guide` now" in boundary
+    assert "`overview` for broad cross-feature orientation" in boundary
+    assert "`sessions` when the request is specifically about chat/session" in boundary
     assert managed_product_guide_turn_boundary(catalog, ["read_file"]) == ""
 
     spoof = {
