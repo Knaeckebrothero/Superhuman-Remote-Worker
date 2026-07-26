@@ -3964,6 +3964,18 @@ def get_phase_system_prompt(
             expert_identity=expert_identity,
             available_skills=available_skills,
         )
+        # The managed product guide is runtime-owned policy, not an ordinary
+        # user skill. Model-specific interactive templates may intentionally
+        # omit {available_skills}; inject its trusted reader rule separately so
+        # every live prompt family receives the same current-digest floor.
+        from src.core.skill_resolution import managed_product_guide_system_floor
+
+        product_guide_floor = managed_product_guide_system_floor(
+            config.extra.get("_resolved_skills"),
+            tool_names or [],
+        )
+        if product_guide_floor:
+            rendered = f"{product_guide_floor}\n\n{rendered}"
 
         # Prepend reasoning directive for OSS models
         method = detect_reasoning_method(

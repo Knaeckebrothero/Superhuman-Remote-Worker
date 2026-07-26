@@ -7,6 +7,7 @@ from src.core.expert_resolution import fence_skills_menu
 from src.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     add_persistent_system_skills,
+    managed_product_guide_system_floor,
 )
 from src.tools.context import ToolContext
 from src.tools.product_help import create_product_help_tools
@@ -85,6 +86,12 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
     # it is not dependent on retaining an old ToolMessage in conversation.
     current_menu = fence_skills_menu(catalog["menu"])
     assert "- app-guide [load with read_product_guide(topic_id)]" in current_menu
+    current_floor = managed_product_guide_system_floor(
+        catalog,
+        [APP_GUIDE_LOADER_TOOL],
+    )
+    assert "on every relevant turn" in current_floor
+    assert "summaries, memories, prior tool results" in current_floor
 
     current_jobs = reader.invoke({"topic_id": "jobs"})
     assert "[product guide topic: jobs]" in current_jobs
