@@ -47,7 +47,10 @@ The shipped file renderers support:
 - plain text, source code, and LaTeX source text;
 - strict, self-contained static HTML;
 - explicitly requested, self-contained interactive HTML when the current tool
-  schema advertises `html-interactive`; and
+  schema advertises `html-interactive`;
+- Word, Excel, and PowerPoint files (`.docx`, `.xlsx`, `.pptx`) and their
+  OpenDocument equivalents (`.odt`, `.ods`, `.odp`), only on a deployment that
+  enables the Office editor; and
 - PNG, JPEG, WebP, and GIF raster images.
 
 SVG, PDF, Mermaid, and compiled full-document LaTeX are not supported file
@@ -64,12 +67,20 @@ access, or external and sibling resources; every CSS, script, image, and font
 must be in the one bounded HTML file. It is an isolated artifact, not a live
 workspace application.
 
+An Office document is detected from the file itself, so `auto` is enough and
+no other renderer will accept it. On a deployment without the Office editor
+the presentation fails outright instead of degrading to text, so ask the agent
+for a Markdown or plain-text version of the same content. Where the editor is
+enabled, you edit the document in Canvas and the agent edits that same
+workspace file between turns; it does not type beside you in the document.
+
 A one-port live application may be available only when the deployment enables
 **Live Preview** and the current `set_canvas` tool advertises that source type.
 
-Text, Markdown, code, LaTeX source, strict-static-HTML, and supported
-interactive-HTML files may be editable when the workspace is writable and the
-agent presented them with editing enabled. Images are not source-editable.
+Text, Markdown, code, LaTeX source, strict-static-HTML, supported
+interactive-HTML, and Office files may be editable when the workspace is
+writable and the agent presented them with editing enabled. Images are not
+source-editable.
 Before changing an editable file that may have user edits, the agent should
 inspect Canvas and re-read the current file. After changing the file, it must
 present it again to publish the new source version. If Canvas says the source
