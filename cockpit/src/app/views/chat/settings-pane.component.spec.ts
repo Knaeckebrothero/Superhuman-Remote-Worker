@@ -1,12 +1,15 @@
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
-import {of} from 'rxjs';
+import {Observable, Subject, of} from 'rxjs';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ModelService} from '../../core/services/model.service';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
-import {SESSION_TOOL_GROUP_NAMES} from '../agent-settings/agent-settings.types';
+import {
+  SESSION_TOOL_GROUP_BASE_ENABLED,
+  SESSION_TOOL_GROUP_NAMES,
+} from '../agent-settings/agent-settings.types';
 import {SettingsPaneComponent} from './settings-pane.component';
 
 /**
@@ -22,6 +25,11 @@ function createPane(options: {
   grants?: Record<string, unknown> | null;
   attachedIds?: string[];
   eligible?: Array<{id: string; type: string; name: string}>;
+  /** Server-resolved tool-group enablement; null models an orchestrator that
+   *  predates the endpoint (the pane falls back to its session_base mirror). */
+  toolGroups?: Record<string, boolean> | null;
+  /** Observable for the tool-groups call, to drive the load-ordering test. */
+  toolGroups$?: Observable<Record<string, boolean> | null>;
 } = {}) {
   const chat = {
     threadId: signal<string | null>('thread-1'),
@@ -48,6 +56,9 @@ function createPane(options: {
       }),
     ),
     getEligibleDatasources: vi.fn().mockReturnValue(of(options.eligible ?? [])),
+    getSessionToolGroups: vi
+      .fn()
+      .mockReturnValue(options.toolGroups$ ?? of(options.toolGroups ?? null)),
   };
   const capabilities = {grants: signal(options.grants ?? null)};
   const modelService = {load: vi.fn()};
@@ -122,8 +133,17 @@ describe('SettingsPaneComponent apply diff', () => {
   });
 
   it('tool toggles send [] to disable and the vocabulary mirror to re-enable', () => {
+    // Baseline must have canvas OFF and workflows ON for both directions to
+    // diff. The server is the source of that baseline now — an override of
+    // `{tools: {canvas: []}}` alone would leave workflows disabled by the
+    // session_base default, so "disable workflows" would be a no-op.
     const {component, chat, fakeSettings} = createPane({
-      override: {tools: {canvas: []}},
+      toolGroups: {
+        orchestrator: false,
+        agent_catalog: false,
+        workflows: true,
+        canvas: false,
+      },
     });
     // Re-enable canvas, disable workflows in one batch.
     fakeSettings.getOverrides.mockReturnValue({
@@ -139,6 +159,129 @@ describe('SettingsPaneComponent apply diff', () => {
         workflows: [],
       },
     });
+  });
+
+  it('an unset group reads as disabled from the server defaults', () => {
+    // The reported bug: config_override says nothing about orchestrator, so
+    // the pane used to render it ticked while the agent had zero fleet tools.
+    const {fakeSettings} = createPane({
+      override: {},
+      toolGroups: {
+        orchestrator: false,
+        agent_catalog: false,
+        workflows: false,
+        canvas: true,
+      },
+    });
+
+    const prefilled = fakeSettings.prefillFromConfig.mock.calls[0][0] as {
+      tools: Record<string, string[]>;
+    };
+    expect(prefilled.tools['orchestrator']).toEqual([]);
+    expect(prefilled.tools['agent_catalog']).toEqual([]);
+    expect(prefilled.tools['workflows']).toEqual([]);
+    expect(prefilled.tools['canvas']).toEqual(SESSION_TOOL_GROUP_NAMES['canvas']);
+  });
+
+  it('falls back to the session_base mirror when the endpoint is unavailable', () => {
+    // Older orchestrator (404) or a failed request → getSessionToolGroups
+    // yields null, and the client's own defaults must still be correct.
+    const {fakeSettings} = createPane({override: {}, toolGroups: null});
+
+    const prefilled = fakeSettings.prefillFromConfig.mock.calls[0][0] as {
+      tools: Record<string, string[]>;
+    };
+    for (const [group, enabled] of Object.entries(SESSION_TOOL_GROUP_BASE_ENABLED)) {
+      expect(prefilled.tools[group]).toEqual(
+        enabled ? SESSION_TOOL_GROUP_NAMES[group] : [],
+      );
+    }
+  });
+
+  it('a thread override wins over the server defaults', () => {
+    const {fakeSettings} = createPane({
+      override: {tools: {canvas: []}},
+      toolGroups: {
+        orchestrator: false,
+        agent_catalog: false,
+        workflows: false,
+        canvas: true,
+      },
+    });
+
+    const prefilled = fakeSettings.prefillFromConfig.mock.calls[0][0] as {
+      tools: Record<string, string[]>;
+    };
+    expect(prefilled.tools['canvas']).toEqual([]);
+  });
+
+  it('re-enabling a base-disabled group dispatches the vocabulary mirror', () => {
+    // This path was dead before the fix: the group rendered ticked, so its
+    // baseline was "enabled" and turning it on could never produce a delta.
+    const {component, chat, fakeSettings} = createPane({
+      override: {},
+      toolGroups: {
+        orchestrator: false,
+        agent_catalog: false,
+        workflows: false,
+        canvas: true,
+      },
+    });
+    fakeSettings.getOverrides.mockReturnValue({
+      tools: {orchestrator: SESSION_TOOL_GROUP_NAMES['orchestrator']},
+    });
+
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      tools: {orchestrator: SESSION_TOOL_GROUP_NAMES['orchestrator']},
+    });
+  });
+
+  it('late-arriving server defaults never fire a spurious config.update', () => {
+    // The race this design exists to prevent: if the tool-group answer landed
+    // after the lastApplied anchor, liveConfig() would shift under a stale
+    // baseline and the next change would silently disable three tool groups
+    // the user never touched.
+    const toolGroups$ = new Subject<Record<string, boolean> | null>();
+    const {component, chat, fakeSettings} = createPane({override: {}, toolGroups$});
+
+    // Nothing is prefilled or anchored while the join is still open.
+    expect(fakeSettings.prefillFromConfig).not.toHaveBeenCalled();
+    component.onSettingsChange();
+    // Bounded advance, not runAllTimers: with no baseline yet, applyChanges
+    // deliberately re-arms the debounce rather than absorbing the edit, so the
+    // queue never drains until the fetch lands (400 ms re-arm, self-limiting).
+    vi.advanceTimersByTime(2000);
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+
+    // Deliberately DIFFERENT from SESSION_TOOL_GROUP_BASE_ENABLED (orchestrator
+    // is on here): if this landed after the anchor, the baseline would still
+    // hold the mirror's values and the next change would diff against them.
+    toolGroups$.next({
+      orchestrator: true,
+      agent_catalog: false,
+      workflows: false,
+      canvas: true,
+    });
+    toolGroups$.complete();
+
+    expect(fakeSettings.prefillFromConfig).toHaveBeenCalled();
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('a response for a superseded thread is ignored', () => {
+    const toolGroups$ = new Subject<Record<string, boolean> | null>();
+    const {chat, fakeSettings} = createPane({override: {}, toolGroups$});
+
+    chat.threadId.set('thread-2');
+    toolGroups$.next(null);
+    toolGroups$.complete();
+
+    expect(fakeSettings.prefillFromConfig).not.toHaveBeenCalled();
   });
 
   it('rapid edits coalesce into one config.update (one cache invalidation)', () => {

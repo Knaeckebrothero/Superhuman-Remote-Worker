@@ -963,6 +963,13 @@ class PostgresDB:
         parent_uuid = UUID(parent_job_id) if parent_job_id else None
         thread_uuid = UUID(created_by_thread_id) if created_by_thread_id else None
 
+        # Every entry point (REST, MCP, automations, loops, delegation) funnels
+        # through here, so normalize once: surrounding whitespace is never
+        # meaningful and a trailing blank line used to break VM provisioning
+        # outright. Defence in depth only — the render sites escape the value,
+        # which is what actually makes it safe.
+        description = (description or "").strip()
+
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """

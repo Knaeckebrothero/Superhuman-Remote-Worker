@@ -11,11 +11,13 @@ import {
     viewChild,
 } from '@angular/core';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {forkJoin} from 'rxjs';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
 import {
     LIVE_TOOL_CATEGORIES,
     SESSION_TOOL_GROUP_NAMES,
     readConfigPath,
+    toolGroupDefaultsConfig,
 } from '../agent-settings/agent-settings.types';
 import {deepMergeConfig} from '../agent-settings/config-merge';
 import {PersistentChatService, NarrationMode, PermissionMode} from '../../core/services/persistent-chat.service';
@@ -208,6 +210,16 @@ export class SettingsPaneComponent {
 
     /** Redacted config_override from thread metadata (fetched on open). */
     private readonly threadOverride = signal<Record<string, unknown>>({});
+    /** Server-resolved tool-group enablement; null = unknown (not fetched yet,
+     *  older orchestrator, or the request failed) → the session_base mirror
+     *  stands in. Always set BEFORE prefill/anchor — see loadThread. */
+    private readonly serverToolGroups = signal<Record<string, boolean> | null>(null);
+    /** Tool-group defaults expanded into a config fragment, merged UNDER the
+     *  thread override so an unset group resolves to its real default rather
+     *  than reading as enabled. */
+    private readonly toolGroupDefaults = computed(() =>
+        toolGroupDefaultsConfig(this.serverToolGroups()),
+    );
     readonly loadingThread = signal(false);
     /** The session's currently attached datasource ids (durable selection;
      *  optimistically advanced when the pane dispatches a change). */
@@ -225,9 +237,14 @@ export class SettingsPaneComponent {
     private lastApplied: Record<string, unknown> | null = null;
     private applyTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /** The session's current effective config: durable overrides overlaid
-     *  with the live signals (which win — they track config.changed acks, so
-     *  the sub-groups' "resolved default" is always the running state). */
+    /** The session's current effective config: the resolved tool-group
+     *  defaults, overlaid with the durable overrides, overlaid with the live
+     *  signals (which win — they track config.changed acks, so the sub-groups'
+     *  "resolved default" is always the running state).
+     *
+     *  The defaults layer is what makes an absent `tools.<group>` render and
+     *  diff as DISABLED when the base config ships it empty. deepMergeConfig
+     *  replaces arrays wholesale, so an explicitly pinned group still wins. */
     readonly liveConfig = computed(() => {
         const live: Record<string, unknown> = {
             llm: {
@@ -239,7 +256,10 @@ export class SettingsPaneComponent {
                 narration_mode: this.chat.narrationMode(),
             },
         };
-        return deepMergeConfig(this.threadOverride(), live);
+        return deepMergeConfig(
+            deepMergeConfig(this.toolGroupDefaults(), this.threadOverride()),
+            live,
+        );
     });
 
     readonly workspaceTier = computed(() =>
@@ -299,8 +319,25 @@ export class SettingsPaneComponent {
 
     private loadThread(threadId: string): void {
         this.loadingThread.set(true);
-        this.api.getPersistentThread(threadId).subscribe((thread) => {
+        // Honest "unknown" while loading: the mirror stands in until the
+        // server answers, so liveConfig() is never momentarily wrong.
+        this.serverToolGroups.set(null);
+        // forkJoin, NOT two independent subscribes: the tool-group answer must
+        // land BEFORE prefillFromConfig and BEFORE the lastApplied anchor. If
+        // it arrived after, liveConfig() would shift under a stale baseline and
+        // the next change would dispatch a config.update disabling three tool
+        // groups that the user never touched. Both observables are
+        // catchError → of(null) in ApiService, so neither can starve the join.
+        forkJoin({
+            thread: this.api.getPersistentThread(threadId),
+            toolGroups: this.api.getSessionToolGroups(threadId),
+        }).subscribe(({thread, toolGroups}) => {
+            // prefilledThread is claimed synchronously before the fetch, so a
+            // late response for a superseded thread would clobber the pane the
+            // user is actually looking at.
+            if (this.chat.threadId() !== threadId) return;
             this.loadingThread.set(false);
+            this.serverToolGroups.set(toolGroups);
             const metadata = (thread?.['metadata'] ?? {}) as Record<string, unknown>;
             const override = (metadata['config_override'] ?? {}) as Record<string, unknown>;
             this.threadOverride.set(override);
