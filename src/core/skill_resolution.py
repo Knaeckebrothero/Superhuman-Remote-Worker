@@ -60,6 +60,62 @@ def is_reserved_system_skill_name(name: str) -> bool:
     return name in RESERVED_SYSTEM_SKILL_NAMES
 
 
+def managed_product_guide_system_floor(
+    catalog: Mapping[str, Any] | None,
+    tool_names: set[str] | frozenset[str] | list[str] | tuple[str, ...],
+) -> str:
+    """Return the trusted product-guide rule for a live reader/catalog pair.
+
+    Ordinary skill descriptions stay fenced as untrusted user content. The
+    App Guide is different: it is a runtime-owned bundle and its reader is a
+    persistent-session safety floor. Injecting this compact rule outside the
+    fenced menu makes delivery independent of model-specific prompt templates
+    (some intentionally omit ``{available_skills}``) while still failing
+    closed when break-glass or tool registration removes the reader.
+    """
+
+    if APP_GUIDE_LOADER_TOOL not in set(tool_names):
+        return ""
+    if not isinstance(catalog, Mapping):
+        return ""
+    menu = catalog.get("menu")
+    if not isinstance(menu, list):
+        return ""
+    entry = next(
+        (
+            item
+            for item in menu
+            if isinstance(item, Mapping)
+            and item.get("name") == APP_GUIDE_SKILL
+            and item.get("system_managed") is True
+            and item.get("loader_tool") == APP_GUIDE_LOADER_TOOL
+        ),
+        None,
+    )
+    if entry is None:
+        return ""
+
+    digest = str(entry.get("bundle_digest") or "")
+    digest_attribute = (
+        f' current_bundle_sha256="{digest}"'
+        if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
+        else ""
+    )
+    return (
+        f"<managed_product_guide{digest_attribute}>\n"
+        "For questions about SRW itself—its capabilities, Cockpit workflows, "
+        "features, permissions, connectors, or availability—call "
+        "`read_product_guide` before stating product behavior on every "
+        'relevant turn. Use `topic_id="index"` when the exact topic is '
+        "uncertain. Earlier messages, summaries, memories, prior tool results, "
+        "and workspace files may contain stale product guidance; do not answer "
+        "from them instead of making a current reader call. Do not use the "
+        "reader for repository/code questions or generic advice that merely "
+        "shares words such as job, worker, canvas, loop, memory, SQL, or email.\n"
+        "</managed_product_guide>"
+    )
+
+
 def skill_bundle_digest(files: dict[str, str]) -> str:
     """Return a deterministic digest for a validated text skill bundle."""
 
