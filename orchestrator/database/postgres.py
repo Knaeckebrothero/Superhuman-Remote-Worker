@@ -917,6 +917,8 @@ class PostgresDB:
         delegation_context: str | None = None,
         expert_id: str | None = None,
         runner_kind: str = "user",
+        status: str = "created",
+        freeze_data: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -936,6 +938,11 @@ class PostgresDB:
             creation_order: Optional 0-based index for delegation subagent merge ordering
             worktree_path: Optional git worktree path for delegation subagents
             delegation_context: Optional shared context string from parent delegation
+            status: Initial status (default "created"; "paused" + freeze_data
+                creates a born-parked row the dispatcher cannot pick up)
+            freeze_data: Optional freeze dict set atomically at creation — an
+                INSERT-time park has no window in which the dispatcher poll
+                could grab the row (docs/issues/loop_advances_into_active_model_cooldown.md)
 
         Returns:
             Created job dict with id
@@ -947,8 +954,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                 RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind
                 """,
                 description,
@@ -956,7 +963,7 @@ class PostgresDB:
                 config_name,
                 json.dumps(config_override) if config_override else None,
                 json.dumps(context) if context else None,
-                "created",
+                status,
                 user_uuid,
                 project_uuid,
                 branch_name,
@@ -968,6 +975,7 @@ class PostgresDB:
                 delegation_context,
                 UUID(expert_id) if expert_id else None,
                 runner_kind,
+                json.dumps(freeze_data) if freeze_data else None,
             )
 
         return dict(row)
@@ -1107,6 +1115,7 @@ class PostgresDB:
         assigned_agent_id: str | None = None,
         error_message: str | None = None,
         freeze_data: Dict[str, Any] | None = None,
+        error_details: Dict[str, Any] | None = None,
     ) -> bool:
         """Update job status fields.
 
@@ -1116,6 +1125,8 @@ class PostgresDB:
             assigned_agent_id: Agent ID if being assigned
             error_message: Error message if failed
             freeze_data: Freeze metadata dict (for waiting_for_reply, pending_review)
+            error_details: Structured agent error (classification/model/reset_at)
+                persisted alongside a failure so heal-path re-reads see it
 
         Returns:
             True if updated, False if not found
@@ -1149,6 +1160,11 @@ class PostgresDB:
             param_count += 1
             updates.append(f"freeze_data = ${param_count}::jsonb")
             values.append(json.dumps(freeze_data))
+
+        if error_details is not None:
+            param_count += 1
+            updates.append(f"error_details = ${param_count}::jsonb")
+            values.append(json.dumps(error_details))
 
         if not updates:
             return False

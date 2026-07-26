@@ -168,3 +168,46 @@ async def test_unblock_handler_error_does_not_break_sweep(wired, monkeypatch):
     monkeypatch.setattr(main, "_handle_delegation_child_completion", AsyncMock())
 
     assert await main._llm_outage_sweep_once() == (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Born-parked loop members (docs/issues/loop_advances_into_active_model_cooldown.md)
+# — created paused+frozen with NO first_failed_at, so the ceiling clock starts
+# at wake, not at creation. This test fails if anyone ever stamps
+# first_failed_at at park time: the whole park duration would read as elapsed
+# outage and the member would be ceiling-killed at its wake instant.
+# ---------------------------------------------------------------------------
+
+
+def _born_parked_job(job_id):
+    """A loop member created parked: due now, attempt 0, no first/last_failed_at."""
+    real_now = datetime.now(timezone.utc)
+    return {
+        "id": job_id,
+        "config_name": "critic",
+        "user_id": None,
+        "project_id": None,
+        "freeze_data": {
+            "freeze_type": "llm_unavailable",
+            "classification": "cooldown",
+            "next_retry_at": real_now.isoformat(),
+            "attempt": 0,
+            "origin": "loop_cooldown_park",
+        },
+        "context": {
+            "llm_outage": {
+                "attempt": 0,
+                "next_retry_at": real_now.isoformat(),
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_born_parked_job_wakes_and_claims(wired):
+    db, trigger = wired
+    db.list_due_llm_outage_jobs = AsyncMock(return_value=[_born_parked_job("j-park")])
+    assert await main._llm_outage_sweep_once() == (1, 0)
+    db.claim_llm_outage_redispatch.assert_awaited_once_with("j-park")
+    db.fail_llm_outage_job.assert_not_awaited()
+    trigger.assert_called_once()

@@ -102,10 +102,20 @@ def _advance_db(loop: dict, jobs: list[dict], *, barrier: bool = True) -> AsyncM
     db.get_loop_stage_member_statuses.return_value = {
         str(j["id"]): j["status"] for j in jobs
     }
+    # The cooldown-park aggregator refetches failed sibling rows; default to
+    # "row gone" so tests that don't care read as no-park instead of leaking
+    # AsyncMock children into the extractor.
+    db.get_job.return_value = None
     return db
 
 
-def _advance_patches(stack: ExitStack, db: AsyncMock, *, rotate: AsyncMock | None):
+def _advance_patches(
+    stack: ExitStack,
+    db: AsyncMock,
+    *,
+    rotate: AsyncMock | None,
+    notify: AsyncMock | None = None,
+):
     stack.enter_context(patch("main.postgres_db", db))
     stack.enter_context(
         patch(
@@ -113,6 +123,7 @@ def _advance_patches(stack: ExitStack, db: AsyncMock, *, rotate: AsyncMock | Non
         )
     )
     stack.enter_context(patch("main._notify_loop_user_questions", AsyncMock()))
+    stack.enter_context(patch("main._notify_loop_event", notify or AsyncMock()))
     if rotate is not None:
         stack.enter_context(patch("main._rotate_loop_to_next_stage", rotate))
 
@@ -284,3 +295,314 @@ class TestResume:
 
             await _resume_project_loop(LOOP_ID)
         adv.assert_awaited_once_with(done, {}, [])
+
+
+# =============================================================================
+# Born-parked spawn on model-cooldown turn failure
+# (docs/issues/loop_advances_into_active_model_cooldown.md)
+# =============================================================================
+
+
+def _cooldown_error(reset_at: float, message: str = "cool") -> dict:
+    return {
+        "message": message,
+        "type": "llm_error",
+        "recoverable": False,
+        "classification": "cooldown",
+        "model": "gpt-5.3-codex-spark",
+        "reset_at": reset_at,
+    }
+
+
+class TestCooldownPark:
+    @pytest.mark.asyncio
+    async def test_cooldown_failed_member_parks_next_spawn(self):
+        import time as _time
+
+        job = _job(status="failed")
+        loop = _loop(current_stage_jobs=[job["id"]], current_job_id=job["id"])
+        db = _advance_db(loop, [job])
+        rotate, notify = AsyncMock(), AsyncMock()
+        reset_at = _time.time() + 7200
+        actions: list = []
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate, notify=notify)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(
+                job, {"error": _cooldown_error(reset_at)}, actions
+            )
+        kw = rotate.await_args.kwargs
+        assert kw["park_until"] is not None
+        assert abs(kw["park_until"].timestamp() - reset_at) < 2
+        assert kw["consecutive"] == 1
+        assert kw["last_error"] == "cool"  # human string, not the dict
+        assert kw["completed_failed"] is True
+        assert any("parked until" in a for a in actions)
+        notify.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cooldown_reset_in_past_spawns_normally(self):
+        import time as _time
+
+        job = _job(status="failed")
+        loop = _loop(current_stage_jobs=[job["id"]], current_job_id=job["id"])
+        db = _advance_db(loop, [job])
+        rotate, notify = AsyncMock(), AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate, notify=notify)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(
+                job, {"error": _cooldown_error(_time.time() - 60)}, []
+            )
+        assert rotate.await_args.kwargs["park_until"] is None
+        notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noncooldown_dict_error_spawns_normally(self):
+        job = _job(status="failed")
+        loop = _loop(current_stage_jobs=[job["id"]], current_job_id=job["id"])
+        db = _advance_db(loop, [job])
+        rotate, notify = AsyncMock(), AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate, notify=notify)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(
+                job, {"error": {"message": "boom", "type": "llm_error"}}, []
+            )
+        kw = rotate.await_args.kwargs
+        assert kw["park_until"] is None
+        assert kw["last_error"] == "boom"
+        notify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_heal_redrive_reads_persisted_error_details(self):
+        import json as _json
+        import time as _time
+
+        reset_at = _time.time() + 3600
+        job = _job(status="failed")
+        # asyncpg hands JSONB back as a raw JSON string on the heal path.
+        job["error_details"] = _json.dumps(
+            {"classification": "cooldown", "reset_at": reset_at}
+        )
+        loop = _loop(current_stage_jobs=[job["id"]], current_job_id=job["id"])
+        db = _advance_db(loop, [job])
+        rotate = AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(job, {}, [])
+        kw = rotate.await_args.kwargs
+        assert kw["park_until"] is not None
+        assert abs(kw["park_until"].timestamp() - reset_at) < 2
+
+    @pytest.mark.asyncio
+    async def test_fanout_park_uses_max_reset_among_cooldown_failed(self):
+        import time as _time
+
+        t1, t2 = _time.time() + 3600, _time.time() + 7200
+        winner = _job(role="scholar", status="failed")
+        sibling = _job(role="product-qa", status="failed")
+        sibling_row = dict(
+            sibling, error_details={"classification": "cooldown", "reset_at": t2}
+        )
+        loop = _loop(
+            current_stage_jobs=[winner["id"], sibling["id"]], current_job_id=None
+        )
+        db = _advance_db(loop, [winner, sibling])
+        db.get_job.side_effect = lambda jid: (
+            sibling_row if str(jid) == sibling["id"] else None
+        )
+        rotate = AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(winner, {"error": _cooldown_error(t1)}, [])
+        kw = rotate.await_args.kwargs
+        assert abs(kw["park_until"].timestamp() - t2) < 2
+        # Only the sibling needed a row refetch — the winner rode the payload.
+        assert db.get_job.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_fanout_partial_failure_still_parks_but_resets_consecutive(self):
+        import time as _time
+
+        reset_at = _time.time() + 3600
+        ok = _job(role="scholar")
+        bad = _job(role="product-qa", status="failed")
+        bad_row = dict(
+            bad, error_details={"classification": "cooldown", "reset_at": reset_at}
+        )
+        loop = _loop(
+            consecutive_failures=2,
+            current_stage_jobs=[ok["id"], bad["id"]],
+            current_job_id=None,
+        )
+        db = _advance_db(loop, [ok, bad])
+        db.get_job.side_effect = lambda jid: (
+            bad_row if str(jid) == bad["id"] else None
+        )
+        rotate = AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(ok, {}, [])
+        kw = rotate.await_args.kwargs
+        assert kw["consecutive"] == 0
+        assert abs(kw["park_until"].timestamp() - reset_at) < 2
+
+    @pytest.mark.asyncio
+    async def test_park_clamped_to_cap(self):
+        import time as _time
+
+        from services.project_loops import LOOP_COOLDOWN_PARK_CAP_SECONDS
+
+        job = _job(status="failed")
+        loop = _loop(current_stage_jobs=[job["id"]], current_job_id=job["id"])
+        db = _advance_db(loop, [job])
+        rotate = AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(
+                job, {"error": _cooldown_error(_time.time() + 365 * 24 * 3600)}, []
+            )
+        park = rotate.await_args.kwargs["park_until"]
+        assert (
+            abs(park.timestamp() - (_time.time() + LOOP_COOLDOWN_PARK_CAP_SECONDS)) < 30
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_axis_wins_over_park(self):
+        import time as _time
+
+        job = _job(status="failed")
+        loop = _loop(
+            consecutive_failures=2,
+            max_consecutive_failures=3,
+            current_stage_jobs=[job["id"]],
+            current_job_id=job["id"],
+        )
+        db = _advance_db(loop, [job])
+        rotate, notify = AsyncMock(), AsyncMock()
+        with ExitStack() as stack:
+            _advance_patches(stack, db, rotate=rotate, notify=notify)
+            from main import _advance_project_loop
+
+            await _advance_project_loop(
+                job, {"error": _cooldown_error(_time.time() + 7200)}, []
+            )
+        rotate.assert_not_awaited()
+        notify.assert_not_awaited()
+        kw = db.update_project_loop.call_args.kwargs
+        assert kw["status"] == "failed" and kw["stop_reason"] == "failures"
+
+
+class TestParkThreading:
+    @pytest.mark.asyncio
+    async def test_rotate_threads_park_until_to_stage_spawn(self):
+        from datetime import datetime, timezone
+
+        park = datetime(2026, 7, 30, 11, 54, 4, tzinfo=timezone.utc)
+        loop = _loop()
+        db = AsyncMock()
+        spawn = AsyncMock(return_value=([{"id": "j2"}], 2))
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main._spawn_loop_stage", spawn))
+            stack.enter_context(patch("main._writeback_loop_stage", AsyncMock()))
+            from main import _rotate_loop_to_next_stage
+
+            await _rotate_loop_to_next_stage(
+                loop,
+                seq_index_completed=0,
+                base_total=1,
+                next_remaining=5,
+                consecutive=0,
+                last_error=None,
+                actions=[],
+                park_until=park,
+            )
+        assert spawn.await_args.kwargs["park_until"] == park
+
+    @pytest.mark.asyncio
+    async def test_rotate_threads_park_until_into_campaign_step(self):
+        from datetime import datetime, timezone
+
+        park = datetime(2026, 7, 30, 11, 54, 4, tzinfo=timezone.utc)
+        job = _job(role="developer")
+        loop = _loop(scheduling="campaign")
+        planner = AsyncMock(return_value=(True, None))
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", AsyncMock()))
+            stack.enter_context(patch("main._advance_planner_campaign", planner))
+            from main import _rotate_loop_to_next_stage
+
+            await _rotate_loop_to_next_stage(
+                loop,
+                seq_index_completed=0,
+                base_total=1,
+                next_remaining=5,
+                consecutive=0,
+                last_error=None,
+                actions=[],
+                completed_job=job,
+                completed_ctx=job["context"],
+                completed_failed=True,
+                park_until=park,
+            )
+        assert planner.await_args.kwargs["park_until"] == park
+
+    @pytest.mark.asyncio
+    async def test_campaign_member_spawn_inherits_park(self):
+        from datetime import datetime, timezone
+
+        park = datetime(2026, 7, 30, 11, 54, 4, tzinfo=timezone.utc)
+        loop = _loop(scheduling="campaign")
+        campaign = {"id": "c1", "title": "t", "stages": ["developer"]}
+        spawn = AsyncMock(return_value=([{"id": "j3"}], 2))
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", AsyncMock()))
+            stack.enter_context(patch("main._spawn_loop_stage", spawn))
+            stack.enter_context(patch("main._writeback_loop_stage", AsyncMock()))
+            from main import _spawn_campaign_member
+
+            await _spawn_campaign_member(
+                loop,
+                campaign=campaign,
+                stage_index=0,
+                execution_slot=2,
+                base_total=1,
+                next_remaining=5,
+                consecutive=0,
+                last_error=None,
+                actions=[],
+                park_until=park,
+            )
+        assert spawn.await_args.kwargs["park_until"] == park
+
+    @pytest.mark.asyncio
+    async def test_spawn_loop_job_forwards_park_to_create(self):
+        from datetime import datetime, timezone
+
+        park = datetime(2026, 7, 30, 11, 54, 4, tzinfo=timezone.utc)
+        loop = _loop()
+        create = AsyncMock(return_value={"id": "j4"})
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", AsyncMock()))
+            stack.enter_context(patch("main._trigger_dispatch"))
+            stack.enter_context(patch("services.project_loops.create_loop_job", create))
+            stack.enter_context(
+                patch("services.job_provisioning.provision_job_repo", AsyncMock())
+            )
+            from main import _spawn_loop_job
+
+            await _spawn_loop_job(loop, role="critic", iteration=2, park_until=park)
+        assert create.await_args.kwargs["park_until"] == park

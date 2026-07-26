@@ -12250,6 +12250,7 @@ async def _spawn_loop_job(
     remaining_iterations: int | None = None,
     disable_memory_assembler: bool = False,
     extra_context: dict[str, Any] | None = None,
+    park_until: datetime | None = None,
 ) -> dict[str, Any]:
     """Create + provision + dispatch one bare project-loop job.
 
@@ -12276,6 +12277,7 @@ async def _spawn_loop_job(
         remaining_iterations=remaining_iterations,
         disable_memory_assembler=disable_memory_assembler,
         extra_context=extra_context,
+        park_until=park_until,
     )
 
     try:
@@ -12311,6 +12313,7 @@ async def _spawn_loop_stage(
     base_total: int,
     remaining: int | None,
     extra_context: dict[str, Any] | None = None,
+    park_until: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Spawn every role in ONE loop stage and return (jobs, new_total_jobs_run).
 
@@ -12340,6 +12343,7 @@ async def _spawn_loop_stage(
             remaining_iterations=remaining,
             disable_memory_assembler=is_fan_out,
             extra_context=extra_context,
+            park_until=park_until,
         )
         jobs.append(job)
     return jobs, new_total
@@ -12640,6 +12644,7 @@ async def _spawn_campaign_member(
     consecutive: int,
     last_error: str | None,
     actions: list[str],
+    park_until: datetime | None = None,
 ) -> bool:
     """Spawn ONE campaign stage and point the loop at it (planner mode).
 
@@ -12674,6 +12679,7 @@ async def _spawn_campaign_member(
                 "loop_campaign_id": str(campaign["id"]),
                 "loop_campaign_index": int(stage_index),
             },
+            park_until=park_until,
         )
     except Exception as e:
         logger.exception(
@@ -12721,6 +12727,7 @@ async def _advance_planner_campaign(
     consecutive: int,
     last_error: str | None,
     actions: list[str],
+    park_until: datetime | None = None,
 ) -> tuple[bool, Any]:
     """Planner-mode campaign step for a completed single-role loop job.
 
@@ -12833,6 +12840,7 @@ async def _advance_planner_campaign(
             consecutive=consecutive,
             last_error=last_error,
             actions=actions,
+            park_until=park_until,
         )
         return handled, _WB_UNSET
 
@@ -12899,6 +12907,7 @@ async def _advance_planner_campaign(
             consecutive=consecutive,
             last_error=last_error,
             actions=actions,
+            park_until=park_until,
         )
         return handled, _WB_UNSET
 
@@ -13012,6 +13021,7 @@ async def _advance_planner_campaign(
         consecutive=consecutive,
         last_error=last_error,
         actions=actions,
+        park_until=park_until,
     )
     return handled, _WB_UNSET
 
@@ -13028,6 +13038,7 @@ async def _rotate_loop_to_next_stage(
     completed_job: dict[str, Any] | None = None,
     completed_ctx: dict[str, Any] | None = None,
     completed_failed: bool = False,
+    park_until: datetime | None = None,
 ) -> None:
     """Rotate a loop past the just-finished stage and spawn the next one.
 
@@ -13061,6 +13072,7 @@ async def _rotate_loop_to_next_stage(
             consecutive=consecutive,
             last_error=last_error,
             actions=actions,
+            park_until=park_until,
         )
         if handled:
             return
@@ -13108,6 +13120,7 @@ async def _rotate_loop_to_next_stage(
             seq_index=next_index,
             base_total=base_total,
             remaining=next_remaining,
+            park_until=park_until,
         )
     except Exception as e:
         logger.exception("project loop %s: failed to spawn next stage", loop_id)
@@ -13185,6 +13198,51 @@ async def _advance_project_loop(
     await _advance_loop_member(job, result, actions, loop=loop, ctx=ctx or {})
 
 
+async def _loop_cooldown_park_until(
+    winner_job: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    stage_ids: list[str],
+    statuses: dict[str, str],
+) -> datetime | None:
+    """When the completed turn failed on a model cooldown, the instant the
+    NEXT member should wake — else None (spawn normally).
+
+    ANY cooldown-failed member of the turn triggers the park (the loop-level
+    model pin dooms the next turn regardless of sibling successes). Wake =
+    ``max(reset_at)`` among cooldown-failed members, clamped to
+    ``LOOP_COOLDOWN_PARK_CAP_SECONDS``; already-past resets are dropped. The
+    winner's reset rides the in-flight completion payload; siblings went
+    terminal earlier, so their row (``error_details``, written atomically with
+    ``status='failed'``) is the truth.
+    docs/issues/loop_advances_into_active_model_cooldown.md
+    """
+    from services.project_loops import (
+        LOOP_COOLDOWN_PARK_CAP_SECONDS,
+        extract_cooldown_reset_at,
+    )
+
+    winner_id = str(winner_job["id"])
+    resets: list[float] = []
+    for mid in stage_ids:
+        if statuses.get(mid) != "failed":
+            continue
+        if mid == winner_id:
+            reset = extract_cooldown_reset_at(winner_job, result)
+        else:
+            row = await postgres_db.get_job(mid)
+            reset = extract_cooldown_reset_at(row or {}, {})
+        if reset is not None:
+            resets.append(reset)
+
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    future = [r for r in resets if r > now_epoch]
+    if not future:
+        return None
+    park = min(max(future), now_epoch + LOOP_COOLDOWN_PARK_CAP_SECONDS)
+    return datetime.fromtimestamp(park, tz=timezone.utc)
+
+
 async def _advance_loop_member(
     job: dict[str, Any],
     result: dict[str, Any],
@@ -13215,7 +13273,12 @@ async def _advance_loop_member(
     stage_ids = [str(x) for x in (loop.get("current_stage_jobs") or [])]
 
     failed = bool(result.get("error")) or job.get("status") == "failed"
-    member_error = (result.get("error") or "job failed") if failed else None
+    # The agent's error may be a structured dict (e.g. the cooldown fail-fast);
+    # loop last_error and the retro want the human message, not the dict.
+    _err = result.get("error")
+    if isinstance(_err, dict):
+        _err = _err.get("message") or str(_err)
+    member_error = (str(_err) if _err else "job failed") if failed else None
 
     # Per-member artifact handling: squash-merge, F29 flags, retro. Best
     # effort — never blocks the barrier. Runs BEFORE the barrier claim below,
@@ -13274,6 +13337,32 @@ async def _advance_loop_member(
         actions.append(f"project loop {str(loop_id)[:8]} stopped ({stop_reason})")
         return
 
+    # Born-parked next spawn on a model-cooldown turn failure
+    # (docs/issues/loop_advances_into_active_model_cooldown.md, Option A).
+    # Strictly after the barrier claim (exactly-once per turn) and the stop
+    # check (a stopping loop stops exactly as before — no park, no notify).
+    park_until = await _loop_cooldown_park_until(
+        job, result, stage_ids=stage_ids, statuses=statuses
+    )
+    if park_until is not None:
+        park_iso = park_until.isoformat()
+        actions.append(
+            f"project loop {str(loop_id)[:8]}: model cooldown — "
+            f"next member parked until {park_iso}"
+        )
+        await _notify_loop_event(
+            loop,
+            job_id=str(job["id"]),
+            event_type="loop_cooldown_park",
+            subject="Loop waiting for model cooldown",
+            message=(
+                f"A loop member failed because model "
+                f"'{loop.get('model') or 'the pinned model'}' is in a quota "
+                f"cooldown. The next member was created parked and will "
+                f"dispatch automatically at {park_iso}."
+            ),
+        )
+
     await _rotate_loop_to_next_stage(
         loop,
         seq_index_completed=int(loop.get("seq_index") or 0),
@@ -13285,6 +13374,7 @@ async def _advance_loop_member(
         completed_job=job,
         completed_ctx=ctx,
         completed_failed=failed,
+        park_until=park_until,
     )
 
 
@@ -13865,6 +13955,13 @@ async def complete_job(
             kwargs: dict[str, Any] = {"status": new_status}
             if error_message:
                 kwargs["error_message"] = error_message
+            # Persist the agent's structured error alongside the failure so the
+            # loop-advance heal path (which re-runs with result={}) can read
+            # classification/reset_at back off the row. Rides the SAME UPDATE
+            # as status='failed', so a sibling barrier winner never sees one
+            # without the other. docs/issues/loop_advances_into_active_model_cooldown.md
+            if new_status == "failed" and isinstance(result.get("error"), dict):
+                kwargs["error_details"] = result["error"]
             await postgres_db.update_job_status(job_id, **kwargs)
             actions.append(f"status -> {new_status}")
             logger.info(f"Job {job_id} status set to '{new_status}'")
