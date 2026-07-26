@@ -87,7 +87,10 @@ def managed_product_guide_system_floor(
         "relevant turn. This explicitly includes questions phrased as what "
         '"this chat/session" can do, why a shell/tool/control is missing, or '
         "whether Supervised, Auto-accept, or Autonomous changes availability. "
-        'Use `topic_id="sessions"` for broad chat/workspace-tier questions, '
+        'Use `topic_id="overview"` for broad cross-feature orientation '
+        "(including how sessions, jobs, and projects fit together), "
+        '`topic_id="sessions"` when the request is specifically about a '
+        "chat/session or workspace tiers, "
         '`topic_id="permissions-and-availability"` for missing controls or '
         'permission-mode effects, and `topic_id="index"` when the exact topic '
         "is otherwise uncertain. Earlier messages, summaries, memories, prior "
@@ -134,7 +137,9 @@ def managed_product_guide_turn_boundary(
         "For an SRW product question, use a current-digest "
         "`read_product_guide` result from this same user turn if one is already "
         "present; otherwise you must call `read_product_guide` now before "
-        "answering. Use `sessions` for broad chat/workspace-tier questions and "
+        "answering. Use `overview` for broad cross-feature orientation, "
+        "`sessions` when the request is specifically about chat/session "
+        "behavior or workspace tiers, and "
         "`permissions-and-availability` for missing controls or permission-mode "
         "effects. Do not answer from history, memory, or an earlier answer "
         "instead. Do not call the reader for repository/code questions or "
