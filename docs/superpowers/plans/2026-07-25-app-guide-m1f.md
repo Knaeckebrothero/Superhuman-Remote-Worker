@@ -17,14 +17,16 @@ router.
 
 ## Status
 
-Final verification in progress. M1a–M1e are shipped and work packages 1–3 are
-implemented. A first complete live-model run and all six fresh/resumed k3d
-delivery cells ran 2026-07-25; their failures and observations drove a final
-routing/prerequisite hardening pass. The clean final source/image now has a
-recorded identity, but its deployed current-arm evaluation and final-digest
-fresh/resumed confirmation still gate M1. The focused suites pass, while the
-full combined content command still exposes an unrelated concurrent
-Canvas/Office renderer-coverage gap.
+Release verification passed 2026-07-26. M1a–M1f are implemented, the exact
+runtime image passed all six fresh/resumed k3d cells, and the complete
+deployed current-arm evaluation passed 30/30 with no critical forbidden claims
+or provider errors. The final implementation source is
+`6ff4d443c7e2d8defa5db792e2d80f21f392686a`; the follow-up evaluator-manifest
+commit `0bb6d0184d0992e41b4b6220bcaa67ab1213c738` only declares one valid
+cross-topic overlap and does not change runtime bytes. Normal deployment
+values were restored in Helm revision 24, all pods are ready, and the tracked
+synthetic threads, temporary worktrees/files, old candidate images, and
+port-forwards were removed. M1f operational closeout is complete.
 
 ## Non-negotiable boundaries
 
@@ -92,7 +94,7 @@ Canvas/Office renderer-coverage gap.
   tests/test_bundled_skills.py -q
 ```
 
-Implementation-time evidence (2026-07-25):
+Implementation and release evidence (2026-07-25 through 2026-07-26):
 
 - `tests/test_product_help_tool.py` plus `tests/test_bundled_skills.py`:
   **16 passed**.
@@ -102,8 +104,11 @@ Implementation-time evidence (2026-07-25):
 - The unfiltered union is deliberately not recorded as green: it reports one
   Canvas contract failure because the current `CanvasRenderer` contains the
   concurrently introduced `office` value but that separate feature's guide
-  coverage set has not yet classified it. Work package 5 must rerun the
-  unfiltered command.
+  coverage set has not yet classified it.
+- Final M1-scoped union on runtime source `6ff4d443`: **607 passed,
+  1 deselected, 6 warnings** in 54.90 seconds. The sole explicit deselection is
+  that same unrelated Office renderer classification gap; it remains visible
+  and is not counted as App Guide coverage.
 
 ## Work package 2 — operator break-glass and degraded health
 
@@ -156,7 +161,7 @@ helm lint helm/ -f helm/ci/test-values.yaml
 helm lint helm/ -f helm/ci/customer-external-values.yaml
 ```
 
-Implementation-time evidence (2026-07-25):
+Implementation and release evidence (2026-07-25 through 2026-07-26):
 
 - Focused Python union: **401 passed**, with four pre-existing warnings.
 - Ruff check and format check pass for all affected Python files.
@@ -237,9 +242,22 @@ Implementation-time evidence (2026-07-25):
   allowed the first complete current-arm run without persisting a key or base
   URL. It scored 18/30 with no provider errors or critical forbidden claims,
   correctly failing the release gate and exposing routing/grounding weaknesses.
-- A later candidate-snapshot run scored 29/30, but it is diagnostic rather
-  than release evidence. The complete final deployed current arm must still
-  pass against the exact final bundle.
+- A later candidate-snapshot run scored 29/30, but it remains diagnostic
+  rather than release evidence because it preceded the exact final deployed
+  current arm.
+- The exact final deployed current arm subsequently passed **30/30**:
+  trajectory, grounding, positive reader calls, and positive topic routing
+  were all 1.0; near-miss reader false positives were 0.0; critical forbidden
+  claims and errors were both zero. The retained artifact is
+  `eval/app_guide/runs/m1f-live-current-6ff4d443/`.
+- The final corpus digest is
+  `d146ae493509240a64126cf289a5735690ac07037c394c70794d028f974dd0da`;
+  the harness digest is
+  `018fe3db1eca205f2fe14f575208fe5cde4d159a45be13a1ba0d8596ae3cd9e6`.
+- The only manifest correction after runtime source `6ff4d443` permits
+  `permissions-and-availability` as a directly relevant secondary topic for
+  the broad session/workspace question. Required facts and forbidden claims
+  remain unchanged.
 
 ## Work package 4 — fresh/resumed k3d acceptance matrix
 
@@ -265,16 +283,23 @@ Implementation-time evidence (2026-07-25):
 | Resumed pre-M1f thread | off | off | Virtual | Current digest replaces frozen/stale catalog bytes |
 | Resumed pre-M1f thread | off | off | Container | Current guide remains authoritative across workspace persistence |
 
-Checkpoint result: all six cells passed against deployed guide digest
-`7d16da6338f4e6bc1a50b3c1ab20e6da3a2d0405f6815998ecc506d82d744dc0`.
-The later routing hardening produced final digest `20974f2e...`, so the matrix
-remains open until live paths confirm that exact digest.
+Final result: all six cells passed against exact agent image
+`srw-registry:5000/srw-agent:m1f-6ff4d443`, runtime source
+`6ff4d443c7e2d8defa5db792e2d80f21f392686a`, and managed guide digest
+`f05ca7e71e3b8514b8d919cf565c0c93ecb445f967492e5c80affd50990aeb45`.
+Fresh None, Virtual, and Container/Sandbox sessions routed respectively to
+Overview, Email, and Project Loops. Pre-upgrade resumed sessions on the same
+tiers routed respectively to Automations, Fleet/Delegation, and Jobs. No cell
+loaded an unrelated topic.
 
 **Behavioral probes**
 
-- [ ] Ask the core broad question and the Email folder-allowlist question in at
+- [x] Ask the core broad question and the Email folder-allowlist question in at
   least one fresh and one resumed session; confirm the reader trajectory and
-  grounded answer.
+  grounded answer. The checkpoint and final matrices cover both fresh and
+  resumed delivery; the final exact-image fresh probes covered these two
+  questions, while final resumed probes used unseen focused topics to avoid
+  repeated-topic contamination in heavily reused synthetic histories.
 - [x] Force a context compaction, ask a second product question, and confirm
   the guide is retrieved again from the current bundle.
 - [x] Enable the break-glass value in the local test deployment, confirm the
@@ -293,16 +318,29 @@ remains open until live paths confirm that exact digest.
 
 ## Work package 5 — close M1
 
-- [ ] Run the union of focused Python tests, Ruff checks, both Helm lint
+- [x] Run the union of focused Python tests, Ruff checks, both Helm lint
   profiles, and any affected Cockpit checks.
-- [ ] Run `git diff --check` and validate the staged patch independently from
+- [x] Run `git diff --check` and validate the staged patch independently from
   unrelated dirty work.
-- [ ] Update `docs/features/app_guide_skill.md` with shipped M1f behavior and
+- [x] Update `docs/features/app_guide_skill.md` with shipped M1f behavior and
   links to the evaluation/live evidence.
-- [ ] Check the remaining Phase 1 boxes only when their evidence above is
+- [x] Check the remaining Phase 1 boxes only when their evidence above is
   present.
-- [ ] Mark M1 complete only when the Phase 1 exit gate passes for both a fresh
-  chart-default session and a pre-upgrade resumed session.
+- [x] Pass the Phase 1 exit gate for both fresh and pre-upgrade resumed
+  sessions on all three persistent workspace tiers.
+- [x] Restore the normal Helm configuration, permanently delete the exact
+  synthetic threads, remove sensitive temporary files/worktrees, and then mark
+  operational closeout complete.
+
+Final verification summary:
+
+- Python: **607 passed, 1 unrelated deselection, 6 warnings**.
+- Evaluation harness after the final manifest correction: **25 passed**.
+- Ruff check/format and `git diff --check`: pass.
+- Both Helm lint profiles: pass, with only the existing informational icon
+  recommendation.
+- Live matrix: **6/6** on the exact final image and digest.
+- Live current-arm evaluation: **30/30**, release gate pass.
 
 ## Recommended commit boundaries
 
