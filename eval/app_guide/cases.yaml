@@ -40,6 +40,7 @@ cases:
     tags: [paraphrase, orientation]
     expected_trigger: true
     expected_topic: sessions
+    allowed_topics: [permissions-and-availability]
     expected_gap: false
     criticality: standard
     required_facts:
