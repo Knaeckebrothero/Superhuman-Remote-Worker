@@ -530,3 +530,22 @@ class TestDeterminismFailFast:
         status, err = determine_job_status(job, STOP)
         assert status == "paused"
         assert err is None
+
+
+class TestBornParkedShape:
+    """A born-parked loop member's context.llm_outage carries only
+    {attempt: 0, next_retry_at} — evaluate_llm_outage must anchor the outage
+    at the wake instant, not at creation
+    (docs/issues/loop_advances_into_active_model_cooldown.md)."""
+
+    def test_born_parked_shape_survives_wake(self):
+        ctx = {
+            "llm_outage": {
+                "attempt": 0,
+                "next_retry_at": NOW.isoformat(),
+            }
+        }
+        ev = evaluate_llm_outage(ctx, NOW + timedelta(seconds=30))
+        assert ev["over_ceiling"] is False
+        assert ev["attempt"] == 0
+        assert ev["first_failed_at"] == NOW + timedelta(seconds=30)

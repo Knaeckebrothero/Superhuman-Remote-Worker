@@ -23,9 +23,10 @@ aliases:
 
 # DB-Backed Default Experts and Mode Base Configs
 
-> **Status:** Implemented, 2026-07-22. Automated backend, Cockpit, i18n, and
-> production-build verification is complete; the live rollout checks in the
-> verification matrix remain deployment-operator steps.
+> **Status:** Implemented and repository-verified, 2026-07-22. Automated
+> backend, Cockpit, i18n, and production-build verification is complete; the
+> live rollout checks in the verification matrix remain deployment-operator
+> steps.
 > The product decisions in this document were confirmed in the default-expert
 > discussion on 2026-07-22.
 >

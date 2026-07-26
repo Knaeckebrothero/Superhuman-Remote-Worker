@@ -8,11 +8,13 @@ tier so e.g. a loop can run all of its roles on a VM).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 
 from services.project_loops import (
+    extract_cooldown_reset_at,
     build_loop_description,
     build_loop_kickoff,
     create_loop_job,
@@ -316,3 +318,115 @@ class TestLoopCounterStamps:
         ctx = _context(db)
         assert "loop_seq_index" not in ctx
         assert "loop_remaining" not in ctx
+
+
+# =============================================================================
+# extract_cooldown_reset_at (docs/issues/loop_advances_into_active_model_cooldown.md)
+# =============================================================================
+
+
+class TestExtractCooldownResetAt:
+    def test_in_flight_dict_error_wins(self):
+        result = {"error": {"classification": "cooldown", "reset_at": 1785412444.0}}
+        job = {"error_details": {"classification": "cooldown", "reset_at": 1.0}}
+        assert extract_cooldown_reset_at(job, result) == 1785412444.0
+
+    def test_non_cooldown_in_flight_falls_back_to_row(self):
+        result = {"error": {"message": "boom", "type": "llm_error"}}
+        job = {"error_details": {"classification": "cooldown", "reset_at": 42.0}}
+        assert extract_cooldown_reset_at(job, result) == 42.0
+
+    def test_row_error_details_as_json_string(self):
+        job = {
+            "error_details": '{"classification": "cooldown", "reset_at": 1785412444}'
+        }
+        assert extract_cooldown_reset_at(job, {}) == 1785412444.0
+
+    def test_heal_shape_empty_result_reads_row(self):
+        job = {"error_details": {"classification": "cooldown", "reset_at": 7.5}}
+        assert extract_cooldown_reset_at(job, {}) == 7.5
+
+    def test_both_absent_returns_none(self):
+        assert extract_cooldown_reset_at({}, {}) is None
+        assert extract_cooldown_reset_at(None, None) is None
+
+    def test_non_cooldown_classification_returns_none(self):
+        job = {"error_details": {"classification": "transient", "reset_at": 5.0}}
+        assert extract_cooldown_reset_at(job, {}) is None
+
+    def test_missing_or_bad_reset_at_returns_none(self):
+        assert (
+            extract_cooldown_reset_at(
+                {"error_details": {"classification": "cooldown"}}, {}
+            )
+            is None
+        )
+        job = {"error_details": {"classification": "cooldown", "reset_at": "soon"}}
+        assert extract_cooldown_reset_at(job, {}) is None
+
+    def test_malformed_json_string_returns_none(self):
+        assert extract_cooldown_reset_at({"error_details": "not json{"}, {}) is None
+
+
+# =============================================================================
+# Born-parked creation (docs/issues/loop_advances_into_active_model_cooldown.md)
+# =============================================================================
+
+
+PARK_UNTIL = datetime(2026, 7, 30, 11, 54, 4, tzinfo=timezone.utc)
+
+
+class TestBornParkedCreation:
+    @pytest.mark.asyncio
+    async def test_park_until_creates_born_parked_row(self):
+        db = _db()
+        await create_loop_job(
+            db,
+            _loop(model="gpt-5.3-codex-spark"),
+            role="critic",
+            iteration=4,
+            park_until=PARK_UNTIL,
+        )
+        kwargs = db.create_job.call_args.kwargs
+        assert kwargs["status"] == "paused"
+        fd = kwargs["freeze_data"]
+        assert fd["freeze_type"] == "llm_unavailable"
+        assert fd["classification"] == "cooldown"
+        assert fd["next_retry_at"] == PARK_UNTIL.isoformat()
+        assert fd["attempt"] == 0
+        assert fd["model"] == "gpt-5.3-codex-spark"
+        ctx = kwargs["context"]
+        assert ctx["llm_outage"] == {
+            "attempt": 0,
+            "next_retry_at": PARK_UNTIL.isoformat(),
+        }
+        # The ceiling landmine: first_failed_at at creation time would make
+        # evaluate_llm_outage read the whole park as elapsed outage and kill
+        # the member AT WAKE. It must be absent.
+        assert "first_failed_at" not in ctx["llm_outage"]
+
+    @pytest.mark.asyncio
+    async def test_without_park_is_unchanged(self):
+        db = _db()
+        await create_loop_job(db, _loop(), role="scholar", iteration=1)
+        kwargs = db.create_job.call_args.kwargs
+        assert kwargs["status"] == "created"
+        assert kwargs["freeze_data"] is None
+        assert "llm_outage" not in kwargs["context"]
+
+    @pytest.mark.asyncio
+    async def test_park_context_wins_over_extra_context(self):
+        db = _db()
+        await create_loop_job(
+            db,
+            _loop(),
+            role="critic",
+            iteration=2,
+            extra_context={"llm_outage": {"attempt": 9}},
+            park_until=PARK_UNTIL,
+        )
+        ctx = db.create_job.call_args.kwargs["context"]
+        assert ctx["llm_outage"] == {
+            "attempt": 0,
+            "next_retry_at": PARK_UNTIL.isoformat(),
+        }
