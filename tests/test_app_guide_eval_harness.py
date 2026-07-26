@@ -175,6 +175,24 @@ def test_grounding_normalization_ignores_markdown_bold(cases):
     assert score["passed"] is True
 
 
+def test_email_attachment_fact_accepts_explicit_connector_selection(cases):
+    case = _case(cases, "workflow-share-email-folder")
+    answer = (
+        "Open Connectors and create an Email connector with the Folder "
+        "allowlist. Leaving it empty shares the whole mailbox. Explicitly "
+        "select this connector for the intended session, job, or project."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "datasources-email"}],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
 def test_required_facts_allow_only_a_bounded_modifier_gap(cases):
     shell_case = _case(cases, "availability-missing-shell")
     shell_calls = [
