@@ -19,7 +19,14 @@ cases:
       - id: jobs-are-autonomous
         any_of: ["jobs are autonomous", "jobs (autonomous)", "autonomous work", "background job"]
       - id: projects-share-context
-        any_of: ["shared goal", "shared context", "shared knowledge", "knowledge and connectors"]
+        any_of:
+          - "shared goal"
+          - "shared context"
+          - "shared knowledge"
+          - "knowledge and connectors"
+          - "shared home for a specific goal"
+          - "provide a shared home"
+          - "durable context"
     forbidden_claims:
       - id: all-workspaces-have-shell
         severity: critical
