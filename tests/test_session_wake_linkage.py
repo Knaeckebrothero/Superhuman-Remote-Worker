@@ -151,9 +151,7 @@ class TestLinkagePersistence:
         assert kwargs["wake_on_complete"] is True
 
     @pytest.mark.asyncio
-    async def test_job_without_a_thread_gets_no_backref(
-        self, linkage_db, fake_request
-    ):
+    async def test_job_without_a_thread_gets_no_backref(self, linkage_db, fake_request):
         """A cockpit/automation job has nobody to wake."""
         from main import JobCreate
 
