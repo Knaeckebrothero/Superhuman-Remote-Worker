@@ -97,8 +97,9 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
     assert "summaries, memories, prior tool results" in current_floor
 
     # Resume-time memory is tail-injected after the user's current question.
-    # It must end with a current-digest freshness boundary so historical
-    # workspace/product facts cannot become the most recent instruction.
+    # A transient HumanMessage must follow it with a current-digest freshness
+    # boundary so historical workspace/product facts cannot become the most
+    # recent instruction.
     current_boundary = managed_product_guide_memory_boundary(
         catalog,
         [APP_GUIDE_LOADER_TOOL],
@@ -116,8 +117,10 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
         "",
         product_guide_memory_boundary=current_boundary,
     )
-    assert isinstance(prepared[-1], ToolMessage)
-    assert prepared[-1].content.endswith(current_boundary)
+    assert isinstance(prepared[-2], ToolMessage)
+    assert prepared[-2].content == "Old workspace notes"
+    assert isinstance(prepared[-1], HumanMessage)
+    assert prepared[-1].content == current_boundary
     assert catalog["menu"][0]["bundle_digest"] in current_boundary
 
     current_jobs = reader.invoke({"topic_id": "jobs"})

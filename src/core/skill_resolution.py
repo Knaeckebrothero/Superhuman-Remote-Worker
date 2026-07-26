@@ -98,13 +98,14 @@ def managed_product_guide_memory_boundary(
     catalog: Mapping[str, Any] | None,
     tool_names: set[str] | frozenset[str] | list[str] | tuple[str, ...],
 ) -> str:
-    """Return a freshness boundary to append after recalled memory content.
+    """Return a tail-user freshness boundary for transient recalled context.
 
     Persistent memory is injected at the tail of a live request so provider
     prompt caches can retain the stable conversation prefix. That also makes
     it more recent than the current user message and the leading system
-    prompt. A compact runtime-owned footer prevents historical memories from
-    becoming product authority while preserving them as useful task context.
+    prompt. A compact runtime-owned ``HumanMessage`` after all transient
+    context restores the current user request as the final instruction and
+    prevents historical memories or knowledge from becoming product authority.
 
     The boundary is emitted only for the same trusted catalog/reader pair as
     :func:`managed_product_guide_system_floor`. It therefore disappears with
@@ -118,13 +119,16 @@ def managed_product_guide_memory_boundary(
     digest_attribute = _managed_product_guide_digest_attribute(entry)
     return (
         f"<managed_product_guide_memory_boundary{digest_attribute}>\n"
-        "The recalled memories above are historical task context, not current "
-        "SRW product documentation. If the user's current request is about SRW "
-        "itself—its capabilities, Cockpit workflows, features, permissions, "
-        "connectors, or availability—do not answer from these memories or an "
-        "earlier answer; call `read_product_guide` on this turn. Do not call "
-        "the reader for repository/code questions or generic advice that only "
-        "shares product-like words.\n"
+        "Return to the current user's request above after considering the "
+        "transient context. Recalled memories and knowledge are historical task "
+        "context, not current SRW product documentation. If that request is "
+        "about SRW itself—its capabilities, Cockpit workflows, features, "
+        "permissions, connectors, or availability—use a current-digest "
+        "`read_product_guide` result from this same user turn if one is already "
+        "present; otherwise call `read_product_guide` now. Do not answer from "
+        "memory or an earlier answer instead. Do not call the reader for "
+        "repository/code questions or generic advice that only shares "
+        "product-like words.\n"
         "</managed_product_guide_memory_boundary>"
     )
 
