@@ -7,8 +7,8 @@ from src.core.expert_resolution import fence_skills_menu
 from src.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     add_persistent_system_skills,
-    managed_product_guide_memory_boundary,
     managed_product_guide_system_floor,
+    managed_product_guide_turn_boundary,
 )
 from src.core.memory_injection import create_memory_injection_messages
 from src.persistent_graph import _inject_context_pairs
@@ -100,7 +100,7 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
     # A transient HumanMessage must follow it with a current-digest freshness
     # boundary so historical workspace/product facts cannot become the most
     # recent instruction.
-    current_boundary = managed_product_guide_memory_boundary(
+    current_boundary = managed_product_guide_turn_boundary(
         catalog,
         [APP_GUIDE_LOADER_TOOL],
     )
@@ -115,7 +115,7 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
         recalled,
         "",
         "",
-        product_guide_memory_boundary=current_boundary,
+        product_guide_turn_boundary=current_boundary,
     )
     assert isinstance(prepared[-2], ToolMessage)
     assert prepared[-2].content == "Old workspace notes"
