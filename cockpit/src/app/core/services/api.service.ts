@@ -137,6 +137,20 @@ export interface IdeSessionStatus {
 }
 
 /**
+ * Server-resolved enablement of the four closed session tool groups.
+ *
+ * `source` names the agent path the answer models: `resolved` (the
+ * orchestrator-resolved blob the agent hydrates), `legacy` (experts off — an
+ * unset group is enabled there), or `error`, in which case `tool_groups` is
+ * null and the caller falls back to its own base defaults.
+ */
+export interface SessionToolGroupsResponse {
+  thread_id: string;
+  source: 'resolved' | 'legacy' | 'error';
+  tool_groups: Record<string, boolean> | null;
+}
+
+/**
  * Snapshot storage statistics from the orchestrator.
  */
 export interface SnapshotStorageStats {
@@ -1544,6 +1558,29 @@ export class ApiService {
             .pipe(
                 catchError((error) => {
                     console.error(`Failed to get thread ${threadId}:`, error);
+                    return of(null);
+                }),
+            );
+    }
+
+    /**
+     * Get the server-resolved enablement of the four closed session tool
+     * groups. Authoritative: it folds in the base config, expert and project
+     * layers, none of which the thread's `config_override` reveals.
+     *
+     * Null on any failure — including a 404 from an orchestrator that predates
+     * the endpoint — so the caller falls back to SESSION_TOOL_GROUP_BASE_ENABLED.
+     * Deliberately silent (no toast): the fallback is correct for the stock case.
+     */
+    getSessionToolGroups(threadId: string): Observable<Record<string, boolean> | null> {
+        return this.http
+            .get<SessionToolGroupsResponse>(
+                `${this.baseUrl}/persistent/threads/${threadId}/tool-groups`,
+            )
+            .pipe(
+                map((response) => response?.tool_groups ?? null),
+                catchError((error) => {
+                    console.error(`Failed to get tool groups for thread ${threadId}:`, error);
                     return of(null);
                 }),
             );

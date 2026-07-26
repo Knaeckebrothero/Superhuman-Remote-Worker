@@ -68,8 +68,6 @@ tools:
     - search_papers
     - download_paper
     - get_paper_info
-    - browse_website
-    - download_from_website
     - research_topic
   browser_direct:
     - browser_navigate

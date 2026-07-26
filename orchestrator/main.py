@@ -263,6 +263,7 @@ from src.core.datasource_setup import datasource_tool_categories  # noqa: E402
 from src.core.session_tool_overrides import (  # noqa: E402
     SESSION_TOOL_OVERRIDE_NAMES,
     SessionToolOverrideError,
+    session_tool_group_enablement,
     validate_session_tool_overrides,
 )
 
@@ -302,7 +303,11 @@ from services.default_experts import (  # noqa: E402
     resolve_root_expert,
     seed_managed_default_experts,
 )
-from src.core.loader import canonical_config_name  # noqa: E402
+from src.core.loader import (  # noqa: E402
+    canonical_config_name,
+    load_and_merge_config,
+    resolve_config_path,
+)
 from services.session_router import SessionRouterService  # noqa: E402
 from services.session_tokens import SessionTokenService  # noqa: E402
 from services.lifecycle import (  # noqa: E402
@@ -1667,6 +1672,107 @@ async def _resolve_session_config(
         if status is not None:
             status["state"] = "error"
         return None
+
+
+def _merged_session_tool_groups(
+    *,
+    base_config_name: str,
+    expert_row: dict[str, Any] | None,
+    project_overrides: dict[str, Any] | None,
+    request_override: dict[str, Any] | None,
+) -> dict[str, bool]:
+    """The four closed session tool groups as the RESOLVED path will bind them.
+
+    SYNCHRONOUS — ``resolve_config`` parses YAML off disk and reads prompt
+    files. Call it from ``asyncio.to_thread`` so it cannot block the loop.
+
+    Runs the SAME ``resolve_config`` layering as ``_resolve_session_config``
+    minus everything that provably cannot reach ``tools``. Anything skipped
+    here that CAN move a tool group is a correctness bug, so the ledger is
+    explicit:
+
+    - ``base_defaults`` (``_resolve_session_account_defaults``) emits only
+      ``llm``/``auxiliary``/``interactive``/``command_allowlist``/``headless``/
+      ``workspace``, and the settings matrix its model choice feeds
+      (``src/core/loader._apply_settings_matrix``) writes only ``llm``,
+      ``limits`` and ``shell.mode``. Saves 2 round trips.
+    - ``_seed_registry_model_overrides`` only ``setdefault``s ``llm.*``.
+    - ``skills`` is written to the returned blob AFTER ``resolve_config`` takes
+      the ``capture`` deepcopy, so it cannot appear in the merged fragment.
+    - ``_enforce_dispatch_grants`` is a PDP, not a transform. Skipping it means
+      a grant-denied session still gets a resolved-shaped answer; that session
+      never attaches, and this read surface must not become a second 403.
+    - ``_thread_project_ids`` / ``_thread_has_knowledge_scope`` /
+      ``inject_blob_credentials`` all act on the post-capture delivery copy and
+      inject transport/KB-profile keys only.
+    - The attach-time ``config_override`` (warm-pool) differs from the stored
+      one only by ``workspace.*`` and datasource categories
+      (``graph``/``sql``/``mongodb``/``webdav``/``email``/``mcp``) — disjoint
+      from these four groups.
+
+    Kept, because each CAN set ``tools.*``: the base config name, the expert
+    row, the project-expert link override, and the request override (which is
+    where a live Settings toggle lands, so this stays fresh after a toggle).
+    """
+    capture: dict[str, Any] = {}
+    resolve_config(
+        base_config_name=base_config_name,
+        base_defaults=None,
+        expert_row=expert_row,
+        project_overrides=project_overrides,
+        request_override=request_override,
+        expert_type="session",
+        capture=capture,
+    )
+    return session_tool_group_enablement(capture.get("merged_fragment") or {})
+
+
+def _legacy_session_tool_groups(
+    base_config_name: str,
+    request_override: dict[str, Any] | None,
+) -> dict[str, bool]:
+    """The four groups as the LEGACY (experts-off) agent path will bind them.
+
+    SYNCHRONOUS — loads the base YAML. Call via ``asyncio.to_thread``.
+
+    This path answers the OPPOSITE of the resolved path for an unset group.
+    ``persistent_app._apply_session_tool_group_markers`` sets a disable marker
+    only on an explicit ``config_override.tools.<group> == []``, and
+    ``persistent_session._setup_tools`` then APPENDS the canonical lists for
+    ``orchestrator``/``agent_catalog``/``workflows`` whenever the marker is
+    absent — so an unset group is ENABLED regardless of the base YAML's ``[]``.
+
+    ``canvas`` is asymmetric: its branch is strip-only with no append, so it
+    additionally requires a non-empty ``tools.canvas`` in the loaded base.
+
+    Fidelity caveat: when the thread has no ``config_name`` the agent falls back
+    to the POD's boot YAML, which the orchestrator cannot observe; we proxy with
+    ``session_base``. Affects ``canvas`` only, and only when experts are off.
+    """
+    explicit = (request_override or {}).get("tools")
+    explicit = explicit if isinstance(explicit, dict) else {}
+    groups = {
+        group: explicit.get(group) != []
+        for group in SESSION_TOOL_OVERRIDE_NAMES
+        if group != "canvas"
+    }
+    canvas_names: Any = explicit.get("canvas")
+    if canvas_names is None:
+        try:
+            base_path, _ = resolve_config_path(base_config_name)
+            base_tools = (load_and_merge_config(base_path) or {}).get("tools") or {}
+            canvas_names = base_tools.get("canvas")
+        except Exception:
+            logger.warning(
+                "Legacy tool-group probe could not load base config '%s'; "
+                "reporting canvas as enabled",
+                base_config_name,
+            )
+            canvas_names = None
+        if canvas_names is None:
+            canvas_names = ["_unknown_base_assume_enabled"]
+    groups["canvas"] = bool(canvas_names)
+    return groups
 
 
 async def _session_grant_violations(thread: dict[str, Any]) -> list[str]:
@@ -21597,6 +21703,77 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
         if m.get("mount_kind") == "project" and m.get("source_ref")
     ]
     return result
+
+
+@app.get("/api/persistent/threads/{thread_id}/tool-groups")
+async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, Any]:
+    """Resolved enablement of the four closed session tool groups (auth: owner).
+
+    The Cockpit Settings→Tools checkboxes render from this. They cannot be
+    derived from the thread's ``config_override`` alone: an unset group resolves
+    to ``session_base``'s ``[]`` — i.e. DISABLED — so guessing "absent means on"
+    shows a ticked Fleet Management box for a session whose agent has no fleet
+    tools at all. That is exactly the bug this endpoint closes.
+
+    Deliberately NOT a field on ``GET /api/persistent/threads/{id}``: that
+    endpoint is hot (every pane open, every thread load, the list view's
+    sibling) and this answer costs a config resolve.
+
+    ``source`` tells the caller which agent path the answer models:
+
+    - ``resolved`` — the orchestrator-resolved blob the agent hydrates.
+    - ``legacy`` — experts off, so the agent takes the ``config_name`` +
+      ``config_override`` fallback, where an unset group is ENABLED.
+    - ``error`` — the resolve failed, so ``tool_groups`` is ``None``. Honest by
+      construction: a resolve error REFUSES the attach (fail closed) rather
+      than downgrading to legacy, so there is no agent answer to report.
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    request_override = metadata.get("config_override") or None
+
+    base = canonical_config_name(thread.get("config_name") or "session_base")
+    if _looks_like_uuid(base):
+        # Sentinel / cockpit-conflated expert UUID → the real session base.
+        base = "session_base"
+
+    if not _is_experts_db_enabled() or not await _user_experts_enabled():
+        groups = await asyncio.to_thread(
+            _legacy_session_tool_groups, base, request_override
+        )
+        return {"thread_id": thread_id, "source": "legacy", "tool_groups": groups}
+
+    try:
+        expert_id = metadata.get("expert_id")
+        expert_row = (
+            await postgres_db.get_expert_by_id(str(expert_id)) if expert_id else None
+        )
+        project_id = str(thread["project_id"]) if thread.get("project_id") else None
+        project_overrides = None
+        if project_id and expert_id:
+            link = await postgres_db.get_project_expert_link(
+                project_id=project_id, expert_id=str(expert_id)
+            )
+            if link:
+                project_overrides = link.get("config_override") or None
+                if isinstance(project_overrides, str):
+                    project_overrides = json.loads(project_overrides)
+        groups = await asyncio.to_thread(
+            _merged_session_tool_groups,
+            base_config_name=base,
+            expert_row=expert_row,
+            project_overrides=project_overrides,
+            request_override=request_override,
+        )
+    except Exception:
+        logger.exception("Tool-group resolve failed for thread %s", thread_id)
+        return {"thread_id": thread_id, "source": "error", "tool_groups": None}
+    return {"thread_id": thread_id, "source": "resolved", "tool_groups": groups}
 
 
 @app.patch("/api/persistent/threads/{thread_id}")
