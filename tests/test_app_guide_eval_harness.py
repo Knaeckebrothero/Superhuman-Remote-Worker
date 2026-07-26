@@ -300,6 +300,42 @@ def test_required_fact_gap_accepts_faithful_connector_limit(cases):
     assert score["passed"] is True
 
 
+def test_connector_limit_accepts_support_attaching_wording(cases):
+    case = _case(cases, "workflow-weekly-invoice-connector-limit")
+    answer = (
+        "The guide does not document a supported built-in workflow for this "
+        "exact outcome. Automation-fired jobs do not support attaching "
+        "connectors, so they cannot use the Email connector."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "automations"}],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
+def test_email_selection_accepts_explicit_attach_wording(cases):
+    case = _case(cases, "availability-email-send-now")
+    answer = (
+        "Creating it does not prove current access. Explicitly attach it to "
+        "this session, then check the Send tier and send without human "
+        "approval setting."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "datasources-email"}],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
 def test_fleet_capacity_fact_accepts_can_queue_paraphrase(cases):
     case = _case(cases, "workflow-background-fleet")
     answer = (
