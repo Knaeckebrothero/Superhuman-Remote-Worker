@@ -4,7 +4,12 @@ import {of} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {ToolsGroupComponent} from './tools-group.component';
 import {ExecutionGroupComponent} from './execution-group.component';
-import {LIVE_TOOL_CATEGORIES, SESSION_TOOL_GROUP_NAMES} from './agent-settings.types';
+import {
+  LIVE_TOOL_CATEGORIES,
+  SESSION_TOOL_GROUP_BASE_ENABLED,
+  SESSION_TOOL_GROUP_NAMES,
+  toolGroupDefaultsConfig,
+} from './agent-settings.types';
 
 /**
  * Live-mode behavior of the shared settings surface
@@ -83,6 +88,38 @@ describe('ToolsGroupComponent live mode', () => {
 
     const overrides = component.getOverrides() as {tools?: Record<string, string[]>};
     expect(overrides.tools?.['workflows']).toEqual([]);
+  });
+});
+
+describe('toolGroupDefaultsConfig', () => {
+  it('expands the session_base mirror when the server answer is unavailable', () => {
+    const config = toolGroupDefaultsConfig(null) as {tools: Record<string, string[]>};
+
+    expect(Object.keys(config.tools).sort()).toEqual([
+      'agent_catalog',
+      'canvas',
+      'orchestrator',
+      'workflows',
+    ]);
+    for (const [group, enabled] of Object.entries(SESSION_TOOL_GROUP_BASE_ENABLED)) {
+      expect(config.tools[group]).toEqual(
+        enabled ? SESSION_TOOL_GROUP_NAMES[group] : [],
+      );
+    }
+  });
+
+  it('a partial server answer falls back per key, and unknown keys are ignored', () => {
+    const config = toolGroupDefaultsConfig({
+      orchestrator: true,
+      not_a_group: true,
+    }) as {tools: Record<string, string[]>};
+
+    expect(config.tools['orchestrator']).toEqual(SESSION_TOOL_GROUP_NAMES['orchestrator']);
+    // Unanswered groups keep the base default (disabled), and the bogus key
+    // never reaches the fragment.
+    expect(config.tools['workflows']).toEqual([]);
+    expect(config.tools['canvas']).toEqual(SESSION_TOOL_GROUP_NAMES['canvas']);
+    expect(config.tools['not_a_group']).toBeUndefined();
   });
 });
 

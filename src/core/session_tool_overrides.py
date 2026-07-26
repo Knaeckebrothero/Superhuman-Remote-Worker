@@ -100,8 +100,33 @@ def validate_session_tool_overrides(
     return accepted
 
 
+def session_tool_group_enablement(merged_config: Any) -> dict[str, bool]:
+    """Return resolved-path enablement per closed session group.
+
+    A group is DISABLED iff its merged list is exactly ``[]`` — the positive
+    reading of ``orchestrator.main._session_tool_group_disabled_markers`` and
+    the exact predicate the runtime gates apply
+    (``persistent_session._fleet_management_enabled`` and its siblings).
+
+    An ABSENT key reads as enabled.  That is only reachable on the legacy
+    (experts-off) path: the resolved path always merges ``session_base``, which
+    declares every one of these groups explicitly.
+
+    Takes the fully merged config fragment — ``capture["merged_fragment"]`` from
+    ``resolve_config`` — NOT a request-layer ``config_override``.  Feeding it the
+    latter reproduces the very bug this exists to close, because an unset group
+    would read enabled when the base ships it empty.
+    """
+
+    tools = merged_config.get("tools") if isinstance(merged_config, dict) else None
+    if not isinstance(tools, dict):
+        return {group: True for group in SESSION_TOOL_OVERRIDE_NAMES}
+    return {group: tools.get(group) != [] for group in SESSION_TOOL_OVERRIDE_NAMES}
+
+
 __all__ = [
     "SESSION_TOOL_OVERRIDE_NAMES",
     "SessionToolOverrideError",
+    "session_tool_group_enablement",
     "validate_session_tool_overrides",
 ]

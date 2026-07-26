@@ -79,6 +79,44 @@ export const SESSION_TOOL_GROUP_NAMES: Record<string, string[]> = {
   workflows: ['list_automations', 'get_automation', 'list_automation_runs', 'propose_automation', 'get_project_loop', 'list_project_loop_jobs', 'explain_project_loop'],
   canvas: ['set_canvas', 'get_canvas', 'clear_canvas'],
 };
+
+/**
+ * Default enablement of each closed session group in config/session_base.yaml —
+ * a group ships EMPTY (= DISABLED) unless listed true here, so "absent from the
+ * thread override" must NOT be read as enabled. Pinned against drift by
+ * tests/test_session_tool_group_mirror.py.
+ *
+ * This is the fallback for GET /api/persistent/threads/{id}/tool-groups, which
+ * is authoritative because it also folds in the expert and project layers.
+ * Used when that endpoint is unavailable (older orchestrator, request failure).
+ */
+export const SESSION_TOOL_GROUP_BASE_ENABLED: Record<string, boolean> = {
+  orchestrator: false,
+  agent_catalog: false,
+  workflows: false,
+  canvas: true,
+};
+
+/**
+ * Expand a group→enabled map into a config fragment that can be merged UNDER a
+ * thread's config_override, so an unset group resolves to its real default
+ * instead of silently reading as enabled.
+ *
+ * Iterates the closed vocabulary rather than the input, so a server response
+ * missing a key falls back per-key to the base mirror and an unknown key is
+ * ignored. Pass null when the server answer is unavailable.
+ */
+export function toolGroupDefaultsConfig(
+  enabled: Record<string, boolean> | null,
+): Record<string, unknown> {
+  const tools: Record<string, string[]> = {};
+  for (const key of Object.keys(SESSION_TOOL_GROUP_BASE_ENABLED)) {
+    const on = enabled?.[key] ?? SESSION_TOOL_GROUP_BASE_ENABLED[key];
+    tools[key] = on ? [...SESSION_TOOL_GROUP_NAMES[key]] : [];
+  }
+  return {tools};
+}
+
 export const AUTONOMY_LEVELS = [
   { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
   { value: 'review', label: 'Review', description: 'Freezes at job completion for human review' },
