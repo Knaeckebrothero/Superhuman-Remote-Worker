@@ -414,7 +414,10 @@ def test_current_and_no_skill_arms_differ_only_at_managed_guide_seam(monkeypatch
     assert reader_for_catalog(current) is not None
     assert reader_for_catalog(no_skill) is None
     assert "read_product_guide(topic_id)" in system_prompt(current)
+    assert "<managed_product_guide" in system_prompt(current)
+    assert "on every relevant turn" in system_prompt(current)
     assert "read_product_guide(topic_id)" not in system_prompt(no_skill)
+    assert "<managed_product_guide" not in system_prompt(no_skill)
     assert {
         entry["name"] for entry in current["menu"] if entry["name"] != APP_GUIDE_SKILL
     } == {entry["name"] for entry in no_skill["menu"]}

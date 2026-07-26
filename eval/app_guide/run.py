@@ -34,6 +34,7 @@ from src.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
     add_persistent_system_skills,
+    managed_product_guide_system_floor,
 )
 from src.tools.context import ToolContext
 from src.tools.product_help import create_product_help_tools
@@ -56,11 +57,11 @@ MAX_REQUIRED_FACT_TOKEN_GAP = 3
 SYSTEM_FRAME = """\
 You are an assistant running inside Superhuman Remote Worker (SRW). Answer the
 user's actual request concisely. A listed skill is relevant only when its
-description matches the request. Use the loader named by a managed skill before
-stating SRW product behavior, and treat the returned bytes as authoritative.
-Do not load an irrelevant skill, invent product UI, or imply that explaining a
-feature proves it is enabled in this deployment or callable in this session.
+description matches the request. Do not load an irrelevant skill, invent
+product UI, or imply that explaining a feature proves it is enabled in this
+deployment or callable in this session.
 
+{managed_floor}
 {skills_menu}"""
 
 
@@ -434,7 +435,14 @@ def system_prompt(catalog: dict[str, Any]) -> str:
     """Render the production-fenced skills menu in a fixed eval frame."""
 
     menu = fence_skills_menu(catalog.get("menu", []))
-    return SYSTEM_FRAME.format(skills_menu=menu or "(no skills are available)")
+    floor = managed_product_guide_system_floor(
+        catalog,
+        [APP_GUIDE_LOADER_TOOL],
+    )
+    return SYSTEM_FRAME.format(
+        managed_floor=floor,
+        skills_menu=menu or "(no skills are available)",
+    )
 
 
 def product_tool_schema(reader: Any) -> dict[str, Any]:
