@@ -742,6 +742,18 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+      # The chart render contract tests in tests/test_canvas_slice3_infra.py
+      # shell out to `helm template`. ubuntu-latest ships Helm, so their
+      # `which("helm")` skip guard never fires here; without the subchart
+      # vendored they fail on the Collabora dependency instead of skipping.
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+      - name: Build Helm dependencies
+        run: |
+          helm repo add collabora https://collaboraonline.github.io/online --force-update
+          helm dependency build helm/
       - name: Install dependencies
         run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
       - name: Run tests
