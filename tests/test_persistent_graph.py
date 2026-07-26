@@ -1699,9 +1699,12 @@ class TestExecuteTurnMemoryRetrieval:
             and str(message.tool_call_id).startswith("memory_inject_")
         )
         assert "HISTORICAL WORKSPACE MEMORY" in memory_result.content
-        assert "<managed_product_guide_memory_boundary" in memory_result.content
-        assert digest in memory_result.content
-        assert "call `read_product_guide` on this turn" in memory_result.content
+        assert "<managed_product_guide_memory_boundary" not in memory_result.content
+        boundary = captured[0][-1]
+        assert isinstance(boundary, HumanMessage)
+        assert "<managed_product_guide_memory_boundary" in boundary.content
+        assert digest in boundary.content
+        assert "otherwise call `read_product_guide` now" in boundary.content
 
 
 # ---------------------------------------------------------------------------
@@ -4222,7 +4225,7 @@ class TestInjectContextPairs:
         assert _is_tool_call_ai(prepared[2])
         assert isinstance(prepared[3], ToolMessage)
 
-    def test_product_guide_boundary_follows_legacy_memory(self):
+    def test_product_guide_boundary_is_tail_user_after_legacy_memory(self):
         prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
         boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
 
@@ -4234,11 +4237,13 @@ class TestInjectContextPairs:
             product_guide_memory_boundary=boundary,
         )
 
-        assert count == 2
-        assert isinstance(prepared[-1], ToolMessage)
-        assert prepared[-1].content == f"HISTORICAL MEMORY\n\n{boundary}"
+        assert count == 3
+        assert isinstance(prepared[-2], ToolMessage)
+        assert prepared[-2].content == "HISTORICAL MEMORY"
+        assert isinstance(prepared[-1], HumanMessage)
+        assert prepared[-1].content == boundary
 
-    def test_product_guide_boundary_follows_manager_memory_without_mutation(self):
+    def test_product_guide_boundary_is_tail_user_after_manager_memory(self):
         manager = _memory_pair("MANAGER MEMORY")
         original_content = manager[1].content
         prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
@@ -4252,18 +4257,20 @@ class TestInjectContextPairs:
             product_guide_memory_boundary=boundary,
         )
 
-        assert count == 2
+        assert count == 3
         assert manager[1].content == original_content
         injected = next(
             message for message in prepared if isinstance(message, ToolMessage)
         )
-        assert injected.content == f"{original_content}\n\n{boundary}"
+        assert injected.content == original_content
+        assert isinstance(prepared[-1], HumanMessage)
+        assert prepared[-1].content == boundary
 
-    def test_product_guide_boundary_is_not_added_without_memory(self):
+    def test_product_guide_boundary_follows_tail_knowledge_too(self):
         prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
         boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
 
-        _inject_context_pairs(
+        count = _inject_context_pairs(
             prepared,
             [],
             "",
@@ -4271,6 +4278,24 @@ class TestInjectContextPairs:
             product_guide_memory_boundary=boundary,
         )
 
+        assert count == 3
+        assert isinstance(prepared[-2], ToolMessage)
+        assert isinstance(prepared[-1], HumanMessage)
+        assert prepared[-1].content == boundary
+
+    def test_product_guide_boundary_is_not_added_without_transient_context(self):
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
+        boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
+
+        count = _inject_context_pairs(
+            prepared,
+            [],
+            "",
+            "",
+            product_guide_memory_boundary=boundary,
+        )
+
+        assert count == 0
         assert all(boundary not in str(message.content) for message in prepared)
 
     def test_knowledge_injected_after_first_human(self):

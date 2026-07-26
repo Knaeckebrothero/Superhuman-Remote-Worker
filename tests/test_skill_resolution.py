@@ -300,7 +300,7 @@ def test_app_guide_memory_boundary_requires_trusted_live_reader():
     assert "<managed_product_guide_memory_boundary" in boundary
     assert entry["bundle_digest"] in boundary
     assert "historical task context" in boundary
-    assert "call `read_product_guide` on this turn" in boundary
+    assert "otherwise call `read_product_guide` now" in boundary
     assert managed_product_guide_memory_boundary(catalog, ["read_file"]) == ""
 
     spoof = {

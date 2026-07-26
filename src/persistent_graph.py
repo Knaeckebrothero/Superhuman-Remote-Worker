@@ -95,12 +95,15 @@ def _inject_context_pairs(
     """Insert transient memory/knowledge/citation context pairs into ``prepared``.
 
     Mutates ``prepared`` in place and returns the number of messages inserted.
-    The pairs are anchored at the tail (see ``_injection_anchor_index``) so
-    the stable history prefix stays byte-identical between turns for provider
+    The pairs are anchored at the tail (see ``_injection_anchor_index``) so the
+    stable history prefix stays byte-identical between turns for provider
     prompt caches, while remaining valid for providers that enforce
-    function-call turn ordering (Gemini). Memory, knowledge, and
-    citation-feedback injection failures are non-fatal — the turn proceeds
-    without that context.
+    function-call turn ordering (Gemini). When the managed App Guide is live,
+    a runtime-owned HumanMessage follows the transient block. This restores
+    the current user request as the final instruction instead of letting a
+    synthetic memory/knowledge tool result become the most recent authority.
+    Memory, knowledge, and citation-feedback injection failures are non-fatal
+    — the turn proceeds without that context.
 
     The same message objects may be reused across inner-loop iterations; pair
     ids are only prefix-checked downstream.
@@ -109,45 +112,14 @@ def _inject_context_pairs(
     base_inject_idx = _injection_anchor_index(prepared)
 
     if manager_injection:
-        manager_messages = manager_injection
-        if product_guide_memory_boundary:
-            from .core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
-
-            # Do not mutate the MemoryManager payload: the same messages are
-            # reused on every inner-loop LLM call in this turn.
-            manager_messages = [
-                message.model_copy(
-                    update={
-                        "content": (
-                            f"{message.content}\n\n{product_guide_memory_boundary}"
-                        )
-                    }
-                )
-                if isinstance(message, ToolMessage)
-                and str(getattr(message, "tool_call_id", "")).startswith(
-                    MEMORY_TOOL_CALL_ID_PREFIX
-                )
-                and isinstance(message.content, str)
-                and product_guide_memory_boundary not in message.content
-                else message
-                for message in manager_injection
-            ]
-        prepared[base_inject_idx:base_inject_idx] = manager_messages
-        injected_count += len(manager_messages)
+        prepared[base_inject_idx:base_inject_idx] = manager_injection
+        injected_count += len(manager_injection)
 
     if memory_block:
         try:
             from .core.memory_injection import create_memory_injection_messages
 
             mem_ai, mem_tool = create_memory_injection_messages(memory_block)
-            if product_guide_memory_boundary:
-                mem_tool = mem_tool.model_copy(
-                    update={
-                        "content": (
-                            f"{mem_tool.content}\n\n{product_guide_memory_boundary}"
-                        )
-                    }
-                )
             # Front of the injection zone, before the manager pairs (legacy
             # order preserved).
             prepared.insert(base_inject_idx, mem_ai)
@@ -185,6 +157,18 @@ def _inject_context_pairs(
             injected_count += 2
         except Exception as e:
             logger.warning(f"Citation feedback injection failed (non-fatal): {e}")
+
+    if product_guide_memory_boundary and injected_count:
+        # A HumanMessage is deliberate: several providers/models give a
+        # trailing synthetic tool result more weight than the earlier system
+        # floor and current user request. Keep the function-call/result pairs
+        # valid, then finish the ephemeral request with a current-digest
+        # instruction. The boundary is never written to durable history.
+        prepared.insert(
+            base_inject_idx + injected_count,
+            HumanMessage(content=product_guide_memory_boundary),
+        )
+        injected_count += 1
 
     return injected_count
 
