@@ -15,7 +15,7 @@ from src.core.skill_resolution import (
     app_guide_break_glass_disabled,
     app_guide_health_snapshot,
     is_reserved_system_skill_name,
-    managed_product_guide_memory_boundary,
+    managed_product_guide_turn_boundary,
     resolve_skill_menu,
     scope_skills_for_tools,
     skill_bundle_digest,
@@ -289,19 +289,19 @@ def test_app_guide_scope_requires_its_dedicated_reader():
     assert set(with_reader["files"]) == {APP_GUIDE_SKILL, "ordinary-skill"}
 
 
-def test_app_guide_memory_boundary_requires_trusted_live_reader():
+def test_app_guide_turn_boundary_requires_trusted_live_reader():
     catalog = add_persistent_system_skills({})
-    boundary = managed_product_guide_memory_boundary(
+    boundary = managed_product_guide_turn_boundary(
         catalog,
         [APP_GUIDE_LOADER_TOOL],
     )
 
     entry = next(item for item in catalog["menu"] if item["name"] == APP_GUIDE_SKILL)
-    assert "<managed_product_guide_memory_boundary" in boundary
+    assert "<managed_product_guide_turn_boundary" in boundary
     assert entry["bundle_digest"] in boundary
-    assert "historical task context" in boundary
-    assert "otherwise call `read_product_guide` now" in boundary
-    assert managed_product_guide_memory_boundary(catalog, ["read_file"]) == ""
+    assert "not current SRW product documentation" in boundary
+    assert "must call `read_product_guide` now" in boundary
+    assert managed_product_guide_turn_boundary(catalog, ["read_file"]) == ""
 
     spoof = {
         "menu": [
@@ -313,7 +313,7 @@ def test_app_guide_memory_boundary_requires_trusted_live_reader():
         ]
     }
     assert (
-        managed_product_guide_memory_boundary(
+        managed_product_guide_turn_boundary(
             spoof,
             [APP_GUIDE_LOADER_TOOL],
         )

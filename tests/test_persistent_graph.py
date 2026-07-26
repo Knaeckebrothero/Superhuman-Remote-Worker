@@ -1699,12 +1699,12 @@ class TestExecuteTurnMemoryRetrieval:
             and str(message.tool_call_id).startswith("memory_inject_")
         )
         assert "HISTORICAL WORKSPACE MEMORY" in memory_result.content
-        assert "<managed_product_guide_memory_boundary" not in memory_result.content
+        assert "<managed_product_guide_turn_boundary" not in memory_result.content
         boundary = captured[0][-1]
         assert isinstance(boundary, HumanMessage)
-        assert "<managed_product_guide_memory_boundary" in boundary.content
+        assert "<managed_product_guide_turn_boundary" in boundary.content
         assert digest in boundary.content
-        assert "otherwise call `read_product_guide` now" in boundary.content
+        assert "must call `read_product_guide` now" in boundary.content
 
 
 # ---------------------------------------------------------------------------
@@ -4227,14 +4227,14 @@ class TestInjectContextPairs:
 
     def test_product_guide_boundary_is_tail_user_after_legacy_memory(self):
         prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
-        boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
+        boundary = "<managed_product_guide_turn_boundary>fresh</managed>"
 
         count = _inject_context_pairs(
             prepared,
             [],
             "HISTORICAL MEMORY",
             "",
-            product_guide_memory_boundary=boundary,
+            product_guide_turn_boundary=boundary,
         )
 
         assert count == 3
@@ -4247,14 +4247,14 @@ class TestInjectContextPairs:
         manager = _memory_pair("MANAGER MEMORY")
         original_content = manager[1].content
         prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
-        boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
+        boundary = "<managed_product_guide_turn_boundary>fresh</managed>"
 
         count = _inject_context_pairs(
             prepared,
             manager,
             "",
             "",
-            product_guide_memory_boundary=boundary,
+            product_guide_turn_boundary=boundary,
         )
 
         assert count == 3
@@ -4268,14 +4268,14 @@ class TestInjectContextPairs:
 
     def test_product_guide_boundary_follows_tail_knowledge_too(self):
         prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
-        boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
+        boundary = "<managed_product_guide_turn_boundary>fresh</managed>"
 
         count = _inject_context_pairs(
             prepared,
             [],
             "",
             "KNOWLEDGE",
-            product_guide_memory_boundary=boundary,
+            product_guide_turn_boundary=boundary,
         )
 
         assert count == 3
@@ -4283,20 +4283,21 @@ class TestInjectContextPairs:
         assert isinstance(prepared[-1], HumanMessage)
         assert prepared[-1].content == boundary
 
-    def test_product_guide_boundary_is_not_added_without_transient_context(self):
+    def test_product_guide_boundary_is_added_without_transient_context(self):
         prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
-        boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
+        boundary = "<managed_product_guide_turn_boundary>fresh</managed>"
 
         count = _inject_context_pairs(
             prepared,
             [],
             "",
             "",
-            product_guide_memory_boundary=boundary,
+            product_guide_turn_boundary=boundary,
         )
 
-        assert count == 0
-        assert all(boundary not in str(message.content) for message in prepared)
+        assert count == 1
+        assert isinstance(prepared[-1], HumanMessage)
+        assert prepared[-1].content == boundary
 
     def test_knowledge_injected_after_first_human(self):
         prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
