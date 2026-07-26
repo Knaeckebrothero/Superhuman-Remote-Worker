@@ -3805,3 +3805,89 @@ describe('PersistentChatService — Phase 4: delta coalescing', () => {
         expect(ctx.service.isStreaming()).toBe(false);
     });
 });
+
+describe('PersistentChatService — session wake on job completion', () => {
+    // A worker job the session created reached a terminal state and the
+    // orchestrator injected the notice via POST /api/input with role='event'
+    // (docs/features/session_wake_on_job_completion.md).
+    //
+    // Both halves matter and fail differently:
+    //   * the live frame — without it the user watches a turn start and stream
+    //     a reply with no visible prompt, because /api/input broadcasts nothing
+    //     and no frame carries user-message content;
+    //   * the history branch — without it the reloaded transcript renders the
+    //     notice as a USER bubble, i.e. claims the user said something they
+    //     never said.
+    // They must agree, or the transcript changes shape on reload.
+    let originalEs: unknown;
+    let originalWs: unknown;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    const NOTICE = '[JOB_FINISHED] A worker job you created has reached a terminal state.';
+
+    async function readySession() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-wake');
+        fireSseOpen(ctx.sseInstances[0]);
+        fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');
+        return {...ctx, es: ctx.sseInstances[0]};
+    }
+
+    it('session.event renders a system line, not a user bubble', async () => {
+        const ctx = await readySession();
+
+        fireSseMessage(
+            ctx.es,
+            {method: 'session.event', params: {content: NOTICE, id: 'msg_1', role: 'event'}},
+            '1:2',
+        );
+
+        const systemTurns = ctx.service.turns().filter(isSystemTurn);
+        expect(systemTurns.some((t) => String(t.content).includes('[JOB_FINISHED]'))).toBe(true);
+        expect(ctx.service.turns().filter(isUserTurn)).toHaveLength(0);
+    });
+
+    it('an unknown session.event payload degrades to an empty line, never throws', async () => {
+        const ctx = await readySession();
+        expect(() =>
+            fireSseMessage(ctx.es, {method: 'session.event', params: {}}, '1:2'),
+        ).not.toThrow();
+    });
+
+    it("history role='event' renders the same system line", () => {
+        const turns = historyToTurns([
+            {id: 'u1', role: 'human', content: 'launch three designers', tool_calls: null, turn_number: 1, created_at: null},
+            {id: 'e1', role: 'event', content: NOTICE, tool_calls: null, turn_number: 2, created_at: null},
+        ] as never);
+
+        expect(turns).toHaveLength(2);
+        expect(isUserTurn(turns[0])).toBe(true);
+        expect(isSystemTurn(turns[1])).toBe(true);
+        expect(String((turns[1] as {content: string}).content)).toContain('[JOB_FINISHED]');
+    });
+
+    it("history role='event' is never folded into an assistant turn", () => {
+        // Unlike role='summary' (which attaches inline to an open turn), an
+        // event is a top-level fact about the session, not a step inside a turn.
+        const turns = historyToTurns([
+            {id: 'a1', role: 'ai', content: 'working', tool_calls: null, turn_number: 1, created_at: null},
+            {id: 'e1', role: 'event', content: NOTICE, tool_calls: null, turn_number: 1, created_at: null},
+        ] as never);
+
+        expect(turns.filter(isSystemTurn)).toHaveLength(1);
+        expect(turns.filter(isAssistantTurn)).toHaveLength(1);
+    });
+});

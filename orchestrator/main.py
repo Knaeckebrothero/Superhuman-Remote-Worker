@@ -158,6 +158,11 @@ from routers import shared_browser_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
+from services.session_wake import (  # noqa: E402
+    kick_drain as _kick_session_wake_drain,
+    maybe_wake_session,
+    session_wake_sweeper_loop,
+)
 from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
@@ -4224,6 +4229,17 @@ def _strip_public_job_reserved_markers(job: "JobCreate") -> None:
     job.creation_order = None
     job.worktree_path = None
     job.delegation_context = None
+    # thread_id is derived, never submitted. Only the internal path may set it,
+    # and there it is authenticated: _resolve_internal_job_creation_scope
+    # fetches the thread and 403s when it is missing or owned by someone else.
+    # The public path never validated it — harmless while the value was merely
+    # a datasource-inheritance hint whose lookup failures are swallowed, but
+    # once it is PERSISTED as created_by_thread_id and woken on, an unchecked
+    # body field lets a caller name a victim's live session and have a
+    # completion payload POSTed into it (/api/input on the agent pod is
+    # unauthenticated). Stripping is also what keeps a bogus-but-well-formed
+    # UUID a no-op instead of a ForeignKeyViolationError → HTTP 500.
+    job.thread_id = None
     if isinstance(job.context, dict):
         job.context = {
             key: value
@@ -6118,7 +6134,11 @@ class JobCreate(BaseModel):
         description=(
             "Persistent-session thread UUID. When provided and user_id "
             "is unset, the owning user (and project) are inherited from "
-            "the thread row so dispatch can apply user preferences."
+            "the thread row so dispatch can apply user preferences. Also "
+            "persisted as jobs.created_by_thread_id, which is what the "
+            "completion wake routes on. INTERNAL PATH ONLY — the public path "
+            "strips it (_strip_public_job_reserved_markers); a caller cannot "
+            "name someone else's session."
         ),
     )
     parent_job_id: str | None = Field(
@@ -7232,6 +7252,14 @@ async def lifespan(app: FastAPI):
     stale_verification_sweeper_task = asyncio.create_task(
         stale_verification_sweeper_loop(postgres_db, _shutdown_event)
     )
+    # Backstop for session wakes: deliver any completion notice whose
+    # opportunistic post-commit send was lost, or whose terminal path has no
+    # hook at all. Deliberately NOT run_when_leader — single-firing comes from
+    # the row claim, which works from every replica, and leader-gating would
+    # make this a SPOF across a handover. See services/session_wake.py.
+    session_wake_sweeper_task = asyncio.create_task(
+        session_wake_sweeper_loop(postgres_db, _shutdown_event)
+    )
 
     # Slice-3 KB index freshness sweep: catch out-of-band vault edits (human
     # pushes, recovered partial reindexes) the post-merge trigger can't see.
@@ -7380,6 +7408,7 @@ async def lifespan(app: FastAPI):
     await automation_cron_task
     await project_loop_sweeper_task
     await stale_verification_sweeper_task
+    await session_wake_sweeper_task
     await kb_reindex_sweeper_task
     await pricing_sync_task
     await workspace_metering_task
@@ -8354,6 +8383,29 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                     ),
                 )
 
+        # Session ↔ job backref. `job.thread_id` is authenticated on the
+        # internal path (_resolve_internal_job_creation_scope 403s on a thread
+        # that is missing or owned by someone else) and forced to None on the
+        # public path by _strip_public_job_reserved_markers — so persisting it
+        # here cannot be steered from a request body.
+        #
+        # Only ROOT creations carry the backref: a worker child (scholar,
+        # critic, delegation subagent) inherits its thread scope for datasources
+        # but its completion is the parent job's business, not the session's.
+        # Waking the session per subjob would turn one delegation into a status
+        # feed. (Those call sites hit postgres_db.create_job directly anyway and
+        # simply never pass the kwarg.)
+        #
+        # wake_on_complete is set here, server-side, rather than being a
+        # create_worker_job parameter: an opt-in flag the model must remember
+        # fails SILENTLY — it forgets, then never learns the job finished, which
+        # is indistinguishable from having no wake feature at all. A surplus
+        # wake costs one cheap turn the agent can go straight back to sleep
+        # from. docs/features/session_wake_on_job_completion.md.
+        creating_thread_id = (
+            str(job.thread_id) if (job.thread_id and root_creation) else None
+        )
+
         result = await postgres_db.create_job(
             description=job.description,
             document_path=job.document_path,
@@ -8369,6 +8421,8 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             creation_order=job.creation_order,
             worktree_path=job.worktree_path,
             delegation_context=job.delegation_context,
+            created_by_thread_id=creating_thread_id,
+            wake_on_complete=bool(creating_thread_id),
         )
 
         # Create Gitea repo/branch + grant creator access + seed the Mode A
@@ -8802,6 +8856,16 @@ async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
             await _handle_scholar_completion(job, [])
         except Exception as e:
             logger.warning(f"Error handling scholar cancellation for {job_id}: {e}")
+
+        # A session cancelling its own job does not need telling — but a user
+        # cancelling from the cockpit does, and the session can't distinguish
+        # the two from a status column. One cheap turn either way; the cost of
+        # NOT sending is a session that waits on a job that will never report.
+        # (Cascade-cancelled children are never session-created — they carry a
+        # parent_job_id, so create_job withholds the backref — which is why
+        # _cascade_cancel_to_children needs no hook of its own.)
+        await maybe_wake_session(postgres_db, job_id, "cancelled")
+        _kick_session_wake_drain(postgres_db)
 
         # Agent is being freed — trigger dispatcher for queued jobs
         _trigger_dispatch()
@@ -10784,6 +10848,13 @@ async def approve_job(
         if job.get("parent_job_id"):
             merge_result = await _graft_subjob_output(job_id)
 
+        # Approval is a SECOND legitimate wake: the session was already told the
+        # job froze for review, and "it was approved" is new information. The
+        # dedup key is (job_id, terminal_status), so this fires exactly because
+        # the status changed from pending_review to completed.
+        await maybe_wake_session(postgres_db, job_id, "completed")
+        _kick_session_wake_drain(postgres_db)
+
         # Agent is freed after completion — trigger dispatcher
         _trigger_dispatch()
 
@@ -11135,13 +11206,21 @@ async def _set_target_to_autonomy_status(target_job_id: str) -> str:
                 target_job_id,
             )
         logger.info(f"Set target job {target_job_id} to 'completed' (autonomy=full)")
-        return "completed"
+        new_status = "completed"
     else:
         await postgres_db.update_job_status(target_job_id, status="pending_review")
         logger.info(
             f"Set target job {target_job_id} to 'pending_review' (autonomy={autonomy})"
         )
-        return "pending_review"
+        new_status = "pending_review"
+
+    # This is the terminal transition with the least obvious hook point: a
+    # critic-approved target reaches its terminal state HERE, from the critic's
+    # completion, and never calls /complete of its own. Without this the wake
+    # would arrive a sweeper tick late for every autonomy=full job.
+    await maybe_wake_session(postgres_db, target_job_id, new_status)
+    _kick_session_wake_drain(postgres_db)
+    return new_status
 
 
 async def _spawn_scholar_subjob(
@@ -14258,6 +14337,22 @@ async def complete_job(
                 f"Error advancing project loop for {job_id}: {e}", exc_info=True
             )
 
+        # 5e. Wake the session that created this job, if any. Must sit BEFORE
+        # the workspace archive below: that call tears the workspace down, and
+        # a wake that raced it would point the session at a workspace being
+        # deleted underneath it. Enqueue-only — the actual send happens after
+        # this request commits (see kick_drain at the end).
+        #
+        # Keyed on new_status, deliberately NOT falling back to job['status']:
+        # new_status is the outcome of THIS completion, and None means nothing
+        # terminal happened here (the loop-advance suppression path). The stale
+        # entry-time status would enqueue a wake for a transition that did not
+        # occur. Anything genuinely terminal that this call misses is picked up
+        # by the sweeper, which reads the row's real status.
+        # docs/features/session_wake_on_job_completion.md
+        if new_status:
+            await maybe_wake_session(postgres_db, job_id, new_status)
+
         # 6. Trigger dispatch (freed agent can pick up queued work)
         _trigger_dispatch()
 
@@ -14273,6 +14368,12 @@ async def complete_job(
                     e,
                 )
                 actions.append(f"workspace cleanup failed: {e}")
+
+        # Fast path for the wake enqueued above. Every statement here
+        # autocommits, so the terminal status is already durable; this only
+        # skips the sweeper's tick. Fire-and-forget by design — losing it is
+        # harmless because the claim, not this call, is the mechanism.
+        _kick_session_wake_drain(postgres_db)
 
         return {
             "status": "handled",
@@ -16945,6 +17046,24 @@ async def get_job_statistics(request: Request) -> dict[str, int]:
     vis = await _visibility_kwargs_for_stats(user)
     try:
         return await postgres_db.get_job_statistics(**vis)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/stats/session-wakes")
+async def get_session_wake_statistics(request: Request) -> dict[str, int]:
+    """Health of the session-wake outbox. **Admin only** (fleet-wide).
+
+    ``dead`` is the one number that matters and the whole observability story
+    for docs/features/session_wake_on_job_completion.md: each one is a session
+    waiting on a job it will never be told about — precisely the bug the feature
+    exists to remove — so a non-zero value warrants an alert, not a dashboard.
+    ``pending``/``sending`` are the in-flight depth; a steadily growing
+    ``sending`` means deliveries are timing out rather than failing fast.
+    """
+    await _require_admin(request)
+    try:
+        return await postgres_db.get_job_wake_stats()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

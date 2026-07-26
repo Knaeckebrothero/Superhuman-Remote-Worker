@@ -972,8 +972,15 @@ CREATE TABLE public.jobs (
     expert_id uuid,
     runner_kind text DEFAULT 'user'::text NOT NULL,
     lease_expires_at timestamp with time zone,
+    created_by_thread_id uuid,
+    wake_on_complete boolean DEFAULT false NOT NULL,
+    wake_state text DEFAULT 'none'::text NOT NULL,
+    wake_claimed_at timestamp with time zone,
+    wake_attempts integer DEFAULT 0 NOT NULL,
+    wake_notified_status text,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
+    CONSTRAINT jobs_wake_state_known CHECK ((wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text, 'sent'::text, 'dead'::text]))),
     CONSTRAINT valid_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'processing'::character varying, 'completed'::character varying, 'failed'::character varying, 'cancelled'::character varying, 'pending_review'::character varying, 'paused'::character varying, 'reviewing'::character varying, 'waiting'::character varying, 'waiting_for_reply'::character varying])::text[])))
 );
 
@@ -1011,6 +1018,27 @@ COMMENT ON COLUMN public.jobs.exported_at IS 'Timestamp the Mode B shared-folder
 --
 
 COMMENT ON COLUMN public.jobs.runner_kind IS 'Dispatch runner class. user = owner grants; lifecycle = system subjob with owner capabilities and full autonomy ceiling; service = reserved for ownerless system jobs.';
+
+
+--
+-- Name: COLUMN jobs.created_by_thread_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.created_by_thread_id IS 'Session thread that created this job (NULL for cockpit/automation/child jobs). Queryable backref powering the completion wake and the session''s own "my outstanding jobs" view. Design: docs/features/session_wake_on_job_completion.md.';
+
+
+--
+-- Name: COLUMN jobs.wake_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.wake_state IS 'Wake outbox state: none|pending|sending|sent|dead. Claimed by an atomic UPDATE ... FOR UPDATE SKIP LOCKED before the (non-idempotent) send.';
+
+
+--
+-- Name: COLUMN jobs.wake_notified_status; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.jobs.wake_notified_status IS 'Terminal status last delivered to the creating session. Second half of the (job_id, terminal_status) dedup key — a later, different terminal status (pending_review → completed via approve) is a legitimate second wake.';
 
 
 --
@@ -3042,6 +3070,13 @@ CREATE INDEX idx_jobs_user_id ON public.jobs USING btree (user_id);
 
 
 --
+-- Name: idx_jobs_wake_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_jobs_wake_pending ON public.jobs USING btree (updated_at) WHERE (wake_on_complete AND (created_by_thread_id IS NOT NULL) AND (wake_state = ANY (ARRAY['none'::text, 'pending'::text, 'sending'::text])));
+
+
+--
 -- Name: idx_llm_endpoints_user; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3932,6 +3967,14 @@ ALTER TABLE ONLY public.job_datasources
 
 ALTER TABLE ONLY public.job_datasources
     ADD CONSTRAINT job_datasources_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: jobs jobs_created_by_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.jobs
+    ADD CONSTRAINT jobs_created_by_thread_id_fkey FOREIGN KEY (created_by_thread_id) REFERENCES public.threads(id) ON DELETE SET NULL;
 
 
 --
