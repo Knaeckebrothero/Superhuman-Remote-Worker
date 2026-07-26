@@ -47,6 +47,7 @@ from ..core.workspace_backend import WorkspaceUnavailableError
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
+    PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY,
     IdleTimeoutError,
     PersistentLoopCallbacks,
     run_persistent_loop,
@@ -262,6 +263,16 @@ _NOTIFICATION_METHODS = frozenset(
         "ready",
     }
 )
+
+# Roles POST /api/input may request. 'human' is the normal path; 'event' is a
+# system-injected notice (currently: a worker job this session created reached a
+# terminal state — docs/features/session_wake_on_job_completion.md).
+#
+# An allow-list rather than a passthrough because /api/input has NO
+# authentication of any kind (no session token, no internal key; the agent
+# NetworkPolicy is egress-only). An arbitrary role would let anything that can
+# reach the pod forge 'ai' or 'system' rows in the transcript.
+_ACCEPTED_INPUT_ROLES = frozenset({"human", "event"})
 
 
 class WorkspaceNotReady(RuntimeError):
@@ -2497,7 +2508,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 # docs/issues/persistent_session_dual_mode_phase1_gap.md.
 
 
-async def _accept_user_input(content: str) -> str:
+async def _accept_user_input(content: str, *, role: str = "human") -> str:
     """Persist an accepted user message, then enqueue it for the loop.
 
     Returns the message id. Persisting BEFORE the 200 goes out closes the
@@ -2506,6 +2517,20 @@ async def _accept_user_input(content: str) -> str:
     on reload and died with the pod. The loop reuses the id when it consumes
     the item, so its own persist is an upsert onto this row (final
     turn_number), never a duplicate.
+
+    ``role`` controls only how the row is PERSISTED; the in-memory message stays
+    a ``HumanMessage`` regardless. That split is deliberate, and both halves are
+    load-bearing:
+
+    * ``role='event'`` keeps a system-injected notice (a worker job the session
+      created has finished) out of the human-bubble family, so the transcript
+      does not claim the user said it. It joins the shipped non-conversational
+      roles ``summary`` and ``error``, which the cockpit already branches on.
+    * Keeping the carrier a ``HumanMessage`` is what keeps ``_save_turn_ai_messages``
+      correct — it reconciles a turn by walking backwards until it hits one — and
+      avoids introducing a novel LangChain type into the graph. A synthetic
+      AIMessage+ToolMessage pair (the *transient* injection family) would be the
+      wrong shape: this is a one-time fact that must survive compaction.
     """
     import uuid as _uuid
 
@@ -2513,7 +2538,14 @@ async def _accept_user_input(content: str) -> str:
 
     msg = HumanMessage(content=content)
     msg.id = f"msg_{_uuid.uuid4().hex[:24]}"
-    _loop_last_user_content[0] = content
+    injected = role != "human"
+    if injected:
+        # Carried on the message so BOTH writes agree: this accept-time persist
+        # and the loop's turn-start reconcile, which re-serializes the same row
+        # by id and would otherwise flip the role back to 'human'.
+        msg.additional_kwargs[_PERSIST_ROLE_KEY] = role
+    else:
+        _loop_last_user_content[0] = content
     if (
         _session is not None
         and _session.postgres_conn is not None
@@ -2534,19 +2566,44 @@ async def _accept_user_input(content: str) -> str:
             # write must not reject the input; the loop's upsert recovers
             # it for any turn that starts.
             logger.warning(f"Accept-time user message persist failed: {e}")
-    await _loop_user_queue.put({"content": content, "id": msg.id})
+    item = {"content": content, "id": msg.id}
+    if injected:
+        item["role"] = role
+    await _loop_user_queue.put(item)
+    if injected:
+        # Make the injection visible in a live cockpit. Nothing else would:
+        # /api/input broadcasts nothing and no frame carries user-message
+        # content (the cockpit builds a user turn from its own optimistic
+        # dispatch on send, or from a history reload). Without this the user
+        # watches a turn start and stream a reply with no visible prompt — the
+        # agent apparently talking to itself. Rides the normal _broadcast path,
+        # so it reaches WS subscribers and the thread_events log (hence SSE)
+        # alike.
+        _broadcast("session.event", {"content": content, "id": msg.id, "role": role})
     # Title the thread from the opening prompt(s) so the cockpit header fills in
     # on submit rather than only after the (possibly long) first turn ends.
     # Fire-and-forget — must not block input acceptance. _early_title_from_prompt
     # self-guards on a placeholder title and a low-signal prompt; the after-turn
     # pass in _loop_on_turn_complete remains the fallback.
-    if _session is not None and _session.turn_count <= 2:
+    #
+    # Injected input is excluded: a wake landing in a young session would
+    # retitle the whole thread after the job-completion text.
+    if not injected and _session is not None and _session.turn_count <= 2:
         asyncio.create_task(_early_title_from_prompt(content))
     return msg.id
 
 
 async def handle_api_input(request: Request) -> JSONResponse:
-    """Push user input onto the loop's queue. Body: {content, turn_id?}."""
+    """Push user input onto the loop's queue. Body: {content, role?, turn_id?}.
+
+    ``role`` defaults to 'human'. The orchestrator sends ``role='event'`` when
+    injecting a system notice (a worker job the session created finished) so the
+    persisted row does not render as a user bubble.
+
+    A 503 here is not an error for that caller — it means the loop is not
+    running, and the orchestrator falls back to writing the notice durably for
+    the next resume.
+    """
     if _session is None or _loop_user_queue is None:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     try:
@@ -2559,9 +2616,15 @@ async def handle_api_input(request: Request) -> JSONResponse:
             {"error": "content must be a non-empty string"},
             status_code=400,
         )
+    role = body.get("role") or "human"
+    if role not in _ACCEPTED_INPUT_ROLES:
+        return JSONResponse(
+            {"error": f"role must be one of {sorted(_ACCEPTED_INPUT_ROLES)}"},
+            status_code=400,
+        )
     if not _ensure_persistent_loop_started("rest_input"):
         return JSONResponse({"error": "Session not ready"}, status_code=503)
-    message_id = await _accept_user_input(content)
+    message_id = await _accept_user_input(content, role=role)
     return JSONResponse(
         {
             "accepted": True,
@@ -4841,6 +4904,20 @@ def _db_rows_to_lc_messages(db_messages: list) -> list:
         if role in ("human", "user"):
             restored.append(HumanMessage(content=content, id=msg_id))
 
+        elif role == "event":
+            # System-injected notice (a worker job this session created reached
+            # a terminal state). Restored as a HumanMessage because that is what
+            # it was in memory when the model first saw it — the 'event' role is
+            # a TRANSCRIPT distinction, not a model-context one.
+            #
+            # This branch is not optional. The if/elif chain has no else, so an
+            # unhandled role is dropped SILENTLY: the notice would keep existing
+            # in the DB and in the UI while vanishing from the model's context
+            # on the next pod recycle, and the session would answer a question
+            # it can no longer see. (postgres_db's history query excludes only
+            # 'summary' and 'error', so 'event' rows do reach here.)
+            restored.append(HumanMessage(content=content, id=msg_id))
+
         elif role in ("ai", "assistant"):
             lc_tool_calls = []
             if tool_calls:
@@ -5205,6 +5282,15 @@ def _serialize_message_row(
     """
     raw_type = getattr(msg, "type", "unknown")
     role = _ROLE_MAP.get(raw_type, raw_type)
+    # A message may declare the row role it wants to be stored under when its
+    # LangChain type is only a carrier — an injected 'event' notice travels as
+    # HumanMessage so the graph and _save_turn_ai_messages need no changes, but
+    # must not persist as a user bubble. Read here rather than at each call site
+    # so the accept-time write and the turn-start reconcile (which re-serializes
+    # the same row by id) cannot disagree.
+    override = getattr(msg, "additional_kwargs", {}).get(_PERSIST_ROLE_KEY)
+    if isinstance(override, str) and override:
+        role = override
     content = msg.content if hasattr(msg, "content") else None
     tc = None
     if hasattr(msg, "tool_calls") and msg.tool_calls:

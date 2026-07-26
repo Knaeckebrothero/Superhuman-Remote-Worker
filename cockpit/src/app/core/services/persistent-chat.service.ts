@@ -3111,6 +3111,19 @@ export class PersistentChatService {
                 this.endedAt.set(new Date().toISOString());
                 break;
 
+            case 'session.event':
+                // A system notice was injected into the running session
+                // (currently: a worker job this session created finished —
+                // docs/features/session_wake_on_job_completion.md). Required,
+                // not polish: /api/input broadcasts nothing on its own and no
+                // frame carries user-message content, so without this the user
+                // watches a turn start and stream a reply with no visible
+                // prompt — the agent apparently talking to itself. Matches the
+                // muted system line the same row gets on history reload
+                // (role='event' in historyToTurns).
+                this._systemMessage((params['content'] as string) || '');
+                break;
+
             case 'session.suspended':
                 // Drift-drain (platform update) suspend. Unlike 'ended', a
                 // suspended thread stays live-resumable: the next message
@@ -3523,6 +3536,26 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
                     timestamp: ts,
                 });
             }
+            continue;
+        }
+
+        // System-injected notice (role='event') → muted system line. Today the
+        // only producer is the session-wake feature: a worker job this session
+        // created reached a terminal state and the orchestrator injected the
+        // notice via POST /api/input
+        // (docs/features/session_wake_on_job_completion.md).
+        //
+        // The role exists precisely so this does NOT render as a user bubble —
+        // the model was told something, but the user never said it, and a
+        // transcript that claims otherwise is a lie the user cannot audit.
+        // Joins 'summary' and 'error' as the third non-conversational role.
+        if (m.role === 'event') {
+            turns.push({
+                kind: 'system',
+                id: m.id,
+                content: m.content || '',
+                timestamp: ts,
+            });
             continue;
         }
 
