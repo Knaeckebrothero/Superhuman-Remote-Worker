@@ -3974,9 +3974,6 @@ def get_phase_system_prompt(
             config.extra.get("_resolved_skills"),
             tool_names or [],
         )
-        if product_guide_floor:
-            rendered = f"{product_guide_floor}\n\n{rendered}"
-
         # Prepend reasoning directive for OSS models
         method = detect_reasoning_method(
             model or config.llm.model, config.llm.reasoning_method
@@ -3984,6 +3981,12 @@ def get_phase_system_prompt(
         if method == "prompt":
             level = config.llm.reasoning_level or "high"
             rendered = f"Reasoning: {level}\n\n{rendered}"
+
+        # Keep the freshness rule at the end of the trusted system message.
+        # Long resumed histories and tail-injected memory otherwise put many
+        # tokens between this rule and the current turn.
+        if product_guide_floor:
+            rendered = f"{rendered}\n\n{product_guide_floor}"
 
         return rendered
 

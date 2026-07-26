@@ -287,6 +287,7 @@ class TestInteractivePromptResolution:
         assert f'current_bundle_sha256="{digest}"' in result
         assert "on every relevant turn" in result
         assert "summaries, memories, prior tool results" in result
+        assert result.endswith("</managed_product_guide>")
 
     def test_managed_product_guide_floor_requires_live_reader(self):
         digest = "b" * 64

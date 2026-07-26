@@ -61,8 +61,8 @@ description matches the request. Do not load an irrelevant skill, invent
 product UI, or imply that explaining a feature proves it is enabled in this
 deployment or callable in this session.
 
-{managed_floor}
-{skills_menu}"""
+{skills_menu}
+{managed_floor}"""
 
 
 @dataclass(frozen=True)
