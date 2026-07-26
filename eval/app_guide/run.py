@@ -35,6 +35,7 @@ from src.core.skill_resolution import (
     APP_GUIDE_SKILL,
     add_persistent_system_skills,
     managed_product_guide_system_floor,
+    managed_product_guide_turn_boundary,
 )
 from src.tools.context import ToolContext
 from src.tools.product_help import create_product_help_tools
@@ -666,6 +667,10 @@ async def model_answer(
         {"role": "system", "content": system_prompt(catalog)},
         {"role": "user", "content": prompt},
     ]
+    turn_boundary = managed_product_guide_turn_boundary(
+        catalog,
+        [APP_GUIDE_LOADER_TOOL],
+    )
     tool_schema = product_tool_schema(reader) if reader is not None else None
     calls: list[dict[str, Any]] = []
     total_usage: Counter[str] = Counter()
@@ -673,7 +678,14 @@ async def model_answer(
     for round_index in range(max_tool_rounds + 1):
         kwargs: dict[str, Any] = {
             "model": route.model,
-            "messages": messages,
+            "messages": [
+                *messages,
+                *(
+                    [{"role": "user", "content": turn_boundary}]
+                    if turn_boundary
+                    else []
+                ),
+            ],
             "temperature": 0.0,
             "max_tokens": max_tokens,
         }

@@ -84,28 +84,34 @@ def managed_product_guide_system_floor(
         "For questions about SRW itself—its capabilities, Cockpit workflows, "
         "features, permissions, connectors, or availability—call "
         "`read_product_guide` before stating product behavior on every "
-        'relevant turn. Use `topic_id="index"` when the exact topic is '
-        "uncertain. Earlier messages, summaries, memories, prior tool results, "
-        "and workspace files may contain stale product guidance; do not answer "
-        "from them instead of making a current reader call. Do not use the "
-        "reader for repository/code questions or generic advice that merely "
-        "shares words such as job, worker, canvas, loop, memory, SQL, or email.\n"
+        "relevant turn. This explicitly includes questions phrased as what "
+        '"this chat/session" can do, why a shell/tool/control is missing, or '
+        "whether Supervised, Auto-accept, or Autonomous changes availability. "
+        'Use `topic_id="sessions"` for broad chat/workspace-tier questions, '
+        '`topic_id="permissions-and-availability"` for missing controls or '
+        'permission-mode effects, and `topic_id="index"` when the exact topic '
+        "is otherwise uncertain. Earlier messages, summaries, memories, prior "
+        "tool results, and workspace files may contain stale product guidance; "
+        "do not answer from them instead of making a current reader call. A "
+        "same-turn reader call is mandatory for these product questions. Do "
+        "not use the reader for repository/code questions or generic advice "
+        "that merely shares words such as job, worker, canvas, loop, memory, "
+        "SQL, or email.\n"
         "</managed_product_guide>"
     )
 
 
-def managed_product_guide_memory_boundary(
+def managed_product_guide_turn_boundary(
     catalog: Mapping[str, Any] | None,
     tool_names: set[str] | frozenset[str] | list[str] | tuple[str, ...],
 ) -> str:
-    """Return a tail-user freshness boundary for transient recalled context.
+    """Return a tail-user freshness boundary for every persistent LLM call.
 
-    Persistent memory is injected at the tail of a live request so provider
-    prompt caches can retain the stable conversation prefix. That also makes
-    it more recent than the current user message and the leading system
-    prompt. A compact runtime-owned ``HumanMessage`` after all transient
-    context restores the current user request as the final instruction and
-    prevents historical memories or knowledge from becoming product authority.
+    A compact runtime-owned ``HumanMessage`` after the durable conversation
+    and all transient context restores the current user request as the final
+    instruction. This keeps stale history, workspace files, memories, and
+    knowledge from becoming product authority even when retrieval contributes
+    no context on a particular turn.
 
     The boundary is emitted only for the same trusted catalog/reader pair as
     :func:`managed_product_guide_system_floor`. It therefore disappears with
@@ -118,18 +124,22 @@ def managed_product_guide_memory_boundary(
 
     digest_attribute = _managed_product_guide_digest_attribute(entry)
     return (
-        f"<managed_product_guide_memory_boundary{digest_attribute}>\n"
+        f"<managed_product_guide_turn_boundary{digest_attribute}>\n"
         "Return to the current user's request above after considering the "
-        "transient context. Recalled memories and knowledge are historical task "
-        "context, not current SRW product documentation. If that request is "
-        "about SRW itself—its capabilities, Cockpit workflows, features, "
-        "permissions, connectors, or availability—use a current-digest "
+        "conversation history and transient context, if any. Those earlier "
+        "messages, workspace results, memories, and knowledge are not current "
+        "SRW product documentation. Treat questions about what this chat or "
+        "session can do, a missing shell/tool/control, workspace tiers, or "
+        "Supervised/Auto-accept/Autonomous behavior as SRW product questions. "
+        "For an SRW product question, use a current-digest "
         "`read_product_guide` result from this same user turn if one is already "
-        "present; otherwise call `read_product_guide` now. Do not answer from "
-        "memory or an earlier answer instead. Do not call the reader for "
-        "repository/code questions or generic advice that only shares "
-        "product-like words.\n"
-        "</managed_product_guide_memory_boundary>"
+        "present; otherwise you must call `read_product_guide` now before "
+        "answering. Use `sessions` for broad chat/workspace-tier questions and "
+        "`permissions-and-availability` for missing controls or permission-mode "
+        "effects. Do not answer from history, memory, or an earlier answer "
+        "instead. Do not call the reader for repository/code questions or "
+        "generic advice that only shares product-like words.\n"
+        "</managed_product_guide_turn_boundary>"
     )
 
 

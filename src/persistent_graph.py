@@ -90,7 +90,7 @@ def _inject_context_pairs(
     knowledge_block: str,
     citation_feedback_block: str = "",
     *,
-    product_guide_memory_boundary: str = "",
+    product_guide_turn_boundary: str = "",
 ) -> int:
     """Insert transient memory/knowledge/citation context pairs into ``prepared``.
 
@@ -99,11 +99,11 @@ def _inject_context_pairs(
     stable history prefix stays byte-identical between turns for provider
     prompt caches, while remaining valid for providers that enforce
     function-call turn ordering (Gemini). When the managed App Guide is live,
-    a runtime-owned HumanMessage follows the transient block. This restores
-    the current user request as the final instruction instead of letting a
-    synthetic memory/knowledge tool result become the most recent authority.
-    Memory, knowledge, and citation-feedback injection failures are non-fatal
-    — the turn proceeds without that context.
+    a runtime-owned HumanMessage follows the durable turn and any transient
+    block. This restores the current user request as the final instruction
+    even on calls without recalled context. Memory, knowledge, and
+    citation-feedback injection failures are non-fatal — the turn proceeds
+    without that context.
 
     The same message objects may be reused across inner-loop iterations; pair
     ids are only prefix-checked downstream.
@@ -158,15 +158,16 @@ def _inject_context_pairs(
         except Exception as e:
             logger.warning(f"Citation feedback injection failed (non-fatal): {e}")
 
-    if product_guide_memory_boundary and injected_count:
+    if product_guide_turn_boundary:
         # A HumanMessage is deliberate: several providers/models give a
-        # trailing synthetic tool result more weight than the earlier system
-        # floor and current user request. Keep the function-call/result pairs
-        # valid, then finish the ephemeral request with a current-digest
-        # instruction. The boundary is never written to durable history.
+        # trailing conversation answer or synthetic tool result more weight
+        # than the earlier system floor and current user request. Keep any
+        # function-call/result pairs valid, then finish the ephemeral request
+        # with a current-digest instruction. The boundary is never written to
+        # durable history.
         prepared.insert(
             base_inject_idx + injected_count,
-            HumanMessage(content=product_guide_memory_boundary),
+            HumanMessage(content=product_guide_turn_boundary),
         )
         injected_count += 1
 
@@ -993,11 +994,11 @@ async def _execute_turn(
 
     from .core.knowledge_injection import selected_knowledge_bindings
     from .core.skill_resolution import (
-        managed_product_guide_memory_boundary as _product_guide_memory_boundary,
+        managed_product_guide_turn_boundary as _product_guide_turn_boundary,
     )
 
     kb_bindings = selected_knowledge_bindings(tool_context)
-    product_guide_memory_nudge = _product_guide_memory_boundary(
+    product_guide_turn_nudge = _product_guide_turn_boundary(
         getattr(config, "extra", {}).get("_resolved_skills")
         if isinstance(getattr(config, "extra", {}), dict)
         else None,
@@ -1337,7 +1338,7 @@ async def _execute_turn(
             memory_block,
             knowledge_block,
             citation_feedback_block,
-            product_guide_memory_boundary=product_guide_memory_nudge,
+            product_guide_turn_boundary=product_guide_turn_nudge,
         )
 
         # Repair tool-call pairing before the LLM call. Compaction thrash, an

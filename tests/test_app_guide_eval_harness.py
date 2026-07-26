@@ -542,8 +542,12 @@ async def test_live_loop_calls_real_reader_but_keeps_trajectory_bounded(monkeypa
     assert "result" not in calls[0]
     assert calls[0]["result_chars"] > 1000
     assert len(calls[0]["result_sha256"]) == 64
-    assert requests[1]["messages"][-1]["role"] == "tool"
-    assert "[product guide topic: jobs]" in requests[1]["messages"][-1]["content"]
+    assert requests[1]["messages"][-2]["role"] == "tool"
+    assert "[product guide topic: jobs]" in requests[1]["messages"][-2]["content"]
+    assert requests[1]["messages"][-1]["role"] == "user"
+    assert (
+        "<managed_product_guide_turn_boundary" in requests[1]["messages"][-1]["content"]
+    )
     assert usage == {
         "prompt_tokens": 20,
         "completion_tokens": 4,
