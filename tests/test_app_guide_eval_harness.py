@@ -193,6 +193,41 @@ def test_email_attachment_fact_accepts_explicit_connector_selection(cases):
     assert score["passed"] is True
 
 
+def test_broad_session_fact_accepts_settings_qualification(cases):
+    case = _case(cases, "broad-session-capabilities")
+    answer = (
+        "Depending on your settings, I can research and use enabled tools. "
+        "Virtual workspaces have files while Container workspaces can add "
+        "shell and Git."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "sessions"}],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
+def test_campaign_scope_accepts_neither_ship_nor_kill_wording(cases):
+    case = _case(cases, "workflow-project-campaign")
+    answer = (
+        "In the project Loop, set max iterations and a Critic checkpoint. "
+        "Neither ship nor kill stops the entire project loop."
+    )
+
+    score = score_case(
+        case,
+        [{"name": APP_GUIDE_LOADER_TOOL, "topic_id": "project-loops"}],
+        answer,
+    )
+
+    assert score["answer_score"]["grounding_pass"] is True
+    assert score["passed"] is True
+
+
 def test_required_facts_allow_only_a_bounded_modifier_gap(cases):
     shell_case = _case(cases, "availability-missing-shell")
     shell_calls = [

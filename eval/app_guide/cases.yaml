@@ -39,7 +39,8 @@ cases:
       - id: workspace-dependent
         any_of: ["depends on the workspace", "workspace tier", "virtual", "container"]
       - id: settings-or-tools
-        any_of: ["current tool", "agent settings", "settings panel", "tools and permissions enabled", "tools available"]
+        any_of:
+          ["current tool", "agent settings", "settings panel", "depending on your settings", "tools and permissions enabled", "tools available"]
     forbidden_claims:
       - id: guide-grants-tools
         severity: critical
@@ -238,7 +239,8 @@ cases:
       - id: bounded-run
         any_of: ["max iterations", "time limit", "budget"]
       - id: disposition-scope
-        any_of: ["close the campaign, not the overall project loop", "does not stop the overall loop", "does not stop the whole loop", "only close the specific campaign", "return to the normal loop", "return to the loop"]
+        any_of:
+          ["close the campaign, not the overall project loop", "does not stop the overall loop", "does not stop the whole loop", "neither ship nor kill stops", "only close the specific campaign", "return to the normal loop", "return to the loop", "loop continues"]
     forbidden_claims:
       - id: definition-auto-stop
         severity: standard
