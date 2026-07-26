@@ -1638,6 +1638,71 @@ class TestExecuteTurnMemoryRetrieval:
 
         recall.retrieve.assert_called_once_with("")
 
+    @pytest.mark.asyncio
+    async def test_managed_guide_boundary_reaches_tail_injected_memory(self):
+        """The trusted catalog/reader pair reaches the actual LLM request.
+
+        Regression for a resumed, compacted session whose recalled workspace
+        memory followed the current product question and caused the model to
+        reuse an earlier answer without calling the current guide.
+        """
+        from src.core.skill_resolution import (
+            APP_GUIDE_LOADER_TOOL,
+            APP_GUIDE_SKILL,
+            add_persistent_system_skills,
+        )
+
+        catalog = add_persistent_system_skills({})
+        digest = next(
+            item["bundle_digest"]
+            for item in catalog["menu"]
+            if item["name"] == APP_GUIDE_SKILL
+        )
+        config = _make_config()
+        config.extra = {"_resolved_skills": catalog}
+
+        recall = MagicMock()
+        recall.decrement_ttl = AsyncMock()
+        recall.retrieve = AsyncMock(return_value=[MagicMock()])
+        captured = []
+
+        with patch(
+            "src.services.recall_store.RecallStore.assemble_memory_block",
+            return_value="HISTORICAL WORKSPACE MEMORY",
+        ):
+            await _execute_turn(
+                llm_with_tools=_capturing_llm(
+                    captured,
+                    _make_llm_response("done"),
+                ),
+                tool_map={APP_GUIDE_LOADER_TOOL: MagicMock()},
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(
+                        side_effect=lambda messages, *args, **kwargs: messages
+                    )
+                ),
+                messages=[
+                    SystemMessage(content="current system prompt"),
+                    HumanMessage(content="What can this SRW session do?"),
+                ],
+                callbacks=_make_callbacks(),
+                llm_timeout=600,
+                auxiliary_llm=None,
+                config=config,
+                recall_store=recall,
+            )
+
+        memory_result = next(
+            message
+            for message in captured[0]
+            if isinstance(message, ToolMessage)
+            and str(message.tool_call_id).startswith("memory_inject_")
+        )
+        assert "HISTORICAL WORKSPACE MEMORY" in memory_result.content
+        assert "<managed_product_guide_memory_boundary" in memory_result.content
+        assert digest in memory_result.content
+        assert "call `read_product_guide` on this turn" in memory_result.content
+
 
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — knowledge retrieval
@@ -4156,6 +4221,57 @@ class TestInjectContextPairs:
         assert isinstance(prepared[1], HumanMessage)
         assert _is_tool_call_ai(prepared[2])
         assert isinstance(prepared[3], ToolMessage)
+
+    def test_product_guide_boundary_follows_legacy_memory(self):
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
+        boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
+
+        count = _inject_context_pairs(
+            prepared,
+            [],
+            "HISTORICAL MEMORY",
+            "",
+            product_guide_memory_boundary=boundary,
+        )
+
+        assert count == 2
+        assert isinstance(prepared[-1], ToolMessage)
+        assert prepared[-1].content == f"HISTORICAL MEMORY\n\n{boundary}"
+
+    def test_product_guide_boundary_follows_manager_memory_without_mutation(self):
+        manager = _memory_pair("MANAGER MEMORY")
+        original_content = manager[1].content
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
+        boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
+
+        count = _inject_context_pairs(
+            prepared,
+            manager,
+            "",
+            "",
+            product_guide_memory_boundary=boundary,
+        )
+
+        assert count == 2
+        assert manager[1].content == original_content
+        injected = next(
+            message for message in prepared if isinstance(message, ToolMessage)
+        )
+        assert injected.content == f"{original_content}\n\n{boundary}"
+
+    def test_product_guide_boundary_is_not_added_without_memory(self):
+        prepared = [SystemMessage(content="sys"), HumanMessage(content="product?")]
+        boundary = "<managed_product_guide_memory_boundary>fresh</managed>"
+
+        _inject_context_pairs(
+            prepared,
+            [],
+            "",
+            "KNOWLEDGE",
+            product_guide_memory_boundary=boundary,
+        )
+
+        assert all(boundary not in str(message.content) for message in prepared)
 
     def test_knowledge_injected_after_first_human(self):
         prepared = [SystemMessage(content="sys"), HumanMessage(content="hi")]
