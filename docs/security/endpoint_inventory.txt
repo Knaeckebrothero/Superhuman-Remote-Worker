@@ -278,6 +278,7 @@ GET    /api/sources/{source_id}                                                 
 GET    /api/stats/agents                                                                admin:_require_admin
 GET    /api/stats/daily                                                                 gated:require_approved_user
 GET    /api/stats/jobs                                                                  gated:require_approved_user
+GET    /api/stats/session-wakes                                                         admin:_require_admin
 GET    /api/stats/stuck                                                                 gated:require_approved_user
 GET    /api/sudo/events                                                                 gated:user_can_access_job
 GET    /api/sudo/requests                                                               gated:require_job_access

@@ -1425,6 +1425,15 @@ export interface Job {
    * jobs get the Mode B "Open cloud folder" button.
    */
   cloud_review_mode?: 'diff' | 'open_folder' | null;
+  /**
+   * Session thread that created this job (session_wake_on_job_completion.md).
+   * NULL for cockpit-, automation- and worker-child-created jobs. Set
+   * server-side from the authenticated internal create path — never submitted.
+   * The job card uses it to render "launched from this session".
+   */
+  created_by_thread_id?: string | null;
+  /** Whether this job's terminal state owes its creating session a wake. */
+  wake_on_complete?: boolean;
 }
 
 /**

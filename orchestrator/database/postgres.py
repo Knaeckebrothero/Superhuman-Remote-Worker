@@ -749,7 +749,7 @@ class PostgresDB:
                        j.project_id, j.parent_job_id, j.priority,
                        j.repo_name, j.branch_name, j.merge_status,
                        j.diff_status, j.exported_at, j.error_message,
-                       j.created_at,
+                       j.created_at, j.created_by_thread_id,
                        j.context->'snapshot'->>'status' AS snapshot_status,
                        p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
@@ -836,7 +836,7 @@ class PostgresDB:
                        j.project_id, j.parent_job_id, j.priority,
                        j.repo_name, j.branch_name, j.merge_status,
                        j.diff_status, j.exported_at, j.error_message,
-                       j.created_at,
+                       j.created_at, j.created_by_thread_id,
                        j.context->'snapshot'->>'status' AS snapshot_status,
                        p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
@@ -887,6 +887,7 @@ class PostgresDB:
                        j.exported_folder_handle, j.exported_at,
                        j.creation_order, j.worktree_path, j.delegation_context,
                        j.error_message, j.error_details, j.runner_kind,
+                       j.created_by_thread_id, j.wake_on_complete,
                        j.created_at, j.updated_at, j.description, j.context,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
                 FROM jobs j
@@ -919,6 +920,8 @@ class PostgresDB:
         runner_kind: str = "user",
         status: str = "created",
         freeze_data: Dict[str, Any] | None = None,
+        created_by_thread_id: str | None = None,
+        wake_on_complete: bool = False,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -943,6 +946,14 @@ class PostgresDB:
             freeze_data: Optional freeze dict set atomically at creation — an
                 INSERT-time park has no window in which the dispatcher poll
                 could grab the row (docs/issues/loop_advances_into_active_model_cooldown.md)
+            created_by_thread_id: Session thread that created this job. Only the
+                creating *session* sets this — scholar/critic/delegation subjob
+                call sites pass parent_job_id alone and therefore correctly do
+                NOT inherit the backref (a subjob's completion is the parent
+                job's business, not the session's).
+            wake_on_complete: Whether this job's terminal state owes the creating
+                session a wake. Set server-side by the create endpoint, never by
+                the model — see docs/features/session_wake_on_job_completion.md.
 
         Returns:
             Created job dict with id
@@ -950,13 +961,14 @@ class PostgresDB:
         user_uuid = UUID(user_id) if user_id else None
         project_uuid = UUID(project_id) if project_id else None
         parent_uuid = UUID(parent_job_id) if parent_job_id else None
+        thread_uuid = UUID(created_by_thread_id) if created_by_thread_id else None
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete
                 """,
                 description,
                 document_path or document_dir,
@@ -976,6 +988,8 @@ class PostgresDB:
                 UUID(expert_id) if expert_id else None,
                 runner_kind,
                 json.dumps(freeze_data) if freeze_data else None,
+                thread_uuid,
+                wake_on_complete,
             )
 
         return dict(row)
@@ -4466,6 +4480,254 @@ class PostgresDB:
                 job_uuid,
             )
             return row is not None
+
+    # --- Session wake outbox -------------------------------------------------
+    #
+    # A single-message-per-row transactional outbox on the jobs row itself:
+    # same correctness as a dedicated outbox table, no new table, and durable
+    # and inspectable in a way an in-memory claim is not. Design + rationale:
+    # docs/features/session_wake_on_job_completion.md.
+    #
+    # The claim exists because the send is NOT idempotent — the agent's
+    # /api/input mints a fresh message id per call and unconditionally enqueues,
+    # so a duplicate is a visible message in the user's transcript plus a second
+    # paid LLM turn. Claim first, commit, then send.
+    #
+    # Deliberately NOT modelled on claim_delegation_resume: its dedup is a CAS
+    # on the waiter's own status transition (waiting → paused), where the legal
+    # transition IS the already-woken flag. A thread has no equivalent — it is
+    # legitimately 'active' before, during and after a wake — so the claim has
+    # to be materialized.
+
+    async def mark_job_wake_pending(self, job_id: str, terminal_status: str) -> bool:
+        """Enqueue a completion wake for the session that created ``job_id``.
+
+        Returns True iff this call moved the row into 'pending' (i.e. a wake is
+        now owed). False covers every legitimate no-op: the job was not created
+        by a session, its owner opted out, a wake for this same terminal status
+        was already delivered, or one is already in flight.
+
+        Idempotent by construction, which is what makes it safe to call from
+        several completion paths plus the sweeper for the same job. The guard
+        ``wake_state IN ('none','sent')`` is what stops an in-flight wake from
+        being re-enqueued; ``wake_notified_status IS DISTINCT FROM $2`` is what
+        stops the *same* terminal status from being delivered twice while still
+        allowing pending_review → completed to wake a second time.
+
+        Note the deliberate omission: this does NOT clear wake_attempts. A row
+        that already burned attempts on an unreachable pod keeps its budget, so
+        a permanently dead session can't be re-armed into an infinite retry by
+        repeated terminal transitions.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET wake_state = 'pending',
+                       wake_claimed_at = NULL
+                 WHERE id = $1
+                   AND wake_on_complete
+                   AND created_by_thread_id IS NOT NULL
+                   AND wake_state IN ('none', 'sent')
+                   AND wake_notified_status IS DISTINCT FROM $2
+                RETURNING id
+                """,
+                job_uuid,
+                terminal_status,
+            )
+            return row is not None
+
+    async def claim_pending_job_wakes(
+        self,
+        *,
+        limit: int = 20,
+        visibility_timeout_seconds: int = 120,
+    ) -> List[Dict[str, Any]]:
+        """Atomically claim up to ``limit`` owed wakes for THIS caller to send.
+
+        Returns the claimed rows. Every returned row is exclusively ours until
+        the visibility timeout expires; the caller MUST follow up with
+        :meth:`finish_job_wake` or :meth:`release_job_wake` for each.
+
+        Atomicity is guaranteed by documented Read Committed semantics, not by
+        luck: ``SELECT ... FOR UPDATE`` re-evaluates its WHERE against the row
+        version it actually locked, so a loser matches nothing and gets zero
+        rows back. Combined with SKIP LOCKED (two replicas take disjoint sets
+        rather than one blocking on the other), exactly one replica sends each
+        wake.
+
+        Three WHERE arms, each load-bearing:
+
+        * ``wake_state = 'pending'`` — the hook fired and a wake is owed.
+        * ``'sending'`` past the visibility timeout — re-claim of a row a
+          replica died holding. This arm is the entire durability argument: it
+          is why losing the opportunistic post-commit send is harmless, and why
+          a SIGKILL mid-rollout costs latency rather than a silently-lost wake.
+        * ``'none'`` on an already-terminal job — the BACKSTOP. There is no
+          terminal-state choke point in this codebase: dispatch-time
+          grant/config failures, the LLM-outage fail path and VM-upgrade
+          approval expiry all mark a job terminal with a direct DB write and no
+          hook of any kind. Finding those by *status* rather than by hook is
+          what turns "a session that waits forever" into "one tick of latency".
+          ``wake_notified_status IS DISTINCT FROM status`` keeps it from
+          re-firing what was already delivered.
+
+        INDEX CONTRACT: the states are LITERAL SQL here so the partial index
+        idx_jobs_wake_pending (migration 0071) applies. Rewriting any of them to
+        ``wake_state = ANY($n)`` makes the predicate non-immutable at plan time
+        and permanently disables the index — turning every sweeper tick into a
+        seq-scan of jobs. The index predicate also carries ``wake_on_complete``
+        and ``created_by_thread_id IS NOT NULL``, which is why they lead the
+        WHERE here rather than being left implicit.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE jobs j
+                   SET wake_state = 'sending',
+                       wake_claimed_at = NOW(),
+                       wake_attempts = j.wake_attempts + 1
+                  FROM (
+                        SELECT id FROM jobs
+                         WHERE wake_on_complete
+                           AND created_by_thread_id IS NOT NULL
+                           AND (
+                                wake_state = 'pending'
+                                OR (wake_state = 'sending'
+                                    AND wake_claimed_at
+                                        < NOW() - make_interval(
+                                            secs => $1::double precision))
+                                OR (wake_state = 'none'
+                                    AND status IN ('completed', 'failed',
+                                                   'cancelled', 'pending_review')
+                                    AND wake_notified_status IS DISTINCT FROM status)
+                               )
+                         ORDER BY updated_at
+                         FOR UPDATE SKIP LOCKED
+                         LIMIT $2
+                       ) s
+                 WHERE j.id = s.id
+                RETURNING j.id, j.created_by_thread_id, j.status, j.wake_attempts,
+                          j.user_id, j.project_id, j.description, j.expert_id,
+                          j.config_name, j.freeze_data, j.error_message
+                """,
+                float(visibility_timeout_seconds),
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def finish_job_wake(self, job_id: str, delivered_status: str) -> None:
+        """Mark a claimed wake delivered, recording WHICH terminal status went
+        out. The recorded status is what lets a later, different terminal state
+        (approve flipping pending_review → completed) wake the session again
+        without re-delivering the one it already saw."""
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE jobs
+                   SET wake_state = 'sent',
+                       wake_notified_status = $2,
+                       wake_claimed_at = NULL
+                 WHERE id = $1
+                   AND wake_state = 'sending'
+                """,
+                job_uuid,
+                delivered_status,
+            )
+
+    async def release_job_wake(self, job_id: str, *, max_attempts: int = 8) -> str:
+        """Hand a failed send back for retry, or bury it.
+
+        Returns the resulting state ('pending' or 'dead'). Burying at the cap is
+        what keeps one permanently-unreachable session from re-claiming forever
+        and starving live wakes behind it in the ORDER BY. ``wake_state='dead'``
+        is the single alert-worthy metric this feature has — a non-zero count
+        means some session is waiting on a job it will never hear about, which
+        is precisely the bug the feature exists to remove.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return "dead"
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET wake_state = CASE WHEN wake_attempts >= $2 THEN 'dead'
+                                         ELSE 'pending' END,
+                       wake_claimed_at = NULL
+                 WHERE id = $1
+                   AND wake_state = 'sending'
+                RETURNING wake_state
+                """,
+                job_uuid,
+                max_attempts,
+            )
+        return str(row["wake_state"]) if row else "dead"
+
+    async def get_job_wake_stats(self) -> Dict[str, int]:
+        """Fleet-wide wake-outbox depth by state.
+
+        ``dead`` is the alert-worthy number and the whole observability story
+        for this feature: each one is a session waiting on a job it will never
+        be told about. Excludes 'none' — most jobs are not session-created and
+        counting them would swamp the signal.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT wake_state, COUNT(*) AS n FROM jobs "
+                "WHERE wake_state <> 'none' GROUP BY wake_state"
+            )
+        counts = {str(r["wake_state"]): int(r["n"]) for r in rows}
+        return {
+            "pending": counts.get("pending", 0),
+            "sending": counts.get("sending", 0),
+            "sent": counts.get("sent", 0),
+            "dead": counts.get("dead", 0),
+        }
+
+    async def get_thread_job_counts(self, thread_id: str) -> Dict[str, int]:
+        """Terminal/in-flight tallies over every job a thread created.
+
+        Feeds the "1 of 3 finished — 1 still running, 1 failed" line in the wake
+        payload. Without it the agent must spend a list_worker_jobs round-trip
+        on EVERY wake just to decide whether this is the moment to act; with it
+        the decision is free. Keys: total, running, completed, failed,
+        cancelled, pending_review.
+        """
+        try:
+            thread_uuid = UUID(thread_id)
+        except ValueError:
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT status, COUNT(*) AS n
+                  FROM jobs
+                 WHERE created_by_thread_id = $1
+                 GROUP BY status
+                """,
+                thread_uuid,
+            )
+        by_status = {str(r["status"]): int(r["n"]) for r in rows}
+        terminal = ("completed", "failed", "cancelled")
+        return {
+            "total": sum(by_status.values()),
+            "finished": sum(by_status.get(s, 0) for s in terminal),
+            "running": sum(n for s, n in by_status.items() if s not in terminal),
+            "completed": by_status.get("completed", 0),
+            "failed": by_status.get("failed", 0),
+            "cancelled": by_status.get("cancelled", 0),
+            "pending_review": by_status.get("pending_review", 0),
+        }
 
     async def queue_job_for_resume(
         self, job_id: str, context_merge: Dict[str, Any] | None = None

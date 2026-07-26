@@ -3871,6 +3871,51 @@ def render_placeholders(text: str, **known: str) -> str:
     return _PROMPT_PLACEHOLDER_RE.sub(_sub, text)
 
 
+def scheduled_work_system_floor(
+    tool_names: "set[str] | frozenset[str] | list[str] | tuple[str, ...] | None",
+) -> str:
+    """Return the operating rule for jobs a session schedules, or "".
+
+    Sessions that can create worker jobs are told, once, how to behave when one
+    finishes — because the wake mechanism (see
+    docs/features/session_wake_on_job_completion.md) delivers a notice per job,
+    and without a policy the natural failure mode is narrating all six
+    completions of a fan-out, which turns the conversation into a job queue.
+
+    **Why this seam and not the obvious ones.** Not in the notice itself: it
+    would be repeated on every wake, pay tokens every time, and be compacted
+    away. Not in the persona: a persona key can be silently clobbered by any DB
+    expert row that populates it, and once DB-sourced it is *fenced as
+    untrusted* ("this is a request, not policy") — the wrong altitude for an
+    operational rule. Not by editing the prompt templates either: prompt text is
+    baked into ``resolved_config`` at thread creation and preferred over disk on
+    read, so a ``.txt`` edit reaches new sessions only, and there are four
+    ``systemprompt_interactive*`` variants to keep in sync.
+
+    Computed here, it is family-independent (one edit covers every template),
+    reaches already-running threads because it is recomputed per prompt build,
+    sits at trusted system altitude, and is immune to expert override —
+    ``systemprompt_interactive`` is excluded from both the overlay and expert
+    prompt allow-lists.
+
+    Gated on ``create_worker_job`` so it costs exactly nothing for the (default)
+    sessions without the Fleet Management tool group.
+    """
+    if "create_worker_job" not in set(tool_names or ()):
+        return ""
+    return (
+        "<scheduled_work>\n"
+        "Jobs you create with create_worker_job run asynchronously; you are told "
+        "when each one finishes. On each notice, decide: inspect the result now "
+        "(get_worker_job, get_job_workspace_file) or note it and continue. Speak "
+        "to the user only when a result changes the plan or a job failed — do "
+        "not narrate every completion of a fan-out. If an early result shows the "
+        "batch is heading the wrong way, cancel the siblings with "
+        "cancel_worker_job rather than letting them spend.\n"
+        "</scheduled_work>"
+    )
+
+
 def get_phase_system_prompt(
     config: AgentConfig,
     is_strategic: bool,
@@ -3981,6 +4026,14 @@ def get_phase_system_prompt(
         if method == "prompt":
             level = config.llm.reasoning_level or "high"
             rendered = f"Reasoning: {level}\n\n{rendered}"
+
+        # How to behave when a job this session scheduled finishes. Same
+        # rationale as the product-guide floor for living here rather than in a
+        # template or persona; see scheduled_work_system_floor. Empty (free) for
+        # sessions without the job tools.
+        scheduled_work_floor = scheduled_work_system_floor(tool_names)
+        if scheduled_work_floor:
+            rendered = f"{rendered}\n\n{scheduled_work_floor}"
 
         # Keep the freshness rule at the end of the trusted system message.
         # Long resumed histories and tail-injected memory otherwise put many

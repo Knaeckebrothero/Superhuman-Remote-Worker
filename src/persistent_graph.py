@@ -237,6 +237,14 @@ INTERRUPT_SENTINEL = "__INTERRUPT__"
 APPROVE_SENTINEL = "__APPROVE__"
 DENY_SENTINEL = "__DENY__"
 
+# additional_kwargs key by which a message declares the thread_messages.role it
+# should be PERSISTED under, when its LangChain type is only a carrier. An
+# injected system notice travels as HumanMessage — so this loop, the turn
+# reconciler's backwards walk, and the model's context all stay unchanged — but
+# must persist as role='event' rather than as a user bubble. Defined here (the
+# lower layer) so the transport and the loop cannot drift apart on the spelling.
+PERSIST_ROLE_KEY = "_srw_persist_role"
+
 
 def _user_facing_turn_error(e: BaseException) -> str:
     """Map a turn-killing exception to a message worth showing the user.
@@ -710,8 +718,14 @@ async def run_persistent_loop(
         # row under (session_silent_failure_audit.md #1) — reusing it makes
         # every later write an upsert onto that row instead of a duplicate.
         input_msg_id: Optional[str] = None
+        input_persist_role: Optional[str] = None
         if isinstance(user_input, dict):
             input_msg_id = user_input.get("id")
+            # System-injected input (e.g. a worker job this session created
+            # finished) persists under its own transcript role. Carried through
+            # so the turn-start reconcile below re-writes the SAME role the
+            # accept-time persist used, instead of flipping the row to 'human'.
+            input_persist_role = user_input.get("role")
             user_input = user_input.get("content", "")
 
         if not user_input or user_input == INTERRUPT_SENTINEL:
@@ -755,6 +769,11 @@ async def run_persistent_loop(
         user_msg = HumanMessage(content=user_input)
         if input_msg_id:
             user_msg.id = input_msg_id
+        if input_persist_role and input_persist_role != "human":
+            # Persist-role only — the message stays a HumanMessage so the turn
+            # walk in _save_turn_ai_messages (backwards until the first
+            # HumanMessage) keeps finding the turn boundary.
+            user_msg.additional_kwargs[PERSIST_ROLE_KEY] = input_persist_role
         messages.append(_ensure_msg_id(user_msg))
 
         await callbacks.on_turn_start(turn_id)

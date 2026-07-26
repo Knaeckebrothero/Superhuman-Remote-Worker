@@ -1,0 +1,67 @@
+-- migration:     0071_jobs_wake_pending_idx.notx.sql
+-- description:   Partial index for the session-wake claim query
+--                (PostgresDB.claim_pending_job_wakes), run by both the
+--                opportunistic post-commit drain and the backstop sweeper every
+--                ~20s. The query scans jobs for the owed set, orders by
+--                updated_at and takes a small LIMIT under FOR UPDATE SKIP
+--                LOCKED.
+--
+--                The predicate is the point: without it, a tick every 20
+--                seconds forever is a seq-scan of the whole jobs table. With
+--                it, the index holds only session-created jobs that have not
+--                been woken yet — roughly "jobs currently in flight from a
+--                session" — and a quiet tick costs an empty range scan.
+--
+--                All three live wake_states are covered, each for a distinct
+--                reason:
+--                  'none'    — the BACKSTOP arm. There is no terminal-state
+--                              choke point in this codebase: dispatch-time
+--                              grant/config failures, the LLM-outage fail path
+--                              and VM-upgrade approval expiry all mark a job
+--                              terminal with a direct DB write and no hook. The
+--                              claim finds those by status instead, so a missed
+--                              hook costs one tick of latency rather than a
+--                              session that waits forever.
+--                  'pending' — the hook fired; a wake is owed.
+--                  'sending' — a replica claimed it and may have died holding
+--                              the claim; re-claimable past the visibility
+--                              timeout. This arm is the entire durability
+--                              argument — it is why losing the opportunistic
+--                              send is harmless.
+--                'sent' and 'dead' are excluded, which is what bounds the
+--                index: a delivered wake leaves it permanently.
+--
+--                created_by_thread_id IS NOT NULL is in the predicate so a row
+--                orphaned by the FK's ON DELETE SET NULL (the creating thread
+--                was hard-deleted) drops off the index instead of sitting on it
+--                forever with nobody to wake.
+--
+--                Key is updated_at because the claim orders by it (oldest owed
+--                wake first), so the scan is pre-sorted and early-exits at
+--                LIMIT.
+--
+--                Predicate contract: the claim embeds the states as LITERAL SQL
+--                (wake_state = 'pending', etc). Rewriting any of them to
+--                wake_state = ANY($1) makes the predicate non-immutable at plan
+--                time and permanently disables this index. A code comment on
+--                the method mirrors this warning.
+-- depends-on:    0070_jobs_created_by_thread.sql (wake_* columns)
+-- expected:      seconds on dev; on a large jobs table CONCURRENTLY takes
+--                longer but never blocks writers.
+-- locks:         ShareUpdateExclusiveLock only (CONCURRENTLY).
+-- transactional: NO. CREATE INDEX CONCURRENTLY can't run inside a transaction
+--                block; hence the .notx.sql suffix the runner recognises.
+-- runbook:       If CONCURRENTLY is interrupted (crash/timeout) it leaves an
+--                INVALID index behind. IF NOT EXISTS will then NOT rebuild it
+--                (the name exists), so the build silently no-ops. Recover with:
+--                    DROP INDEX CONCURRENTLY IF EXISTS idx_jobs_wake_pending;
+--                then re-run this migration. Detect stragglers via:
+--                    SELECT indexrelid::regclass FROM pg_index
+--                    WHERE NOT indisvalid
+--                      AND indexrelid::regclass::text = 'idx_jobs_wake_pending';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_wake_pending
+    ON jobs (updated_at)
+    WHERE wake_on_complete
+      AND created_by_thread_id IS NOT NULL
+      AND wake_state IN ('none', 'pending', 'sending');
