@@ -234,7 +234,22 @@ The project's `goal` carries a one-line restatement of the branch convention as 
 backstop if the skill is not loaded. This project is also the container a future
 loop (F8) attaches to.
 
-### 4. The `srw-repo-contribution` skill
+### 4. The `repo-contribution` skill
+
+**Written 2026-07-26 → `docs/skills/repo-contribution/SKILL.md`.** Verified against
+the real parser (`src.core.skill_format.parse_skill_md`) and the house budgets:
+description 763/1024 chars, 147/500 lines, ~1.9k/5k tokens.
+
+**Renamed from `srw-repo-contribution`, and written generically.** The mechanics
+(work in the clone, cut a job branch, push, write the PR body, stop) are not
+SRW-specific — they are what *any* agent contributing to *any* attached repository
+datasource must do. Hardcoding SRW would have made F9 a rewrite instead of a
+promotion. SRW-specific details (which test command, the `docs/issues/` convention)
+belong in the project `goal` or the job description, not the skill.
+
+It stays a **user-owned DB skill** for now regardless of its genericity — promoting
+it to `config/skills/` is a deliberate roster decision under [[default_skill_roster]],
+not a side effect of how it happened to be written.
 
 **A user-owned DB skill, deliberately not `config/skills/`.** Bundled skills ship
 to every deployment; "how to contribute to the SRW repo" is not universal and
@@ -307,9 +322,22 @@ App (F1) makes the actor unforgeable.
 authoring the source in-repo and importing; re-import after edits. If this proves
 annoying, promote to a bound expert instruction file.
 
-**Open — where does the skill source file live?** It must not be under
-`config/skills/` (would bundle it). Candidates: `docs/skills/`, or a new
-`config/skills-local/` excluded from the bundle scan. Deferred to implementation.
+**R5 — usage under-reporting on orchestrator restart.** Relevant because the
+motivation is *spending* OpenAI capacity, so the ledger is how you know it worked.
+The codex metering gap itself is **fixed and live on dev** (`812963ef`, 2026-07-19,
+on `origin/develop`; **not on `origin/main`, so prod lacks it**). But
+`llm_usage_poll_loop` (`orchestrator/main.py:1880`) keeps its cursor **in memory**
+and re-anchors to `max(llm_requests.timestamp)` on every startup — deliberately
+forward-only, "does not backfill historical rows." So rows that arrived but were
+not yet materialized when the orchestrator restarts are skipped permanently: the
+new anchor jumps past them. The lost window is bounded by the 120 s tick plus the
+`min_age_s` hold-back, per restart. On a dev cluster that redeploys often, the
+dashboard will under-report — and under-report *more* the more you deploy. Persist
+the cursor to make it restart-safe if the accounting needs to be trusted.
+
+**Resolved — where the skill source file lives.** `docs/skills/repo-contribution/SKILL.md`.
+Outside `config/skills/`, so `_scan_skills` never globs it into every deployment's
+menu, but still version-controlled and reviewable. No new bundle-scan exclusion needed.
 
 **Open — does `_scan_skills` or any test assert on skills outside `config/skills/`?**
 `tests/test_bundled_skills.py` covers bundled skills only, so a DB skill gets no
