@@ -551,7 +551,7 @@ async def _agent_label(db: Any, row: dict[str, Any]) -> str:
 
 
 async def _sibling_line(db: Any, thread_id: str) -> str:
-    """"1 of 3 finished — 1 still running, 1 failed".
+    """ "1 of 3 finished — 1 still running, 1 failed".
 
     Free once created_by_thread_id exists, and it saves the agent a
     list_worker_jobs round-trip on EVERY wake just to decide whether this is the
@@ -572,7 +572,9 @@ async def _sibling_line(db: Any, thread_id: str) -> str:
     if counts.get("cancelled"):
         parts.append(f"{counts['cancelled']} cancelled")
     tail = f" — {', '.join(parts)}" if parts else ""
-    return f"Your outstanding jobs: {counts.get('finished', 0)} of {total} finished{tail}."
+    return (
+        f"Your outstanding jobs: {counts.get('finished', 0)} of {total} finished{tail}."
+    )
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

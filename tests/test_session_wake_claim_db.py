@@ -160,9 +160,7 @@ async def test_a_crashed_sender_is_re_claimed_after_the_visibility_timeout(db):
     await db.claim_pending_job_wakes()
 
     # Inside the window: still exclusively the (now dead) claimer's.
-    assert not [
-        r for r in await db.claim_pending_job_wakes() if str(r["id"]) == job_id
-    ]
+    assert not [r for r in await db.claim_pending_job_wakes() if str(r["id"]) == job_id]
 
     async with db.acquire() as conn:
         await conn.execute(
@@ -191,9 +189,7 @@ async def test_backstop_claims_a_terminal_job_whose_hook_never_ran(db):
 @pytest.mark.asyncio
 async def test_a_still_running_job_is_never_claimed(db):
     job_id = await _mk(db, status="processing")
-    assert not [
-        r for r in await db.claim_pending_job_wakes() if str(r["id"]) == job_id
-    ]
+    assert not [r for r in await db.claim_pending_job_wakes() if str(r["id"]) == job_id]
 
 
 @pytest.mark.asyncio
@@ -232,9 +228,7 @@ async def test_a_delivered_wake_leaves_the_claimable_set(db):
     await db.claim_pending_job_wakes()
     await db.finish_job_wake(job_id, "completed")
 
-    assert not [
-        r for r in await db.claim_pending_job_wakes() if str(r["id"]) == job_id
-    ]
+    assert not [r for r in await db.claim_pending_job_wakes() if str(r["id"]) == job_id]
     assert (await _state(db, job_id))["wake_notified_status"] == "completed"
 
 
@@ -255,9 +249,7 @@ async def test_release_retries_under_the_cap_and_buries_at_it(db):
 
     # Burying is what stops one unreachable session starving live wakes behind
     # it in the claim's ORDER BY — so a dead row must stay out.
-    assert not [
-        r for r in await db.claim_pending_job_wakes() if str(r["id"]) == job_id
-    ]
+    assert not [r for r in await db.claim_pending_job_wakes() if str(r["id"]) == job_id]
     assert (await db.get_job_wake_stats())["dead"] >= 1
 
 

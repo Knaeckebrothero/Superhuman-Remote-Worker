@@ -1000,7 +1000,9 @@ async def test_intake_accepts_dispose_only_plan_and_skips_kb_check():
         out = await file_loop_plan(
             MagicMock(),
             CRITIC_JOB_ID,
-            LoopPlanRequest(plan={"disposition": {"outcome": "kill", "notes": "dead end"}}),
+            LoopPlanRequest(
+                plan={"disposition": {"outcome": "kill", "notes": "dead end"}}
+            ),
         )
     assert out["status"] == "accepted"
     kb_fetchrow.assert_not_awaited()
