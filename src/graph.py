@@ -372,6 +372,30 @@ def _cooldown_detail(error: Exception) -> tuple[Optional[float], Optional[str]]:
     return None, None
 
 
+def _cooldown_failfast_error(
+    message: str, model: Optional[str], reset_seconds: Optional[float]
+) -> Dict[str, Any]:
+    """Structured error payload for a cooldown fail-fast.
+
+    Carries ``classification``/``model``/``reset_at`` so the orchestrator's
+    loop engine can park the next member instead of spawning it into the same
+    frozen model. ``reset_at`` is ABSOLUTE epoch seconds — the payload is read
+    by the loop advance minutes later and by the heal path hours later, so a
+    relative ``reset_seconds`` would rot; ``None`` when the provider stated no
+    reset. docs/issues/loop_advances_into_active_model_cooldown.md
+    """
+    return {
+        "message": message,
+        "type": "llm_error",
+        "recoverable": False,
+        "classification": "cooldown",
+        "model": model,
+        "reset_at": (
+            time.time() + reset_seconds if reset_seconds is not None else None
+        ),
+    }
+
+
 def _is_insufficient_quota(exc: BaseException) -> bool:
     """True if ``exc`` is an OpenAI-style ``insufficient_quota`` billing error.
 
@@ -2797,11 +2821,9 @@ def create_execute_node(
                             phase_number=phase_number,
                         )
                     return {
-                        "error": {
-                            "message": cd_msg,
-                            "type": "llm_error",
-                            "recoverable": False,
-                        },
+                        "error": _cooldown_failfast_error(
+                            cd_msg, cd_model or phase_model, reset_s
+                        ),
                         "iteration": iteration + 1,
                         "should_stop": True,
                     }

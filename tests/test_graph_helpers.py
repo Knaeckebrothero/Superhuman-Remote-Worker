@@ -12,6 +12,7 @@ from src.graph import (
     _classify_llm_error,
     _cooldown_reset_seconds,
     _cooldown_detail,
+    _cooldown_failfast_error,
     _cooldown_within_pause_budget,
     _COOLDOWN_MAX_PAUSE_SECONDS,
     _extract_rate_limit_delay,
@@ -1183,6 +1184,32 @@ class TestIsOutputTruncated:
         # Defensive: a non-string finish_reason must not raise.
         assert _is_output_truncated(0) is False
         assert _is_output_truncated(["length"]) is True  # str(list) contains it
+
+
+# =============================================================================
+# _cooldown_failfast_error — structured payload for the cooldown fail-fast
+# (docs/issues/loop_advances_into_active_model_cooldown.md)
+# =============================================================================
+
+
+class TestCooldownFailfastError:
+    def test_carries_structured_fields(self):
+        import time as _time
+
+        before = _time.time()
+        err = _cooldown_failfast_error("msg", "gpt-5.3-codex-spark", 585034.0)
+        after = _time.time()
+        assert err["message"] == "msg"
+        assert err["type"] == "llm_error"
+        assert err["recoverable"] is False
+        assert err["classification"] == "cooldown"
+        assert err["model"] == "gpt-5.3-codex-spark"
+        assert before + 585034.0 <= err["reset_at"] <= after + 585034.0
+
+    def test_unknown_reset_gives_none_reset_at(self):
+        err = _cooldown_failfast_error("msg", "m", None)
+        assert err["reset_at"] is None
+        assert err["classification"] == "cooldown"
 
 
 # =============================================================================

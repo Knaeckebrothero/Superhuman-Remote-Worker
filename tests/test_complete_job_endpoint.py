@@ -586,3 +586,63 @@ class TestOrchestratorClientReportCompletion:
             success = await client.report_completion("job-123", {"should_stop": True})
 
         assert success is True
+
+
+# =============================================================================
+# Structured cooldown fail-fast error (docs/issues/loop_advances_into_active_model_cooldown.md)
+# =============================================================================
+
+
+class TestStructuredCooldownFailfast:
+    """The fail-fast error dict gained classification/model/reset_at — the
+    completion path must neither divert on the extra keys nor lose the text."""
+
+    def test_cooldown_failfast_dict_fails_with_message_text(self):
+        job = make_job()
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {
+                "message": "cooldown msg",
+                "type": "llm_error",
+                "recoverable": False,
+                "classification": "cooldown",
+                "model": "gpt-5.3-codex-spark",
+                "reset_at": 1785412444.0,
+            },
+        }
+        new_status, error_message = determine_job_status(job, result)
+        assert new_status == "failed"
+        assert error_message == "cooldown msg"
+
+    @pytest.mark.asyncio
+    async def test_update_job_status_writes_error_details(self):
+        from contextlib import asynccontextmanager
+
+        from orchestrator.database.postgres import PostgresDB
+
+        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+            db = PostgresDB()
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        @asynccontextmanager
+        async def fake_acquire():
+            yield conn
+
+        db.acquire = fake_acquire
+
+        updated = await db.update_job_status(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            status="failed",
+            error_message="cooldown msg",
+            error_details={"classification": "cooldown", "reset_at": 1785412444.0},
+        )
+        assert updated is True
+        query = conn.execute.await_args.args[0]
+        params = conn.execute.await_args.args[1:]
+        assert "error_details = $" in query
+        assert "::jsonb" in query
+        assert any(
+            isinstance(p, str) and '"classification": "cooldown"' in p for p in params
+        )

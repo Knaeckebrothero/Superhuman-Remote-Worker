@@ -4,27 +4,35 @@ tags:
   - experts
   - product
   - defaults
+related:
+  - "[[db_backed_default_experts]]"
 ---
 
 # Default Expert Roster
 
-> **Status**: Research + recommendation, 2026-06-21. **No code changes yet.** Defines which bundled experts SRW should ship *by default in every deployment*, structured as a tight always-on **core** plus **opt-in tiers**. Builds on the shipped experts substrate ([[global_expert_management]]) and the skills layer ([[agent_skills]]). The roster recommendation is **pending decision**; the proposed first concrete build is a new `writer` worker expert.
+> **Status**: Research + recommendation, 2026-06-21; partially adopted
+> 2026-07-22. The general-purpose **Assistant** session expert and
+> **General Worker** application default shipped with
+> [[db_backed_default_experts]]. The broader core/opt-in roster recommendation
+> remains open, including the proposed `writer` worker expert and re-tiering of
+> specialist roles. Builds on [[global_expert_management]] and
+> [[agent_skills]].
 >
 > **Method**: a `deep-research` harness run (113 agents, ~4.5M tokens, 30 sources fetched, 146 claims extracted → 25 verified → **22 confirmed / 3 refuted** via 3-vote adversarial verification) surveyed multi-agent frameworks, coding-agent products, deep-research systems, and the role-specialization literature — then synthesized against SRW's architecture. Descriptive claims (what each system *ships*) are strongly sourced; roster *placements* are reasoned synthesis on top (confidence noted per call).
 
 ## Motivation
 
-SRW ships bundled experts (`config/experts/`) that every deployment inherits regardless of where it runs. The question this doc answers: **what should that default set be?** Some roles you always want no matter the deployment — a researcher, a builder, a reviewer. Others are domain-specific and should be opt-in. We currently ship **7** experts (`scholar`, `developer`, `critic`, `curator`, `designer`, `designer-interactive`, `bughunter`); this doc re-assesses that set against external evidence and proposes a deliberate core + tiered catalog.
+SRW ships bundled experts (`config/experts/`) that every deployment inherits regardless of where it runs. The question this doc answers: **what should that default set be?** Some roles you always want no matter the deployment — a researcher, a builder, a reviewer. Others are domain-specific and should be opt-in. At the time of this research SRW shipped **7** experts (`scholar`, `developer`, `critic`, `curator`, `designer`, `designer-interactive`, `bughunter`); this doc re-assesses that original set against external evidence and proposes a deliberate core + tiered catalog. Assistant and General Worker were added afterward through [[db_backed_default_experts]].
 
 The goal is **balanced general-purpose** — roughly even coverage across software engineering, research/knowledge work, and writing/design — not a software-company roster and not a research-only roster.
 
 ## TL;DR
 
 - **Ship a small core, not a big roster.** The strongest evidence (the MAST failure taxonomy) says multi-agent systems fail 41–86.7% of the time, gains over a single strong agent are "often minimal," and failures cluster in **role/system design**, not coordination. Breadth is a liability; **investing in a few sharply-specified roles is the win** (improving role specs alone gave ChatDev +9.4% with no new agents).
-- **Recommended core (5):** `scholar` (research) · `developer` (build) · `critic` (review) · **`writer`** (synthesize — *new*) · **`assistant`** (general-purpose session — *new*).
+- **Recommended core (5):** `scholar` (research) · `developer` (build) · `critic` (review) · **`writer`** (synthesize — *proposed*) · **`assistant`** (general-purpose session — *shipped*).
 - **Move to opt-in:** `curator`, `designer`, `bughunter`.
 - **Don't ship as experts:** orchestrator / planner / supervisor / router / triage / memory-manager — these are framework mechanics SRW already owns.
-- **Biggest practical gap:** 6 of the current 7 are *worker* experts; the **session** side is nearly empty. A "deploy-anywhere" default needs at least one strong interactive role.
+- **Original biggest practical gap:** 6 of the original 7 were *worker* experts. Assistant now supplies the general interactive baseline; session variants of specialist roles remain an open roster question.
 - This validates the platform's **capability-grants (deny-by-default) model** as the correct lever: tight per-role tool restriction + clear authority beats policing personas (role *disobedience* is a rare 1.5% failure mode).
 
 ## Headline finding: a few well-specified roles beat many
@@ -56,18 +64,29 @@ Four worker roles cover the three balanced legs (SWE / research / writing) plus 
 | **developer** (executor) | worker | **keep as-is** | Executor/coder is near-universal: MetaGPT `Engineer`, ChatDev `Programmer`, Magentic-One `Coder`+`ComputerTerminal`, and OpenHands' *entire* default agent | files, shell, git | `shell_tools`; optional `vm_workspace`, `datasource_tools` |
 | **critic** (reviewer) | worker | **keep as-is** | Generator–critic loop is the best-evidenced quality pattern: ChatDev `Reviewer`, GPT Researcher `Reviewer`/`Reviser`, Anthropic's separated `CitationAgent`. SRW's auto-spawn-on-completion already matches this | files read, web/citations, KB read | read-heavy, **minimal write** |
 | **writer** (synthesizer) | worker | **NEW** | The missing writing/communication leg: GPT Researcher ships a dedicated `Writer`+`Publisher`; Anthropic/MetaGPT pipelines terminate in compiled artifacts. SRW has executor+researcher+critic but nothing whose job is *producing the deliverable* | files write, KB read, web/citations, git read | **low** — explicitly no `shell_tools`/`vm_workspace`/`delegation` |
-| **assistant** (generalist) | **session** | **NEW** | The most-wanted "deploy-anywhere" default and SRW's thinnest area. Mirrors Claude Code shipping a *generic* built-in core (Explore/Plan/general-purpose) and offering specialists as examples | files, web research, KB | moderate, deployment-tunable |
+| **assistant** (generalist) | **session** | **SHIPPED 2026-07-22** | The most-wanted "deploy-anywhere" default and SRW's thinnest area. Mirrors Claude Code shipping a *generic* built-in core (Explore/Plan/general-purpose) and offering specialists as examples | files, web research, KB | moderate, deployment-tunable |
 
 Per-role notes:
 
 - **`writer` is the highest-value, lowest-risk addition.** It closes the writing leg, carries the smallest capability footprint (no shell, no VM, no delegation → safe for untrusted/showcase deploys), and is directly useful to in-house documentation work. Recommended **first build**.
-- **`assistant`** may be thin to implement if `persistent_defaults` already backs bare sessions — the value is a *named, listed* picker entry with a strong general persona, plus a home for the session core.
+- **`assistant` is implemented.** It extends `session_base`, provides the named
+  general persona, and is seeded into the database as the initial application
+  session default. See [[db_backed_default_experts]].
 
 ### The session gap (sharpest practical finding)
 
-Of the current 7 experts, **6 are workers** — only `designer-interactive` extends `persistent_defaults`. For any deployment that leans interactive there is **no general assistant, no research-chat, no coding-chat** session expert. A balanced "no matter where you deploy" default must include at least one strong session role (`assistant`), and arguably session variants of `scholar`/`developer`/`writer` for interactive power users (opt-in).
+At the time of the research, **6 of 7 experts were workers** and only
+`designer-interactive` extended the session base. Assistant has since closed the
+general-purpose gap. There are still no dedicated research-chat, coding-chat,
+or writing-chat session variants; those remain candidates for opt-in profiles.
 
-> **Architecture constraint (verified in code):** an expert's mode is fixed by the base it `$extends` — `defaults` ⇒ worker, `persistent_defaults` ⇒ session — and for DB-backed experts `expert_type` is an **immutable column**. There is **no "one definition, two modes."** Offering a role in both modes means **two expert definitions** (the `designer` / `designer-interactive` pattern). This shapes several recommendations below.
+> **Architecture constraint (verified in code):** an expert's mode is fixed by
+> the base it `$extends` — `worker_base` ⇒ worker, `session_base` ⇒ session —
+> and for DB-backed experts `expert_type` is an **immutable column**. There is
+> **no "one definition, two modes."** Offering a role in both modes means **two
+> expert definitions** (the `designer` / `designer-interactive` pattern). The
+> old `defaults` and `persistent_defaults` selectors remain compatibility
+> aliases only.
 
 ### B) Opt-in tiers (grouped catalog, enable per deployment)
 
@@ -83,7 +102,7 @@ Of the current 7 experts, **6 are workers** — only `designer-interactive` exte
 
 > Prefer expressing fine-grained variants (`editor`, `publisher`, `citation-specialist`) as **skills** ([[agent_skills]]) bound to a core expert rather than as standalone experts, unless a deployment genuinely needs them as separate pickable roles. This keeps the roster tight per the headline finding.
 
-## Re-assessment of the current 7
+## Re-assessment of the original 7
 
 | Expert | Verdict | Reasoning |
 |---|---|---|
@@ -92,10 +111,13 @@ Of the current 7 experts, **6 are workers** — only `designer-interactive` exte
 | **critic** | ✅ Keep — **core** | Best-evidenced quality pattern; auto-spawn matches precedent |
 | **curator** | ↘️ **Move to opt-in** | Partly redundant with SRW's **automatic memory engine** — shipping a persona for a mechanic is the anti-pattern this doc warns against. No surveyed framework ships a standalone curator. Keep for deployments wanting *curated* KB beyond passive extraction. *(confidence: medium)* |
 | **designer** | ↘️ **Move to opt-in** (design tier) | Design is a real role (ChatDev `Designer`) but domain-specific, not universal — wrong fit for a *balanced* core. *(confidence: medium)* |
-| **designer-interactive** | ⚠️ **Don't merge — de-duplicate** | The research suggested "merge into `designer`," but this is **not feasible**: the two extend different bases (`defaults` vs `persistent_defaults`) and mode is immutable. The pair is the platform-idiomatic way to offer one role in both modes. Action: keep both *or* pick the one mode design actually needs (likely interactive), and factor the shared persona/`design_guide` into a common file instead of duplicating it |
+| **designer-interactive** | ⚠️ **Don't merge — de-duplicate** | The research suggested "merge into `designer`," but this is **not feasible**: the two extend different bases (`worker_base` vs `session_base`) and mode is immutable. The pair is the platform-idiomatic way to offer one role in both modes. Action: keep both *or* pick the one mode design actually needs (likely interactive), and factor the shared persona/`design_guide` into a common file instead of duplicating it |
 | **bughunter** | ↘️ Keep — **opt-in** (SE tier); **do NOT fold into `critic`** | Different tool domains *and* lifecycle: `critic` is a read-only gate auto-spawned on completion; `bughunter` is an *active* shell+browser executor that produces reproductions. Mirrors Anthropic's deliberate `code-reviewer` (read-only) vs `debugger` (Edit-enabled) split |
 
-**Net effect:** core narrows to `scholar + developer + critic`, **adds** `writer` (+ `assistant`), and moves `curator`/`designer`/`bughunter` to opt-in — landing at a **4–5 role core**, squarely inside the validated range.
+**Net recommendation:** core narrows to `scholar + developer + critic`,
+**adds** `writer`, retains the now-shipped `assistant`, and moves
+`curator`/`designer`/`bughunter` to opt-in — landing at a **4–5 role core**,
+squarely inside the validated range.
 
 ## Anti-roles — do **not** ship as experts
 
@@ -137,7 +159,7 @@ The harness killed 3 claims (0-3 votes), all of which would have *over*-supporte
 
 ## Open questions
 
-1. **Session variants:** beyond `assistant`, do we want session variants of `scholar`/`developer`/`writer` in the default set, or leave them opt-in? (Each is a *separate* definition given the immutable-mode constraint.)
+1. **Session variants:** beyond the shipped `assistant`, do we want session variants of `scholar`/`developer`/`writer` in the default set, or leave them opt-in? (Each is a *separate* definition given the immutable-mode constraint.)
 2. **Verifier split:** is a separate `fact-checker`/`citation-specialist` worth shipping, or is the core `critic` + existing citation tooling sufficient? Anthropic deliberately split `CitationAgent`; SRW's `critic` already reviews/approves — marginal value here is unmeasured.
 3. **Marginal value of the Nth role** on a *phase-based* platform that already has stuck-detection + goal-check: does any role beyond the tight core improve reliability, or mostly add inter-agent-misalignment surface (36.9% of MAST failures)? No surveyed source measures this for an architecture like SRW's.
 4. **Per-role model/autonomy defaults:** an expert is persona+tools+workspace+autonomy+**model**. The literature entangles role design with model choice (ChatDev on GPT-4o; Anthropic Opus-lead/Sonnet-subagents), so good per-role model defaults are unresolved.
@@ -146,13 +168,18 @@ The harness killed 3 claims (0-3 votes), all of which would have *over*-supporte
 
 Recommended order:
 
-1. **Lock this roster** (review + sign-off on the core, the tier placements, and the current-7 verdicts).
-2. **Build `writer`** — new worker expert under `config/experts/writer/` (persona, `$extends: defaults`, low-footprint tool set, no `shell_tools`/`vm_workspace`/`delegation`). Highest value, lowest risk.
-3. **Build / name `assistant`** — session expert (`$extends: persistent_defaults`); likely thin if `persistent_defaults` already backs bare sessions.
-4. **Re-tier the existing 7** — mark `curator`/`designer`/`bughunter` as opt-in. Mechanism TBD: the configs stay on disk; "opt-in" likely means tags/metadata + which experts a deployment surfaces by default (not deletion). Define how a deployment selects its enabled set (values overlay? a `default_roster` list?).
+1. **Lock the remaining roster** (review + sign-off on the core, tier placements, and original-seven verdicts).
+2. **Build `writer`** — new worker expert under `config/experts/writer/` (persona, `$extends: worker_base`, low-footprint tool set, no `shell_tools`/`vm_workspace`/`delegation`). Highest value, lowest risk.
+3. ✅ **Assistant and General Worker defaults shipped** through [[db_backed_default_experts]].
+4. **Re-tier the original 7** — mark `curator`/`designer`/`bughunter` as opt-in. Mechanism TBD: the configs stay on disk; "opt-in" likely means tags/metadata + which experts a deployment surfaces by default (not deletion). Define how a deployment selects its enabled set (values overlay? a `default_roster` list?).
 5. **De-duplicate `designer` / `designer-interactive`** shared prompt content (or collapse to the single mode design needs).
 
-> Re-tiering needs a small decision the codebase doesn't yet encode: **how a deployment expresses "which bundled experts are on by default."** Today all 7 are simply present. Options: a Helm/values `defaultExperts` list, an `enabled`/`tier` field in each expert's YAML surfaced through the picker, or a system-setting. Resolve before step 4.
+> Re-tiering needs a small decision the codebase doesn't yet encode: **how a
+> deployment expresses "which bundled experts are on by default."** Today every
+> bundled expert config is simply present; the original seven have no tier
+> filtering. Options: a Helm/values `defaultExperts` list, an `enabled`/`tier`
+> field in each expert's YAML surfaced through the picker, or a system setting.
+> Resolve before step 4.
 
 ## Sources
 

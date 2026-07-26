@@ -16,6 +16,21 @@ related:
 **Filed:** 2026-07-24, from a live dev incident on 2026-07-23 (project "Research RAG
 technologies", loop `528a4f91`). Line numbers are develop @ 2026-07-24.
 
+**IMPLEMENTED 2026-07-25 (Option A + prerequisite, develop, uncommitted):** structured
+`classification/model/reset_at` in the fail-fast error dict (`src/graph.py`
+`_cooldown_failfast_error`), persisted to the previously-dormant `jobs.error_details`
+JSONB on every failed dict-error completion; `_loop_cooldown_park_until` aggregator in
+the barrier winner (ANY cooldown-failed member, max reset, 14d cap
+`LOOP_COOLDOWN_PARK_CAP_SECONDS`); `park_until` threaded through rotation + all three
+campaign spawn sites into `create_loop_job`; born-parked rows created atomically by
+`db.create_job(status=, freeze_data=)` (paused + `llm_unavailable` freeze +
+`context.llm_outage` WITHOUT `first_failed_at` — the wake-time ceiling landmine); rides
+the existing llm_outage sweeper unchanged. 24 new unit tests across 6 suites (advance
+park/threading, born-parked row shape, extractor table, sweeper wake, evaluator wake,
+completion passthrough); full local suite green. **Owed: k3d live gate** (blocked
+2026-07-25 by a host docker-bridge firewall failure on the dev laptop, not by the
+change) — procedure in the Verification section of the implementation plan.
+
 ## Symptom
 
 When a loop member fails because its model hit a **long quota cooldown** (the

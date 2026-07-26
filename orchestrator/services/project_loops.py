@@ -43,6 +43,37 @@ logger = logging.getLogger(__name__)
 # like scholar/critic. Wiring per docs/features/loop_parallel_stages.md (Phase 0).
 LOOP_ANALYSIS_ROLES: frozenset[str] = frozenset({"scholar", "critic", "product-qa"})
 
+# Ceiling on how long a born-parked loop member may wait for a model-cooldown
+# reset. A pathological upstream reset_at must not park a loop for a year; an
+# early wake self-heals (the member re-hits the remaining cooldown → in-job
+# pause if ≤12h, else fail-fast → the next member re-parks on a fresh reset).
+# docs/issues/loop_advances_into_active_model_cooldown.md
+LOOP_COOLDOWN_PARK_CAP_SECONDS: int = 14 * 24 * 3600
+
+
+def extract_cooldown_reset_at(
+    job: dict[str, Any] | None, result: dict[str, Any] | None
+) -> float | None:
+    """Absolute epoch reset time if this member failed on a model cooldown, else None.
+
+    Prefers the in-flight completion result's error dict; falls back to the
+    row's persisted ``error_details`` (heal/resume re-drives call the advance
+    with ``result={}``, and asyncpg hands JSONB back as raw JSON strings).
+    """
+    for cand in ((result or {}).get("error"), (job or {}).get("error_details")):
+        if isinstance(cand, str):
+            try:
+                cand = json.loads(cand)
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(cand, dict) or cand.get("classification") != "cooldown":
+            continue
+        try:
+            return float(cand["reset_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
 
 def is_loop_execution_role(role: str | None) -> bool:
     """True if a loop role produces the project artifact (merge must land)."""
@@ -713,6 +744,7 @@ async def create_loop_job(
     remaining_iterations: int | None = None,
     disable_memory_assembler: bool = False,
     extra_context: dict[str, Any] | None = None,
+    park_until: datetime | None = None,
 ) -> dict[str, Any]:
     """Materialize ONE bare loop job for the given role + iteration.
 
@@ -823,10 +855,39 @@ async def create_loop_job(
     if seq_index is not None:
         context["loop_seq_index"] = int(seq_index)
         context["loop_remaining"] = remaining_iterations
+
+    # Born parked (docs/issues/loop_advances_into_active_model_cooldown.md): the
+    # previous turn failed on a model cooldown that outlives the pause budget, so
+    # this member is created paused-with-freeze instead of dispatched —
+    # freeze_data non-NULL hides it from the dispatcher and the existing
+    # llm_outage sweeper wakes it at next_retry_at. context.llm_outage carries NO
+    # first_failed_at: evaluate_llm_outage would read creation time as a
+    # multi-day elapsed outage and ceiling-fail the member AT WAKE; absent, it
+    # defaults to wake-time now → elapsed≈0 → survives (completion.py).
+    status = "created"
+    freeze_data: dict[str, Any] | None = None
+    if park_until is not None:
+        park_iso = park_until.isoformat()
+        status = "paused"
+        freeze_data = {
+            "freeze_type": "llm_unavailable",
+            "classification": "cooldown",
+            "next_retry_at": park_iso,
+            "attempt": 0,
+            "model": loop.get("model"),
+            "origin": "loop_cooldown_park",
+            "error_summary": (
+                f"Created parked: model '{loop.get('model') or 'pinned model'}' "
+                f"in quota cooldown until {park_iso} (inherited from the "
+                f"previous loop turn)"
+            )[:500],
+        }
+        context["llm_outage"] = {"attempt": 0, "next_retry_at": park_iso}
+
     # Campaign member stamps (loop_campaign_id / loop_campaign_index) and any
     # other spawn-time truth the caller needs read back by the advance/heal.
     # Reserved keys above win — extra context can never shadow the loop join
-    # key or the counter stamps.
+    # key, the counter stamps, or the born-parked llm_outage state.
     if extra_context:
         for key, value in extra_context.items():
             context.setdefault(key, value)
@@ -872,6 +933,8 @@ async def create_loop_job(
         project_id=project_id,
         priority=5,
         expert_id=expert_id,
+        status=status,
+        freeze_data=freeze_data,
     )
     job_id = str(job["id"])
 
