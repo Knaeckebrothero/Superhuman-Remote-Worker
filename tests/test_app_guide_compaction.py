@@ -95,8 +95,8 @@ def test_app_guide_can_be_loaded_again_after_old_result_is_compacted(monkeypatch
     )
     assert "on every relevant turn" in current_floor
     assert "summaries, memories, prior tool results" in current_floor
-    assert 'topic_id="overview"' in current_floor
-    assert 'topic_id="sessions"' in current_floor
+    assert "topic from the actual user request" in current_floor
+    assert 'topic_id="index"' in current_floor
 
     # Resume-time memory is tail-injected after the user's current question.
     # A transient HumanMessage must follow it with a current-digest freshness

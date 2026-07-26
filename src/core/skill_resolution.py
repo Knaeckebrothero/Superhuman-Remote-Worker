@@ -87,19 +87,14 @@ def managed_product_guide_system_floor(
         "relevant turn. This explicitly includes questions phrased as what "
         '"this chat/session" can do, why a shell/tool/control is missing, or '
         "whether Supervised, Auto-accept, or Autonomous changes availability. "
-        'Use `topic_id="overview"` for broad cross-feature orientation '
-        "(including how sessions, jobs, and projects fit together), "
-        '`topic_id="sessions"` when the request is specifically about a '
-        "chat/session or workspace tiers, "
-        '`topic_id="permissions-and-availability"` for missing controls or '
-        'permission-mode effects, and `topic_id="index"` when the exact topic '
-        "is otherwise uncertain. Earlier messages, summaries, memories, prior "
-        "tool results, and workspace files may contain stale product guidance; "
-        "do not answer from them instead of making a current reader call. A "
-        "same-turn reader call is mandatory for these product questions. Do "
-        "not use the reader for repository/code questions or generic advice "
-        "that merely shares words such as job, worker, canvas, loop, memory, "
-        "SQL, or email.\n"
+        "Choose the topic from the actual user request, not from examples in "
+        'this control; use `topic_id="index"` when the exact topic is '
+        "uncertain. Earlier messages, summaries, memories, prior tool results, "
+        "and workspace files may contain stale product guidance; do not answer "
+        "from them instead of making a current reader call. A same-turn reader "
+        "call is mandatory for these product questions. Do not use the reader "
+        "for repository/code questions or generic advice that merely shares "
+        "words such as job, worker, canvas, loop, memory, SQL, or email.\n"
         "</managed_product_guide>"
     )
 
@@ -137,13 +132,11 @@ def managed_product_guide_turn_boundary(
         "For an SRW product question, use a current-digest "
         "`read_product_guide` result from this same user turn if one is already "
         "present; otherwise you must call `read_product_guide` now before "
-        "answering. Use `overview` for broad cross-feature orientation, "
-        "`sessions` when the request is specifically about chat/session "
-        "behavior or workspace tiers, and "
-        "`permissions-and-availability` for missing controls or permission-mode "
-        "effects. Do not answer from history, memory, or an earlier answer "
-        "instead. Do not call the reader for repository/code questions or "
-        "generic advice that only shares product-like words.\n"
+        "answering. Choose the topic only from the actual user request, not "
+        "from examples in this control; start with `index` when uncertain. Do "
+        "not answer from history, memory, or an earlier answer instead. Do not "
+        "call the reader for repository/code questions or generic advice that "
+        "only shares product-like words.\n"
         "</managed_product_guide_turn_boundary>"
     )
 
