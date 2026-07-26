@@ -11,18 +11,15 @@ tags:
 # SRW Self-Knowledge and App Guide
 
 > **Status**: v1 `app-guide` shipped 2026-07-08. M1a managed delivery, M1b
-> Email/OKF guidance plus the connector-type drift gate, M1c
-> Automations/Fleet guidance plus live tool-group coverage, M1d
-> Canvas/browser plus permission/workspace guidance, and M1e project
-> loops/campaigns plus Protected Cloud guidance were implemented through
-> 2026-07-24. M1d also repaired the automation expert-selection contract that
-> the guide audit exposed. The M1f closure plan was defined 2026-07-25. Its
-> core-reference, operator break-glass/health, and routing/compaction
-> evaluation packages are implemented. A first complete live-model run and
-> six-cell fresh/resumed deployment checkpoint drove final routing and
-> prerequisite hardening; the exact final bundle's deployed current-arm run
-> and final-digest session confirmation still gate M1. The live capability
-> plane, visual help, and the later roadmap remain open.
+> Email/OKF guidance and connector drift coverage, M1c Automations/Fleet,
+> M1d Canvas/browser and permissions/workspaces, M1e project
+> loops/campaigns and Protected Cloud, and the M1f reliability closure are
+> implemented. On 2026-07-26 the exact final runtime image passed all six
+> fresh/resumed workspace cells and the complete 30-case deployed evaluation
+> with zero critical forbidden claims, near-miss false positives, or errors.
+> Normal deployment values were restored and the synthetic verification
+> resources were removed; **M1 is complete**. The runtime capability plane,
+> visual help, and Phases 2–8 remain open.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -239,9 +236,9 @@ The first M1 slice makes the guide a persistent-session product floor:
   tests cover current delivery, stale-byte rejection, non-shadowing, digest
   refresh, invalid paths, and fail-closed behavior.
 
-This is not the M1 exit gate. The broader reference-content audit,
-break-glass/degraded-health surface, compaction evaluation, held-out
-trigger/answer evaluations, and fresh/resumed k3d matrix remain open below.
+M1a alone did not satisfy the M1 exit gate. The later reference-content audit,
+break-glass/degraded-health surface, compaction and held-out evaluations, and
+fresh/resumed k3d matrix are closed by M1b–M1f below.
 
 ### Shipped M1b — connector content and first drift gate
 
@@ -412,11 +409,12 @@ The final original-reference audit is implemented:
   pin consequential Jobs/Experts/Memory boundaries, and prove that the managed
   reader loads those topics independently.
 
-The App Guide-specific tests pass. The repository's full combined content
-command currently also observes an unrelated concurrent Canvas/Office coverage
-failure (`CanvasRenderer` includes `office` while the Canvas guide-coverage
-test has not yet classified it); that external drift remains visible and is
-not counted as a pass for the M1 exit gate.
+The final M1-scoped Python union passes **607 tests** with one explicit
+deselection and six existing warnings. The deselection keeps an unrelated
+concurrent Canvas/Office coverage gap visible: `CanvasRenderer` includes
+`office`, while the separate Office work has not yet classified that renderer
+in the App Guide coverage contract. It is neither hidden nor counted as App
+Guide coverage.
 
 ### Implemented M1f work package 2 — operator break-glass and health
 
@@ -447,9 +445,9 @@ The managed guide now has one explicit emergency withdrawal path:
   denial, session disable/re-enable, bounded degradation, and readiness
   independence. Both chart lint profiles and false/true ConfigMap renders pass.
 
-### Implemented M1f work package 3 — held-out routing and compaction evaluation
+### Shipped M1f work package 3 — held-out routing and compaction evaluation
 
-The evaluation foundation and first live diagnostic are now implemented:
+The evaluation foundation and final release evidence are implemented:
 
 - `eval/app_guide/cases.yaml` keeps 30 held-out synthetic questions outside the
   runtime skill: 17 product positives and 13 near-miss negatives, balanced
@@ -477,22 +475,35 @@ The evaluation foundation and first live diagnostic are now implemented:
 - Run artifacts record source/model/corpus/harness/guide identities and
   per-case trajectory without keys, base URLs, prior-snapshot paths, private
   sessions, raw provider exceptions, or full guide tool results.
+- The current-digest reader rule is a trusted system-message floor, independent
+  of model-specific prompt templates. Every persistent LLM call with the
+  trusted managed reader also receives an ephemeral tail `HumanMessage` after
+  conversation history, recalled memory, and knowledge. It restores the actual
+  user request as the final instruction, treats current-session/tool/workspace
+  questions as product questions, requires a same-turn current reader result,
+  and forbids choosing a topic from examples in the control text.
 - A focused context test compacts an old guide ToolMessage, rebuilds the
   managed menu independently, calls the current reader again, and proves the
   newly requested Jobs topic does not pull Email or OKF reference text.
 
-The harness/compaction tests pass (**12 passed**), and their union with the
-persistent graph/session regressions passes (**230 passed**, three pre-existing
-warnings). The first complete deployed current-arm run scored 18/30 with no
+The first complete deployed current-arm diagnostic scored 18/30 with no
 provider errors or critical forbidden claims. It correctly failed the release
 gate and exposed ambiguous near-miss routing, missing prerequisite emphasis,
 and unsafe composition of separately documented features. The resulting
-hardening narrows the skill trigger, makes `index` a router rather than an
-answer substitute, requires prerequisites/limits in answers, and explicitly
-abstains on undocumented combinations. A candidate-snapshot rerun reached
-29/30; the exact final deployed current arm remains the release gate.
+hardening narrows the trigger, makes `index` a router rather than an answer
+substitute, requires prerequisites and limits, abstains on undocumented
+combinations, preserves the current request after recall, and routes only from
+that request.
 
-### Remaining closure gates and later gaps
+The exact final image then passed the six-cell fresh/resumed matrix and the
+complete 30-case deployed current arm: trajectory, grounding, positive reader
+calls, and topic routing were all 1.0; near-miss reader false positives were
+0.0; critical forbidden claims and errors were zero. The final guide digest is
+`f05ca7e71e3b8514b8d919cf565c0c93ecb445f967492e5c80affd50990aeb45`.
+Full evidence is recorded in
+`docs/tests/app_guide_m1_verification.md`.
+
+### M1 closure result and later gaps
 
 The guide is now delivered reliably, but it is not yet self-maintaining or
 runtime-aware:
@@ -515,9 +526,9 @@ runtime-aware:
   sessions do not currently record the exact resolved tool-name set in
   `ToolContext`; the orchestrator alone cannot infer all post-upgrade runtime
   state.
-- The current `BUILD_SHA` is a short, production-agent-only value, absent in
-  local development by design. It is not an orchestrator, Cockpit, guide, or
-  release identity, and SRW supports independently tagged component images.
+- The final M1 agent image carries a verified full `BUILD_SHA`, but SRW still
+  lacks a surfaced orchestrator, Cockpit, guide, and logical release identity;
+  independently tagged component images can still produce mixed deployments.
 - Cockpit still repeats connector IDs in TypeScript/UI source, but the canonical
   Python inventory now drives backend acceptance and CI asserts parity.
   Canvas/direct-browser and grant coverage consume current Python
@@ -531,12 +542,14 @@ runtime-aware:
   non-UTF-8 files.
 - There is no structured Cockpit help-card or coach-mark protocol.
 - The held-out harness now defines model trigger, topic, deterministic
-  grounding, near-miss, and honest-gap measurements. A live model has exercised
-  it, but the hardened final deployed `current` arm has not yet produced a
-  complete passing release artifact.
-- All six fresh/resumed delivery cells passed on the preceding managed digest,
-  including real persisted compaction and a stale mutable sandbox guide. The
-  final hardened digest still needs live confirmation before the matrix closes.
+  grounding, near-miss, and honest-gap measurements and has one passing
+  deployed release artifact. It is not yet a continuous release/CI service.
+- Repeated identical product prompts in heavily reused histories can still be
+  answered by a model from a recent same-topic turn despite the mandatory
+  current-reader instruction. Deterministic tests and fresh evaluation
+  contexts enforce the prompt contract; final resume evidence deliberately
+  used previously unseen topics rather than presenting model compliance as an
+  absolute authorization boundary.
 
 ### M1f verification — close the reliable text-guide milestone
 
@@ -551,12 +564,12 @@ The work is deliberately ordered:
 2. add the operator-only `APP_GUIDE_BREAK_GLASS_DISABLED` escape hatch and a
    bounded persistent-agent health signal (implemented and live-probed);
 3. add a held-out routing/answer corpus plus compaction and honest-gap
-   evaluation (implemented; first full live diagnostic completed);
+   evaluation (implemented; complete deployed current arm passed 30/30);
 4. run the fresh/resumed `none`, `virtual`, and Container k3d matrix with DB
-   skills and experts disabled (checkpoint matrix completed; final-digest
-   confirmation pending); and
-5. record evidence and close the Phase 1 boxes only after the chart-default
-   and pre-upgrade-resume exit gate passes.
+   skills and experts disabled (all six exact-image/final-digest cells passed);
+   and
+5. record the image, digest, matrix, evaluation, and static-check evidence
+   (implemented in `docs/tests/app_guide_m1_verification.md`).
 
 M1f keeps detailed cases outside the runtime skill, does not infer Phase 2
 availability state, and treats a skipped live-model or k3d check as incomplete
@@ -564,13 +577,13 @@ rather than successful.
 
 ### Validated repository implementation seams
 
-These are the leading implementation seams as of 2026-07-25. They record why
+These are the leading implementation seams as of 2026-07-26. They record why
 the roadmap is sequenced this way; symbols may move during implementation.
 
 | Concern | Existing seam/evidence | Status / intended change |
 |---|---|---|
 | Managed system-skill floor | `src/core/skill_resolution.py` — `add_persistent_system_skills()` plus reserved-name filtering | M1a now replaces any same-name catalog payload with the running digest-stamped guide and keeps it out of worker catalogs |
-| Persistent delivery/freshness | `src/api/persistent_session.py` — post-load skill scoping | M1a now refreshes the managed bundle on every tool setup/rebind and does not materialize it into the workspace |
+| Persistent delivery/freshness | `src/api/persistent_session.py`, `src/core/loader.py`, and `src/persistent_graph.py` | M1a refreshes the managed bundle on every tool setup/rebind and never materializes it into the workspace; M1f adds the trusted current-digest system floor and ephemeral post-recall turn boundary on every eligible LLM call |
 | Guide retrieval | `src/tools/product_help.py` and `src/tools/registry.py` | M1a adds bounded `read_product_guide(topic_id)` independent of workspace tier while preserving ordinary workspace skills |
 | Capability service | Existing grants route in `orchestrator/main.py`; `orchestrator/services/grants_service.py` | Put product definitions/evaluation in a dedicated service and small router rather than enlarging the grants endpoint |
 | Thread ownership/scope | `orchestrator/routers/sessions.py` fetch-then-owner checks | Reuse the owned-thread pattern and resolve only the active thread/project scope |
@@ -584,11 +597,11 @@ the roadmap is sequenced this way; symbols may move during implementation.
 | Protected Cloud review | `orchestrator/services/cloud_staging/`, `orchestrator/services/diff_source.py`, protected mount/endpoint wiring in `orchestrator/main.py`, and the session-create/chat/diff-review Cockpit surfaces | M1e documents the shipped flag/backend/workspace gates, staging and whole-diff decision contract, fail-closed posture, conflicts, and recovery boundaries; live evaluation remains Phase 2 |
 | Core Jobs/Experts/Memory references | Current Cockpit create/list/project surfaces, `orchestrator/services/default_experts.py`, bundled expert YAML, `src/services/recall_store.py`, the configured memory pipeline, and native/OKF knowledge paths | M1f work package 1 corrects the original references and their broad overlaps, adds metadata, and pins consequential scope/action/degradation claims plus the complete bundled roster |
 | M1 break-glass/health | `src/core/skill_resolution.py`, `src/tools/product_help.py`, the persistent-agent health route in `src/api/persistent_app.py`, and the shared Helm ConfigMap | M1f now provides one default-off negative operator escape hatch, withholds both guide and reader when active, preserves chat readiness, restores the current digest on rebind, and reports a bounded degraded reason without reviving mutable fallback content |
-| M1 evaluation/acceptance | `eval/app_guide/`, persistent graph/session tests, and `docs/tests/app_guide_m1_verification.md` | M1f implements held-out trigger trajectory, topic routing, grounded facts, near-miss negatives, honest gaps, and deterministic compaction recovery. The first live diagnostic and six-cell deployment checkpoint are recorded; a passing final deployed current arm and final-digest session confirmation remain open |
+| M1 evaluation/acceptance | `eval/app_guide/`, persistent graph/session tests, and `docs/tests/app_guide_m1_verification.md` | M1f implements held-out trigger trajectory, topic routing, grounded facts, near-miss negatives, honest gaps, and deterministic compaction recovery. The exact final image passed all six live delivery cells and the full 30-case deployed current arm |
 | Deep-link actions | `cockpit/src/app/app.routes.ts` and datasource page/list components | Add an explicit action manifest and handler; do not assume `/datasources?new=email` already works |
 | Help presentation | `cockpit/src/app/core/models/tool-card.model.ts` currently knows `open_canvas`; strict Canvas HTML is inert while schema-advertised interactive HTML is an isolated, untrusted artifact | Define a separately validated help-card/App contract; do not treat arbitrary interactive Canvas HTML as trusted product UI |
-| Provenance | Agent-only `BUILD_SHA` in `docker/Dockerfile.agent` and short CI values; independently tagged images in Helm values | Stamp and surface full revision/digest metadata for each relevant component |
-| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, persistent-session, and held-out App Guide harness suites | M1a covers managed delivery/current bytes; M1b–M1e add focused content plus datasource, Fleet/Workflow, Canvas/browser, grant-catalog, loop/campaign, and Protected Cloud boundaries; M1f adds deterministic trigger/topic/grounding contracts and post-compaction reload, while live model behavior and the k3d resume matrix remain open |
+| Provenance | Agent `BUILD_SHA` in `docker/Dockerfile.agent` and independently tagged images in Helm values | M1 evidence binds one full runtime revision, image ID/digests, and guide digest; Phase 2 must stamp and surface equivalent identities for every relevant component |
+| Tests | Bundled, resolution, product-help tool, content-contract, CRUD, backend-tier, persistent-session, and held-out App Guide harness suites | M1a covers managed delivery/current bytes; M1b–M1e add focused content plus datasource, Fleet/Workflow, Canvas/browser, grant-catalog, loop/campaign, and Protected Cloud boundaries; M1f closes deterministic compaction/freshness and live trigger/topic/grounding acceptance |
 
 ## Architecture
 
@@ -1415,26 +1428,28 @@ DB-authored-skills or DB-experts features.
 - [x] Verify the activated guide procedure remains available after session
   context compaction, while unneeded references remain unloadable/on demand.
   M1f adds a deterministic real-reader/tool-result compaction regression; the
-  live forced-compaction probe remains part of the k3d matrix.
+  pre-upgrade None-workspace thread also retained real persisted-compaction
+  history and loaded a new focused topic after the final upgrade.
 - [x] Remove the current unsupported suggestion that the default session can
   attach a datasource; offer only observed tools or validated guide actions.
 - [x] Create the first minimal canonical/coverage seam for datasource types so
   the repaired email guide immediately gains a drift check.
 - [x] Add balanced trigger evaluations for broad/specific product questions and
   near-miss negatives such as project/codebase onboarding. The 30-case
-  held-out corpus and live-capable runner are implemented, and the first
-  recorded full run drove routing/grounding hardening. A passing final deployed
-  current arm remains an M1 exit-gate requirement.
-- [ ] Verify fresh and pre-existing resumed k3d sessions with DB skills and DB
+  held-out corpus and live-capable runner are implemented. The first recorded
+  full run drove routing/grounding hardening; the exact final deployed current
+  arm passed 30/30.
+- [x] Verify fresh and pre-existing resumed k3d sessions with DB skills and DB
   experts disabled, including `none`, `virtual`, and normal shell workspaces.
-  All six paths passed on the preceding digest; confirm the hardened final
-  digest before checking this box.
+  All six paths passed on exact runtime source `6ff4d443` and guide digest
+  `f05ca7e71e3b8514b8d919cf565c0c93ecb445f967492e5c80affd50990aeb45`.
 - [x] Verify an off-doc question produces an honest gap instead of a guess.
 
 **Exit gate:** the chart-default deployment and a session created before an
 upgrade answer the core evaluation set from the same current immutable guide,
 including the email folder-allowlist journey, with no shadowing or workspace
-dependency.
+dependency. **Passed 2026-07-26**; see
+`docs/tests/app_guide_m1_verification.md`.
 
 ### Phase 2 — runtime capability plane
 
