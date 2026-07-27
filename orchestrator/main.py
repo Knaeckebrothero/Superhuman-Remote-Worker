@@ -12454,12 +12454,18 @@ async def _trigger_verification_on_complete(
     critic_config = verification_config.get("critic_config", "critic")
     config_name = job.get("config_name", "unknown")
 
-    # Format instructions
+    # Format instructions — including any findings previous rounds left open,
+    # so a fresh critic (this design spawns a new one every round, never
+    # resumes) inherits what its predecessor found instead of reviewing
+    # blind. `rounds` is the TARGET's own ledger, fetched above.
+    from services.verification_ledger import fold_open_findings, render_prior_findings
+
     instructions = format_verification_instructions(
         job_id=job_id,
         description=job.get("description", ""),
         freeze_data=freeze_data,
         config_name=config_name,
+        prior_findings=render_prior_findings(fold_open_findings(rounds)),
     )
     if not instructions:
         logger.error(f"Failed to format verification instructions for job {job_id}")
@@ -12472,6 +12478,12 @@ async def _trigger_verification_on_complete(
 
     context = {
         "verification_target": job_id,
+        # Delivery channel for the rendered brief — extracted by
+        # _dispatch_job_to_agent() and written to the workspace as
+        # instructions.md (src/agent.py), same as the scholar subjob. Without
+        # this key the text computed above is discarded: create_job() has no
+        # `instructions` parameter, only `context`.
+        "instructions": instructions,
         "original_description": job.get("description", ""),
         "original_config": config_name,
         "deliverables": freeze_data.get("deliverables", []),

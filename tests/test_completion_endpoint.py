@@ -538,3 +538,40 @@ class TestFormatScholarInstructions:
                 config_name="x",
             )
             assert result is None
+
+
+class TestVerificationInstructionsDelivery:
+    """Task 7: the rendered instructions must actually reach the critic.
+
+    Before this fix, ``format_verification_instructions`` was called in
+    ``orchestrator/main.py`` and its result was only null-checked, never
+    passed to ``create_job`` (which has no ``instructions`` parameter) — so
+    every critic since the orchestrator migration ran on a generic
+    description instead of the rendered brief. See
+    docs/superpowers/plans/2026-07-27-verification-fail-closed.md Task 7.
+    """
+
+    def test_prior_findings_rendered_into_template(self):
+        from orchestrator.services.completion import format_verification_instructions
+
+        text = format_verification_instructions(
+            job_id="t1",
+            description="d",
+            freeze_data={},
+            config_name="worker_base",
+            prior_findings="- **F1** [high, opened round 1]: missing source",
+        )
+        assert text is not None
+        assert "F1" in text
+        assert "missing source" in text
+
+    def test_missing_prior_findings_does_not_abort(self):
+        """A KeyError here returns None, which aborts critic spawn entirely."""
+        from orchestrator.services.completion import format_verification_instructions
+
+        assert (
+            format_verification_instructions(
+                job_id="t1", description="d", freeze_data={}, config_name="worker_base"
+            )
+            is not None
+        )

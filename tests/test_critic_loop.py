@@ -24,6 +24,7 @@ from src.tools.evaluation.evaluation_tools import (  # noqa: E402
     get_verdict_data,
     clear_verdict_data,
     EVALUATION_TOOLS_METADATA,
+    create_evaluation_tools,
 )
 from src.core.phase import (  # noqa: E402
     _finalize_with_verdict,
@@ -353,6 +354,48 @@ class TestCriticStrategicPromptVerdictTiming:
         assert "strategic-phase-only" in text, (
             f"{fname} lost the directive that the verdict tools are strategic-only."
         )
+
+
+# =============================================================================
+# Critic verdict-tool / template agreement (Task 7)
+# =============================================================================
+#
+# Same failure MODE as the deadlock above, different mechanism: instead of a
+# phase-timing contradiction, the §4 "Render Your Verdict" section in
+# verification_instructions.md kept documenting the RETIRED
+# `return_job_with_feedback(..., issues=[...], severity="...")` call shape
+# after Task 5 replaced it with `findings=[...]` / `dispositions=[...]`. A
+# stale doc doesn't crash the tool call the way the phase contradiction did,
+# but it reliably mis-teaches the model the wrong verdict-tool shape. These
+# assertions are tied to the LIVE tool signatures (not a hardcoded string),
+# so a future signature change that forgets to update the prompt fails here
+# instead of drifting silently again.
+
+VERIFICATION_INSTRUCTIONS_PATH = CRITIC_PROMPT_DIR / "verification_instructions.md"
+
+
+class TestCriticVerdictInstructionsToolAgreement:
+    """§4 of verification_instructions.md must match the REAL verdict tools."""
+
+    def test_stale_verdict_shape_is_gone(self):
+        text = VERIFICATION_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+        assert "issues=" not in text, (
+            "verification_instructions.md still documents the retired "
+            'issues=[...] / severity="..." call shape that Task 5 replaced.'
+        )
+
+    def test_verdict_examples_use_real_tool_params(self):
+        text = VERIFICATION_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+        for tool_fn in create_evaluation_tools(MagicMock()):
+            assert f"{tool_fn.name}(" in text, (
+                f"verification_instructions.md never calls `{tool_fn.name}`."
+            )
+            for param in tool_fn.args:
+                assert f"{param}=" in text, (
+                    f"verification_instructions.md never shows "
+                    f"`{tool_fn.name}`'s real `{param}=` parameter — the "
+                    "prompt has drifted from the tool surface."
+                )
 
 
 # =============================================================================
