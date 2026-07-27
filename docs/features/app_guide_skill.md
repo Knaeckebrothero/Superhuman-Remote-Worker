@@ -18,14 +18,17 @@ tags:
 > fresh/resumed workspace cells and the complete 30-case deployed evaluation
 > with zero critical forbidden claims, near-miss false positives, or errors.
 > Normal deployment values were restored and the synthetic verification
-> resources were removed; **M1 is complete**. The runtime capability plane,
-> visual help, and Phases 2–8 remain open. Post-closure commit `02fed505`
+> resources were removed; **M1 is complete**. M2a's schema-1.0 typed contract,
+> immutable 18-definition build registry, guide-link validation, and
+> deterministic registry revision are implemented; M2b server resolution is
+> next. The remaining runtime capability plane, visual help, and Phases 3–8
+> remain open. Post-closure commit `02fed505`
 > added the missing Office-on-Canvas guide coverage; its focused inventory
 > regression and the complete current-tree M1 union pass. The 2026-07-27
 > revalidation result is **774 passed, 0 deselected, 10 warnings**, with Ruff,
 > formatting, diff, and both Helm lint gates also green. The M2 code/seam audit
-> and five-slice implementation design are complete; implementation starts with
-> the typed M2a contract/registry. See
+> and five-slice implementation design are complete. M2a passed its 83-test
+> focused verification plus Ruff/format checks on 2026-07-27. See
 > `docs/superpowers/plans/2026-07-27-app-guide-m2.md`.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
@@ -1511,13 +1514,18 @@ The executable design and seam audit are in
 
 #### M2a — typed contract and build registry
 
-- [ ] Add schema `1.0` models/enums, layer/state/reason compatibility,
+- [x] Add schema `1.0` models/enums, layer/state/reason compatibility,
   visibility, qualifiers, bounded errors, provenance, and advisory semantics
   in `src/core/product_capabilities.py`.
-- [ ] Register the 18 capability IDs already present in reviewed App Guide
+- [x] Register the 18 capability IDs already present in reviewed App Guide
   metadata using a typed immutable Python registry.
-- [ ] Add schema, bounds, deterministic registry-revision, and guide-coverage
+- [x] Add schema, bounds, deterministic registry-revision, and guide-coverage
   validation.
+
+**Result (2026-07-27):** M2a is complete. The build registry revision is
+`sha256:d4ccbe3f7933750abf113a637d02747f65d69cef1607b14d6b3b0b1fbc35851a`;
+the focused contract/App Guide/bundled-skill suite passed 83 tests. This slice
+adds no endpoint, runtime resolver, or model behavior.
 
 #### M2b — server resolver and dark endpoint
 
