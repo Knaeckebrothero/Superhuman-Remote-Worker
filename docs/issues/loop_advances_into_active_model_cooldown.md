@@ -29,7 +29,7 @@ the existing llm_outage sweeper unchanged. 24 new unit tests across 6 suites (ad
 park/threading, born-parked row shape, extractor table, sweeper wake, evaluator wake,
 completion passthrough); full local suite green. **Owed: k3d live gate** (blocked
 2026-07-25 by a host docker-bridge firewall failure on the dev laptop, not by the
-change) — procedure in the Verification section of the implementation plan.
+change) — full runbook: `tests/loop_cooldown_born_parked_validation.md`.
 
 ## Symptom
 

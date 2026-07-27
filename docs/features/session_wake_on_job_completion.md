@@ -30,8 +30,11 @@ related:
 
 > A session launches a worker job ("run a research agent on topic X"), the user closes the tab, and twenty minutes later the job finishes. Today the result just sits silently in the database. This feature lets the session be woken — or at least notified — when a job *it created* completes, so it can continue. It is **subagent delegation, where the parent is an interactive chat session and the wait is asynchronous.**
 
-**Status:** **Phase 1 IMPLEMENTED 2026-07-26** on `develop` (uncommitted at time of
-writing); live-gate not yet run. Phases 2–3 not started. Co-designing the shared
+**Status:** **Phase 1 SHIPPED + LIVE-GATED.** Implemented 2026-07-26
+(`320cc112`), gated on dev 2026-07-27 — all five checks passed; see
+[Live verification](#live-verification--passed-on-dev-2026-07-27). One defect
+found by the gate (the durable branch's out-of-band notification never sent) is
+fixed but **not yet deployed**. Phases 2–3 not started. Co-designing the shared
 bus with the [[automations]] event-trigger half remains the end state, but v1
 deliberately skips it; see
 [v1 shortcut](#v1-shortcut--no-bus-but-the-direct-post-is-not-the-mechanism).
@@ -723,7 +726,7 @@ the cheap half and it is the half the workflow actually needs.
 - [x] Crash after claim → re-claimed past the visibility timeout, attempt burned.
 - [x] Terminal job whose hook never ran → claimed by status alone.
 - [x] `role='event'` survives a simulated pod recycle (the `_db_rows_to_lc_messages` regression).
-- [ ] **Live gate on dev — NOT RUN.** See [Live verification](#live-verification-owed).
+- [x] **Live gate on dev — PASSED 2026-07-27**, all five checks. See [Live verification](#live-verification--passed-on-dev-2026-07-27). It found one real defect (silent notification drop on the durable branch), fixed with regression tests but not yet deployed.
 
 Phase 1 delivers the actual workflow (schedule → keep working → get woken →
 inspect or defer → schedule the next stage) while touching neither the
@@ -763,23 +766,56 @@ missed hook costs one 20-second tick, not a session that waits forever. That
 inverts the design's own "missing one means a session that waits forever" risk,
 which was the single scariest line in the emission-points analysis.
 
-### Live verification (owed)
+### Live verification — PASSED on dev 2026-07-27
 
-Nothing below has been run; unit and real-Postgres coverage does not exercise
-the pod hop.
+Run against the dev cluster (`main` context, ns `superhuman-remote-worker`) on
+orchestrator + agent image `sha-1391831`, migrations `0070`/`0071` applied and
+`idx_jobs_wake_pending` VALID. Thread `3af91400`, jobs `38e17406` and
+`d7d6f511`.
 
-1. Session with Fleet Management on → `create_worker_job` → confirm
-   `jobs.created_by_thread_id` is set and `wake_on_complete` is true.
-2. Let it finish → the session receives a `[JOB_FINISHED]` turn, the cockpit
-   shows a system line (not a user bubble), and `wake_state='sent'` with
-   `wake_notified_status='completed'`.
-3. Close the tab so the pod is torn down, then finish a second job → a
-   `role='event'` row lands in `thread_messages` and a notification is
-   dispatched; reopen and confirm the notice is in the transcript **and** in the
-   model's context after the restore.
-4. `GET /api/stats/session-wakes` → `dead` is 0.
-5. Confirm the `<scheduled_work>` block is present in the resolved system prompt
-   for a Fleet-Management session and absent for a default one.
+1. **Backref — PASS.** A Fleet-Management session called `create_worker_job`;
+   the row came back with `created_by_thread_id = 3af91400` and
+   `wake_on_complete = t`, both set server-side.
+2. **Live wake — PASS, and it closed the loop.** The job completed and the
+   notice arrived as `role='event'`, turn 2, with expert, status, task, summary,
+   confidence and the `get_worker_job` pointer. The woken agent then *called
+   `get_worker_job` and reported to the user* — the behavior the
+   `<scheduled_work>` rule prescribes, unprompted. Enqueue → delivery was 51 ms
+   via the post-commit fast path (`wake_attempts=1`).
+3. **Durable branch — PASS.** The session pod was deleted mid-flight; the thread
+   went `awaiting_user → ended` (confirming the audit's correction — a dead pod
+   yields `ended`, not `suspended`) while `agents.status` still read `session`
+   for ~4 minutes. The wake probed, found the pod gone, and wrote the notice to
+   `thread_messages`; no pod was restored. On resume the model recalled **both**
+   notices by job id and task — so the history filter admits `role='event'` and
+   the `_db_rows_to_lc_messages` branch works. The silent trap is closed.
+4. **`dead` — PASS.** `GET /api/stats/session-wakes` →
+   `{pending:0, sending:0, sent:2, dead:0}`.
+5. **Prompt block — PASS.** Built inside the deployed agent image from the real
+   `session_base` config and interactive template: with `create_worker_job` the
+   prompt is 5402 chars and carries `<scheduled_work>` at offset 4905
+   (tail-anchored, trusted altitude); without it, 4903 chars and no block — so
+   it costs a default session exactly nothing.
+
+**Two mechanisms proved themselves that no unit test could reach.** The two
+wakes were enqueued by *different replicas* and neither double-delivered —
+the non-leader-gated claim working as designed. And job `d7d6f511`'s wake was
+delivered by the **sweeper backstop**, not the request's `kick_drain` (the log
+line carries no `request_id` and is the sweeper's own): the durability path is
+not theoretical, it fired on the second job of the gate.
+
+**One real defect found and fixed — the out-of-band notification never sent.**
+`services.email` logged `Refusing to send email to undeliverable recipient(s):
+['']`. `notification_service.dispatch` takes `user_id` for *preference lookup
+only*; its email leg sends to `recipient_email or ""`, so omitting that argument
+does not fall back to the user's address — it hands the empty string to the
+email service, which refuses and merely logs. Nothing raises, so the
+notification was silently dropped while the wake still reported success. That is
+the half of the durable branch that actually reaches a user who closed the tab,
+so the drop defeated the branch's purpose. `_notify_owner` now resolves the user
+row and passes `recipient_email` / `recipient_name`, mirroring
+`_notify_operator_freeze` — the existing caller that got this right. Two
+regression tests pin it. **Not yet re-verified live: that needs a deploy.**
 
 **Precondition — the tools are off by default.** `config/session_base.yaml:119`
 sets `orchestrator: [ ]`, and `assistant` (the default expert for new sessions)
