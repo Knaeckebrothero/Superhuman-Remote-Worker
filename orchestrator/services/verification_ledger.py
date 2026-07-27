@@ -103,9 +103,29 @@ def assign_ids(
     return out
 
 
-def compute_verdict(open_findings: List[Dict[str, Any]]) -> str:
-    """Derive the verdict from the open set. Never trusts a model assertion."""
-    return "returned" if any(is_blocking(f) for f in open_findings) else "approved"
+def compute_verdict(asserted: str, open_findings: List[Dict[str, Any]]) -> str:
+    """Derive the verdict from the open set plus the critic's own assertion.
+
+    The server may compute STRICTER than the model asserted, never laxer.
+    Two independent grounds for ``returned``:
+
+    1. An open BLOCKING finding. This overrides an asserted ``approved`` — the
+       rule that makes the original incident (approving over an open
+       high-severity finding) impossible. It must never regress.
+    2. An asserted ``returned`` while ANYTHING is still open. Without this, a
+       critic that deliberately returned a job over medium/low findings had
+       its verdict silently rewritten to ``approved`` and the target advanced.
+
+    An asserted ``returned`` with nothing open at all computes ``approved``:
+    there is nothing to return on. That call is rejected upstream by
+    :func:`validate_verdict_call`, so it is unreachable in practice, but the
+    computation stays total rather than relying on that.
+    """
+    blocking = any(is_blocking(f) for f in open_findings)
+    asserted_returned = str(asserted).lower() == "returned"
+    if blocking or (asserted_returned and open_findings):
+        return "returned"
+    return "approved"
 
 
 _VALID_DISPOSITIONS = {"RESOLVED", "STILL_OPEN", "DISPUTED"}
@@ -162,17 +182,30 @@ def validate_dispositions(
     return errors
 
 
-def validate_verdict_call(asserted: str, opened: List[Dict[str, Any]]) -> List[str]:
+def validate_verdict_call(
+    asserted: str,
+    opened: List[Dict[str, Any]],
+    open_before: List[Dict[str, Any]],
+) -> List[str]:
     """Reject internally inconsistent verdict calls at the tool boundary.
 
     A JSON schema cannot express this: ``{"issues": [], "severity": "high"}`` is
     a structurally valid document, and the live incident recorded it as
     "Issues: 0, Severity: high" without complaint.
+
+    A ``returned`` verdict is only inconsistent when there is nothing to return
+    ON: no NEW findings in ``opened`` *and* nothing left open by previous
+    rounds. Rejecting on empty ``opened`` alone blocked the most common round-2
+    shape — no new problems, but a predecessor's F1 still unaddressed — which
+    made ``return_job_with_feedback`` uncallable for that critic and pushed it
+    toward ``approve_job`` instead. Wrong pressure direction for a gate whose
+    whole point is failing closed.
     """
-    if str(asserted).lower() == "returned" and not opened:
+    if str(asserted).lower() == "returned" and not opened and not open_before:
         return [
-            "Cannot return a job with no findings. Supply at least one finding "
-            "in `opened`, or approve instead."
+            "Cannot return a job with no findings: `opened` is empty and no "
+            "findings from previous rounds are open. If the deliverable has a "
+            "problem, describe it as a finding in `opened`."
         ]
     return []
 

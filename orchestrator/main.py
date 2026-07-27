@@ -12369,30 +12369,38 @@ def _verification_gate_decision(
 
     Returns ("spawn", "") or ("escalate", reason). Escalation never approves.
     """
-    from services.verification_ledger import fold_open_findings, is_blocking
+    from services.verification_ledger import fold_open_findings
 
     if not rounds:
         return ("spawn", "")
 
-    blocking = [f for f in fold_open_findings(rounds) if is_blocking(f)]
-    if not blocking:
+    # Guards run on the whole OPEN set, not just its blocking subset. An
+    # explicitly asserted 'returned' at medium/low severity now resumes the
+    # target (see compute_verdict), so a round can legitimately end with open
+    # findings and none of them blocking. Checking only the blocking subset
+    # would let that state spawn a fresh critic forever — dodging both the
+    # round cap and the no-progress check, with no terminal state at all.
+    # A genuinely empty open set still spawns freely: nothing is being
+    # re-litigated, so neither guard has anything to measure.
+    open_findings = fold_open_findings(rounds)
+    if not open_findings:
         return ("spawn", "")
 
-    open_ids = ", ".join(f["id"] for f in blocking)
+    open_ids = ", ".join(f["id"] for f in open_findings if f.get("id"))
 
     previous_head = rounds[-1].get("head_commit")
     if head_commit and previous_head and head_commit == previous_head:
         return (
             "escalate",
             f"No progress since round {len(rounds)}: the deliverable is unchanged "
-            f"(commit {head_commit[:8]}) while {len(blocking)} blocking finding(s) "
+            f"(commit {head_commit[:8]}) while {len(open_findings)} finding(s) "
             f"remain open ({open_ids}).",
         )
 
     if max_rounds > 0 and len(rounds) >= max_rounds:
         return (
             "escalate",
-            f"Round limit reached ({max_rounds}) with {len(blocking)} blocking "
+            f"Round limit reached ({max_rounds}) with {len(open_findings)} "
             f"finding(s) still open ({open_ids}).",
         )
 
@@ -18228,7 +18236,7 @@ async def _record_verification_round_impl(
 
     open_before = fold_open_findings(rounds)
 
-    errors = validate_verdict_call(asserted_verdict, opened)
+    errors = validate_verdict_call(asserted_verdict, opened, open_before)
     errors += validate_dispositions(dispositions, open_before)
     if errors:
         raise HTTPException(status_code=409, detail={"errors": errors})
@@ -18244,7 +18252,7 @@ async def _record_verification_round_impl(
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     open_after = fold_open_findings(rounds + [record])
-    record["verdict"] = compute_verdict(open_after)
+    record["verdict"] = compute_verdict(record["asserted_verdict"], open_after)
 
     if record["verdict"] != record["asserted_verdict"]:
         # Free, direct measure of critic quality: how often a critic tries to
