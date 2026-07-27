@@ -771,7 +771,7 @@ class KnowledgeStore:
         phase: Optional[int] = None,
         created_at: Optional[datetime] = None,
         modified_at: Optional[datetime] = None,
-        priority: int = 1,
+        priority: Optional[int] = 1,
     ) -> uuid.UUID:
         """Upsert a note-level row keyed by ``(kb_id, path)``.
 
@@ -784,10 +784,30 @@ class KnowledgeStore:
         working through the transition. ``priority`` is the backlog rank parsed
         by ``note_fields`` from frontmatter (0=high/1=normal/2=low) — this is
         the file-edit path onto ``knowledge_index.priority``, the counterpart to
-        :meth:`upsert_note`'s agent-write path. Returns the row id (for the
-        chunk FK).
+        :meth:`upsert_note`'s agent-write path.
+
+        ``priority=None`` means "the file had no ``priority:`` line, leave
+        the stored rank as-is" (fix round 2, Finding 3) — the counterpart to
+        :meth:`upsert_note`'s own sentinel. Every pre-existing note lacks
+        that line, and this runs on every merge and via the sweeper, so
+        writing a concrete default here on every reindex would silently
+        overwrite any priority set through the agent-write path. Both
+        ``COALESCE``s below fall back to the row's existing value on
+        conflict, and to 1 only for a genuinely new row (nothing to
+        preserve there).
+
+        Returns the row id (for the chunk FK).
         """
         content_hash = self._content_hash(content)
+        # priority ($21) is referenced twice below with two different
+        # COALESCE fallbacks, mirroring upsert_note's INSERT branch (see the
+        # comment there): the VALUES list needs a concrete NOT-NULL value for
+        # a genuinely new row (1 — nothing to preserve), while ON CONFLICT is
+        # a real existing row and must fall back to ITS current value, not 1,
+        # when $21 is NULL. That fallback deliberately references the raw
+        # $21 parameter, not EXCLUDED.priority: EXCLUDED.priority is already
+        # the VALUES-list's coalesced-to-1 result and can never itself be
+        # NULL, so using it here would silently reintroduce the clobber.
         return await self.db.fetchval(
             """
             INSERT INTO knowledge_index
@@ -801,7 +821,7 @@ class KnowledgeStore:
                  $7, $8, $9, $10, $11,
                  $12, $13, $14, $15,
                  $16, $17, $18, $19, $20, NOW(),
-                 $21)
+                 COALESCE($21, 1))
             ON CONFLICT (kb_id, path) WHERE kb_id IS NOT NULL AND path IS NOT NULL
             DO UPDATE SET
                 note_id = $2, title = $4, note_type = $5, content = $6,
@@ -809,7 +829,7 @@ class KnowledgeStore:
                 retrieval_messages = $11, blob_sha = $12, embedding_version = $13,
                 superseded_by = $14, invalidated_at = $15, job_id = $16,
                 phase = $17, content_hash = $18, modified_at = $20, indexed_at = NOW(),
-                priority = $21
+                priority = COALESCE($21, knowledge_index.priority)
             RETURNING id
             """,
             kb_id,

@@ -443,6 +443,102 @@ class TestUpsertNotePriorityCoalesceSentinel:
 
 
 # =============================================================================
+# upsert_kb_note priority sentinel (project-backlog-pipeline task 3, fix
+# round 2, Finding 3): priority=None means "the file has no priority: line,
+# leave the stored rank as-is" -- the reindex-path counterpart to
+# TestUpsertNotePriorityCoalesceSentinel above (the agent-write path).
+# Mutation-tested: reverting either COALESCE to a bare `$21`/
+# `EXCLUDED.priority` reference fails these.
+# =============================================================================
+
+
+class TestUpsertKbNotePriorityCoalesceSentinel:
+    @pytest.mark.asyncio
+    async def test_coalesces_none_against_existing_row_on_conflict(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="feature",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=None,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "priority = COALESCE($21, knowledge_index.priority)" in query
+        # This layer must never turn None into a concrete int itself -- that
+        # decision belongs entirely to the SQL COALESCE against the live row.
+        assert params[-1] is None
+
+    @pytest.mark.asyncio
+    async def test_coalesces_none_to_default_for_a_fresh_row(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="feature",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=None,
+        )
+        query = mock_db.fetchval.call_args[0][0]
+        assert "COALESCE($21, 1)" in query
+
+    @pytest.mark.asyncio
+    async def test_on_conflict_preserves_existing_not_excluded(self):
+        """Never EXCLUDED.priority here -- it's already the VALUES-list's
+        COALESCE(_, 1) result and would never be NULL, so referencing it
+        would silently reintroduce the clobber bug on every conflicting
+        upsert with priority=None (i.e. every reindex of an existing note
+        whose file has no priority: line)."""
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="feature",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=None,
+        )
+        query = mock_db.fetchval.call_args[0][0]
+        conflict_clause = query.split("ON CONFLICT")[1]
+        assert "priority = COALESCE($21, knowledge_index.priority)" in conflict_clause
+        assert "EXCLUDED.priority" not in conflict_clause
+
+    @pytest.mark.asyncio
+    async def test_explicit_priority_still_wins(self):
+        """Regression guard: the sentinel must not interfere with a real,
+        caller-supplied value (Task 2's original contract)."""
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="feature",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=0,
+        )
+        params = mock_db.fetchval.call_args[0][1:]
+        assert params[-1] == 0
+
+
+# =============================================================================
 # 11.6: delete_note()
 # =============================================================================
 

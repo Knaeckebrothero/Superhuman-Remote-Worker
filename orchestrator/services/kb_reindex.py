@@ -169,6 +169,17 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     vocabularies (valid_note_type / valid_note_status) — and unrecognised
     ``priority`` words — fall back to safe defaults rather than failing the
     INSERT.
+
+    ``priority`` is the one field that does NOT follow that "unknown ->
+    default" rule (fix round 2, Finding 3): an *absent* ``priority`` key maps
+    to ``None`` ("this file carries no opinion — leave the stored rank
+    alone"), never to ``_DEFAULT_PRIORITY_RANK``. Every pre-existing note
+    (and any human edit that just doesn't touch the line) lacks this key, and
+    ``upsert_kb_note`` runs on every merge and via the sweeper — defaulting
+    it would silently stamp "normal" over a real priority on the very next
+    reindex. An *invalid* value (a typo) is different: the value is present,
+    just unparseable, so it still falls back to ``_DEFAULT_PRIORITY_RANK``
+    rather than propagating garbage or failing the row.
     """
     fm = fm or {}
 
@@ -188,9 +199,15 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     if status not in VALID_STATUSES:
         status = _DEFAULT_STATUS
 
-    priority = PRIORITY_RANKS.get(
-        str(fm.get("priority", "")).strip().lower(), _DEFAULT_PRIORITY_RANK
-    )
+    raw_priority = fm.get("priority")
+    if raw_priority is None:
+        # Absent from frontmatter, or an explicit YAML null — not "unknown,
+        # use the default" like type/status above. See the docstring note.
+        priority: Optional[int] = None
+    else:
+        priority = PRIORITY_RANKS.get(
+            str(raw_priority).strip().lower(), _DEFAULT_PRIORITY_RANK
+        )
 
     def _as_list(value: Any) -> List[str]:
         if value is None:

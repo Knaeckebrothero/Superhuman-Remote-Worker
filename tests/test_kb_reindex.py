@@ -228,6 +228,31 @@ class TestNoteFields:
         f = note_fields("knowledge/n.md", fm, "b")
         assert f["tags"] == ["single-tag"]
 
+    def test_absent_priority_maps_to_none(self):
+        # Fix round 2 (Finding 3): unlike type/status, an absent priority
+        # is NOT "unknown, use the default" -- it means "this file has no
+        # opinion", so upsert_kb_note can tell "leave it alone" apart from
+        # "set it to normal". Every pre-existing note lacks this key.
+        fm = {"id": "n", "type": "feature", "status": "active"}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["priority"] is None
+
+    def test_no_frontmatter_at_all_maps_priority_to_none(self):
+        f = note_fields("knowledge/n.md", None, "# N\n\nbody")
+        assert f["priority"] is None
+
+    def test_invalid_priority_falls_back_to_normal(self):
+        # Present but unparseable (a human typo) -- still a safe default,
+        # unlike the absent case above.
+        fm = {"id": "n", "type": "feature", "priority": "URGENT!!"}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["priority"] == 1
+
+    def test_valid_priority_word_maps_to_its_rank(self):
+        fm = {"id": "n", "type": "feature", "priority": "low"}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["priority"] == 2
+
 
 # =============================================================================
 # reindex_kb — the orchestration
@@ -410,6 +435,46 @@ class TestReindexKbIncremental:
         assert expected["priority"] == 0  # sanity: the fixture says "high"
         up_kwargs = store.upsert_kb_note.await_args[1]
         assert up_kwargs["priority"] == expected["priority"]
+
+    @pytest.mark.asyncio
+    async def test_absent_priority_forwards_none_not_a_default(self):
+        # Fix round 2, Finding 3 repro: a file with NO priority: line (every
+        # pre-existing note, and any edit that doesn't touch that line) must
+        # forward None to upsert_kb_note, not _DEFAULT_PRIORITY_RANK -- this
+        # runs on every merge and via the sweeper, so silently defaulting
+        # here would stamp "normal" over a real stored priority on the very
+        # next reindex. See TestUpsertKbNotePriorityCoalesceSentinel in
+        # test_knowledge_store.py for proof the SQL side honors None as
+        # "leave unchanged" rather than nulling the column.
+        kb = uuid.uuid4()
+        endpoint_stamp = f"{EMBEDDING_VERSION}:pf-effective-profile"
+        endpoint_pipeline = reindex_pipeline_version(endpoint_stamp, "knowledge")
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=endpoint_pipeline
+        )
+        # _note_md carries no priority: line at all -- the common case for
+        # every note that predates this feature or was hand-edited.
+        note_text = _note_md("changed", "fresh insight", note_type="feature")
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/changed.md": "OLD", "knowledge/same.md": "same1"},
+            contents={"knowledge/changed.md": note_text},
+        )
+        svc.profile_fingerprint = "pf-effective-profile"
+        await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        fm, body = parse_note_md(note_text)
+        expected = note_fields("knowledge/changed.md", fm, body)
+        assert expected["priority"] is None  # sanity: no priority: line
+        up_kwargs = store.upsert_kb_note.await_args[1]
+        assert up_kwargs["priority"] is None
 
     @pytest.mark.asyncio
     async def test_progress_counters_reset_and_finalize(self):
