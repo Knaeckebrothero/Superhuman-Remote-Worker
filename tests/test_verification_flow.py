@@ -714,7 +714,9 @@ class TestVerificationGateDecision:
             }
         ]
 
-        action, _ = _verification_gate_decision(rounds, content_tree="bbb", max_rounds=3)
+        action, _ = _verification_gate_decision(
+            rounds, content_tree="bbb", max_rounds=3
+        )
         assert action == "spawn"
 
     def test_cap_reached_with_open_blocking_escalates(self):
@@ -1016,9 +1018,7 @@ class TestEscalateTargetWakesAndNotifies:
         notify_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_ownerless_job_is_not_notified_and_still_escalates(
-        self, monkeypatch
-    ):
+    async def test_ownerless_job_is_not_notified_and_still_escalates(self, monkeypatch):
         import orchestrator.main as main_module
         from orchestrator.main import _escalate_target
 
