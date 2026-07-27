@@ -639,6 +639,90 @@ class TestFinalizeJobContentTree:
 
         assert first["content_tree"] == second["content_tree"]
 
+    @staticmethod
+    def _simulate_return_resume(ws, open_findings):
+        """The step every earlier test of this guard was missing.
+
+        A *returned* verification round does not just loop ``finalize_job``:
+        the orchestrator resumes the target with feedback
+        (``_internal_resume_job`` in orchestrator/main.py), and the resume node
+        writes that feedback into the workspace ROOT as ``feedback.md``
+        (``restore_from_feedback`` in src/graph.py). The next round's
+        ``git add -A`` then commits it.
+
+        Both string templates are replicated verbatim from those two call
+        sites. Byte-exactness is not what the assertion depends on — any file
+        at a new tracked path moves the hash — but realistic content keeps the
+        test honest about what production actually writes.
+        """
+        # orchestrator/main.py, _handle_critic_verdict_on_complete
+        lines = ["## Open findings", ""]
+        for f in sorted(open_findings, key=lambda x: x.get("id", "")):
+            lines.append(
+                f"- **{f['id']}** [{f.get('severity', 'unknown')}]: "
+                f"{f.get('claim', '')}"
+            )
+        feedback = "\n".join(lines)
+
+        # src/graph.py, restore_from_feedback step 2
+        ws.write_file(
+            "feedback.md",
+            f"# Human Feedback\n\n"
+            f"Received when resuming frozen job.\n\n"
+            f"## Feedback\n\n"
+            f"{feedback}\n",
+        )
+
+    @pytest.mark.skipif(
+        shutil.which("git") is None, reason="Git not available on system"
+    )
+    def test_a_full_return_round_does_not_look_like_progress(self, tmp_path):
+        """THE round shape the guard actually has to survive.
+
+        complete -> capture -> critic RETURNS -> resume writes feedback.md ->
+        complete -> capture, with the deliverable byte-identical throughout.
+
+        Every previous test of this guard looped ``finalize_job`` directly and
+        never performed the resume, which is precisely why ``feedback.md``
+        survived three rounds of fixes: it is written between the two captures,
+        so it is a NEW tracked path in the second one. With it counted, T1 was
+        never equal to T2 and the guard could not fire on the first repeat —
+        only from the second consecutive identical return onward.
+        """
+        findings = [{"id": "F1", "severity": "high", "claim": "missing tests"}]
+        ws = self._make_real_workspace(tmp_path)
+        tm = self._real_todo_manager(ws)
+
+        trees = []
+        for _ in range(3):
+            tm.add("attempt to address the feedback")
+            self._seed_final_data()
+            trees.append(
+                finalize_job(
+                    make_state(), ws, tm, config=make_config("partial")
+                ).freeze_data["content_tree"]
+            )
+            # The critic returns; the target is resumed with the open findings.
+            self._simulate_return_resume(ws, findings)
+
+        # Sanity: feedback.md really is tracked, or this passes vacuously.
+        listing = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=ws.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        assert "feedback.md" in listing, (
+            "feedback.md was never committed — this test would pass vacuously"
+        )
+
+        assert trees[0] == trees[1], (
+            "the guard cannot fire on the FIRST repeated return: the resume "
+            f"wrote a file that moved the hash. {trees[0]} != {trees[1]}"
+        )
+        assert len(set(trees)) == 1, f"hashes diverged across rounds: {trees}"
+
     @pytest.mark.skipif(
         shutil.which("git") is None, reason="Git not available on system"
     )
