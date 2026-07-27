@@ -11476,6 +11476,22 @@ async def _set_target_to_autonomy_status(target_job_id: str) -> str:
     return new_status
 
 
+async def _escalate_target(job_id: str, job: dict[str, Any], reason: str) -> str:
+    """Hand a target to a human without approving it.
+
+    Loop jobs must NOT park on ``pending_review`` — the loop advance hook fires
+    only on terminal statuses, so a parked loop job wedges the whole loop. They
+    resolve ``completed`` with the reason in ``error_message`` for the retro.
+    """
+    from services.project_loops import job_loop_id
+    from services.verification_ledger import escalation_status
+
+    status = escalation_status(is_loop_job=bool(job_loop_id(job)))
+    await postgres_db.update_job_status(job_id, status=status, error_message=reason)
+    logger.warning("Verification escalated target %s to %s: %s", job_id, status, reason)
+    return status
+
+
 async def _spawn_scholar_subjob(
     job: dict[str, Any],
     config_name: str,
@@ -12323,18 +12339,63 @@ async def _handle_critic_verdict_on_complete(
         logger.warning(f"Unknown verdict '{verdict}' for critic job {job_id}")
 
 
+def _verification_gate_decision(
+    rounds: list[dict[str, Any]],
+    head_commit: str | None,
+    max_rounds: int,
+) -> tuple[str, str]:
+    """Decide whether to spawn another critic or hand the job to a human.
+
+    Returns ("spawn", "") or ("escalate", reason). Escalation never approves.
+    """
+    from services.verification_ledger import fold_open_findings, is_blocking
+
+    if not rounds:
+        return ("spawn", "")
+
+    blocking = [f for f in fold_open_findings(rounds) if is_blocking(f)]
+    if not blocking:
+        return ("spawn", "")
+
+    open_ids = ", ".join(f["id"] for f in blocking)
+
+    previous_head = rounds[-1].get("head_commit")
+    if head_commit and previous_head and head_commit == previous_head:
+        return (
+            "escalate",
+            f"No progress since round {len(rounds)}: the deliverable is unchanged "
+            f"(commit {head_commit[:8]}) while {len(blocking)} blocking finding(s) "
+            f"remain open ({open_ids}).",
+        )
+
+    if max_rounds > 0 and len(rounds) >= max_rounds:
+        return (
+            "escalate",
+            f"Round limit reached ({max_rounds}) with {len(blocking)} blocking "
+            f"finding(s) still open ({open_ids}).",
+        )
+
+    return ("spawn", "")
+
+
 async def _trigger_verification_on_complete(
     job: dict[str, Any],
     result: dict[str, Any],
     actions: list[str],
 ) -> None:
-    """Spawn or resume a critic verification job after a main job completes.
+    """Spawn a fresh critic, or escalate to a human, after a main job completes.
 
     Guards:
     1. No error, should_stop is True
     2. Not a subjob (no parent_job_id)
     3. freeze_data indicates job completion (not phase boundary)
     4. Verification enabled in resolved_config
+
+    Past the guards, the durable ledger on the TARGET job
+    (``context.verification_rounds``) is the single source of truth for what
+    happens next — see ``_verification_gate_decision``. There is no more
+    "resume the existing critic" path: every round gets a fresh critic, or
+    the job escalates to a human (never an auto-approval).
     """
     from services.completion import (
         _parse_freeze_data,
@@ -12374,189 +12435,184 @@ async def _trigger_verification_on_complete(
 
     verification_config = get_verification_config(job)
     freeze_data = _parse_freeze_data(job) or {}
+    rounds = _verification_rounds(job)
+    max_rounds = verification_config.get("max_rounds", 3)
+    head_commit = freeze_data.get("head_commit")
 
-    # Check for an existing waiting critic job (subsequent rounds)
-    async with postgres_db.acquire() as conn:
-        critic_row = await conn.fetchrow(
-            "SELECT id, status, context FROM jobs "
-            "WHERE parent_job_id = $1::uuid AND status = 'waiting'",
-            job_id,
-        )
+    action, reason = _verification_gate_decision(rounds, head_commit, max_rounds)
+    if action == "escalate":
+        await _escalate_target(job_id, job, reason)
+        actions.append(f"target {job_id} escalated: {reason}")
+        return
 
-    if critic_row:
-        # Subsequent round: resume existing critic
-        critic_id = str(critic_row["id"])
+    # Fall through to create a FRESH critic. This is now the ONLY path — round
+    # number and the open-findings brief come from the ledger (`rounds`),
+    # never from a counter or resumed state on a critic, so a critic that
+    # dies or leaves 'waiting' for any reason can no longer reset review to
+    # round 0 with a critic that knows nothing about the open findings (the
+    # incident this design replaces).
+    critic_config = verification_config.get("critic_config", "critic")
+    config_name = job.get("config_name", "unknown")
 
-        # Atomic round increment (mirrors increment_job_memory_retry) so racing
-        # completion handlers can't both read the same round and stall the
-        # counter. The freeze snapshot is a separate whole-key merge — no
-        # cross-key invariant ties it to the counter.
-        new_round = await postgres_db.increment_job_verification_round(critic_id)
-        await postgres_db.merge_job_context(
-            critic_id,
-            {
-                "deliverables": freeze_data.get("deliverables", []),
-                "summary": freeze_data.get("summary", ""),
-                "confidence": freeze_data.get("confidence", 0),
-            },
-        )
+    # Format instructions
+    instructions = format_verification_instructions(
+        job_id=job_id,
+        description=job.get("description", ""),
+        freeze_data=freeze_data,
+        config_name=config_name,
+    )
+    if not instructions:
+        logger.error(f"Failed to format verification instructions for job {job_id}")
+        return
 
-        logger.info(
-            f"Resuming existing critic {critic_id} for job {job_id} (round {new_round})"
-        )
-        await _internal_resume_job(
-            critic_id,
-            feedback=(
-                f"Target job addressed your feedback (round {new_round}). "
-                f"Review the updated deliverables and either approve or return with new feedback."
-            ),
-        )
-        actions.append(f"critic {critic_id} resumed (round {new_round})")
-    else:
-        # First round: create new critic job
-        critic_config = verification_config.get("critic_config", "critic")
-        max_rounds = verification_config.get("max_rounds", 3)
-        config_name = job.get("config_name", "unknown")
+    verification_description = (
+        f"Verify deliverables of job {job_id} ({config_name}). "
+        f"Review output against original requirements and either approve or return with feedback."
+    )
 
-        # Format instructions
-        instructions = format_verification_instructions(
-            job_id=job_id,
-            description=job.get("description", ""),
-            freeze_data=freeze_data,
-            config_name=config_name,
-        )
-        if not instructions:
-            logger.error(f"Failed to format verification instructions for job {job_id}")
-            return
+    context = {
+        "verification_target": job_id,
+        "original_description": job.get("description", ""),
+        "original_config": config_name,
+        "deliverables": freeze_data.get("deliverables", []),
+        "summary": freeze_data.get("summary", ""),
+        "confidence": freeze_data.get("confidence", 0),
+        "verification_round": len(rounds),
+        # NOTE: kept, despite Task 6's brief saying to delete this — the cap
+        # itself now lives with the target's config and IS read fresh at
+        # decision time above (_verification_gate_decision), never from this
+        # stamp. But _handle_critic_verdict_on_complete (this file, the
+        # 'elif verdict == "returned":' branch above) still reads
+        # critic_context.get("max_verification_rounds", 3) to decide its own
+        # (separately still-live, not part of this task) round-cap
+        # auto-accept. Deleting this key would make THAT check silently fall
+        # back to the hardcoded default of 3 for every critic regardless of
+        # the target's real configured max_rounds — including "0 = unlimited"
+        # — which would auto-accept a target a critic just returned, on a cap
+        # the target never configured. Keeping it stamped correctly costs
+        # nothing (the gate above already escalates at the target's real cap
+        # before a critic old enough to trip that check could ever be
+        # spawned) and avoids a live regression until that function is made
+        # ledger-aware (docs/superpowers/specs/
+        # 2026-07-27-verification-fail-closed-design.md, "_handle_critic_
+        # verdict_on_complete gains ... a terminal-status gate").
+        "max_verification_rounds": max_rounds,
+    }
 
-        verification_description = (
-            f"Verify deliverables of job {job_id} ({config_name}). "
-            f"Review output against original requirements and either approve or return with feedback."
-        )
+    # Inherit parent's workspace backend so critic runs on the same VM/container
+    parent_ctx = job.get("context") or {}
+    if isinstance(parent_ctx, str):
+        try:
+            parent_ctx = json.loads(parent_ctx)
+        except (json.JSONDecodeError, ValueError):
+            parent_ctx = {}
+    # A critic is spawned after the parent completes, so the parent's
+    # workspace is ready and always inherited here. Stamp the explicit flag
+    # (same discriminator the scholar uses) so the dispatch-time resolver
+    # overlays the parent's LIVE workspace instead of skipping it — the flag,
+    # not key presence, now gates the inherit path.
+    if parent_ctx.get("vm"):
+        context["vm"] = parent_ctx["vm"]
+        context["inherits_parent_workspace"] = True
+    elif parent_ctx.get("workspace_container"):
+        context["workspace_container"] = parent_ctx["workspace_container"]
+        context["inherits_parent_workspace"] = True
 
-        context = {
-            "verification_target": job_id,
-            "original_description": job.get("description", ""),
-            "original_config": config_name,
-            "deliverables": freeze_data.get("deliverables", []),
-            "summary": freeze_data.get("summary", ""),
-            "confidence": freeze_data.get("confidence", 0),
-            "verification_round": 0,
-            "max_verification_rounds": max_rounds,
-        }
+    config_override = {
+        "autonomy": "full",
+        "tools": {
+            "evaluation": ["approve_job", "return_job_with_feedback"],
+        },
+    }
 
-        # Inherit parent's workspace backend so critic runs on the same VM/container
-        parent_ctx = job.get("context") or {}
-        if isinstance(parent_ctx, str):
-            try:
-                parent_ctx = json.loads(parent_ctx)
-            except (json.JSONDecodeError, ValueError):
-                parent_ctx = {}
-        # A critic is spawned after the parent completes, so the parent's
-        # workspace is ready and always inherited here. Stamp the explicit flag
-        # (same discriminator the scholar uses) so the dispatch-time resolver
-        # overlays the parent's LIVE workspace instead of skipping it — the flag,
-        # not key presence, now gates the inherit path.
-        if parent_ctx.get("vm"):
-            context["vm"] = parent_ctx["vm"]
-            context["inherits_parent_workspace"] = True
-        elif parent_ctx.get("workspace_container"):
-            context["workspace_container"] = parent_ctx["workspace_container"]
-            context["inherits_parent_workspace"] = True
+    # Propagate parent's LLM override so the critic uses the same model
+    parent_override = job.get("config_override")
+    if isinstance(parent_override, str):
+        try:
+            parent_override = json.loads(parent_override)
+        except (json.JSONDecodeError, ValueError):
+            parent_override = None
+    if parent_override and isinstance(parent_override.get("llm"), dict):
+        config_override["llm"] = parent_override["llm"]
 
-        config_override = {
-            "autonomy": "full",
-            "tools": {
-                "evaluation": ["approve_job", "return_job_with_feedback"],
-            },
-        }
+    project_id = str(job["project_id"]) if job.get("project_id") else None
 
-        # Propagate parent's LLM override so the critic uses the same model
-        parent_override = job.get("config_override")
-        if isinstance(parent_override, str):
-            try:
-                parent_override = json.loads(parent_override)
-            except (json.JSONDecodeError, ValueError):
-                parent_override = None
-        if parent_override and isinstance(parent_override.get("llm"), dict):
-            config_override["llm"] = parent_override["llm"]
+    logger.info(
+        f"Creating verification job for {job_id} "
+        f"(critic_config={critic_config}, round={len(rounds)}, max_rounds={max_rounds})"
+    )
 
-        project_id = str(job["project_id"]) if job.get("project_id") else None
+    critic_job = await postgres_db.create_job(
+        description=verification_description,
+        config_name=critic_config,
+        config_override=config_override,
+        context=context,
+        parent_job_id=job_id,
+        project_id=project_id,
+        priority=10,
+        user_id=str(job["user_id"]) if job.get("user_id") else None,
+        runner_kind="lifecycle",
+    )
 
-        logger.info(
-            f"Creating verification job for {job_id} "
-            f"(critic_config={critic_config}, max_rounds={max_rounds})"
-        )
+    critic_job_id = str(critic_job["id"])
+    short_id = critic_job_id[:8]
 
-        critic_job = await postgres_db.create_job(
-            description=verification_description,
-            config_name=critic_config,
-            config_override=config_override,
-            context=context,
-            parent_job_id=job_id,
-            project_id=project_id,
-            priority=10,
-            user_id=str(job["user_id"]) if job.get("user_id") else None,
-            runner_kind="lifecycle",
-        )
+    # Inherit the parent's datasource selection (explicit-only resolution).
+    await _propagate_datasources_to_subjob(job_id, critic_job_id)
 
-        critic_job_id = str(critic_job["id"])
-        short_id = critic_job_id[:8]
+    # Set up Gitea branch for the subjob (same logic as create_job endpoint)
+    if gitea_client.is_initialized:
+        parent_repo_name = job.get("repo_name")
+        if not parent_repo_name:
+            parent_repo_name = f"job-{str(job['id'])[:8]}"
 
-        # Inherit the parent's datasource selection (explicit-only resolution).
-        await _propagate_datasources_to_subjob(job_id, critic_job_id)
-
-        # Set up Gitea branch for the subjob (same logic as create_job endpoint)
-        if gitea_client.is_initialized:
-            parent_repo_name = job.get("repo_name")
-            if not parent_repo_name:
-                parent_repo_name = f"job-{str(job['id'])[:8]}"
-
-            from_branch = job.get("branch_name") or "main"
-            branch_name = f"subjob/{short_id}/{critic_config}"
-            try:
-                branch_ok = await gitea_client.create_branch(
-                    parent_repo_name, branch_name, from_branch=from_branch
+        from_branch = job.get("branch_name") or "main"
+        branch_name = f"subjob/{short_id}/{critic_config}"
+        try:
+            branch_ok = await gitea_client.create_branch(
+                parent_repo_name, branch_name, from_branch=from_branch
+            )
+            if not branch_ok:
+                logger.error(
+                    f"Failed to create branch '{branch_name}' from '{from_branch}' "
+                    f"in '{parent_repo_name}' for critic {critic_job_id}"
                 )
-                if not branch_ok:
-                    logger.error(
-                        f"Failed to create branch '{branch_name}' from '{from_branch}' "
-                        f"in '{parent_repo_name}' for critic {critic_job_id}"
-                    )
-                # Propagate git remote URL and update branch/repo on the critic job
-                parent_context = job.get("context") or {}
-                if isinstance(parent_context, str):
-                    try:
-                        parent_context = json.loads(parent_context)
-                    except (json.JSONDecodeError, ValueError):
-                        parent_context = {}
-                git_remote_url = parent_context.get("git_remote_url", "")
+            # Propagate git remote URL and update branch/repo on the critic job
+            parent_context = job.get("context") or {}
+            if isinstance(parent_context, str):
+                try:
+                    parent_context = json.loads(parent_context)
+                except (json.JSONDecodeError, ValueError):
+                    parent_context = {}
+            git_remote_url = parent_context.get("git_remote_url", "")
 
-                await postgres_db.merge_job_context(
-                    critic_job_id, {"git_remote_url": git_remote_url}
-                )
+            await postgres_db.merge_job_context(
+                critic_job_id, {"git_remote_url": git_remote_url}
+            )
 
-                # Set worktree_path if subjob inherits a workspace backend
-                worktree_path = None
-                if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
-                    worktree_path = f"/home/agent-host/workspace/worktrees/{short_id}-{critic_config}"
-
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE jobs SET branch_name = $1, repo_name = $2, worktree_path = $3 WHERE id = $4::uuid",
-                        branch_name,
-                        parent_repo_name,
-                        worktree_path,
-                        critic_job_id,
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to create Gitea branch for critic {critic_job_id}: {e}"
+            # Set worktree_path if subjob inherits a workspace backend
+            worktree_path = None
+            if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
+                worktree_path = (
+                    f"/home/agent-host/workspace/worktrees/{short_id}-{critic_config}"
                 )
 
-        _trigger_dispatch()
-        actions.append(f"critic job {critic_job_id} created")
-        logger.info(f"Verification job {critic_job_id} created for job {job_id}")
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET branch_name = $1, repo_name = $2, worktree_path = $3 WHERE id = $4::uuid",
+                    branch_name,
+                    parent_repo_name,
+                    worktree_path,
+                    critic_job_id,
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to create Gitea branch for critic {critic_job_id}: {e}"
+            )
+
+    _trigger_dispatch()
+    actions.append(f"critic job {critic_job_id} created")
+    logger.info(f"Verification job {critic_job_id} created for job {job_id}")
 
 
 def _loop_deadline_passed(run_until: Any) -> bool:
@@ -18063,6 +18119,7 @@ async def _record_verification_round_impl(
     HTTPException(409) with the model-facing errors on invalid input, or
     HTTPException(400) if ``critic_job_id`` is missing.
     """
+    from services.completion import _parse_freeze_data
     from services.verification_ledger import (
         assign_ids,
         compute_verdict,
@@ -18083,6 +18140,16 @@ async def _record_verification_round_impl(
     target = await postgres_db.get_job(target_job_id)
     if not target:
         raise HTTPException(status_code=404, detail=f"Job {target_job_id} not found")
+
+    # head_commit is server-authoritative from the TARGET's own completion
+    # freeze, not the caller-supplied value — the critic runs on its own
+    # ``subjob/<id>/critic`` branch, so ITS workspace HEAD is a different
+    # commit than the target's, and comparing it against the previous
+    # round's (the no-progress check in _verification_gate_decision) would
+    # be meaningless. Falls back to the caller-supplied value only when the
+    # target's freeze has none (e.g. an older freeze predating this field).
+    target_freeze = _parse_freeze_data(target) or {}
+    head_commit = target_freeze.get("head_commit") or head_commit
 
     rounds = _verification_rounds(target)
 

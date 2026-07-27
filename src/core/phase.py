@@ -845,6 +845,23 @@ def finalize_job(
     # Clear the final phase data
     clear_final_phase_data(job_id)
 
+    # Best-effort HEAD commit for verification's no-progress detection
+    # (services/verification_ledger.py, consumed by
+    # _verification_gate_decision in orchestrator/main.py): if a later round
+    # sees the same head_commit as this one while blocking findings are
+    # still open, the target produced nothing and the job escalates instead
+    # of spawning another critic. Computed once and shared by both freeze
+    # shapes below. Must never raise or block completion — get_head_commit()
+    # already swallows its own errors, but the call site stays defensive too
+    # (this function already treats `workspace` as possibly falsy below, for
+    # the git commit/push step).
+    head_commit = None
+    if workspace:
+        try:
+            head_commit = workspace.get_head_commit()
+        except Exception:  # noqa: BLE001 — best-effort, see comment above
+            pass
+
     if autonomy == "full":
         # Full autonomy: auto-complete without freezing
         completion_data = {
@@ -854,6 +871,7 @@ def finalize_job(
             "deliverables": final_data.get("deliverables", []),
             "confidence": final_data.get("confidence", 1.0),
             "job_id": job_id,
+            "head_commit": head_commit,
         }
         if "notes" in final_data:
             completion_data["notes"] = final_data["notes"]
@@ -917,6 +935,7 @@ def finalize_job(
         "deliverables": final_data.get("deliverables", []),
         "confidence": final_data.get("confidence", 1.0),
         "job_id": job_id,
+        "head_commit": head_commit,
     }
 
     if "notes" in final_data:
