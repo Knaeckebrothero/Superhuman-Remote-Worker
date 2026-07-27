@@ -18330,7 +18330,9 @@ async def _record_verification_round_impl(
             critic_ctx = json.loads(critic_ctx)
         except (json.JSONDecodeError, ValueError):
             critic_ctx = {}
-    claimed_target = (critic_ctx or {}).get("verification_target")
+    if not isinstance(critic_ctx, dict):
+        critic_ctx = {}
+    claimed_target = critic_ctx.get("verification_target")
     if not critic or str(claimed_target or "") != str(target_job_id):
         logger.warning(
             "Rejected verification round: critic %s is not the critic for target "
