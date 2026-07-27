@@ -753,7 +753,10 @@ def test_critic_config_override_removes_self_closing_tools():
     core = override["tools"]["core"]
     assert "job_complete" not in core
     assert "mark_complete" not in core
-    assert set(override["tools"]["evaluation"]) == {"approve_job", "return_job_with_feedback"}
+    assert set(override["tools"]["evaluation"]) == {
+        "approve_job",
+        "return_job_with_feedback",
+    }
 
     # Test 2: parent_llm is NOT passed through when None
     assert "llm" not in _critic_config_override(parent_llm=None)

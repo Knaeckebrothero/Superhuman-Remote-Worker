@@ -47,7 +47,9 @@ class TestFoldOpenFindings:
     def test_resolved_closes(self):
         rounds = [
             _round(1, opened=[{"id": "F1", "severity": "high"}]),
-            _round(2, dispositions=[{"id": "F1", "disposition": "RESOLVED", "quote": "q"}]),
+            _round(
+                2, dispositions=[{"id": "F1", "disposition": "RESOLVED", "quote": "q"}]
+            ),
         ]
         assert fold_open_findings(rounds) == []
 
@@ -62,7 +64,9 @@ class TestFoldOpenFindings:
         # The incident: a later critic must not close a finding by re-judging it.
         rounds = [
             _round(1, opened=[{"id": "F1", "severity": "high"}]),
-            _round(2, dispositions=[{"id": "F1", "disposition": "DISPUTED", "reason": "r"}]),
+            _round(
+                2, dispositions=[{"id": "F1", "disposition": "DISPUTED", "reason": "r"}]
+            ),
         ]
         open_findings = fold_open_findings(rounds)
         assert [f["id"] for f in open_findings] == ["F1"]
@@ -71,9 +75,11 @@ class TestFoldOpenFindings:
     def test_accumulates_across_rounds(self):
         rounds = [
             _round(1, opened=[{"id": "F1", "severity": "high"}]),
-            _round(2,
-                   opened=[{"id": "F2", "severity": "high"}],
-                   dispositions=[{"id": "F1", "disposition": "RESOLVED", "quote": "q"}]),
+            _round(
+                2,
+                opened=[{"id": "F2", "severity": "high"}],
+                dispositions=[{"id": "F1", "disposition": "RESOLVED", "quote": "q"}],
+            ),
         ]
         assert [f["id"] for f in fold_open_findings(rounds)] == ["F2"]
 
@@ -124,8 +130,10 @@ class TestNextFindingIndex:
         assert next_finding_index([]) == 1
 
     def test_continues_from_max(self):
-        rounds = [_round(1, opened=[{"id": "F1"}, {"id": "F2"}]),
-                  _round(2, opened=[{"id": "F3"}])]
+        rounds = [
+            _round(1, opened=[{"id": "F1"}, {"id": "F2"}]),
+            _round(2, opened=[{"id": "F3"}]),
+        ]
         assert next_finding_index(rounds) == 4
 
     def test_ignores_malformed_ids(self):
@@ -136,8 +144,10 @@ class TestNextFindingIndex:
 class TestAssignIds:
     def test_assigns_sequential_ids(self):
         rounds = [_round(1, opened=[{"id": "F1", "severity": "high"}])]
-        out = assign_ids([{"severity": "high", "claim": "a"},
-                          {"severity": "low", "claim": "b"}], rounds)
+        out = assign_ids(
+            [{"severity": "high", "claim": "a"}, {"severity": "low", "claim": "b"}],
+            rounds,
+        )
         assert [f["id"] for f in out] == ["F2", "F3"]
 
     def test_overwrites_model_supplied_ids(self):
@@ -165,39 +175,56 @@ class TestComputeVerdict:
 
     def test_open_high_returns(self):
         # asserted='approved' on purpose: the BLOCKING rule does the work.
-        assert compute_verdict("approved", [{"id": "F1", "severity": "high"}]) == "returned"
+        assert (
+            compute_verdict("approved", [{"id": "F1", "severity": "high"}])
+            == "returned"
+        )
 
     def test_only_non_blocking_approves(self):
-        assert compute_verdict("approved", [{"id": "F1", "severity": "medium"},
-                                            {"id": "F2", "severity": "low"}]) == "approved"
+        assert (
+            compute_verdict(
+                "approved",
+                [{"id": "F1", "severity": "medium"}, {"id": "F2", "severity": "low"}],
+            )
+            == "approved"
+        )
 
     def test_mixed_returns(self):
-        assert compute_verdict("approved", [{"id": "F1", "severity": "low"},
-                                            {"id": "F2", "severity": "high"}]) == "returned"
+        assert (
+            compute_verdict(
+                "approved",
+                [{"id": "F1", "severity": "low"}, {"id": "F2", "severity": "high"}],
+            )
+            == "returned"
+        )
 
     # -- the four (asserted) x (blocking) combinations -----------------------
 
     def test_asserted_approved_with_blocking_returns(self):
-        assert compute_verdict(
-            "approved", [{"id": "F1", "severity": "high"}]
-        ) == "returned"
+        assert (
+            compute_verdict("approved", [{"id": "F1", "severity": "high"}])
+            == "returned"
+        )
 
     def test_asserted_approved_without_blocking_approves(self):
-        assert compute_verdict(
-            "approved", [{"id": "F1", "severity": "medium"}]
-        ) == "approved"
+        assert (
+            compute_verdict("approved", [{"id": "F1", "severity": "medium"}])
+            == "approved"
+        )
 
     def test_asserted_returned_with_blocking_returns(self):
-        assert compute_verdict(
-            "returned", [{"id": "F1", "severity": "high"}]
-        ) == "returned"
+        assert (
+            compute_verdict("returned", [{"id": "F1", "severity": "high"}])
+            == "returned"
+        )
 
     def test_asserted_returned_without_blocking_still_returns(self):
         """The defect: an explicit 'returned' at medium/low severity was
         silently recorded as 'approved', advancing the target."""
-        assert compute_verdict(
-            "returned", [{"id": "F1", "severity": "medium"}]
-        ) == "returned"
+        assert (
+            compute_verdict("returned", [{"id": "F1", "severity": "medium"}])
+            == "returned"
+        )
 
     def test_asserted_returned_with_nothing_open_approves(self):
         """Nothing is open, so there is nothing to return on. Unreachable in
@@ -206,9 +233,9 @@ class TestComputeVerdict:
         assert compute_verdict("returned", []) == "approved"
 
     def test_asserted_verdict_is_case_insensitive(self):
-        assert compute_verdict(
-            "RETURNED", [{"id": "F1", "severity": "low"}]
-        ) == "returned"
+        assert (
+            compute_verdict("RETURNED", [{"id": "F1", "severity": "low"}]) == "returned"
+        )
 
 
 from orchestrator.services.verification_ledger import (  # noqa: E402
@@ -223,9 +250,13 @@ OPEN_HIGH = [{"id": "F1", "severity": "high", "claim": "missing source"}]
 
 class TestValidateDispositions:
     def test_valid_resolved(self):
-        assert validate_dispositions(
-            [{"id": "F1", "disposition": "RESOLVED", "quote": "new text"}], OPEN_HIGH
-        ) == []
+        assert (
+            validate_dispositions(
+                [{"id": "F1", "disposition": "RESOLVED", "quote": "new text"}],
+                OPEN_HIGH,
+            )
+            == []
+        )
 
     def test_resolved_without_quote_rejected(self):
         errors = validate_dispositions(
@@ -248,8 +279,11 @@ class TestValidateDispositions:
 
     def test_unknown_id_rejected(self):
         errors = validate_dispositions(
-            [{"id": "F1", "disposition": "STILL_OPEN"},
-             {"id": "F99", "disposition": "RESOLVED", "quote": "q"}], OPEN_HIGH
+            [
+                {"id": "F1", "disposition": "STILL_OPEN"},
+                {"id": "F99", "disposition": "RESOLVED", "quote": "q"},
+            ],
+            OPEN_HIGH,
         )
         assert any("F99" in e for e in errors)
 
@@ -294,9 +328,10 @@ class TestValidateVerdictCall:
         assert "no findings" in errors[0].lower()
 
     def test_returned_with_findings_ok(self):
-        assert validate_verdict_call(
-            "returned", [{"claim": "x", "severity": "high"}], []
-        ) == []
+        assert (
+            validate_verdict_call("returned", [{"claim": "x", "severity": "high"}], [])
+            == []
+        )
 
     def test_approved_with_no_findings_ok(self):
         assert validate_verdict_call("approved", [], []) == []
@@ -349,8 +384,16 @@ class TestRenderPriorFindings:
 
     def test_lists_ids_and_claims(self):
         text = render_prior_findings(
-            [{"id": "F1", "severity": "high", "claim": "missing source",
-              "evidence": "line 44", "opened_round": 1, "disputed": False}]
+            [
+                {
+                    "id": "F1",
+                    "severity": "high",
+                    "claim": "missing source",
+                    "evidence": "line 44",
+                    "opened_round": 1,
+                    "disputed": False,
+                }
+            ]
         )
         assert "F1" in text
         assert "missing source" in text
@@ -363,8 +406,16 @@ class TestRenderPriorFindings:
         # that weaker assertion would still pass even with the per-finding
         # flag logic deleted entirely.
         text = render_prior_findings(
-            [{"id": "F1", "severity": "high", "claim": "c", "opened_round": 1,
-              "disputed": True, "dispute_reason": "disagree"}]
+            [
+                {
+                    "id": "F1",
+                    "severity": "high",
+                    "claim": "c",
+                    "opened_round": 1,
+                    "disputed": True,
+                    "dispute_reason": "disagree",
+                }
+            ]
         )
         assert "*(you previously disputed this)*" in text
 
@@ -372,8 +423,15 @@ class TestRenderPriorFindings:
         # Contrasting case: without this, test_marks_disputed alone can't
         # actually fail on a deleted/reversed flag condition.
         text = render_prior_findings(
-            [{"id": "F1", "severity": "high", "claim": "c", "opened_round": 1,
-              "disputed": False}]
+            [
+                {
+                    "id": "F1",
+                    "severity": "high",
+                    "claim": "c",
+                    "opened_round": 1,
+                    "disputed": False,
+                }
+            ]
         )
         assert "*(you previously disputed this)*" not in text
 
