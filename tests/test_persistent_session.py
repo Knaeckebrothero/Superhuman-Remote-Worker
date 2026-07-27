@@ -160,6 +160,54 @@ class TestCapabilityScopedCanvasSkillDeployment:
             for item in session.config.extra["_resolved_skills"]["menu"]
         )
 
+    def test_runtime_facts_bind_managed_guide_digest_to_agent_source(
+        self,
+        monkeypatch,
+    ):
+        from src.core.product_capabilities import (
+            ProductComponent,
+            ProvenanceStatus,
+        )
+
+        revision = "a" * 40
+        monkeypatch.setenv("SRW_COMPONENT", "agent")
+        monkeypatch.setenv("SRW_SOURCE_REVISION", revision)
+        monkeypatch.setenv(
+            "SRW_DEPLOYMENT_PROVENANCE_JSON",
+            ('{"components":{"workspace":{"source_revision":"' + ("b" * 40) + '"}}}'),
+        )
+        cfg = _make_config(extra={"_resolved_skills": {}})
+        session = _make_session(config=cfg)
+        session.workspace_manager = SimpleNamespace(
+            backend=SimpleNamespace(
+                supports_shell=True,
+                supports_file_tools=True,
+                supports_canvas_presentation=False,
+                supports_canvas_live_apps=False,
+                supports_canvas_shared_browser=False,
+                sudo_action="freeze",
+            )
+        )
+        session.tool_context = SimpleNamespace(
+            config={},
+            _resolved_tool_names=["read_product_guide"],
+            session_runtime_facts=None,
+        )
+
+        session._scope_skills_for_tool_names(["read_product_guide"])
+        session._refresh_runtime_facts(["read_product_guide"])
+
+        facts = session.tool_context.session_runtime_facts
+        components = dict(facts.runtime_component_provenance)
+        assert components[ProductComponent.AGENT].source_revision == revision
+        assert components[ProductComponent.GUIDE].source_revision == revision
+        assert components[ProductComponent.GUIDE].content_digest.startswith("sha256:")
+        assert (
+            components[ProductComponent.GUIDE].provenance_status
+            is ProvenanceStatus.DECLARED
+        )
+        assert components[ProductComponent.WORKSPACE].source_revision == "b" * 40
+
     def test_break_glass_removes_stale_guide_during_session_rebind(self, monkeypatch):
         from src.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
 

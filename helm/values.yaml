@@ -69,23 +69,52 @@ image:
   orchestrator:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator
     tag: latest
+    digest: ""
     pullPolicy: Always
   agent:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent
     tag: latest
+    digest: ""
     pullPolicy: Always
   cockpit:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-cockpit
     tag: latest
+    digest: ""
     pullPolicy: Always
   mcp:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp
     tag: latest
+    digest: ""
     pullPolicy: Always
   workspace:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace
     tag: latest
+    digest: ""
     pullPolicy: Always
+
+# Public, declarative component identity. Source revisions are full commit IDs,
+# never display tags. Artifact digests remain empty unless the corresponding
+# image is actually deployed by digest above.
+provenance:
+  sourceUrl: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  documentationUrl: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
+  releaseVersion: ""
+  components:
+    orchestrator:
+      sourceRevision: ""
+      releaseVersion: ""
+    agent:
+      sourceRevision: ""
+      releaseVersion: ""
+    cockpit:
+      sourceRevision: ""
+      releaseVersion: ""
+    mcp:
+      sourceRevision: ""
+      releaseVersion: ""
+    workspace:
+      sourceRevision: ""
+      releaseVersion: ""
 
 # =============================================================================
 # Orchestrator

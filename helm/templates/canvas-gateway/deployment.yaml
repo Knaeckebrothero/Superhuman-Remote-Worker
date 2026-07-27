@@ -114,7 +114,7 @@ spec:
       {{- end }}
       containers:
         - name: canvas-gateway
-          image: "{{ .Values.image.orchestrator.repository }}:{{ .Values.image.orchestrator.tag }}"
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
           command:
             - uvicorn

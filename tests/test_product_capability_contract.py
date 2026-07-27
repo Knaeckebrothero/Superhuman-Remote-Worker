@@ -196,11 +196,11 @@ def _response(
     )
 
 
-def test_schema_1_0_is_closed_and_machine_readable():
+def test_schema_1_1_is_closed_and_machine_readable():
     schema = ProductCapabilitiesResponse.model_json_schema()
 
-    assert SCHEMA_VERSION == "1.0"
-    assert schema["properties"]["schema_version"]["const"] == "1.0"
+    assert SCHEMA_VERSION == "1.1"
+    assert schema["properties"]["schema_version"]["const"] == "1.1"
     assert schema["additionalProperties"] is False
     assert schema["$defs"]["ProductCapability"]["additionalProperties"] is False
     assert json.loads(json.dumps(schema)) == schema
@@ -209,8 +209,8 @@ def test_schema_1_0_is_closed_and_machine_readable():
 @pytest.mark.parametrize(
     ("observed", "expected"),
     [
-        ("1.0", SchemaCompatibility.EXACT),
-        ("1.1", SchemaCompatibility.SAME_MAJOR),
+        ("1.0", SchemaCompatibility.SAME_MAJOR),
+        ("1.1", SchemaCompatibility.EXACT),
         ("1.999", SchemaCompatibility.SAME_MAJOR),
         ("2.0", SchemaCompatibility.UNSUPPORTED_MAJOR),
         ("0.9", SchemaCompatibility.UNSUPPORTED_MAJOR),
@@ -513,6 +513,20 @@ def test_component_roles_and_provenance_require_consistent_evidence():
         ComponentProvenance(
             source_revision="a" * 40,
             provenance_status=ProvenanceStatus.VERIFIED,
+        )
+    declared = ComponentProvenance(
+        source_revision="a" * 40,
+        source_url="https://github.com/example/srw",
+        release_version="v1.2.3",
+        documentation_url="https://docs.example.test/srw",
+        provenance_status=ProvenanceStatus.DECLARED,
+    )
+    assert declared.release_version == "v1.2.3"
+    assert declared.documentation_url == "https://docs.example.test/srw"
+    with pytest.raises(ValidationError, match="may not carry evidence"):
+        ComponentProvenance(
+            release_version="v1.2.3",
+            provenance_status=ProvenanceStatus.UNAVAILABLE,
         )
 
 

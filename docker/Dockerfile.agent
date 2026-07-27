@@ -47,8 +47,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Production image
 FROM python:3.11-slim
 
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+
 LABEL maintainer="SRW Team"
 LABEL description="Universal Agent for document processing and requirement validation"
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="agent"
 
 # Create non-root user early so COPY --chown can reference it
 RUN groupadd -r srw && useradd -r -g srw -m srw
@@ -63,7 +73,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     AGENT_CONFIG=defaults \
     AGENT_PORT=8001 \
-    BUILD_SHA=${BUILD_SHA}
+    BUILD_SHA=${BUILD_SHA} \
+    SRW_COMPONENT=agent \
+    SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
+    SRW_SOURCE_URL=${SRW_SOURCE_URL} \
+    SRW_RELEASE_VERSION=${SRW_RELEASE_VERSION} \
+    SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
 WORKDIR /app
 

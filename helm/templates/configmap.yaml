@@ -63,6 +63,9 @@ data:
 
   # Orchestrator
   ORCHESTRATOR_URL: {{ printf "http://%s:8085" (include "srw.serviceName" (dict "context" . "component" "orchestrator")) | quote }}
+  # Public component declarations only. Agent pods inherit this ConfigMap;
+  # the orchestrator references this key explicitly.
+  SRW_DEPLOYMENT_PROVENANCE_JSON: {{ include "srw.deploymentProvenanceJson" . | quote }}
 
   # Workspace
   WORKSPACE_PATH: {{ "/workspace" | quote }}
@@ -363,7 +366,7 @@ data:
   AGENT_TAILSCALE_DARK_TIMEOUT_SECONDS: {{ .Values.agent.tailscale.darkTimeoutSeconds | default 600 | quote }}
 
   # Workspace containers (per-job sandboxed execution environments)
-  WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
+  WORKSPACE_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.workspace) | quote }}
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
   WORKSPACE_FUSE_ENABLED: {{ ternary "true" "false" .Values.workspace.fuse.enabled | quote }}
   WORKSPACE_FUSE_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.fuse.privileged | quote }}
@@ -374,8 +377,8 @@ data:
   OPERATOR_HOME_ALLOWED_EMAIL: {{ .Values.workspace.networkPolicy.operatorHomeAllowedEmail | default "" | quote }}
 
   # Agent pods (on-demand via AgentProvisioner)
-  AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
-  PERSISTENT_AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
+  AGENT_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.agent) | quote }}
+  PERSISTENT_AGENT_IMAGE: {{ include "srw.imageRef" (dict "image" .Values.image.agent) | quote }}
 
   # Agent pool sizing (AgentProvisioner)
   MAX_AGENTS: {{ .Values.agent.pool.maxAgents | quote }}

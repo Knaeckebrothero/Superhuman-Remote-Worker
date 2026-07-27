@@ -38,6 +38,9 @@ env:
   # this for production tags; YAML expressions can't lowercase, so we hardcode.
   # Update this if the repo is renamed.
   REPO_LOWER: knaeckebrothero/uni-projekt-graph-rag
+  SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
+  SRW_RELEASE_VERSION: 0.0.0-dev.sha-${{ github.sha }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -723,8 +726,19 @@ jobs:
           file: ./docker/Dockerfile.website
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=website
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
 
   # ---------------------------------------------------------------------------
   # Python tests (change-based)
@@ -853,12 +867,22 @@ jobs:
           file: ./docker/Dockerfile.agent
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=agent
           provenance: false
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
           build-args: |
             BUILD_SHA=${{ steps.short_sha.outputs.sha }}
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
 
   build-orchestrator:
     needs: [changes, dependency-audit, test-python, test-cockpit]
@@ -901,8 +925,19 @@ jobs:
           file: ./docker/Dockerfile.orchestrator
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=orchestrator
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
@@ -947,8 +982,19 @@ jobs:
           file: ./docker/Dockerfile.cockpit
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=cockpit
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
@@ -993,8 +1039,19 @@ jobs:
           file: ./docker/Dockerfile.mcp
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=mcp
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
@@ -1042,9 +1099,19 @@ jobs:
           file: ./docker/Dockerfile.workspace
           build-args: |
             PLAYWRIGHT_VERSION=${{ steps.pw.outputs.version }}
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=workspace
           provenance: false
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
@@ -1183,7 +1250,12 @@ jobs:
             # would then fail develop's own stage2 gate.
             TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
           fi
-          BUILD_ARGS=()
+          BUILD_ARGS=(
+            --build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"
+            --build-arg "SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}"
+            --build-arg "SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}"
+            --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
+          )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -1315,7 +1387,12 @@ jobs:
           else
             TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
           fi
-          BUILD_ARGS=()
+          BUILD_ARGS=(
+            --build-arg "SRW_SOURCE_REVISION=${GITHUB_SHA}"
+            --build-arg "SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}"
+            --build-arg "SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}"
+            --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
+          )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk .
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -1366,8 +1443,19 @@ jobs:
           file: ./vm/controller/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
+            io.srw.component=vm-controller
           provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
+            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
@@ -1504,23 +1592,49 @@ jobs:
       # -- Update image tags in values-experimental.yaml --
       - name: Update orchestrator tag
         if: needs.build-orchestrator.result == 'success'
-        run: yq -i '.image.orchestrator.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+        run: |
+          yq -i '
+            .image.orchestrator.tag = "${{ steps.tag.outputs.sha }}" |
+            .provenance.releaseVersion = strenv(SRW_RELEASE_VERSION) |
+            .provenance.components.orchestrator.sourceRevision = strenv(GITHUB_SHA) |
+            .provenance.components.orchestrator.releaseVersion = strenv(SRW_RELEASE_VERSION)
+          ' deployment/values-experimental.yaml
 
       - name: Update agent tag
         if: needs.build-agent.result == 'success'
-        run: yq -i '.image.agent.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+        run: |
+          yq -i '
+            .image.agent.tag = "${{ steps.tag.outputs.sha }}" |
+            .provenance.components.agent.sourceRevision = strenv(GITHUB_SHA) |
+            .provenance.components.agent.releaseVersion = strenv(SRW_RELEASE_VERSION)
+          ' deployment/values-experimental.yaml
 
       - name: Update cockpit tag
         if: needs.build-cockpit.result == 'success'
-        run: yq -i '.image.cockpit.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+        run: |
+          yq -i '
+            .image.cockpit.tag = "${{ steps.tag.outputs.sha }}" |
+            .provenance.components.cockpit.sourceRevision = strenv(GITHUB_SHA) |
+            .provenance.components.cockpit.releaseVersion = strenv(SRW_RELEASE_VERSION)
+          ' deployment/values-experimental.yaml
 
       - name: Update MCP tag
         if: needs.build-mcp.result == 'success'
-        run: yq -i '.image.mcp.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+        run: |
+          yq -i '
+            .image.mcp.tag = "${{ steps.tag.outputs.sha }}" |
+            .provenance.components.mcp.sourceRevision = strenv(GITHUB_SHA) |
+            .provenance.components.mcp.releaseVersion = strenv(SRW_RELEASE_VERSION)
+          ' deployment/values-experimental.yaml
 
       - name: Update workspace tag
         if: needs.build-workspace.result == 'success'
-        run: yq -i '.image.workspace.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+        run: |
+          yq -i '
+            .image.workspace.tag = "${{ steps.tag.outputs.sha }}" |
+            .provenance.components.workspace.sourceRevision = strenv(GITHUB_SHA) |
+            .provenance.components.workspace.releaseVersion = strenv(SRW_RELEASE_VERSION)
+          ' deployment/values-experimental.yaml
 
       - name: Update VM controller image tag
         if: needs.build-vm-controller.result == 'success'

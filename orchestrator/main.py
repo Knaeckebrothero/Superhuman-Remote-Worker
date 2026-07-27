@@ -246,6 +246,10 @@ from src.core.model_registry import (  # noqa: E402
     UnknownModelError,
     resolve_model as _resolve_model,
 )
+from src.core.product_capabilities import (  # noqa: E402
+    ComponentProvenance,
+    ProvenanceStatus,
+)
 
 # Lite (no-workspace-pod) backend names. Canonical set lives agent-side in the
 # backend factory; imported (not re-declared) so the dispatch/provisioning
@@ -6243,6 +6247,12 @@ class AgentRegistration(BaseModel):
     build_sha: str | None = Field(
         None, description="Build commit SHA baked into the agent image"
     )
+    product_provenance: ComponentProvenance = Field(
+        default_factory=lambda: ComponentProvenance(
+            provenance_status=ProvenanceStatus.UNAVAILABLE
+        ),
+        description="Bounded declared provenance for the registering agent image",
+    )
     pod_uid: str | None = Field(
         None,
         description=(
@@ -6251,6 +6261,18 @@ class AgentRegistration(BaseModel):
             "stamp ownerReferences on per-session Service/Ingress resources."
         ),
     )
+
+    @field_validator("product_provenance")
+    @classmethod
+    def reject_self_verified_provenance(
+        cls,
+        value: ComponentProvenance,
+    ) -> ComponentProvenance:
+        if value.provenance_status is ProvenanceStatus.VERIFIED:
+            raise ValueError(
+                "agent registration may not self-assert verified provenance"
+            )
+        return value
 
 
 class AgentRegistrationResponse(BaseModel):
@@ -18590,6 +18612,7 @@ async def register_agent(
             agent_mode=registration.agent_mode,
             thread_id=registration.thread_id,
             build_sha=registration.build_sha,
+            product_provenance=registration.product_provenance.model_dump(mode="json"),
             pod_uid=registration.pod_uid,
         )
         # Bind persistent agent to its thread. Defense-in-depth against the
