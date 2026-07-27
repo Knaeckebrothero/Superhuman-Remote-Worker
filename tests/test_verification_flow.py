@@ -340,6 +340,56 @@ class TestReturnWithNoNewFindingsButPriorOpen:
         assert exc.value.status_code == 409
 
 
+class TestRecordVerificationRoundContentTree:
+    """The ledger row must carry ``content_tree``, taken from the TARGET's own
+    freeze — same server-authoritative rule as ``head_commit``, and for the
+    same reason (the critic runs on its own branch, so its content is a
+    different thing from the target's)."""
+
+    @pytest.mark.asyncio
+    async def test_target_freeze_content_tree_is_recorded(self, fake_db, ledger_state):
+        from orchestrator.main import _record_verification_round_impl
+
+        ledger_state["freeze_data"] = {
+            "head_commit": "target-sha",
+            "content_tree": "target-tree",
+        }
+
+        await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c1",
+            asserted_verdict="returned",
+            opened=[{"severity": "high", "claim": "x"}],
+            dispositions=[],
+            head_commit="critic-own-branch-sha",
+            content_tree="critic-own-branch-tree",
+        )
+
+        assert ledger_state["rounds"][0]["content_tree"] == "target-tree"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_caller_supplied_content_tree(
+        self, fake_db, ledger_state
+    ):
+        from orchestrator.main import _record_verification_round_impl
+
+        ledger_state["freeze_data"] = {"summary": "older freeze, no content_tree"}
+
+        await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c1",
+            asserted_verdict="returned",
+            opened=[{"severity": "high", "claim": "x"}],
+            dispositions=[],
+            head_commit="caller-sha",
+            content_tree="caller-tree",
+        )
+
+        assert ledger_state["rounds"][0]["content_tree"] == "caller-tree"
+
+
 class TestRecordVerificationRoundHeadCommitAuthority:
     """Amendment item 2: the recorded round's ``head_commit`` is
     server-authoritative from the TARGET's ``freeze_data``, not whatever the
@@ -418,7 +468,7 @@ class TestVerificationGateDecision:
     def test_first_round_spawns(self):
         from orchestrator.main import _verification_gate_decision
 
-        action, _ = _verification_gate_decision([], head_commit="aaa", max_rounds=3)
+        action, _ = _verification_gate_decision([], content_tree="aaa", max_rounds=3)
         assert action == "spawn"
 
     def test_unchanged_head_with_open_blocking_escalates(self):
@@ -434,7 +484,7 @@ class TestVerificationGateDecision:
             {
                 "round": 1,
                 "critic_job_id": "c1",
-                "head_commit": "aaa",
+                "content_tree": "aaa",
                 "verdict": "returned",
                 "asserted_verdict": "returned",
                 "opened": [{"id": "F1", "severity": "high", "claim": "c"}],
@@ -444,12 +494,56 @@ class TestVerificationGateDecision:
         ]
 
         action, reason = _verification_gate_decision(
-            rounds, head_commit="aaa", max_rounds=3
+            rounds, content_tree="aaa", max_rounds=3
         )
         assert action == "escalate"
         assert "no progress" in reason.lower()
 
     def test_changed_head_with_open_blocking_spawns(self):
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = [
+            {
+                "round": 1,
+                "critic_job_id": "c1",
+                "content_tree": "aaa",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "opened": [{"id": "F1", "severity": "high", "claim": "c"}],
+                "dispositions": [],
+                "ts": "t",
+            }
+        ]
+
+        action, _ = _verification_gate_decision(rounds, content_tree="bbb", max_rounds=3)
+        assert action == "spawn"
+
+    def test_cap_reached_with_open_blocking_escalates(self):
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = [
+            {
+                "round": i,
+                "critic_job_id": f"c{i}",
+                "content_tree": f"h{i}",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "opened": [{"id": f"F{i}", "severity": "high", "claim": "c"}],
+                "dispositions": [],
+                "ts": "t",
+            }
+            for i in range(1, 4)
+        ]
+
+        action, reason = _verification_gate_decision(
+            rounds, content_tree="h9", max_rounds=3
+        )
+        assert action == "escalate"
+        assert "round limit" in reason.lower()
+
+    def test_legacy_rounds_without_content_tree_fall_back_to_head_commit(self):
+        """In-flight jobs whose earlier rounds were written before
+        ``content_tree`` existed must not lose the guard entirely."""
         from orchestrator.main import _verification_gate_decision
 
         rounds = [
@@ -465,31 +559,37 @@ class TestVerificationGateDecision:
             }
         ]
 
-        action, _ = _verification_gate_decision(rounds, head_commit="bbb", max_rounds=3)
-        assert action == "spawn"
+        action, reason = _verification_gate_decision(
+            rounds, content_tree=None, max_rounds=3, head_commit="aaa"
+        )
+        assert action == "escalate"
+        assert "no progress" in reason.lower()
 
-    def test_cap_reached_with_open_blocking_escalates(self):
+    def test_content_tree_and_head_commit_are_never_compared_across(self):
+        """A tree hash and a commit SHA are different value spaces. When one
+        side has only the legacy field the guard must ABSTAIN (spawn), not
+        manufacture a comparison — the round cap still bounds the loop, and a
+        false 'no progress' escalation on a healthy job is the worse error.
+        """
         from orchestrator.main import _verification_gate_decision
 
         rounds = [
             {
-                "round": i,
-                "critic_job_id": f"c{i}",
-                "head_commit": f"h{i}",
+                "round": 1,
+                "critic_job_id": "c1",
+                "head_commit": "aaa",  # legacy row: no content_tree
                 "verdict": "returned",
                 "asserted_verdict": "returned",
-                "opened": [{"id": f"F{i}", "severity": "high", "claim": "c"}],
+                "opened": [{"id": "F1", "severity": "high", "claim": "c"}],
                 "dispositions": [],
                 "ts": "t",
             }
-            for i in range(1, 4)
         ]
 
-        action, reason = _verification_gate_decision(
-            rounds, head_commit="h9", max_rounds=3
+        action, _ = _verification_gate_decision(
+            rounds, content_tree="aaa", max_rounds=3, head_commit="bbb"
         )
-        assert action == "escalate"
-        assert "round limit" in reason.lower()
+        assert action == "spawn"
 
     def test_cap_applies_to_non_blocking_open_findings_too(self):
         """Downstream of the verdict-rule change: an explicit 'returned' at
@@ -507,7 +607,7 @@ class TestVerificationGateDecision:
             {
                 "round": i,
                 "critic_job_id": f"c{i}",
-                "head_commit": f"h{i}",
+                "content_tree": f"h{i}",
                 "verdict": "returned",
                 "asserted_verdict": "returned",
                 "opened": [{"id": f"F{i}", "severity": "medium", "claim": "c"}],
@@ -518,7 +618,7 @@ class TestVerificationGateDecision:
         ]
 
         action, reason = _verification_gate_decision(
-            rounds, head_commit="h9", max_rounds=3
+            rounds, content_tree="h9", max_rounds=3
         )
         assert action == "escalate"
         assert "round limit" in reason.lower()
@@ -530,7 +630,7 @@ class TestVerificationGateDecision:
             {
                 "round": 1,
                 "critic_job_id": "c1",
-                "head_commit": "aaa",
+                "content_tree": "aaa",
                 "verdict": "returned",
                 "asserted_verdict": "returned",
                 "opened": [{"id": "F1", "severity": "medium", "claim": "c"}],
@@ -540,7 +640,7 @@ class TestVerificationGateDecision:
         ]
 
         action, reason = _verification_gate_decision(
-            rounds, head_commit="aaa", max_rounds=3
+            rounds, content_tree="aaa", max_rounds=3
         )
         assert action == "escalate"
         assert "no progress" in reason.lower()
@@ -555,7 +655,7 @@ class TestVerificationGateDecision:
             {
                 "round": i,
                 "critic_job_id": f"c{i}",
-                "head_commit": f"h{i}",
+                "content_tree": f"h{i}",
                 "verdict": "returned",
                 "asserted_verdict": "returned",
                 "opened": [],
@@ -565,7 +665,7 @@ class TestVerificationGateDecision:
             for i in range(1, 6)
         ]
 
-        action, _ = _verification_gate_decision(rounds, head_commit="h9", max_rounds=3)
+        action, _ = _verification_gate_decision(rounds, content_tree="h9", max_rounds=3)
         assert action == "spawn"
 
     def test_unlimited_rounds_never_hits_cap(self):
@@ -575,7 +675,7 @@ class TestVerificationGateDecision:
             {
                 "round": i,
                 "critic_job_id": f"c{i}",
-                "head_commit": f"h{i}",
+                "content_tree": f"h{i}",
                 "verdict": "returned",
                 "asserted_verdict": "returned",
                 "opened": [{"id": f"F{i}", "severity": "high", "claim": "c"}],
@@ -585,7 +685,7 @@ class TestVerificationGateDecision:
             for i in range(1, 9)
         ]
 
-        action, _ = _verification_gate_decision(rounds, head_commit="h9", max_rounds=0)
+        action, _ = _verification_gate_decision(rounds, content_tree="h9", max_rounds=0)
         assert action == "spawn"
 
 
@@ -633,7 +733,7 @@ class TestEscalateTarget:
 def _make_completion_job(
     *,
     job_id: str = "target-1",
-    freeze_head_commit,
+    freeze_content_tree,
     verification_rounds,
     max_rounds: int = 3,
     is_loop: bool = False,
@@ -641,7 +741,7 @@ def _make_completion_job(
     """A minimal job row that clears every guard in
     ``_trigger_verification_on_complete`` (not a subjob, verification
     enabled, freeze indicates job completion) with a controllable ledger and
-    freeze ``head_commit`` — enough to exercise the REAL function end to end.
+    freeze ``content_tree`` — enough to exercise the REAL function end to end.
     """
     context: dict = {"verification_rounds": verification_rounds}
     if is_loop:
@@ -658,7 +758,7 @@ def _make_completion_job(
             "summary": "done",
             "deliverables": [],
             "confidence": 0.9,
-            "head_commit": freeze_head_commit,
+            "content_tree": freeze_content_tree,
         },
         "context": context,
         "status": "reviewing",
@@ -671,18 +771,18 @@ def _make_completion_job(
     }
 
 
-class TestTriggerVerificationHeadCommitWiring:
-    """Amendment item 3: proves head_commit actually FLOWS from a completion
-    freeze into the gate comparison inside the real
-    ``_trigger_verification_on_complete`` — not just that the pure decision
-    function behaves correctly when handed a value directly (that's what
-    ``TestVerificationGateDecision`` above proves, and it stayed green while
-    the wiring was dead in production, because nothing wrote ``head_commit``
-    into a freeze at all).
+class TestTriggerVerificationContentTreeWiring:
+    """Proves ``content_tree`` actually FLOWS from a completion freeze into the
+    gate comparison inside the real ``_trigger_verification_on_complete`` — not
+    just that the pure decision function behaves correctly when handed a value
+    directly (that's what ``TestVerificationGateDecision`` above proves, and it
+    stayed green through TWO generations of dead wiring: first when nothing
+    wrote the field into a freeze at all, then when the field it compared moved
+    on every round regardless of what the agent produced).
     """
 
     @pytest.mark.asyncio
-    async def test_same_head_commit_in_freeze_escalates_via_real_trigger(
+    async def test_same_content_tree_in_freeze_escalates_via_real_trigger(
         self, monkeypatch
     ):
         """THE INCIDENT REGRESSION TEST, exercised through the real trigger
@@ -696,7 +796,7 @@ class TestTriggerVerificationHeadCommitWiring:
         prior_round = {
             "round": 1,
             "critic_job_id": "c1",
-            "head_commit": "aaa",
+            "content_tree": "aaa",
             "verdict": "returned",
             "asserted_verdict": "returned",
             "opened": [{"id": "F1", "severity": "high", "claim": "still broken"}],
@@ -704,7 +804,7 @@ class TestTriggerVerificationHeadCommitWiring:
             "ts": "t",
         }
         job = _make_completion_job(
-            freeze_head_commit="aaa", verification_rounds=[prior_round]
+            freeze_content_tree="aaa", verification_rounds=[prior_round]
         )
         actions: list[str] = []
 
@@ -720,11 +820,11 @@ class TestTriggerVerificationHeadCommitWiring:
         assert any("escalated" in a for a in actions)
 
     @pytest.mark.asyncio
-    async def test_changed_head_commit_in_freeze_spawns_via_real_trigger(
+    async def test_changed_content_tree_in_freeze_spawns_via_real_trigger(
         self, monkeypatch
     ):
         """Contrast case: proves the comparison is real, not a constant. An
-        implementation that always escalates (or never reads head_commit at
+        implementation that always escalates (or never reads content_tree at
         all) would pass the test above but must fail this one."""
         import orchestrator.main as main_module
         from orchestrator.main import _trigger_verification_on_complete
@@ -744,7 +844,7 @@ class TestTriggerVerificationHeadCommitWiring:
         prior_round = {
             "round": 1,
             "critic_job_id": "c1",
-            "head_commit": "aaa",
+            "content_tree": "aaa",
             "verdict": "returned",
             "asserted_verdict": "returned",
             "opened": [{"id": "F1", "severity": "high", "claim": "still broken"}],
@@ -752,7 +852,7 @@ class TestTriggerVerificationHeadCommitWiring:
             "ts": "t",
         }
         job = _make_completion_job(
-            freeze_head_commit="bbb", verification_rounds=[prior_round]
+            freeze_content_tree="bbb", verification_rounds=[prior_round]
         )
         actions: list[str] = []
 
@@ -777,7 +877,7 @@ class TestTriggerVerificationHeadCommitWiring:
         prior_round = {
             "round": 1,
             "critic_job_id": "c1",
-            "head_commit": "aaa",
+            "content_tree": "aaa",
             "verdict": "returned",
             "asserted_verdict": "returned",
             "opened": [{"id": "F1", "severity": "high", "claim": "still broken"}],
@@ -785,7 +885,7 @@ class TestTriggerVerificationHeadCommitWiring:
             "ts": "t",
         }
         job = _make_completion_job(
-            freeze_head_commit="aaa",
+            freeze_content_tree="aaa",
             verification_rounds=[prior_round],
             is_loop=True,
         )
@@ -833,7 +933,7 @@ class TestTriggerVerificationInstructionsWiring:
         prior_round = {
             "round": 1,
             "critic_job_id": "c1",
-            "head_commit": "aaa",
+            "content_tree": "aaa",
             "verdict": "returned",
             "asserted_verdict": "returned",
             "opened": [{"id": "F1", "severity": "high", "claim": "still broken"}],
@@ -841,7 +941,7 @@ class TestTriggerVerificationInstructionsWiring:
             "ts": "t",
         }
         job = _make_completion_job(
-            freeze_head_commit="bbb", verification_rounds=[prior_round]
+            freeze_content_tree="bbb", verification_rounds=[prior_round]
         )
         actions: list[str] = []
 

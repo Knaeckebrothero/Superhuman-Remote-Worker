@@ -13,6 +13,7 @@ Usage:
         git_mgr.tag("phase-1-tactical-complete")
 """
 
+import hashlib
 import logging
 import posixpath
 import shlex
@@ -20,7 +21,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -597,6 +598,74 @@ class GitManager:
             return result.stdout.strip() if result.returncode == 0 else None
         except Exception:
             return None
+
+    # Files the agent writes ABOUT its own completion, not deliverables. Each
+    # carries a fresh ``timestamp``, so including them would make the content
+    # hash differ between two byte-identical rounds — reintroducing exactly
+    # the inertness ``get_content_tree`` exists to remove.
+    COMPLETION_BOOKKEEPING_PATHS = (
+        "output/job_completion.json",
+        "output/job_frozen.json",
+    )
+
+    def get_content_tree(self, exclude: Optional[Iterable[str]] = None) -> str | None:
+        """Stable hash of the committed workspace CONTENT at HEAD.
+
+        This is the progress signal the verification gate compares between
+        rounds ("did the deliverable actually change?"). Unlike a commit SHA
+        it is content-addressed, which is what makes it usable:
+
+        - **Invariant under empty commits.** Both freeze branches of
+          ``finalize_job`` and every phase boundary call
+          ``commit(..., allow_empty=True)`` unconditionally, so HEAD moves on
+          every round no matter what. A guard keyed on the commit SHA can
+          therefore never fire whenever workspace git versioning is on — the
+          default.
+        - **Invariant under a re-clone.** When a round's ``push()`` fails and
+          the pod is recycled, the workspace re-clones from the remote and
+          HEAD reverts to an older commit. A commit comparison reads that
+          infrastructure hiccup as "no progress" and escalates BACKWARDS; the
+          content hash is unchanged as long as the content is.
+
+        Derived from ``git ls-tree -r HEAD`` (mode/type/blob-sha/path for
+        every tracked file) rather than ``rev-parse HEAD^{tree}`` so that the
+        completion bookkeeping files can be excluded — see
+        ``COMPLETION_BOOKKEEPING_PATHS``.
+
+        Args:
+            exclude: Repo-relative paths to leave out of the hash. Defaults to
+                ``COMPLETION_BOOKKEEPING_PATHS``; pass ``()`` to hash
+                everything tracked.
+
+        Returns:
+            Hex digest, or None if not in a git repo or on any error. Like
+            :meth:`get_current_commit`, callers must treat failure as
+            "unknown", not as an error — it must never raise.
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(["ls-tree", "-r", "HEAD"])
+            if result.returncode != 0:
+                return None
+            listing = result.stdout or ""
+        except Exception:
+            return None
+
+        skip = set(self.COMPLETION_BOOKKEEPING_PATHS if exclude is None else exclude)
+        kept: List[str] = []
+        for line in listing.splitlines():
+            # "<mode> <type> <sha>\t<path>"
+            path = line.split("\t", 1)[1] if "\t" in line else ""
+            if path in skip:
+                continue
+            kept.append(line)
+
+        # ls-tree -r already emits a stable order; sorting pins it so the
+        # digest can never depend on git's output ordering.
+        kept.sort()
+        return hashlib.sha256("\n".join(kept).encode("utf-8")).hexdigest()
 
     # =========================================================================
     # Remote Operations

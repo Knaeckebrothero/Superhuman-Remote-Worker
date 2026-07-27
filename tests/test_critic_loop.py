@@ -59,9 +59,10 @@ def make_workspace():
     ws.git_manager = None
     # An unconfigured MagicMock() return value breaks json.dumps in
     # finalize_job's normal (non-verdict) completion path, which always
-    # reads this for freeze_data["head_commit"] — a real WorkspaceManager
-    # returns str | None.
+    # reads these for freeze_data["head_commit"] / ["content_tree"] — a real
+    # WorkspaceManager returns str | None.
     ws.get_head_commit = MagicMock(return_value=None)
+    ws.get_content_tree = MagicMock(return_value=None)
     return ws
 
 
@@ -512,20 +513,21 @@ class TestCriticVerdictInstructionsToolAgreement:
 
 def _rounds_with_open_blocking(n: int) -> list:
     """``n`` prior rounds, each returned with a distinct open high-severity
-    finding and a distinct head_commit.
+    finding and a distinct content_tree.
 
-    Distinct per-round commits matter: ``_verification_gate_decision`` checks
-    no-progress (same HEAD as the immediately preceding round) BEFORE the
-    round cap, and the two are mutually exclusive branches. A decision made
-    against yet another new head_commit (see call sites below) exercises the
-    CAP branch specifically, not the no-progress branch already covered by
-    ``TestVerificationGateDecision`` in tests/test_verification_flow.py.
+    Distinct per-round content hashes matter: ``_verification_gate_decision``
+    checks no-progress (same content as the immediately preceding round)
+    BEFORE the round cap, and the two are mutually exclusive branches. A
+    decision made against yet another new content_tree (see call sites below)
+    exercises the CAP branch specifically, not the no-progress branch already
+    covered by ``TestVerificationGateDecision`` in
+    tests/test_verification_flow.py.
     """
     return [
         {
             "round": i,
             "critic_job_id": f"c{i}",
-            "head_commit": f"h{i}",
+            "content_tree": f"h{i}",
             "verdict": "returned",
             "asserted_verdict": "returned",
             "opened": [{"id": f"F{i}", "severity": "high", "claim": "still broken"}],
@@ -537,7 +539,7 @@ def _rounds_with_open_blocking(n: int) -> list:
 
 
 def _make_loop_target_job(
-    *, freeze_head_commit: str, verification_rounds: list, max_rounds: int = 3
+    *, freeze_content_tree: str, verification_rounds: list, max_rounds: int = 3
 ) -> dict:
     """A job row that clears every guard in
     ``_trigger_verification_on_complete`` for a PROJECT-LOOP job (has
@@ -556,7 +558,7 @@ def _make_loop_target_job(
             "summary": "done",
             "deliverables": [],
             "confidence": 0.9,
-            "head_commit": freeze_head_commit,
+            "content_tree": freeze_content_tree,
         },
         "context": {
             "verification_rounds": verification_rounds,
@@ -588,7 +590,7 @@ class TestRoundLimitEnforcement:
         from orchestrator.main import _verification_gate_decision
 
         rounds = _rounds_with_open_blocking(1)
-        action, _ = _verification_gate_decision(rounds, head_commit="h9", max_rounds=3)
+        action, _ = _verification_gate_decision(rounds, content_tree="h9", max_rounds=3)
         assert action == "spawn"
 
     def test_round_at_limit_escalates(self):
@@ -596,7 +598,7 @@ class TestRoundLimitEnforcement:
 
         rounds = _rounds_with_open_blocking(3)
         action, reason = _verification_gate_decision(
-            rounds, head_commit="h9", max_rounds=3
+            rounds, content_tree="h9", max_rounds=3
         )
         assert action == "escalate"
         assert "round limit" in reason.lower()
@@ -606,7 +608,7 @@ class TestRoundLimitEnforcement:
 
         rounds = _rounds_with_open_blocking(5)
         action, reason = _verification_gate_decision(
-            rounds, head_commit="h9", max_rounds=3
+            rounds, content_tree="h9", max_rounds=3
         )
         assert action == "escalate"
         assert "round limit" in reason.lower()
@@ -615,7 +617,7 @@ class TestRoundLimitEnforcement:
         """Round zero (no prior rounds at all) is always under the cap."""
         from orchestrator.main import _verification_gate_decision
 
-        action, _ = _verification_gate_decision([], head_commit="h1", max_rounds=3)
+        action, _ = _verification_gate_decision([], content_tree="h1", max_rounds=3)
         assert action == "spawn"
 
     def test_cap_reached_outcome_is_never_approval(self):
@@ -627,7 +629,7 @@ class TestRoundLimitEnforcement:
 
         rounds = _rounds_with_open_blocking(10)
         action, _ = _verification_gate_decision(
-            rounds, head_commit="h999", max_rounds=3
+            rounds, content_tree="h999", max_rounds=3
         )
         assert action in ("spawn", "escalate")
 
@@ -645,12 +647,12 @@ class TestRoundLimitEnforcement:
         monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
 
         rounds = _rounds_with_open_blocking(3)
-        # A head_commit distinct from every prior round's — proves this
+        # A content_tree distinct from every prior round's — proves this
         # escalation is the CAP branch, not the no-progress branch (already
         # covered by test_loop_job_no_progress_escalates_to_completed in
         # tests/test_verification_flow.py).
         job = _make_loop_target_job(
-            freeze_head_commit="h999", verification_rounds=rounds
+            freeze_content_tree="h999", verification_rounds=rounds
         )
         actions: list[str] = []
 
