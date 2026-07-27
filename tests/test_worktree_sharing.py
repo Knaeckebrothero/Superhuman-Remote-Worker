@@ -730,3 +730,22 @@ class TestDispatchParentJobUnaffected:
             remaining_context["worktree_path"] = job["worktree_path"]
 
         assert "worktree_path" not in remaining_context
+
+
+# =============================================================================
+# Critic config override — remove self-closing tools
+# =============================================================================
+
+
+def test_critic_config_override_removes_self_closing_tools():
+    """`deep_merge` merges dicts by key, so the override ADDS `evaluation` and
+    narrows nothing — `core` still carried job_complete/mark_complete, the most
+    likely LLM mistake and a direct path to a verdict-less completion.
+    """
+    from orchestrator.main import _critic_config_override
+
+    override = _critic_config_override(parent_llm=None)
+    core = override["tools"]["core"]
+    assert "job_complete" not in core
+    assert "mark_complete" not in core
+    assert set(override["tools"]["evaluation"]) == {"approve_job", "return_job_with_feedback"}
