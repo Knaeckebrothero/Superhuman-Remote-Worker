@@ -202,6 +202,10 @@ agent:
   # only to contain a broken guide/reader, then disable it after rollback or
   # repair. Persistent-agent health reports operator_break_glass while active.
   appGuideBreakGlassDisabled: "false"
+  # -- Dark-launch gate for the authenticated, read-only M2 product-capability
+  # endpoint. This is an operator rollout control, not a user preference.
+  # Keep false until the shadow comparison/acceptance gates pass.
+  productCapabilitiesEndpointEnabled: "false"
   # -- Enable user-added MCP servers as datasources. Both gates default off;
   # stdio executes third-party commands in agent pods and should remain off
   # for hosted/multi-tenant deployments without suitable isolation.

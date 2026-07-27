@@ -97,6 +97,9 @@ data:
   # Negative/default-off by design; provisioned agent pods inherit this value
   # via envFrom and expose operator_break_glass in persistent-agent health.
   APP_GUIDE_BREAK_GLASS_DISABLED: {{ .Values.agent.appGuideBreakGlassDisabled | default "false" | quote }}
+  # Temporary operator-owned dark-launch gate for the authenticated M2
+  # product-capability endpoint. It is deliberately not a user preference.
+  PRODUCT_CAPABILITIES_ENDPOINT_ENABLED: {{ .Values.agent.productCapabilitiesEndpointEnabled | default "false" | quote }}
   # User-added MCP servers. stdio is separately gated because it runs
   # third-party commands inside dynamically provisioned agent pods.
   MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}
