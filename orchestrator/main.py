@@ -12411,20 +12411,20 @@ def _verification_gate_decision(
     rounds: list[dict[str, Any]],
     content_tree: str | None,
     max_rounds: int,
-    head_commit: str | None = None,
 ) -> tuple[str, str]:
     """Decide whether to spawn another critic or hand the job to a human.
 
     Returns ("spawn", "") or ("escalate", reason). Escalation never approves.
 
     The no-progress guard compares ``content_tree`` — a content hash of the
-    committed workspace (src/managers/git_manager.py) — NOT a commit SHA. A
+    committed workspace (src/managers/git_manager.py) — and nothing else. A
     commit SHA is unusable for this in both directions: every freeze commits
     with ``allow_empty=True`` so HEAD moves on every round regardless of what
     the agent produced (the guard could never fire), and a re-clone after a
     failed push reverts HEAD to an older commit (the guard fired backwards on
-    an infrastructure hiccup). ``head_commit`` is still accepted, and used
-    only for ledger rows written before ``content_tree`` existed.
+    an infrastructure hiccup). ``head_commit`` is therefore not accepted here
+    at all — a ledger row that predates ``content_tree`` makes this guard
+    abstain, and the round cap does the bounding.
     """
     from services.verification_ledger import fold_open_findings
 
@@ -12445,23 +12445,24 @@ def _verification_gate_decision(
 
     open_ids = ", ".join(f["id"] for f in open_findings if f.get("id"))
 
-    # Prefer the content hash. Fall back to the legacy commit SHA only when
-    # BOTH sides carry it and neither carries a content hash (an in-flight job
-    # whose earlier rounds predate this field). The two are never compared
-    # ACROSS: they are different value spaces, so a mismatch between them is
-    # not evidence of progress — with nothing comparable the guard abstains,
-    # which is the safe direction (the round cap still bounds the loop, and a
-    # false "no progress" escalation on a healthy job is the worse error).
-    previous = rounds[-1]
-    current, prior, unit = content_tree, previous.get("content_tree"), "content"
-    if not (current and prior):
-        current, prior, unit = head_commit, previous.get("head_commit"), "commit"
-
-    if current and prior and current == prior:
+    # ``content_tree`` on BOTH sides or the guard ABSTAINS. There is
+    # deliberately no fallback to ``head_commit``: it is a value known to be
+    # wrong for this comparison in both directions — captured before the
+    # freeze commit (which runs with allow_empty=True) so it never matches,
+    # and reverted by a re-clone after a failed push so that when it DOES
+    # match it is reporting an infrastructure hiccup as "no progress" and
+    # escalating a healthy job backwards. Comparing it is strictly worse than
+    # not comparing at all.
+    #
+    # So a round written before ``content_tree`` existed simply yields "cannot
+    # determine progress" and spawns normally. The round cap below still
+    # bounds the loop, which is why abstaining is safe.
+    previous_tree = rounds[-1].get("content_tree")
+    if content_tree and previous_tree and content_tree == previous_tree:
         return (
             "escalate",
             f"No progress since round {len(rounds)}: the deliverable is unchanged "
-            f"({unit} {current[:8]}) while {len(open_findings)} finding(s) "
+            f"(content {content_tree[:8]}) while {len(open_findings)} finding(s) "
             f"remain open ({open_ids}).",
         )
 
@@ -12565,11 +12566,8 @@ async def _trigger_verification_on_complete(
     rounds = _verification_rounds(job)
     max_rounds = verification_config.get("max_rounds", 3)
     content_tree = freeze_data.get("content_tree")
-    head_commit = freeze_data.get("head_commit")
 
-    action, reason = _verification_gate_decision(
-        rounds, content_tree, max_rounds, head_commit=head_commit
-    )
+    action, reason = _verification_gate_decision(rounds, content_tree, max_rounds)
     if action == "escalate":
         await _escalate_target(job_id, job, reason)
         actions.append(f"target {job_id} escalated: {reason}")
@@ -18357,8 +18355,9 @@ async def _record_verification_round_impl(
     # (the no-progress check in _verification_gate_decision) would be
     # meaningless. Each falls back to the caller-supplied value only when the
     # target's freeze has none (e.g. an older freeze predating the field).
-    # ``content_tree`` is the one the gate compares; ``head_commit`` is kept
-    # for diagnostics and for reading rows written before it existed.
+    # ``content_tree`` is the ONLY one the gate compares. ``head_commit`` is
+    # recorded purely for diagnostics — it is unusable as a progress signal
+    # (see _verification_gate_decision) and nothing reads it back.
     target_freeze = _parse_freeze_data(target) or {}
     head_commit = target_freeze.get("head_commit") or head_commit
     content_tree = target_freeze.get("content_tree") or content_tree
