@@ -258,6 +258,44 @@ async def test_does_not_fire_while_critic_still_processing(db):
 
 
 @pytest.mark.asyncio
+async def test_does_not_fire_while_critic_waiting_for_reply(db):
+    """Round-1 fix-loop finding: a critic can legitimately reach
+    'waiting_for_reply' itself. `config/worker_base.yaml` sets
+    `tools.communication: [send_message]`; `config/experts/critic/config.yaml`
+    never overrides the `communication` key, and `deep_merge`
+    (src/core/loader.py) merges the `tools` dict by key rather than replacing
+    it wholesale, so the critic inherits `send_message`. A blocking-mode
+    `send_message` call sets the CALLER's own job status to
+    'waiting_for_reply' (orchestrator/main.py's send_message handler). That
+    critic is alive, blocked on a human reply — not dead — and the watchdog
+    must not treat it as absent just because 'waiting_for_reply' isn't
+    'waiting'.
+    """
+    target = uuid4()
+    critic = uuid4()
+    await _insert_job(
+        db,
+        job_id=target,
+        status="reviewing",
+        updated_minutes_ago=45,
+        context={},
+    )
+    await _insert_job(
+        db,
+        job_id=critic,
+        status="waiting_for_reply",
+        parent_job_id=target,
+        context={"verification_target": str(target)},
+        created_minutes_ago=10,
+    )
+
+    rows = await db.unstick_reviewing_parents(grace_minutes=GRACE_MINUTES)
+
+    assert rows == []
+    assert await _status(db, target) == "reviewing"
+
+
+@pytest.mark.asyncio
 async def test_does_not_fire_before_grace_elapsed(db):
     """A dead, unrecorded critic doesn't strand the target instantly — the
     grace floor still applies."""
