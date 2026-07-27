@@ -44,11 +44,27 @@ def fold_open_findings(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     Returns copies, each carrying ``opened_round``; a finding left DISPUTED
     additionally carries ``disputed: True`` so the human gate can surface it.
+
+    Malformed entries (non-dict rounds/findings/dispositions, non-list
+    ``opened``/``dispositions``) are SKIPPED rather than raising. ``rounds``
+    comes from a jsonb column, so nothing at the type level guarantees its
+    shape, and this fold runs inside the /complete handler — whose bare
+    ``except Exception: log`` would swallow a TypeError and leave the target
+    wedged in 'reviewing' forever. Skipping is also the fail-closed direction:
+    an unreadable finding is dropped from the OPEN set only if it was
+    unreadable to begin with, and a round that opens nothing readable simply
+    contributes nothing.
     """
     open_by_id: Dict[str, Dict[str, Any]] = {}
 
     for rnd in rounds:
-        for finding in rnd.get("opened") or []:
+        if not isinstance(rnd, dict):
+            continue
+
+        opened = rnd.get("opened")
+        for finding in opened if isinstance(opened, list) else []:
+            if not isinstance(finding, dict):
+                continue
             fid = finding.get("id")
             if not fid:
                 continue
@@ -57,7 +73,10 @@ def fold_open_findings(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             entry["disputed"] = False
             open_by_id[fid] = entry
 
-        for disp in rnd.get("dispositions") or []:
+        dispositions = rnd.get("dispositions")
+        for disp in dispositions if isinstance(dispositions, list) else []:
+            if not isinstance(disp, dict):
+                continue
             fid = disp.get("id")
             if fid not in open_by_id:
                 continue
@@ -72,10 +91,20 @@ def fold_open_findings(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def next_finding_index(rounds: List[Dict[str, Any]]) -> int:
-    """Next free numeric suffix for a server-assigned finding ID."""
+    """Next free numeric suffix for a server-assigned finding ID.
+
+    Skips malformed entries for the same reason (and from the same stored
+    jsonb) as :func:`fold_open_findings`. Raising here would abort the append
+    itself, so the critic's verdict would never become durable at all.
+    """
     highest = 0
     for rnd in rounds:
-        for finding in rnd.get("opened") or []:
+        if not isinstance(rnd, dict):
+            continue
+        opened = rnd.get("opened")
+        for finding in opened if isinstance(opened, list) else []:
+            if not isinstance(finding, dict):
+                continue
             match = _FINDING_ID_RE.match(str(finding.get("id", "")))
             if match:
                 highest = max(highest, int(match.group(1)))
