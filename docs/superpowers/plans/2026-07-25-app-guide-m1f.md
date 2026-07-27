@@ -27,6 +27,9 @@ cross-topic overlap and does not change runtime bytes. Normal deployment
 values were restored in Helm revision 24, all pods are ready, and the tracked
 synthetic threads, temporary worktrees/files, old candidate images, and
 port-forwards were removed. M1f operational closeout is complete.
+Post-closure Office guide coverage and the complete current-tree M1 regression
+scope were revalidated 2026-07-27: **774 passed, 0 deselected, 10 warnings**;
+Ruff, formatting, diff, and both Helm lint profiles also pass.
 
 ## Non-negotiable boundaries
 
@@ -101,14 +104,18 @@ Implementation and release evidence (2026-07-25 through 2026-07-26):
 - `tests/test_app_guide_content.py`, excluding the unrelated
   `test_canvas_and_direct_browser_tool_inventories_have_guide_coverage`:
   **16 passed, 1 deselected**.
-- The unfiltered union is deliberately not recorded as green: it reports one
-  Canvas contract failure because the current `CanvasRenderer` contains the
-  concurrently introduced `office` value but that separate feature's guide
-  coverage set has not yet classified it.
-- Final M1-scoped union on runtime source `6ff4d443`: **607 passed,
-  1 deselected, 6 warnings** in 54.90 seconds. The sole explicit deselection is
-  that same unrelated Office renderer classification gap; it remains visible
-  and is not counted as App Guide coverage.
+- At closure, the unfiltered union was deliberately not recorded as green: it
+  reported one Canvas contract failure because `CanvasRenderer` contained the
+  concurrently introduced `office` value before the guide classified it.
+- Final closure-time M1-scoped union on runtime source `6ff4d443`:
+  **607 passed, 1 deselected, 6 warnings** in 54.90 seconds. The explicit
+  deselection kept that Office renderer classification gap visible rather than
+  counting it as App Guide coverage.
+- Post-closure commit `02fed505` documents the Office renderer and adds its
+  explicit inventory coverage decision. The formerly deselected focused test
+  and the complete 18-module M1 union pass on current source
+  `507df822ac35793690a618489c68611a3e066fe6`: **774 passed,
+  0 deselected, 10 warnings** in 52.83 seconds.
 
 ## Work package 2 — operator break-glass and degraded health
 
@@ -334,7 +341,10 @@ loaded an unrelated topic.
 
 Final verification summary:
 
-- Python: **607 passed, 1 unrelated deselection, 6 warnings**.
+- Closure-time Python: **607 passed, 1 Office-coverage deselection,
+  6 warnings**.
+- Current-tree Python revalidation: **774 passed, 0 deselected, 10 warnings**.
+- Current Office renderer coverage regression: pass.
 - Evaluation harness after the final manifest correction: **25 passed**.
 - Ruff check/format and `git diff --check`: pass.
 - Both Helm lint profiles: pass, with only the existing informational icon
