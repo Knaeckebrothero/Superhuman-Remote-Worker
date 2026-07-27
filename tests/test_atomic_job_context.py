@@ -431,3 +431,64 @@ class TestFusedContextStatusWrites:
         assert row["context"]["keep"] == "me"  # unrelated key preserved
         assert row["status"] == "paused"  # flipped in the same statement
         assert row["assigned_agent_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# append_verification_round
+# ---------------------------------------------------------------------------
+
+
+class TestAppendVerificationRound:
+    @pytest.mark.asyncio
+    async def test_appends_and_returns_length(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, {})
+
+        assert await db.append_verification_round(jid, {"round": 1, "critic_job_id": "c1"}) == 1
+        assert await db.append_verification_round(jid, {"round": 2, "critic_job_id": "c2"}) == 2
+        rounds = (await _read_ctx(db, jid))["verification_rounds"]
+        assert [r["critic_job_id"] for r in rounds] == ["c1", "c2"]
+
+    @pytest.mark.asyncio
+    async def test_null_column_creates_array(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, None)
+
+        assert await db.append_verification_round(jid, {"round": 1, "critic_job_id": "c1"}) == 1
+
+    @pytest.mark.asyncio
+    async def test_preserves_other_keys(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, {"keep": "me"})
+
+        await db.append_verification_round(jid, {"round": 1, "critic_job_id": "c1"})
+        assert (await _read_ctx(db, jid))["keep"] == "me"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_critic_id_is_noop(self, db):
+        # A retried /complete must not append a second round for the same critic.
+        jid = str(uuid4())
+        await _insert_job(db, jid, {})
+
+        assert await db.append_verification_round(jid, {"round": 1, "critic_job_id": "c1"}) == 1
+        assert await db.append_verification_round(jid, {"round": 1, "critic_job_id": "c1"}) == 0
+        assert len((await _read_ctx(db, jid))["verification_rounds"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_appends_all_land(self, db):
+        # The property a mock cannot defend: N racing single-statement appends
+        # are lost-update-immune under READ COMMITTED.
+        jid = str(uuid4())
+        await _insert_job(db, jid, {})
+        n = 10
+
+        await asyncio.gather(
+            *(db.append_verification_round(jid, {"round": i, "critic_job_id": f"c{i}"})
+              for i in range(n))
+        )
+
+        assert len((await _read_ctx(db, jid))["verification_rounds"]) == n
+
+    @pytest.mark.asyncio
+    async def test_missing_job_returns_zero(self, db):
+        assert await db.append_verification_round(str(uuid4()), {"critic_job_id": "c1"}) == 0

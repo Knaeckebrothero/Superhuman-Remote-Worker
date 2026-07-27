@@ -1896,6 +1896,59 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def append_verification_round(
+        self, job_id: str, record: Dict[str, Any]
+    ) -> int:
+        """Atomically append one verification round record to the TARGET job.
+
+        Single-statement ``jsonb_set(..., arr || $1)`` so two orchestrator
+        replicas racing on the same target both land (same property as
+        ``append_queued_reply``; see HF-3 in docs/features/database_roadmap.md).
+
+        Idempotent on ``critic_job_id``: a retried ``/complete`` for the same
+        critic is a no-op, because a duplicate round would corrupt the round
+        counter (round number is the array length).
+
+        Args:
+            job_id: TARGET job UUID as string
+            record: Round record (see the plan's Data Shapes)
+
+        Returns:
+            New array length, or 0 if the job is missing, the id is invalid,
+            or the append was suppressed as a duplicate.
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return 0
+
+        critic_job_id = str(record.get("critic_job_id") or "")
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "        COALESCE(context, '{}'::jsonb), "
+            "        '{verification_rounds}', "
+            "        COALESCE(context->'verification_rounds', '[]'::jsonb) || $1::jsonb"
+            "    ), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2 "
+            "  AND NOT (COALESCE(context->'verification_rounds', '[]'::jsonb) "
+            "           @> $3::jsonb) "
+            "RETURNING jsonb_array_length(context->'verification_rounds')"
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                query,
+                json_module.dumps([record]),
+                uuid_val,
+                json_module.dumps([{"critic_job_id": critic_job_id}]),
+            )
+
+        return int(row[0]) if row else 0
+
     async def increment_job_memory_retry(self, job_id: str) -> int:
         """Atomically increment context.memory_retry_count and return the new value.
 
