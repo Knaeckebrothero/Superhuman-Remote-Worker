@@ -43,6 +43,10 @@ from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
 from .orchestrator.catalog import create_catalog_tools
 from .orchestrator.workflows import create_workflow_tools
+from .product_capabilities import (
+    create_product_capability_tools,
+    get_product_capabilities_metadata,
+)
 from .product_help import create_product_help_tools, get_product_help_metadata
 from .research import (
     create_browser_direct_tools,
@@ -86,6 +90,7 @@ TOOL_REGISTRY.update(get_knowledge_metadata())
 TOOL_REGISTRY.update(get_communication_metadata())
 TOOL_REGISTRY.update(get_orchestrator_metadata())
 TOOL_REGISTRY.update(get_product_help_metadata())
+TOOL_REGISTRY.update(get_product_capabilities_metadata())
 # Loop campaign tools — never in bundled configs; injected per-job via
 # config_override.tools.loop for planner-loop checkpoint critics only.
 TOOL_REGISTRY.update(get_loop_metadata())
@@ -458,7 +463,10 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # Managed product help is persistent-session infrastructure and has no
     # workspace, datasource, or optional-service dependency.
     if "product_help" in tools_by_category:
-        product_help_tools = create_product_help_tools(context)
+        product_help_tools = [
+            *create_product_help_tools(context),
+            *create_product_capability_tools(context),
+        ]
         requested = set(tools_by_category["product_help"])
         for tool in product_help_tools:
             if tool.name in requested:
