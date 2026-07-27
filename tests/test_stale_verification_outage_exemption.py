@@ -158,3 +158,28 @@ async def test_created_stale_critic_unchanged(db):
     critic = await _seed_critic(db, status="created", stale_hours_ago=7)
     assert await db.cancel_stale_verification_subjobs(stale_hours=6) == 1
     assert await _status(db, critic) == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_stale_waiting_critic_is_reaped(db):
+    # Task 10: 'waiting' critics are orphans of the retired inter-round
+    # parking mechanism (docs/issues/stale_critic_waiting_status_escapes_
+    # reaper.md) — nothing legitimately parks a critic in 'waiting' between
+    # rounds any more (a fresh critic is spawned every round instead), so an
+    # agentless 'waiting' critic past the staleness horizon must be reaped
+    # exactly like 'created', even while its parent is still alive.
+    await _seed_parent(db)
+    critic = await _seed_critic(db, status="waiting", stale_hours_ago=7)
+    assert await db.cancel_stale_verification_subjobs(stale_hours=6) == 1
+    assert await _status(db, critic) == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_fresh_waiting_critic_survives_staleness(db):
+    # Mirror of test_created_stale_critic_unchanged's age gate: a 'waiting'
+    # critic younger than the staleness horizon is left alone (parent-
+    # terminal arm aside) — this is an age fallback, not "reap on sight".
+    await _seed_parent(db)
+    critic = await _seed_critic(db, status="waiting", stale_hours_ago=1)
+    assert await db.cancel_stale_verification_subjobs(stale_hours=6) == 0
+    assert await _status(db, critic) == "waiting"

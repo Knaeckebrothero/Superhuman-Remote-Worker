@@ -194,12 +194,18 @@ class TestUnstickReviewingParents:
         args = conn.fetch.await_args.args
         sql = args[0]
         # Flips reviewing → pending_review, gated by the grace floor and the
-        # "no non-failed/cancelled critic" clause; grace binds as $1.
+        # ledger-aware "no live critic + newest round unrecorded" clause;
+        # grace binds as $1. The old "every child failed/cancelled" clause
+        # is gone (a `completed` critic is now normal — see
+        # test_unstick_no_longer_requires_all_children_failed) — replaced by
+        # a check against the durable verification_rounds ledger, not
+        # dropped outright.
         assert "status = 'pending_review'" in sql
         assert "p.status = 'reviewing'" in sql
         assert "make_interval" in sql
         assert "verification_target" in sql
-        assert "NOT IN ('failed', 'cancelled')" in sql
+        assert "status NOT IN ('failed', 'cancelled')" not in sql
+        assert "verification_rounds" in sql
         assert "RETURNING" in sql
         assert args[1] == 30
 
@@ -210,3 +216,42 @@ class TestUnstickReviewingParents:
         db = _make_db(conn)
 
         assert await db.unstick_reviewing_parents() == []
+
+
+def test_unstick_no_longer_requires_all_children_failed():
+    """Every round now leaves a `completed` critic behind (Task 8 froze both
+    verdicts as ordinary `completed` subjobs instead of parking a 'returned'
+    critic in 'waiting'), so the old "all children failed/cancelled" condition
+    could never be met again after round 1 — a target whose round-2 critic
+    died would sit in `reviewing` forever.
+    """
+    from orchestrator.database.postgres import PostgresDB
+
+    sql = PostgresDB._UNSTICK_REVIEWING_SQL
+    assert "status NOT IN ('failed', 'cancelled')" not in sql
+    assert "verification_rounds" in sql
+
+
+def test_sweeper_reaps_waiting_critics_and_still_reaps_paused():
+    """`waiting` critics are orphans of the retired inter-round parking
+    mechanism (docs/issues/stale_critic_waiting_status_escapes_reaper.md) and
+    must now be reaped.
+
+    Deviation from the task-10 brief's literal example test: the brief
+    asserted ``"'paused'" not in sql`` (i.e. remove 'paused' entirely). That
+    contradicts this plan's own explicit constraint — "Never add 'paused'...
+    Removing paused from the existing set is equally wrong" — and it would
+    silently gut the LLM-outage/cooldown exemption a few lines below in the
+    same query, which tests specifically for ``j.status = 'paused'``. Orphan
+    recovery legitimately re-dispatches critics through `paused`, and "paused
+    too long ⇒ dead" was evaluated and rejected as a standalone signal in a
+    prior design (docs/features/llm_outage_subjob_resilience.md) — there is no
+    positive deadness signal for `paused` the way there now is for `waiting`
+    (a status nothing legitimately parks in any more). So `paused` must
+    survive in the predicate, and this test asserts presence, not absence.
+    """
+    from orchestrator.database.postgres import PostgresDB
+
+    sql = PostgresDB._CANCEL_STALE_VERIFICATION_SQL
+    assert "'waiting'" in sql
+    assert "'paused'" in sql
