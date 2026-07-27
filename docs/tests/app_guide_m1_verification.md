@@ -133,12 +133,12 @@ The final App Guide Python union on runtime source `6ff4d443` completed in
 607 passed, 1 deselected, 6 warnings
 ```
 
-The one explicit deselection is
+At closure, the one explicit deselection was
 `test_canvas_and_direct_browser_tool_inventories_have_guide_coverage`. It
-detects an unrelated concurrent Office renderer classification gap:
-`CanvasRenderer.office` was introduced outside the App Guide work and has not
-yet been assigned guide coverage. The gap remains visible and is not presented
-as an App Guide pass.
+detected a concurrent Office renderer classification gap:
+`CanvasRenderer.office` had been introduced outside the App Guide work without
+a guide coverage decision. The closure record kept that gap visible rather
+than presenting it as an App Guide pass.
 
 Additional final checks:
 
@@ -151,6 +151,70 @@ Additional final checks:
 
 Both Helm lint runs retain only the existing informational recommendation that
 `Chart.yaml` include an icon.
+
+### Post-closure Office coverage revalidation
+
+Commit `02fed505` closes the one accepted closure-time deselection. The
+Canvas/browser guide now documents supported Office/OpenDocument file types,
+deployment gating, `auto` detection, fail-closed behavior when the Office
+editor is unavailable, and turn-based editing of the shared workspace file.
+The renderer inventory contract now explicitly classifies `office`.
+
+On 2026-07-27, the formerly deselected focused regression passes:
+
+```text
+tests/test_app_guide_content.py::
+  test_canvas_and_direct_browser_tool_inventories_have_guide_coverage
+1 passed
+```
+
+The historical 607/1-deselected result above remains the exact M1 closure
+record. It is not rewritten by the later guide change.
+
+The complete current-tree M1 union was then revalidated from
+`507df822ac35793690a618489c68611a3e066fe6`. Its 18 modules cover App Guide
+content/evaluation, managed skill delivery and CRUD, datasource/grant/model
+catalogs, internal authorization, Fleet integration, persistent sessions and
+compaction, and the Protected Cloud manifest contract.
+
+```bash
+.venv/bin/pytest \
+  tests/cloud_staging/test_manifest.py \
+  tests/test_app_guide_compaction.py \
+  tests/test_app_guide_content.py \
+  tests/test_app_guide_eval_harness.py \
+  tests/test_bundled_skills.py \
+  tests/test_capability_grants_api.py \
+  tests/test_datasource_catalog.py \
+  tests/test_internal_auth.py \
+  tests/test_loader_interactive.py \
+  tests/test_model_registry.py \
+  tests/test_orchestrator_jobs_tool.py \
+  tests/test_persistent_app.py \
+  tests/test_persistent_graph.py \
+  tests/test_persistent_session.py \
+  tests/test_product_help_tool.py \
+  tests/test_skill_crud.py \
+  tests/test_skill_resolution.py \
+  tests/test_skill_tool.py \
+  -q --tb=short
+```
+
+```text
+774 passed, 0 deselected, 10 warnings in 52.83s
+```
+
+The warnings are one LangGraph pending-deprecation warning and nine
+unawaited-coroutine warnings in mocked internal-auth, persistent-app, and
+persistent-graph test paths. No test failed or skipped.
+
+Current-tree static evidence:
+
+- Ruff check: pass across all 34 Python files touched by App Guide commits;
+- Ruff format check: all 34 files already formatted;
+- `git diff --check`: pass;
+- both Helm lint profiles: pass, with only the existing informational
+  `Chart.yaml` icon recommendation.
 
 ## Break-glass and recovery evidence
 
