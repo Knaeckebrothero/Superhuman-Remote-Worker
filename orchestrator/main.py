@@ -12413,7 +12413,7 @@ def _critic_config_override(parent_llm: dict[str, Any] | None) -> dict[str, Any]
             "core": ["next_phase_todos", "todo_complete", "todo_list", "todo_rewind"],
         },
     }
-    if parent_llm:
+    if parent_llm is not None:
         override["llm"] = parent_llm
     return override
 
