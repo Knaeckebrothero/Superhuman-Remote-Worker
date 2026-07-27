@@ -28,8 +28,14 @@ non-default Nextcloud project; use its focused guide before relying on it.
 Treat the list below as possible session capabilities, not proof of what this
 particular session can do. In a broad capability answer, explicitly say that
 the current workspace, selected tools in **Agent Settings**, effective grants,
-and deployment configuration decide what is actually available; tell the user
-to check the current tool list or **Settings** panel before offering to act.
+and deployment configuration decide what is actually available. After reading
+this reference, use `get_product_capabilities` without filters for a broad
+current-session inventory, or with the exact relevant `capability_ids` above
+for a focused check. The current tool list and **Settings** panel remain useful
+user-visible evidence. Before offering to act, require the exact operation tool
+and report that operation's own result. Its action-time checks are
+tool-specific; do not infer that it re-fetched every upstream policy merely
+because an earlier capability snapshot said `can_execute`.
 
 - **Work with files** when the session uses a Virtual or full workspace.
   Container and VM workspaces add git; None is chat-only.

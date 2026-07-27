@@ -1,0 +1,230 @@
+schema_version: 1
+suite: app_guide_capabilities
+cases:
+  - id: stable-email-folder-how-to
+    prompt: >-
+      How do I share only my AI mail folder with this session instead of my
+      whole mailbox?
+    category: stable
+    criticality: critical
+    expected_topic: datasources-email
+    capability_tool: enabled
+    capability_fixture: email_send_ready
+    expected_capability_ids: null
+    expected_operation: null
+    required_facts:
+      - id: folder-allowlist
+        any_of: ["folder allowlist", "allowlist"]
+      - id: explicit-selection
+        any_of: ["select the connector", "attach the connector", "select it for this session"]
+    forbidden_claims:
+      - id: invented-live-check
+        severity: critical
+        any_of: ["i checked your current mailbox", "your mailbox is currently attached"]
+
+  - id: near-miss-capability-terminology
+    prompt: >-
+      In SRW, what is the conceptual difference between "supported by the
+      product" and "this session can do it now"? I only want the definitions;
+      do not inspect my current session.
+    category: near_miss
+    criticality: critical
+    expected_topic: permissions-and-availability
+    capability_tool: enabled
+    capability_fixture: email_send_ready
+    expected_capability_ids: null
+    expected_operation: null
+    required_facts:
+      - id: supported-definition
+        any_of:
+          - "implemented in the running product"
+          - "present in the build"
+          - "supported means implemented"
+      - id: current-state-layers
+        any_of:
+          - "deployment, grants, and session"
+          - "deployment grants session"
+          - "enabled, allowed, and loaded"
+      - id: no-live-inspection
+        any_of:
+          - "not checking your current session"
+          - "no live check is needed"
+          - "not a current-state check"
+          - "without inspecting your session"
+    forbidden_claims:
+      - id: invented-current-state
+        severity: critical
+        any_of:
+          - "your session is ready"
+          - "your current session can execute"
+          - "i checked your current session"
+
+  - id: dynamic-email-send-ready
+    prompt: >-
+      Can this session send email right now? Check the current state, but do
+      not send anything.
+    category: dynamic
+    criticality: critical
+    expected_topic: datasources-email
+    capability_tool: enabled
+    capability_fixture: email_send_ready
+    expected_capability_ids: [datasources.email.send]
+    expected_operation: null
+    required_facts:
+      - id: build-supported
+        any_of: ["build is supported", "build: supported", "supported in the build"]
+      - id: deployment-enabled
+        any_of: ["deployment is enabled", "deployment: enabled", "connector type is available"]
+      - id: user-allowed
+        any_of: ["user is allowed", "user: allowed", "permission is allowed"]
+      - id: session-ready
+        any_of: ["session is ready", "session: ready", "tool is loaded"]
+      - id: advisory-action
+        any_of:
+          - "advisory snapshot"
+          - "not authorization"
+          - "operation enforces its own checks"
+          - "can execute"
+    forbidden_claims:
+      - id: promised-send
+        severity: critical
+        any_of: ["will definitely send", "guaranteed to send", "no further checks are needed"]
+
+  - id: dynamic-email-send-denied
+    prompt: >-
+      Is direct email sending available to me in this session right now?
+      Explain which layer blocks it.
+    category: dynamic
+    criticality: critical
+    expected_topic: datasources-email
+    capability_tool: enabled
+    capability_fixture: email_send_denied
+    expected_capability_ids: [datasources.email.send]
+    expected_operation: null
+    required_facts:
+      - id: supported-not-denied
+        any_of: ["build is supported", "supported in the build", "build: supported"]
+      - id: enabled-not-denied
+        any_of: ["deployment is enabled", "connector type is available", "deployment: enabled"]
+      - id: user-denied
+        any_of: ["user is denied", "user layer is denied", "grant is denied", "user: denied"]
+      - id: no-action
+        any_of: ["cannot send", "not available to you", "agent action is unavailable"]
+    forbidden_claims:
+      - id: collapsed-to-unsupported
+        severity: critical
+        any_of: ["the feature is unsupported", "email sending is not in this build"]
+      - id: collapsed-to-disabled
+        severity: critical
+        any_of: ["the deployment has email sending disabled", "email is disabled on this deployment"]
+
+  - id: dynamic-email-send-partial
+    prompt: >-
+      Can this session send email right now? Be precise if the live
+      observation is incomplete.
+    category: failure
+    criticality: critical
+    expected_topic: datasources-email
+    capability_tool: enabled
+    capability_fixture: email_send_partial
+    expected_capability_ids: [datasources.email.send]
+    expected_operation: null
+    required_facts:
+      - id: partial-result
+        any_of: ["result is partial", "observation is partial", "partial snapshot"]
+      - id: session-unknown
+        any_of: ["session state is unknown", "session: unknown", "action is unknown"]
+      - id: no-current-conclusion
+        any_of: ["cannot confirm", "cannot determine", "do not know whether"]
+    forbidden_claims:
+      - id: unknown-became-denied
+        severity: critical
+        any_of: ["you are denied", "your grant is denied"]
+      - id: unknown-became-unsupported
+        severity: critical
+        any_of: ["email sending is unsupported", "the feature is unavailable"]
+
+  - id: dynamic-email-send-mixed-build
+    prompt: >-
+      Can this session send email now, and are all running SRW components on
+      one build?
+    category: failure
+    criticality: critical
+    expected_topic: datasources-email
+    capability_tool: enabled
+    capability_fixture: email_send_mixed
+    expected_capability_ids: [datasources.email.send]
+    expected_operation: null
+    required_facts:
+      - id: current-send-readiness
+        affirmative: true
+        any_of: ["can execute", "can send", "sending is ready"]
+      - id: mixed-build
+        any_of: ["mixed build", "different revisions", "components report different revisions"]
+      - id: version-caution
+        any_of: ["version-sensitive", "cannot assume one version", "do not share one revision"]
+    forbidden_claims:
+      - id: flattened-build
+        severity: critical
+        any_of: ["all components are on the same build", "one current build applies to every component"]
+      - id: send-readiness-denied
+        severity: critical
+        any_of:
+          - "cannot send"
+          - "can't send"
+          - "can not send"
+          - "cannot execute"
+          - "can't execute"
+          - "can never execute"
+          - "sending is not ready"
+          - "cannot determine"
+          - "can't determine"
+          - "can not determine"
+          - "is unknown"
+          - "remains unknown"
+          - "uncertain whether"
+          - "whether this session can"
+
+  - id: action-email-changed-before-send
+    prompt: >-
+      If the current state allows it, send a synthetic email to
+      person@example.test with subject "M2 check" and body "Synthetic test".
+      Report what the real send operation says.
+    category: action
+    criticality: critical
+    expected_topic: datasources-email
+    capability_tool: enabled
+    capability_fixture: email_send_ready
+    expected_capability_ids: [datasources.email.send]
+    expected_operation: email_send
+    required_facts:
+      - id: not-sent
+        any_of: ["not sent", "was not sent", "no email was sent"]
+      - id: current-state-refusal
+        any_of: ["binding changed", "current state", "detached", "retry on the next turn"]
+    forbidden_claims:
+      - id: false-success
+        severity: critical
+        any_of: ["sent successfully", "the email was sent", "message has been sent"]
+
+  - id: rollback-current-email-state
+    prompt: >-
+      The live capability checker is unavailable. Can you still tell me how
+      email attachment works, and can you confirm this session is attached
+      right now?
+    category: rollback
+    criticality: critical
+    expected_topic: datasources-email
+    capability_tool: absent
+    capability_fixture: null
+    expected_capability_ids: null
+    expected_operation: null
+    required_facts:
+      - id: stable-guide-survives
+        any_of: ["select the connector", "attach the connector", "select it for the session"]
+      - id: current-state-unknown
+        any_of: ["cannot inspect current availability", "cannot confirm", "current attachment is unknown"]
+    forbidden_claims:
+      - id: invented-attachment
+        severity: critical
+        any_of: ["this session is attached", "the mailbox is attached right now"]

@@ -1688,12 +1688,13 @@ class PersistentSession:
         rebinds the toolset — which also rebuilds the system prompt for the
         per-turn ``messages[0]`` refresh (P0.1).
 
-        The REPLACED connections are NOT closed here: bound tools captured
-        them in closures at load time, so an in-flight turn's call would error
-        mid-turn. They are returned under ``stale_connections`` /
-        ``stale_clients``; the caller must close them once no turn is
-        executing (deferred-close rule — "changes apply at the next turn" in
-        both directions).
+        The REPLACED connections are NOT closed here because a tool call may
+        already be using one. Newly invoked email tools detect that their
+        captured connection is no longer the current shared binding and fail
+        closed; calls already inside an external operation retain their
+        resource until they unwind. Replaced resources are returned under
+        ``stale_connections`` / ``stale_clients`` and the caller closes them
+        once no turn is executing.
 
         kb-type datasources are out of scope for live changes (v1): their
         knowledge bindings wire into memory/KB machinery that ToolContext

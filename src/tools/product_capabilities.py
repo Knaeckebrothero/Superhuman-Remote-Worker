@@ -114,6 +114,20 @@ class CapabilityToolRequest(BaseModel):
         max_length=MAX_TOOL_CAPABILITY_IDS,
     )
 
+    @field_validator("topic")
+    @classmethod
+    def validate_known_topic(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        known_topics = {
+            topic
+            for definition in CAPABILITY_REGISTRY.values()
+            for topic in definition.topics
+        }
+        if value not in known_topics:
+            raise ValueError("unknown capability topic")
+        return value
+
     @field_validator("capability_ids", mode="before")
     @classmethod
     def validate_raw_count(cls, value: Any) -> Any:
@@ -955,15 +969,29 @@ def _summary(
     *,
     status: CapabilityToolStatus,
 ) -> str:
+    observed_at = response.evaluated_at.isoformat().replace("+00:00", "Z")
     first = (
-        "Current product capability observation is complete."
-        if status is CapabilityToolStatus.READY
-        else "Current product capability observation is partial."
+        f"Product-capability snapshot at {observed_at} is "
+        f"{'complete' if status is CapabilityToolStatus.READY else 'partial'}."
+    )
+    mixed_build = response.product.mixed_build
+    build_note = (
+        " Component revisions are mixed."
+        if mixed_build is True
+        else (
+            " Known component revisions agree."
+            if mixed_build is False
+            else " Build uniformity is unknown."
+        )
     )
     if not response.capabilities:
-        return f"{first} No visible capabilities matched the exact filters."
+        return (
+            f"{first}{build_note} "
+            "No visible capabilities matched the exact filters; absence does "
+            "not prove unsupported, disabled, or denied."
+        )
 
-    lines = [first]
+    lines = [f"{first}{build_note}"]
     for capability in response.capabilities:
         qualifiers = [
             qualifier

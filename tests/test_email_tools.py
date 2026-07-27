@@ -493,6 +493,27 @@ class TestTierBackupGate:
         )
         assert "Error" in result and not smtp.sent
 
+    def test_send_rechecks_tier_and_send_gate_after_tool_binding(self):
+        conn = make_conn(access="send", unattended=True)
+        smtp = FakeSMTP()
+        conn.open_smtp = lambda: smtp
+        tools = make_tools(conn, make_mailbox())
+
+        conn.access = "draft"
+        downgraded = tools["email_send"].invoke(
+            {"subject": "Hi", "body": "text", "to": ["a@example.com"]}
+        )
+        assert "Error" in downgraded and "draft" in downgraded
+        assert not smtp.sent
+
+        conn.access = "send"
+        conn.unattended_send = False
+        gated = tools["email_send"].invoke(
+            {"subject": "Hi", "body": "text", "to": ["a@example.com"]}
+        )
+        assert "Error" in gated and "email_draft" in gated
+        assert not smtp.sent
+
     def test_unknown_access_tier_clamps_to_read(self):
         conn = make_conn(access="admin")
         assert conn.access == "read"
@@ -929,6 +950,23 @@ class TestEmailSend:
             {"subject": "Hi", "body": "text", "to": ["bob@example.com"]}
         )
         assert "Error" in result and "email_draft" in result
+        assert not smtp.sent
+        assert email_tools_mod._SEND_STATE["count"] == 0
+
+    def test_stale_bound_tool_refuses_after_live_detach(self):
+        conn = make_conn(access="send", unattended=True)
+        smtp = FakeSMTP()
+        conn.open_smtp = lambda: smtp
+        conn._new_mailbox = make_mailbox
+        context = ToolContext(datasources={"email": conn})
+        tools = {tool.name: tool for tool in create_email_tools(context)}
+
+        context.datasources.clear()
+        result = tools["email_send"].invoke(
+            {"subject": "Hi", "body": "text", "to": ["bob@example.com"]}
+        )
+
+        assert "Error" in result and "binding changed" in result
         assert not smtp.sent
         assert email_tools_mod._SEND_STATE["count"] == 0
 

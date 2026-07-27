@@ -22,8 +22,12 @@ tags:
 > contract and immutable 18-definition registry are implemented. M2b's
 > authenticated server resolver and default-off dark endpoint, M2c's live
 > session overlay and separately gated agent tool, and M2d's additive
-> schema-1.1 component provenance are implemented; M2e guide integration and
-> acceptance are next. The remaining visual help and
+> schema-1.1 component provenance are implemented. M2e's deterministic guide
+> integration, held-out capability trajectory suite, and changed-before-action
+> email enforcement are implemented in the 2026-07-27 M2e slice. The formal model,
+> canary, fresh/resumed live-session, and rollback matrices have not passed, so
+> both rollout gates remain default-off and **M2 is not complete**. The
+> remaining visual help and
 > Phases 3–8 remain open. Post-closure
 > commit `02fed505`
 > added the missing Office-on-Canvas guide coverage; its focused inventory
@@ -988,8 +992,9 @@ For a product question, the skill directs the agent to:
 8. Never turn a proposed design found in the repository into a claim about the
    running product.
 9. Treat capability output as an observation, not permission. If the user asks
-   the agent to act, call the real operation so it performs current policy and
-   precondition checks; do not infer success from `can_execute`.
+   the agent to act, call the real operation so its own action-time checks and
+   result, rather than the snapshot, decide the outcome. Those checks vary by
+   tool; do not infer success or a policy re-fetch from `can_execute`.
 
 Preferred answer shape:
 
@@ -1008,8 +1013,10 @@ that action is genuinely available.
 
 For "How can I share my email with you?", the agent should:
 
-1. Resolve `datasources.email` and the current session's datasource state.
-2. Read the email workflow reference.
+1. Read the email workflow reference.
+2. If the question asks about current attachment/readiness, resolve the exact
+   relevant `datasources.email` / `datasources.email.send` capability IDs
+   listed by that reference. A stable setup question remains guide-only.
 3. Explain **Datasources -> New -> Email (IMAP/SMTP)**, provider/app-password
    setup, access tier, Test/Create, and attaching it to a session or project.
 4. Recommend a dedicated `AI` folder allowlist when the user wants selective
@@ -1241,8 +1248,10 @@ non-blocking, and reopenable; SRW does not force a first-run tour.
 
 - Resolve capability state for the authenticated caller and active project;
   never return another user's grants or datasource details.
-- Treat capability output as an advisory observation. Every mutating or
-  privileged operation re-authorizes and revalidates at execution time.
+- Treat capability output as an advisory observation. Mutating and privileged
+  operations remain governed by their owning operation/binding enforcement;
+  the capability layer adds no authorization, and callers must not claim a
+  policy re-fetch that the owning path does not perform.
 - Return safe booleans/enums and reason codes, not secrets, hostnames, key
   names, raw administrator configuration, datasource names, folder names, or
   connection URLs. Return aggregate type/tier/readiness only.
@@ -1271,13 +1280,13 @@ non-blocking, and reopenable; SRW does not force a first-run tour.
 | Capability result partial or resolver errored | Preserve `partial`/`unknown` and safe evaluation errors; absence does not mean unsupported or denied |
 | Feature disabled or grant denied | Explain the safe user-facing reason and next owner/admin action when discoverable |
 | Session lacks attachment/tool | Explain that the product supports it but this session is not ready; show how to attach/upgrade |
-| Capability snapshot changes before action | The operation re-authorizes/revalidates and reports its current result; the earlier snapshot grants nothing |
+| Capability snapshot changes before action | The operation or current binding enforces the state its owning path checks and reports the operation result; the earlier snapshot grants nothing, and uncovered state remains unknown |
 | Component provenance missing or mixed | Name the affected uncertainty; skip source-derived claims for components without an immutable revision |
 | Source URL/full revision missing | Skip repository fallback; bundled/runtime knowledge still works |
 | Pinned source revision unreachable | Report fallback failure without switching to the default branch |
 | Screenshot/help card unavailable | Fall back to text steps and a validated deep link |
 | Help anchor missing/obscured/disabled | Stop the coach-mark journey and show the text card; never guess a selector or continue blindly |
-| Guide conflicts with effective state | Current runtime observation wins for explanation; flag the guide as potentially stale, while execution still rechecks |
+| Guide conflicts with effective state | Current runtime observation wins for explanation; flag the guide as potentially stale, while execution remains governed by the owning operation/binding checks |
 
 ## Testing and evaluation
 
@@ -1616,19 +1625,57 @@ Verified/SLSA provenance remains explicitly out of scope.
 
 #### M2e — guide integration and acceptance
 
-- [ ] Update `app-guide` to require the capability tool only for
+- [x] Update `app-guide` to require the capability tool only for
   availability/permission/current-context claims and preserve guide-only
   stable how-to answers.
-- [ ] Add resolver, auth/scope, visibility, redaction, payload-bound,
+- [x] Add resolver, auth/scope, visibility, redaction, payload-bound,
   partial/stale/error, mixed-build, graceful-degradation, and same-major
   compatibility tests.
-- [ ] Add changed-state-between-snapshot-and-action tests. Claim revalidation
+- [x] Add changed-state-between-snapshot-and-action tests. Claim revalidation
   only where the real operation or binding lifecycle actually enforces it;
   fix the owning enforcement path if the test exposes a gap.
 - [ ] Canary the read-only tool, run fresh/resumed live matrices, then make the
   endpoint/tool default-on only after zero critical false-positive claims.
-- [ ] Add English and German reason-code presentation where a UI or
+- [x] Add English and German reason-code presentation where a UI or
   deterministic user-facing summary actually exposes it.
+
+**Current M2e result (2026-07-27, incomplete):** the managed skill now reads
+the focused guide before an exact capability-ID lookup, keeps stable how-to
+answers guide-only, preserves per-layer partial/unknown/mixed state, and treats
+the snapshot as advisory. Unknown guide-topic filters fail closed before a
+server fetch. A separate eight-case held-out M2 corpus covers stable,
+capability-near-miss, ready, denied, partial/unknown, mixed-build,
+changed-before-action, and tool-absent rollback trajectories without
+disturbing the balanced 30-case M1 corpus.
+
+The action audit exposed a real stale-closure issue: an `email_send` tool
+captured before live detach could still submit through its old connection.
+Email operations now verify that the captured connection remains the current
+shared binding, recheck tier and unattended-send immediately before SMTP
+submission, and refuse after detach/rebind. This proves live attachment/tier
+changes and current bound-connection gates; it does **not** claim that an
+out-of-band `email_autonomous_send` grant revocation is fetched from the
+orchestrator on every SMTP call.
+
+No Cockpit or deterministic end-user reason-code surface was added. The
+English summary is model-facing structured tool context, so there is no new
+English/German UI copy in this slice. The skill-creator's generic validator
+rejects SRW's intentional `display_name`, `icon`, `color`, and `tags`
+frontmatter extensions; the repository's bundled-skill parser and content
+contracts remain the applicable validation authority.
+
+Offline corpus validation and the focused guide/capability/lifecycle suite
+pass at **183 tests**. The current post-review planned M2 union passes **1280
+tests** with 12 existing warnings; the larger pre-hardening source-derived
+union passed 1778, and the final delta is included in both current runs.
+Repository-wide Ruff lint, scoped format, both Helm profiles, and diff
+validation pass; the repository-wide format check reports only the unrelated
+`tests/test_atomic_job_context.py`. A smoke attempt against the configured local
+OpenAI-compatible model route was rejected at authentication and is not
+release evidence. The k3d cluster is stopped, so the canary, three-repeat
+eight-case model matrix,
+fresh/resumed deployment matrix, mixed deployment, and rollback probe remain
+open. Defaults must not flip until those gates pass.
 
 **Exit gate:** email correctly distinguishes supported/available, denied by
 the real datasource grant, allowed but unattached, ready at its effective tier,
