@@ -485,6 +485,67 @@ def _ds(ds_type, name, read_only=False):
 
 class TestResetupDatasources:
     @pytest.mark.asyncio
+    async def test_email_runtime_facts_refresh_on_failed_ready_and_removed_attachment(
+        self,
+    ):
+        """The published snapshot tracks aggregate state without retaining identity."""
+
+        session = _make_session()
+        email = {
+            "type": "email",
+            "name": "Private mailbox",
+            "datasource_id": "private-datasource-id",
+            "config": {
+                "access": "send",
+                "folders": ["INBOX/Private"],
+            },
+        }
+
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({}, {}, []),
+        ):
+            await session.resetup_datasources([email])
+        failed = session.tool_context.session_runtime_facts
+        assert failed.attached_datasource_types == ("email",)
+        assert failed.email_access_tier == "send"
+        assert failed.email_connection_failed is True
+
+        connection = SimpleNamespace(access="send", unattended_send=True)
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({"email": connection}, {}, []),
+        ):
+            await session.resetup_datasources([email])
+        ready = session.tool_context.session_runtime_facts
+        assert ready.attached_datasource_types == ("email",)
+        assert ready.email_access_tier == "send"
+        assert ready.email_connection_failed is False
+        assert ready.email_direct_send_enabled is True
+
+        # The live type-keyed connection is the action authority when several
+        # attached mailboxes resolve to one tool closure. A lower live tier
+        # must not inherit the higher configured aggregate tier.
+        connection.access = "read"
+        session._refresh_runtime_facts()
+        clamped = session.tool_context.session_runtime_facts
+        assert clamped.email_access_tier == "read"
+
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({}, {}, []),
+        ):
+            await session.resetup_datasources([])
+        removed = session.tool_context.session_runtime_facts
+        assert removed.attached_datasource_types == ()
+        assert removed.email_access_tier is None
+        assert removed.email_connection_failed is False
+        assert removed.email_direct_send_enabled is False
+        assert "Private mailbox" not in repr(removed)
+        assert "private-datasource-id" not in repr(removed)
+        assert "INBOX/Private" not in repr(removed)
+
+    @pytest.mark.asyncio
     async def test_swaps_registry_in_place_and_returns_stale_for_deferred_close(
         self,
     ):

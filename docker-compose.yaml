@@ -574,6 +574,8 @@ services:
       ORCHESTRATOR_URL: http://orchestrator:8085
       # Shared only with trusted agent/MCP callers of internal routes.
       MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
+      # Read-only persistent-session capability tool canary.
+      PRODUCT_CAPABILITIES_TOOL_ENABLED: "${PRODUCT_CAPABILITIES_TOOL_ENABLED:-false}"
       CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
       WORKSPACE_PATH: /workspace
       # LLM routing

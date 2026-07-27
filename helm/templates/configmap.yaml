@@ -100,6 +100,9 @@ data:
   # Temporary operator-owned dark-launch gate for the authenticated M2
   # product-capability endpoint. It is deliberately not a user preference.
   PRODUCT_CAPABILITIES_ENDPOINT_ENABLED: {{ .Values.agent.productCapabilitiesEndpointEnabled | default "false" | quote }}
+  # Separate default-off canary for the persistent-session capability tool.
+  # Agent pods inherit it through envFrom; it does not enable the endpoint.
+  PRODUCT_CAPABILITIES_TOOL_ENABLED: {{ .Values.agent.productCapabilitiesToolEnabled | default "false" | quote }}
   # User-added MCP servers. stdio is separately gated because it runs
   # third-party commands inside dynamically provisioned agent pods.
   MCP_DATASOURCES_ENABLED: {{ .Values.agent.mcpDatasourcesEnabled | default "false" | quote }}

@@ -206,6 +206,9 @@ agent:
   # endpoint. This is an operator rollout control, not a user preference.
   # Keep false until the shadow comparison/acceptance gates pass.
   productCapabilitiesEndpointEnabled: "false"
+  # -- Separate canary gate for the persistent-session capability tool.
+  # Operators must also enable the endpoint gate for controlled live probes.
+  productCapabilitiesToolEnabled: "false"
   # -- Enable user-added MCP servers as datasources. Both gates default off;
   # stdio executes third-party commands in agent pods and should remain off
   # for hosted/multi-tenant deployments without suitable isolation.

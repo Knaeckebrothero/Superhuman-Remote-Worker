@@ -1054,6 +1054,140 @@ class TestSetupCloudMountOverlayFailure:
 
 
 class TestSetupTools:
+    def test_capability_tool_is_independent_persistent_floor(
+        self,
+        monkeypatch,
+    ):
+        """The M2c canary survives every user group being off and guide break-glass."""
+
+        from src.tools.product_capabilities import (
+            PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV,
+            PRODUCT_CAPABILITIES_TOOL_NAME,
+        )
+
+        monkeypatch.setenv(PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV, "true")
+        monkeypatch.setenv("APP_GUIDE_BREAK_GLASS_DISABLED", "true")
+        monkeypatch.setenv("EXPERTS_DB_ENABLED", "false")
+        monkeypatch.setenv("SKILLS_DB_ENABLED", "false")
+        cfg = _make_config(
+            extra={
+                "_fleet_management_disabled": True,
+                "_agent_catalog_disabled": True,
+                "_workflows_disabled": True,
+                "_canvas_disabled": True,
+            }
+        )
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend = SimpleNamespace(
+            supports_shell=False,
+            supports_file_tools=False,
+            supports_canvas_presentation=False,
+            supports_canvas_live_apps=False,
+            supports_canvas_shared_browser=False,
+        )
+        captured: list[list[str]] = []
+
+        def load(names, _context):
+            captured.append(list(names))
+            return [_named_tool(name) for name in names]
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=[
+                    "read_product_guide",
+                    "create_worker_job",
+                    "list_skills",
+                    "list_automations",
+                    "set_canvas",
+                ],
+            ),
+            patch("src.api.persistent_session.load_tools", side_effect=load),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda tools: tools,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda tools, _context: tools,
+            ),
+            patch.object(session, "_scope_skills_for_tool_names"),
+            patch.object(session, "_deploy_catalog_skill_files"),
+            patch("src.tools.generate_workspace_tool_docs"),
+        ):
+            session._setup_tools(None)
+
+        assert captured
+        candidates = captured[0]
+        assert PRODUCT_CAPABILITIES_TOOL_NAME in candidates
+        assert "read_product_guide" not in candidates
+        assert "create_worker_job" not in candidates
+        assert "list_skills" not in candidates
+        assert "list_automations" not in candidates
+        assert "set_canvas" not in candidates
+        assert PRODUCT_CAPABILITIES_TOOL_NAME in (
+            session.tool_context._resolved_tool_names
+        )
+
+    def test_final_post_enforcement_tool_names_are_published(self, monkeypatch):
+        from src.tools.product_capabilities import (
+            PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV,
+            PRODUCT_CAPABILITIES_TOOL_NAME,
+        )
+
+        monkeypatch.setenv(PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV, "true")
+        cfg = _make_config()
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend = SimpleNamespace(
+            supports_shell=False,
+            supports_file_tools=True,
+            supports_canvas_presentation=False,
+            supports_canvas_live_apps=False,
+            supports_canvas_shared_browser=False,
+        )
+
+        def enforce(tools, _context):
+            return [tool for tool in tools if tool.name != "web_search"]
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=["web_search"],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools",
+                side_effect=lambda names, _context: [
+                    _named_tool(name) for name in names
+                ],
+            ),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda tools: tools,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=enforce,
+            ),
+            patch.object(session, "_scope_skills_for_tool_names"),
+            patch.object(session, "_deploy_catalog_skill_files"),
+            patch("src.tools.generate_workspace_tool_docs"),
+        ):
+            session._setup_tools(None)
+
+        assert "web_search" not in session.tool_context._resolved_tool_names
+        assert session.tool_context._resolved_tool_names == [
+            tool.name for tool in session.tools
+        ]
+        assert session.tool_context.session_runtime_facts.loaded_tool_names == tuple(
+            sorted(session.tool_context._resolved_tool_names)
+        )
+        assert (
+            PRODUCT_CAPABILITIES_TOOL_NAME
+            in session.tool_context.session_runtime_facts.loaded_tool_names
+        )
+
     def test_excluded_tools_filtered_out(self):
         """Phase-specific tools are filtered from tool names."""
         cfg = _make_config()
@@ -2332,9 +2466,14 @@ class TestResetupToolsForBackend:
     without rebuilding ``tool_context`` or resetting ``session_task_manager``.
     """
 
-    def test_swap_then_resetup_readmits_shell_and_git(self):
+    def test_swap_then_resetup_readmits_shell_and_git(self, monkeypatch):
+        from src.tools.product_capabilities import (
+            PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV,
+            PRODUCT_CAPABILITIES_TOOL_NAME,
+        )
         from src.tools.registry import get_tools_by_category
 
+        monkeypatch.setenv(PRODUCT_CAPABILITIES_TOOL_ENABLED_ENV, "true")
         shell = get_tools_by_category("shell")[0]
         git = get_tools_by_category("git")[0]
         web = get_tools_by_category("research")[0]
@@ -2388,6 +2527,7 @@ class TestResetupToolsForBackend:
             before = {t.name for t in session.tools}
             assert shell not in before and git not in before
             assert web in before
+            assert PRODUCT_CAPABILITIES_TOOL_NAME in before
             # S5: the lite tier exposes the agent-initiated upgrade request.
             assert "request_workspace_upgrade" in before
 
@@ -2405,6 +2545,7 @@ class TestResetupToolsForBackend:
 
         # Shell + git re-admitted against the sandbox backend; web retained.
         assert shell in after and git in after and web in after
+        assert PRODUCT_CAPABILITIES_TOOL_NAME in after
         # S5: once shell-capable, the upgrade request drops out (nothing to
         # upgrade to) — the re-derive re-evaluates exposure against the new tier.
         assert "request_workspace_upgrade" not in after
@@ -2415,6 +2556,13 @@ class TestResetupToolsForBackend:
         assert shell in rebind_names and git in rebind_names
         assert session.llm_with_tools is session._llm.bind_tools.return_value
         assert session.system_prompt == "post-upgrade prompt"
+        assert session.tool_context._resolved_tool_names == [
+            tool.name for tool in session.tools
+        ]
+        assert session.tool_context.session_runtime_facts.backend_id == "sandbox"
+        assert session.tool_context.session_runtime_facts.loaded_tool_names == tuple(
+            sorted(t.name for t in session.tools)
+        )
 
     def test_resetup_before_setup_is_noop(self):
         """Guard: called before _setup_tools (no tool_context) → safe no-op."""
@@ -2424,12 +2572,63 @@ class TestResetupToolsForBackend:
         assert session.tools is None
 
 
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        (
+            SimpleNamespace(supports_shell=False, supports_file_tools=False),
+            "none",
+        ),
+        (
+            SimpleNamespace(supports_shell=False, supports_file_tools=True),
+            "virtual",
+        ),
+        (
+            SimpleNamespace(
+                supports_shell=True,
+                supports_file_tools=True,
+                sudo_action="freeze",
+            ),
+            "sandbox",
+        ),
+        (
+            SimpleNamespace(
+                supports_shell=True,
+                supports_file_tools=True,
+                sudo_action="allow",
+            ),
+            "vm",
+        ),
+    ],
+)
+def test_runtime_backend_id_comes_from_active_backend_features(backend, expected):
+    assert PersistentSession._runtime_backend_id(backend) == expected
+
+
 # ---------------------------------------------------------------------------
 # 2.11 cleanup()
 # ---------------------------------------------------------------------------
 
 
 class TestCleanup:
+    @pytest.mark.asyncio
+    async def test_cleanup_withdraws_runtime_facts_and_loaded_tool_names(self):
+        session = _make_session()
+        context = SimpleNamespace(
+            citation_verdict_callback=MagicMock(),
+            canvas_event_callback=MagicMock(),
+            _resolved_tool_names=["email_read"],
+            session_runtime_facts=object(),
+        )
+        session.tool_context = context
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend = MagicMock(spec=[])
+
+        await session.cleanup()
+
+        assert context._resolved_tool_names == []
+        assert context.session_runtime_facts is None
+
     @pytest.mark.asyncio
     async def test_cleanup_shell_manager(self):
         """cleanup() calls shell_manager.cleanup()."""
