@@ -599,17 +599,15 @@ class GitManager:
         except Exception:
             return None
 
-    # Paths the agent writes ABOUT its own run rather than as deliverables.
-    # Each changes on EVERY round regardless of what was produced, so counting
-    # them makes the content hash differ between two byte-identical rounds —
-    # reintroducing exactly the inertness ``get_content_tree`` exists to
-    # remove. Every entry here was found empirically, by diffing `ls-tree`
-    # round-over-round against a real workspace; do not add to it by guess.
+    # Paths that are not part of what a round PRODUCED. Each changes on every
+    # round regardless of the agent's output, so counting them makes the
+    # content hash differ between two byte-identical rounds — reintroducing
+    # exactly the inertness ``get_content_tree`` exists to remove.
     #
-    # Entries ending in "/" match by PREFIX, everything else exactly — the
-    # same convention as ``SYNC_IGNORE_PATTERNS`` in
-    # src/services/cloud_sync/base.py, which independently classifies
-    # ``archive/`` as process bookkeeping that is never delivered to the user.
+    # Entries ending in "/" match by PREFIX, everything else exactly.
+    #
+    # That rule is NOT the same as "not delivered to the user", and the
+    # difference matters for the last entry:
     #
     # - output/job_{completion,frozen}.json carry a fresh ``timestamp``.
     # - archive/ holds ``todos_phase_{N}_{type}_{TIMESTAMP}.md``, written by
@@ -618,10 +616,31 @@ class GitManager:
     #   tracked path staged by round N+1's ``git add -A``. That alone made the
     #   guard inert for any job whose agent used todos, i.e. essentially all
     #   of them, and it is invisible to any test that mocks the TodoManager.
+    #   (It is also in ``SYNC_IGNORE_PATTERNS``, i.e. never delivered — but
+    #   that is a coincidence, not the reason. See below.)
+    # - feedback.md is written into the workspace ROOT by
+    #   ``restore_from_feedback`` (src/graph.py) on every feedback resume —
+    #   which is exactly what a RETURNED verification round triggers, via
+    #   ``_internal_resume_job``. It lands between round N's capture and round
+    #   N+1's, so it is a new tracked path in N+1 and the guard could never
+    #   fire on the first repeated return.
+    #
+    #   Note it IS delivered to the user (deliberately absent from
+    #   ``SYNC_IGNORE_PATTERNS``). It is excluded here because it is the
+    #   round's INPUT — the critic's feedback, handed TO the agent — not
+    #   anything the agent produced in response. Do not generalise this list
+    #   as "the undelivered files"; that reading would be wrong here and would
+    #   licence excluding real deliverables.
+    #
+    # Every entry was found empirically, by diffing `ls-tree` round-over-round
+    # against a real workspace driven through a full return cycle. Do not add
+    # to it by guess: each entry costs detection sensitivity, and a wrong one
+    # blinds the guard to real work.
     NON_DELIVERABLE_PATHS = (
         "output/job_completion.json",
         "output/job_frozen.json",
         "archive/",
+        "feedback.md",
     )
 
     def get_content_tree(self, exclude: Optional[Iterable[str]] = None) -> str | None:

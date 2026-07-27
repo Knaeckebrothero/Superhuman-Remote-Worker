@@ -671,19 +671,59 @@ class TestWorkspaceGetContentTree:
         assert first is not None
         assert ws.get_content_tree() == first
 
-    def test_a_deliverable_change_still_moves_it_alongside_archives(self, temp_base):
-        """Guard against over-exclusion: the prefix rule must not swallow real
-        content sitting outside ``archive/``."""
+    def test_ignores_the_resume_feedback_file(self, temp_base):
+        """``feedback.md`` is written into the workspace ROOT by
+        ``restore_from_feedback`` (src/graph.py) on every feedback resume —
+        which is exactly what a RETURNED verification round triggers. It lands
+        between one round's capture and the next, so counting it meant the
+        guard could never fire on the first repeated return.
+
+        Unlike ``archive/`` this file IS delivered to the user; it is excluded
+        because it is the round's INPUT, not its output.
+        """
+        ws = self._make_ws(temp_base)
+        ws.write_file("output/report.md", "deliverable")
+        ws.git_manager.commit("work")
+        first = ws.get_content_tree()
+
+        ws.write_file("feedback.md", "# Human Feedback\n\n## Feedback\n\nfix F1\n")
+        ws.git_manager.commit("resumed with feedback")
+        assert ws.get_content_tree() == first
+
+        # And again with DIFFERENT feedback, since a later round's findings
+        # can differ.
+        ws.write_file("feedback.md", "# Human Feedback\n\n## Feedback\n\nfix F2\n")
+        ws.git_manager.commit("resumed again")
+        assert ws.get_content_tree() == first
+
+    def test_a_deliverable_change_still_moves_it_alongside_bookkeeping(self, temp_base):
+        """Guard against over-exclusion: the exclusions must not swallow real
+        content sitting outside them, however much bookkeeping churns."""
         ws = self._make_ws(temp_base)
         ws.write_file("output/report.md", "v1")
         ws.write_file("archive/todos_phase_1_strategic_20260727_120000.md", "a")
+        ws.write_file("feedback.md", "round 1 feedback")
         ws.git_manager.commit("v1")
         first = ws.get_content_tree()
 
         ws.write_file("output/report.md", "v2")
         ws.write_file("archive/todos_phase_1_strategic_20260727_130000.md", "b")
+        ws.write_file("feedback.md", "round 2 feedback")
         ws.git_manager.commit("v2")
 
+        assert ws.get_content_tree() != first
+
+    def test_exclusion_is_exact_for_non_prefix_entries(self, temp_base):
+        """``feedback.md`` has no trailing slash, so it must match exactly —
+        a deliverable named ``feedback.md.bak`` or ``old_feedback.md`` is real
+        content."""
+        ws = self._make_ws(temp_base)
+        ws.write_file("output/report.md", "deliverable")
+        ws.git_manager.commit("base")
+        first = ws.get_content_tree()
+
+        ws.write_file("old_feedback.md", "a real file")
+        ws.git_manager.commit("sibling")
         assert ws.get_content_tree() != first
 
     def test_prefix_entries_do_not_match_a_similarly_named_sibling(self, temp_base):
