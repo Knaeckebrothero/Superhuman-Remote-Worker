@@ -43,6 +43,7 @@ import {
     MemoryListResponse,
     MemoryStats,
     Project,
+    ProjectBacklog,
     ProjectLoop,
     ProjectLoopStartRequest,
     ProjectCreateRequest,
@@ -2007,6 +2008,13 @@ export class ApiService {
     return this.http
       .get<Job[]>(`${this.baseUrl}/projects/${projectId}/loop/jobs`)
       .pipe(catchError(() => of([])));
+  }
+
+  /** The project's ticket pool (docs/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md). */
+  getProjectBacklog(projectId: string): Observable<ProjectBacklog | null> {
+    return this.http
+      .get<ProjectBacklog>(`${this.baseUrl}/projects/${projectId}/backlog`)
+      .pipe(catchError(() => of(null)));
   }
 
   getProjectMembers(id: string): Observable<ProjectMember[]> {

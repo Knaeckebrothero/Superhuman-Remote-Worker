@@ -1229,6 +1229,23 @@
       "deleteConfirm": "Sind Sie sicher, dass Sie dieses Projekt dauerhaft löschen möchten? Dies kann nicht rückgängig gemacht werden."
     }
   },
+  "projectBacklog": {
+    "title": "Backlog",
+    "refresh": "Aktualisieren",
+    "totalLabel": "Gesamt",
+    "inProgress": "In Bearbeitung",
+    "empty": "Noch keine offenen Tickets – die Scholars des Loops legen hier Ideen ab.",
+    "priority": {
+      "high": "Hoch",
+      "normal": "Normal",
+      "low": "Niedrig"
+    },
+    "type": {
+      "feature": "Feature",
+      "issue": "Problem",
+      "idea": "Idee"
+    }
+  },
   "chat": {
     "defaultTitle": "Persistenter Agent",
     "connection": {
