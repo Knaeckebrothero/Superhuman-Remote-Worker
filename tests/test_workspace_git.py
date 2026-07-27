@@ -650,6 +650,55 @@ class TestWorkspaceGetContentTree:
 
         assert ws.get_content_tree() == first
 
+    def test_ignores_the_todo_archive_directory_by_prefix(self, temp_base):
+        """``TodoManager.archive`` writes
+        ``archive/todos_phase_{N}_{type}_{TIMESTAMP}.md`` — a NEW filename
+        every round, from inside ``finalize_job`` itself. An exact-path
+        exclusion cannot cover a timestamped name, so ``archive/`` is matched
+        by prefix. Without this the hash moved every round for any job whose
+        agent used todos, i.e. essentially all of them.
+        """
+        ws = self._make_ws(temp_base)
+        ws.write_file("output/report.md", "deliverable")
+        ws.git_manager.commit("work")
+        first = ws.get_content_tree()
+
+        ws.write_file("archive/todos_phase_1_strategic_20260727_120000.md", "round 1")
+        ws.git_manager.commit("archive round 1")
+        ws.write_file("archive/todos_phase_1_strategic_20260727_130000.md", "round 2")
+        ws.git_manager.commit("archive round 2")
+
+        assert first is not None
+        assert ws.get_content_tree() == first
+
+    def test_a_deliverable_change_still_moves_it_alongside_archives(self, temp_base):
+        """Guard against over-exclusion: the prefix rule must not swallow real
+        content sitting outside ``archive/``."""
+        ws = self._make_ws(temp_base)
+        ws.write_file("output/report.md", "v1")
+        ws.write_file("archive/todos_phase_1_strategic_20260727_120000.md", "a")
+        ws.git_manager.commit("v1")
+        first = ws.get_content_tree()
+
+        ws.write_file("output/report.md", "v2")
+        ws.write_file("archive/todos_phase_1_strategic_20260727_130000.md", "b")
+        ws.git_manager.commit("v2")
+
+        assert ws.get_content_tree() != first
+
+    def test_prefix_entries_do_not_match_a_similarly_named_sibling(self, temp_base):
+        """``archive/`` must not also exclude ``archived_results.md`` — prefix
+        matching on a trailing-slash entry, not a bare string prefix."""
+        ws = self._make_ws(temp_base)
+        ws.write_file("output/report.md", "deliverable")
+        ws.git_manager.commit("base")
+        first = ws.get_content_tree()
+
+        ws.write_file("archived_results.md", "this IS a deliverable")
+        ws.git_manager.commit("add sibling")
+
+        assert ws.get_content_tree() != first
+
     def test_same_content_in_a_fresh_repo_hashes_the_same(self, temp_base):
         """Content-addressed, so a re-clone after a failed push — which
         reverts HEAD to an entirely different commit — does not read as 'no
