@@ -130,6 +130,15 @@ def render_backlog_block(
         IN PROGRESS: [high] issue-deploy-docs — Deployment docs missing
           [high]   feature  feature-rag-boundary — Permission-aware RAG boundary
           … 18 more
+
+    ``in_progress`` with no ``priority`` key (or an explicit ``None``) renders
+    with the ``[...]`` tag OMITTED entirely (``IN PROGRESS: note-id — Title``)
+    rather than defaulting to a guessed rank (fix round 1, Finding 2): the
+    caller — the loop's own campaign, not a KB row — has no real priority to
+    report for its in-progress initiative, and this block exists to be the
+    one place an agent can trust about the backlog. Asserting a value nobody
+    read would undermine exactly that. Contrast a *pool row*, which always
+    carries a real ``priority`` from the query and always gets the tag.
     """
     total = sum(counts.values())
     breakdown = ", ".join(
@@ -146,8 +155,11 @@ def render_backlog_block(
     lines = [header]
 
     if in_progress:
+        priority = in_progress.get("priority")
+        # is-not-None, not truthiness: rank 0 (high) must still get its tag.
+        tag = f"[{_priority_word(priority)}] " if priority is not None else ""
         lines.append(
-            f"IN PROGRESS: [{_priority_word(in_progress.get('priority'))}] "
+            f"IN PROGRESS: {tag}"
             f"{in_progress.get('note_id')} — {in_progress.get('title') or ''}".rstrip()
             .rstrip("—")
             .rstrip()
