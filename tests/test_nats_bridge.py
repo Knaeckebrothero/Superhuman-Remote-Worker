@@ -87,6 +87,12 @@ def mock_db():
     db.merge_thread_vm_context_if_current = AsyncMock(return_value=True)
     db.merge_ide_session_context = AsyncMock()
     db.bind_thread_workspace_backing = AsyncMock()
+    # VM callbacks resolve thread-vs-job by DB lookup (never process-local
+    # state), so these must be explicit: a bare AsyncMock returns a truthy mock
+    # and would silently make every entity look like a thread. Default is job;
+    # thread tests set get_thread.return_value themselves.
+    db.get_thread = AsyncMock(return_value=None)
+    db.get_job = AsyncMock(return_value={"id": "job", "user_id": "u1"})
     return db
 
 
@@ -892,7 +898,7 @@ class TestOnDaemonRegister:
     ):
         """Guest NATS self-report is not provisioner-attested; fail closed."""
         thread_id = "thread-reg-canvas-closed"
-        bridge_with_db._thread_vm_ids.add(thread_id)
+        mock_db.get_thread = AsyncMock(return_value={"id": thread_id, "user_id": "u1"})
         bridge_with_db._seed_vm_ide_config = AsyncMock()
         await bridge_with_db._on_daemon_register(
             make_msg(
@@ -1251,6 +1257,123 @@ class TestOnDaemonRegister:
 
         mock_db.merge_vm_context.assert_not_awaited()
         callback.assert_not_called()
+
+
+# =============================================================================
+# Test: thread-vs-job routing is durable, not process-local (Defect 4)
+# docs/issues/session_vm_backend_never_attaches.md
+# =============================================================================
+
+
+class TestVmEntityRoutingIsDurable:
+    """Under HA (2 replicas), the replica that PUBLISHED vm.lifecycle.create is
+    not necessarily the leader that handles the daemon's register. Routing must
+    therefore come from the database, never from state left in the publishing
+    process — otherwise the leader treats a thread UUID as a job and writes
+    ssh_host into a jobs row that does not exist, stranding the thread at
+    status='created' forever.
+
+    Every test here uses a bridge that never published anything, which is
+    exactly the non-publishing replica's situation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_register_routes_to_thread_on_non_publishing_replica(
+        self, bridge_with_db, mock_db, leader
+    ):
+        tid = "77b3d3e6-6dfc-422e-a8ec-a5848cb8febc"
+        mock_db.get_thread = AsyncMock(return_value={"id": tid, "user_id": "u1"})
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+
+        await bridge_with_db._on_daemon_register(
+            make_msg(
+                {
+                    "job_id": tid,
+                    "hostname": "vm-thread",
+                    "ip": "100.64.1.55",
+                    "pid": 44,
+                    "ssh_ready": True,
+                }
+            )
+        )
+
+        mock_db.merge_thread_vm_context.assert_awaited()
+        mock_db.merge_vm_context.assert_not_awaited()
+        assert mock_db.merge_thread_vm_context.call_args.args[1]["status"] == "ready"
+
+    @pytest.mark.asyncio
+    async def test_register_routes_to_job_when_id_is_not_a_thread(
+        self, bridge_with_db, mock_db, leader
+    ):
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+
+        await bridge_with_db._on_daemon_register(
+            make_msg(
+                {
+                    "job_id": "job-durable-001",
+                    "hostname": "vm-job",
+                    "ip": "100.64.1.7",
+                    "pid": 7,
+                    "ssh_ready": True,
+                }
+            )
+        )
+
+        mock_db.merge_vm_context.assert_awaited()
+        mock_db.merge_thread_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_register_writes_nothing_for_unknown_entity(
+        self, bridge_with_db, mock_db, leader
+    ):
+        """Neither a thread nor a job: writing to either table would be a guess.
+        Fail safe — the wrong-table write is the bug being fixed."""
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value=None)
+        bridge_with_db._seed_vm_ide_config = AsyncMock()
+
+        await bridge_with_db._on_daemon_register(
+            make_msg(
+                {
+                    "job_id": "ghost-entity",
+                    "hostname": "vm-ghost",
+                    "ip": "100.64.1.9",
+                    "pid": 9,
+                    "ssh_ready": True,
+                }
+            )
+        )
+
+        mock_db.merge_thread_vm_context.assert_not_awaited()
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_status_routes_to_thread_on_non_publishing_replica(
+        self, bridge_with_db, mock_db
+    ):
+        tid = "77b3d3e6-6dfc-422e-a8ec-a5848cb8febc"
+        mock_db.get_thread = AsyncMock(return_value={"id": tid, "user_id": "u1"})
+
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg({"job_id": tid, "status": "created", "vm_name": "agent-vm-x"})
+        )
+
+        mock_db.merge_thread_vm_context.assert_awaited()
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_routes_to_thread_on_non_publishing_replica(
+        self, bridge_with_db, mock_db
+    ):
+        tid = "77b3d3e6-6dfc-422e-a8ec-a5848cb8febc"
+        mock_db.get_thread = AsyncMock(return_value={"id": tid, "user_id": "u1"})
+
+        await bridge_with_db._on_daemon_heartbeat(
+            make_msg({"job_id": tid, "agent_running": True})
+        )
+
+        mock_db.merge_thread_vm_context.assert_awaited()
+        mock_db.merge_vm_context.assert_not_awaited()
 
 
 # =============================================================================
