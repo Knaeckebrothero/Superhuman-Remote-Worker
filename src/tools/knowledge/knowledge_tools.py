@@ -24,8 +24,10 @@ from langchain_core.tools import tool
 
 from ...services.knowledge_graph import (
     CONFIDENCE_LEVELS,
+    DEFAULT_PRIORITY_RANK,
     NOTE_STATUSES,
     NOTE_TYPES,
+    PRIORITY_RANKS,
     PRIORITY_WORDS,
     slugify,
 )
@@ -76,6 +78,13 @@ NoteTypeValue = Literal[
 NoteStatusValue = Literal["active", "resolved", "superseded", "archived"]
 NoteConfidenceValue = Literal["high", "medium", "low"]
 PriorityValue = Literal["high", "normal", "low"]
+
+# Note types eligible for a backlog priority (Task 3, project-backlog-pipeline).
+# Priority is scoped to tickets: this gates whether kb_write/kb_update surface
+# it in the OKF frontmatter and kb_list — never whether it reaches the
+# pgvector row, which always carries the rank the caller asked for (or
+# DEFAULT_PRIORITY_RANK), so a note's priority survives a later re-index.
+_TICKET_TYPES = ("feature", "issue", "idea")
 
 # Shown by the genuinely graph-shaped tools when Neo4j is absent (slice-3 PR4c).
 # CONTRADICTS / DERIVED_FROM / ANSWERS edges and the Neo4j export have no
@@ -700,6 +709,7 @@ def create_kb_tools(
         confidence: Optional[str],
         add_tags: Optional[List[str]],
         add_links: Optional[List[dict]],
+        priority: Optional[int] = None,
     ) -> str:
         """Neo4j-less update: read the row from the store, apply the mutation in
         Python (the graph does this in Cypher), write back to store + OKF file.
@@ -734,6 +744,15 @@ def create_kb_tools(
             new_confidence = (
                 confidence if confidence is not None else existing.get("confidence")
             )
+            # None means "leave unchanged" — never fall back to
+            # DEFAULT_PRIORITY_RANK here, or every status/tag/content-only
+            # edit would silently reset an existing ticket's priority to
+            # normal (Global constraint).
+            new_priority = (
+                priority
+                if priority is not None
+                else existing.get("priority", DEFAULT_PRIORITY_RANK)
+            )
             new_type = existing.get("type") or "learning"
             new_title = existing.get("title") or note
 
@@ -748,22 +767,21 @@ def create_kb_tools(
 
             # OKF file is canonical — write it first (mirrors kb_write ordering),
             # so the edit survives even if the disposable pgvector write fails.
-            _dual_write_note(
-                context,
-                note,
-                {
-                    "id": note,
-                    "type": new_type,
-                    "title": new_title,
-                    "description": existing.get("description"),
-                    "content": new_content,
-                    "tags": merged_tags,
-                    "keywords": existing.get("keywords", []),
-                    "confidence": new_confidence,
-                    "status": new_status,
-                    "relationships": add_links or [],
-                },
-            )
+            updated_note = {
+                "id": note,
+                "type": new_type,
+                "title": new_title,
+                "description": existing.get("description"),
+                "content": new_content,
+                "tags": merged_tags,
+                "keywords": existing.get("keywords", []),
+                "confidence": new_confidence,
+                "status": new_status,
+                "relationships": add_links or [],
+            }
+            if new_type in _TICKET_TYPES:
+                updated_note["priority"] = new_priority
+            _dual_write_note(context, note, updated_note)
             try:
                 _run_async(
                     ks.upsert_note(
@@ -779,6 +797,7 @@ def create_kb_tools(
                         job_id=job_id_arg,
                         phase=existing.get("phase"),
                         modified_at=datetime.now(timezone.utc),
+                        priority=new_priority,
                     )
                 )
             except Exception as e:
@@ -808,17 +827,28 @@ def create_kb_tools(
         append: Optional[str] = None,
         status: Optional[str] = None,
         confidence: Optional[str] = None,
+        priority: Optional[int] = None,
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[dict]] = None,
     ) -> str:
         """Update an existing note: Neo4j + OKF dual-write + pgvector write-through.
 
         Shared by the ``kb_update`` tool and the verdict gate's UPDATE/SUPERSEDE
-        routing, so both apply an edit the same way.
+        routing, so both apply an edit the same way. ``priority`` is
+        ``None`` for both internal callers (dedup redirect, supersede retire)
+        — correctly preserving the target's existing rank rather than
+        resetting it, since neither is a caller-directed priority change.
         """
         if kg is None:
             return _update_existing_kgless(
-                note, content, append, status, confidence, add_tags, add_links
+                note,
+                content,
+                append,
+                status,
+                confidence,
+                add_tags,
+                add_links,
+                priority=priority,
             )
 
         project_id = _get_project_id(context)
@@ -844,32 +874,52 @@ def create_kb_tools(
             try:
                 full_note = kg.read_note(project_id, note)
                 if full_note:
+                    new_type = full_note.get("type", "learning")
+                    # Neo4j has no priority property (out of scope — Tasks
+                    # 1-2 only added it to the pgvector row). An explicit
+                    # value wins; otherwise best-effort preserve whatever the
+                    # index row already has, so this write-through never
+                    # resets a ticket's priority to normal just because it
+                    # went through the graph-enabled path.
+                    if priority is not None:
+                        new_priority = priority
+                    else:
+                        new_priority = DEFAULT_PRIORITY_RANK
+                        try:
+                            prior_row = _run_async(
+                                ks.get_note_by_slug(uuid.UUID(project_id), note)
+                            )
+                            if prior_row:
+                                new_priority = prior_row.get(
+                                    "priority", DEFAULT_PRIORITY_RANK
+                                )
+                        except Exception as e:
+                            logger.debug(f"priority lookup skipped for {note}: {e}")
                     # Files-canonical dual-write (slice 1) — before the
                     # disposable-index upsert, so the canonical file lands even
                     # if the pgvector write fails.
-                    _dual_write_note(
-                        context,
-                        note,
-                        {
-                            "id": note,
-                            "type": full_note.get("type", "learning"),
-                            "title": full_note.get("title", note),
-                            "description": full_note.get("description"),
-                            "content": full_note.get("content", ""),
-                            "tags": full_note.get("tags", []),
-                            "keywords": full_note.get("keywords", []),
-                            "confidence": full_note.get("confidence"),
-                            "status": full_note.get("status", "active"),
-                            "superseded_by": full_note.get("superseded_by"),
-                            "relationships": full_note.get("relationships", []),
-                        },
-                    )
+                    full_note_dict = {
+                        "id": note,
+                        "type": new_type,
+                        "title": full_note.get("title", note),
+                        "description": full_note.get("description"),
+                        "content": full_note.get("content", ""),
+                        "tags": full_note.get("tags", []),
+                        "keywords": full_note.get("keywords", []),
+                        "confidence": full_note.get("confidence"),
+                        "status": full_note.get("status", "active"),
+                        "superseded_by": full_note.get("superseded_by"),
+                        "relationships": full_note.get("relationships", []),
+                    }
+                    if new_type in _TICKET_TYPES:
+                        full_note_dict["priority"] = new_priority
+                    _dual_write_note(context, note, full_note_dict)
                     _run_async(
                         ks.upsert_note(
                             note_id=note,
                             project_id=uuid.UUID(project_id),
                             title=full_note.get("title", ""),
-                            note_type=full_note.get("type", "learning"),
+                            note_type=new_type,
                             content=full_note.get("content", ""),
                             status=full_note.get("status", "active"),
                             confidence=full_note.get("confidence"),
@@ -881,6 +931,7 @@ def create_kb_tools(
                             phase=full_note.get("phase"),
                             retrieval_messages=full_note.get("retrieval_messages", []),
                             modified_at=datetime.now(timezone.utc),
+                            priority=new_priority,
                         )
                     )
             except Exception as e:
@@ -917,6 +968,7 @@ def create_kb_tools(
         tags: Optional[List[str]] = None,
         keywords: Optional[List[str]] = None,
         confidence: Optional[NoteConfidenceValue] = None,
+        priority: PriorityValue = "normal",
         links: Optional[List[dict]] = None,
         retrieval_messages: Optional[List[str]] = None,
     ) -> str:
@@ -939,6 +991,10 @@ def create_kb_tools(
             tags: List of tag names (e.g. ["authentication", "security"])
             keywords: List of keyword strings for search
             confidence: Confidence level — high, medium, or low
+            priority: Backlog rank for feature/issue/idea tickets: "high",
+                "normal" (default) or "low". A LABEL only — it orders the
+                backlog list the loop is shown and nothing refuses or
+                reprioritizes work because of it.
             links: Relationships to other notes — list of {"target": "note-slug", "type": "RELATIONSHIP_TYPE"}.
                    Types: REFERENCES, DERIVED_FROM, SUPPORTS, CONTRADICTS, ANSWERS, DEPENDS_ON, SUPERSEDES, IMPLEMENTS
             retrieval_messages: Synthetic queries describing when this note should be retrieved
@@ -1054,8 +1110,11 @@ def create_kb_tools(
                 )
 
             # Write to pgvector — the primary write when Neo4j-less, a
-            # write-through otherwise.
+            # write-through otherwise. Always persisted (harmless for
+            # non-ticket types — nothing reads/filters on it); only the OKF
+            # frontmatter below is gated to tickets.
             now = datetime.now(timezone.utc)
+            rank = PRIORITY_RANKS[priority]
             try:
                 _run_async(
                     ks.upsert_note(
@@ -1072,6 +1131,7 @@ def create_kb_tools(
                         retrieval_messages=retrieval_messages,
                         created_at=now,
                         modified_at=now,
+                        priority=rank,
                     )
                 )
             except Exception as e:
@@ -1080,22 +1140,24 @@ def create_kb_tools(
                 # the reindexer can rebuild pgvector from either.
 
             # Files-canonical dual-write (slice 1): materialize knowledge/<slug>.md.
-            _dual_write_note(
-                context,
-                slug,
-                {
-                    "id": slug,
-                    "type": type,
-                    "title": title,
-                    "description": description,
-                    "content": content,
-                    "tags": tags,
-                    "keywords": keywords,
-                    "confidence": confidence,
-                    "status": "active",
-                    "relationships": links or [],
-                },
-            )
+            new_note = {
+                "id": slug,
+                "type": type,
+                "title": title,
+                "description": description,
+                "content": content,
+                "tags": tags,
+                "keywords": keywords,
+                "confidence": confidence,
+                "status": "active",
+                "relationships": links or [],
+            }
+            if type in _TICKET_TYPES:
+                # Only tickets show a priority line — _render_note_md omits it
+                # entirely when the key is absent, keeping non-ticket notes'
+                # frontmatter byte-identical (Global constraint).
+                new_note["priority"] = rank
+            _dual_write_note(context, slug, new_note)
 
             # Verdict SUPERSEDE: retire the stale note(s) the candidate replaces,
             # pointing them at the new note (status=superseded + SUPERSEDED_BY).
@@ -1136,6 +1198,7 @@ def create_kb_tools(
         append: Optional[str] = None,
         status: Optional[NoteStatusValue] = None,
         confidence: Optional[NoteConfidenceValue] = None,
+        priority: Optional[PriorityValue] = None,
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[dict]] = None,
     ) -> str:
@@ -1149,6 +1212,7 @@ def create_kb_tools(
             append: Append text to existing content (mutually exclusive with content)
             status: New status — active, resolved, superseded, or archived
             confidence: New confidence level — high, medium, or low
+            priority: Change the backlog rank; omit to leave it unchanged.
             add_tags: Additional tags to add
             add_links: Additional relationships — list of {"target": "slug", "type": "RELATIONSHIP_TYPE"}
 
@@ -1175,6 +1239,10 @@ def create_kb_tools(
             append=append,
             status=status,
             confidence=confidence,
+            # None means "leave unchanged" — converted to a rank only when the
+            # caller actually asked for a change (Global constraint: never
+            # silently reset an existing ticket's priority to normal).
+            priority=PRIORITY_RANKS[priority] if priority is not None else None,
             add_tags=add_tags,
             add_links=add_links,
         )
@@ -1337,13 +1405,22 @@ def create_kb_tools(
             for binding, n in notes:
                 status_icon = "●" if n.get("status") == "active" else "○"
                 confidence = f" [{n['confidence']}]" if n.get("confidence") else ""
+                # Priority is a backlog-ticket concept only (feature/issue/
+                # idea) — every other note type's line is byte-identical to
+                # before this existed (Global constraint).
+                priority_tag = ""
+                if n.get("type") in _TICKET_TYPES:
+                    word = PRIORITY_WORDS.get(
+                        n.get("priority", DEFAULT_PRIORITY_RANK), "normal"
+                    )
+                    priority_tag = f" [priority: {word}]"
                 note_id = n.get("id", "?")
                 handle = _qualified(binding, note_id)
                 source = f"[{binding.alias}] " if _has_bound_scopes else ""
                 lines.append(
                     f"{status_icon} {source}**{handle}** — "
                     f"{n.get('title', '(untitled)')} "
-                    f"({n.get('type', '?')}{confidence})"
+                    f"({n.get('type', '?')}{confidence}{priority_tag})"
                 )
 
             snapshot_marker = _external_snapshot_marker(bindings)
