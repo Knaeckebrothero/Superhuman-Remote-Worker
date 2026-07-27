@@ -20,12 +20,17 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.core.phase import should_freeze_at_boundary, freeze_for_review  # noqa: E402
+from src.core.phase import (  # noqa: E402
+    should_freeze_at_boundary,
+    freeze_for_review,
+    finalize_job,
+)
 from src.core.loader import (  # noqa: E402
     AgentConfig,
     VALID_AUTONOMY_LEVELS,
     load_agent_config_from_dict,
 )
+from src.tools.core.job import _final_phase_data  # noqa: E402
 
 
 # =============================================================================
@@ -417,6 +422,81 @@ class TestSerializationRoundTrip:
 
         restored = load_config_from_resolved(resolved)
         assert restored.autonomy == "partial"
+
+
+# =============================================================================
+# finalize_job() head_commit tests (Task 6 amendment item 1)
+# =============================================================================
+
+
+class TestFinalizeJobHeadCommit:
+    """``head_commit`` must reach the completion freeze.
+
+    Nothing else writes ``head_commit`` into a job's ``freeze_data``.
+    Without this, ``_verification_gate_decision``'s no-progress
+    short-circuit (``orchestrator/main.py``) can never fire in production —
+    the exact defect the amendment identified: unit tests for the decision
+    function pass ``head_commit`` in explicitly and stay green while the
+    real wiring is dead. See docs/superpowers/specs/
+    2026-07-27-verification-fail-closed-design.md.
+    """
+
+    def setup_method(self):
+        _final_phase_data.clear()
+
+    @staticmethod
+    def _seed_final_data(job_id: str = "test-job") -> None:
+        _final_phase_data[job_id] = {
+            "summary": "done",
+            "deliverables": ["output/report.md"],
+            "confidence": 0.9,
+            "job_id": job_id,
+        }
+
+    def test_partial_autonomy_freeze_carries_head_commit(self):
+        """The 'freeze for human review' path (non-full autonomy)."""
+        state = make_state()
+        ws = MagicMock()
+        ws.git_manager = None
+        ws.get_head_commit = MagicMock(return_value="abc1234")
+        tm = MagicMock()
+        self._seed_final_data()
+
+        result = finalize_job(state, ws, tm, config=make_config("partial"))
+
+        assert result.freeze_data["head_commit"] == "abc1234"
+
+    def test_full_autonomy_completion_carries_head_commit(self):
+        """The auto-complete path (autonomy=full) — a DIFFERENT dict literal
+        in finalize_job than the partial-autonomy freeze above. Verification
+        can still gate a full-autonomy target (autonomy only decides what
+        happens AFTER a critic approves), so this freeze needs head_commit
+        too — not just the pending_review one."""
+        state = make_state()
+        ws = MagicMock()
+        ws.git_manager = None
+        ws.get_head_commit = MagicMock(return_value="def5678")
+        tm = MagicMock()
+        self._seed_final_data()
+
+        result = finalize_job(state, ws, tm, config=make_config("full"))
+
+        assert result.freeze_data["head_commit"] == "def5678"
+
+    def test_head_commit_failure_is_swallowed_and_completion_still_succeeds(self):
+        """Best-effort: a git failure at freeze time must never break job
+        completion — it must only cost the no-progress detection a round."""
+        state = make_state()
+        ws = MagicMock()
+        ws.git_manager = None
+        ws.get_head_commit = MagicMock(side_effect=RuntimeError("no repo"))
+        tm = MagicMock()
+        self._seed_final_data()
+
+        result = finalize_job(state, ws, tm, config=make_config("partial"))
+
+        assert result.success is True
+        assert result.freeze_data["head_commit"] is None
 
 
 # =============================================================================
