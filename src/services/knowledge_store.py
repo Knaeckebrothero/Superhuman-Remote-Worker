@@ -268,7 +268,7 @@ class KnowledgeStore:
         retrieval_messages: Optional[List[str]] = None,
         created_at: Optional[datetime] = None,
         modified_at: Optional[datetime] = None,
-        priority: int = 1,
+        priority: Optional[int] = 1,
     ) -> uuid.UUID:
         """Upsert a note into the search index (write-through from Neo4j).
 
@@ -291,6 +291,14 @@ class KnowledgeStore:
             modified_at: Last modification timestamp
             priority: Backlog rank — 0=high, 1=normal (default), 2=low. A
                 non-binding label; see PRIORITY_RANKS in knowledge_graph.py.
+                ``None`` means "unknown, leave it as-is" (project-backlog-
+                pipeline task 3 fix round 1): callers that could not
+                determine a note's current priority (e.g. a failed lookback
+                in the Neo4j-enabled kb_update path) pass ``None`` rather
+                than guessing — both SQL branches below ``COALESCE`` it
+                against the row's own existing value, and only fall back to
+                1 for a genuinely new row, which has no prior value to
+                clobber in the first place.
 
         Returns:
             UUID of the upserted row
@@ -311,14 +319,19 @@ class KnowledgeStore:
         )
 
         if existing_hash == new_hash:
-            # Content unchanged — update metadata only, skip embedding
+            # Content unchanged — update metadata only, skip embedding.
+            # priority = COALESCE($13, priority): this branch only ever runs
+            # against a row that was just confirmed to exist (the
+            # existing_hash lookup above), so a NULL $13 ("unknown, leave
+            # unchanged") correctly falls back to the row's own current
+            # value instead of overwriting it.
             row_id = await self.db.fetchval(
                 """
                 UPDATE knowledge_index
                 SET title = $3, note_type = $4, status = $5, confidence = $6,
                     tags = $7, keywords = $8, job_id = $9, phase = $10,
                     retrieval_messages = $11, modified_at = $12,
-                    indexed_at = NOW(), priority = $13
+                    indexed_at = NOW(), priority = COALESCE($13, priority)
                 WHERE project_id = $1 AND note_id = $2
                 RETURNING id
                 """,
@@ -366,6 +379,15 @@ class KnowledgeStore:
         # path above which never touches it. See kb_convergence design doc.
         ttl_value = self._ttl_for_note_type(note_type)
 
+        # priority is bound as $19 and referenced twice below, each with a
+        # different COALESCE fallback: the VALUES list needs *some* concrete,
+        # NOT-NULL value for a genuinely new row (nothing to preserve, so 1 —
+        # DEFAULT_PRIORITY_RANK — is an honest default, not a guess), while
+        # the ON CONFLICT branch is a real existing row and must fall back to
+        # ITS current value, not 1, when $19 is NULL ("unknown, leave
+        # unchanged"). Referencing EXCLUDED.priority there instead would be
+        # wrong: it would already be the coalesced-to-1 VALUES-list result,
+        # never NULL, so the "leave unchanged" case could never trigger.
         row_id = await self.db.fetchval(
             """
             INSERT INTO knowledge_index (
@@ -377,7 +399,7 @@ class KnowledgeStore:
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11, $12,
                 $13, to_tsvector('english', $14), $15, $16, NOW(),
-                $17, $18, $19
+                $17, $18, COALESCE($19, 1)
             )
             ON CONFLICT (project_id, note_id) DO UPDATE SET
                 title = EXCLUDED.title,
@@ -395,7 +417,7 @@ class KnowledgeStore:
                 modified_at = EXCLUDED.modified_at,
                 indexed_at = NOW(),
                 content_hash = EXCLUDED.content_hash,
-                priority = EXCLUDED.priority
+                priority = COALESCE($19, knowledge_index.priority)
             RETURNING id
             """,
             note_id,

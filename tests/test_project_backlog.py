@@ -303,6 +303,79 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
         kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
         assert kwargs["priority"] == 0
 
+    def test_lookback_failure_leaves_priority_and_frontmatter_untouched(self):
+        """Fix round 1, Finding 1 repro: kg-enabled, get_note_by_slug raises,
+        existing ticket is priority=high, kb_update omits priority.
+
+        Before the fix this seeded DEFAULT_PRIORITY_RANK (normal) ahead of
+        the lookback and the except swallowed the raise, so ks.upsert_note
+        was called with priority=1 and the rewritten OKF file claimed
+        "priority: normal" -- silently clobbering "high". A failed lookback
+        must instead leave priority as None (the "unknown, don't touch"
+        sentinel COALESCE'd against the real row in knowledge_store.py), so
+        neither the DB row nor the frontmatter ever assert a guessed value.
+        """
+        ws, writes = _capture_workspace()
+        ctx = _kb_context_with_kg()
+        ctx.workspace_manager = ws
+        ctx.has_git.return_value = True
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_graph.read_note.return_value = {
+            "type": "feature",
+            "title": "Add dark mode",
+            "content": "body",
+            "status": "active",
+        }
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            side_effect=Exception("pgvector hiccup")
+        )
+        tools = _make_tools(ctx)
+        result = tools["kb_update"].invoke(
+            {"note": "add-dark-mode", "status": "resolved"}
+        )
+
+        # (c) a pgvector hiccup must not block the rest of the update.
+        assert "status → resolved" in result
+
+        # (a) nothing writes a priority that was neither supplied by the
+        # caller nor read from storage -- None reaches the persistence call,
+        # which is the sentinel knowledge_store.py's upsert_note COALESCEs
+        # against the row's real (unknown-to-us) current value instead of
+        # overwriting it. See TestUpsertNotePriorityCoalesceSentinel in
+        # test_knowledge_store.py for proof the SQL side honors it.
+        kwargs = ctx.knowledge_store.upsert_note.call_args.kwargs
+        assert kwargs["priority"] is None
+
+        # The frontmatter must not assert a value we don't actually know --
+        # _render_note_md omits the line entirely when the key is absent.
+        md = writes["knowledge/add-dark-mode.md"]
+        assert "priority:" not in md
+
+    def test_lookback_failure_is_logged_not_swallowed(self, caplog):
+        """Finding 1(b): the failure must be visible, not silently eaten."""
+        import logging
+
+        ctx = _kb_context_with_kg()
+        ctx.knowledge_graph.update_note.return_value = True
+        ctx.knowledge_graph.read_note.return_value = {
+            "type": "feature",
+            "title": "Add dark mode",
+            "content": "body",
+            "status": "active",
+        }
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            side_effect=Exception("pgvector hiccup")
+        )
+        tools = _make_tools(ctx)
+        with caplog.at_level(
+            logging.WARNING, logger="src.tools.knowledge.knowledge_tools"
+        ):
+            tools["kb_update"].invoke({"note": "add-dark-mode", "status": "resolved"})
+        assert any(
+            "priority" in record.message and "pgvector hiccup" in record.message
+            for record in caplog.records
+        )
+
 
 class TestKbListPriorityDisplay:
     """Step 5 (corrected): priority is visible for backlog tickets, and the

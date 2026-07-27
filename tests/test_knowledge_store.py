@@ -354,6 +354,95 @@ class TestUpsertContentChanged:
 
 
 # =============================================================================
+# upsert_note priority sentinel (project-backlog-pipeline task 3, fix round 1,
+# Finding 1): priority=None means "unknown, leave it as-is" -- both branches
+# must COALESCE against the row's existing value, not silently default to 1
+# and clobber a real priority. Mutation-tested: reverting either COALESCE to
+# a bare `priority`/`EXCLUDED.priority` reference fails these.
+# =============================================================================
+
+
+class TestUpsertNotePriorityCoalesceSentinel:
+    @pytest.mark.asyncio
+    async def test_metadata_only_branch_coalesces_none_against_existing_row(self):
+        store, mock_db, _ = _make_store()
+        existing_hash = KnowledgeStore._content_hash("body")
+        mock_db.fetchval.side_effect = [existing_hash, uuid.uuid4()]
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="feature",
+            content="body",
+            priority=None,
+        )
+        update_call = mock_db.fetchval.call_args_list[1]
+        query = update_call[0][0]
+        assert "priority = COALESCE($13, priority)" in query
+        # This layer must never turn None into a concrete int itself -- that
+        # decision belongs entirely to the SQL COALESCE against the live row.
+        assert update_call[0][-1] is None
+
+    @pytest.mark.asyncio
+    async def test_insert_branch_coalesces_none_to_default_for_a_fresh_row(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.side_effect = [None, uuid.uuid4()]  # no existing -> INSERT
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="feature",
+            content="body",
+            priority=None,
+        )
+        insert_call = mock_db.fetchval.call_args_list[1]
+        assert "COALESCE($19, 1)" in insert_call[0][0]
+        # $19 is still bound as None -- the VALUES-list COALESCE (not Python)
+        # is what turns it into 1 for the genuinely-new row.
+        assert insert_call[0][-1] is None
+
+    @pytest.mark.asyncio
+    async def test_insert_branch_on_conflict_preserves_existing_not_excluded(self):
+        """The ON CONFLICT branch must reference the raw bound parameter
+        ($19), never EXCLUDED.priority -- EXCLUDED.priority is already the
+        VALUES-list COALESCE(_, 1) result and would never be NULL, so
+        referencing it here would silently reintroduce the clobber bug on
+        every conflicting upsert with priority=None."""
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.side_effect = [None, uuid.uuid4()]
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="feature",
+            content="body",
+            priority=None,
+        )
+        query = mock_db.fetchval.call_args_list[1][0][0]
+        conflict_clause = query.split("ON CONFLICT")[1]
+        assert "priority = COALESCE($19, knowledge_index.priority)" in conflict_clause
+        assert "EXCLUDED.priority" not in conflict_clause
+
+    @pytest.mark.asyncio
+    async def test_explicit_priority_still_wins_on_metadata_only_branch(self):
+        """Regression guard: the sentinel must not interfere with a real,
+        caller-supplied value (Task 3's original contract, fix round 0)."""
+        store, mock_db, _ = _make_store()
+        existing_hash = KnowledgeStore._content_hash("body")
+        mock_db.fetchval.side_effect = [existing_hash, uuid.uuid4()]
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="feature",
+            content="body",
+            priority=0,
+        )
+        update_call = mock_db.fetchval.call_args_list[1]
+        assert update_call[0][-1] == 0
+
+
+# =============================================================================
 # 11.6: delete_note()
 # =============================================================================
 
