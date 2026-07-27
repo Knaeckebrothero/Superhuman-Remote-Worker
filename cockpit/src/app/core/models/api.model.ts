@@ -1049,6 +1049,43 @@ export interface ProjectLoopStartRequest {
   scheduling?: 'standard' | 'campaign';
 }
 
+// =============================================================================
+// Project Backlog (loop ticket pool) —
+// docs/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md
+// =============================================================================
+
+/**
+ * Priority label for a backlog ticket. Always a word on the wire — the 0/1/2
+ * storage rank (`orchestrator/services/project_backlog.py::PRIORITY_WORDS`) is
+ * a server-side implementation detail the cockpit never sees. A label only:
+ * it sorts what's shown, nothing gates or reorders work because of it.
+ */
+export type BacklogPriority = 'high' | 'normal' | 'low';
+
+/** One ticket in the project's backlog pool (GET /projects/{id}/backlog). */
+export interface BacklogItem {
+  note_id: string;
+  note_type: 'feature' | 'issue' | 'idea';
+  title: string;
+  priority: BacklogPriority;
+}
+
+/**
+ * The project's ticket pool, as shown to the user. `items` is capped
+ * server-side (200, priority-then-age order) but `counts`/`total` are NOT —
+ * for a large pool they can exceed `items.length`, which is why the cockpit
+ * must render the counts and not just the list (a capped list otherwise
+ * hides its own tail). `in_progress` is the active loop's current campaign
+ * initiative — excluded from `items` so it's never shown twice; null when no
+ * campaign is running.
+ */
+export interface ProjectBacklog {
+  total: number;
+  counts: Record<BacklogPriority, number>;
+  in_progress: { note_id: string; title: string } | null;
+  items: BacklogItem[];
+}
+
 /**
  * Workspace egress tier for a project. The set must stay in sync with
  * the CHECK constraint in 0016_project_network_tier.sql and the
