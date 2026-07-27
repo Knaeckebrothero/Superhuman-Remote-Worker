@@ -4450,6 +4450,55 @@ class PostgresDB:
             )
         return [str(row["id"]) for row in rows]
 
+    # Cancels orphaned critic/verification subjobs that can never progress.
+    # Hoisted to a constant so tests can assert on the predicate directly
+    # (tests/test_stale_verification_sweeper.py). See
+    # ``cancel_stale_verification_subjobs`` below for the full rationale.
+    #
+    # 'waiting' was added to the top-level status filter (closes
+    # docs/issues/stale_critic_waiting_status_escapes_reaper.md): as of the
+    # fail-closed verification design a critic is never parked in 'waiting'
+    # between rounds any more — a fresh critic is spawned every round instead
+    # (orchestrator/main.py's ``_trigger_verification_on_complete``) — so a
+    # critic still sitting in 'waiting' is unconditionally an orphan of the
+    # retired mechanism, not a legitimate in-flight wait.
+    #
+    # 'paused' is deliberately KEPT — never remove it. Orphan recovery
+    # legitimately re-dispatches critics through 'paused', "paused too long
+    # ⇒ dead" was evaluated and rejected as a standalone deadness signal in a
+    # prior design (docs/features/llm_outage_subjob_resilience.md), and the
+    # outage/cooldown exemption clause below only has any effect while
+    # 'paused' rows still reach it — removing 'paused' from this filter would
+    # silently disable that exemption rather than just "widen" the reap.
+    _CANCEL_STALE_VERIFICATION_SQL = """
+        UPDATE jobs AS j
+        SET status = 'cancelled',
+            assigned_agent_id = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        FROM jobs AS parent
+        WHERE j.parent_job_id = parent.id
+          AND j.context->>'verification_target' IS NOT NULL
+          AND j.status IN ('created', 'paused', 'waiting')
+          AND j.assigned_agent_id IS NULL
+          AND (
+                parent.status IN ('completed', 'failed', 'cancelled')
+             OR (
+                    j.updated_at
+                    < CURRENT_TIMESTAMP - make_interval(hours => $1::int)
+                -- COALESCE guards the NULL case: a paused critic with
+                -- no llm_outage state must stay reapable, and NULL
+                -- would otherwise silently exempt it.
+                AND NOT COALESCE(
+                    j.status = 'paused'
+                    AND (j.context->'llm_outage'->>'next_retry_at')::timestamptz
+                        > CURRENT_TIMESTAMP
+                          - make_interval(mins => $2::int),
+                    false
+                )
+             )
+          )
+    """
+
     async def cancel_stale_verification_subjobs(
         self, stale_hours: int = 6, outage_grace_minutes: int = 30
     ) -> int:
@@ -4487,34 +4536,7 @@ class PostgresDB:
         """
         async with self.acquire() as conn:
             result = await conn.execute(
-                """
-                UPDATE jobs AS j
-                SET status = 'cancelled',
-                    assigned_agent_id = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                FROM jobs AS parent
-                WHERE j.parent_job_id = parent.id
-                  AND j.context->>'verification_target' IS NOT NULL
-                  AND j.status IN ('created', 'paused')
-                  AND j.assigned_agent_id IS NULL
-                  AND (
-                        parent.status IN ('completed', 'failed', 'cancelled')
-                     OR (
-                            j.updated_at
-                            < CURRENT_TIMESTAMP - make_interval(hours => $1::int)
-                        -- COALESCE guards the NULL case: a paused critic with
-                        -- no llm_outage state must stay reapable, and NULL
-                        -- would otherwise silently exempt it.
-                        AND NOT COALESCE(
-                            j.status = 'paused'
-                            AND (j.context->'llm_outage'->>'next_retry_at')::timestamptz
-                                > CURRENT_TIMESTAMP
-                                  - make_interval(mins => $2::int),
-                            false
-                        )
-                     )
-                  )
-                """,
+                self._CANCEL_STALE_VERIFICATION_SQL,
                 stale_hours,
                 outage_grace_minutes,
             )
@@ -4522,6 +4544,82 @@ class PostgresDB:
         if result.startswith("UPDATE "):
             return int(result.split()[1])
         return 0
+
+    # Un-sticks parents wedged in 'reviewing' whose critic pipeline is dead.
+    # Hoisted to a constant so tests can assert on the predicate directly
+    # (tests/test_stale_verification_sweeper.py). See
+    # ``unstick_reviewing_parents`` below for the full rationale.
+    #
+    # Fires when NO non-terminal critic child exists (a live critic — or a
+    # `completed` one whose verdict handler hasn't finished acting on it yet
+    # — must never be pre-empted) AND the most recently spawned critic child
+    # left no trace on the target's own durable ledger
+    # (``context.verification_rounds``).
+    #
+    # The second clause replaces the old "every child is failed/cancelled"
+    # exclusion of `completed` critics (removed, never just dropped — see
+    # tests/test_stale_verification_sweeper.py's
+    # ``test_unstick_no_longer_requires_all_children_failed``). As of the
+    # fail-closed verification design every round — approved AND returned —
+    # freezes its critic `completed` (Task 8; see src/core/phase.py), so an
+    # OLD round's critic sits there `completed` forever and must not block
+    # this watchdog on its own, or a target whose round-2 critic later died
+    # would sit in 'reviewing' forever (exactly the bug this replaces).
+    #
+    # But the CURRENT (most recently spawned) critic reaching `completed`
+    # does NOT by itself mean the target has left 'reviewing': recording the
+    # verdict (``POST .../verification/rounds``, see
+    # ``_record_verification_round_impl`` in orchestrator/main.py) happens
+    # strictly BEFORE the critic's own job finishes, so there is a real
+    # window where the critic is already terminal but
+    # ``_handle_critic_verdict_on_complete`` hasn't applied the consequence
+    # yet. Checking "is the ledger non-empty" can't tell these two cases
+    # apart — every appended round always carries a non-null verdict by
+    # construction, so that check is a tautology once ANY round has ever
+    # been recorded. Comparing the ledger's newest entry against the id of
+    # the MOST RECENT critic CHILD (by ``created_at``) is what actually
+    # distinguishes them: if the latest critic's id is on the ledger, the
+    # verdict handler owns this transition and the watchdog must stand down;
+    # if it isn't, that critic died (or froze into a non-actionable-forever
+    # status) without ever reporting, and the target is genuinely stranded.
+    #
+    # The inner scalar subquery returns NULL when no critic child exists at
+    # all; `r->>'critic_job_id' = NULL` can then never match any row, so the
+    # NOT EXISTS is true and the watchdog is eligible to fire — mirroring the
+    # old query's "(or none exists)" case.
+    #
+    # The CAS (``WHERE p.status = 'reviewing'``) makes this idempotent and
+    # safe against a concurrent sweeper tick / the verdict handler.
+    _UNSTICK_REVIEWING_SQL = """
+        UPDATE jobs AS p
+           SET status = 'pending_review',
+               error_message = 'Automated verification did not complete (critic pipeline died); returned to manual review.',
+               updated_at = CURRENT_TIMESTAMP
+         WHERE p.status = 'reviewing'
+           AND p.updated_at
+               < CURRENT_TIMESTAMP - make_interval(mins => $1::int)
+           AND NOT EXISTS (
+                 SELECT 1 FROM jobs c
+                  WHERE c.parent_job_id = p.id
+                    AND c.context->>'verification_target' IS NOT NULL
+                    AND c.status IN ('created', 'processing', 'paused', 'waiting')
+               )
+           AND NOT EXISTS (
+                 SELECT 1
+                   FROM jsonb_array_elements(
+                            COALESCE(p.context->'verification_rounds', '[]'::jsonb)
+                        ) r
+                  WHERE r->>'critic_job_id' = (
+                            SELECT c.id::text
+                              FROM jobs c
+                             WHERE c.parent_job_id = p.id
+                               AND c.context->>'verification_target' IS NOT NULL
+                             ORDER BY c.created_at DESC
+                             LIMIT 1
+                        )
+               )
+        RETURNING p.id, p.user_id, p.config_name
+    """
 
     async def unstick_reviewing_parents(
         self, grace_minutes: int = 30
@@ -4535,22 +4633,29 @@ class PostgresDB:
         parent sits in 'reviewing' forever. This flips such a parent back to
         'pending_review' (human review takes over) + lets the caller notify.
 
-        Fires only when EVERY critic child is terminal-failed/cancelled (or none
-        exists) and the parent has been reviewing past ``grace_minutes``:
+        Fires when no non-terminal critic child exists (or none exists at all)
+        and the target's own verification ledger has no record for the most
+        recently spawned critic — see ``_UNSTICK_REVIEWING_SQL`` above for the
+        full "why not just check every child is failed/cancelled" reasoning:
 
-        - A live critic ('processing'/'created'/'paused'/'waiting…') keeps the
+        - A live critic ('processing'/'created'/'paused'/'waiting') keeps the
           parent untouched — a long review or a recovering (paused) critic is
           never pre-empted.
-        - A 'completed' critic also keeps the parent untouched — that is the
-          verdict handler's job; excluding it avoids racing that handler.
-        - The grace floor on ``updated_at`` dodges the critic-spawn and
-          in-flight-verdict windows.
+        - A `completed` critic whose id is already on the ledger ALSO keeps
+          the parent untouched — that is the verdict handler's job; the
+          ledger check (not a blanket 'completed' exclusion, which an old
+          round's critic would satisfy forever) is what avoids racing it.
+        - The grace floor on ``updated_at`` dodges the critic-spawn window;
+          the ledger check (not just the grace floor) is what stays safe even
+          if the verdict handler is delayed well past grace before applying a
+          verdict that already recorded.
 
         The CAS (``WHERE status='reviewing'``) makes it idempotent and safe
         against a concurrent sweeper / the verdict handler.
 
-        See docs/superpowers/specs/2026-07-05-reviewing-parent-unstick-watchdog-design.md
-        and critic_failure_leaves_parent_job_stuck_reviewing.md (#4).
+        See docs/superpowers/specs/2026-07-05-reviewing-parent-unstick-watchdog-design.md,
+        critic_failure_leaves_parent_job_stuck_reviewing.md (#4), and
+        docs/superpowers/sdd/2026-07-27-verification-fail-closed/task-10-brief.md.
 
         Args:
             grace_minutes: minimum time a parent must have been in 'reviewing'.
@@ -4560,22 +4665,7 @@ class PostgresDB:
         """
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
-                UPDATE jobs AS p
-                   SET status = 'pending_review',
-                       error_message = 'Automated verification did not complete (critic pipeline died); returned to manual review.',
-                       updated_at = CURRENT_TIMESTAMP
-                 WHERE p.status = 'reviewing'
-                   AND p.updated_at
-                       < CURRENT_TIMESTAMP - make_interval(mins => $1::int)
-                   AND NOT EXISTS (
-                         SELECT 1 FROM jobs c
-                          WHERE c.parent_job_id = p.id
-                            AND c.context->>'verification_target' IS NOT NULL
-                            AND c.status NOT IN ('failed', 'cancelled')
-                       )
-                RETURNING p.id, p.user_id, p.config_name
-                """,
+                self._UNSTICK_REVIEWING_SQL,
                 grace_minutes,
             )
         return [dict(r) for r in rows]
