@@ -6,7 +6,6 @@ full-dict rewrites:
 
     - ``append_queued_reply``          (jsonb_set + ``|| $1`` array append)
     - ``delete_job_context_keys``      (``context - $1::text[]``)
-    - ``increment_job_verification_round`` (jsonb_set counter)
     - ``merge_job_context``            (``|| $1`` top-level merge, NULL guard)
 
 The point these tests defend that a mock cannot: under real concurrency the
@@ -240,55 +239,6 @@ class TestDeleteJobContextKeys:
     @pytest.mark.asyncio
     async def test_missing_job_returns_false(self, db):
         assert await db.delete_job_context_keys(str(uuid4()), ["k"]) is False
-
-
-# ---------------------------------------------------------------------------
-# increment_job_verification_round
-# ---------------------------------------------------------------------------
-
-
-class TestIncrementVerificationRound:
-    @pytest.mark.asyncio
-    async def test_from_missing_key_starts_at_one(self, db):
-        jid = str(uuid4())
-        await _insert_job(db, jid, {})
-
-        assert await db.increment_job_verification_round(jid) == 1
-        assert await db.increment_job_verification_round(jid) == 2
-        assert (await _read_ctx(db, jid))["verification_round"] == 2
-
-    @pytest.mark.asyncio
-    async def test_null_column_starts_at_one(self, db):
-        jid = str(uuid4())
-        await _insert_job(db, jid, None)
-
-        assert await db.increment_job_verification_round(jid) == 1
-
-    @pytest.mark.asyncio
-    async def test_preserves_other_keys(self, db):
-        jid = str(uuid4())
-        await _insert_job(db, jid, {"verification_round": 2, "keep": "me"})
-
-        assert await db.increment_job_verification_round(jid) == 3
-        assert (await _read_ctx(db, jid))["keep"] == "me"
-
-    @pytest.mark.asyncio
-    async def test_concurrent_increments_no_lost_update(self, db):
-        # N racing increments must end at exactly N (the retired RMW counter
-        # stalled below N when two handlers read the same value).
-        jid = str(uuid4())
-        await _insert_job(db, jid, {})
-        n = 10
-
-        await asyncio.gather(
-            *(db.increment_job_verification_round(jid) for _ in range(n))
-        )
-
-        assert (await _read_ctx(db, jid))["verification_round"] == n
-
-    @pytest.mark.asyncio
-    async def test_missing_job_returns_zero(self, db):
-        assert await db.increment_job_verification_round(str(uuid4())) == 0
 
 
 # ---------------------------------------------------------------------------

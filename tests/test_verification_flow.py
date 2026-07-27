@@ -1486,6 +1486,66 @@ class TestTriggerVerificationInstructionsWiring:
         assert "F1" in instructions
         assert "still broken" in instructions
 
+    @pytest.mark.asyncio
+    async def test_a_later_critic_with_nothing_open_is_not_told_it_is_first(
+        self, monkeypatch
+    ):
+        """The round COUNT must flow, not just the open findings. A round-3
+        critic whose predecessors resolved everything has an empty open set —
+        indistinguishable from round 1 unless `len(rounds)` reaches the
+        renderer — and was being told "This is a first review."
+        """
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main_module, "_propagate_datasources_to_subjob", AsyncMock()
+        )
+        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+
+        rounds = [
+            {
+                "round": 1,
+                "critic_job_id": "c1",
+                "content_tree": "aaa",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "opened": [{"id": "F1", "severity": "high", "claim": "broken"}],
+                "dispositions": [],
+                "ts": "t",
+            },
+            {
+                "round": 2,
+                "critic_job_id": "c2",
+                "content_tree": "bbb",
+                "verdict": "approved",
+                "asserted_verdict": "approved",
+                "opened": [],
+                "dispositions": [
+                    {"id": "F1", "disposition": "RESOLVED", "quote": "fixed"}
+                ],
+                "ts": "t",
+            },
+        ]
+        job = _make_completion_job(
+            freeze_content_tree="ccc", verification_rounds=rounds
+        )
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, []
+        )
+
+        instructions = create_job_mock.call_args.kwargs["context"]["instructions"]
+        assert "2 previous review rounds" in instructions
+        assert "reviewer number 3" in instructions
+
 
 class TestFailClosedVerdictHandling:
     def test_non_critic_subjob_is_ignored(self):
