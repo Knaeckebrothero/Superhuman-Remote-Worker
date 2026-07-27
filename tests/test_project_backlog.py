@@ -661,3 +661,158 @@ class TestFetchBacklog:
         ]
         assert 0 in counts
         assert counts[0] == 3
+
+
+# =============================================================================
+# Task 5: inject the backlog into every kickoff
+# =============================================================================
+
+
+class TestKickoffInjection:
+    def _loop(self):
+        return {
+            "id": "105a6f98-134c-4077-b7e1-6d08916650d7",
+            "status": "running",
+            "scheduling": "standard",
+            "role_sequence": ["scholar", "critic", "developer"],
+            "seq_index": 0,
+            "goal": "Build a thing",
+            "max_iterations": 30,
+            "remaining_iterations": 20,
+            "campaign": None,
+            "campaign_history": [],
+        }
+
+    def test_block_is_injected_verbatim(self):
+        from orchestrator.services.project_loops import build_loop_kickoff
+
+        kickoff = build_loop_kickoff(
+            self._loop(),
+            role="critic",
+            iteration=3,
+            backlog_block="PROJECT BACKLOG — 2 open: 2 high\nIN PROGRESS: (none)",
+        )
+        assert "PROJECT BACKLOG — 2 open: 2 high" in kickoff
+
+    def test_the_fictional_backlog_instruction_is_gone(self):
+        """The old kickoff told the agent to go find a backlog that did not
+        exist. Injection replaces the search; the instruction must not survive
+        or agents will keep similarity-hunting for it."""
+        from orchestrator.services.project_loops import build_loop_kickoff
+
+        kickoff = build_loop_kickoff(
+            self._loop(), role="critic", iteration=3, backlog_block="X"
+        )
+        assert "the current open backlog" not in kickoff
+
+    def test_no_block_still_builds_a_kickoff(self):
+        from orchestrator.services.project_loops import build_loop_kickoff
+
+        kickoff = build_loop_kickoff(self._loop(), role="scholar", iteration=1)
+        assert "PROJECT GOAL" in kickoff
+
+
+class _SpawnLoopJobHarness:
+    """Shared plumbing for exercising ``main._spawn_loop_job`` end to end —
+    every loop spawn funnels through it, so this is where the backlog fetch
+    must be proven wired, not just ``render_backlog_block`` in isolation.
+
+    Mirrors the patch set in
+    tests/test_loop_unified_advance.py::test_spawn_loop_job_forwards_park_to_create
+    (postgres_db / _trigger_dispatch / create_loop_job / provision_job_repo),
+    plus ``main.vector_db`` and ``services.project_backlog.fetch_backlog`` for
+    the new backlog fetch.
+    """
+
+    def _loop(self, **over):
+        base = {
+            "id": "105a6f98-134c-4077-b7e1-6d08916650d7",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+            "campaign": None,
+        }
+        base.update(over)
+        return base
+
+    async def _spawn(self, loop, *, fetch_backlog_double):
+        from contextlib import ExitStack
+
+        create = AsyncMock(return_value={"id": "job-1"})
+        with ExitStack() as stack:
+            stack.enter_context(patch("main.postgres_db", AsyncMock()))
+            stack.enter_context(patch("main.vector_db", MagicMock()))
+            stack.enter_context(patch("main._trigger_dispatch"))
+            stack.enter_context(patch("services.project_loops.create_loop_job", create))
+            stack.enter_context(
+                patch("services.job_provisioning.provision_job_repo", AsyncMock())
+            )
+            stack.enter_context(
+                patch("services.project_backlog.fetch_backlog", fetch_backlog_double)
+            )
+            from main import _spawn_loop_job
+
+            job = await _spawn_loop_job(loop, role="critic", iteration=2)
+        return job, create
+
+
+class TestSpawnLoopJobBacklogWiring(_SpawnLoopJobHarness):
+    """Test-quality bar: a pure ``render_backlog_block`` test doesn't prove
+    the orchestrator actually threads the pool through the one funnel every
+    loop job spawns from. These do."""
+
+    @pytest.mark.asyncio
+    async def test_rendered_block_reaches_create_loop_job(self):
+        fetch = AsyncMock(
+            return_value=(
+                [
+                    {
+                        "note_id": "issue-x",
+                        "note_type": "issue",
+                        "title": "Fix the thing",
+                        "priority": 0,
+                    }
+                ],
+                {0: 1},
+            )
+        )
+        _job, create = await self._spawn(self._loop(), fetch_backlog_double=fetch)
+
+        fetch.assert_awaited_once()
+        block = create.await_args.kwargs["backlog_block"]
+        assert block is not None
+        assert "PROJECT BACKLOG — 1 open: 1 high" in block
+        assert "issue-x" in block
+
+    @pytest.mark.asyncio
+    async def test_in_progress_campaign_initiative_is_excluded_and_surfaced(self):
+        """A ticket the loop is already working (campaign.initiative_note_id)
+        keeps status='active' in the KB, so the pool query must exclude it —
+        it is surfaced on the IN PROGRESS line instead, never offered twice."""
+        fetch = AsyncMock(return_value=([], {}))
+        loop = self._loop(
+            campaign={"initiative_note_id": "issue-underway", "title": "Underway thing"}
+        )
+        _job, create = await self._spawn(loop, fetch_backlog_double=fetch)
+
+        assert fetch.await_args.kwargs["exclude_note_id"] == "issue-underway"
+        block = create.await_args.kwargs["backlog_block"]
+        assert "IN PROGRESS: [normal] issue-underway — Underway thing" in block
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_still_spawns_with_no_block(self):
+        """Non-fatal: a KB/pgvector outage must cost the block, never the
+        job — every loop spawn funnels through here."""
+        fetch = AsyncMock(side_effect=RuntimeError("pgvector outage"))
+        job, create = await self._spawn(self._loop(), fetch_backlog_double=fetch)
+
+        assert job == {"id": "job-1"}
+        assert create.await_args.kwargs["backlog_block"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_project_id_skips_fetch_entirely(self):
+        """Start-up / non-project loops must not even attempt the fetch."""
+        fetch = AsyncMock(return_value=([], {}))
+        loop = self._loop(project_id=None)
+        _job, create = await self._spawn(loop, fetch_backlog_double=fetch)
+
+        fetch.assert_not_awaited()
+        assert create.await_args.kwargs["backlog_block"] is None

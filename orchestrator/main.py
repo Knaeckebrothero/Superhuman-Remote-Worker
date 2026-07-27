@@ -12595,10 +12595,45 @@ async def _spawn_loop_job(
     stamped into the job's context for the torn-advance heal (see
     ``create_loop_job``). ``disable_memory_assembler`` (set for fan-out stage
     members) turns off the TTL-curation assembler so concurrent members don't
-    race the shared project store.
+    race the shared project store. The real ticket pool (docs/superpowers/specs/
+    2026-07-26-project-backlog-pipeline-design.md) is fetched here — the single
+    funnel every loop spawn passes through — and handed to ``create_loop_job``
+    pre-rendered; a KB/pgvector outage costs the block, never the job.
     """
     from services.job_provisioning import provision_job_repo
     from services.project_loops import create_loop_job
+
+    # Hand the work pool over rather than making the agent hunt for it. Every
+    # loop spawn funnels through here. Non-fatal: a KB outage costs the block,
+    # not the job.
+    backlog_block: str | None = None
+    project_id = loop.get("project_id")
+    if project_id and vector_db is not None:
+        from services.project_backlog import fetch_backlog, render_backlog_block
+
+        campaign = loop.get("campaign") or {}
+        in_progress_id = campaign.get("initiative_note_id")
+        try:
+            rows, counts = await fetch_backlog(
+                vector_db, str(project_id), exclude_note_id=in_progress_id
+            )
+            in_progress = None
+            if in_progress_id:
+                in_progress = {
+                    "note_id": in_progress_id,
+                    "title": campaign.get("title") or "",
+                    "priority": 1,
+                    "note_type": "feature",
+                }
+            backlog_block = render_backlog_block(
+                rows, counts, in_progress=in_progress
+            )
+        except Exception:
+            logger.warning(
+                "loop %s: backlog fetch failed — spawning without the block",
+                str(loop.get("id"))[:8],
+                exc_info=True,
+            )
 
     job = await create_loop_job(
         postgres_db,
@@ -12609,6 +12644,7 @@ async def _spawn_loop_job(
         remaining_iterations=remaining_iterations,
         disable_memory_assembler=disable_memory_assembler,
         extra_context=extra_context,
+        backlog_block=backlog_block,
         park_until=park_until,
     )
 
