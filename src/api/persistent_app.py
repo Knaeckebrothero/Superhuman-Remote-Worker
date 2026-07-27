@@ -1234,6 +1234,26 @@ def _session_backend_is_lite(config: Optional[Dict[str, Any]]) -> bool:
     return ws.get("backend") in LITE_BACKENDS
 
 
+def _session_backend_is_vm(config: Optional[Dict[str, Any]]) -> bool:
+    """True if a resolved session config / override selects the VM tier
+    (``vm``, or its legacy ``remote`` alias).
+
+    A vm-tier session's workspace is a KubeVirt VM, and its readiness poll must
+    accept ONLY that VM: a sandbox container is ready in seconds while a cold VM
+    boot takes minutes, so a container that exists for any reason would always
+    win the race and silently attach the session to the wrong tier
+    (docs/issues/session_vm_backend_never_attaches.md Defect 2).
+
+    Same dual-shape contract as :func:`_session_backend_is_lite`.
+    """
+    if not isinstance(config, dict):
+        return False
+    from ..core.backends.factory import VM_BACKENDS
+
+    ws = config.get("workspace") or (config.get("agent") or {}).get("workspace") or {}
+    return ws.get("backend") in VM_BACKENDS
+
+
 _FLEET_MANAGEMENT_DISABLED_KEY = "_fleet_management_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
@@ -1463,6 +1483,9 @@ async def _attach_session(
     # Check BOTH blobs: the resolved config is the agent's preferred hydration
     # source, the override is the authoritative tier — either may carry it.
     is_lite_session = _session_backend_is_lite(_rc) or _session_backend_is_lite(_co)
+    # Same dual-blob read for the VM tier: a vm-tier session must attach to its
+    # VM and never to a container that happens to be ready (Defect 2).
+    is_vm_session = _session_backend_is_vm(_rc) or _session_backend_is_vm(_co)
 
     # Wait for workspace container (if orchestrator is provisioning one).
     # Skipped for lite tiers, which run with no pod — the session builds its
@@ -1470,11 +1493,25 @@ async def _attach_session(
     workspace_override = None
     if not is_lite_session and _orchestrator_client and _thread_id:
         workspace_override = await _poll_workspace_ready(
-            _orchestrator_client, _thread_id, timeout=120, raise_on_denied=True
+            _orchestrator_client,
+            _thread_id,
+            timeout=120,
+            raise_on_denied=True,
+            require_vm=is_vm_session,
         )
         if workspace_override:
             logger.info(
-                f"Workspace container ready: {workspace_override['remote']['host']}"
+                f"Workspace ready ({workspace_override.get('backend')}): "
+                f"{workspace_override['remote']['host']}"
+            )
+        elif is_vm_session:
+            # Never silently downgrade a vm-tier session to a container. Say what
+            # actually failed so the pod log names the real cause instead of
+            # blaming a container this session was never supposed to have.
+            raise WorkspaceNotReady(
+                "VM workspace never became ready for this vm-tier session "
+                "(metadata.vm did not reach status='ready' with an ssh_host "
+                "within the VM budget). Not falling back to a sandbox container."
             )
         else:
             raise WorkspaceNotReady(
@@ -6265,6 +6302,7 @@ async def _poll_workspace_ready(
     *,
     raise_on_denied: bool = False,
     vm_timeout: int = _vm_upgrade_poll_timeout,
+    require_vm: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Poll orchestrator for workspace container readiness.
 
@@ -6274,6 +6312,15 @@ async def _poll_workspace_ready(
     the sandbox-container ``timeout`` default, so the deadline self-extends
     rather than declaring a still-booting VM "not ready"
     (docs/features/session_create_on_vm.md).
+
+    ``require_vm`` makes the VM the ONLY acceptable answer: a ready sandbox
+    container is refused (and logged as a provisioning leak) instead of being
+    returned. Checking ``vm_status`` first is not sufficient on its own — within
+    a single iteration a not-yet-ready VM falls through to the container branch,
+    and since a container is ready in ~8 s against a multi-minute VM boot it wins
+    that race every time. Callers pass this when the thread's resolved tier is
+    ``vm``; the sandbox-upgrade caller deliberately does not
+    (docs/issues/session_vm_backend_never_attaches.md Defect 2).
 
     Returns:
         Workspace config dict {"backend": "remote", "remote": {host, port, ...}}
@@ -6338,6 +6385,44 @@ async def _poll_workspace_ready(
                 # legacy nc_session_folder sync shim for protected threads.
                 "protected_cloud": ws.get("protected_cloud"),
             }
+
+        # A vm-tier thread accepts no substitute. Bail on a terminal VM instead
+        # of burning the full VM budget — the pre-existing 'failed' bail below
+        # also requires the CONTAINER to have failed, which never happens on a
+        # thread that (correctly) has no container.
+        if require_vm:
+            if not vm_status:
+                # No VM context at all on a vm-tier thread — provisioning was
+                # never requested (create_thread sets vm.status='provisioning'
+                # synchronously before the agent can poll, and it persists across
+                # resume). Terminal, so fail fast rather than sitting out the
+                # budget; mirrors the container branch's status=='none' bail.
+                logger.warning(
+                    "Thread %s: vm-tier session has no VM context — no VM was "
+                    "ever provisioned for it.",
+                    thread_id,
+                )
+                return None
+            if vm_status == "failed":
+                logger.warning(
+                    "Thread %s: VM provisioning failed — not falling back to a "
+                    "container (vm-tier session).",
+                    thread_id,
+                )
+                return None
+            if ws.get("status") == "ready" and ws.get("pod_ip"):
+                # A container exists for a vm-tier thread: a provisioning leak
+                # (see Defect 1). Refuse it — attaching here is precisely the
+                # silent wrong-tier downgrade this guard exists to prevent.
+                logger.warning(
+                    "Thread %s: ignoring a ready workspace container on a vm-tier "
+                    "session (pod %s) — this container should not exist; waiting "
+                    "for the VM instead.",
+                    thread_id,
+                    ws.get("pod_ip"),
+                )
+            await asyncio.sleep(poll_interval)
+            continue
 
         # Check container workspace
         status = ws.get("status", "none")

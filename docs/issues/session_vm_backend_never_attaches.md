@@ -12,9 +12,11 @@ tags:
 **Status:** Diagnosed 2026-07-26 from live dev thread
 `77b3d3e6-6dfc-422e-a8ec-a5848cb8febc`. Work on `develop`.
 
-- **Defect 1 — FIXED** (2026-07-27, uncommitted): `VM_BACKENDS` arm in
+- **Defect 1 — FIXED** (2026-07-27, commit `5a40c4ce`): `VM_BACKENDS` arm in
   `ensure_session_workspace`. Unit-verified; **dev live gate not yet run.**
-- **Defect 2 — open.**
+- **Defect 2 — FIXED** (2026-07-27, uncommitted): `require_vm` in
+  `_poll_workspace_ready` + `_session_backend_is_vm`. Unit-verified; **dev live
+  gate not yet run.** Caveat below on where the failure reason surfaces.
 - **Defect 3 — split out**, root cause unknown:
   `docs/issues/vm_guest_boots_to_emergency_shell.md`.
 - **Defect 4 — open.**
@@ -146,12 +148,31 @@ layer that decides *which tier the agent actually runs on*, and today that
 decision can silently contradict the tier the user paid for and the operator
 gated.
 
-**Fix:** make the poll tier-aware. When the thread's resolved backend is `vm`,
-`vm_status == "ready"` is the only acceptable success; a ready container must be
-ignored (and ideally logged loudly as a provisioning leak), and the poll must
-time out on the VM budget with a truthful VM reason rather than silently
-downgrading. The thread's backend is already available to this code path via the
-workspace payload's `config_override`.
+**FIXED 2026-07-27 (uncommitted).** `_poll_workspace_ready` gained an explicit
+`require_vm` flag rather than self-detecting the tier, so the sandbox-upgrade
+caller (`_handle_workspace_upgrade`, same file) is untouched and keeps accepting
+a container. `_attach_session` computes the tier the same way it already computes
+the lite tier — a new `_session_backend_is_vm` mirroring `_session_backend_is_lite`,
+reading both `resolved_config` and `config_override` and reusing `VM_BACKENDS`
+from the Defect 1 fix. Under `require_vm` the poll:
+
+- returns only on `vm_status == "ready"`; a ready container is refused and logged
+  as a provisioning leak;
+- bails immediately on `vm_status == "failed"` (the pre-existing bail also
+  required the *container* to have failed, which never happens on a thread that
+  correctly has no container);
+- bails immediately when there is no VM context at all — provisioning was never
+  requested, so waiting out the budget is pointless.
+
+**Caveat — "fails loudly" means the pod log, not the cockpit.** The tier-aware
+`WorkspaceNotReady` message is only logged: `_exit_workspace_not_ready`
+(`src/api/persistent_app.py:802`) logs and exits 0 without reporting a reason
+upstream, and its siblings (`_exit_grant_denied`, `_exit_memory_unavailable`)
+rely on the cockpit re-deriving the cause from an orchestrator create/prepare
+pre-flight. **There is no pre-flight that can catch "the VM never became ready"**,
+so the user still sees a generic session-ready timeout. Surfacing the real reason
+needs a failure reason plumbed from agent → orchestrator → cockpit; that is
+separate work and deliberately not bundled here.
 
 **Sequencing warning:** fixing Defects 1+2 *without* Defect 3 converts today's
 "fast session on the wrong tier" into "session hangs ~15 min, then fails." That
