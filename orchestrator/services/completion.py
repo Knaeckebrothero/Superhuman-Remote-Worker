@@ -1145,9 +1145,14 @@ def format_verification_instructions(
     formatted with ``str.format``, which raises ``KeyError`` for a missing
     key, and the ``except KeyError`` branch below returns ``None`` — which
     would abort critic creation entirely at the caller. Callers should pass
-    ``render_prior_findings(fold_open_findings(rounds))`` (see
+    ``render_prior_findings(fold_open_findings(rounds), len(rounds))`` (see
     ``services.verification_ledger``); the fallback text below only covers
     callers that don't.
+
+    That fallback deliberately does NOT claim "this is a first review": this
+    function has no ledger and cannot tell a genuine first round from a later
+    one whose findings were all resolved. Asserting the stronger claim without
+    the evidence for it is what the caller-side fix removes.
     """
     search_paths = [
         _REPO_ROOT / "config" / "experts" / "critic" / "verification_instructions.md",
@@ -1194,7 +1199,7 @@ def format_verification_instructions(
             agent_summary=freeze_data.get("summary", "*(no summary provided)*"),
             agent_confidence=confidence_str,
             prior_findings=prior_findings
-            or "No open findings from previous rounds. This is a first review.",
+            or "No open findings from previous rounds were supplied.",
         )
     except KeyError as e:
         logger.error("Verification template has unknown placeholder: %s", e)

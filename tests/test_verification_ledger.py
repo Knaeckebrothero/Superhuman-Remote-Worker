@@ -326,6 +326,27 @@ class TestRenderPriorFindings:
     def test_empty_states_none_open(self):
         assert "No open findings" in render_prior_findings([])
 
+    def test_no_rounds_yet_is_called_a_first_review(self):
+        assert "This is a first review" in render_prior_findings([], rounds_completed=0)
+
+    def test_later_round_with_everything_resolved_is_not_a_first_review(self):
+        """A round-3 critic whose predecessors resolved everything was being
+        told "This is a first review." — false, and it strips the one signal
+        that two other reviewers already went over this deliverable."""
+        text = render_prior_findings([], rounds_completed=2)
+
+        assert "This is a first review" not in text
+        assert "2 previous review rounds" in text
+        assert "reviewer number 3" in text
+
+    def test_single_prior_round_is_not_pluralised(self):
+        assert "1 previous review round already" in render_prior_findings(
+            [], rounds_completed=1
+        )
+
+    def test_resolved_case_still_says_nothing_is_open(self):
+        assert "No open findings" in render_prior_findings([], rounds_completed=2)
+
     def test_lists_ids_and_claims(self):
         text = render_prior_findings(
             [{"id": "F1", "severity": "high", "claim": "missing source",

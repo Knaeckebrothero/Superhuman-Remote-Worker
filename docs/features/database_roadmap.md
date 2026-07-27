@@ -461,7 +461,10 @@ new atomic helpers mirror the existing `merge_job_context` /
 `increment_job_memory_retry` pattern: `append_queued_reply`
 (`jsonb_set(COALESCE(context,'{}'), '{queued_replies}', COALESCE(…,'[]') || $1)`),
 `delete_job_context_keys` (`context - $1::text[]`), and
-`increment_job_verification_round` (`jsonb_set` counter). Site map: the 8
+`increment_job_verification_round` (`jsonb_set` counter — **retired
+2026-07-27**: the fail-closed verification design derives the round number
+from `len(context.verification_rounds)`, so the counter had no remaining
+caller and was deleted with its tests). Site map: the 8
 `update_job_context` callers became `merge_job_context` **deltas** (graft
 `graft_output_path`; scholar+critic subjob `git_remote_url` — safe because both
 subjobs are created with their context already persisted, so a delta merge drops

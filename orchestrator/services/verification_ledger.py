@@ -266,12 +266,30 @@ def validate_verdict_call(
     return []
 
 
-def render_prior_findings(open_findings: List[Dict[str, Any]]) -> str:
-    """Render the open findings block injected into a fresh critic's brief."""
+def render_prior_findings(
+    open_findings: List[Dict[str, Any]], rounds_completed: int = 0
+) -> str:
+    """Render the open findings block injected into a fresh critic's brief.
+
+    ``rounds_completed`` distinguishes the two ways the open set can be empty.
+    Without it, a round-3 critic whose predecessors resolved everything was
+    told "This is a first review." — false, and it discards the one signal
+    that two other reviewers already went over this deliverable and found
+    nothing left standing.
+    """
     if not open_findings:
+        if rounds_completed <= 0:
+            return (
+                "No open findings from previous rounds. This is a first review — "
+                "evaluate the deliverables against the original requirements."
+            )
+        plural = "" if rounds_completed == 1 else "s"
         return (
-            "No open findings from previous rounds. This is a first review — "
-            "evaluate the deliverables against the original requirements."
+            f"No open findings: {rounds_completed} previous review round{plural} "
+            f"already ran and every finding they opened has since been resolved. "
+            f"You are reviewer number {rounds_completed + 1}, not the first — "
+            f"evaluate the deliverables against the original requirements, and be "
+            f"specific about anything your predecessors missed."
         )
 
     lines = [
