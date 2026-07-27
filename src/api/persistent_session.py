@@ -17,6 +17,7 @@ from dataclasses import asdict as _dc_asdict
 from dataclasses import dataclass, field
 from dataclasses import is_dataclass as _dc_is_dataclass
 from dataclasses import replace as _dc_replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +38,7 @@ from ..core.loader import (
 from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from ..core.workspace_backend import WorkspaceUnavailableError
 from ..tools import ToolContext, load_tools, apply_instruction_enforcement
+from ..tools.context import SessionRuntimeFacts
 from ..tools.description_manager import apply_description_overrides
 
 logger = logging.getLogger(__name__)
@@ -388,6 +390,7 @@ class PersistentSession:
 
         # 9. Set up memory (RecallStore) if enabled
         self._setup_memory(postgres_conn, vector_conn)
+        self._refresh_runtime_facts()
 
         logger.info(
             f"PersistentSession initialized: thread={self.thread_id}, "
@@ -1194,6 +1197,133 @@ class PersistentSession:
 
         self._load_tools_for_backend()
 
+    @staticmethod
+    def _runtime_backend_id(backend: Any) -> str | None:
+        """Map the active backend object onto SRW's public four-tier IDs."""
+
+        if backend is None:
+            return None
+        supports_shell = bool(getattr(backend, "supports_shell", False))
+        supports_files = bool(getattr(backend, "supports_file_tools", True))
+        if supports_shell:
+            return (
+                "vm" if getattr(backend, "sudo_action", None) == "allow" else "sandbox"
+            )
+        return "virtual" if supports_files else "none"
+
+    def _refresh_runtime_facts(
+        self,
+        loaded_tool_names: Optional[List[str]] = None,
+    ) -> None:
+        """Atomically publish one redacted live-session observation.
+
+        All raw datasource and workspace objects stay on ``PersistentSession``.
+        The model-facing capability tool receives only this immutable aggregate
+        snapshot through ``ToolContext``.
+        """
+
+        context = self.tool_context
+        if context is None:
+            return
+
+        if loaded_tool_names is None:
+            loaded_tool_names = list(getattr(context, "_resolved_tool_names", []) or [])
+        safe_tool_names = [
+            name for name in loaded_tool_names if isinstance(name, str) and name
+        ]
+
+        datasource_types = tuple(
+            sorted(
+                {
+                    str(item.get("type"))
+                    for item in self.datasource_configs
+                    if isinstance(item, dict) and item.get("type")
+                }
+            )
+        )
+        email_configs = [
+            item
+            for item in self.datasource_configs
+            if isinstance(item, dict) and item.get("type") == "email"
+        ]
+        email_tier = None
+        if email_configs:
+            from ..core.datasource_setup import (
+                EMAIL_TIER_ORDER,
+                email_effective_access,
+            )
+
+            email_tier = max(
+                (email_effective_access(item) for item in email_configs),
+                key=EMAIL_TIER_ORDER.index,
+            )
+            live_email_tier = getattr(
+                self.datasources.get("email"),
+                "access",
+                None,
+            )
+            if live_email_tier in EMAIL_TIER_ORDER:
+                email_tier = live_email_tier
+
+        backend = getattr(self.workspace_manager, "backend", None)
+        cloud_active = bool(
+            self.cloud_mount_manager
+            and getattr(self.cloud_mount_manager, "active", False)
+        )
+        protected_active = bool(
+            cloud_active
+            and self.overlay_mount_manager
+            and getattr(self.overlay_mount_manager, "active", False)
+        )
+        supports_file_tools = bool(
+            backend is not None and getattr(backend, "supports_file_tools", True)
+        )
+
+        try:
+            facts = SessionRuntimeFacts(
+                observed_at=datetime.now(timezone.utc),
+                backend_id=self._runtime_backend_id(backend),
+                backend_supports_shell=bool(getattr(backend, "supports_shell", False)),
+                backend_supports_file_tools=supports_file_tools,
+                backend_supports_canvas_presentation=bool(
+                    getattr(backend, "supports_canvas_presentation", False)
+                ),
+                backend_supports_canvas_live_apps=bool(
+                    getattr(backend, "supports_canvas_live_apps", False)
+                ),
+                backend_supports_shared_browser=bool(
+                    getattr(backend, "supports_canvas_shared_browser", False)
+                ),
+                attached_datasource_types=datasource_types,
+                email_access_tier=email_tier,
+                email_connection_failed=bool(
+                    email_configs and self.datasources.get("email") is None
+                ),
+                email_direct_send_enabled=bool(
+                    email_configs
+                    and getattr(
+                        self.datasources.get("email"),
+                        "unattended_send",
+                        False,
+                    )
+                ),
+                knowledge_binding_available=bool(self.knowledge_bindings),
+                knowledge_store_available=self.knowledge_store is not None,
+                memory_available=self.recall_store is not None,
+                cloud_mount_active=cloud_active,
+                protected_cloud_active=protected_active,
+                loaded_tool_names=tuple(safe_tool_names),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not publish redacted session runtime facts (%s)",
+                type(exc).__name__,
+            )
+            context.session_runtime_facts = None
+            return
+
+        context.session_runtime_facts = facts
+
     def _load_tools_for_backend(self) -> None:
         """Resolve, filter, load, document, and post-process the toolset for
         the CURRENT workspace backend, setting ``self.tools``.
@@ -1229,6 +1359,22 @@ class PersistentSession:
             tool_names = [name for name in tool_names if name != APP_GUIDE_LOADER_TOOL]
         elif APP_GUIDE_LOADER_TOOL not in tool_names:
             tool_names.append(APP_GUIDE_LOADER_TOOL)
+
+        # Runtime introspection is a separate persistent-session floor. Its
+        # canary gate is operator-owned and independent of both the managed
+        # guide break-glass switch and every user-selectable tool group.
+        from src.tools.product_capabilities import (
+            PRODUCT_CAPABILITIES_TOOL_NAME,
+            product_capabilities_tool_enabled,
+        )
+
+        if product_capabilities_tool_enabled():
+            if PRODUCT_CAPABILITIES_TOOL_NAME not in tool_names:
+                tool_names.append(PRODUCT_CAPABILITIES_TOOL_NAME)
+        else:
+            tool_names = [
+                name for name in tool_names if name != PRODUCT_CAPABILITIES_TOOL_NAME
+            ]
 
         # Fleet Management is the UI-facing group for SRW control-plane tools.
         # Experts & Skills and Automations & Loops are separate groups keyed by
@@ -1398,6 +1544,13 @@ class PersistentSession:
         # Apply description overrides and enforcement
         self.tools = apply_description_overrides(self.tools)
         self.tools = apply_instruction_enforcement(self.tools, self.tool_context)
+        final_tool_names = [
+            tool.name
+            for tool in self.tools
+            if isinstance(getattr(tool, "name", None), str)
+        ]
+        self.tool_context._resolved_tool_names = list(final_tool_names)
+        self._refresh_runtime_facts(final_tool_names)
 
         logger.info(f"Loaded {len(self.tools)} tools for persistent session")
 
@@ -1578,6 +1731,7 @@ class PersistentSession:
                     self.workspace_manager.source_repos.pop(clone_name, None)
 
         self.datasource_configs = new_configs
+        self._refresh_runtime_facts()
 
         if self.workspace_manager:
             # inject_datasource_index rewrites (cuts the previous section), so
@@ -1992,6 +2146,7 @@ class PersistentSession:
 
         # Rebuild ShellManager with new backend
         self._setup_shell_manager()
+        self._refresh_runtime_facts()
 
         logger.info(
             f"Backend swapped to {type(new_backend).__name__} "
@@ -2003,6 +2158,8 @@ class PersistentSession:
         if self.tool_context is not None:
             self.tool_context.citation_verdict_callback = None
             self.tool_context.canvas_event_callback = None
+            self.tool_context._resolved_tool_names = []
+            self.tool_context.session_runtime_facts = None
 
         if self._cloud_overlay_monitor_task is not None:
             self._cloud_overlay_monitor_task.cancel()

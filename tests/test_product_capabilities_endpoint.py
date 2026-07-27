@@ -408,9 +408,19 @@ def test_limit_truncation_is_explicit_and_schema_valid(endpoint):
 def test_main_application_includes_the_endpoint_exactly_once():
     import main
 
+    def effective_routes(routes):
+        """Flatten both copied and lazily included FastAPI router layouts."""
+
+        for route in routes:
+            original_router = getattr(route, "original_router", None)
+            if original_router is not None:
+                yield from effective_routes(original_router.routes)
+            else:
+                yield route
+
     matches = [
         route
-        for route in main.app.routes
+        for route in effective_routes(main.app.routes)
         if getattr(route, "path", None) == "/api/users/me/product-capabilities"
         and "GET" in getattr(route, "methods", set())
     ]

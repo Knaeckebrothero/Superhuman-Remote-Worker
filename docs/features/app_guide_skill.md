@@ -20,9 +20,10 @@ tags:
 > Normal deployment values were restored and the synthetic verification
 > resources were removed; **M1 is complete**. M2a's schema-1.0 typed contract
 > and immutable 18-definition registry are implemented. M2b's authenticated
-> server resolver and default-off dark endpoint are also implemented; M2c's
-> live session overlay and agent tool are next. The remaining runtime
-> capability plane, visual help, and Phases 3–8 remain open. Post-closure
+> server resolver and default-off dark endpoint and M2c's live session overlay
+> and separately gated agent tool are also implemented; M2d component
+> provenance is next. The remaining runtime capability plane, visual help, and
+> Phases 3–8 remain open. Post-closure
 > commit `02fed505`
 > added the missing Office-on-Canvas guide coverage; its focused inventory
 > regression and the complete current-tree M1 union pass. The 2026-07-27
@@ -30,7 +31,11 @@ tags:
 > formatting, diff, and both Helm lint gates also green. The M2 code/seam audit
 > and five-slice implementation design are complete. M2a passed its 83-test
 > focused verification; M2b passed its 192-test focused regression union plus
-> Ruff/format, diff, and both Helm lint gates on 2026-07-27. See
+> Ruff/format, diff, and both Helm lint gates. M2c passed the complete
+> source-derived M2 union (**748 tests**) plus repository-wide Ruff lint,
+> scoped Ruff format, diff, and both Helm lint profiles on 2026-07-27. The
+> repository-wide format check also identifies the pre-existing, unrelated
+> `orchestrator/database/postgres.py`; M2c leaves that file untouched. See
 > `docs/superpowers/plans/2026-07-27-app-guide-m2.md`.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
@@ -1552,17 +1557,32 @@ Helm lint profiles.
 
 #### M2c — live session overlay and agent tool
 
-- [ ] Record the final post-instantiation tool-name set in persistent
+- [x] Record the final post-instantiation tool-name set in persistent
   `ToolContext` and refresh it after backend/datasource rebinds.
-- [ ] Add a typed redacted runtime-facts snapshot for backend features,
+- [x] Add a typed redacted runtime-facts snapshot for backend features,
   aggregate datasource type/tier/connection state, knowledge, cloud, and
   attachments.
-- [ ] Add `get_product_capabilities` as a separate always-on product-help tool,
-  bound to the current user/thread and independent of Fleet toggles or the
-  App Guide break-glass switch.
-- [ ] Validate the server schema, overlay only live facts the agent observed,
+- [x] Add `get_product_capabilities` as a separately operator-gated
+  persistent-session product-help floor, bound to the current user/thread and
+  independent of Fleet toggles or the App Guide break-glass switch.
+- [x] Validate the server schema, overlay only live facts the agent observed,
   derive actionability from actual tools, and return bounded structured output
   plus a concise deterministic text summary.
+
+**Result (2026-07-27):** M2c is complete behind the default-off
+`PRODUCT_CAPABILITIES_TOOL_ENABLED` canary. Controlled live use requires both
+the tool and endpoint gates. Persistent sessions atomically publish immutable,
+redacted runtime facts after final tool enforcement and refresh or withdraw
+them across datasource/backend lifecycle changes. The agent validates and
+projects the server contract, overlays only those facts, and fails closed with
+bounded output; a server-only response still cannot claim live actionability.
+Direct email execution additionally requires the active connection's
+unattended-send enforcement flag, preventing a loaded `email_send` tool from
+overstating what it may execute. The full source-derived M2 regression union
+passed 748 tests; repository-wide Ruff lint, scoped Ruff format,
+`git diff --check`, and both Helm lint profiles passed. The repository-wide
+format check separately reports the pre-existing
+`orchestrator/database/postgres.py`, which this slice does not change.
 
 #### M2d — component provenance
 

@@ -13,9 +13,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
+from ..core.datasource_catalog import DATASOURCE_TYPES
 from ..core.workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,92 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from ..database.postgres_db import PostgresDB
     from ..services.knowledge.bindings import KnowledgeBinding
+
+
+WorkspaceBackendId = Literal["sandbox", "vm", "virtual", "none"]
+EmailAccessTier = Literal["read", "read_write", "draft", "send"]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRuntimeFacts:
+    """One immutable, redacted observation of a persistent session runtime.
+
+    The capability tool consumes this object instead of inspecting mutable
+    attach payloads or live connection objects during a model call. It carries
+    only public aggregate facts: no datasource/resource names or IDs,
+    accounts, folders, credentials, hosts, URLs, project IDs, or mount paths.
+    Replacing the reference on ``ToolContext`` is the atomic publication step.
+    """
+
+    observed_at: datetime
+    backend_id: WorkspaceBackendId | None
+    backend_supports_shell: bool
+    backend_supports_file_tools: bool
+    backend_supports_canvas_presentation: bool
+    backend_supports_canvas_live_apps: bool
+    backend_supports_shared_browser: bool
+    attached_datasource_types: tuple[str, ...] = ()
+    email_access_tier: EmailAccessTier | None = None
+    email_connection_failed: bool = False
+    email_direct_send_enabled: bool = False
+    knowledge_binding_available: bool = False
+    knowledge_store_available: bool = False
+    memory_available: bool = False
+    cloud_mount_active: bool = False
+    protected_cloud_active: bool = False
+    loaded_tool_names: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("SessionRuntimeFacts.observed_at must be timezone-aware")
+        object.__setattr__(
+            self,
+            "observed_at",
+            self.observed_at.astimezone(timezone.utc),
+        )
+
+        if self.backend_id not in {None, "sandbox", "vm", "virtual", "none"}:
+            raise ValueError("SessionRuntimeFacts contains an unknown backend ID")
+        if self.email_access_tier not in {
+            None,
+            "read",
+            "read_write",
+            "draft",
+            "send",
+        }:
+            raise ValueError("SessionRuntimeFacts contains an unknown email tier")
+
+        datasource_types = tuple(sorted(set(self.attached_datasource_types)))
+        if any(item not in DATASOURCE_TYPES for item in datasource_types):
+            raise ValueError("SessionRuntimeFacts contains an unknown datasource type")
+        object.__setattr__(self, "attached_datasource_types", datasource_types)
+
+        tool_names = tuple(sorted(set(self.loaded_tool_names)))
+        if any(
+            not isinstance(name, str)
+            or not name
+            or len(name) > 120
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}", name) is None
+            for name in tool_names
+        ):
+            raise ValueError("SessionRuntimeFacts contains an invalid tool name")
+        object.__setattr__(self, "loaded_tool_names", tool_names)
+
+        email_attached = "email" in datasource_types
+        if email_attached and self.email_access_tier is None:
+            raise ValueError("attached email requires an effective access tier")
+        if self.email_access_tier is not None and not email_attached:
+            raise ValueError("email_access_tier requires an attached email datasource")
+        if self.email_connection_failed and not email_attached:
+            raise ValueError(
+                "email_connection_failed requires an attached email datasource"
+            )
+        if self.email_direct_send_enabled and not email_attached:
+            raise ValueError(
+                "email_direct_send_enabled requires an attached email datasource"
+            )
+        if self.protected_cloud_active and not self.cloud_mount_active:
+            raise ValueError("protected cloud requires an active cloud mount")
 
 
 @dataclass
@@ -165,6 +252,10 @@ class ToolContext:
     )  # Parent's actually-loaded tool names, stashed post-load so the light
     # spawn_subagent backend can build a reader inheriting them (minus the
     # delegation category). Empty until _setup_job_tools finishes loading.
+    session_runtime_facts: Optional[SessionRuntimeFacts] = (
+        None  # Atomically replaced redacted persistent-session observation.
+        # Worker jobs and sessions still setting up/tearing down leave it None.
+    )
     _limits: Optional[Any] = None  # Parent LimitsConfig — used to build the
     # light-subagent reader LLM (create_llm(subagent_cfg, limits=...)).
 
