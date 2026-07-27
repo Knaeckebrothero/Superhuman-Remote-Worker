@@ -1094,3 +1094,185 @@ class TestCloseBacklogTicket:
         _, old_line, new_line = diffs[0]
         assert old_line.startswith("status:")
         assert new_line == "status: resolved"
+
+
+# =============================================================================
+# Task 7: GET /api/projects/{id}/backlog -- the cockpit-facing wire format
+# =============================================================================
+
+
+class TestBacklogEndpoint:
+    """The wire format must not leak the 0/1/2 rank encoding -- priority goes
+    out as a word (in both ``items`` and ``counts``), and the endpoint must
+    never filter or gate on it (Global constraint: priority is a
+    non-binding label). A ticket the active loop is already working
+    (``campaign.initiative_note_id``) is excluded from the pool and
+    surfaced separately as ``in_progress`` instead, so it's never listed
+    twice; "no active loop" and "loop with no campaign" must both degrade
+    to an empty-ish payload, never a raise.
+
+    Patch targets mirror the established idiom for this router (see
+    ``test_loop_campaign_scheduling.py::test_start_rejects_planner_with_invalid_template``):
+    the bare ``routers.project_loops`` import root (not
+    ``orchestrator.routers.project_loops`` -- conftest.py puts
+    ``orchestrator/`` first on sys.path so the router module actually
+    executes under the bare name, and patching the dotted name would
+    silently miss it), auth helpers patched where the router module bound
+    them at import time, and ``main.postgres_db`` / ``main.vector_db``
+    patched where the endpoint's late `from main import ...` will find them.
+    """
+
+    PROJECT_ID = "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"
+
+    def _loop(self, **over):
+        base: dict = {
+            "id": "105a6f98-134c-4077-b7e1-6d08916650d7",
+            "status": "running",
+            "campaign": None,
+        }
+        base.update(over)
+        return base
+
+    def _row(self, note_id, note_type="feature", title="T", priority=1):
+        return {
+            "note_id": note_id,
+            "note_type": note_type,
+            "title": title,
+            "priority": priority,
+        }
+
+    async def _call(self, *, loop, fetch_return, member_side_effect=None):
+        """Invoke the real endpoint with auth + DB reach mocked out.
+
+        Returns ``(response, fetch_backlog_mock)`` so callers can assert on
+        both the wire payload and how ``fetch_backlog`` was actually
+        invoked (e.g. its ``exclude_note_id`` kwarg).
+        """
+        from contextlib import ExitStack
+
+        from routers.project_loops import get_project_backlog
+
+        db = AsyncMock()
+        db.get_active_project_loop = AsyncMock(return_value=loop)
+        fetch = AsyncMock(return_value=fetch_return)
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "routers.project_loops.require_approved_user",
+                    AsyncMock(return_value={"id": str(uuid.uuid4())}),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "routers.project_loops.require_project_member",
+                    AsyncMock(side_effect=member_side_effect),
+                )
+            )
+            stack.enter_context(patch("main.postgres_db", db))
+            stack.enter_context(patch("main.vector_db", MagicMock()))
+            stack.enter_context(patch("routers.project_loops.fetch_backlog", fetch))
+
+            out = await get_project_backlog(MagicMock(), self.PROJECT_ID)
+        return out, fetch
+
+    @pytest.mark.asyncio
+    async def test_ranks_are_translated_to_words_in_items_and_counts(self):
+        """The 0/1/2 encoding must not survive to the wire in either shape
+        the client reads it from."""
+        rows = [self._row("f-1", priority=0), self._row("f-2", priority=2)]
+        counts = {0: 1, 1: 5, 2: 1}
+        out, _fetch = await self._call(loop=self._loop(), fetch_return=(rows, counts))
+
+        assert out["items"][0]["priority"] == "high"
+        assert out["items"][1]["priority"] == "low"
+        assert out["counts"] == {"high": 1, "normal": 5, "low": 1}
+        assert all(isinstance(k, str) for k in out["counts"])
+
+    @pytest.mark.asyncio
+    async def test_high_priority_rank_zero_is_not_dropped_or_mislabelled(self):
+        """Rank 0 (high) is falsy in Python -- a `row["priority"] or None`
+        or `counts.get(rank) or 0`-style bug would silently drop or
+        mislabel it. Prove a lone rank-0 ticket survives intact."""
+        rows = [self._row("only-ticket", priority=0)]
+        counts = {0: 1}
+        out, _fetch = await self._call(loop=self._loop(), fetch_return=(rows, counts))
+
+        assert out["total"] == 1
+        assert len(out["items"]) == 1
+        assert out["items"][0]["priority"] == "high"
+        assert out["counts"]["high"] == 1
+
+    @pytest.mark.asyncio
+    async def test_exclude_note_id_passed_through_from_campaign(self):
+        """The in-progress ticket keeps status='active' in the KB -- the
+        pool query must genuinely receive its note_id as the exclusion, not
+        just happen to omit it from a canned fixture."""
+        loop = self._loop(
+            campaign={"initiative_note_id": "issue-underway", "title": "Underway thing"}
+        )
+        out, fetch = await self._call(loop=loop, fetch_return=([], {}))
+
+        assert fetch.await_args.kwargs["exclude_note_id"] == "issue-underway"
+        assert out["in_progress"] == {
+            "note_id": "issue-underway",
+            "title": "Underway thing",
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_campaign_excludes_nothing(self):
+        """An active loop that hasn't filed a campaign yet must not raise
+        and must not fabricate an exclusion."""
+        out, fetch = await self._call(
+            loop=self._loop(campaign=None), fetch_return=([], {})
+        )
+
+        assert fetch.await_args.kwargs["exclude_note_id"] is None
+        assert out["in_progress"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_active_loop_returns_well_formed_empty_payload(self):
+        """No loop at all (project never started one, or its only loop is
+        terminal) must degrade to an empty-ish payload, not a raise or a
+        404 -- the pool itself is still a real, answerable question."""
+        out, fetch = await self._call(loop=None, fetch_return=([], {}))
+
+        assert fetch.await_args.kwargs["exclude_note_id"] is None
+        assert out == {
+            "total": 0,
+            "counts": {"high": 0, "normal": 0, "low": 0},
+            "in_progress": None,
+            "items": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_member_is_rejected(self):
+        """Auth is a real gate here, not decoration: a caller
+        ``require_project_member`` rejects must not reach the DB/backlog
+        fetch at all."""
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc:
+            await self._call(
+                loop=self._loop(),
+                fetch_return=([], {}),
+                member_side_effect=HTTPException(
+                    status_code=403, detail="not a project member"
+                ),
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_priority_does_not_filter_or_reorder_items(self):
+        """Global constraint: priority is a non-binding label. The endpoint
+        must hand back exactly what fetch_backlog returned, in the same
+        order, regardless of rank -- it has no business re-sorting or
+        dropping rows itself."""
+        rows = [
+            self._row("a", priority=2),
+            self._row("b", priority=0),
+            self._row("c", priority=1),
+        ]
+        out, _fetch = await self._call(loop=self._loop(), fetch_return=(rows, {}))
+
+        assert [i["note_id"] for i in out["items"]] == ["a", "b", "c"]
