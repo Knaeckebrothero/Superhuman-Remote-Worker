@@ -19,7 +19,11 @@ tags:
 > with zero critical forbidden claims, near-miss false positives, or errors.
 > Normal deployment values were restored and the synthetic verification
 > resources were removed; **M1 is complete**. The runtime capability plane,
-> visual help, and Phases 2–8 remain open.
+> visual help, and Phases 2–8 remain open. Post-closure commit `02fed505`
+> added the missing Office-on-Canvas guide coverage; its focused inventory
+> regression and the complete current-tree M1 union pass. The 2026-07-27
+> revalidation result is **774 passed, 0 deselected, 10 warnings**, with Ruff,
+> formatting, diff, and both Helm lint gates also green.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -409,12 +413,15 @@ The final original-reference audit is implemented:
   pin consequential Jobs/Experts/Memory boundaries, and prove that the managed
   reader loads those topics independently.
 
-The final M1-scoped Python union passes **607 tests** with one explicit
-deselection and six existing warnings. The deselection keeps an unrelated
-concurrent Canvas/Office coverage gap visible: `CanvasRenderer` includes
-`office`, while the separate Office work has not yet classified that renderer
-in the App Guide coverage contract. It is neither hidden nor counted as App
-Guide coverage.
+At M1 closure, the scoped Python union passed **607 tests** with one explicit
+deselection and six existing warnings. That deselection exposed a concurrent
+Canvas/Office coverage gap: `CanvasRenderer` included `office` before the App
+Guide classified it. Post-closure commit `02fed505` now documents Office file
+types, deployment gating, renderer selection/failure behavior, and turn-based
+editing, and adds `office` to the inventory coverage decision. The formerly
+deselected focused regression and the complete 18-module M1 union pass on
+current source `507df822ac35793690a618489c68611a3e066fe6`:
+**774 passed, 0 deselected, 10 warnings** in 52.83 seconds.
 
 ### Implemented M1f work package 2 — operator break-glass and health
 
