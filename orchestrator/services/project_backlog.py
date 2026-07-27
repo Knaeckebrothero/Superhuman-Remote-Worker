@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 # Canonical copy: src/services/knowledge_graph.py (not importable here — the
 # orchestrator image has no agent deps; see kb_reindex.py for the same pattern).
 PRIORITY_WORDS: dict[int, str] = {0: "high", 1: "normal", 2: "low"}
-DEFAULT_PRIORITY_RANK = 1
 
 BACKLOG_NOTE_TYPES: tuple[str, ...] = ("feature", "issue", "idea")
 
@@ -81,7 +80,7 @@ async def fetch_backlog(
                AND status = 'active'
                AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
                AND ($2::text IS NULL OR note_id <> $2)
-             ORDER BY priority ASC, created_at ASC
+             ORDER BY priority ASC, created_at ASC NULLS LAST, note_id ASC
              LIMIT $3
             """,
             project_id,
@@ -193,6 +192,16 @@ def render_backlog_block(
 _STATUS_LINE = re.compile(r"^status:.*$", re.MULTILINE)
 
 
+def _rowcount(command_status: Any) -> int:
+    """Parse asyncpg's ``conn.execute()`` status tag (``"UPDATE 1"``) into a
+    row count. Returns -1 (never 0) on anything unparseable, so a shape this
+    doesn't recognise can never be mistaken for the real zero-rows case."""
+    try:
+        return int(str(command_status).strip().rsplit(" ", 1)[-1])
+    except ValueError:
+        return -1
+
+
 def _rewrite_status(markdown: str, new_status: str) -> str:
     """Replace the frontmatter ``status:`` line, or insert one if absent.
 
@@ -224,7 +233,12 @@ async def close_backlog_ticket(
     The database (campaign + campaign_history) stays authoritative for what the
     loop did; this only keeps the pool and the human-readable note in step.
     Best-effort by contract: a disposition must never fail because a mirror
-    write failed. Returns True only when the durable (file) write succeeded.
+    write failed. Returns True only when the durable (file) write succeeded
+    AND actually changed the note's status line — a byte-identical rewrite
+    (no frontmatter block, or one ``_rewrite_status`` couldn't find a closing
+    ``---`` in) means the file was never really touched, and claiming success
+    there would hide exactly the case that most needs a human to look at the
+    note by hand.
     """
     repo_name = f"project-{str(project_id)[:8]}-jobs"
     file_path = f"knowledge/{note_id}.md"
@@ -233,14 +247,24 @@ async def close_backlog_ticket(
         current = await gitea.get_file_content(repo_name, file_path)
         if current:
             updated = _rewrite_status(current, new_status)
-            file_written = bool(
-                await gitea.create_or_update_file(
-                    repo_name,
+            if updated == current:
+                logger.warning(
+                    "backlog: %s has no rewritable frontmatter status line "
+                    "(missing or malformed frontmatter) — %s → %s left the "
+                    "file untouched; index-only close",
                     file_path,
-                    updated,
-                    f"backlog: {note_id} → {new_status}",
+                    note_id,
+                    new_status,
                 )
-            )
+            else:
+                file_written = bool(
+                    await gitea.create_or_update_file(
+                        repo_name,
+                        file_path,
+                        updated,
+                        f"backlog: {note_id} → {new_status}",
+                    )
+                )
         else:
             logger.info(
                 "backlog: note file %s not found in %s — index-only close",
@@ -258,7 +282,7 @@ async def close_backlog_ticket(
 
     try:
         async with vector_db.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 """
                 UPDATE knowledge_index
                    SET status = $3, modified_at = NOW()
@@ -271,6 +295,28 @@ async def close_backlog_ticket(
                 new_status,
                 list(BACKLOG_NOTE_TYPES),
             )
+            if _rowcount(result) == 0:
+                # UPDATE 0: either no such note, or one that exists but isn't
+                # a ticket type (e.g. a `decision` note mistakenly filed as a
+                # campaign initiative — B1). Look up what's actually there so
+                # the warning names the mismatch instead of just the symptom.
+                actual_type = await conn.fetchval(
+                    "SELECT note_type FROM knowledge_index "
+                    "WHERE project_id = $1::uuid AND note_id = $2",
+                    project_id,
+                    note_id,
+                )
+                logger.warning(
+                    "backlog: index close matched 0 rows for note_id=%s "
+                    "(project %s, wanted status=%s) — stored note_type is "
+                    "%r, expected one of %s; a close that closes nothing "
+                    "must not be silent",
+                    note_id,
+                    project_id,
+                    new_status,
+                    actual_type,
+                    BACKLOG_NOTE_TYPES,
+                )
     except Exception:
         logger.warning(
             "backlog: index mirror failed for %s (%s)",

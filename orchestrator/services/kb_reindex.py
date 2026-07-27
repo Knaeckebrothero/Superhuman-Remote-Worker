@@ -25,6 +25,7 @@ import posixpath
 import re
 import uuid
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from src.tools.knowledge.chunker import (
@@ -159,16 +160,44 @@ def plan_reindex(
     return upserts, deletes
 
 
+def _parse_created_at(value: Any) -> Optional[datetime]:
+    """Best-effort parse of frontmatter ``created`` into a timestamp.
+
+    ``_render_note_md`` writes ``created:`` unquoted (knowledge_tools.py:449),
+    so YAML's implicit timestamp resolver has usually already turned the
+    common case into a native ``datetime``/``date`` by the time it reaches
+    here — this only has real work to do for a quoted string or a stray
+    type. Never raises: an unparseable ``created:`` line must still let the
+    note index, just without a ``created_at`` (the pool query's
+    ``NULLS LAST`` ordering already covers that — project_backlog.py).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
 def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str, Any]:
     """Map a parsed note file onto ``upsert_kb_note`` arguments.
 
     The inverse of ``_render_note_md``'s frontmatter (id/type/tags/keywords/
-    confidence/status/priority/superseded_by), hardened for human-authored
-    files: a missing frontmatter block derives the id from the filename stem
-    and the title from the first H1; values outside the CHECK-constraint
-    vocabularies (valid_note_type / valid_note_status) — and unrecognised
-    ``priority`` words — fall back to safe defaults rather than failing the
-    INSERT.
+    confidence/status/priority/created/superseded_by), hardened for
+    human-authored files: a missing frontmatter block derives the id from the
+    filename stem and the title from the first H1; values outside the
+    CHECK-constraint vocabularies (valid_note_type / valid_note_status) — and
+    unrecognised ``priority`` words — fall back to safe defaults rather than
+    failing the INSERT.
 
     ``priority`` is the one field that does NOT follow that "unknown ->
     default" rule (fix round 2, Finding 3): an *absent* ``priority`` key maps
@@ -179,7 +208,18 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     it would silently stamp "normal" over a real priority on the very next
     reindex. An *invalid* value (a typo) is different: the value is present,
     just unparseable, so it still falls back to ``_DEFAULT_PRIORITY_RANK``
-    rather than propagating garbage or failing the row.
+    rather than propagating garbage or failing the row. The numeric rank
+    itself (0/1/2, int or numeric string) is also accepted, not just the
+    word: a user who reads ``knowledge_index.priority`` (0=high) elsewhere
+    and writes it straight back (``priority: 0``) must round-trip rather than
+    silently landing on "normal" via the word-only lookup.
+
+    ``created`` maps to ``created_at`` (project-backlog-pipeline fix wave,
+    finding B3): this is the only ingest path that can set it at all, since
+    the reindexer INSERTs new rows with no ``created_at`` otherwise — the
+    cockpit's backlog panel is read-only, so a hand-authored file is the only
+    way a user files a ticket, and without this it always sorts as if newest
+    (NULL), regardless of the ticket's real age.
     """
     fm = fm or {}
 
@@ -205,9 +245,18 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
         # use the default" like type/status above. See the docstring note.
         priority: Optional[int] = None
     else:
-        priority = PRIORITY_RANKS.get(
-            str(raw_priority).strip().lower(), _DEFAULT_PRIORITY_RANK
-        )
+        priority = None
+        if not isinstance(raw_priority, bool):
+            try:
+                as_rank: Optional[int] = int(raw_priority)
+            except (TypeError, ValueError):
+                as_rank = None
+            if as_rank in PRIORITY_RANKS.values():
+                priority = as_rank
+        if priority is None:
+            priority = PRIORITY_RANKS.get(
+                str(raw_priority).strip().lower(), _DEFAULT_PRIORITY_RANK
+            )
 
     def _as_list(value: Any) -> List[str]:
         if value is None:
@@ -229,6 +278,7 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
         "keywords": _as_list(fm.get("keywords")),
         "confidence": str(confidence)[:_CONFIDENCE_MAX] if confidence else None,
         "superseded_by": str(superseded_by)[:_NOTE_ID_MAX] if superseded_by else None,
+        "created_at": _parse_created_at(fm.get("created")),
     }
 
 
@@ -640,6 +690,7 @@ async def _reindex_snapshot(
                 keywords=fields["keywords"],
                 superseded_by=fields["superseded_by"],
                 priority=fields["priority"],
+                created_at=fields["created_at"],
             )
             await store.replace_note_chunks(
                 note_row=note_row,
