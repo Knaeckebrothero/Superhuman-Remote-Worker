@@ -205,3 +205,95 @@ async def test_suspended_workspace_status_fires_restore():
     susp.restore.assert_awaited_once()
     prov.create_workspace.assert_not_called()
     assert res.outcome == EnsureOutcome.PENDING
+
+
+@pytest.mark.asyncio
+async def test_ensure_skips_vm_backend_thread():
+    """A vm-tier session's workspace IS the VM (metadata.vm, owned by
+    vm_provisioner) — ensure must not provision a sandbox container alongside it
+    (docs/issues/session_vm_backend_never_attaches.md, Defect 1)."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "status": "active",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "vm"}},
+            },
+        }
+    )
+    prov = AsyncMock()
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+    assert res is None
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_skips_vm_backend_thread_legacy_remote_alias():
+    """'remote' is the legacy alias for 'vm' and must skip identically."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "status": "active",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "remote"}},
+            },
+        }
+    )
+    prov = AsyncMock()
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+    assert res is None
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_skips_vm_backend_thread_str_metadata():
+    """Same skip when metadata arrives as a JSON string (asyncpg JSONB)."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "status": "active",
+            "metadata": '{"config_override": {"workspace": {"backend": "vm"}}}',
+        }
+    )
+    prov = AsyncMock()
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+    assert res is None
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ensure_skips_vm_thread_with_gitea_workspace_container():
+    """The exact production shape that regressed: _setup_gitea writes
+    workspace_container={git_remote_url, repo_name} for EVERY thread including
+    vm-tier ones, with no 'status' key. That entry must not be read as "a
+    container belongs here" — this is the state that made both /prepare and the
+    reconcile sweep provision a sandbox pod for a VM session."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": "t1",
+            "status": "active",
+            "metadata": {
+                "config_override": {"workspace": {"backend": "vm"}},
+                "workspace_container": {
+                    "git_remote_url": "http://gitea/srw/thread-t1.git",
+                    "repo_name": "thread-t1",
+                },
+            },
+        }
+    )
+    prov = AsyncMock()
+    res = await ensure_session_workspace(
+        "t1", db=db, provisioner=prov, suspension=AsyncMock()
+    )
+    assert res is None
+    prov.create_workspace.assert_not_called()
