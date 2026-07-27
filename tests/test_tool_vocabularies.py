@@ -102,6 +102,24 @@ class TestVocabularyDrift:
         assert enum is not None
         assert set(enum) == set(_AUTONOMY_VALUES)
 
+    def test_backlog_ticket_types_are_in_every_vocabulary(self):
+        """A ticket type missing from any one site silently degrades: the tool
+        rejects it, or kb_reindex rewrites it to 'learning' on the next pass."""
+        from orchestrator.services.kb_reindex import VALID_NOTE_TYPES
+        from src.services.knowledge_graph import NOTE_TYPES
+        from src.tools.knowledge.knowledge_tools import NoteTypeValue
+
+        for ticket_type in ("feature", "issue", "idea"):
+            assert ticket_type in NOTE_TYPES
+            assert ticket_type in set(get_args(NoteTypeValue))
+            assert ticket_type in VALID_NOTE_TYPES
+
+    def test_priority_literal_matches_priority_ranks(self):
+        from src.services.knowledge_graph import PRIORITY_RANKS
+        from src.tools.knowledge.knowledge_tools import PriorityValue
+
+        assert set(get_args(PriorityValue)) == set(PRIORITY_RANKS)
+
 
 # =============================================================================
 # 2 + 3. CONSTRAINT and SURVIVAL — the schema carries enum, and keeps it
