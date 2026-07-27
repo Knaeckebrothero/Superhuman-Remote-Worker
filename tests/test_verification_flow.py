@@ -768,6 +768,146 @@ class TestEscalateTarget:
         )
 
 
+def _patch_escalation_collaborators(monkeypatch, main_module):
+    """Stub the three side effects ``_escalate_target`` fires and return them."""
+    update_mock = AsyncMock()
+    wake_mock = AsyncMock()
+    kick_mock = MagicMock()
+    notify_mock = AsyncMock()
+    monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+    monkeypatch.setattr(main_module, "maybe_wake_session", wake_mock)
+    monkeypatch.setattr(main_module, "_kick_session_wake_drain", kick_mock)
+    monkeypatch.setattr(
+        main_module.notification_service,
+        "notify_review_returned_to_manual",
+        notify_mock,
+    )
+    return update_mock, wake_mock, kick_mock, notify_mock
+
+
+class TestEscalateTargetWakesAndNotifies:
+    """``_escalate_target`` is a TERMINAL transition with no /complete of its
+    own — the same property its sibling ``_set_target_to_autonomy_status``
+    carries a comment about. Without the wake it arrives a sweeper tick late
+    for every escalated job; without a notification, "escalates to a human"
+    means "sits in a queue nobody is paged about".
+    """
+
+    @pytest.mark.asyncio
+    async def test_wakes_the_creating_session(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _escalate_target
+
+        _, wake_mock, kick_mock, _ = _patch_escalation_collaborators(
+            monkeypatch, main_module
+        )
+
+        job = {"id": "t1", "context": {}, "user_id": "u1", "config_name": "developer"}
+        await _escalate_target("t1", job, "no progress")
+
+        wake_mock.assert_awaited_once_with(
+            main_module.postgres_db, "t1", "pending_review"
+        )
+        kick_mock.assert_called_once_with(main_module.postgres_db)
+
+    @pytest.mark.asyncio
+    async def test_wake_uses_the_loop_terminal_status(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _escalate_target
+
+        _, wake_mock, _, _ = _patch_escalation_collaborators(monkeypatch, main_module)
+
+        job = {"id": "t1", "context": {"loop_id": "l1"}, "user_id": "u1"}
+        await _escalate_target("t1", job, "round limit reached")
+
+        wake_mock.assert_awaited_once_with(main_module.postgres_db, "t1", "completed")
+
+    @pytest.mark.asyncio
+    async def test_notifies_the_owner_with_the_reason(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _escalate_target
+
+        _, _, _, notify_mock = _patch_escalation_collaborators(monkeypatch, main_module)
+
+        job = {"id": "t1", "context": {}, "user_id": "u1", "config_name": "developer"}
+        await _escalate_target("t1", job, "No progress since round 2: F1 open.")
+
+        notify_mock.assert_awaited_once()
+        kwargs = notify_mock.call_args.kwargs
+        assert kwargs["user_id"] == "u1"
+        assert kwargs["job_id"] == "t1"
+        assert kwargs["config_name"] == "developer"
+        assert "No progress since round 2" in kwargs["reason"]
+
+    @pytest.mark.asyncio
+    async def test_loop_job_is_not_notified(self, monkeypatch):
+        """A loop job resolves 'completed' and its reason is read by the loop
+        retro from ``error_message``. Paging a human per iteration is noise,
+        not signal."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _escalate_target
+
+        _, _, _, notify_mock = _patch_escalation_collaborators(monkeypatch, main_module)
+
+        job = {"id": "t1", "context": {"loop_id": "l1"}, "user_id": "u1"}
+        await _escalate_target("t1", job, "round limit reached")
+
+        notify_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ownerless_job_is_not_notified_and_still_escalates(
+        self, monkeypatch
+    ):
+        import orchestrator.main as main_module
+        from orchestrator.main import _escalate_target
+
+        update_mock, _, _, notify_mock = _patch_escalation_collaborators(
+            monkeypatch, main_module
+        )
+
+        status = await _escalate_target("t1", {"id": "t1", "context": {}}, "why")
+
+        assert status == "pending_review"
+        update_mock.assert_awaited_once()
+        notify_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_notification_failure_does_not_break_the_escalation(
+        self, monkeypatch
+    ):
+        """The status write is the load-bearing part. A notifier outage must
+        not leave the target in 'reviewing' — the wedge this design removes."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _escalate_target
+
+        update_mock, _, _, notify_mock = _patch_escalation_collaborators(
+            monkeypatch, main_module
+        )
+        notify_mock.side_effect = RuntimeError("SMTP down")
+
+        job = {"id": "t1", "context": {}, "user_id": "u1", "config_name": "developer"}
+        status = await _escalate_target("t1", job, "why")
+
+        assert status == "pending_review"
+        update_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_wake_failure_does_not_break_the_escalation(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _escalate_target
+
+        update_mock, wake_mock, _, _ = _patch_escalation_collaborators(
+            monkeypatch, main_module
+        )
+        wake_mock.side_effect = RuntimeError("db down")
+
+        job = {"id": "t1", "context": {}, "user_id": "u1"}
+        status = await _escalate_target("t1", job, "why")
+
+        assert status == "pending_review"
+        update_mock.assert_awaited_once()
+
+
 def _make_completion_job(
     *,
     job_id: str = "target-1",
