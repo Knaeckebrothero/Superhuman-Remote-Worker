@@ -1260,7 +1260,9 @@ class PostgresDB:
         """
         if keep_n < 1:
             # keep_n<1 would delete the latest checkpoint (the resume state). Refuse.
-            logger.warning("prune_checkpoints_keep_last: refusing keep_n=%s (<1)", keep_n)
+            logger.warning(
+                "prune_checkpoints_keep_last: refusing keep_n=%s (<1)", keep_n
+            )
             return 0
         if os.getenv("CHECKPOINTER_BACKEND", "sqlite").strip().lower() != "postgres":
             return 0
@@ -3900,6 +3902,7 @@ class PostgresDB:
         agent_mode: str = "worker",
         thread_id: str | None = None,
         build_sha: str | None = None,
+        product_provenance: Dict[str, Any] | None = None,
         pod_uid: str | None = None,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
@@ -3917,6 +3920,14 @@ class PostgresDB:
         Returns:
             Dict with agent_id and heartbeat_interval_seconds
         """
+        registration_metadata = json.dumps(
+            {
+                "build_sha": build_sha or "",
+                "product_provenance": product_provenance
+                or {"provenance_status": "unavailable"},
+            }
+        )
+
         async with self.acquire() as conn:
             # Check for existing agent with same hostname
             if hostname:
@@ -3967,7 +3978,7 @@ class PostgresDB:
                         agent_id,
                         agent_mode,
                         thread_id,
-                        json.dumps({"build_sha": build_sha or ""}),
+                        registration_metadata,
                         pod_uid,
                     )
                     return {
@@ -3989,7 +4000,7 @@ class PostgresDB:
                 pid,
                 agent_mode,
                 thread_id,
-                json.dumps({"build_sha": build_sha or ""}),
+                registration_metadata,
                 pod_uid,
             )
 

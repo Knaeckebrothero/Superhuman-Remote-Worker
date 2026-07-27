@@ -13,6 +13,9 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 from pydantic import BaseModel
 
+from src.core.product_capabilities import ProductComponent
+from src.core.runtime_provenance import component_provenance_from_environment
+
 logger = logging.getLogger(__name__)
 
 
@@ -335,6 +338,11 @@ class OrchestratorClient:
             await self.connect()
 
         url = f"{self.orchestrator_url}/api/agents/register"
+        product_provenance = component_provenance_from_environment(
+            os.environ,
+            ProductComponent.AGENT,
+            include_common=True,
+        )
         payload = {
             "config_name": self.config_name,
             "pod_ip": self.pod_ip,
@@ -344,6 +352,7 @@ class OrchestratorClient:
             "agent_mode": agent_mode,
             "thread_id": thread_id,
             "build_sha": os.environ.get("BUILD_SHA", ""),
+            "product_provenance": product_provenance.model_dump(mode="json"),
             # Injected via Kubernetes downward API by agent_provisioner; empty
             # outside of K8s (local dev). The orchestrator persists this on
             # the agents row so the session router can construct K8s

@@ -29,7 +29,7 @@ spec:
           command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-orchestrator 8085; do sleep 2; done"]
       containers:
         - name: mcp
-          image: "{{ .Values.image.mcp.repository }}:{{ .Values.image.mcp.tag }}"
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.mcp) | quote }}
           imagePullPolicy: {{ .Values.image.mcp.pullPolicy }}
           ports:
             - containerPort: 8000

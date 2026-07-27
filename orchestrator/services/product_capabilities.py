@@ -13,6 +13,7 @@ agent in M2c. Every result from this module therefore keeps
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -27,6 +28,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -74,6 +76,12 @@ from src.core.product_capabilities import (
     evaluate_layer_safely,
     validate_capability_against_definition,
     validate_capability_registry,
+)
+from src.core.runtime_provenance import (
+    build_product_provenance,
+    component_provenance_from_environment,
+    inherited_content_provenance,
+    unavailable_component_provenance,
 )
 
 logger = logging.getLogger(__name__)
@@ -218,6 +226,50 @@ LayerResolver: TypeAlias = Callable[
 LayerResolverOverrides: TypeAlias = Mapping[
     tuple[CapabilityResolverKey, LayerName], LayerResolver
 ]
+AgentProvenanceResolver: TypeAlias = Callable[
+    [Any, Mapping[str, Any] | None],
+    Awaitable[ComponentProvenance],
+]
+
+
+async def registered_agent_provenance(
+    postgres_db: Any,
+    admitted_thread: Mapping[str, Any] | None,
+) -> ComponentProvenance:
+    """Read only the safe, validated provenance from the bound agent row."""
+
+    if admitted_thread is None:
+        return unavailable_component_provenance()
+    agent_id = admitted_thread.get("agent_id")
+    get_agent = getattr(postgres_db, "get_agent", None)
+    if not agent_id or not callable(get_agent):
+        return unavailable_component_provenance()
+    try:
+        agent = await get_agent(str(agent_id))
+    except Exception:
+        return unavailable_component_provenance()
+    if not isinstance(agent, Mapping) or agent.get("status") in {"offline", "failed"}:
+        return unavailable_component_provenance()
+
+    metadata = agent.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, UnicodeError):
+            return unavailable_component_provenance()
+    if not isinstance(metadata, Mapping):
+        return unavailable_component_provenance()
+    try:
+        provenance = ComponentProvenance.model_validate(
+            metadata.get("product_provenance")
+        )
+    except (TypeError, ValidationError):
+        return unavailable_component_provenance()
+    # M2d accepts declarations only. Verified/SLSA provenance remains a later
+    # trust-policy feature and cannot be self-asserted by a registering agent.
+    if provenance.provenance_status is ProvenanceStatus.VERIFIED:
+        return unavailable_component_provenance()
+    return provenance
 
 
 @dataclass(slots=True)
@@ -350,6 +402,9 @@ class ProductCapabilityService:
         resolver_overrides: LayerResolverOverrides | None = None,
         datasource_types: frozenset[str] = DATASOURCE_TYPES,
         environment: Mapping[str, str] | None = None,
+        agent_provenance_resolver: AgentProvenanceResolver = (
+            registered_agent_provenance
+        ),
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
@@ -364,6 +419,7 @@ class ProductCapabilityService:
         self._resolver_overrides = dict(resolver_overrides or {})
         self._datasource_types = frozenset(datasource_types)
         self._environment = os.environ if environment is None else environment
+        self._agent_provenance_resolver = agent_provenance_resolver
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
         if max_response_bytes < 1024:
@@ -387,6 +443,7 @@ class ProductCapabilityService:
 
         selected, selection_errors, truncated = self._select_definitions(request)
         grants, grants_failed = await self._resolve_grants(request, selected)
+        product = await self._resolve_product_provenance(admitted_thread)
         state = _ResolutionState(
             request=request,
             admitted_thread=admitted_thread,
@@ -411,6 +468,7 @@ class ProductCapabilityService:
             capabilities=capabilities,
             errors=errors,
             truncated=truncated,
+            product=product,
         )
         self._emit_metrics(
             response,
@@ -529,6 +587,51 @@ class ProductCapabilityService:
         except Exception:
             return None, True
         return grants, False
+
+    async def _resolve_product_provenance(
+        self,
+        admitted_thread: Mapping[str, Any] | None,
+    ) -> ProductProvenance:
+        orchestrator = component_provenance_from_environment(
+            self._environment,
+            ProductComponent.ORCHESTRATOR,
+            include_common=True,
+        )
+        try:
+            agent = await self._agent_provenance_resolver(
+                self._db,
+                admitted_thread,
+            )
+        except Exception:
+            agent = unavailable_component_provenance()
+        if not isinstance(agent, ComponentProvenance):
+            agent = unavailable_component_provenance()
+
+        components = {
+            ProductComponent.REGISTRY: inherited_content_provenance(
+                orchestrator,
+                content_digest=REGISTRY_REVISION,
+            ),
+            ProductComponent.ORCHESTRATOR: orchestrator,
+            ProductComponent.AGENT: agent,
+            ProductComponent.COCKPIT: component_provenance_from_environment(
+                self._environment,
+                ProductComponent.COCKPIT,
+            ),
+            ProductComponent.GUIDE: unavailable_component_provenance(),
+            ProductComponent.WORKSPACE: component_provenance_from_environment(
+                self._environment,
+                ProductComponent.WORKSPACE,
+            ),
+            ProductComponent.MCP: component_provenance_from_environment(
+                self._environment,
+                ProductComponent.MCP,
+            ),
+        }
+        return build_product_provenance(
+            components,
+            release_version=orchestrator.release_version,
+        )
 
     def _resolve_capability(
         self,
@@ -868,6 +971,7 @@ class ProductCapabilityService:
         capabilities: list[ProductCapability],
         errors: list[EvaluationError],
         truncated: bool,
+        product: ProductProvenance,
     ) -> ProductCapabilitiesResponse:
         errors = sorted(set(errors), key=_error_sort_key)
         if len(errors) > MAX_EVALUATION_ERRORS:
@@ -882,6 +986,7 @@ class ProductCapabilityService:
             capabilities=capabilities,
             errors=errors,
             truncated=truncated,
+            product=product,
         )
         if self._encoded_size(response) <= self._max_response_bytes:
             return response
@@ -901,6 +1006,7 @@ class ProductCapabilityService:
                 capabilities=capabilities,
                 errors=errors,
                 truncated=truncated,
+                product=product,
             )
             if self._encoded_size(response) <= self._max_response_bytes:
                 return response
@@ -923,6 +1029,7 @@ class ProductCapabilityService:
                 capabilities=capabilities,
                 errors=errors,
                 truncated=truncated,
+                product=product,
             )
             if self._encoded_size(response) <= self._max_response_bytes:
                 return response
@@ -949,6 +1056,7 @@ class ProductCapabilityService:
         capabilities: list[ProductCapability],
         errors: list[EvaluationError],
         truncated: bool,
+        product: ProductProvenance,
     ) -> ProductCapabilitiesResponse:
         partial = bool(errors) or truncated
         return ProductCapabilitiesResponse(
@@ -964,13 +1072,7 @@ class ProductCapabilityService:
                 ),
                 thread_id=request.thread_id,
             ),
-            product=ProductProvenance(
-                components={
-                    ProductComponent.ORCHESTRATOR: ComponentProvenance(
-                        provenance_status=ProvenanceStatus.UNAVAILABLE
-                    )
-                }
-            ),
+            product=product,
             capabilities=tuple(capabilities),
             evaluation_errors=tuple(errors),
         )
@@ -1029,4 +1131,5 @@ __all__ = [
     "ProductCapabilityService",
     "ResolutionRequest",
     "product_capabilities_endpoint_enabled",
+    "registered_agent_provenance",
 ]

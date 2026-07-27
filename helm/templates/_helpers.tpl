@@ -83,6 +83,55 @@ ConfigMap name (used by all deployments that read from the shared configmap).
 {{- end }}
 
 {{/*
+First-party image reference. A real digest pin takes precedence over the
+display/update tag; an empty digest preserves the existing repository:tag
+behavior.
+Usage: {{ include "srw.imageRef" (dict "image" .Values.image.agent) }}
+*/}}
+{{- define "srw.imageRef" -}}
+{{- $digest := default "" .image.digest -}}
+{{- if $digest -}}
+{{- printf "%s@%s" .image.repository $digest -}}
+{{- else -}}
+{{- printf "%s:%s" .image.repository .image.tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Bounded public deployment provenance consumed by the orchestrator and
+dynamically provisioned agents. The image digest comes only from the same
+value that srw.imageRef uses, so a tag can never be reported as an artifact
+digest. MCP is omitted when its deployment is disabled.
+*/}}
+{{- define "srw.deploymentProvenanceJson" -}}
+{{- $root := . -}}
+{{- $components := dict -}}
+{{- range $name := list "orchestrator" "agent" "cockpit" "workspace" -}}
+  {{- $image := index $root.Values.image $name -}}
+  {{- $declaration := index $root.Values.provenance.components $name -}}
+  {{- $_ := set $components $name (dict
+      "source_revision" (default "" $declaration.sourceRevision)
+      "artifact_digest" (default "" $image.digest)
+      "release_version" (default "" $declaration.releaseVersion)
+    ) -}}
+{{- end -}}
+{{- if $root.Values.mcp.enabled -}}
+  {{- $image := $root.Values.image.mcp -}}
+  {{- $declaration := $root.Values.provenance.components.mcp -}}
+  {{- $_ := set $components "mcp" (dict
+      "source_revision" (default "" $declaration.sourceRevision)
+      "artifact_digest" (default "" $image.digest)
+      "release_version" (default "" $declaration.releaseVersion)
+    ) -}}
+{{- end -}}
+{{- dict
+    "source_url" (default "" $root.Values.provenance.sourceUrl)
+    "documentation_url" (default "" $root.Values.provenance.documentationUrl)
+    "components" $components
+  | toJson -}}
+{{- end }}
+
+{{/*
 VM controller — resource names + URLs. The controller can run in the same
 namespace as the orchestrator (vmController.namespace = .Release.Namespace)
 or in a dedicated namespace (the typical case). When enabled, the controller

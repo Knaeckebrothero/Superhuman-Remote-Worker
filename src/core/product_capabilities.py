@@ -35,7 +35,7 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 SCHEMA_MAJOR = 1
 
 MAX_CAPABILITY_ID_LENGTH = 120
@@ -621,29 +621,46 @@ class ComponentProvenance(_FrozenModel):
     source_url: str | None = Field(default=None, min_length=1, max_length=2048)
     artifact_digest: Sha256Digest | None = None
     content_digest: Sha256Digest | None = None
+    release_version: str | None = Field(default=None, min_length=1, max_length=80)
+    documentation_url: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=2048,
+    )
     provenance_status: ProvenanceStatus
 
-    @field_validator("source_url")
+    @field_validator("source_url", "documentation_url")
     @classmethod
-    def validate_source_url(cls, value: str | None) -> str | None:
+    def validate_public_url(cls, value: str | None) -> str | None:
         if value is None:
             return None
         if value != value.strip() or not value.startswith("https://"):
-            raise ValueError("source_url must be an absolute HTTPS URL")
+            raise ValueError("provenance URL must be an absolute HTTPS URL")
         if "@" in value.split("://", 1)[1].split("/", 1)[0]:
-            raise ValueError("source_url may not contain URL credentials")
+            raise ValueError("provenance URL may not contain URL credentials")
+        return value
+
+    @field_validator("release_version")
+    @classmethod
+    def validate_release_version(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip() or not _QUALIFIER_TOKEN_RE.fullmatch(value):
+            raise ValueError("release_version must be a bounded token")
         return value
 
     @model_validator(mode="after")
     def validate_provenance_evidence(self) -> ComponentProvenance:
-        evidence = (
+        all_metadata = (
             self.source_revision,
             self.source_url,
             self.artifact_digest,
             self.content_digest,
+            self.release_version,
+            self.documentation_url,
         )
         if self.provenance_status is ProvenanceStatus.UNAVAILABLE:
-            if any(item is not None for item in evidence):
+            if any(item is not None for item in all_metadata):
                 raise ValueError("unavailable provenance may not carry evidence")
             return self
         if not any(
@@ -652,6 +669,7 @@ class ComponentProvenance(_FrozenModel):
                 self.source_revision,
                 self.artifact_digest,
                 self.content_digest,
+                self.release_version,
             )
         ):
             raise ValueError("declared/verified provenance requires identity evidence")
@@ -791,9 +809,9 @@ class ProductCapability(_FrozenModel):
 
 
 class ProductCapabilitiesResponse(_FrozenModel):
-    """Schema-1.0 endpoint/tool result envelope."""
+    """Schema-1.1 endpoint/tool result envelope."""
 
-    schema_version: Literal["1.0"] = SCHEMA_VERSION
+    schema_version: Literal["1.1"] = SCHEMA_VERSION
     registry_revision: Sha256Digest
     evaluated_at: datetime
     completeness: Completeness

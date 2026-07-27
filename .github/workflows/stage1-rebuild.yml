@@ -32,6 +32,8 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  SRW_SOURCE_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+  SRW_DOCUMENTATION_URL: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs
 
 jobs:
   build-agent-vm-base-stage1:
@@ -134,8 +136,14 @@ jobs:
           # SHA tag uses the checked-out ref's HEAD, not GITHUB_SHA (the scheduling
           # ref), so each channel image is traceable to its own commit.
           REF_SHA=$(git rev-parse --short=7 HEAD)
+          REF_FULL_SHA=$(git rev-parse HEAD)
           TAGS=("${IMAGE}:sha-${REF_SHA}" "${IMAGE}:${{ matrix.tag }}" "${IMAGE}:cron-$(date -u +%Y%m%d)-${{ matrix.tag }}")
-          BUILD_ARGS=()
+          BUILD_ARGS=(
+            --build-arg "SRW_SOURCE_REVISION=${REF_FULL_SHA}"
+            --build-arg "SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}"
+            --build-arg "SRW_RELEASE_VERSION=0.0.0-${{ matrix.tag }}.sha-${REF_FULL_SHA}"
+            --build-arg "SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}"
+          )
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
           for T in "${TAGS[@]}"; do docker push "$T"; done

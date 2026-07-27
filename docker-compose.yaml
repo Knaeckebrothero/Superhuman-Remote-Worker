@@ -320,6 +320,9 @@ services:
       MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
       # Authenticated product-capability endpoint dark-launch gate.
       PRODUCT_CAPABILITIES_ENDPOINT_ENABLED: "${PRODUCT_CAPABILITIES_ENDPOINT_ENABLED:-false}"
+      # Optional bounded public component declarations. Tags are deliberately
+      # not inferred as source revisions or artifact digests.
+      SRW_DEPLOYMENT_PROVENANCE_JSON: "${SRW_DEPLOYMENT_PROVENANCE_JSON:-}"
       # Dark-shipped Canvas live-app capability; keep disabled until the
       # isolated viewer-domain launch gates are satisfied.
       CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
@@ -576,6 +579,7 @@ services:
       MCP_INTERNAL_KEY: "${MCP_INTERNAL_KEY:?MCP_INTERNAL_KEY must be set to a random shared secret}"
       # Read-only persistent-session capability tool canary.
       PRODUCT_CAPABILITIES_TOOL_ENABLED: "${PRODUCT_CAPABILITIES_TOOL_ENABLED:-false}"
+      SRW_DEPLOYMENT_PROVENANCE_JSON: "${SRW_DEPLOYMENT_PROVENANCE_JSON:-}"
       CANVAS_LIVE_PREVIEW_ENABLED: "${CANVAS_LIVE_PREVIEW_ENABLED:-false}"
       WORKSPACE_PATH: /workspace
       # LLM routing

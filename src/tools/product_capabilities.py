@@ -47,6 +47,7 @@ from src.core.product_capabilities import (
     ProductCapabilitiesResponse,
     ProductCapability,
     ProductComponent,
+    ProductProvenance,
     ReasonCode,
     SCHEMA_VERSION,
     SchemaCompatibility,
@@ -58,6 +59,7 @@ from src.core.product_capabilities import (
     schema_compatibility,
     validate_capability_against_definition,
 )
+from src.core.runtime_provenance import merge_product_provenance
 
 from .context import SessionRuntimeFacts, ToolContext
 
@@ -868,6 +870,10 @@ def _overlay_live_facts(
     capabilities: list[ProductCapability] = []
     errors = list(response.evaluation_errors)
     has_guide = "read_product_guide" in facts.loaded_tool_names
+    product = merge_product_provenance(
+        response.product,
+        dict(facts.runtime_component_provenance),
+    )
 
     for capability in response.capabilities:
         definition = CAPABILITY_REGISTRY[capability.id]
@@ -917,6 +923,7 @@ def _overlay_live_facts(
         evaluation_errors=errors,
         truncated=(response.truncated or projection_incomplete),
         completeness=(Completeness.PARTIAL if partial else Completeness.COMPLETE),
+        product=product,
     )
 
 
@@ -927,6 +934,7 @@ def _replace_response(
     evaluation_errors: list[EvaluationError] | None = None,
     truncated: bool | None = None,
     completeness: Completeness | None = None,
+    product: ProductProvenance | None = None,
 ) -> ProductCapabilitiesResponse:
     payload = response.model_dump(mode="python")
     if capabilities is not None:
@@ -937,6 +945,8 @@ def _replace_response(
         payload["truncated"] = truncated
     if completeness is not None:
         payload["completeness"] = completeness
+    if product is not None:
+        payload["product"] = product
     return ProductCapabilitiesResponse.model_validate(payload)
 
 

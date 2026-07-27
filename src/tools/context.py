@@ -17,6 +17,11 @@ from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Literal, Opt
 from urllib.parse import urlparse
 
 from ..core.datasource_catalog import DATASOURCE_TYPES
+from ..core.product_capabilities import (
+    ComponentProvenance,
+    ProductComponent,
+    ProvenanceStatus,
+)
 from ..core.workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,9 @@ class SessionRuntimeFacts:
     cloud_mount_active: bool = False
     protected_cloud_active: bool = False
     loaded_tool_names: tuple[str, ...] = ()
+    runtime_component_provenance: tuple[
+        tuple[ProductComponent, ComponentProvenance], ...
+    ] = ()
 
     def __post_init__(self) -> None:
         if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
@@ -95,6 +103,34 @@ class SessionRuntimeFacts:
         ):
             raise ValueError("SessionRuntimeFacts contains an invalid tool name")
         object.__setattr__(self, "loaded_tool_names", tool_names)
+
+        allowed_components = {
+            ProductComponent.AGENT,
+            ProductComponent.GUIDE,
+            ProductComponent.WORKSPACE,
+        }
+        component_provenance: dict[ProductComponent, ComponentProvenance] = {}
+        for item in self.runtime_component_provenance:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError(
+                    "SessionRuntimeFacts contains invalid component provenance"
+                )
+            component, provenance = item
+            if (
+                component not in allowed_components
+                or not isinstance(provenance, ComponentProvenance)
+                or provenance.provenance_status is ProvenanceStatus.VERIFIED
+                or component in component_provenance
+            ):
+                raise ValueError(
+                    "SessionRuntimeFacts contains invalid component provenance"
+                )
+            component_provenance[component] = provenance
+        object.__setattr__(
+            self,
+            "runtime_component_provenance",
+            tuple(sorted(component_provenance.items(), key=lambda item: item[0].value)),
+        )
 
         email_attached = "email" in datasource_types
         if email_attached and self.email_access_tier is None:

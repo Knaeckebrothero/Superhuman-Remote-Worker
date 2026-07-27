@@ -18,11 +18,12 @@ tags:
 > fresh/resumed workspace cells and the complete 30-case deployed evaluation
 > with zero critical forbidden claims, near-miss false positives, or errors.
 > Normal deployment values were restored and the synthetic verification
-> resources were removed; **M1 is complete**. M2a's schema-1.0 typed contract
-> and immutable 18-definition registry are implemented. M2b's authenticated
-> server resolver and default-off dark endpoint and M2c's live session overlay
-> and separately gated agent tool are also implemented; M2d component
-> provenance is next. The remaining runtime capability plane, visual help, and
+> resources were removed; **M1 is complete**. M2a's initial schema-1.0 typed
+> contract and immutable 18-definition registry are implemented. M2b's
+> authenticated server resolver and default-off dark endpoint, M2c's live
+> session overlay and separately gated agent tool, and M2d's additive
+> schema-1.1 component provenance are implemented; M2e guide integration and
+> acceptance are next. The remaining visual help and
 > Phases 3–8 remain open. Post-closure
 > commit `02fed505`
 > added the missing Office-on-Canvas guide coverage; its focused inventory
@@ -35,7 +36,10 @@ tags:
 > source-derived M2 union (**748 tests**) plus repository-wide Ruff lint,
 > scoped Ruff format, diff, and both Helm lint profiles on 2026-07-27. The
 > repository-wide format check also identifies the pre-existing, unrelated
-> `orchestrator/database/postgres.py`; M2c leaves that file untouched. See
+> `orchestrator/database/postgres.py`; M2c leaves that file untouched. M2d's
+> deduplicated capability/runtime/infrastructure union passed **1215 tests**,
+> both Helm profiles and all nine release Dockerfile BuildKit checks passed,
+> and repository-wide Ruff lint/format plus diff validation are green. See
 > `docs/superpowers/plans/2026-07-27-app-guide-m2.md`.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
@@ -831,7 +835,7 @@ An effective result has an explicit state per layer:
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "registry_revision": "sha256:<registry-digest>",
   "evaluated_at": "<RFC-3339-timestamp>",
   "completeness": "complete",
@@ -849,6 +853,8 @@ An effective result has an explicit state per layer:
         "artifact_digest": "sha256:<digest>",
         "source_url": "<configured-repository>",
         "source_revision": "<full-immutable-commit>",
+        "release_version": "<component-logical-release>",
+        "documentation_url": "<public-product-documentation>",
         "provenance_status": "declared"
       },
       "agent": {},
@@ -1586,12 +1592,27 @@ format check separately reports the pre-existing
 
 #### M2d — component provenance
 
-- [ ] Stamp first-party orchestrator, agent, Cockpit, MCP, workspace, and guide
+- [x] Stamp first-party orchestrator, agent, Cockpit, MCP, workspace, and guide
   artifacts with full source revision/source URL/version/documentation
   metadata; expose an artifact digest only when the deployment truly supplies
   one.
-- [ ] Report declared/unavailable provenance and mixed/indeterminate builds
+- [x] Report declared/unavailable provenance and mixed/indeterminate builds
   per component; keep short SHAs display-only and verified provenance deferred.
+
+**Result (2026-07-27):** M2d is complete. The contract is now schema `1.1`;
+same-major `1.0`/future-minor projection remains fail-closed. Orchestrator,
+agent, Cockpit, MCP, workspace, website, VM-controller, and both containerDisk
+images carry standardized OCI declarations and receive full source revisions
+from every build workflow. The active agent registers a validated declared
+identity, the live session binds the managed guide digest and active workspace,
+and the server keeps registry, guide content, source revision, and optional
+image digest identities separate. Helm uses a digest for both execution and
+reporting or neither, while develop preserves per-component revisions across
+change-based builds. The 1215-test closure union, repository-wide Ruff lint,
+scoped Ruff format, both Helm lint profiles, Actionlint/workflow parsing, diff
+checks, and all nine BuildKit validations passed. The repository-wide format
+check separately reports the unrelated `tests/test_atomic_job_context.py`.
+Verified/SLSA provenance remains explicitly out of scope.
 
 #### M2e — guide integration and acceptance
 

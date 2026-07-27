@@ -72,6 +72,26 @@ image:
     tag: sha-9710244
   workspace:
     tag: sha-9710244
+# Full deployment identities are updated alongside each independently rebuilt
+# image. Short image tags remain display/update handles only.
+provenance:
+  releaseVersion: ""
+  components:
+    orchestrator:
+      sourceRevision: 1391831bbaa2ec8ad0cdbd4210f4f7c70815a7df
+      releaseVersion: ""
+    agent:
+      sourceRevision: 1391831bbaa2ec8ad0cdbd4210f4f7c70815a7df
+      releaseVersion: ""
+    cockpit:
+      sourceRevision: 1391831bbaa2ec8ad0cdbd4210f4f7c70815a7df
+      releaseVersion: ""
+    mcp:
+      sourceRevision: 9710244e267ac724e224c1b55a75ab3ec07b9e70
+      releaseVersion: ""
+    workspace:
+      sourceRevision: 9710244e267ac724e224c1b55a75ab3ec07b9e70
+      releaseVersion: ""
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
 # (docs/operations/orchestrator_m1_go_live.md)
