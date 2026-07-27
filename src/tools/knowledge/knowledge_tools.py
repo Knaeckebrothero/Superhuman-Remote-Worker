@@ -875,26 +875,45 @@ def create_kb_tools(
                 full_note = kg.read_note(project_id, note)
                 if full_note:
                     new_type = full_note.get("type", "learning")
-                    # Neo4j has no priority property (out of scope — Tasks
-                    # 1-2 only added it to the pgvector row). An explicit
-                    # value wins; otherwise best-effort preserve whatever the
-                    # index row already has, so this write-through never
-                    # resets a ticket's priority to normal just because it
-                    # went through the graph-enabled path.
-                    if priority is not None:
-                        new_priority = priority
-                    else:
-                        new_priority = DEFAULT_PRIORITY_RANK
-                        try:
-                            prior_row = _run_async(
-                                ks.get_note_by_slug(uuid.UUID(project_id), note)
-                            )
-                            if prior_row:
-                                new_priority = prior_row.get(
-                                    "priority", DEFAULT_PRIORITY_RANK
+                    # Priority only exists for backlog tickets — skip the
+                    # lookback entirely for every other type, both to save
+                    # the round-trip and to shrink the surface where a
+                    # lookback failure could matter at all.
+                    #
+                    # None is a real, load-bearing value here, not "no
+                    # opinion": it means "the current priority could not be
+                    # determined", and both ks.upsert_note (COALESCE against
+                    # the row's existing value) and the dual-write dict below
+                    # (key omitted entirely) treat it as "leave unchanged" —
+                    # never as license to guess DEFAULT_PRIORITY_RANK, which
+                    # previously clobbered a real existing priority whenever
+                    # the lookback failed (fix round 1, Finding 1).
+                    new_priority: Optional[int] = None
+                    if new_type in _TICKET_TYPES:
+                        if priority is not None:
+                            new_priority = priority
+                        else:
+                            # Neo4j has no priority property (Tasks 1-2 only
+                            # added it to the pgvector row) — best-effort
+                            # read the row's current value. A failed *or*
+                            # not-found lookback leaves new_priority at None:
+                            # not-found means a fresh pgvector row is about
+                            # to be inserted (nothing to preserve, 1 is an
+                            # honest default there — see upsert_note), and a
+                            # failure must never be resolved by guessing.
+                            try:
+                                prior_row = _run_async(
+                                    ks.get_note_by_slug(uuid.UUID(project_id), note)
                                 )
-                        except Exception as e:
-                            logger.debug(f"priority lookup skipped for {note}: {e}")
+                                if prior_row:
+                                    new_priority = prior_row.get(
+                                        "priority", DEFAULT_PRIORITY_RANK
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    f"priority lookback failed for {note}, "
+                                    f"leaving its priority unchanged: {e}"
+                                )
                     # Files-canonical dual-write (slice 1) — before the
                     # disposable-index upsert, so the canonical file lands even
                     # if the pgvector write fails.
@@ -911,7 +930,7 @@ def create_kb_tools(
                         "superseded_by": full_note.get("superseded_by"),
                         "relationships": full_note.get("relationships", []),
                     }
-                    if new_type in _TICKET_TYPES:
+                    if new_type in _TICKET_TYPES and new_priority is not None:
                         full_note_dict["priority"] = new_priority
                     _dual_write_note(context, note, full_note_dict)
                     _run_async(
