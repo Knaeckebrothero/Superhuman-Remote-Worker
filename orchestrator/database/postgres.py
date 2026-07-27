@@ -1988,33 +1988,6 @@ class PostgresDB:
             new_count = await conn.fetchval(query, uuid_val)
         return int(new_count) if new_count is not None else 0
 
-    async def increment_job_verification_round(self, job_id: str) -> int:
-        """Atomically increment ``context.verification_round`` and return it.
-
-        Single-statement read-and-increment (mirrors
-        :meth:`increment_job_memory_retry`) so racing completion handlers for the
-        same critic can't both read the same round and stall the counter.
-        Returns the new round, or 0 if the job was not found / id was invalid.
-        """
-        try:
-            uuid_val = UUID(job_id)
-        except ValueError:
-            return 0
-
-        query = (
-            "UPDATE jobs "
-            "SET context = jsonb_set("
-            "        COALESCE(context, '{}'::jsonb), '{verification_round}', "
-            "        to_jsonb(COALESCE((context->>'verification_round')::int, 0) + 1)"
-            "    ), "
-            "    updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = $1 "
-            "RETURNING (context->>'verification_round')::int"
-        )
-        async with self.acquire() as conn:
-            new_round = await conn.fetchval(query, uuid_val)
-        return int(new_round) if new_round is not None else 0
-
     async def increment_job_llm_outage_attempt(
         self,
         job_id: str,

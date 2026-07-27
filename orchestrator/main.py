@@ -12614,7 +12614,7 @@ async def _trigger_verification_on_complete(
         description=job.get("description", ""),
         freeze_data=freeze_data,
         config_name=config_name,
-        prior_findings=render_prior_findings(fold_open_findings(rounds)),
+        prior_findings=render_prior_findings(fold_open_findings(rounds), len(rounds)),
     )
     if not instructions:
         logger.error(f"Failed to format verification instructions for job {job_id}")
