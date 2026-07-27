@@ -480,3 +480,104 @@ class TestProjectWorkspacePrepopulatedRoot:
         with pytest.raises(RuntimeError, match="is not empty"):
             ws.initialize_project_workspace()
         assert ws._initialized is False
+
+
+class TestWorkspaceGetHeadCommit:
+    """get_head_commit: the critic verdict tools' progress-detection heuristic
+    (docs/superpowers/plans/2026-07-27-verification-fail-closed.md, Task 5).
+
+    Must work even when workspace-level git versioning (``git_manager``) is
+    disabled — a target repo can be checked out at the workspace root by other
+    means — and must never raise: a failure here must not break a verdict.
+    """
+
+    def test_returns_current_head_sha(self, temp_base):
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=True,
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+        ws.initialize()
+
+        expected = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ws.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        assert ws.get_head_commit() == expected
+        assert len(expected) == 40  # full SHA-1, not an abbreviation
+
+    def test_reflects_new_commits(self, temp_base):
+        """Not cached — a fresh call after a commit sees the new HEAD."""
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=True,
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+        ws.initialize()
+
+        before = ws.get_head_commit()
+        ws.write_file("notes.md", "more notes")
+        ws.git_manager.commit("Add notes")
+        after = ws.get_head_commit()
+
+        assert before is not None
+        assert after is not None
+        assert before != after
+
+    def test_returns_none_without_git_repo(self, temp_base):
+        """No `.git` at the workspace root (versioning disabled) — None, not
+        an exception."""
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=False,
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+        ws.initialize()
+
+        assert ws.git_manager is None  # sanity: this is the no-git_manager case
+        assert ws.get_head_commit() is None
+
+    def test_returns_none_when_git_binary_missing(self, temp_base, monkeypatch):
+        monkeypatch.setattr(
+            shutil, "which", lambda x: None if x == "git" else shutil.which(x)
+        )
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=True,
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+        ws.initialize()
+
+        assert ws.get_head_commit() is None
+
+    def test_returns_none_before_workspace_initialized(self, temp_base):
+        """Called on a workspace whose root doesn't exist yet — heuristic
+        failure, not a crash."""
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(structure=["archive/"]),
+            base_path=temp_base / "never-created",
+            backend=FilesystemTestBackend(temp_base / "never-created"),
+        )
+
+        assert ws.get_head_commit() is None

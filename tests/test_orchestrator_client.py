@@ -9,6 +9,7 @@ from src.api.orchestrator_client import (
     OrchestratorClient,
     SessionGrantDenied,
     ThreadConfigUpdateDenied,
+    VerdictRecordingError,
     create_orchestrator_client_from_env,
     get_agent_ip,
     get_hostname,
@@ -418,6 +419,171 @@ class TestUpdateThreadConfig:
             )
             await client.update_thread_config("thread-1", {"llm": {}})
         assert "datasource_ids" not in mock_client.patch.call_args.kwargs["json"]
+
+
+class TestRecordVerificationRound:
+    """record_verification_round: journal-before-observe durability for the
+    critic verdict tools (docs/superpowers/plans/2026-07-27-verification-fail-
+    closed.md, Task 5). Unlike the rest of this client, failure must be LOUD —
+    every downstream loss path treats a missing verdict as approval, so this
+    method raises VerdictRecordingError instead of returning None/False."""
+
+    @pytest.fixture
+    def client(self):
+        return OrchestratorClient(
+            orchestrator_url="http://localhost:8085",
+            pod_ip="10.0.0.5",
+            pod_port=8001,
+            hostname="test-agent",
+            config_name="critic",
+            pid=12345,
+        )
+
+    def _response(self, status_code, json_body=None, text=""):
+        r = MagicMock()
+        r.status_code = status_code
+        r.text = text
+        if json_body is not None:
+            r.json = MagicMock(return_value=json_body)
+        else:
+            r.json = MagicMock(side_effect=ValueError("no body"))
+        return r
+
+    @pytest.mark.asyncio
+    async def test_success_returns_server_response(self, client):
+        server_body = {
+            "verdict": "returned",
+            "round": 2,
+            "assigned": [{"id": "F2", "severity": "high"}],
+            "open_findings": [{"id": "F1"}, {"id": "F2"}],
+        }
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(return_value=self._response(200, server_body))
+            result = await client.record_verification_round(
+                target_job_id="target-1",
+                critic_job_id="critic-1",
+                asserted_verdict="approved",
+                opened=[{"claim": "x", "severity": "high"}],
+                dispositions=[{"id": "F1", "disposition": "STILL_OPEN"}],
+                head_commit="abc123",
+            )
+        assert result == server_body
+
+    @pytest.mark.asyncio
+    async def test_posts_to_the_target_job_verification_rounds_url(self, client):
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(
+                return_value=self._response(
+                    200,
+                    {
+                        "verdict": "approved",
+                        "round": 1,
+                        "assigned": [],
+                        "open_findings": [],
+                    },
+                )
+            )
+            await client.record_verification_round(
+                target_job_id="target-1",
+                critic_job_id="critic-1",
+                asserted_verdict="approved",
+                opened=[],
+                dispositions=[],
+            )
+        call = mock_client.post.call_args
+        assert call.args[0] == (
+            "http://localhost:8085/api/jobs/target-1/verification/rounds"
+        )
+        assert call.kwargs["json"] == {
+            "critic_job_id": "critic-1",
+            "asserted_verdict": "approved",
+            "opened": [],
+            "dispositions": [],
+            "head_commit": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_409_with_errors_list_raises_with_errors_verbatim(self, client):
+        """The errors list is model-facing — it must survive into the
+        exception message so the model can correct itself."""
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(
+                return_value=self._response(
+                    409,
+                    {
+                        "detail": {
+                            "errors": [
+                                "F1: no disposition supplied.",
+                                "Cannot return a job with no findings.",
+                            ]
+                        }
+                    },
+                )
+            )
+            with pytest.raises(VerdictRecordingError) as exc_info:
+                await client.record_verification_round(
+                    target_job_id="target-1",
+                    critic_job_id="critic-1",
+                    asserted_verdict="returned",
+                    opened=[],
+                    dispositions=[],
+                )
+        assert "F1: no disposition supplied." in str(exc_info.value)
+        assert "Cannot return a job with no findings." in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_409_with_non_dict_detail_falls_back_to_str(self, client):
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(
+                return_value=self._response(409, {"detail": "malformed request"})
+            )
+            with pytest.raises(VerdictRecordingError) as exc_info:
+                await client.record_verification_round(
+                    target_job_id="target-1",
+                    critic_job_id="critic-1",
+                    asserted_verdict="approved",
+                    opened=[],
+                    dispositions=[],
+                )
+        assert "malformed request" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_other_http_error_raises_with_status_and_body(self, client):
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(
+                return_value=self._response(500, text="internal error")
+            )
+            with pytest.raises(VerdictRecordingError) as exc_info:
+                await client.record_verification_round(
+                    target_job_id="target-1",
+                    critic_job_id="critic-1",
+                    asserted_verdict="approved",
+                    opened=[],
+                    dispositions=[],
+                )
+        assert "500" in str(exc_info.value)
+        assert "internal error" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_network_failure_raises_not_none(self, client):
+        """Unlike the rest of this client's best-effort methods, a network
+        failure here must not collapse to None — that would let the caller
+        treat an unrecorded verdict as recorded."""
+        import httpx
+
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(
+                side_effect=httpx.ConnectError("connection refused")
+            )
+            with pytest.raises(VerdictRecordingError) as exc_info:
+                await client.record_verification_round(
+                    target_job_id="target-1",
+                    critic_job_id="critic-1",
+                    asserted_verdict="approved",
+                    opened=[],
+                    dispositions=[],
+                )
+        assert "network error" in str(exc_info.value).lower()
 
 
 class TestCreateOrchestratorClientFromEnv:

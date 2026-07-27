@@ -334,6 +334,33 @@ class WorkspaceManager:
         """Git managers for source/reference repos, keyed by repo name."""
         return self._source_repos
 
+    def get_head_commit(self) -> Optional[str]:
+        """Best-effort HEAD commit SHA at the workspace root.
+
+        Used by the critic verdict tools to detect whether a target job's
+        deliverable changed between review rounds (progress detection).
+        Deliberately independent of ``git_manager``/``git_versioning``: a repo
+        can be present at the workspace root (e.g. a project job's cloned jobs
+        repo) even when workspace-level versioning was never enabled, so this
+        always probes the root directly rather than relying on
+        ``self._git_manager`` being set.
+
+        This is a heuristic, not a correctness dependency — it must never
+        raise. Any failure (no repo, git unavailable, backend error) returns
+        None.
+        """
+        try:
+            from ..managers.git_manager import GitManager
+        except ImportError:
+            from src.managers.git_manager import GitManager
+
+        try:
+            return GitManager(
+                self._workspace_path, backend=self._backend
+            ).get_current_commit()
+        except Exception:
+            return None
+
     @property
     def _backend_has_shell(self) -> bool:
         """Check if the workspace backend supports shell execution."""
