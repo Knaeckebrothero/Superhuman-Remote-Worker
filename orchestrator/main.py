@@ -18253,8 +18253,10 @@ async def _record_verification_round_impl(
     """Validate, compute, and durably append one verification round.
 
     Split out of the route so the gate logic is testable without HTTP. Raises
-    HTTPException(409) with the model-facing errors on invalid input, or
-    HTTPException(400) if ``critic_job_id`` is missing.
+    HTTPException(409) with the model-facing errors on invalid input,
+    HTTPException(400) if ``critic_job_id`` is missing, HTTPException(403) if
+    the critic was not spawned for this target, or HTTPException(404) if the
+    target does not exist.
     """
     from services.completion import _parse_freeze_data
     from services.verification_ledger import (
@@ -18277,6 +18279,44 @@ async def _record_verification_round_impl(
     target = await postgres_db.get_job(target_job_id)
     if not target:
         raise HTTPException(status_code=404, detail=f"Job {target_job_id} not found")
+
+    # The target comes from the URL but is chosen by the MODEL —
+    # ``approve_job(job_id=...)`` flows straight through to it, and the route
+    # is authenticated only by the shared internal key, which every agent pod
+    # holds. A confused critic writing to the wrong job's ledger is fail-closed
+    # for its REAL target (which then escalates for lack of a verdict), but it
+    # pollutes an unrelated job's ledger with phantom findings that get
+    # injected into that job's next critic brief and can force its cap /
+    # no-progress escalation. Same principle as the rest of this design: never
+    # trust the model's assertion about what it is judging.
+    critic = await postgres_db.get_job(critic_job_id)
+    critic_ctx = (critic or {}).get("context")
+    if isinstance(critic_ctx, str):
+        # asyncpg returns JSONB as a string on the app pool (no codec
+        # registered); an isinstance-only check here would reject every real
+        # critic. See docs/issues/
+        # jsonb_isinstance_guard_without_parse_silent_dead_paths.md.
+        try:
+            critic_ctx = json.loads(critic_ctx)
+        except (json.JSONDecodeError, ValueError):
+            critic_ctx = {}
+    claimed_target = (critic_ctx or {}).get("verification_target")
+    if not critic or str(claimed_target or "") != str(target_job_id):
+        logger.warning(
+            "Rejected verification round: critic %s is not the critic for target "
+            "%s (its verification_target is %r)",
+            critic_job_id,
+            target_job_id,
+            claimed_target,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Job {critic_job_id} is not the verification critic for "
+                f"{target_job_id}. Record your verdict against the job you were "
+                f"asked to review."
+            ),
+        )
 
     # Both progress markers are server-authoritative from the TARGET's own
     # completion freeze, not the caller-supplied values — the critic runs on
