@@ -1928,17 +1928,26 @@ class PostgresDB:
 
         critic_job_id = str(record.get("critic_job_id") or "")
 
+        # `existing` type-checks with jsonb_typeof rather than COALESCE for
+        # the same reason _UNSTICK_REVIEWING_SQL does: a jsonb `null` is not
+        # SQL NULL, so COALESCE leaves it in place and `'null'::jsonb || [x]`
+        # silently yields `[null, x]` — a ledger whose round numbers are off
+        # by one from its first append onward. Anything that is not an array
+        # is treated as no ledger at all.
+        existing = (
+            "CASE WHEN jsonb_typeof(context->'verification_rounds') = 'array' "
+            "     THEN context->'verification_rounds' ELSE '[]'::jsonb END"
+        )
         query = (
             "UPDATE jobs "
             "SET context = jsonb_set("
             "        COALESCE(context, '{}'::jsonb), "
             "        '{verification_rounds}', "
-            "        COALESCE(context->'verification_rounds', '[]'::jsonb) || $1::jsonb"
+            f"        {existing} || $1::jsonb"
             "    ), "
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2 "
-            "  AND NOT (COALESCE(context->'verification_rounds', '[]'::jsonb) "
-            "           @> $3::jsonb) "
+            f"  AND NOT ({existing} @> $3::jsonb) "
             "RETURNING jsonb_array_length(context->'verification_rounds')"
         )
         async with self.acquire() as conn:
@@ -4609,6 +4618,14 @@ class PostgresDB:
     #
     # The CAS (``WHERE p.status = 'reviewing'``) makes this idempotent and
     # safe against a concurrent sweeper tick / the verdict handler.
+    #
+    # The ledger subquery type-checks with ``jsonb_typeof(...) = 'array'``
+    # rather than ``COALESCE(..., '[]'::jsonb)``: a jsonb `null` is NOT SQL
+    # NULL, so COALESCE leaves it in place and
+    # ``jsonb_array_elements('null'::jsonb)`` raises "cannot extract elements
+    # from a scalar". That aborts the statement, which kills the sweeper tick,
+    # which stops the stranded-target watchdog SYSTEM-WIDE — one malformed row
+    # taking down every target's safety net.
     _UNSTICK_REVIEWING_SQL = """
         UPDATE jobs AS p
            SET status = 'pending_review',
@@ -4629,7 +4646,12 @@ class PostgresDB:
            AND NOT EXISTS (
                  SELECT 1
                    FROM jsonb_array_elements(
-                            COALESCE(p.context->'verification_rounds', '[]'::jsonb)
+                            CASE
+                              WHEN jsonb_typeof(p.context->'verification_rounds')
+                                   = 'array'
+                              THEN p.context->'verification_rounds'
+                              ELSE '[]'::jsonb
+                            END
                         ) r
                   WHERE r->>'critic_job_id' = (
                             SELECT c.id::text

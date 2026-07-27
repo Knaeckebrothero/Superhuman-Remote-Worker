@@ -388,6 +388,63 @@ async def test_scholar_and_delegation_children_are_ignored(db):
 
 
 @pytest.mark.asyncio
+async def test_survives_a_json_null_verification_rounds(db):
+    """A jsonb `null` at context->'verification_rounds' is NOT SQL NULL, so
+    COALESCE does not replace it and `jsonb_array_elements('null'::jsonb)`
+    raises "cannot extract elements from a scalar". That aborts the whole
+    statement, the sweeper tick dies with it, and the stranded-target watchdog
+    stops working SYSTEM-WIDE — for every target, not just this row.
+
+    Reachable today: a caller could seed `verification_rounds` through the
+    public POST /api/jobs context (that hole is closed separately), and any
+    future writer that stores a null lands here too. The predicate must
+    type-check the value rather than trust its shape.
+    """
+    target = uuid4()
+    await _insert_job(
+        db,
+        job_id=target,
+        status="reviewing",
+        updated_minutes_ago=45,
+        context={"verification_rounds": None},
+    )
+
+    # Must not raise — that is the entire point of this test.
+    rows = await db.unstick_reviewing_parents(grace_minutes=GRACE_MINUTES)
+
+    assert [str(r["id"]) for r in rows] == [str(target)]
+    assert await _status(db, target) == "pending_review"
+
+
+@pytest.mark.asyncio
+async def test_survives_a_non_array_verification_rounds(db):
+    """Same class, other scalars/objects: anything that is not a jsonb array
+    must be treated as "no ledger", never fed to jsonb_array_elements."""
+    for bad in ('"oops"', "42", '{"round": 1}'):
+        target = uuid4()
+        async with db.acquire() as conn:
+            await conn.execute("TRUNCATE jobs CASCADE")
+            await conn.execute(
+                """
+                INSERT INTO jobs
+                    (id, description, status, context, config_name,
+                     created_at, updated_at)
+                VALUES
+                    ($1, 'bad ledger', 'reviewing',
+                     jsonb_build_object('verification_rounds', $2::jsonb),
+                     'developer', CURRENT_TIMESTAMP,
+                     CURRENT_TIMESTAMP - make_interval(mins => 45))
+                """,
+                target,
+                bad,
+            )
+
+        rows = await db.unstick_reviewing_parents(grace_minutes=GRACE_MINUTES)
+
+        assert [str(r["id"]) for r in rows] == [str(target)], f"failed for {bad}"
+
+
+@pytest.mark.asyncio
 async def test_cas_does_not_touch_non_reviewing_targets(db):
     """The CAS (`WHERE p.status = 'reviewing'`) — a target already moved on
     (e.g. the verdict handler won the race and flipped it to something else)

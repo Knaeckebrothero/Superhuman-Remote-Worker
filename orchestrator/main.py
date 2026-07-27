@@ -4419,6 +4419,12 @@ _PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "runner_source",
     "scholar_target",
     "snapshot",
+    # The verification ledger is server-owned end to end: the server assigns
+    # finding ids, computes the verdict from the open set, and reads the round
+    # count for the cap. A caller-seeded ledger plants phantom findings into
+    # the first critic's brief and can trip the cap/no-progress escalation on
+    # round one, so it is stripped alongside its `verification_target` pair.
+    "verification_rounds",
     "verification_target",
     "vm",
     "workspace_container",

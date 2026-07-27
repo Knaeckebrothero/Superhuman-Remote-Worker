@@ -80,6 +80,44 @@ class TestFoldOpenFindings:
     def test_empty_ledger(self):
         assert fold_open_findings([]) == []
 
+    def test_non_dict_rounds_are_skipped(self):
+        """``verification_rounds`` is a jsonb column. Nothing at the type level
+        stops a malformed value landing there, and this fold runs inside the
+        /complete handler — a TypeError here is swallowed by that handler's
+        bare except and leaves the target wedged in 'reviewing' forever."""
+        rounds = [
+            None,
+            "not a round",
+            42,
+            ["nested"],
+            _round(1, opened=[{"id": "F1", "severity": "high"}]),
+        ]
+        assert [f["id"] for f in fold_open_findings(rounds)] == ["F1"]
+
+    def test_non_dict_findings_and_dispositions_are_skipped(self):
+        rounds = [
+            {
+                "round": 1,
+                "critic_job_id": "c1",
+                "opened": ["junk", None, {"id": "F1", "severity": "high"}],
+                "dispositions": [],
+            },
+            {
+                "round": 2,
+                "critic_job_id": "c2",
+                "opened": [],
+                "dispositions": ["junk", 7, {"id": "F1", "disposition": "STILL_OPEN"}],
+            },
+        ]
+        assert [f["id"] for f in fold_open_findings(rounds)] == ["F1"]
+
+    def test_non_list_opened_and_dispositions_are_skipped(self):
+        rounds = [
+            {"round": 1, "critic_job_id": "c1", "opened": "F1", "dispositions": 3},
+            _round(2, opened=[{"id": "F1", "severity": "high"}]),
+        ]
+        assert [f["id"] for f in fold_open_findings(rounds)] == ["F1"]
+
 
 class TestNextFindingIndex:
     def test_empty_starts_at_one(self):
