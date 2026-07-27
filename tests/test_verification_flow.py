@@ -579,3 +579,70 @@ class TestTriggerVerificationHeadCommitWiring:
 
         update_mock.assert_awaited_once()
         assert update_mock.call_args.kwargs["status"] == "completed"
+
+
+class TestTriggerVerificationInstructionsWiring:
+    """Task 7: ``format_verification_instructions`` was rendered and then
+    discarded — ``create_job`` has no ``instructions`` parameter, so every
+    critic ran on a generic description instead of the rendered brief.
+
+    Fixed by threading the rendered text through ``context["instructions"]``,
+    the same delivery channel the scholar subjob already uses successfully
+    (``_dispatch_job_to_agent`` extracts ``context["instructions"]`` and the
+    agent writes it to ``instructions.md`` in the workspace — see
+    ``src/agent.py``'s ``metadata.get("instructions")`` handling).
+
+    This test exercises the REAL ``_trigger_verification_on_complete`` end to
+    end and inspects what is actually handed to ``postgres_db.create_job``,
+    so a future regression back to computing-and-discarding fails loudly
+    here instead of silently in production.
+    """
+
+    @pytest.mark.asyncio
+    async def test_instructions_reach_critic_context_with_prior_findings(
+        self, monkeypatch
+    ):
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main_module, "_propagate_datasources_to_subjob", AsyncMock()
+        )
+        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+
+        prior_round = {
+            "round": 1,
+            "critic_job_id": "c1",
+            "head_commit": "aaa",
+            "verdict": "returned",
+            "asserted_verdict": "returned",
+            "opened": [{"id": "F1", "severity": "high", "claim": "still broken"}],
+            "dispositions": [],
+            "ts": "t",
+        }
+        job = _make_completion_job(
+            freeze_head_commit="bbb", verification_rounds=[prior_round]
+        )
+        actions: list[str] = []
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, actions
+        )
+
+        create_job_mock.assert_awaited_once()
+        context = create_job_mock.call_args.kwargs["context"]
+        instructions = context.get("instructions")
+
+        assert instructions, (
+            "critic context is missing 'instructions' — the rendered brief "
+            "was computed and discarded (the Task 7 defect)"
+        )
+        # The target job's own description reaches the critic.
+        assert "do the thing" in instructions
+        # The open finding left by the previous round is folded in — proves
+        # prior_findings flows end-to-end, not just that SOME instructions
+        # text was delivered.
+        assert "F1" in instructions
+        assert "still broken" in instructions
