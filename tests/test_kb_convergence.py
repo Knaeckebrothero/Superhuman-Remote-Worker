@@ -114,6 +114,51 @@ class TestUpsertSetsTtl:
 
 
 # =============================================================================
+# upsert_note persists priority on both branches (project-backlog-pipeline
+# task 2, fix round 1 findings 1 + 2) — mutation-tested: deleting the bound
+# arg or the SET/VALUES clause on either branch fails these.
+# =============================================================================
+
+
+class TestUpsertNotePriorityBinding:
+    @pytest.mark.asyncio
+    async def test_insert_branch_binds_priority_last(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.side_effect = [None, uuid.uuid4()]  # no existing -> INSERT
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="body",
+            priority=0,
+        )
+        insert_call = mock_db.fetchval.call_args_list[1]
+        assert "priority" in insert_call[0][0]
+        assert insert_call[0][-1] == 0
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_branch_binds_priority(self):
+        # Finding 1 (fix round 1): a status/metadata-only kb_update (content
+        # hash unchanged, so this branch — not the INSERT branch — runs) must
+        # not silently discard a priority change.
+        store, mock_db, _ = _make_store()
+        existing_hash = KnowledgeStore._content_hash("body")
+        mock_db.fetchval.side_effect = [existing_hash, uuid.uuid4()]
+        await store.upsert_note(
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="body",
+            priority=2,
+        )
+        update_call = mock_db.fetchval.call_args_list[1]
+        assert "priority" in update_call[0][0]
+        assert update_call[0][-1] == 2
+
+
+# =============================================================================
 # decrement_ttl / get_stale_notes / refresh_ttl
 # =============================================================================
 

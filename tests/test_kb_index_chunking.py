@@ -433,6 +433,29 @@ class TestUpsertKbNote:
         query = mock_db.fetchval.call_args[0][0]
         assert "created_at" not in query.split("DO UPDATE")[1]
 
+    @pytest.mark.asyncio
+    async def test_binds_priority_at_final_position(self):
+        # Mutation-tested (project-backlog-pipeline task 2, fix round 1
+        # finding 2): colliding priority's DO-UPDATE placeholder with
+        # modified_at's ($20 instead of $21) left this path untested before —
+        # pin both the query's SET clause and the bound value's position.
+        store, mock_db, _ = _make_store()
+        mock_db.fetchval.return_value = uuid.uuid4()
+        await store.upsert_kb_note(
+            kb_id=uuid.uuid4(),
+            note_id="n",
+            path="knowledge/n.md",
+            title="T",
+            note_type="learning",
+            content="body",
+            blob_sha="b",
+            embedding_version="v1",
+            priority=0,
+        )
+        query, *params = mock_db.fetchval.call_args[0]
+        assert "priority = $21" in query
+        assert params[-1] == 0
+
 
 # =============================================================================
 # replace_note_chunks — atomic delete + insert of a note's chunks
