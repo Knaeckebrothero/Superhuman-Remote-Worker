@@ -429,7 +429,9 @@ _ROLE_BLOCKS: dict[str, str] = {
         "Your output is proposal notes, not repo commits. You work on your own "
         "branch; anything you deliberately leave in the working tree is "
         "squash-merged into the project when you finish, so keep it clean — "
-        "research scratch belongs in the KB, not the repo."
+        "research scratch belongs in the KB, not the repo. Default to foraging "
+        "widely rather than waiting to be told what to look at — file what you "
+        "find as `idea` notes; that is how the backlog grows."
     ),
     "critic": (
         "Select and prioritise among ALL open work candidates AGAINST THE "
@@ -507,7 +509,9 @@ _ROLE_BLOCKS: dict[str, str] = {
         "other — the Critic weighs all approaches (proposals and qa-findings "
         "alike) and decides what to do next. "
         "Your output is issue-candidate notes, not repo commits. You work on your "
-        "own branch; an empty merge is expected — your findings live in the KB."
+        "own branch; an empty merge is expected — your findings live in the KB. "
+        "File every defect you confirm as an `issue` note (kb_write) — an issue "
+        "that exists only in your report is invisible to the next iteration."
     ),
 }
 
@@ -660,6 +664,7 @@ def build_loop_kickoff(
     role: str,
     iteration: int,
     extra_context: dict[str, Any] | None = None,
+    backlog_block: str | None = None,
 ) -> str:
     """Assemble the loop-aware kickoff *message* for one job.
 
@@ -679,6 +684,11 @@ def build_loop_kickoff(
     member gets its campaign context (stage N of M + the honesty contract).
     ``extra_context`` is the spawn-time context stamp dict — a present
     ``loop_campaign_id`` marks a campaign member.
+
+    ``backlog_block`` is the pre-rendered work pool (see
+    ``services/project_backlog.render_backlog_block``). It is injected
+    VERBATIM: this function stays pure and does no I/O, so the caller fetches
+    it. Passing None (start-up paths, tests) simply omits the section.
     """
     goal = (loop.get("goal") or "").strip() or (
         "(no explicit goal set — make useful, self-directed progress and record "
@@ -706,13 +716,25 @@ def build_loop_kickoff(
         f"LOOP STATUS: iteration {iteration}. {budget_line} Do NOT try to finish "
         "the whole goal in one job — make ONE solid, verifiable increment and "
         "hand off through the KB.",
+    ]
+
+    # The work pool, handed over rather than searched for. Placed before the
+    # role block so selection duty reads it in order.
+    if backlog_block:
+        parts.append(backlog_block)
+
+    parts += [
         "BEFORE you act: restate the goal in one line, then check the KB for "
-        "(a) what's already done, (b) what's been TRIED AND REJECTED (do not "
-        "re-propose it), and (c) the current open backlog.",
+        "(a) what's already done and (b) what's been TRIED AND REJECTED (do "
+        "not re-propose it). The open backlog is listed above — it is given to "
+        "you, do not go searching for it.",
         f"YOUR ROLE THIS ITERATION — {role.upper()}:\n{role_block}",
         "WHEN DONE: write to the KB what you did, what you learned, and what the "
         "next agent should do. If you closed or abandoned an approach, record it "
-        "as tried/rejected so nobody repeats it.",
+        "as tried/rejected so nobody repeats it. File any new work you spotted "
+        "but did not do as a `feature`, `issue` or `idea` note (kb_write) — that "
+        "is the project backlog, and it is the only place future iterations will "
+        "look for it.",
     ]
 
     # Campaign-scheduled loops (docs/features/loop_campaign_scheduling.md):
@@ -744,6 +766,7 @@ async def create_loop_job(
     remaining_iterations: int | None = None,
     disable_memory_assembler: bool = False,
     extra_context: dict[str, Any] | None = None,
+    backlog_block: str | None = None,
     park_until: datetime | None = None,
 ) -> dict[str, Any]:
     """Materialize ONE bare loop job for the given role + iteration.
@@ -775,6 +798,10 @@ async def create_loop_job(
     ``memory.pipeline.writers`` list — a scalar deep-merge that leaves the
     append-only extractors, the KB curator, and the writers list untouched. See
     docs/features/loop_parallel_stages.md and [[project_kb_convergence_f13]].
+
+    ``backlog_block`` is threaded straight through to ``build_loop_kickoff`` —
+    this function does no fetching itself, it just carries the caller's
+    pre-rendered pool string (or None) into the kickoff message.
     """
     loop_id = str(loop["id"])
     project_id = str(loop["project_id"]) if loop.get("project_id") else None
@@ -840,7 +867,11 @@ async def create_loop_job(
 
     description = build_loop_description(loop, role=role, iteration=iteration)
     kickoff = build_loop_kickoff(
-        loop, role=role, iteration=iteration, extra_context=extra_context
+        loop,
+        role=role,
+        iteration=iteration,
+        extra_context=extra_context,
+        backlog_block=backlog_block,
     )
     context = {
         "loop_id": loop_id,
