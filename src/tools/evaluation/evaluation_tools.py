@@ -134,48 +134,73 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
                 f"resubmitted.\n{e}"
             )
 
-        verdict = result["verdict"]
-        report_data = {
-            "verdict": verdict,
-            "asserted_verdict": asserted,
-            "target_job_id": target_job_id,
-            "narrative": narrative,
-            "round": result["round"],
-            "open_findings": result["open_findings"],
-        }
-        if context.has_workspace():
-            context.workspace_manager.write_file(
-                f"output/verification_report_round_{result['round']}.json",
-                json.dumps(report_data, indent=2, ensure_ascii=False),
+        # From here on the round IS durably recorded server-side — the only
+        # thing that can still go wrong is LOCAL bookkeeping (mirroring it for
+        # finalize_job, writing the human-readable report file). That must
+        # never raise: an uncaught exception here would hand the model a raw
+        # traceback instead of a status string, even though the verdict is
+        # already safely persisted (and, per the server's per-critic_job_id
+        # dedup guard, does not need — and must not be told — to be
+        # resubmitted). The mirror is populated before the best-effort
+        # workspace write, so a write_file failure alone can't also cost
+        # finalize_job the verdict.
+        try:
+            verdict = result["verdict"]
+            round_num = result["round"]
+            open_findings = result["open_findings"]
+
+            _verdict_data[context.job_id] = {
+                "_verdict": verdict,
+                "_target_job_id": target_job_id,
+                "round": round_num,
+                "open_findings": open_findings,
+            }
+            _final_phase_data[context.job_id] = {
+                "summary": (
+                    f"Verification round {round_num}: {verdict} job {target_job_id}"
+                ),
+                "deliverables": [f"output/verification_report_round_{round_num}.json"],
+                "confidence": 1.0,
+                "job_id": context.job_id,
+            }
+
+            report_data = {
+                "verdict": verdict,
+                "asserted_verdict": asserted,
+                "target_job_id": target_job_id,
+                "narrative": narrative,
+                "round": round_num,
+                "open_findings": open_findings,
+            }
+            if context.has_workspace():
+                context.workspace_manager.write_file(
+                    f"output/verification_report_round_{round_num}.json",
+                    json.dumps(report_data, indent=2, ensure_ascii=False),
+                )
+
+            open_ids = ", ".join(f["id"] for f in open_findings) or "none"
+            divergence = (
+                f"\nNOTE: you asserted {asserted!r} but the recorded verdict is "
+                f"{verdict!r}, computed from the open findings."
+                if verdict != asserted
+                else ""
             )
-
-        _verdict_data[context.job_id] = {
-            "_verdict": verdict,
-            "_target_job_id": target_job_id,
-            "round": result["round"],
-            "open_findings": result["open_findings"],
-        }
-        _final_phase_data[context.job_id] = {
-            "summary": f"Verification round {result['round']}: {verdict} job {target_job_id}",
-            "deliverables": [
-                f"output/verification_report_round_{result['round']}.json"
-            ],
-            "confidence": 1.0,
-            "job_id": context.job_id,
-        }
-
-        open_ids = ", ".join(f["id"] for f in result["open_findings"]) or "none"
-        divergence = (
-            f"\nNOTE: you asserted {asserted!r} but the recorded verdict is "
-            f"{verdict!r}, computed from the open findings."
-            if verdict != asserted
-            else ""
-        )
-        return (
-            f"Verdict recorded (round {result['round']}): {verdict.upper()} "
-            f"job {target_job_id}.\nOpen findings: {open_ids}.{divergence}\n\n"
-            f"Complete your remaining todos to finalize."
-        )
+            return (
+                f"Verdict recorded (round {round_num}): {verdict.upper()} "
+                f"job {target_job_id}.\nOpen findings: {open_ids}.{divergence}\n\n"
+                f"Complete your remaining todos to finalize."
+            )
+        except Exception as e:
+            logger.error(
+                f"Verdict for {target_job_id} was durably recorded by the "
+                f"orchestrator, but local bookkeeping failed afterward: {e}"
+            )
+            return (
+                f"Verdict recorded by the orchestrator for job {target_job_id} "
+                f"— this round is durable; do NOT resubmit it. Local "
+                f"bookkeeping (workspace report / turn finalization) failed "
+                f"afterward and may not be fully reflected in this turn: {e}"
+            )
 
     @tool
     async def approve_job(

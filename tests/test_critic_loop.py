@@ -645,3 +645,114 @@ class TestVerdictDurability:
         )
 
         assert get_verdict_data("c2")["_verdict"] == "returned"
+
+    @pytest.mark.asyncio
+    async def test_workspace_write_failure_degrades_gracefully_not_raises(self):
+        """Round 1 fix — Finding 1.
+
+        The round is durably recorded by the orchestrator BEFORE any local
+        bookkeeping runs. If the subsequent workspace write then fails (I/O
+        error, remote-backend hiccup), the tool must report success with a
+        degradation note, not crash — the model must not be told to correct
+        and resubmit a round that has already landed durably.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from src.tools.context import ToolContext
+        from src.tools.evaluation.evaluation_tools import (
+            create_evaluation_tools,
+            get_verdict_data,
+        )
+
+        ctx = ToolContext(_job_id="c3", config={})
+        ctx.orchestrator_client = AsyncMock()
+        ctx.orchestrator_client.record_verification_round = AsyncMock(
+            return_value={
+                "verdict": "approved",
+                "round": 1,
+                "assigned": [],
+                "open_findings": [],
+            }
+        )
+        ctx.workspace_manager = MagicMock()
+        ctx.workspace_manager.get_head_commit = MagicMock(return_value=None)
+        ctx.workspace_manager.write_file = MagicMock(side_effect=OSError("disk full"))
+        approve, _ = create_evaluation_tools(ctx)
+
+        result = await approve.ainvoke({"job_id": "t1", "report": "looks good"})
+
+        # Must NOT read like the "not recorded" failure path...
+        assert "error" not in result.lower()
+        # ...and must say plainly that the round IS recorded.
+        assert "recorded" in result.lower()
+        assert "disk full" in result
+
+        # Bonus (stricter than the brief's minimal ask): the mirror is
+        # populated before the workspace write is attempted, so a write
+        # failure alone doesn't also cost finalize_job the verdict.
+        assert get_verdict_data("c3")["_verdict"] == "approved"
+
+    @pytest.mark.asyncio
+    async def test_approve_tool_fails_loudly_when_client_raises(self):
+        """Round 1 fix — Finding 2 (approve_job half).
+
+        Complements test_return_tool_fails_loudly_without_orchestrator_client
+        (client is None — an impossible write) with the other half of the
+        property: a client that IS present but whose
+        record_verification_round raises must also produce a failure-
+        signaling string and leave no local trace.
+        """
+        from unittest.mock import AsyncMock
+
+        from src.api.orchestrator_client import VerdictRecordingError
+        from src.tools.context import ToolContext
+        from src.tools.evaluation.evaluation_tools import (
+            create_evaluation_tools,
+            get_verdict_data,
+        )
+
+        ctx = ToolContext(_job_id="c4", config={})
+        ctx.orchestrator_client = AsyncMock()
+        ctx.orchestrator_client.record_verification_round = AsyncMock(
+            side_effect=VerdictRecordingError(
+                "verdict rejected:\n- F1: no disposition supplied."
+            )
+        )
+        approve, _ = create_evaluation_tools(ctx)
+
+        result = await approve.ainvoke({"job_id": "t1", "report": "looks good"})
+
+        assert "error" in result.lower()
+        assert "not recorded" in result.lower()
+        assert get_verdict_data("c4") is None
+
+    @pytest.mark.asyncio
+    async def test_return_tool_fails_loudly_when_client_raises(self):
+        """Round 1 fix — Finding 2 (return_job_with_feedback half)."""
+        from unittest.mock import AsyncMock
+
+        from src.api.orchestrator_client import VerdictRecordingError
+        from src.tools.context import ToolContext
+        from src.tools.evaluation.evaluation_tools import (
+            create_evaluation_tools,
+            get_verdict_data,
+        )
+
+        ctx = ToolContext(_job_id="c5", config={})
+        ctx.orchestrator_client = AsyncMock()
+        ctx.orchestrator_client.record_verification_round = AsyncMock(
+            side_effect=VerdictRecordingError("network error: connection refused")
+        )
+        _, return_with_feedback = create_evaluation_tools(ctx)
+
+        result = await return_with_feedback.ainvoke(
+            {
+                "job_id": "t1",
+                "feedback": "bad",
+                "findings": [{"claim": "x", "severity": "high"}],
+            }
+        )
+
+        assert "error" in result.lower()
+        assert "not recorded" in result.lower()
+        assert get_verdict_data("c5") is None
