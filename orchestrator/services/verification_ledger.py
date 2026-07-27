@@ -135,6 +135,9 @@ def validate_dispositions(
                 f"Unknown finding id {fid!r}: there is no open finding with that id."
             )
             continue
+        if fid in seen:
+            errors.append(f"{fid}: dispositioned more than once in this call.")
+            continue
         seen.add(fid)
         kind = str(disp.get("disposition", "")).upper()
         if kind not in _VALID_DISPOSITIONS:
