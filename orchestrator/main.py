@@ -12344,7 +12344,7 @@ async def _handle_critic_verdict_on_complete(
         feedback_lines = ["## Open findings", ""]
         for f in sorted(open_findings, key=lambda x: x.get("id", "")):
             feedback_lines.append(
-                f"- **{f['id']}** [{f['severity']}]: {f.get('claim', '')}"
+                f"- **{f['id']}** [{f.get('severity', 'unknown')}]: {f.get('claim', '')}"
             )
         logger.info(
             f"Critic {job_id} returned target {target_job_id} "

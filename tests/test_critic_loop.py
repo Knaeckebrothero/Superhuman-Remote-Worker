@@ -12,7 +12,7 @@ import json
 import pytest
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -494,184 +494,173 @@ class TestCriticVerdictInstructionsToolAgreement:
 # =============================================================================
 # Round limit enforcement tests
 # =============================================================================
+#
+# The round cap used to be enforced agent-side, in `_handle_critic_verdict`
+# (src/api/app.py) — see complete_job's docstring in orchestrator/main.py:
+# "This replaces the agent-side `_update_job_status_from_result`,
+# `_handle_critic_verdict`, and `_maybe_trigger_verification` functions."
+# That function no longer exists (confirmed: it's absent from the whole
+# tree, only mentioned in that historical docstring). A round-cap branch
+# briefly lived on the orchestrator side too, in
+# `_handle_critic_verdict_on_complete`, but Task 8 removed it entirely — the
+# cap is now enforced exactly once, in `_verification_gate_decision`
+# (orchestrator/main.py), read fresh from the target's resolved_config on
+# every round. These tests were skipped with a note that the logic "moved to
+# orchestrator" and never re-targeted there; this rewrites them against the
+# real function.
 
 
-@pytest.mark.skip(
-    reason="Agent-side _handle_critic_verdict removed; logic moved to orchestrator"
-)
+def _rounds_with_open_blocking(n: int) -> list:
+    """``n`` prior rounds, each returned with a distinct open high-severity
+    finding and a distinct head_commit.
+
+    Distinct per-round commits matter: ``_verification_gate_decision`` checks
+    no-progress (same HEAD as the immediately preceding round) BEFORE the
+    round cap, and the two are mutually exclusive branches. A decision made
+    against yet another new head_commit (see call sites below) exercises the
+    CAP branch specifically, not the no-progress branch already covered by
+    ``TestVerificationGateDecision`` in tests/test_verification_flow.py.
+    """
+    return [
+        {
+            "round": i,
+            "critic_job_id": f"c{i}",
+            "head_commit": f"h{i}",
+            "verdict": "returned",
+            "asserted_verdict": "returned",
+            "opened": [{"id": f"F{i}", "severity": "high", "claim": "still broken"}],
+            "dispositions": [],
+            "ts": "t",
+        }
+        for i in range(1, n + 1)
+    ]
+
+
+def _make_loop_target_job(
+    *, freeze_head_commit: str, verification_rounds: list, max_rounds: int = 3
+) -> dict:
+    """A job row that clears every guard in
+    ``_trigger_verification_on_complete`` for a PROJECT-LOOP job (has
+    ``context.loop_id``) — so hitting the cap must resolve 'completed', not
+    'pending_review': the loop advance hook fires only on terminal statuses,
+    and a parked loop job wedges the whole loop."""
+    return {
+        "id": "loop-target-1",
+        "parent_job_id": None,
+        "config_override": None,
+        "resolved_config": {
+            "verification": {"enabled": True, "max_rounds": max_rounds}
+        },
+        "freeze_data": {
+            "freeze_type": "job_complete",
+            "summary": "done",
+            "deliverables": [],
+            "confidence": 0.9,
+            "head_commit": freeze_head_commit,
+        },
+        "context": {
+            "verification_rounds": verification_rounds,
+            "loop_id": "loop-1",
+        },
+        "status": "reviewing",
+        "description": "loop work",
+        "config_name": "developer",
+        "project_id": None,
+        "user_id": None,
+        "repo_name": None,
+        "branch_name": None,
+    }
+
+
 class TestRoundLimitEnforcement:
-    """Tests for round limit logic — now handled by orchestrator."""
+    """The round cap must ESCALATE to a human, never auto-accept.
 
-    def test_round_under_limit(self):
-        """Rounds under max should allow feedback delivery."""
-        current_round = 1
-        max_rounds = 3
-        assert current_round < max_rounds
+    The retired agent-side branch this replaces did the opposite at the cap:
+    fail the critic and call ``_set_target_to_autonomy_status`` directly — an
+    auto-approval of whatever was on disk, regardless of open findings. The
+    orchestrator's ``_verification_gate_decision`` has no such branch; its
+    only two outcomes are "spawn" (another round) and "escalate" (a human
+    decides). These tests pin that down, including the project-loop variant
+    that must resolve 'completed' rather than park on 'pending_review'.
+    """
 
-    def test_round_at_limit(self):
-        """Round at max should trigger discard."""
-        current_round = 3
-        max_rounds = 3
-        assert current_round >= max_rounds
+    def test_round_under_limit_spawns(self):
+        from orchestrator.main import _verification_gate_decision
 
-    def test_round_over_limit(self):
-        """Round over max should trigger discard."""
-        current_round = 5
-        max_rounds = 3
-        assert current_round >= max_rounds
+        rounds = _rounds_with_open_blocking(1)
+        action, _ = _verification_gate_decision(rounds, head_commit="h9", max_rounds=3)
+        assert action == "spawn"
 
-    def test_round_zero_under_limit(self):
-        """First round (0) is always under limit."""
-        current_round = 0
-        max_rounds = 3
-        assert current_round < max_rounds
+    def test_round_at_limit_escalates(self):
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = _rounds_with_open_blocking(3)
+        action, reason = _verification_gate_decision(
+            rounds, head_commit="h9", max_rounds=3
+        )
+        assert action == "escalate"
+        assert "round limit" in reason.lower()
+
+    def test_round_over_limit_escalates(self):
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = _rounds_with_open_blocking(5)
+        action, reason = _verification_gate_decision(
+            rounds, head_commit="h9", max_rounds=3
+        )
+        assert action == "escalate"
+        assert "round limit" in reason.lower()
+
+    def test_first_round_always_spawns(self):
+        """Round zero (no prior rounds at all) is always under the cap."""
+        from orchestrator.main import _verification_gate_decision
+
+        action, _ = _verification_gate_decision([], head_commit="h1", max_rounds=3)
+        assert action == "spawn"
+
+    def test_cap_reached_outcome_is_never_approval(self):
+        """The defect class this replaces: the retired branch auto-accepted
+        the target at the cap. Confirm the decision function's outcome is
+        always one of exactly two values, and approval is never one of
+        them — however many rounds pile up."""
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = _rounds_with_open_blocking(10)
+        action, _ = _verification_gate_decision(
+            rounds, head_commit="h999", max_rounds=3
+        )
+        assert action in ("spawn", "escalate")
 
     @pytest.mark.asyncio
-    async def test_handle_critic_verdict_approved(self):
-        """Approved verdict should call _set_target_to_autonomy_status."""
-        from src.api.app import _handle_critic_verdict
+    async def test_loop_job_at_round_cap_resolves_completed_not_pending_review(
+        self, monkeypatch
+    ):
+        """Wired end to end through the real trigger function (not just the
+        pure decision function): a project-loop job that hits the round cap
+        must resolve 'completed', never 'pending_review'."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
 
-        mock_conn = MagicMock()
-        mock_conn.fetchrow = AsyncMock(
-            return_value={
-                "parent_job_id": "target-job-1",
-                "freeze_data": json.dumps(
-                    {
-                        "verdict": "approved",
-                        "target_job_id": "target-job-1",
-                    }
-                ),
-                "context": json.dumps(
-                    {
-                        "verification_round": 0,
-                        "max_verification_rounds": 3,
-                    }
-                ),
-            }
+        update_mock = AsyncMock()
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+
+        rounds = _rounds_with_open_blocking(3)
+        # A head_commit distinct from every prior round's — proves this
+        # escalation is the CAP branch, not the no-progress branch (already
+        # covered by test_loop_job_no_progress_escalates_to_completed in
+        # tests/test_verification_flow.py).
+        job = _make_loop_target_job(
+            freeze_head_commit="h999", verification_rounds=rounds
+        )
+        actions: list[str] = []
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, actions
         )
 
-        mock_agent = MagicMock()
-        mock_agent.postgres_conn = mock_conn
-
-        with (
-            patch("src.api.app._agent", mock_agent),
-            patch(
-                "src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock
-            ) as mock_set,
-        ):
-            await _handle_critic_verdict("critic-1", {})
-            mock_set.assert_called_once_with("target-job-1")
-
-    @pytest.mark.asyncio
-    async def test_handle_critic_verdict_returned_under_limit(self):
-        """Returned verdict under limit should resume target."""
-        from src.api.app import _handle_critic_verdict
-
-        mock_conn = MagicMock()
-        mock_conn.fetchrow = AsyncMock(
-            return_value={
-                "parent_job_id": "target-job-1",
-                "freeze_data": json.dumps(
-                    {
-                        "verdict": "returned",
-                        "feedback": "Fix the tests",
-                    }
-                ),
-                "context": json.dumps(
-                    {
-                        "verification_round": 1,
-                        "max_verification_rounds": 3,
-                    }
-                ),
-            }
-        )
-
-        mock_agent = MagicMock()
-        mock_agent.postgres_conn = mock_conn
-
-        mock_client = MagicMock()
-        mock_client.resume_job = AsyncMock(return_value=True)
-
-        with (
-            patch("src.api.app._agent", mock_agent),
-            patch("src.api.app._orchestrator_client", mock_client),
-        ):
-            await _handle_critic_verdict("critic-1", {})
-            mock_client.resume_job.assert_called_once_with(
-                "target-job-1", feedback="Fix the tests"
-            )
-
-    @pytest.mark.asyncio
-    async def test_handle_critic_verdict_returned_at_limit(self):
-        """Returned verdict at round limit should fail critic and auto-accept target."""
-        from src.api.app import _handle_critic_verdict
-
-        mock_conn = MagicMock()
-        mock_conn.fetchrow = AsyncMock(
-            return_value={
-                "parent_job_id": "target-job-1",
-                "freeze_data": json.dumps(
-                    {
-                        "verdict": "returned",
-                        "feedback": "Still broken",
-                    }
-                ),
-                "context": json.dumps(
-                    {
-                        "verification_round": 3,
-                        "max_verification_rounds": 3,
-                    }
-                ),
-            }
-        )
-        mock_conn.jobs = MagicMock()
-        mock_conn.jobs.update_status = AsyncMock()
-
-        mock_agent = MagicMock()
-        mock_agent.postgres_conn = mock_conn
-
-        with (
-            patch("src.api.app._agent", mock_agent),
-            patch(
-                "src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock
-            ) as mock_set,
-        ):
-            await _handle_critic_verdict("critic-1", {})
-
-            # Critic should be set to failed
-            mock_conn.jobs.update_status.assert_called_once_with(
-                "critic-1",
-                status="failed",
-                error_message="Verification limit reached (3 rounds)",
-            )
-            # Target should be set to autonomy status
-            mock_set.assert_called_once_with("target-job-1")
-
-    @pytest.mark.asyncio
-    async def test_handle_critic_verdict_not_a_critic(self):
-        """Non-critic jobs (no parent_job_id) should be skipped."""
-        from src.api.app import _handle_critic_verdict
-
-        mock_conn = MagicMock()
-        mock_conn.fetchrow = AsyncMock(
-            return_value={
-                "parent_job_id": None,
-                "freeze_data": None,
-                "context": None,
-            }
-        )
-
-        mock_agent = MagicMock()
-        mock_agent.postgres_conn = mock_conn
-
-        with (
-            patch("src.api.app._agent", mock_agent),
-            patch(
-                "src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock
-            ) as mock_set,
-        ):
-            await _handle_critic_verdict("regular-job-1", {})
-            mock_set.assert_not_called()
+        update_mock.assert_awaited_once()
+        assert update_mock.call_args.kwargs["status"] == "completed"
+        assert "round limit" in update_mock.call_args.kwargs["error_message"].lower()
 
 
 # =============================================================================

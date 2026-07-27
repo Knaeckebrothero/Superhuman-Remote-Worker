@@ -40,6 +40,7 @@ def make_job(
     autonomy: str = "review",
     config_name: str = "defaults",
     context: dict | None = None,
+    config_override: dict | None = None,
 ) -> dict:
     """Create a minimal job dict for testing."""
     resolved_config = {
@@ -66,6 +67,7 @@ def make_job(
         "context": context or {},
         "project_id": None,
         "freeze_data": freeze_data,
+        "config_override": config_override,
     }
     return job
 
@@ -294,63 +296,174 @@ class TestCompleteJobCriticStatus:
 
 
 class TestVerificationTriggerGuards:
-    """Test the 5 guard conditions in _trigger_verification_on_complete.
+    """Test the guard conditions in ``_trigger_verification_on_complete``.
 
-    These are tested as pure logic (no async DB calls needed) since
-    the guards are checked before any DB operations.
+    This class previously asserted the guard *predicates* directly (e.g.
+    ``assert result.get("error") is not None``) without ever calling the
+    guarded function — it would have kept passing even if every guard were
+    deleted from ``_trigger_verification_on_complete``. Every case below
+    instead invokes the REAL function (mocked ``postgres_db`` only) and
+    asserts no critic was created: ``create_job`` is never awaited and
+    ``actions`` stays empty.
+
+    Each job/result starts from ``_passing_job``/``_passing_result`` — a
+    baseline that clears every guard — with only the ONE condition under
+    test broken, so a case only goes green because of the guard it names, not
+    because some other guard also happened to fire.
+    ``test_critic_created_when_all_guards_pass`` is the positive control that
+    proves the untouched baseline really does reach ``create_job``; without
+    it, an implementation that always returns early (e.g. every guard
+    accidentally inverted at once) would pass every case above for the wrong
+    reason.
     """
 
-    def test_guard_error_skips(self):
-        """Guard 1: Jobs with errors should not trigger verification."""
-        result = {"error": {"message": "failed"}, "should_stop": True}
-        # Error guard: result.get("error") → return
-        assert result.get("error") is not None
-
-    def test_guard_not_stopped_skips(self):
-        """Guard 2: Jobs that haven't stopped should not trigger verification."""
-        result = {"should_stop": False}
-        assert not result.get("should_stop", False)
-
-    def test_guard_subjob_skips(self):
-        """Guard 3: Sub-jobs should not trigger verification."""
-        job = make_job(parent_job_id="parent-123", verification_enabled=True)
-        assert job.get("parent_job_id") is not None
-
-    def test_guard_verification_disabled_skips(self):
-        """Guard 4: Verification disabled should not trigger verification."""
-        job = make_job(verification_enabled=False)
-        assert not is_verification_enabled(job)
-
-    def test_guard_phase_boundary_skips(self):
-        """Guard 5: Phase boundary freezes should not trigger verification."""
-        job = make_job(
+    @staticmethod
+    def _passing_job(**overrides) -> dict:
+        base: dict = dict(
             verification_enabled=True,
-            freeze_data={"freeze_type": "phase_boundary"},
+            status="reviewing",
+            freeze_data={
+                "freeze_type": "job_complete",
+                "summary": "done",
+                "deliverables": [],
+                "confidence": 0.9,
+            },
         )
-        # is_job_completion_freeze returns False for phase boundaries
-        assert not is_job_completion_freeze(job)
-        # And status is not "reviewing"
-        assert job.get("status") != "reviewing"
+        base.update(overrides)
+        return make_job(**base)
 
-    def test_all_guards_pass_for_valid_completion(self):
-        """All guards should pass for a valid job completion with verification."""
-        job = make_job(
-            verification_enabled=True,
-            freeze_data={"freeze_type": "job_complete", "summary": "done"},
-            status="reviewing",  # Set by determine_job_status
+    @staticmethod
+    def _passing_result(**overrides) -> dict:
+        base = {"should_stop": True, "goal_achieved": True}
+        base.update(overrides)
+        return base
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_result_has_error(self, monkeypatch):
+        """Guard 1: an errored result must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job()
+        result = self._passing_result(error={"message": "failed"})
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_not_stopped(self, monkeypatch):
+        """Guard 2: a job that hasn't stopped must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job()
+        result = self._passing_result(should_stop=False)
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_subjob(self, monkeypatch):
+        """Guard 3: sub-jobs (parent_job_id set) must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job(parent_job_id="parent-123")
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_lite_backend(self, monkeypatch):
+        """Guard 4: a lite (virtual/none) workspace backend has no git
+        workspace for the critic handoff, so it must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job(config_override={"workspace": {"backend": "virtual"}})
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_verification_disabled(self, monkeypatch):
+        """Guard 5: verification disabled must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job(verification_enabled=False)
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_not_job_completion_freeze(self, monkeypatch):
+        """Guard 6: a phase-boundary freeze (not a genuine job completion,
+        and status isn't 'reviewing' either) must not spawn a critic."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+
+        job = self._passing_job(
+            status="processing",
+            freeze_data={"freeze_type": "phase_boundary", "phase_number": 3},
         )
-        result = {"should_stop": True, "goal_achieved": True}
+        result = self._passing_result()
+        actions: list[str] = []
 
-        # Guard 1: no error
-        assert not result.get("error")
-        # Guard 2: stopped
-        assert result.get("should_stop", False)
-        # Guard 3: not a sub-job
-        assert job.get("parent_job_id") is None
-        # Guard 4: verification enabled
-        assert is_verification_enabled(job)
-        # Guard 5: is a job completion
-        assert is_job_completion_freeze(job) or job.get("status") == "reviewing"
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_critic_created_when_all_guards_pass(self, monkeypatch):
+        """Positive control: the SAME baseline used above, left untouched,
+        really does reach ``create_job``."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(main, "_propagate_datasources_to_subjob", AsyncMock())
+        monkeypatch.setattr(main, "_trigger_dispatch", lambda: None)
+
+        job = self._passing_job()
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_awaited_once()
+        assert any("critic job" in a and "created" in a for a in actions)
 
 
 class TestVerificationTriggerIntegration:
