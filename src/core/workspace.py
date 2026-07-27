@@ -361,6 +361,33 @@ class WorkspaceManager:
         except Exception:
             return None
 
+    def get_content_tree(self) -> Optional[str]:
+        """Best-effort content hash of the committed workspace at HEAD.
+
+        This — not ``get_head_commit`` — is what the verification gate's
+        no-progress guard compares between rounds. A commit SHA moves on every
+        round (both freeze branches commit with ``allow_empty=True``) and
+        reverts on a re-clone after a failed push, so it is simultaneously
+        unable to fire and able to fire backwards. See
+        :meth:`GitManager.get_content_tree`.
+
+        Probes the workspace root directly for the same reason
+        ``get_head_commit`` does: a repo can be present there even when
+        workspace-level versioning was never enabled. Never raises — any
+        failure (no repo, git unavailable, backend error) returns None.
+        """
+        try:
+            from ..managers.git_manager import GitManager
+        except ImportError:
+            from src.managers.git_manager import GitManager
+
+        try:
+            return GitManager(
+                self._workspace_path, backend=self._backend
+            ).get_content_tree()
+        except Exception:
+            return None
+
     @property
     def _backend_has_shell(self) -> bool:
         """Check if the workspace backend supports shell execution."""

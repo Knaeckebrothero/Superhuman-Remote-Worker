@@ -12362,12 +12362,22 @@ async def _handle_critic_verdict_on_complete(
 
 def _verification_gate_decision(
     rounds: list[dict[str, Any]],
-    head_commit: str | None,
+    content_tree: str | None,
     max_rounds: int,
+    head_commit: str | None = None,
 ) -> tuple[str, str]:
     """Decide whether to spawn another critic or hand the job to a human.
 
     Returns ("spawn", "") or ("escalate", reason). Escalation never approves.
+
+    The no-progress guard compares ``content_tree`` — a content hash of the
+    committed workspace (src/managers/git_manager.py) — NOT a commit SHA. A
+    commit SHA is unusable for this in both directions: every freeze commits
+    with ``allow_empty=True`` so HEAD moves on every round regardless of what
+    the agent produced (the guard could never fire), and a re-clone after a
+    failed push reverts HEAD to an older commit (the guard fired backwards on
+    an infrastructure hiccup). ``head_commit`` is still accepted, and used
+    only for ledger rows written before ``content_tree`` existed.
     """
     from services.verification_ledger import fold_open_findings
 
@@ -12388,12 +12398,23 @@ def _verification_gate_decision(
 
     open_ids = ", ".join(f["id"] for f in open_findings if f.get("id"))
 
-    previous_head = rounds[-1].get("head_commit")
-    if head_commit and previous_head and head_commit == previous_head:
+    # Prefer the content hash. Fall back to the legacy commit SHA only when
+    # BOTH sides carry it and neither carries a content hash (an in-flight job
+    # whose earlier rounds predate this field). The two are never compared
+    # ACROSS: they are different value spaces, so a mismatch between them is
+    # not evidence of progress — with nothing comparable the guard abstains,
+    # which is the safe direction (the round cap still bounds the loop, and a
+    # false "no progress" escalation on a healthy job is the worse error).
+    previous = rounds[-1]
+    current, prior, unit = content_tree, previous.get("content_tree"), "content"
+    if not (current and prior):
+        current, prior, unit = head_commit, previous.get("head_commit"), "commit"
+
+    if current and prior and current == prior:
         return (
             "escalate",
             f"No progress since round {len(rounds)}: the deliverable is unchanged "
-            f"(commit {head_commit[:8]}) while {len(open_findings)} finding(s) "
+            f"({unit} {current[:8]}) while {len(open_findings)} finding(s) "
             f"remain open ({open_ids}).",
         )
 
@@ -12485,9 +12506,12 @@ async def _trigger_verification_on_complete(
     freeze_data = _parse_freeze_data(job) or {}
     rounds = _verification_rounds(job)
     max_rounds = verification_config.get("max_rounds", 3)
+    content_tree = freeze_data.get("content_tree")
     head_commit = freeze_data.get("head_commit")
 
-    action, reason = _verification_gate_decision(rounds, head_commit, max_rounds)
+    action, reason = _verification_gate_decision(
+        rounds, content_tree, max_rounds, head_commit=head_commit
+    )
     if action == "escalate":
         await _escalate_target(job_id, job, reason)
         actions.append(f"target {job_id} escalated: {reason}")
@@ -18177,6 +18201,7 @@ async def _record_verification_round_impl(
     opened: list[dict[str, Any]],
     dispositions: list[dict[str, Any]],
     head_commit: str | None,
+    content_tree: str | None = None,
 ) -> dict[str, Any]:
     """Validate, compute, and durably append one verification round.
 
@@ -18206,15 +18231,18 @@ async def _record_verification_round_impl(
     if not target:
         raise HTTPException(status_code=404, detail=f"Job {target_job_id} not found")
 
-    # head_commit is server-authoritative from the TARGET's own completion
-    # freeze, not the caller-supplied value — the critic runs on its own
-    # ``subjob/<id>/critic`` branch, so ITS workspace HEAD is a different
-    # commit than the target's, and comparing it against the previous
-    # round's (the no-progress check in _verification_gate_decision) would
-    # be meaningless. Falls back to the caller-supplied value only when the
-    # target's freeze has none (e.g. an older freeze predating this field).
+    # Both progress markers are server-authoritative from the TARGET's own
+    # completion freeze, not the caller-supplied values — the critic runs on
+    # its own ``subjob/<id>/critic`` branch, so ITS workspace is a different
+    # thing from the target's, and comparing it against the previous round's
+    # (the no-progress check in _verification_gate_decision) would be
+    # meaningless. Each falls back to the caller-supplied value only when the
+    # target's freeze has none (e.g. an older freeze predating the field).
+    # ``content_tree`` is the one the gate compares; ``head_commit`` is kept
+    # for diagnostics and for reading rows written before it existed.
     target_freeze = _parse_freeze_data(target) or {}
     head_commit = target_freeze.get("head_commit") or head_commit
+    content_tree = target_freeze.get("content_tree") or content_tree
 
     rounds = _verification_rounds(target)
 
@@ -18246,6 +18274,7 @@ async def _record_verification_round_impl(
         "round": len(rounds) + 1,
         "critic_job_id": critic_job_id,
         "head_commit": head_commit,
+        "content_tree": content_tree,
         "asserted_verdict": str(asserted_verdict).lower(),
         "opened": assigned,
         "dispositions": dispositions,
@@ -18310,6 +18339,7 @@ async def record_verification_round(
         opened=body.get("opened") or [],
         dispositions=body.get("dispositions") or [],
         head_commit=body.get("head_commit"),
+        content_tree=body.get("content_tree"),
     )
 
 

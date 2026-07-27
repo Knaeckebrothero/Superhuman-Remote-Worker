@@ -581,3 +581,113 @@ class TestWorkspaceGetHeadCommit:
         )
 
         assert ws.get_head_commit() is None
+
+
+class TestWorkspaceGetContentTree:
+    """get_content_tree: the verification gate's REAL no-progress signal.
+
+    A commit SHA cannot serve this purpose in either direction — it moves on
+    every round (every freeze commits with ``allow_empty=True``) and it
+    reverts on a re-clone after a failed push. These pin the two properties
+    that make a content hash usable instead.
+    """
+
+    @staticmethod
+    def _make_ws(base):
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["output/"],
+                git_versioning=True,
+            ),
+            base_path=base,
+            backend=FilesystemTestBackend(base),
+        )
+        ws.initialize()
+        return ws
+
+    def test_invariant_under_an_empty_commit(self, temp_base):
+        """THE defect: ``commit(..., allow_empty=True)`` runs unconditionally
+        at every phase boundary and at completion, so a guard keyed on HEAD
+        can never fire."""
+        ws = self._make_ws(temp_base)
+        ws.write_file("output/report.md", "deliverable")
+        ws.git_manager.commit("work")
+
+        before_tree = ws.get_content_tree()
+        before_head = ws.get_head_commit()
+
+        ws.git_manager.commit("Job frozen for review", allow_empty=True)
+
+        assert before_tree is not None
+        assert ws.get_content_tree() == before_tree
+        assert ws.get_head_commit() != before_head  # the contrast
+
+    def test_changes_when_content_changes(self, temp_base):
+        ws = self._make_ws(temp_base)
+        ws.write_file("output/report.md", "v1")
+        ws.git_manager.commit("v1")
+        first = ws.get_content_tree()
+
+        ws.write_file("output/report.md", "v2")
+        ws.git_manager.commit("v2")
+
+        assert ws.get_content_tree() != first
+
+    def test_ignores_the_completion_bookkeeping_files(self, temp_base):
+        """``job_frozen.json`` / ``job_completion.json`` carry a fresh
+        ``timestamp`` on every run. Counting them would make two rounds over
+        identical deliverables look different — the same inertness, one layer
+        down."""
+        ws = self._make_ws(temp_base)
+        ws.write_file("output/report.md", "deliverable")
+        ws.write_file("output/job_frozen.json", '{"timestamp": "T1"}')
+        ws.git_manager.commit("round 1")
+        first = ws.get_content_tree()
+
+        ws.write_file("output/job_frozen.json", '{"timestamp": "T2"}')
+        ws.git_manager.commit("round 2")
+
+        assert ws.get_content_tree() == first
+
+    def test_same_content_in_a_fresh_repo_hashes_the_same(self, temp_base):
+        """Content-addressed, so a re-clone after a failed push — which
+        reverts HEAD to an entirely different commit — does not read as 'no
+        progress'."""
+        a = self._make_ws(temp_base / "a")
+        a.write_file("output/report.md", "deliverable")
+        a.git_manager.commit("work")
+
+        b = self._make_ws(temp_base / "b")
+        b.write_file("output/report.md", "deliverable")
+        b.git_manager.commit("work")
+        # A different history over identical content — what a re-clone from a
+        # remote that missed a push looks like from the workspace's side.
+        b.git_manager.commit("an extra commit b has and a does not", allow_empty=True)
+
+        assert a.get_content_tree() == b.get_content_tree()
+        assert a.get_head_commit() != b.get_head_commit()  # the contrast
+
+    def test_returns_none_without_git_repo(self, temp_base):
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["archive/"],
+                git_versioning=False,
+            ),
+            base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
+        )
+        ws.initialize()
+
+        assert ws.get_content_tree() is None
+
+    def test_returns_none_before_workspace_initialized(self, temp_base):
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(structure=["archive/"]),
+            base_path=temp_base / "never-created",
+            backend=FilesystemTestBackend(temp_base / "never-created"),
+        )
+
+        assert ws.get_content_tree() is None

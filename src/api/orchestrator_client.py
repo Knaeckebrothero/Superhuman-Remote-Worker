@@ -1288,6 +1288,7 @@ class OrchestratorClient:
         opened: list,
         dispositions: list,
         head_commit: Optional[str] = None,
+        content_tree: Optional[str] = None,
     ) -> dict[str, Any]:
         """Durably record this round and return the SERVER-COMPUTED verdict.
 
@@ -1306,6 +1307,7 @@ class OrchestratorClient:
             "opened": opened,
             "dispositions": dispositions,
             "head_commit": head_commit,
+            "content_tree": content_tree,
         }
         try:
             response = await self._client.post(url, json=payload)

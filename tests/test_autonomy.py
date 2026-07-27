@@ -11,6 +11,7 @@ Tests:
 
 import json
 import pytest
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -497,6 +498,118 @@ class TestFinalizeJobHeadCommit:
 
         assert result.success is True
         assert result.freeze_data["head_commit"] is None
+
+
+class TestFinalizeJobContentTree:
+    """``content_tree`` is what the no-progress guard actually compares.
+
+    Driven against a REAL git repo, twice, with nothing changed in between.
+    A hand-built freeze dict cannot prove this property — the original defect
+    (``head_commit`` read BEFORE a ``commit(..., allow_empty=True)`` that runs
+    unconditionally, so HEAD moves every round and the guard could never fire)
+    hid behind exactly that kind of test. The two recorded values must be
+    EQUAL, or the guard is inert again.
+    """
+
+    def setup_method(self):
+        _final_phase_data.clear()
+
+    @staticmethod
+    def _seed_final_data(job_id: str = "test-job") -> None:
+        _final_phase_data[job_id] = {
+            "summary": "done",
+            "deliverables": ["output/report.md"],
+            "confidence": 0.9,
+            "job_id": job_id,
+        }
+
+    @staticmethod
+    def _make_real_workspace(base):
+        from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+        from tests._fs_backend import FilesystemTestBackend
+
+        ws = WorkspaceManager(
+            job_id="test-job",
+            config=WorkspaceManagerConfig(
+                structure=["output/"],
+                git_versioning=True,
+            ),
+            base_path=base,
+            backend=FilesystemTestBackend(base),
+        )
+        ws.initialize()
+        ws.write_file("output/report.md", "the deliverable")
+        ws.git_manager.commit("deliverable")
+        return ws
+
+    @pytest.mark.skipif(
+        shutil.which("git") is None, reason="Git not available on system"
+    )
+    @pytest.mark.parametrize("autonomy", ["partial", "full"])
+    def test_two_runs_with_no_content_change_record_the_same_value(
+        self, tmp_path, autonomy
+    ):
+        ws = self._make_real_workspace(tmp_path)
+        tm = MagicMock()
+
+        self._seed_final_data()
+        first = finalize_job(
+            make_state(), ws, tm, config=make_config(autonomy)
+        ).freeze_data
+
+        self._seed_final_data()
+        second = finalize_job(
+            make_state(), ws, tm, config=make_config(autonomy)
+        ).freeze_data
+
+        assert first["content_tree"], "no content_tree recorded at all"
+        assert first["content_tree"] == second["content_tree"], (
+            "the no-progress guard is inert: two runs over identical content "
+            "recorded different values"
+        )
+        # Contrast: the commit SHA moves every run because both freeze
+        # branches commit with allow_empty=True. That is why the guard cannot
+        # key on it.
+        assert first["head_commit"] != second["head_commit"]
+
+    @pytest.mark.skipif(
+        shutil.which("git") is None, reason="Git not available on system"
+    )
+    def test_a_real_content_change_moves_the_value(self, tmp_path):
+        """Contrast case: an implementation returning a constant would pass
+        the test above."""
+        ws = self._make_real_workspace(tmp_path)
+        tm = MagicMock()
+
+        self._seed_final_data()
+        first = finalize_job(
+            make_state(), ws, tm, config=make_config("partial")
+        ).freeze_data
+
+        ws.write_file("output/report.md", "the deliverable, now improved")
+
+        self._seed_final_data()
+        second = finalize_job(
+            make_state(), ws, tm, config=make_config("partial")
+        ).freeze_data
+
+        assert first["content_tree"] != second["content_tree"]
+
+    def test_content_tree_failure_is_swallowed(self):
+        """Best-effort, exactly like head_commit: a git failure at freeze time
+        must never break job completion."""
+        state = make_state()
+        ws = MagicMock()
+        ws.git_manager = None
+        ws.get_head_commit = MagicMock(return_value="abc1234")
+        ws.get_content_tree = MagicMock(side_effect=RuntimeError("no repo"))
+        tm = MagicMock()
+        self._seed_final_data()
+
+        result = finalize_job(state, ws, tm, config=make_config("partial"))
+
+        assert result.success is True
+        assert result.freeze_data["content_tree"] is None
 
 
 # =============================================================================
