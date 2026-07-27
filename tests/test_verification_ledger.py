@@ -113,19 +113,64 @@ class TestAssignIds:
 
 
 class TestComputeVerdict:
+    """The server may compute STRICTER than the model asserted, never laxer.
+
+    Two independent grounds for 'returned': an open BLOCKING finding (which
+    overrides an asserted approval — the rule that makes the original incident
+    impossible), or the critic explicitly asserting 'returned' while anything
+    is still open (which respects a deliberate medium/low-severity return
+    instead of silently upgrading it to an approval).
+    """
+
     def test_no_findings_approves(self):
-        assert compute_verdict([]) == "approved"
+        assert compute_verdict("approved", []) == "approved"
 
     def test_open_high_returns(self):
-        assert compute_verdict([{"id": "F1", "severity": "high"}]) == "returned"
+        # asserted='approved' on purpose: the BLOCKING rule does the work.
+        assert compute_verdict("approved", [{"id": "F1", "severity": "high"}]) == "returned"
 
     def test_only_non_blocking_approves(self):
-        assert compute_verdict([{"id": "F1", "severity": "medium"},
-                                {"id": "F2", "severity": "low"}]) == "approved"
+        assert compute_verdict("approved", [{"id": "F1", "severity": "medium"},
+                                            {"id": "F2", "severity": "low"}]) == "approved"
 
     def test_mixed_returns(self):
-        assert compute_verdict([{"id": "F1", "severity": "low"},
-                                {"id": "F2", "severity": "high"}]) == "returned"
+        assert compute_verdict("approved", [{"id": "F1", "severity": "low"},
+                                            {"id": "F2", "severity": "high"}]) == "returned"
+
+    # -- the four (asserted) x (blocking) combinations -----------------------
+
+    def test_asserted_approved_with_blocking_returns(self):
+        assert compute_verdict(
+            "approved", [{"id": "F1", "severity": "high"}]
+        ) == "returned"
+
+    def test_asserted_approved_without_blocking_approves(self):
+        assert compute_verdict(
+            "approved", [{"id": "F1", "severity": "medium"}]
+        ) == "approved"
+
+    def test_asserted_returned_with_blocking_returns(self):
+        assert compute_verdict(
+            "returned", [{"id": "F1", "severity": "high"}]
+        ) == "returned"
+
+    def test_asserted_returned_without_blocking_still_returns(self):
+        """The defect: an explicit 'returned' at medium/low severity was
+        silently recorded as 'approved', advancing the target."""
+        assert compute_verdict(
+            "returned", [{"id": "F1", "severity": "medium"}]
+        ) == "returned"
+
+    def test_asserted_returned_with_nothing_open_approves(self):
+        """Nothing is open, so there is nothing to return on. Unreachable in
+        practice (``validate_verdict_call`` rejects the call first), but the
+        computation must still be total."""
+        assert compute_verdict("returned", []) == "approved"
+
+    def test_asserted_verdict_is_case_insensitive(self):
+        assert compute_verdict(
+            "RETURNED", [{"id": "F1", "severity": "low"}]
+        ) == "returned"
 
 
 from orchestrator.services.verification_ledger import (  # noqa: E402
@@ -204,17 +249,39 @@ class TestValidateDispositions:
 
 
 class TestValidateVerdictCall:
-    def test_returned_with_no_findings_rejected(self):
+    def test_returned_with_nothing_open_at_all_rejected(self):
         # The incident: `issues: "[]"` recorded as "Issues: 0, Severity: high".
-        errors = validate_verdict_call("returned", [])
+        errors = validate_verdict_call("returned", [], [])
         assert len(errors) == 1
         assert "no findings" in errors[0].lower()
 
     def test_returned_with_findings_ok(self):
-        assert validate_verdict_call("returned", [{"claim": "x", "severity": "high"}]) == []
+        assert validate_verdict_call(
+            "returned", [{"claim": "x", "severity": "high"}], []
+        ) == []
 
     def test_approved_with_no_findings_ok(self):
-        assert validate_verdict_call("approved", []) == []
+        assert validate_verdict_call("approved", [], []) == []
+
+    def test_returned_with_no_new_findings_but_prior_open_is_ok(self):
+        """The most common round-2 shape: nothing NEW, but F1 is still open.
+
+        Rejecting this made ``return_job_with_feedback`` uncallable for that
+        critic and pushed it toward ``approve_job`` — the wrong pressure
+        direction for a fail-closed gate.
+        """
+        assert validate_verdict_call("returned", [], OPEN_HIGH) == []
+
+    def test_returned_with_no_new_findings_but_prior_open_nonblocking_is_ok(self):
+        open_medium = [{"id": "F1", "severity": "medium", "claim": "nit"}]
+        assert validate_verdict_call("returned", [], open_medium) == []
+
+    def test_rejection_message_asks_for_a_finding_not_an_approval(self):
+        """The error is the model's only correction signal. It must push
+        toward describing the problem, not toward approving the job."""
+        errors = validate_verdict_call("returned", [], [])
+        assert "opened" in errors[0]
+        assert "approve instead" not in errors[0].lower()
 
 
 class TestRenderPriorFindings:

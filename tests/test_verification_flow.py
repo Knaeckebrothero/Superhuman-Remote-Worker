@@ -230,6 +230,116 @@ class TestRecordVerificationRoundCleanApproval:
         assert ledger_state["rounds"][0]["verdict"] == "approved"
 
 
+class TestExplicitReturnAtNonBlockingSeverity:
+    """A critic that explicitly calls ``return_job_with_feedback`` must not
+    have its verdict silently rewritten to 'approved' just because none of its
+    findings reached ``BLOCKING_SEVERITY``.
+
+    The pure-function combinations live in tests/test_verification_ledger.py;
+    these prove the endpoint actually threads ``asserted_verdict`` into the
+    computation and into the round it persists.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returned_with_only_medium_findings_records_returned(
+        self, fake_db, ledger_state
+    ):
+        from orchestrator.main import _record_verification_round_impl
+
+        result = await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c1",
+            asserted_verdict="returned",
+            opened=[{"severity": "medium", "claim": "shaky citation"}],
+            dispositions=[],
+            head_commit="aaa",
+        )
+
+        assert result["verdict"] == "returned"
+        assert ledger_state["rounds"][0]["verdict"] == "returned"
+
+    @pytest.mark.asyncio
+    async def test_approved_with_only_medium_findings_still_approves(
+        self, fake_db, ledger_state
+    ):
+        """The contrast case: the server computes STRICTER than the model, never
+        laxer. Without this, an implementation that returns on any open finding
+        at all would pass the test above."""
+        from orchestrator.main import _record_verification_round_impl
+
+        result = await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c1",
+            asserted_verdict="approved",
+            opened=[],
+            dispositions=[],
+            head_commit="aaa",
+        )
+
+        assert result["verdict"] == "approved"
+
+
+class TestReturnWithNoNewFindingsButPriorOpen:
+    """Round 2's most common shape: no NEW problems, but a predecessor's
+    finding is still unaddressed. Rejecting this made
+    ``return_job_with_feedback`` uncallable for that critic."""
+
+    @pytest.mark.asyncio
+    async def test_returned_with_empty_opened_and_prior_open_is_accepted(
+        self, fake_db, ledger_state
+    ):
+        from orchestrator.main import _record_verification_round_impl
+
+        ledger_state["rounds"].append(
+            {
+                "round": 1,
+                "critic_job_id": "c1",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "head_commit": "aaa",
+                "opened": [{"id": "F1", "severity": "high", "claim": "missing tests"}],
+                "dispositions": [],
+                "ts": "t",
+            }
+        )
+
+        result = await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c2",
+            asserted_verdict="returned",
+            opened=[],
+            dispositions=[{"id": "F1", "disposition": "STILL_OPEN"}],
+            head_commit="bbb",
+        )
+
+        assert result["verdict"] == "returned"
+        assert [f["id"] for f in result["open_findings"]] == ["F1"]
+        assert len(ledger_state["rounds"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_returned_with_nothing_open_anywhere_still_raises_409(self, fake_db):
+        """The original guard must not be weakened away: an empty return with
+        no prior open findings has nothing to return ON."""
+        from fastapi import HTTPException
+
+        from orchestrator.main import _record_verification_round_impl
+
+        with pytest.raises(HTTPException) as exc:
+            await _record_verification_round_impl(
+                postgres_db=fake_db,
+                target_job_id="t1",
+                critic_job_id="c1",
+                asserted_verdict="returned",
+                opened=[],
+                dispositions=[],
+                head_commit="aaa",
+            )
+        assert exc.value.status_code == 409
+
+
 class TestRecordVerificationRoundHeadCommitAuthority:
     """Amendment item 2: the recorded round's ``head_commit`` is
     server-authoritative from the TARGET's ``freeze_data``, not whatever the
@@ -380,6 +490,83 @@ class TestVerificationGateDecision:
         )
         assert action == "escalate"
         assert "round limit" in reason.lower()
+
+    def test_cap_applies_to_non_blocking_open_findings_too(self):
+        """Downstream of the verdict-rule change: an explicit 'returned' at
+        medium/low severity now resumes the target instead of silently
+        approving it, so a round can END with open findings but NONE blocking.
+
+        If the gate's guards only ever looked at the blocking subset, that
+        state would spawn a fresh critic forever — dodging both the round cap
+        and the no-progress check, with no terminal state at all. The guards
+        run on the OPEN set; only a genuinely empty open set spawns freely.
+        """
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = [
+            {
+                "round": i,
+                "critic_job_id": f"c{i}",
+                "head_commit": f"h{i}",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "opened": [{"id": f"F{i}", "severity": "medium", "claim": "c"}],
+                "dispositions": [],
+                "ts": "t",
+            }
+            for i in range(1, 4)
+        ]
+
+        action, reason = _verification_gate_decision(
+            rounds, head_commit="h9", max_rounds=3
+        )
+        assert action == "escalate"
+        assert "round limit" in reason.lower()
+
+    def test_no_progress_applies_to_non_blocking_open_findings_too(self):
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = [
+            {
+                "round": 1,
+                "critic_job_id": "c1",
+                "head_commit": "aaa",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "opened": [{"id": "F1", "severity": "medium", "claim": "c"}],
+                "dispositions": [],
+                "ts": "t",
+            }
+        ]
+
+        action, reason = _verification_gate_decision(
+            rounds, head_commit="aaa", max_rounds=3
+        )
+        assert action == "escalate"
+        assert "no progress" in reason.lower()
+
+    def test_empty_open_set_spawns_regardless_of_round_count(self):
+        """Contrast case: nothing is open, so nothing is being re-litigated —
+        the cap must not fire and strand a job whose findings were all
+        resolved."""
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = [
+            {
+                "round": i,
+                "critic_job_id": f"c{i}",
+                "head_commit": f"h{i}",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "opened": [],
+                "dispositions": [],
+                "ts": "t",
+            }
+            for i in range(1, 6)
+        ]
+
+        action, _ = _verification_gate_decision(rounds, head_commit="h9", max_rounds=3)
+        assert action == "spawn"
 
     def test_unlimited_rounds_never_hits_cap(self):
         from orchestrator.main import _verification_gate_decision
