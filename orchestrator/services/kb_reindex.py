@@ -63,8 +63,10 @@ OKF_PARSER_VERSION = "okf-parser-v1"
 # (mirrors gardener._RESERVED; index.md carries no frontmatter by spec).
 _RESERVED_BASENAMES = {"index.md", "log.md"}
 
-# CHECK-constraint vocabularies from vector/0001 — frontmatter is human-editable,
-# so unknown values map to safe defaults instead of failing the row INSERT.
+# CHECK-constraint vocabularies from vector/0001 + vector/0013 — frontmatter is
+# human-editable, so unknown values map to safe defaults instead of failing the
+# row INSERT. Canonical copy: src/services/knowledge_graph.py NOTE_TYPES (not
+# importable here — the orchestrator image has no agent deps).
 VALID_NOTE_TYPES = {
     "goal",
     "plan",
@@ -76,6 +78,9 @@ VALID_NOTE_TYPES = {
     "state",
     "retrospective",
     "datasource",
+    "feature",
+    "issue",
+    "idea",
 }
 VALID_STATUSES = {"active", "resolved", "superseded", "archived"}
 _DEFAULT_NOTE_TYPE = "learning"

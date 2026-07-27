@@ -65,6 +65,11 @@ KB_TTL_BY_NOTE_TYPE: Dict[str, Optional[int]] = {
     "code": None,
     "retrospective": None,
     "source": None,
+    # Backlog tickets — durable by design. A ticket is work that still needs
+    # doing; expiring it on a clock would delete the queue.
+    "feature": None,
+    "issue": None,
+    "idea": None,
 }
 KB_TTL_DEFAULT: Optional[int] = None
 
