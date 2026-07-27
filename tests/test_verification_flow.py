@@ -339,6 +339,50 @@ class TestReturnWithNoNewFindingsButPriorOpen:
         assert len(ledger_state["rounds"]) == 2
 
     @pytest.mark.asyncio
+    async def test_returning_while_resolving_the_last_finding_does_not_approve(
+        self, fake_db, ledger_state
+    ):
+        """The laxer-than-asserted path this relaxation opened.
+
+        Allowing `returned` with an empty `opened` (the round-2 shape) means a
+        critic can, in the same call, disposition the last open finding
+        RESOLVED. `open_after` is then empty — and computing `approved` there
+        advances a target the critic explicitly refused to pass. Before the
+        relaxation this shape was a hard 409, so it is newly reachable, and
+        the critic brief now actively teaches the empty-`findings` return.
+        """
+        from orchestrator.main import _record_verification_round_impl
+
+        ledger_state["rounds"].append(
+            {
+                "round": 1,
+                "critic_job_id": "c1",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "content_tree": "aaa",
+                "opened": [{"id": "F1", "severity": "high", "claim": "missing tests"}],
+                "dispositions": [],
+                "ts": "t",
+            }
+        )
+
+        result = await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id=TARGET_ID,
+            critic_job_id="c2",
+            asserted_verdict="returned",
+            opened=[],
+            dispositions=[
+                {"id": "F1", "disposition": "RESOLVED", "quote": "here they are"}
+            ],
+            head_commit="bbb",
+        )
+
+        assert result["open_findings"] == []  # the fold really did close F1
+        assert result["verdict"] == "returned"
+        assert ledger_state["rounds"][1]["verdict"] == "returned"
+
+    @pytest.mark.asyncio
     async def test_returned_with_nothing_open_anywhere_still_raises_409(self, fake_db):
         """The original guard must not be weakened away: an empty return with
         no prior open findings has nothing to return ON."""
@@ -742,9 +786,19 @@ class TestVerificationGateDecision:
         assert action == "escalate"
         assert "round limit" in reason.lower()
 
-    def test_legacy_rounds_without_content_tree_fall_back_to_head_commit(self):
-        """In-flight jobs whose earlier rounds were written before
-        ``content_tree`` existed must not lose the guard entirely."""
+    def test_legacy_rounds_without_content_tree_abstain(self):
+        """A round written before ``content_tree`` existed carries only
+        ``head_commit`` — a value known to be WRONG for this comparison in
+        both directions. It is captured before the freeze commit (which runs
+        with allow_empty=True), so it never matches; and it reverts on a
+        re-clone after a failed push, so when it does match it is reporting an
+        infrastructure hiccup as "no progress" and escalating a healthy job
+        BACKWARDS.
+
+        Comparing it is therefore strictly worse than not comparing at all.
+        The guard abstains — "cannot determine progress", spawn normally — and
+        the round cap still bounds the loop.
+        """
         from orchestrator.main import _verification_gate_decision
 
         rounds = [
@@ -760,17 +814,39 @@ class TestVerificationGateDecision:
             }
         ]
 
+        action, _ = _verification_gate_decision(rounds, content_tree=None, max_rounds=3)
+        assert action == "spawn"
+
+    def test_legacy_rounds_still_hit_the_round_cap(self):
+        """Abstaining on no-progress must not disable the OTHER guard: a
+        legacy job still escalates at the cap."""
+        from orchestrator.main import _verification_gate_decision
+
+        rounds = [
+            {
+                "round": i,
+                "critic_job_id": f"c{i}",
+                "head_commit": "aaa",
+                "verdict": "returned",
+                "asserted_verdict": "returned",
+                "opened": [{"id": f"F{i}", "severity": "high", "claim": "c"}],
+                "dispositions": [],
+                "ts": "t",
+            }
+            for i in range(1, 4)
+        ]
+
         action, reason = _verification_gate_decision(
-            rounds, content_tree=None, max_rounds=3, head_commit="aaa"
+            rounds, content_tree=None, max_rounds=3
         )
         assert action == "escalate"
-        assert "no progress" in reason.lower()
+        assert "round limit" in reason.lower()
 
-    def test_content_tree_and_head_commit_are_never_compared_across(self):
-        """A tree hash and a commit SHA are different value spaces. When one
-        side has only the legacy field the guard must ABSTAIN (spawn), not
-        manufacture a comparison — the round cap still bounds the loop, and a
-        false 'no progress' escalation on a healthy job is the worse error.
+    def test_a_current_content_tree_against_a_legacy_row_abstains(self):
+        """A tree hash and a commit SHA are different value spaces, and the
+        gate no longer takes a commit SHA at all. A current round with a
+        content hash, judged against a legacy row that has none, must ABSTAIN
+        (spawn) rather than manufacture a comparison.
         """
         from orchestrator.main import _verification_gate_decision
 
@@ -788,7 +864,7 @@ class TestVerificationGateDecision:
         ]
 
         action, _ = _verification_gate_decision(
-            rounds, content_tree="aaa", max_rounds=3, head_commit="bbb"
+            rounds, content_tree="aaa", max_rounds=3
         )
         assert action == "spawn"
 
