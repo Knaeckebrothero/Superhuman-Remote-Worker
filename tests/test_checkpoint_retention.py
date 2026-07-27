@@ -100,3 +100,110 @@ class TestUpdateJobStatusPrunes:
 
         assert ok is True
         assert conn.execute.await_count == 1  # only the UPDATE — no prune
+
+
+class TestPruneCheckpointsKeepLast:
+    """In-flight keep-last-N retention across ALL threads (bounds long-running
+    jobs that never terminate, so the checkpointer can't fill the PVC)."""
+
+    @pytest.mark.asyncio
+    async def test_noop_when_backend_not_postgres(self, monkeypatch):
+        monkeypatch.delenv("CHECKPOINTER_BACKEND", raising=False)  # default sqlite
+        conn = AsyncMock()
+        db = _make_db(conn)
+
+        assert await db.prune_checkpoints_keep_last(3) == 0
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prunes_three_tables_keeping_last_n(self, monkeypatch):
+        monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="DELETE 5")
+        db = _make_db(conn)
+
+        deleted = await db.prune_checkpoints_keep_last(3)
+
+        assert deleted == 15  # 3 tables × 5 rows
+        assert conn.execute.await_count == 3
+        sql = [c.args[0] for c in conn.execute.await_args_list]
+        # checkpoints must be pruned BEFORE checkpoint_writes — the writes
+        # cleanup deletes rows orphaned by the checkpoints delete.
+        assert "DELETE FROM checkpoints c" in sql[0]
+        assert "DELETE FROM checkpoint_writes" in sql[1]
+        assert "DELETE FROM checkpoint_blobs cb" in sql[2]
+        # the windowed deletes keep the newest N (bound as $1)
+        assert conn.execute.await_args_list[0].args[1] == 3
+        assert conn.execute.await_args_list[2].args[1] == 3
+
+    @pytest.mark.asyncio
+    async def test_keep_zero_is_rejected(self, monkeypatch):
+        """keep_n < 1 would wipe live resume state — refuse, don't delete."""
+        monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+        conn = AsyncMock()
+        db = _make_db(conn)
+
+        assert await db.prune_checkpoints_keep_last(0) == 0
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_nonfatal_on_error(self, monkeypatch):
+        monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+        conn = AsyncMock()
+        conn.execute = AsyncMock(side_effect=Exception("relation does not exist"))
+        db = _make_db(conn)
+
+        assert await db.prune_checkpoints_keep_last(3) == 0  # swallowed
+
+
+class TestRetentionTick:
+    """The periodic sweeper's per-tick logic: prune only on the leader (so two
+    HA replicas don't run the global prune concurrently), with keep_n from env."""
+
+    @pytest.mark.asyncio
+    async def test_prunes_when_leader(self):
+        from orchestrator.services.checkpoint_retention import retention_tick
+
+        db = MagicMock()
+        db.prune_checkpoints_keep_last = AsyncMock(return_value=7)
+
+        deleted = await retention_tick(db, leader=True)
+
+        assert deleted == 7
+        db.prune_checkpoints_keep_last.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_not_leader(self):
+        from orchestrator.services.checkpoint_retention import retention_tick
+
+        db = MagicMock()
+        db.prune_checkpoints_keep_last = AsyncMock(return_value=7)
+
+        deleted = await retention_tick(db, leader=False)
+
+        assert deleted == 0
+        db.prune_checkpoints_keep_last.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_keep_n_from_env_default_3(self, monkeypatch):
+        from orchestrator.services.checkpoint_retention import retention_tick
+
+        monkeypatch.delenv("CHECKPOINT_RETENTION_KEEP", raising=False)
+        db = MagicMock()
+        db.prune_checkpoints_keep_last = AsyncMock(return_value=0)
+
+        await retention_tick(db, leader=True)
+
+        db.prune_checkpoints_keep_last.assert_awaited_once_with(3)
+
+    @pytest.mark.asyncio
+    async def test_keep_n_from_env_override(self, monkeypatch):
+        from orchestrator.services.checkpoint_retention import retention_tick
+
+        monkeypatch.setenv("CHECKPOINT_RETENTION_KEEP", "5")
+        db = MagicMock()
+        db.prune_checkpoints_keep_last = AsyncMock(return_value=0)
+
+        await retention_tick(db, leader=True)
+
+        db.prune_checkpoints_keep_last.assert_awaited_once_with(5)

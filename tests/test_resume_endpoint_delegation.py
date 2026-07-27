@@ -347,3 +347,84 @@ class TestResumeEndpointDelegation:
         # tests/test_queue_job_for_resume.py. Here we only pin the seam: a
         # declined delegation must fall back to that write.
         endpoint_collaborators.queue_for_resume.assert_awaited_once_with(JOB_ID, None)
+
+
+# ---------------------------------------------------------------------------
+# resume_job endpoint — workspaceless jobs go back to the dispatcher
+# ---------------------------------------------------------------------------
+
+
+class TestResumeEndpointWorkspacelessJob:
+    """A job whose workspace never came up must be re-provisioned, not pushed.
+
+    Nothing in the resume path provisions; only the dispatcher does. Pushing
+    such a job at an agent ships `workspace.backend='vm'` with no `remote`, and
+    the agent hard-fails at init_workspace (job 4435994d, 2026-07-27).
+
+    The shed has to happen BEFORE agent selection: the "no agents available"
+    branch returns early, so a shed placed after it would leave the parked
+    context in place and the dispatcher would just re-park the job.
+    """
+
+    @pytest.fixture
+    def workspaceless(self, monkeypatch, endpoint_collaborators):
+        endpoint_collaborators.job["config_override"] = {"workspace": {"backend": "vm"}}
+        endpoint_collaborators.job["context"] = {
+            "vm": {"status": "failed", "error": "while scanning a simple key"}
+        }
+        shed = AsyncMock(return_value=True)
+        monkeypatch.setattr(main.postgres_db, "shed_workspace_context", shed)
+        endpoint_collaborators.shed = shed
+        return endpoint_collaborators
+
+    @pytest.mark.asyncio
+    async def test_queues_instead_of_resuming_onto_an_agent(self, workspaceless):
+        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert result["status"] == "queued"
+        workspaceless.delegate.assert_not_awaited()
+        workspaceless.queue_for_resume.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sheds_the_parked_vm_context(self, workspaceless):
+        """Without this the dispatcher reads status='failed' and re-parks it."""
+        await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        workspaceless.shed.assert_awaited_once_with(JOB_ID, "vm")
+
+    @pytest.mark.asyncio
+    async def test_sheds_the_container_key_for_sandbox_jobs(self, workspaceless):
+        workspaceless.job["config_override"] = {"workspace": {"backend": "sandbox"}}
+        workspaceless.job["context"] = {"workspace_container": {"status": "deleted"}}
+
+        await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        workspaceless.shed.assert_awaited_once_with(JOB_ID, "workspace_container")
+
+    @pytest.mark.asyncio
+    async def test_feedback_survives_the_reprovisioning_detour(self, workspaceless):
+        """Re-provisioning must not silently drop what the user typed.
+
+        The pre-flight returns before the endpoint's own feedback merge, so the
+        feedback rides along on the queue write instead.
+        """
+        await main.resume_job(
+            MagicMock(), JOB_ID, main.JobResumeRequest(feedback="try again")
+        )
+
+        workspaceless.queue_for_resume.assert_awaited_once_with(
+            JOB_ID, {"queued_feedback": "try again"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_healthy_vm_job_still_resumes_directly(self, workspaceless):
+        """Regression: the guard must not divert jobs that have a live VM."""
+        workspaceless.job["context"] = {
+            "vm": {"status": "ready", "ssh_host": "100.64.0.7", "ssh_port": 22}
+        }
+
+        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert result["status"] == "resumed"
+        workspaceless.delegate.assert_awaited_once()
+        workspaceless.shed.assert_not_awaited()
