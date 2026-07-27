@@ -945,8 +945,14 @@ def determine_job_status(
     if not should_stop:
         return (None, None)  # Still running — leave as processing
 
-    # Critic jobs (have parent_job_id): read status from freeze_data.
-    # Approved → "completed", returned → "waiting".
+    # Critic jobs (have parent_job_id): read status from freeze_data if the
+    # agent supplied an explicit one. As of Task 8, neither approve_job nor
+    # return_job_with_feedback writes a "status" key any more — the verdict
+    # lives on the TARGET's durable ledger, not on the critic's own freeze —
+    # so this branch normally falls through to "infer from goal_achieved"
+    # below, and BOTH verdicts resolve the critic's own job to "completed".
+    # The target's own status is a separate decision made later, from the
+    # ledger, in _handle_critic_verdict_on_complete (orchestrator/main.py).
     if job.get("parent_job_id") is not None:
         fd_status = fd.get("status")
         if fd_status:
