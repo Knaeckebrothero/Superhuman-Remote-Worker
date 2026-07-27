@@ -16,6 +16,7 @@ import pytest
 
 from src.services.knowledge_store import KbWatermark
 from src.tools.knowledge.chunker import CHUNKER_VERSION, note_centroid
+from src.tools.knowledge.gardener import parse_note_md
 
 from orchestrator.services.kb_reindex import (
     kb_sweep_tick,
@@ -370,6 +371,45 @@ class TestReindexKbIncremental:
         wm_kwargs = store.upsert_watermark.await_args[1]
         assert wm_kwargs["indexed_commit"] == "headsha"
         assert wm_kwargs["pipeline_version"] == endpoint_pipeline
+
+    @pytest.mark.asyncio
+    async def test_forwards_parsed_priority_to_upsert_kb_note(self):
+        # Mutation-tested (project-backlog-pipeline task 2, fix round 1
+        # finding 2): note_fields correctly parsing frontmatter priority was
+        # never enough on its own — deleting the forwarding kwarg at the
+        # reindexer's store.upsert_kb_note(...) call site left every existing
+        # test green. Assert the forwarded value against a live note_fields
+        # call on the same parsed frontmatter, so this fails if the two ever
+        # drift apart, not just against a hardcoded literal.
+        kb = uuid.uuid4()
+        endpoint_stamp = f"{EMBEDDING_VERSION}:pf-effective-profile"
+        endpoint_pipeline = reindex_pipeline_version(endpoint_stamp, "knowledge")
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=endpoint_pipeline
+        )
+        note_text = _note_md("changed", "fresh insight", note_type="feature").replace(
+            "status: active\n", "status: active\npriority: high\n"
+        )
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/changed.md": "OLD", "knowledge/same.md": "same1"},
+            contents={"knowledge/changed.md": note_text},
+        )
+        svc.profile_fingerprint = "pf-effective-profile"
+        await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        fm, body = parse_note_md(note_text)
+        expected = note_fields("knowledge/changed.md", fm, body)
+        assert expected["priority"] == 0  # sanity: the fixture says "high"
+        up_kwargs = store.upsert_kb_note.await_args[1]
+        assert up_kwargs["priority"] == expected["priority"]
 
     @pytest.mark.asyncio
     async def test_progress_counters_reset_and_finalize(self):
