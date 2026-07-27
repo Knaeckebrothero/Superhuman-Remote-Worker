@@ -43,7 +43,10 @@ def bridge():
     b._db = AsyncMock()
     b._db.merge_vm_context = AsyncMock(return_value=True)
     b._on_vm_ready = None  # skip the dispatch poke
-    b._thread_vm_ids = set()  # job-1 takes the job (not thread) path
+    # job-1 takes the job (not thread) path. Routing is a DB lookup, so these
+    # must be explicit — a bare AsyncMock get_thread returns a truthy mock.
+    b._db.get_thread = AsyncMock(return_value=None)
+    b._db.get_job = AsyncMock(return_value={"id": "job-1", "user_id": "u1"})
     return b
 
 

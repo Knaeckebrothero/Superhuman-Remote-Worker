@@ -52,6 +52,14 @@ from .workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 logger = logging.getLogger(__name__)
 
 
+def _entity_label(is_thread: Optional[bool]) -> str:
+    """Log label for a VM's owning entity. ``unknown`` is a real outcome — an id
+    that resolves to neither table — and must read differently from ``job``."""
+    if is_thread is None:
+        return "unknown-entity"
+    return "thread" if is_thread else "job"
+
+
 class NatsBridge:
     """Optional NATS bridge for VM lifecycle management.
 
@@ -81,8 +89,6 @@ class NatsBridge:
         self._db: Optional[Any] = None
         self._on_vm_ready: Optional[Callable] = None
         self._available: bool = False
-        # Track which VM IDs correspond to threads (vs jobs) for context routing
-        self._thread_vm_ids: set[str] = set()
 
         if not self._url:
             logger.info("NATS_URL not configured. VM lifecycle features disabled.")
@@ -249,10 +255,6 @@ class NatsBridge:
         """
         if not self._available:
             return False
-
-        # Track thread VMs so NATS callbacks route context to threads table
-        if entity_type == "thread":
-            self._thread_vm_ids.add(job_id)
 
         subject = self._subj("vm.lifecycle.create")
         if subject is None:
@@ -497,13 +499,21 @@ class NatsBridge:
                 if data.get(key) is not None:
                     updates[key] = data[key]
 
+            is_thread = await self._vm_entity_is_thread(job_id)
             logger.info(
                 "VM lifecycle status for %s %s: %s",
-                "thread" if job_id in self._thread_vm_ids else "job",
+                _entity_label(is_thread),
                 job_id,
                 data.get("status"),
             )
-            if job_id in self._thread_vm_ids:
+            if is_thread is None:
+                logger.warning(
+                    "Dropping vm.lifecycle.status for %s — not a known thread or "
+                    "job; refusing to guess a table.",
+                    job_id,
+                )
+                return
+            if is_thread:
                 updates[CANVAS_WORKSPACE_GENERATION_KEY] = None
                 await self._set_thread_vm_context(job_id, updates)
             else:
@@ -574,7 +584,15 @@ class NatsBridge:
                     "waiting for tailscale re-register"
                 )
 
-            is_thread = job_id in self._thread_vm_ids
+            is_thread = await self._vm_entity_is_thread(job_id)
+            if is_thread is None:
+                logger.warning(
+                    "Dropping daemon register for %s — not a known thread or job; "
+                    "refusing to guess a table (its ssh_host would be lost either "
+                    "way, but a wrong-table write also hides the problem).",
+                    job_id,
+                )
+                return
             registered_at = datetime.now(timezone.utc).isoformat()
             vm_updates = {
                 "status": status,
@@ -714,16 +732,17 @@ class NatsBridge:
             if not job_id:
                 return
 
+            is_thread = await self._vm_entity_is_thread(job_id)
             logger.debug(
                 "Heartbeat for %s %s: agent_running=%s",
-                "thread" if job_id in self._thread_vm_ids else "job",
+                _entity_label(is_thread),
                 job_id,
                 data.get("agent_running"),
             )
             now = datetime.now(timezone.utc).isoformat()
-            if job_id in self._thread_vm_ids:
+            if is_thread:
                 await self._set_thread_vm_context(job_id, {"last_heartbeat": now})
-            else:
+            elif is_thread is False:
                 await self._set_vm_context(job_id, {"last_heartbeat": now})
 
             # Track code-server activity for IDE session idle detection.
@@ -843,6 +862,38 @@ class NatsBridge:
     # =========================================================================
     # Helpers
     # =========================================================================
+
+    async def _vm_entity_is_thread(self, entity_id: str) -> Optional[bool]:
+        """Resolve whether a VM's entity id names a thread or a job.
+
+        True = thread, False = job, None = neither/unresolvable.
+
+        This MUST come from the database. It was previously a process-local set
+        populated only on the replica that published ``vm.lifecycle.create``,
+        which is broken under HA: with 2+ replicas the daemon's register is
+        handled by the *leader*, which may not be the publisher. The leader then
+        had no entry for the id, treated a thread UUID as a job, and wrote
+        ``ssh_host`` into a ``jobs`` row that does not exist — stranding the
+        thread at ``status='created'`` forever (a coin flip per VM session, and
+        lost entirely on any orchestrator restart).
+        docs/issues/session_vm_backend_never_attaches.md (Defect 4)
+
+        Callers must treat None as "do not write": guessing a table is exactly
+        the failure mode this replaces.
+        """
+        if not self._db:
+            return None
+        try:
+            if await self._db.get_thread(entity_id):
+                return True
+            if await self._db.get_job(entity_id):
+                return False
+        except Exception:
+            logger.exception(
+                "Could not resolve VM entity %s to a thread or job", entity_id
+            )
+            return None
+        return None
 
     async def _set_thread_vm_context(self, thread_id: str, updates: dict) -> None:
         """Atomically merge updates into a thread's metadata.vm key."""
