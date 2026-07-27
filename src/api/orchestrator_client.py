@@ -59,6 +59,17 @@ class ThreadConfigUpdateDenied(Exception):
         super().__init__(f"Thread config update denied ({status_code}): {detail}")
 
 
+class VerdictRecordingError(Exception):
+    """The verdict could not be durably recorded.
+
+    Deliberately loud: a verdict that is not persisted must never be reported
+    to the model as recorded, because every downstream loss path treats a
+    missing verdict as approval. Raised by ``record_verification_round`` on
+    any failure — network error, non-200 response — instead of the house
+    best-effort convention (return None/False) used elsewhere in this client.
+    """
+
+
 class CanvasClientError(RuntimeError):
     """A model-safe failure from a delegated Dynamic Canvas request.
 
@@ -1268,6 +1279,50 @@ class OrchestratorClient:
             f"{response.text[:200]}"
         )
         return None
+
+    async def record_verification_round(
+        self,
+        target_job_id: str,
+        critic_job_id: str,
+        asserted_verdict: str,
+        opened: list,
+        dispositions: list,
+        head_commit: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Durably record this round and return the SERVER-COMPUTED verdict.
+
+        Journal-before-observe: the tool must not return to the model until the
+        round is committed. Raises VerdictRecordingError on any failure —
+        including a 409, whose ``errors`` list is model-facing and must be
+        surfaced verbatim so the model can correct itself.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{target_job_id}/verification/rounds"
+        payload = {
+            "critic_job_id": critic_job_id,
+            "asserted_verdict": asserted_verdict,
+            "opened": opened,
+            "dispositions": dispositions,
+            "head_commit": head_commit,
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.RequestError as e:
+            raise VerdictRecordingError(f"network error: {e}") from e
+
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 409:
+            detail = response.json().get("detail", {})
+            errors = detail.get("errors") if isinstance(detail, dict) else None
+            raise VerdictRecordingError(
+                "verdict rejected:\n- " + "\n- ".join(errors or [str(detail)])
+            )
+        raise VerdictRecordingError(
+            f"HTTP {response.status_code}: {response.text[:200]}"
+        )
 
     async def resume_job(
         self,

@@ -580,6 +580,24 @@ class GitManager:
         except Exception:
             return None
 
+    def get_current_commit(self) -> str | None:
+        """Get the current HEAD commit SHA.
+
+        Used as a progress-detection heuristic (e.g. the critic verdict
+        tools): callers must treat failure as "unknown", not an error.
+
+        Returns:
+            Full commit SHA, or None if not in a git repo or on any error.
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(["rev-parse", "HEAD"])
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
     # =========================================================================
     # Remote Operations
     # =========================================================================

@@ -575,3 +575,73 @@ class TestStrategicPhaseWithVerdict:
 
         # Verdict data should be consumed
         assert get_verdict_data("critic-job-1") is None
+
+
+# =============================================================================
+# Verdict durability: tools must persist through the orchestrator BEFORE
+# returning to the model (journal-before-observe). Task 5 of the fail-closed
+# verification plan — see docs/superpowers/plans/2026-07-27-verification-fail-closed.md.
+# =============================================================================
+
+
+class TestVerdictDurability:
+    @pytest.mark.asyncio
+    async def test_return_tool_fails_loudly_without_orchestrator_client(self):
+        """A verdict that cannot be persisted must NOT report success.
+
+        The house convention for orchestrator_client is best-effort
+        (`if client is None: return None`). For a verdict that is exactly
+        backwards — a silently-unrecorded rejection becomes an approval.
+        """
+        from src.tools.context import ToolContext
+        from src.tools.evaluation.evaluation_tools import create_evaluation_tools
+
+        ctx = ToolContext(_job_id="c1", config={})
+        ctx.orchestrator_client = None
+        approve, return_with_feedback = create_evaluation_tools(ctx)
+
+        result = await return_with_feedback.ainvoke(
+            {
+                "job_id": "t1",
+                "feedback": "bad",
+                "findings": [{"claim": "x", "severity": "high"}],
+            }
+        )
+
+        assert "error" in result.lower()
+        from src.tools.evaluation.evaluation_tools import get_verdict_data
+
+        assert get_verdict_data("c1") is None
+
+    @pytest.mark.asyncio
+    async def test_tool_stores_server_computed_verdict_not_asserted(self):
+        """The server's computed verdict wins over what the model claimed."""
+        from unittest.mock import AsyncMock
+
+        from src.tools.context import ToolContext
+        from src.tools.evaluation.evaluation_tools import (
+            create_evaluation_tools,
+            get_verdict_data,
+        )
+
+        ctx = ToolContext(_job_id="c2", config={})
+        ctx.orchestrator_client = AsyncMock()
+        ctx.orchestrator_client.record_verification_round = AsyncMock(
+            return_value={
+                "verdict": "returned",
+                "round": 3,
+                "assigned": [],
+                "open_findings": [{"id": "F1"}],
+            }
+        )
+        approve, _ = create_evaluation_tools(ctx)
+
+        await approve.ainvoke(
+            {
+                "job_id": "t1",
+                "report": "looks good",
+                "dispositions": [{"id": "F1", "disposition": "STILL_OPEN"}],
+            }
+        )
+
+        assert get_verdict_data("c2")["_verdict"] == "returned"
