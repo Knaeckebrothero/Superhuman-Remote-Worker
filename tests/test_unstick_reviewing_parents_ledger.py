@@ -483,7 +483,9 @@ async def test_live_critic_is_detected(db, status):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "pending_review"])
+@pytest.mark.parametrize(
+    "status", ["completed", "failed", "cancelled", "pending_review"]
+)
 async def test_finished_critic_is_not_live(db, status):
     target = uuid4()
     critic = uuid4()
