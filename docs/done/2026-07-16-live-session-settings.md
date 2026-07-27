@@ -527,6 +527,17 @@ turn ends** (`_turn_in_flight`, `persistent_app.py:330`) so the observable
 rule stays clean — "changes apply at the next turn" — in both directions.
 The disclaimer wording covers retained *context*, not a last successful call.
 
+**M2e email hardening (2026-07-27).** Email is now stricter than that general
+turn-boundary convenience rule. Every email tool verifies that its captured
+connection is still the current object in the shared datasource registry;
+`email_send` repeats the binding, tier, and unattended-send checks immediately
+before SMTP submission. A tool invoked after live detach/rebind therefore
+refuses rather than using its deferred-close connection. Resources are still
+closed after the turn so a call already unwinding is not torn down underneath
+it. This narrows the security-sensitive email action boundary; it does not turn
+removed conversation context into revocable data or make every other connector
+operation-time revocation-safe.
+
 **Floor rule (from provider research).** Never rebind to an empty toolset
 when the history contains tool calls: proxies 400, Anthropic degrades to
 empty responses, strict templates crash. If the effective belt would be

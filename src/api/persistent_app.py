@@ -5549,12 +5549,11 @@ async def _close_datasources_after_turn(
 ) -> None:
     """Close replaced datasource connections once no turn is executing.
 
-    Live datasource removal defers the close: bound tools captured the old
-    connections in closures at load time, so an eager close would error an
-    in-flight turn's call mid-turn instead of letting it finish — the
-    observable rule stays "changes apply at the next turn" in BOTH directions
-    (live_session_settings.md Slice B). Polls the turn flag and closes as
-    soon as the loop parks (or the session ends).
+    Live datasource removal defers the close because a call may already be
+    using an old connection. Security-sensitive tools reject a newly invoked
+    stale binding, while deferred close lets an operation already unwinding
+    release its resource cleanly. Polls the turn flag and closes as soon as
+    the loop parks (or the session ends).
     """
     from ..core.datasource_setup import close_datasource_connections
 

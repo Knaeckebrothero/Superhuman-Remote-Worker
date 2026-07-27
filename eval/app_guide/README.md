@@ -1,9 +1,16 @@
 # App Guide evaluation
 
-This standalone harness measures whether a fresh SRW session model routes
-product questions to the managed `read_product_guide` reader, avoids that
-reader for near misses, selects the focused topic, and keeps its answer inside
-deterministic required/forbidden fact boundaries.
+This standalone harness has two held-out suites:
+
+- `routing` is the 30-case M1 release corpus. It measures whether a fresh SRW
+  session model routes product questions to `read_product_guide`, avoids that
+  reader for near misses, selects the focused topic, and stays inside
+  deterministic fact boundaries.
+- `capability` is the eight-case M2 matrix. It distinguishes stable and
+  capability-near-miss guide-only answers from dynamic guide →
+  `get_product_capabilities` trajectories, checks per-layer partial/mixed
+  results, requires a real operation after an advisory snapshot, and keeps
+  rollback guidance available when the capability tool is absent.
 
 It evaluates the real bundled catalog, production skill-menu fencing, and
 production reader. The held-out prompts and expectations stay here rather than
@@ -17,12 +24,13 @@ No endpoint or key is needed:
 
 ```bash
 python -m eval.app_guide.run --validate-only
+python -m eval.app_guide.run --suite capability --validate-only
 ```
 
-Ordinary CI also validates schema version, unique IDs and prompts, topic IDs,
-positive/negative balance, broad/workflow/availability coverage, paraphrases,
-the required near-miss classes, an honest off-document case, and critical
-forbidden claims.
+Ordinary CI validates both corpora. M1 retains its deliberate trigger balance
+and near-miss coverage. M2 validates exact registry capability IDs, fixture
+names, guide-only cases, all six trajectory categories, and each synthetic
+fixture against the production capability-output model.
 
 ## Run the live evaluation
 
@@ -37,12 +45,19 @@ export APP_GUIDE_EVAL_BASE_URL="https://example.invalid/v1"
 python -m eval.app_guide.run \
   --arm current \
   --arm no-skill
+
+# M2 live-state behavior; repeat the full suite three times for release evidence.
+python -m eval.app_guide.run \
+  --suite capability \
+  --arm current
 ```
 
 Each case starts with a fresh message list and tool context. `current` loads
 the running checkout. `no-skill` keeps the other system-skill catalog entries
 but removes the App Guide and its tool, providing a useful prior-only
-baseline. To compare a prior skill snapshot, point at a directory containing
+baseline for the routing suite; the capability suite requires the managed
+guide and rejects `no-skill`. To compare a prior skill snapshot, point at a
+directory containing
 `app-guide/SKILL.md` and its `references/` directory:
 
 ```bash
@@ -66,23 +81,41 @@ The output directory contains:
 - `run_meta.json` — model, commit/dirty state, corpus and harness digests, and
   the managed guide bundle digest.
 
-Tool trajectory is scored separately from answer text. A positive case routes
-successfully only if the model actually calls `read_product_guide`; a correct
-answer from model priors is not a routing pass. A near miss passes routing only
-if it does not call that reader. Trajectory rows retain topic, result status,
-size, and digest—not the full guide result.
+Tool trajectory is scored separately from answer text. In M1, a positive case
+passes only if the model calls `read_product_guide`; a correct answer from
+priors is not a routing pass. A near miss passes only without that reader. In
+M2, stable and capability-near-miss questions require zero capability calls,
+dynamic questions require one exact capability-ID call strictly after the
+focused guide call, and the action case requires `email_send` strictly after
+the capability snapshot. The operation cannot carry snapshot/authorization
+fields.
+
+M2 capability outputs are synthetic but are constructed and serialized through
+the production Pydantic contract. The changed-state operation result is a safe
+model fixture; deterministic tests separately prove that the real bound email
+operation refuses after a live detach. This suite is therefore model
+trajectory evidence, not a substitute for authenticated endpoint probes or
+fresh/resumed deployed-session acceptance.
+
+Trajectory rows retain safe logical arguments, result status, size, and
+digest—not raw guide/capability results or email content.
 
 Required facts and forbidden claims use deterministic normalized phrase
 alternatives, not an LLM judge. Required facts permit at most three
 intervening modifier tokens between expected tokens, which accepts faithful
-wording without becoming an unbounded semantic matcher. Forbidden claims
-remain contiguous phrase matches so inserted negation is not mistaken for a
-forbidden claim. They measure grounding rather than prose quality. Any
+wording without becoming an unbounded semantic matcher; intervening negation
+or failure tokens invalidate a positive required-fact match. Expectations
+marked `affirmative` additionally require a denial- and uncertainty-free
+clause. Forbidden claims remain contiguous phrase matches so inserted negation
+is not mistaken for a forbidden claim. They measure grounding rather than
+prose quality. Any
 forbidden hit fails its case, and `critical_forbidden_count` has zero
 tolerance. `release_gate_pass` additionally requires the complete corpus, no
 provider errors, and every case passing. Review failures rather than loosening
-expectations solely to improve a score.
+expectations solely to improve a score. A complete run exits nonzero when that
+release gate fails; intentionally partial development runs remain identified
+by `complete_corpus: false`.
 
 Artifacts contain no API key, base URL, local previous-snapshot path, raw
 provider exception, or private session data. All prompts are synthetic and
-versioned in `cases.yaml`.
+versioned in `cases.yaml` or `capability_cases.yaml`.

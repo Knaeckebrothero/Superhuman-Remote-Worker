@@ -1,9 +1,11 @@
-"""Standalone routing and grounding evaluation for SRW's managed App Guide.
+"""Held-out routing and live-capability evaluation for SRW's managed App Guide.
 
 The harness intentionally lives outside ``config/skills/app-guide`` so the
-runtime skill cannot see held-out questions or expectations. It exercises the
-real managed catalog, production menu fencing, and production
-``read_product_guide`` implementation.
+runtime skill cannot see held-out questions or expectations. Both suites
+exercise the real managed catalog, production menu fencing, and production
+``read_product_guide`` implementation. The M2 suite additionally validates
+synthetic snapshots through the production capability output contract and
+scores guide → capability → operation order.
 
 Run ``python -m eval.app_guide.run --help`` from the repository root.
 """
@@ -29,7 +31,12 @@ from typing import Any, Iterable, Sequence
 
 import yaml
 
+from eval.app_guide.capability_fixtures import (
+    CAPABILITY_FIXTURE_NAMES,
+    capability_fixture_json,
+)
 from src.core.expert_resolution import fence_skills_menu
+from src.core.product_capabilities import CAPABILITY_REGISTRY
 from src.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     APP_GUIDE_SKILL,
@@ -38,13 +45,23 @@ from src.core.skill_resolution import (
     managed_product_guide_turn_boundary,
 )
 from src.tools.context import ToolContext
+from src.tools.product_capabilities import (
+    PRODUCT_CAPABILITIES_TOOL_NAME,
+    CapabilityToolRequest,
+)
 from src.tools.product_help import create_product_help_tools
 
 SCHEMA_VERSION = 1
 DEFAULT_CASES_PATH = Path(__file__).with_name("cases.yaml")
+DEFAULT_CAPABILITY_CASES_PATH = Path(__file__).with_name("capability_cases.yaml")
 DEFAULT_RUNS_ROOT = Path(__file__).with_name("runs")
+ROUTING_SUITE = "routing"
+CAPABILITY_SUITE = "capability"
 ALLOWED_CATEGORIES = frozenset(
     {"broad", "workflow", "availability", "near_miss", "honest_gap"}
+)
+ALLOWED_CAPABILITY_CATEGORIES = frozenset(
+    {"stable", "near_miss", "dynamic", "failure", "action", "rollback"}
 )
 ALLOWED_CRITICALITIES = frozenset({"standard", "critical"})
 ALLOWED_SEVERITIES = frozenset({"standard", "critical"})
@@ -54,6 +71,26 @@ REQUIRED_NEAR_MISS_TAGS = frozenset(
 CASE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,79}$")
 PHRASE_TOKEN_RE = re.compile(r"[a-z0-9]+")
 MAX_REQUIRED_FACT_TOKEN_GAP = 3
+REQUIRED_FACT_POLARITY_BLOCKERS = frozenset(
+    {"not", "never", "no", "cannot", "unable", "without", "hardly", "fail", "fails"}
+)
+AFFIRMATIVE_FACT_BLOCKERS = REQUIRED_FACT_POLARITY_BLOCKERS | frozenset(
+    {
+        "unknown",
+        "uncertain",
+        "unclear",
+        "determine",
+        "whether",
+        "maybe",
+        "perhaps",
+        "possibly",
+        "might",
+        "may",
+        "could",
+        "if",
+    }
+)
+CLAUSE_SPLIT_RE = re.compile(r"[.!?;,\n]+")
 
 SYSTEM_FRAME = """\
 You are an assistant running inside Superhuman Remote Worker (SRW). Answer the
@@ -171,6 +208,18 @@ def _validate_expectations(
         if forbidden and entry["severity"] not in ALLOWED_SEVERITIES:
             raise ValueError(
                 f"{item_location}.severity must be one of {sorted(ALLOWED_SEVERITIES)}"
+            )
+        affirmative = entry.get("affirmative", False)
+        if not isinstance(affirmative, bool):
+            raise ValueError(f"{item_location}.affirmative must be bool")
+        if forbidden and affirmative:
+            raise ValueError(f"{item_location} forbidden claim cannot be affirmative")
+        if affirmative and any(
+            AFFIRMATIVE_FACT_BLOCKERS.intersection(PHRASE_TOKEN_RE.findall(item))
+            for item in alternatives
+        ):
+            raise ValueError(
+                f"{item_location}.any_of contains a non-affirmative alternative"
             )
 
 
@@ -354,6 +403,160 @@ def load_cases(path: Path = DEFAULT_CASES_PATH) -> list[dict[str, Any]]:
     return validate_corpus(document)
 
 
+def validate_capability_corpus(
+    document: Any,
+    *,
+    known_topics: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate the small M2 live-state/trajectory corpus."""
+
+    _expect_type(document, dict, "capability_corpus")
+    if document.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"capability_corpus.schema_version must be {SCHEMA_VERSION}")
+    if document.get("suite") != "app_guide_capabilities":
+        raise ValueError("capability_corpus.suite must be 'app_guide_capabilities'")
+    cases = document.get("cases")
+    _expect_type(cases, list, "capability_corpus.cases")
+    if len(cases) < 8:
+        raise ValueError("capability corpus must contain at least eight cases")
+
+    topics = known_topics if known_topics is not None else current_topic_ids()
+    known_capability_ids = set(CAPABILITY_REGISTRY)
+    required_fields = {
+        "id",
+        "prompt",
+        "category",
+        "criticality",
+        "expected_topic",
+        "capability_tool",
+        "capability_fixture",
+        "expected_capability_ids",
+        "expected_operation",
+        "required_facts",
+        "forbidden_claims",
+    }
+    seen_ids: set[str] = set()
+    seen_prompts: set[str] = set()
+    categories: Counter[str] = Counter()
+
+    for index, case in enumerate(cases):
+        location = f"capability_corpus.cases[{index}]"
+        _expect_type(case, dict, location)
+        missing = required_fields - set(case)
+        if missing:
+            raise ValueError(f"{location} missing {', '.join(sorted(missing))}")
+
+        case_id = case["id"]
+        if not isinstance(case_id, str) or not CASE_ID_RE.fullmatch(case_id):
+            raise ValueError(f"{location}.id has invalid format")
+        if case_id in seen_ids:
+            raise ValueError(f"duplicate capability case id {case_id!r}")
+        seen_ids.add(case_id)
+
+        prompt = case["prompt"]
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"{location}.prompt must be a non-empty string")
+        normalized_prompt = " ".join(prompt.casefold().split())
+        if normalized_prompt in seen_prompts:
+            raise ValueError(f"duplicate capability prompt in {case_id!r}")
+        seen_prompts.add(normalized_prompt)
+
+        category = case["category"]
+        if category not in ALLOWED_CAPABILITY_CATEGORIES:
+            raise ValueError(
+                f"{location}.category must be one of "
+                f"{sorted(ALLOWED_CAPABILITY_CATEGORIES)}"
+            )
+        categories[category] += 1
+        if case["criticality"] not in ALLOWED_CRITICALITIES:
+            raise ValueError(
+                f"{location}.criticality must be one of {sorted(ALLOWED_CRITICALITIES)}"
+            )
+
+        expected_topic = case["expected_topic"]
+        if not isinstance(expected_topic, str) or expected_topic not in topics:
+            raise ValueError(f"{location}.expected_topic is not a current topic")
+
+        capability_mode = case["capability_tool"]
+        if capability_mode not in {"enabled", "absent"}:
+            raise ValueError(
+                f"{location}.capability_tool must be 'enabled' or 'absent'"
+            )
+        fixture = case["capability_fixture"]
+        expected_ids = case["expected_capability_ids"]
+        if expected_ids is not None:
+            if (
+                not isinstance(expected_ids, list)
+                or any(not isinstance(item, str) for item in expected_ids)
+                or len(expected_ids) != len(set(expected_ids))
+            ):
+                raise ValueError(
+                    f"{location}.expected_capability_ids must be null or a unique list"
+                )
+            unknown_ids = sorted(set(expected_ids) - known_capability_ids)
+            if unknown_ids:
+                raise ValueError(
+                    f"{location}.expected_capability_ids contains unknown IDs: "
+                    + ", ".join(unknown_ids)
+                )
+        if capability_mode == "absent":
+            if fixture is not None or expected_ids is not None:
+                raise ValueError(
+                    f"{location} absent capability tool cannot have a fixture "
+                    "or expected call"
+                )
+        elif fixture not in CAPABILITY_FIXTURE_NAMES:
+            raise ValueError(f"{location}.capability_fixture is unknown")
+        else:
+            # Construction uses the production output contract and catches
+            # fixture drift during offline corpus validation.
+            capability_fixture_json(fixture)
+
+        operation = case["expected_operation"]
+        if operation not in {None, "email_send"}:
+            raise ValueError(
+                f"{location}.expected_operation must be null or 'email_send'"
+            )
+        if operation is not None and expected_ids is None:
+            raise ValueError(
+                f"{location} operation case requires a capability observation"
+            )
+        if category in {"dynamic", "failure", "action"} and expected_ids is None:
+            raise ValueError(f"{location} live-state case requires a capability call")
+        if category in {"stable", "near_miss", "rollback"} and expected_ids is not None:
+            raise ValueError(f"{location} must remain guide-only")
+
+        _validate_expectations(
+            case["required_facts"],
+            location=f"{location}.required_facts",
+            forbidden=False,
+        )
+        _validate_expectations(
+            case["forbidden_claims"],
+            location=f"{location}.forbidden_claims",
+            forbidden=True,
+        )
+        if not case["required_facts"]:
+            raise ValueError(f"{location} needs required facts")
+
+    missing_categories = ALLOWED_CAPABILITY_CATEGORIES - set(categories)
+    if missing_categories:
+        raise ValueError(
+            "capability corpus missing categories: "
+            + ", ".join(sorted(missing_categories))
+        )
+    return cases
+
+
+def load_capability_cases(
+    path: Path = DEFAULT_CAPABILITY_CASES_PATH,
+) -> list[dict[str, Any]]:
+    """Load and validate the held-out M2 capability corpus."""
+
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return validate_capability_corpus(document)
+
+
 def parse_arm_spec(spec: str) -> Arm:
     """Parse ``current``, ``no-skill``, or ``previous=/skills/root``."""
 
@@ -472,6 +675,52 @@ def product_tool_schema(reader: Any) -> dict[str, Any]:
     }
 
 
+def capability_tool_schema() -> dict[str, Any]:
+    """Return the production request shape for the live capability tool."""
+
+    return {
+        "type": "function",
+        "function": {
+            "name": PRODUCT_CAPABILITIES_TOOL_NAME,
+            "description": (
+                "Check current SRW build, deployment, user, session, and "
+                "actionability state. The snapshot is advisory, not "
+                "authorization."
+            ),
+            "parameters": CapabilityToolRequest.model_json_schema(),
+        },
+    }
+
+
+def email_send_eval_tool_schema() -> dict[str, Any]:
+    """Return the safe synthetic operation shape used by one trajectory case."""
+
+    return {
+        "type": "function",
+        "function": {
+            "name": "email_send",
+            "description": (
+                "Attempt the requested email send using current operation-time "
+                "policy. This synthetic evaluation never contacts SMTP."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                    "to": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                },
+                "required": ["subject", "body", "to"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 def _normalized_text(value: str) -> str:
     value = (
         value.casefold()
@@ -479,6 +728,7 @@ def _normalized_text(value: str) -> str:
         .replace("“", '"')
         .replace("”", '"')
         .replace("→", "->")
+        .replace("can't", "cannot")
         .replace("**", "")
         .replace("__", "")
     )
@@ -510,8 +760,22 @@ def _contains_required_fact(normalized_answer: str, alternative: str) -> bool:
                 relative = answer_tokens[position + 1 : window_end].index(wanted)
             except ValueError:
                 break
+            skipped = answer_tokens[position + 1 : position + 1 + relative]
+            if REQUIRED_FACT_POLARITY_BLOCKERS.intersection(skipped):
+                break
             position += relative + 1
         else:
+            return True
+    return False
+
+
+def _contains_affirmative_fact(normalized_answer: str, alternative: str) -> bool:
+    """Require a positive fact in a clause without denial or uncertainty."""
+
+    for clause in CLAUSE_SPLIT_RE.split(normalized_answer):
+        if AFFIRMATIVE_FACT_BLOCKERS.intersection(PHRASE_TOKEN_RE.findall(clause)):
+            continue
+        if _contains_required_fact(clause, alternative):
             return True
     return False
 
@@ -525,15 +789,19 @@ def _score_expectations(
     normalized = _normalized_text(answer)
     scored = []
     for expectation in expectations:
+
+        def matches(alternative: str) -> bool:
+            if forbidden:
+                return _normalized_text(alternative) in normalized
+            if expectation.get("affirmative", False):
+                return _contains_affirmative_fact(normalized, alternative)
+            return _contains_required_fact(normalized, alternative)
+
         match = next(
             (
                 alternative
                 for alternative in expectation["any_of"]
-                if (
-                    _normalized_text(alternative) in normalized
-                    if forbidden
-                    else _contains_required_fact(normalized, alternative)
-                )
+                if matches(alternative)
             ),
             None,
         )
@@ -627,6 +895,135 @@ def score_case(
     }
 
 
+def score_capability_case(
+    case: dict[str, Any],
+    calls: Sequence[dict[str, Any]],
+    answer: str,
+) -> dict[str, Any]:
+    """Score guide → capability → operation trajectories without an LLM judge."""
+
+    reader_calls = [call for call in calls if call.get("name") == APP_GUIDE_LOADER_TOOL]
+    capability_calls = [
+        call for call in calls if call.get("name") == PRODUCT_CAPABILITIES_TOOL_NAME
+    ]
+    operation_calls = [call for call in calls if call.get("name") == "email_send"]
+    expected_topic = case["expected_topic"]
+    observed_topics = [
+        call["topic_id"]
+        for call in reader_calls
+        if isinstance(call.get("topic_id"), str)
+    ]
+    unexpected_topics = [
+        topic for topic in observed_topics if topic not in {expected_topic, "index"}
+    ]
+    reader_pass = expected_topic in observed_topics and not unexpected_topics
+
+    expected_ids = case["expected_capability_ids"]
+    if expected_ids is None:
+        capability_pass = not capability_calls
+    else:
+        capability_pass = (
+            len(capability_calls) == 1
+            and capability_calls[0].get("argument_status") == "valid"
+            and capability_calls[0].get("topic") is None
+            and capability_calls[0].get("capability_ids") == sorted(expected_ids)
+        )
+
+    expected_operation = case["expected_operation"]
+    if expected_operation is None:
+        operation_pass = not operation_calls
+    else:
+        operation_pass = (
+            len(operation_calls) == 1
+            and operation_calls[0].get("argument_status") == "valid"
+            and set(operation_calls[0].get("argument_keys", []))
+            == {"subject", "body", "to"}
+        )
+
+    order_pass = True
+    if capability_calls:
+        order_pass = bool(reader_calls) and max(
+            int(call["round"]) for call in reader_calls
+        ) < min(int(call["round"]) for call in capability_calls)
+    if operation_calls:
+        order_pass = (
+            order_pass
+            and bool(capability_calls)
+            and max(int(call["round"]) for call in capability_calls)
+            < min(int(call["round"]) for call in operation_calls)
+        )
+
+    allowed_tool_names = {
+        APP_GUIDE_LOADER_TOOL,
+        PRODUCT_CAPABILITIES_TOOL_NAME,
+        "email_send",
+    }
+    unexpected_tools = sorted(
+        {
+            str(call.get("name"))
+            for call in calls
+            if call.get("name") not in allowed_tool_names
+        }
+    )
+    tool_set_pass = not unexpected_tools
+
+    required = _score_expectations(
+        answer,
+        case["required_facts"],
+        forbidden=False,
+    )
+    forbidden = _score_expectations(
+        answer,
+        case["forbidden_claims"],
+        forbidden=True,
+    )
+    missing_required = [item["id"] for item in required if not item["present"]]
+    forbidden_hits = [item["id"] for item in forbidden if item["hit"]]
+    critical_forbidden_hits = [
+        item["id"]
+        for item in forbidden
+        if item["hit"] and item["severity"] == "critical"
+    ]
+    trajectory_pass = (
+        reader_pass
+        and capability_pass
+        and operation_pass
+        and order_pass
+        and tool_set_pass
+    )
+    grounding_pass = not missing_required and not forbidden_hits
+    return {
+        "trajectory": {
+            "expected_trigger": True,
+            "observed_trigger": bool(reader_calls),
+            "trigger_pass": bool(reader_calls),
+            "expected_topic": expected_topic,
+            "allowed_topics": [],
+            "observed_topics": observed_topics,
+            "unexpected_topics": unexpected_topics,
+            "topic_pass": reader_pass,
+            "expected_capability_ids": expected_ids,
+            "observed_capability_calls": len(capability_calls),
+            "capability_pass": capability_pass,
+            "expected_operation": expected_operation,
+            "observed_operation_calls": len(operation_calls),
+            "operation_pass": operation_pass,
+            "strict_order_pass": order_pass,
+            "unexpected_tools": unexpected_tools,
+            "pass": trajectory_pass,
+        },
+        "answer_score": {
+            "required_facts": required,
+            "missing_required": missing_required,
+            "forbidden_claims": forbidden,
+            "forbidden_hits": forbidden_hits,
+            "critical_forbidden_hits": critical_forbidden_hits,
+            "grounding_pass": grounding_pass,
+        },
+        "passed": trajectory_pass and grounding_pass,
+    }
+
+
 def _tool_result_status(result: str) -> str:
     lowered = result.casefold()
     if result.startswith("[managed product guide:"):
@@ -637,6 +1034,14 @@ def _tool_result_status(result: str) -> str:
         return "invalid_topic"
     if "unavailable" in lowered:
         return "unavailable"
+    try:
+        status = json.loads(result).get("status")
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        status = None
+    if status in {"ready", "partial", "unavailable"}:
+        return str(status)
+    if "binding changed" in lowered or "not sent" in lowered:
+        return "refused"
     return "other"
 
 
@@ -660,6 +1065,8 @@ async def model_answer(
     prompt: str,
     max_tool_rounds: int,
     max_tokens: int,
+    capability_result: str | None = None,
+    operation_result: str | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
     """Run one fresh-context case and return answer plus bounded trajectory."""
 
@@ -671,7 +1078,13 @@ async def model_answer(
         catalog,
         [APP_GUIDE_LOADER_TOOL],
     )
-    tool_schema = product_tool_schema(reader) if reader is not None else None
+    tool_schemas: list[dict[str, Any]] = []
+    if reader is not None:
+        tool_schemas.append(product_tool_schema(reader))
+    if capability_result is not None:
+        tool_schemas.append(capability_tool_schema())
+    if operation_result is not None:
+        tool_schemas.append(email_send_eval_tool_schema())
     calls: list[dict[str, Any]] = []
     total_usage: Counter[str] = Counter()
 
@@ -689,8 +1102,8 @@ async def model_answer(
             "temperature": 0.0,
             "max_tokens": max_tokens,
         }
-        if tool_schema is not None:
-            kwargs["tools"] = [tool_schema]
+        if tool_schemas:
+            kwargs["tools"] = tool_schemas
             kwargs["tool_choice"] = "auto"
         response = await client.chat.completions.create(**kwargs)
         total_usage.update(_usage_dict(getattr(response, "usage", None)))
@@ -723,30 +1136,81 @@ async def model_answer(
         for tool_call in tool_calls:
             name = tool_call.function.name
             topic_id = None
+            capability_topic = None
+            capability_ids: list[str] = []
+            argument_keys: list[str] = []
             argument_status = "valid"
             try:
                 arguments = json.loads(tool_call.function.arguments or "{}")
             except (json.JSONDecodeError, TypeError):
                 arguments = {}
                 argument_status = "invalid_json"
-            if isinstance(arguments, dict) and isinstance(
-                arguments.get("topic_id"), str
-            ):
-                topic_id = arguments["topic_id"]
+            if isinstance(arguments, dict):
+                argument_keys = sorted(str(key) for key in arguments)
             elif argument_status == "valid":
                 argument_status = "invalid_shape"
+                arguments = {}
 
             if (
                 name == APP_GUIDE_LOADER_TOOL
                 and reader is not None
-                and topic_id is not None
+                and argument_status == "valid"
             ):
-                result = str(reader.invoke({"topic_id": topic_id}))
+                raw_topic = arguments.get("topic_id")
+                if isinstance(raw_topic, str):
+                    topic_id = raw_topic
+                    result = str(reader.invoke({"topic_id": topic_id}))
+                else:
+                    argument_status = "invalid_shape"
+                    result = (
+                        "The managed SRW product guide reader received an "
+                        "invalid topic. Do not guess product behavior."
+                    )
             elif name == APP_GUIDE_LOADER_TOOL:
                 result = (
                     "The managed SRW product guide reader is unavailable or "
                     "received an invalid topic. Do not guess product behavior."
                 )
+            elif (
+                name == PRODUCT_CAPABILITIES_TOOL_NAME
+                and capability_result is not None
+                and argument_status == "valid"
+            ):
+                try:
+                    request = CapabilityToolRequest.model_validate(arguments)
+                except (TypeError, ValueError):
+                    argument_status = "invalid_shape"
+                    result = (
+                        '{"status":"unavailable","error_code":"invalid_request",'
+                        '"summary":"The capability request was invalid."}'
+                    )
+                else:
+                    capability_topic = request.topic
+                    capability_ids = list(request.capability_ids)
+                    result = capability_result
+            elif name == PRODUCT_CAPABILITIES_TOOL_NAME:
+                result = (
+                    '{"status":"unavailable","error_code":"endpoint_unavailable",'
+                    '"summary":"Current capability state cannot be inspected."}'
+                )
+            elif (
+                name == "email_send"
+                and operation_result is not None
+                and argument_status == "valid"
+            ):
+                valid_operation = (
+                    set(arguments) == {"subject", "body", "to"}
+                    and isinstance(arguments.get("subject"), str)
+                    and isinstance(arguments.get("body"), str)
+                    and isinstance(arguments.get("to"), list)
+                    and bool(arguments["to"])
+                    and all(isinstance(item, str) for item in arguments["to"])
+                )
+                if valid_operation:
+                    result = operation_result
+                else:
+                    argument_status = "invalid_shape"
+                    result = "Error: invalid synthetic email operation. Not sent."
             else:
                 result = "Unknown evaluation tool. Continue without inventing output."
 
@@ -755,6 +1219,9 @@ async def model_answer(
                     "round": round_index + 1,
                     "name": name,
                     "topic_id": topic_id,
+                    "topic": capability_topic,
+                    "capability_ids": capability_ids,
+                    "argument_keys": argument_keys,
                     "argument_status": argument_status,
                     "result_status": _tool_result_status(result),
                     "result_chars": len(result),
@@ -813,6 +1280,71 @@ async def run_case(
         "category": case["category"],
         "criticality": case["criticality"],
         "expected_gap": case["expected_gap"],
+        "prompt": case["prompt"],
+        "answer": answer,
+        "wording_quality": {
+            "evaluated": False,
+            "reason": "kept separate from deterministic grounding and trajectory",
+        },
+        "tool_trajectory": {"calls": calls},
+        **score,
+        "usage": usage,
+        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        "error_type": error_type,
+    }
+
+
+async def run_capability_case(
+    *,
+    case: dict[str, Any],
+    arm: Arm,
+    catalog: dict[str, Any],
+    route: LLMRoute,
+    timeout: float,
+    max_tool_rounds: int,
+    max_tokens: int,
+) -> dict[str, Any]:
+    """Execute one synthetic M2 trajectory with validated capability output."""
+
+    started = time.perf_counter()
+    reader = reader_for_catalog(catalog)
+    capability_result = (
+        capability_fixture_json(case["capability_fixture"])
+        if case["capability_tool"] == "enabled"
+        else None
+    )
+    operation_result = (
+        "Error: the email connector binding changed after the snapshot. "
+        "No email was sent. Retry on the next turn with current state."
+        if case["expected_operation"] == "email_send"
+        else None
+    )
+    try:
+        async with route.client(timeout=timeout) as client:
+            answer, calls, usage = await model_answer(
+                client=client,
+                route=route,
+                catalog=catalog,
+                reader=reader,
+                prompt=case["prompt"],
+                max_tool_rounds=max_tool_rounds,
+                max_tokens=max_tokens,
+                capability_result=capability_result,
+                operation_result=operation_result,
+            )
+        error_type = None
+    except Exception as exc:
+        answer, calls, usage = "", [], {}
+        error_type = type(exc).__name__
+
+    score = score_capability_case(case, calls, answer)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "suite": CAPABILITY_SUITE,
+        "arm": arm.name,
+        "case_id": case["id"],
+        "category": case["category"],
+        "criticality": case["criticality"],
         "prompt": case["prompt"],
         "answer": answer,
         "wording_quality": {
@@ -923,6 +1455,61 @@ def summarize_results(
     }
 
 
+def summarize_capability_results(
+    rows: Sequence[dict[str, Any]],
+    *,
+    full_corpus_size: int,
+) -> dict[str, Any]:
+    """Aggregate the targeted M2 capability-routing matrix."""
+
+    by_arm: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_arm[row["arm"]].append(row)
+
+    arms: dict[str, dict[str, Any]] = {}
+    for arm, arm_rows in sorted(by_arm.items()):
+        by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in arm_rows:
+            by_category[row["category"]].append(row)
+        summary = {
+            "cases": len(arm_rows),
+            "complete_corpus": len(arm_rows) == full_corpus_size,
+            "passed": sum(bool(row["passed"]) for row in arm_rows),
+            "trajectory_passed": sum(
+                bool(row["trajectory"]["pass"]) for row in arm_rows
+            ),
+            "grounding_passed": sum(
+                bool(row["answer_score"]["grounding_pass"]) for row in arm_rows
+            ),
+            "strict_order_passed": sum(
+                bool(row["trajectory"]["strict_order_pass"]) for row in arm_rows
+            ),
+            "critical_forbidden_count": sum(
+                len(row["answer_score"]["critical_forbidden_hits"]) for row in arm_rows
+            ),
+            "errors": sum(row["error_type"] is not None for row in arm_rows),
+            "by_category": {
+                category: {
+                    "cases": len(category_rows),
+                    "passed": sum(bool(row["passed"]) for row in category_rows),
+                }
+                for category, category_rows in sorted(by_category.items())
+            },
+        }
+        summary["release_gate_pass"] = bool(
+            summary["complete_corpus"]
+            and summary["passed"] == summary["cases"]
+            and summary["critical_forbidden_count"] == 0
+            and summary["errors"] == 0
+        )
+        arms[arm] = summary
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "suite": CAPABILITY_SUITE,
+        "arms": arms,
+    }
+
+
 def _git_revision(repo_root: Path) -> dict[str, Any]:
     """Return bounded source identity without paths or diff content."""
 
@@ -989,8 +1576,17 @@ def _select_cases(
 
 
 async def run(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
-    cases_path = Path(args.cases).resolve()
-    all_cases = load_cases(cases_path)
+    default_cases = (
+        DEFAULT_CAPABILITY_CASES_PATH
+        if args.suite == CAPABILITY_SUITE
+        else DEFAULT_CASES_PATH
+    )
+    cases_path = Path(args.cases or default_cases).resolve()
+    all_cases = (
+        load_capability_cases(cases_path)
+        if args.suite == CAPABILITY_SUITE
+        else load_cases(cases_path)
+    )
     selected_cases = _select_cases(
         all_cases,
         selected_ids=args.case,
@@ -999,6 +1595,8 @@ async def run(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     arms = [parse_arm_spec(spec) for spec in (args.arm or ["current"])]
     if len({arm.name for arm in arms}) != len(arms):
         raise ValueError("arm names must be unique in one run")
+    if args.suite == CAPABILITY_SUITE and any(arm.name == "no-skill" for arm in arms):
+        raise ValueError("the capability suite requires the managed guide")
 
     route = LLMRoute.from_env()
     catalogs = {arm.name: catalog_for_arm(arm) for arm in arms}
@@ -1019,7 +1617,8 @@ async def run(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for arm in arms:
         for case in selected_cases:
-            row = await run_case(
+            runner = run_capability_case if args.suite == CAPABILITY_SUITE else run_case
+            row = await runner(
                 case=case,
                 arm=arm,
                 catalog=catalogs[arm.name],
@@ -1034,10 +1633,15 @@ async def run(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
             error = f" error={row['error_type']}" if row["error_type"] else ""
             print(f"{arm.name:8} {case['id']:40} {status}{error}", flush=True)
 
-    summary = summarize_results(rows, full_corpus_size=len(all_cases))
+    summary = (
+        summarize_capability_results(rows, full_corpus_size=len(all_cases))
+        if args.suite == CAPABILITY_SUITE
+        else summarize_results(rows, full_corpus_size=len(all_cases))
+    )
     repo_root = Path(__file__).resolve().parents[2]
     meta = {
         "schema_version": SCHEMA_VERSION,
+        "suite": args.suite,
         "run_id": run_id,
         "started_at": started_at,
         "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -1065,12 +1669,19 @@ async def run(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate managed App Guide routing and grounded answers."
+        description=(
+            "Evaluate managed App Guide routing or live-capability trajectories."
+        )
+    )
+    parser.add_argument(
+        "--suite",
+        choices=[ROUTING_SUITE, CAPABILITY_SUITE],
+        default=ROUTING_SUITE,
+        help="routing (M1 corpus) or capability (M2 targeted matrix)",
     )
     parser.add_argument(
         "--cases",
-        default=str(DEFAULT_CASES_PATH),
-        help="held-out YAML corpus (default: eval/app_guide/cases.yaml)",
+        help="held-out YAML corpus (defaults to the selected suite's corpus)",
     )
     parser.add_argument(
         "--arm",
@@ -1106,21 +1717,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.validate_only:
-            cases_path = Path(args.cases).resolve()
-            cases = load_cases(cases_path)
-            positives = sum(case["expected_trigger"] for case in cases)
-            print(
-                json.dumps(
+            default_cases = (
+                DEFAULT_CAPABILITY_CASES_PATH
+                if args.suite == CAPABILITY_SUITE
+                else DEFAULT_CASES_PATH
+            )
+            cases_path = Path(args.cases or default_cases).resolve()
+            cases = (
+                load_capability_cases(cases_path)
+                if args.suite == CAPABILITY_SUITE
+                else load_cases(cases_path)
+            )
+            result: dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
+                "suite": args.suite,
+                "cases": len(cases),
+                "corpus_sha256": _sha256_file(cases_path),
+            }
+            if args.suite == CAPABILITY_SUITE:
+                result["categories"] = dict(
+                    sorted(Counter(case["category"] for case in cases).items())
+                )
+            else:
+                positives = sum(case["expected_trigger"] for case in cases)
+                result.update(
                     {
-                        "schema_version": SCHEMA_VERSION,
-                        "cases": len(cases),
                         "positive": positives,
                         "negative": len(cases) - positives,
-                        "corpus_sha256": _sha256_file(cases_path),
-                    },
-                    sort_keys=True,
+                    }
                 )
-            )
+            print(json.dumps(result, sort_keys=True))
             return 0
         output_dir, summary = asyncio.run(run(args))
     except (OSError, RuntimeError, ValueError, yaml.YAMLError) as exc:
@@ -1129,7 +1755,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(json.dumps({"output": str(output_dir), "summary": summary}, indent=2))
     errors = sum(arm["errors"] for arm in summary["arms"].values())
-    return 1 if errors else 0
+    failed_complete_gate = any(
+        arm["complete_corpus"] and not arm["release_gate_pass"]
+        for arm in summary["arms"].values()
+    )
+    return 1 if errors or failed_complete_gate else 0
 
 
 if __name__ == "__main__":
