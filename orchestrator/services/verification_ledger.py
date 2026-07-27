@@ -39,6 +39,19 @@ def is_blocking(finding: Dict[str, Any]) -> bool:
     return SEVERITY_ORDER[severity] >= SEVERITY_ORDER[BLOCKING_SEVERITY]
 
 
+def _severity_rank(finding: Dict[str, Any]) -> int:
+    """Order findings by severity, with unknown ranked ABOVE known.
+
+    Consistent with :func:`is_blocking`, which treats an unrecognised severity
+    as blocking: an unreadable severity must never lose a comparison to a
+    readable low one.
+    """
+    severity = str(finding.get("severity", "")).lower()
+    if severity not in SEVERITY_ORDER:
+        return max(SEVERITY_ORDER.values()) + 1
+    return SEVERITY_ORDER[severity]
+
+
 def fold_open_findings(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Compute the currently-open findings by folding all rounds in order.
 
@@ -71,6 +84,20 @@ def fold_open_findings(rounds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             entry = dict(finding)
             entry["opened_round"] = rnd.get("round")
             entry["disputed"] = False
+
+            existing = open_by_id.get(fid)
+            if existing is not None:
+                # An id can only be open twice if two rounds were computed from
+                # the same pre-append read (racing duplicate critics — see
+                # has_live_verification_critic, which is what prevents this).
+                # A plain overwrite silently DROPS the earlier finding, so a
+                # colliding low-severity twin could erase a high-severity one
+                # and flip a computed 'returned' into 'approved'. Keep the more
+                # severe of the two so blocking-ness can only ever be monotone.
+                # (A normal reopen after RESOLVED is not a collision: the id is
+                # already gone from this dict by then.)
+                if _severity_rank(existing) >= _severity_rank(entry):
+                    continue
             open_by_id[fid] = entry
 
         dispositions = rnd.get("dispositions")

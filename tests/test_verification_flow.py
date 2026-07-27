@@ -1179,6 +1179,13 @@ class TestTriggerVerificationContentTreeWiring:
             main_module, "_propagate_datasources_to_subjob", AsyncMock()
         )
         monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        # No critic in flight — this test is about the gate, not the
+        # duplicate-spawn guard (which fails closed on the non-UUID id here).
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
 
         prior_round = {
             "round": 1,
@@ -1238,6 +1245,174 @@ class TestTriggerVerificationContentTreeWiring:
         assert update_mock.call_args.kwargs["status"] == "completed"
 
 
+class TestNoDuplicateCriticSpawn:
+    """``complete_job`` deliberately accepts entry statuses
+    processing/reviewing/pending_review/completed, so a retried ``/complete``
+    on a target already in 'reviewing' reaches the trigger a second time.
+
+    With no existence check that spawns a SECOND critic for the same round.
+    Both then compute from a pre-append read, producing duplicate `round`
+    numbers and — worse — duplicate finding IDs, because ``assign_ids``
+    derives from ``next_finding_index(rounds)`` and ``fold_open_findings``
+    keys by id. This is the only interleaving that can produce an unwarranted
+    approval.
+    """
+
+    @staticmethod
+    def _patch(monkeypatch, main_module, *, live_critic: bool):
+        create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=live_critic),
+        )
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", AsyncMock())
+        monkeypatch.setattr(
+            main_module, "_propagate_datasources_to_subjob", AsyncMock()
+        )
+        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        return create_job_mock
+
+    @pytest.mark.asyncio
+    async def test_second_trigger_does_not_spawn_a_second_critic(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        create_job_mock = self._patch(monkeypatch, main_module, live_critic=True)
+
+        job = _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
+        actions: list[str] = []
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, actions
+        )
+
+        create_job_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_first_trigger_still_spawns(self, monkeypatch):
+        """Contrast case: an implementation that never spawns would pass the
+        test above and disable verification entirely."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        create_job_mock = self._patch(monkeypatch, main_module, live_critic=False)
+
+        job = _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
+        actions: list[str] = []
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, actions
+        )
+
+        create_job_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_runs_before_creating_the_critic(self, monkeypatch):
+        """A guard consulted only AFTER create_job would be useless."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        order: list[str] = []
+
+        async def _guard(_target):
+            order.append("guard")
+            return False
+
+        async def _create(**_kw):
+            order.append("create")
+            return {"id": "critic-999"}
+
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(side_effect=_guard),
+        )
+        monkeypatch.setattr(
+            main_module.postgres_db, "create_job", AsyncMock(side_effect=_create)
+        )
+        monkeypatch.setattr(
+            main_module, "_propagate_datasources_to_subjob", AsyncMock()
+        )
+        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+
+        job = _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, []
+        )
+
+        assert order == ["guard", "create"]
+
+
+class TestDuplicateFindingIdsCannotHideABlockingFinding:
+    """Defence in depth behind the spawn guard: even if two rounds somehow
+    open the same finding id, folding must never let a blocking finding
+    disappear — ``open_by_id[fid] = entry`` silently overwrote, so a
+    later low-severity F2 could erase an earlier high-severity F2 and turn a
+    computed 'returned' into 'approved'.
+    """
+
+    def test_a_colliding_low_finding_cannot_erase_a_high_one(self):
+        from orchestrator.services.verification_ledger import (
+            compute_verdict,
+            fold_open_findings,
+        )
+
+        rounds = [
+            {
+                "round": 1,
+                "critic_job_id": "cA",
+                "opened": [{"id": "F2", "severity": "high", "claim": "data loss"}],
+                "dispositions": [],
+            },
+            {
+                "round": 1,
+                "critic_job_id": "cB",  # racing twin, same pre-append read
+                "opened": [{"id": "F2", "severity": "low", "claim": "typo"}],
+                "dispositions": [],
+            },
+        ]
+
+        open_findings = fold_open_findings(rounds)
+
+        assert [f["id"] for f in open_findings] == ["F2"]
+        assert open_findings[0]["severity"] == "high"
+        assert compute_verdict("approved", open_findings) == "returned"
+
+    def test_an_ordinary_reopen_of_a_resolved_id_still_works(self):
+        """Contrast: after a RESOLVED disposition the id is gone from the open
+        set, so a later round opening it again is a normal reopen, not a
+        collision, and must take the new severity."""
+        from orchestrator.services.verification_ledger import fold_open_findings
+
+        rounds = [
+            {
+                "round": 1,
+                "critic_job_id": "c1",
+                "opened": [{"id": "F1", "severity": "high", "claim": "x"}],
+                "dispositions": [],
+            },
+            {
+                "round": 2,
+                "critic_job_id": "c2",
+                "opened": [],
+                "dispositions": [
+                    {"id": "F1", "disposition": "RESOLVED", "quote": "fixed"}
+                ],
+            },
+            {
+                "round": 3,
+                "critic_job_id": "c3",
+                "opened": [{"id": "F1", "severity": "low", "claim": "y"}],
+                "dispositions": [],
+            },
+        ]
+
+        open_findings = fold_open_findings(rounds)
+        assert [f["severity"] for f in open_findings] == ["low"]
+
+
 class TestTriggerVerificationInstructionsWiring:
     """Task 7: ``format_verification_instructions`` was rendered and then
     discarded — ``create_job`` has no ``instructions`` parameter, so every
@@ -1268,6 +1443,13 @@ class TestTriggerVerificationInstructionsWiring:
             main_module, "_propagate_datasources_to_subjob", AsyncMock()
         )
         monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        # No critic in flight — this test is about the gate, not the
+        # duplicate-spawn guard (which fails closed on the non-UUID id here).
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
 
         prior_round = {
             "round": 1,
