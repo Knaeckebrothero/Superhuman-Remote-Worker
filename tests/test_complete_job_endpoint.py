@@ -455,6 +455,13 @@ class TestVerificationTriggerGuards:
         monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
         monkeypatch.setattr(main, "_propagate_datasources_to_subjob", AsyncMock())
         monkeypatch.setattr(main, "_trigger_dispatch", lambda: None)
+        # No critic already in flight. Stubbed rather than left real because
+        # the baseline job id is not a UUID and the guard fails CLOSED on one.
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
 
         job = self._passing_job()
         result = self._passing_result()
@@ -464,6 +471,28 @@ class TestVerificationTriggerGuards:
 
         create_job_mock.assert_awaited_once()
         assert any("critic job" in a and "created" in a for a in actions)
+
+    @pytest.mark.asyncio
+    async def test_no_critic_created_when_one_is_already_in_flight(self, monkeypatch):
+        """Guard 7: the same baseline, with a live critic already spawned for
+        this target — a retried /complete must not double it."""
+        from orchestrator import main
+
+        create_job_mock = AsyncMock(return_value={"id": "critic-999"})
+        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=True),
+        )
+
+        job = self._passing_job()
+        result = self._passing_result()
+        actions: list[str] = []
+
+        await main._trigger_verification_on_complete(job, result, actions)
+
+        create_job_mock.assert_not_awaited()
 
 
 class TestVerificationTriggerIntegration:

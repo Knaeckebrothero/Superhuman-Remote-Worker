@@ -4665,6 +4665,60 @@ class PostgresDB:
         RETURNING p.id, p.user_id, p.config_name
     """
 
+    async def has_live_verification_critic(self, target_job_id: str) -> bool:
+        """True when a verification critic for ``target_job_id`` is still alive.
+
+        Guards the critic spawn against duplicates. ``complete_job``
+        deliberately accepts entry statuses processing/reviewing/pending_review
+        /completed, so a retried ``/complete`` on a target already in
+        'reviewing' reaches ``_trigger_verification_on_complete`` a second time.
+        Without this check that spawns a SECOND critic for the same round; both
+        then compute their round number and finding ids from a pre-append read,
+        so the ids collide and folding can lose a blocking finding.
+
+        The status list is the same "still possibly delivering a verdict" set
+        as ``_UNSTICK_REVIEWING_SQL``'s — the two must agree, or a critic this
+        call treats as dead is one the watchdog treats as live (and vice
+        versa). ``context->>'verification_target' IS NOT NULL`` is what keeps
+        scholars and delegation children out: they share ``parent_job_id``, and
+        counting them would block a job's FIRST critic while its scholar runs.
+
+        Fails CLOSED: an unusable id, or any error, reports True. Reading
+        "no critic exists" from a failure would licence exactly the duplicate
+        spawn this exists to prevent.
+        """
+        try:
+            uuid_val = UUID(target_job_id)
+        except (ValueError, TypeError, AttributeError):
+            logger.warning(
+                "has_live_verification_critic: unusable job id %r — reporting "
+                "live to suppress the spawn",
+                target_job_id,
+            )
+            return True
+
+        query = """
+            SELECT EXISTS (
+                SELECT 1 FROM jobs c
+                 WHERE c.parent_job_id = $1
+                   AND c.context->>'verification_target' IS NOT NULL
+                   AND c.status IN (
+                       'created', 'processing', 'paused', 'waiting',
+                       'waiting_for_reply'
+                   )
+            )
+        """
+        try:
+            async with self.acquire() as conn:
+                return bool(await conn.fetchval(query, uuid_val))
+        except Exception:
+            logger.exception(
+                "has_live_verification_critic failed for %s — reporting live to "
+                "suppress the spawn",
+                target_job_id,
+            )
+            return True
+
     async def unstick_reviewing_parents(
         self, grace_minutes: int = 30
     ) -> List[Dict[str, Any]]:
