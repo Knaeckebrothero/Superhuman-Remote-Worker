@@ -181,6 +181,27 @@ class TestValidateDispositions:
         open_low = [{"id": "F1", "severity": "low", "claim": "typo"}]
         assert validate_dispositions([], open_low) == []
 
+    def test_duplicate_id_rejected(self):
+        # Fix for review finding 1: a second disposition for an id already
+        # processed in this call must be rejected, not silently accepted as
+        # a last-write-wins override. Without the guard, a fabricated
+        # RESOLVED riding after a genuine DISPUTED slips through with no
+        # error at all.
+        dupes = [
+            {"id": "F1", "disposition": "DISPUTED", "reason": "still checking"},
+            {"id": "F1", "disposition": "RESOLVED", "quote": "fixed it"},
+        ]
+        errors = validate_dispositions(dupes, OPEN_HIGH)
+        assert len(errors) == 1
+        assert "F1" in errors[0]
+
+        # Because the call is rejected, a correct caller never persists these
+        # dispositions into the ledger — so folding rounds that never
+        # incorporated the invalid call must leave the finding open, not
+        # silently closed by the fabricated RESOLVED.
+        rounds = [_round(1, opened=OPEN_HIGH)]
+        assert [f["id"] for f in fold_open_findings(rounds)] == ["F1"]
+
 
 class TestValidateVerdictCall:
     def test_returned_with_no_findings_rejected(self):
@@ -210,11 +231,25 @@ class TestRenderPriorFindings:
         assert "RESOLVED" in text  # the instruction block explains dispositions
 
     def test_marks_disputed(self):
+        # Fix for review finding 2: assert the actual per-finding marker, not
+        # "DISPUTED", which also appears unconditionally in the static
+        # trailing instructions block whenever open_findings is non-empty —
+        # that weaker assertion would still pass even with the per-finding
+        # flag logic deleted entirely.
         text = render_prior_findings(
             [{"id": "F1", "severity": "high", "claim": "c", "opened_round": 1,
               "disputed": True, "dispute_reason": "disagree"}]
         )
-        assert "DISPUTED" in text
+        assert "*(you previously disputed this)*" in text
+
+    def test_does_not_mark_undisputed(self):
+        # Contrasting case: without this, test_marks_disputed alone can't
+        # actually fail on a deleted/reversed flag condition.
+        text = render_prior_findings(
+            [{"id": "F1", "severity": "high", "claim": "c", "opened_round": 1,
+              "disputed": False}]
+        )
+        assert "*(you previously disputed this)*" not in text
 
 
 class TestEscalationStatus:
