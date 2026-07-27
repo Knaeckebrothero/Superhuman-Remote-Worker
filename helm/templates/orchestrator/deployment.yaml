@@ -116,6 +116,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SKILLS_DB_ENABLED
+            - name: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED
             - name: MCP_DATASOURCES_ENABLED
               valueFrom:
                 configMapKeyRef:

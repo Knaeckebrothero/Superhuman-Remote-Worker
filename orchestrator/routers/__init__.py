@@ -11,6 +11,7 @@ from routers.automations import router as automations_router
 from routers.canvases import internal_router as internal_canvases_router
 from routers.canvases import router as canvases_router
 from routers.project_loops import router as project_loops_router
+from routers.product_capabilities import router as product_capabilities_router
 from routers.shared_browser import router as shared_browser_router
 from routers.wopi import router as wopi_router
 
@@ -19,6 +20,7 @@ __all__ = [
     "canvases_router",
     "internal_canvases_router",
     "project_loops_router",
+    "product_capabilities_router",
     "shared_browser_router",
     "wopi_router",
 ]

@@ -154,6 +154,7 @@ from routers import automations_router  # noqa: E402
 from routers import canvases_router, internal_canvases_router, wopi_router  # noqa: E402
 from services.canvas_office import warm_collabora_discovery  # noqa: E402
 from routers import project_loops_router  # noqa: E402
+from routers import product_capabilities_router  # noqa: E402
 from routers import shared_browser_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
@@ -7875,6 +7876,7 @@ app.include_router(canvases_router)
 app.include_router(internal_canvases_router)
 app.include_router(wopi_router)
 app.include_router(project_loops_router)
+app.include_router(product_capabilities_router)
 app.include_router(shared_browser_router)
 app.include_router(sessions_router)
 

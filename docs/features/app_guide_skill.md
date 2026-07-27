@@ -18,17 +18,19 @@ tags:
 > fresh/resumed workspace cells and the complete 30-case deployed evaluation
 > with zero critical forbidden claims, near-miss false positives, or errors.
 > Normal deployment values were restored and the synthetic verification
-> resources were removed; **M1 is complete**. M2a's schema-1.0 typed contract,
-> immutable 18-definition build registry, guide-link validation, and
-> deterministic registry revision are implemented; M2b server resolution is
-> next. The remaining runtime capability plane, visual help, and Phases 3–8
-> remain open. Post-closure commit `02fed505`
+> resources were removed; **M1 is complete**. M2a's schema-1.0 typed contract
+> and immutable 18-definition registry are implemented. M2b's authenticated
+> server resolver and default-off dark endpoint are also implemented; M2c's
+> live session overlay and agent tool are next. The remaining runtime
+> capability plane, visual help, and Phases 3–8 remain open. Post-closure
+> commit `02fed505`
 > added the missing Office-on-Canvas guide coverage; its focused inventory
 > regression and the complete current-tree M1 union pass. The 2026-07-27
 > revalidation result is **774 passed, 0 deselected, 10 warnings**, with Ruff,
 > formatting, diff, and both Helm lint gates also green. The M2 code/seam audit
 > and five-slice implementation design are complete. M2a passed its 83-test
-> focused verification plus Ruff/format checks on 2026-07-27. See
+> focused verification; M2b passed its 192-test focused regression union plus
+> Ruff/format, diff, and both Helm lint gates on 2026-07-27. See
 > `docs/superpowers/plans/2026-07-27-app-guide-m2.md`.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
@@ -1529,16 +1531,24 @@ adds no endpoint, runtime resolver, or model behavior.
 
 #### M2b — server resolver and dark endpoint
 
-- [ ] Implement pure/server resolution in
+- [x] Implement pure/server resolution in
   `orchestrator/services/product_capabilities.py` and a dedicated router.
-- [ ] Compose real grants, flags, catalogs, readiness seams, and admitted
+- [x] Compose real grants, flags, catalogs, readiness seams, and admitted
   thread context; use the thread's primary project scope rather than every
   visible project and do not trigger lazy state backfills.
-- [ ] Add `GET /api/users/me/product-capabilities` with owner admission,
+- [x] Add `GET /api/users/me/product-capabilities` with owner admission,
   exact filters, count/byte limits, no-store responses, visibility/redaction,
   and `not_applicable` session state when no thread is supplied.
-- [ ] Dark-launch the endpoint and compare privacy-safe layer/state/reason
+- [x] Dark-launch the endpoint and compare privacy-safe layer/state/reason
   outcomes against known fixtures.
+
+**Result (2026-07-27):** M2b is complete. The endpoint remains operator-gated
+and default-off through `PRODUCT_CAPABILITIES_ENDPOINT_ENABLED`; when disabled,
+an authenticated request receives an explicit rollout-disabled `503` signal.
+The server resolves build/deployment/grant facts and selected safe
+thread/browser facts but always leaves live agent actionability `unknown`.
+The focused regression union passed 192 tests plus Ruff/format, diff, and both
+Helm lint profiles.
 
 #### M2c — live session overlay and agent tool
 
