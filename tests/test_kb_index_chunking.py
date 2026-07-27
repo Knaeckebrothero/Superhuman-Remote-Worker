@@ -453,7 +453,10 @@ class TestUpsertKbNote:
             priority=0,
         )
         query, *params = mock_db.fetchval.call_args[0]
-        assert "priority = $21" in query
+        # Fix round 2 (Finding 3): the raw SET is now COALESCE($21, ...) --
+        # see TestUpsertKbNotePriorityCoalesceSentinel for the sentinel
+        # semantics themselves; this test only pins the position.
+        assert "priority = COALESCE($21, knowledge_index.priority)" in query
         assert params[-1] == 0
 
 
