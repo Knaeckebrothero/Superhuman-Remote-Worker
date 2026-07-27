@@ -492,3 +492,24 @@ class TestAppendVerificationRound:
     @pytest.mark.asyncio
     async def test_missing_job_returns_zero(self, db):
         assert await db.append_verification_round(str(uuid4()), {"critic_job_id": "c1"}) == 0
+
+    @pytest.mark.asyncio
+    async def test_json_null_ledger_is_replaced_not_concatenated(self, db):
+        """A jsonb `null` is NOT SQL NULL, so COALESCE leaves it in place and
+        `'null'::jsonb || [x]` yields `[null, x]` — a ledger whose round
+        numbers are off by one from the very first append, and a phantom
+        entry the fold has to defend against."""
+        jid = str(uuid4())
+        await _insert_job(db, jid, {"verification_rounds": None})
+
+        assert await db.append_verification_round(jid, {"round": 1, "critic_job_id": "c1"}) == 1
+        rounds = (await _read_ctx(db, jid))["verification_rounds"]
+        assert [r["critic_job_id"] for r in rounds] == ["c1"]
+
+    @pytest.mark.asyncio
+    async def test_non_array_ledger_is_replaced(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, {"verification_rounds": "garbage"})
+
+        assert await db.append_verification_round(jid, {"round": 1, "critic_job_id": "c1"}) == 1
+        assert len((await _read_ctx(db, jid))["verification_rounds"]) == 1
