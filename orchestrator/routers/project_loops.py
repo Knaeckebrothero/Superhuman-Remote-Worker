@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from security.access import require_project_member
 from security.auth import require_approved_user
+from services.project_backlog import PRIORITY_WORDS, fetch_backlog
 
 logger = logging.getLogger(__name__)
 
@@ -320,3 +321,57 @@ async def list_project_loop_jobs(
     if not loop:
         raise HTTPException(status_code=404, detail="No loop for this project")
     return await postgres_db.list_project_loop_jobs(str(loop["id"]), limit=limit)
+
+
+@router.get("/{project_id}/backlog")
+async def get_project_backlog(request: Request, project_id: str) -> dict[str, Any]:
+    """The project's ticket pool -- what the loop's overseer is shown.
+
+    Priority goes out as a word (``high``/``normal``/``low``); the 0/1/2
+    storage rank is a ``services.project_backlog`` implementation detail the
+    cockpit never needs to know exists. Priority is a non-binding label here
+    too -- this endpoint hands back exactly what ``fetch_backlog`` returns,
+    in its existing order, and never filters or gates on it.
+
+    A ticket the active loop is already working
+    (``campaign.initiative_note_id``) keeps ``status='active'`` in the KB, so
+    it's excluded from the pool and surfaced separately as ``in_progress``
+    instead -- the cockpit must never see it listed twice. "No active loop"
+    and "active loop with no campaign yet" both degrade to an empty-ish
+    payload rather than a 404 or a raise -- unlike ``get_project_loop``, the
+    pool itself is still a real, answerable question with nothing running.
+
+    Viewer or higher required (a read, like the other GETs on this router).
+    """
+    from main import postgres_db, vector_db  # late import: avoid circular
+
+    await require_approved_user(request, postgres_db)
+    await require_project_member(request, postgres_db, project_id, min_role="viewer")
+
+    loop = await postgres_db.get_active_project_loop(project_id)
+    campaign = (loop or {}).get("campaign") or {}
+    in_progress_id = campaign.get("initiative_note_id")
+
+    rows, counts = await fetch_backlog(
+        vector_db, project_id, exclude_note_id=in_progress_id, limit=200
+    )
+    return {
+        "total": sum(counts.values()),
+        "counts": {
+            word: counts.get(rank, 0) for rank, word in sorted(PRIORITY_WORDS.items())
+        },
+        "in_progress": (
+            {"note_id": in_progress_id, "title": campaign.get("title") or ""}
+            if in_progress_id
+            else None
+        ),
+        "items": [
+            {
+                "note_id": r["note_id"],
+                "note_type": r["note_type"],
+                "title": r["title"],
+                "priority": PRIORITY_WORDS.get(int(r["priority"]), "normal"),
+            }
+            for r in rows
+        ],
+    }
