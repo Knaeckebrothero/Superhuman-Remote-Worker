@@ -5,6 +5,8 @@ docs/superpowers/specs/2026-07-26-project-backlog-pipeline-design.md
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 
 # =============================================================================
 # Helpers (Task 3: priority on the agent tool surface)
@@ -422,3 +424,222 @@ class TestKbListPriorityDisplay:
         assert len(lines) == 1
         assert lines[0] == "● **chose-jwt** — Chose JWT (decision [high])"
         assert "priority" not in lines[0]
+
+
+# =============================================================================
+# Task 4: the pool query and its renderer
+# =============================================================================
+
+
+def _row(note_id, note_type="feature", title="T", priority=1):
+    return {
+        "note_id": note_id,
+        "note_type": note_type,
+        "title": title,
+        "priority": priority,
+    }
+
+
+class TestRenderBacklogBlock:
+    def test_counts_line_comes_first_and_breaks_down_by_priority(self):
+        """The cap hides the tail; the counts line is what tells the reader a
+        tail exists at all. It must lead the block."""
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        rows = [_row("a", priority=0), _row("b", priority=1)]
+        counts = {0: 12, 1: 15, 2: 7}
+        block = render_backlog_block(rows, counts, limit=20)
+
+        first = block.splitlines()[0]
+        assert first == (
+            "PROJECT BACKLOG — 34 open: 12 high, 15 normal, 7 low (showing top 20)"
+        )
+
+    def test_in_progress_line_precedes_the_list(self):
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        block = render_backlog_block(
+            [_row("a")],
+            {1: 1},
+            in_progress={"note_id": "issue-deploy", "title": "Deploy docs",
+                         "priority": 0, "note_type": "issue"},
+        )
+        lines = block.splitlines()
+        assert lines[1].startswith("IN PROGRESS: [high] issue-deploy — Deploy docs")
+        assert lines[2].lstrip().startswith("[normal]")
+
+    def test_no_in_progress_renders_none(self):
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        block = render_backlog_block([_row("a")], {1: 1})
+        assert "IN PROGRESS: (none)" in block
+
+    def test_remainder_is_reported_when_capped(self):
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        rows = [_row(f"n{i}") for i in range(3)]
+        block = render_backlog_block(rows, {1: 10}, limit=3)
+        assert "… 7 more" in block
+
+    def test_empty_pool_tells_the_agent_to_file_tickets(self):
+        """An empty pool must not render an empty void — the loop's own agents
+        are the ones expected to fill it."""
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        block = render_backlog_block([], {})
+        assert "0 open" in block
+        assert "kb_write" in block
+
+
+class _FakeAcquire:
+    """Async-context-manager pool.acquire() double.
+
+    Mirrors the idiom in tests/test_loop_campaign_scheduling.py::_FakeAcquire
+    and tests/test_delegation_timeout_outage.py::_FakeAcquire rather than
+    inventing a bespoke one here.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _fake_vector_db(conn):
+    """A pool double whose ``.acquire()`` yields ``conn`` via _FakeAcquire."""
+    vector_db = MagicMock()
+    vector_db.acquire = MagicMock(return_value=_FakeAcquire(conn))
+    return vector_db
+
+
+class TestFetchBacklog:
+    @pytest.mark.asyncio
+    async def test_excludes_the_in_progress_initiative(self):
+        """The overseer must never be offered a ticket already underway."""
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        vector_db = _fake_vector_db(conn)
+
+        await fetch_backlog(vector_db, "p-1", exclude_note_id="issue-x")
+
+        first_sql = conn.fetch.await_args_list[0].args[0]
+        assert "note_id <> $3" in first_sql
+        assert conn.fetch.await_args_list[0].args[3] == "issue-x"
+
+    @pytest.mark.asyncio
+    async def test_counts_query_also_excludes_the_in_progress_initiative(self):
+        """The pool listing and its counts line must agree on what "open"
+        means -- a mismatch here would make the header's total lie about
+        what the list below it actually shows."""
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        vector_db = _fake_vector_db(conn)
+
+        await fetch_backlog(vector_db, "p-1", exclude_note_id="issue-x")
+
+        second_sql = conn.fetch.await_args_list[1].args[0]
+        assert "note_id <> $3" in second_sql
+        assert conn.fetch.await_args_list[1].args[3] == "issue-x"
+
+    @pytest.mark.asyncio
+    async def test_no_exclusion_binds_none(self):
+        """The default (no in-progress campaign) must bind SQL NULL, not the
+        string 'None' -- the WHERE clause's `$3::text IS NULL` branch depends
+        on this."""
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        vector_db = _fake_vector_db(conn)
+
+        await fetch_backlog(vector_db, "p-1")
+
+        assert conn.fetch.await_args_list[0].args[3] is None
+
+    @pytest.mark.asyncio
+    async def test_orders_by_priority_then_age_ascending(self):
+        """Pin the actual ORDER BY clause: a rewrite to DESC (or to created_at
+        first) would still exercise the same mocks and pass a looser test --
+        this one fails if the ordering regresses."""
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        vector_db = _fake_vector_db(conn)
+
+        await fetch_backlog(vector_db, "p-1")
+
+        first_sql = " ".join(conn.fetch.await_args_list[0].args[0].split())
+        assert "ORDER BY priority ASC, created_at ASC" in first_sql
+
+    @pytest.mark.asyncio
+    async def test_note_types_are_bound_to_the_backlog_ticket_types(self):
+        from orchestrator.services.project_backlog import (
+            BACKLOG_NOTE_TYPES,
+            fetch_backlog,
+        )
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        vector_db = _fake_vector_db(conn)
+
+        await fetch_backlog(vector_db, "p-1")
+
+        assert conn.fetch.await_args_list[0].args[2] == list(BACKLOG_NOTE_TYPES)
+        assert conn.fetch.await_args_list[0].args[2] == ["feature", "issue", "idea"]
+
+    @pytest.mark.asyncio
+    async def test_limit_is_bound_as_the_fourth_row_query_parameter(self):
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        vector_db = _fake_vector_db(conn)
+
+        await fetch_backlog(vector_db, "p-1", limit=5)
+
+        assert conn.fetch.await_args_list[0].args[4] == 5
+
+    @pytest.mark.asyncio
+    async def test_high_priority_rank_zero_survives_the_round_trip(self):
+        """Rank 0 (high) is falsy in Python. A `row["priority"] or None` or
+        `{k: v for k, v in ... if k}` style bug would silently drop it --
+        prove a rank-0 row and its count both come back intact."""
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "note_id": "issue-x",
+                        "note_type": "issue",
+                        "title": "T",
+                        "priority": 0,
+                    }
+                ],
+                [{"priority": 0, "n": 3}],
+            ]
+        )
+        vector_db = _fake_vector_db(conn)
+
+        rows, counts = await fetch_backlog(vector_db, "p-1")
+
+        assert rows == [
+            {
+                "note_id": "issue-x",
+                "note_type": "issue",
+                "title": "T",
+                "priority": 0,
+            }
+        ]
+        assert 0 in counts
+        assert counts[0] == 3
