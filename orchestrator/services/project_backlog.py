@@ -32,6 +32,22 @@ DEFAULT_PRIORITY_RANK = 1
 
 BACKLOG_NOTE_TYPES: tuple[str, ...] = ("feature", "issue", "idea")
 
+# The note-type filter, pre-rendered as a SQL literal `IN (...)` list rather
+# than bound as `= ANY($n::text[])`. Fix round 1, Finding 1: measured on
+# pgvector/pgvector:pg15 (303k rows / 300 projects, ANALYZEd), a bound array
+# parameter is fine under the default `auto` plan_cache_mode, but under
+# `force_generic_plan` (a real GUC -- effectively what a reused prepared
+# statement can settle into once cost estimates favour a generic plan) the
+# planner cannot prove `note_type = ANY($n)` implies idx_knowledge_backlog's
+# literal `note_type IN ('feature','issue','idea')` partial predicate, and
+# falls back to idx_knowledge_project(project_id) + Filter + an explicit
+# Sort. The literal form holds under every plan mode. BACKLOG_NOTE_TYPES is a
+# hardcoded module constant, never user input, so inlining it is not an
+# injection surface -- but it must be derived here, once, and never
+# hand-typed a second time: a second copy can silently drift from the tuple
+# and the index would go quietly unused again.
+_BACKLOG_NOTE_TYPES_SQL = "(" + ", ".join(f"'{t}'" for t in BACKLOG_NOTE_TYPES) + ")"
+
 # How many tickets ride in a kickoff. The counts line (see render_backlog_block)
 # is what keeps this cap from hiding the tail.
 BACKLOG_INJECTION_LIMIT = 20
@@ -48,37 +64,40 @@ async def fetch_backlog(
 
     ``exclude_note_id`` drops the in-progress campaign's initiative so the
     overseer is never offered something already underway. Both queries hit
-    ``idx_knowledge_backlog``.
+    ``idx_knowledge_backlog`` -- the note-type filter is inlined as a literal
+    (``_BACKLOG_NOTE_TYPES_SQL``) rather than bound as ``= ANY($n)``, which is
+    what keeps the partial index reachable under every plan mode (fix round
+    1, Finding 1). Binding this shifts ``exclude_note_id``/``limit`` down to
+    ``$2``/``$3`` (row query) and ``$2`` (count query) -- there is no longer a
+    ``$2`` slot for the note-type list.
     """
     async with vector_db.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT note_id, note_type, title, priority
               FROM knowledge_index
              WHERE project_id = $1::uuid
                AND status = 'active'
-               AND note_type = ANY($2::text[])
-               AND ($3::text IS NULL OR note_id <> $3)
+               AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
+               AND ($2::text IS NULL OR note_id <> $2)
              ORDER BY priority ASC, created_at ASC
-             LIMIT $4
+             LIMIT $3
             """,
             project_id,
-            list(BACKLOG_NOTE_TYPES),
             exclude_note_id,
             limit,
         )
         count_rows = await conn.fetch(
-            """
+            f"""
             SELECT priority, COUNT(*) AS n
               FROM knowledge_index
              WHERE project_id = $1::uuid
                AND status = 'active'
-               AND note_type = ANY($2::text[])
-               AND ($3::text IS NULL OR note_id <> $3)
+               AND note_type IN {_BACKLOG_NOTE_TYPES_SQL}
+               AND ($2::text IS NULL OR note_id <> $2)
              GROUP BY priority
             """,
             project_id,
-            list(BACKLOG_NOTE_TYPES),
             exclude_note_id,
         )
     return (
@@ -108,7 +127,7 @@ def render_backlog_block(
     silently becomes write-only)::
 
         PROJECT BACKLOG — 34 open: 12 high, 15 normal, 7 low (showing top 20)
-        IN PROGRESS: [high] issue-deploy-docs-missing — Deployment docs missing
+        IN PROGRESS: [high] issue-deploy-docs — Deployment docs missing
           [high]   feature  feature-rag-boundary — Permission-aware RAG boundary
           … 18 more
     """
