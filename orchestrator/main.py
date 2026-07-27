@@ -17395,6 +17395,28 @@ def _parse_utc_date(s: str) -> datetime:
     )
 
 
+def _verification_rounds(job: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Read ``context.verification_rounds`` from a job row.
+
+    asyncpg returns JSONB as a string on the app pool (no codec registered), so
+    the context must be coerced at every read. This is the single coercion
+    point for the ledger — see
+    docs/issues/jsonb_isinstance_guard_without_parse_silent_dead_paths.md.
+    """
+    if not job:
+        return []
+    ctx = job.get("context")
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            return []
+    if not isinstance(ctx, dict):
+        return []
+    rounds = ctx.get("verification_rounds")
+    return rounds if isinstance(rounds, list) else []
+
+
 def _fold_breakdown(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Fold flat (key, unit) aggregate rows into one object per key.
 
@@ -17968,6 +17990,140 @@ async def store_citation_snapshot(request: Request) -> dict[str, Any]:
     if not key:
         raise HTTPException(status_code=500, detail="Snapshot store write failed")
     return {"snapshot_blob_key": key, "size_bytes": len(data)}
+
+
+async def _record_verification_round_impl(
+    *,
+    postgres_db: Any,
+    target_job_id: str,
+    critic_job_id: str,
+    asserted_verdict: str,
+    opened: list[dict[str, Any]],
+    dispositions: list[dict[str, Any]],
+    head_commit: str | None,
+) -> dict[str, Any]:
+    """Validate, compute, and durably append one verification round.
+
+    Split out of the route so the gate logic is testable without HTTP. Raises
+    HTTPException(409) with the model-facing errors on invalid input, or
+    HTTPException(400) if ``critic_job_id`` is missing.
+    """
+    from services.verification_ledger import (
+        assign_ids,
+        compute_verdict,
+        fold_open_findings,
+        validate_dispositions,
+        validate_verdict_call,
+    )
+
+    if not critic_job_id:
+        # append_verification_round's dedup guard keys on critic_job_id
+        # (`@> {"critic_job_id": ...}`). A falsy value here would make every
+        # caller that omits it collide with every other on this target — both
+        # at the DB-level dedup (silently dropping a genuinely distinct round
+        # as a "duplicate") and at the idempotent-retry short-circuit below
+        # (returning a stranger's stored verdict for a request that never ran).
+        raise HTTPException(status_code=400, detail="critic_job_id is required")
+
+    target = await postgres_db.get_job(target_job_id)
+    if not target:
+        raise HTTPException(status_code=404, detail=f"Job {target_job_id} not found")
+
+    rounds = _verification_rounds(target)
+
+    # Idempotent retry: this critic_job_id already has a durable round on the
+    # ledger. Short-circuit to the stored result BEFORE validating — the
+    # retried round's own findings are now part of `rounds` (they were
+    # appended by the original attempt), so validating this call against them
+    # would wrongly demand the retry disposition the findings it itself just
+    # opened. Checked ahead of the atomic-append dedup below so a same-input
+    # retry never re-derives (and can't diverge from) the stored verdict.
+    for existing in rounds:
+        if existing.get("critic_job_id") == critic_job_id:
+            return {
+                "verdict": existing.get("verdict"),
+                "round": existing.get("round"),
+                "assigned": existing.get("opened", []),
+                "open_findings": fold_open_findings(rounds),
+            }
+
+    open_before = fold_open_findings(rounds)
+
+    errors = validate_verdict_call(asserted_verdict, opened)
+    errors += validate_dispositions(dispositions, open_before)
+    if errors:
+        raise HTTPException(status_code=409, detail={"errors": errors})
+
+    assigned = assign_ids(opened, rounds)
+    record = {
+        "round": len(rounds) + 1,
+        "critic_job_id": critic_job_id,
+        "head_commit": head_commit,
+        "asserted_verdict": str(asserted_verdict).lower(),
+        "opened": assigned,
+        "dispositions": dispositions,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    open_after = fold_open_findings(rounds + [record])
+    record["verdict"] = compute_verdict(open_after)
+
+    if record["verdict"] != record["asserted_verdict"]:
+        # Free, direct measure of critic quality: how often a critic tries to
+        # approve over its own open findings. Previously unobservable.
+        logger.warning(
+            "Verification verdict divergence for target %s (critic %s): "
+            "model asserted %r, computed %r from %d open finding(s)",
+            target_job_id,
+            critic_job_id,
+            record["asserted_verdict"],
+            record["verdict"],
+            len(open_after),
+        )
+
+    appended = await postgres_db.append_verification_round(target_job_id, record)
+    if appended == 0:
+        # Duplicate (retried /complete) — return the stored verdict, idempotent.
+        stored = await postgres_db.get_job(target_job_id)
+        for existing in _verification_rounds(stored):
+            if existing.get("critic_job_id") == critic_job_id:
+                return {
+                    "verdict": existing.get("verdict"),
+                    "round": existing.get("round"),
+                    "assigned": existing.get("opened", []),
+                    "open_findings": fold_open_findings(_verification_rounds(stored)),
+                }
+        raise HTTPException(status_code=500, detail="Ledger append failed")
+
+    return {
+        "verdict": record["verdict"],
+        "round": record["round"],
+        "assigned": assigned,
+        "open_findings": open_after,
+    }
+
+
+@app.post("/api/jobs/{target_job_id}/verification/rounds")
+async def record_verification_round(
+    request: Request, target_job_id: str
+) -> dict[str, Any]:
+    """Record one verification round on the TARGET job's durable ledger.
+
+    **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips this path.
+    Called by the critic's verdict tools BEFORE they return, so the verdict is
+    durable before anything observes it (journal-before-observe). The verdict in
+    the response is COMPUTED from the open findings, not taken from the caller.
+    """
+    await require_internal(request)
+    body = await request.json()
+    return await _record_verification_round_impl(
+        postgres_db=postgres_db,
+        target_job_id=target_job_id,
+        critic_job_id=str(body.get("critic_job_id") or ""),
+        asserted_verdict=str(body.get("asserted_verdict") or ""),
+        opened=body.get("opened") or [],
+        dispositions=body.get("dispositions") or [],
+        head_commit=body.get("head_commit"),
+    )
 
 
 @app.get("/api/citations/{citation_id}")
