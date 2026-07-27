@@ -199,6 +199,37 @@ class TestRecordVerificationRound:
         assert exc.value.status_code == 400
 
 
+class TestRecordVerificationRoundCleanApproval:
+    """Every other test in this module that inspects ``result["verdict"]``
+    exercises a 'returned' outcome, or expects an exception. None of them
+    proves the wiring can produce a genuine, computed 'approved' verdict — a
+    hardcoded ``return {"verdict": "returned", ...}`` inserted anywhere on
+    this path would still pass the entire rest of the suite. This is the
+    positive-path counterpart to
+    ``test_asserted_approved_loses_to_open_blocking_finding`` above.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_open_blocking_findings_computes_approved(
+        self, fake_db, ledger_state
+    ):
+        from orchestrator.main import _record_verification_round_impl
+
+        result = await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c1",
+            asserted_verdict="approved",
+            opened=[],
+            dispositions=[],
+            head_commit="aaa",
+        )
+
+        assert result["verdict"] == "approved"
+        assert result["open_findings"] == []
+        assert ledger_state["rounds"][0]["verdict"] == "approved"
+
+
 class TestRecordVerificationRoundHeadCommitAuthority:
     """Amendment item 2: the recorded round's ``head_commit`` is
     server-authoritative from the TARGET's ``freeze_data``, not whatever the
@@ -880,6 +911,59 @@ class TestHandleCriticVerdictOnCompleteWiring:
         assert "high" in feedback
 
     @pytest.mark.asyncio
+    async def test_returned_finding_without_severity_still_resumes_target(
+        self, monkeypatch
+    ):
+        """``fold_open_findings`` guarantees a finding carries ``id`` but NOT
+        ``severity`` (see its docstring). The rendering loop used to index
+        ``f['severity']`` directly — a finding missing that key raises
+        KeyError, which propagates out of this function. The /complete
+        endpoint wraps this call in a bare ``try/except Exception: log`` (see
+        orchestrator/main.py's complete_job step 3), so the exception is
+        swallowed and the target is left in 'reviewing' forever: never
+        resumed, never escalated. That silent wedge is exactly the failure
+        class this whole plan exists to remove — a rendering bug must not be
+        able to produce it.
+        """
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        target = _make_target_job(
+            rounds=[
+                {
+                    "round": 1,
+                    "critic_job_id": "critic-1",
+                    "verdict": "returned",
+                    "asserted_verdict": "returned",
+                    # No "severity" key — assign_ids always sets one on the
+                    # normal write path, but fold_open_findings' contract
+                    # does not depend on that, and must not crash if it's
+                    # ever absent (e.g. an older or hand-written record).
+                    "opened": [{"id": "F1", "claim": "missing tests"}],
+                    "dispositions": [],
+                    "ts": "t",
+                }
+            ]
+        )
+        monkeypatch.setattr(
+            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+        )
+        resume_mock = AsyncMock()
+        monkeypatch.setattr(main_module, "_internal_resume_job", resume_mock)
+
+        job = _make_critic_job()
+        actions: list[str] = []
+
+        # Must not raise — that is the entire point of this test.
+        await _handle_critic_verdict_on_complete(job, actions)
+
+        resume_mock.assert_awaited_once()
+        feedback = resume_mock.call_args.kwargs.get("feedback", "")
+        assert "F1" in feedback
+        assert "missing tests" in feedback
+        assert "unknown" in feedback
+
+    @pytest.mark.asyncio
     async def test_completed_with_no_ledger_record_escalates_target(self, monkeypatch):
         import orchestrator.main as main_module
         from orchestrator.main import _handle_critic_verdict_on_complete
@@ -965,3 +1049,90 @@ class TestHandleCriticVerdictOnCompleteWiring:
         set_status_mock.assert_not_awaited()
         update_mock.assert_awaited_once()
         assert update_mock.call_args.kwargs["status"] == "pending_review"
+
+
+# =============================================================================
+# End-to-end continuity (Task 11): the gap that made the incident possible
+# was that nothing carried findings from one round to the next, so a fresh
+# critic reviewed blind and could approve over an open blocking finding it
+# had never been told about.
+# =============================================================================
+
+
+class TestMultiRoundContinuity:
+    @pytest.mark.asyncio
+    async def test_round_two_critic_is_told_about_round_one_findings(
+        self, fake_db, ledger_state
+    ):
+        """The gap that made the incident possible: nothing carried findings
+        from one round to the next."""
+        from orchestrator.main import _record_verification_round_impl
+        from orchestrator.services.verification_ledger import (
+            fold_open_findings,
+            render_prior_findings,
+        )
+
+        await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c1",
+            asserted_verdict="returned",
+            opened=[{"severity": "high", "claim": "missing walnut-shell source"}],
+            dispositions=[],
+            head_commit="aaa",
+        )
+
+        # This is exactly what format_verification_instructions folds into
+        # the round-2 critic's brief (see _trigger_verification_on_complete),
+        # so it proves what the NEXT critic is actually told, not just what
+        # the ledger stores.
+        brief = render_prior_findings(fold_open_findings(ledger_state["rounds"]))
+        assert "F1" in brief
+        assert "missing walnut-shell source" in brief
+        assert "may not close a finding by re-judging" in brief
+
+    @pytest.mark.asyncio
+    async def test_round_three_cannot_approve_over_open_finding(
+        self, fake_db, ledger_state
+    ):
+        """The incident itself, as an assertion: job 52949749 was returned
+        twice at severity high, then approved on a byte-identical
+        deliverable by a fresh critic that never saw the findings.
+
+        Round 1 opens F1 (high) and returns. Round "3" here is a fresh
+        critic with no memory of round 1 — it never engages with the
+        finding on its merits, it only DISPUTES it (the critic's opinion
+        that the finding doesn't apply), which — unlike RESOLVED — does NOT
+        close a finding (see fold_open_findings / render_prior_findings:
+        "You may not close a finding by re-judging it"). The computed
+        verdict must stay 'returned' regardless of what the critic asserted.
+        """
+        from orchestrator.main import _record_verification_round_impl
+
+        await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c1",
+            asserted_verdict="returned",
+            opened=[{"severity": "high", "claim": "missing walnut-shell source"}],
+            dispositions=[],
+            head_commit="aaa",
+        )
+        result = await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id="t1",
+            critic_job_id="c3",
+            asserted_verdict="approved",
+            opened=[],
+            dispositions=[
+                {
+                    "id": "F1",
+                    "disposition": "DISPUTED",
+                    "reason": "covered in the safety section",
+                }
+            ],
+            head_commit="aaa",
+        )
+
+        assert result["verdict"] == "returned"
+        assert [f["id"] for f in result["open_findings"]] == ["F1"]
