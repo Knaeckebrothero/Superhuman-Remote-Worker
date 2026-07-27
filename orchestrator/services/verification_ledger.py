@@ -162,26 +162,34 @@ def assign_ids(
 def compute_verdict(asserted: str, open_findings: List[Dict[str, Any]]) -> str:
     """Derive the verdict from the open set plus the critic's own assertion.
 
-    The server may compute STRICTER than the model asserted, never laxer.
+    The server may compute STRICTER than the model asserted, NEVER laxer.
     Two independent grounds for ``returned``:
 
-    1. An open BLOCKING finding. This overrides an asserted ``approved`` — the
+    1. The critic asserted ``returned``. Honoured unconditionally — the open
+       set cannot override it, because overriding it downward is precisely the
+       laxer-than-asserted move the rule forbids.
+    2. An open BLOCKING finding. This overrides an asserted ``approved`` — the
        rule that makes the original incident (approving over an open
        high-severity finding) impossible. It must never regress.
-    2. An asserted ``returned`` while ANYTHING is still open. Without this, a
-       critic that deliberately returned a job over medium/low findings had
-       its verdict silently rewritten to ``approved`` and the target advanced.
 
-    An asserted ``returned`` with nothing open at all computes ``approved``:
-    there is nothing to return on. That call is rejected upstream by
-    :func:`validate_verdict_call`, so it is unreachable in practice, but the
-    computation stays total rather than relying on that.
+    (1) is unconditional rather than gated on ``open_findings`` being
+    non-empty, and that distinction is load-bearing rather than theoretical: a
+    round may legally supply no NEW findings (the common round-2 shape, once
+    :func:`validate_verdict_call` learned to count prior open ones) while
+    dispositioning the last open finding ``RESOLVED``. The open set is then
+    empty even though the critic explicitly refused to pass the job, and
+    computing ``approved`` there ADVANCES it. That shape used to be a hard
+    409, so the relaxation is what made it reachable, and the critic brief now
+    actively teaches the empty-``findings`` return.
+
+    A ``returned`` with nothing open anywhere is still rejected at the tool
+    boundary by :func:`validate_verdict_call` — the critic is asked to name
+    the problem — but if one ever reaches here it resolves ``returned``, which
+    is the safe direction.
     """
-    blocking = any(is_blocking(f) for f in open_findings)
-    asserted_returned = str(asserted).lower() == "returned"
-    if blocking or (asserted_returned and open_findings):
+    if str(asserted).lower() == "returned":
         return "returned"
-    return "approved"
+    return "returned" if any(is_blocking(f) for f in open_findings) else "approved"
 
 
 _VALID_DISPOSITIONS = {"RESOLVED", "STILL_OPEN", "DISPUTED"}
