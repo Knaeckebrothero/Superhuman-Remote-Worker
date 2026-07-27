@@ -12,6 +12,7 @@ Tests:
 import json
 import pytest
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -503,12 +504,25 @@ class TestFinalizeJobHeadCommit:
 class TestFinalizeJobContentTree:
     """``content_tree`` is what the no-progress guard actually compares.
 
-    Driven against a REAL git repo, twice, with nothing changed in between.
-    A hand-built freeze dict cannot prove this property — the original defect
-    (``head_commit`` read BEFORE a ``commit(..., allow_empty=True)`` that runs
-    unconditionally, so HEAD moves every round and the guard could never fire)
-    hid behind exactly that kind of test. The two recorded values must be
+    Driven against a REAL git repo and a REAL ``TodoManager``, for three
+    rounds, with nothing changed in between. All three recorded values must be
     EQUAL, or the guard is inert again.
+
+    **Every collaborator that writes to the workspace must be real here.** This
+    guard has now been found inert three times, and each time the test that was
+    supposed to catch it had stubbed out whatever moved the tree:
+
+    1. ``head_commit`` was read BEFORE a ``commit(..., allow_empty=True)`` that
+       runs unconditionally — hidden behind a hand-built freeze dict.
+    2. ``rev-parse HEAD^{tree}`` counted ``output/job_frozen.json``, whose
+       ``timestamp`` is fresh every round — hidden behind a two-round test.
+    3. ``TodoManager.archive`` writes ``archive/todos_phase_{N}_{type}_{TS}.md``
+       — a NEW filename every round — from ``finalize_job`` itself, AFTER the
+       hash is captured, so round N's archive is staged by round N+1's
+       ``git add -A``. Hidden behind ``tm = MagicMock()``.
+
+    So: no mocks on the workspace side, and three rounds rather than two,
+    because (3) only shows up from the second round onward.
     """
 
     def setup_method(self):
@@ -531,7 +545,7 @@ class TestFinalizeJobContentTree:
         ws = WorkspaceManager(
             job_id="test-job",
             config=WorkspaceManagerConfig(
-                structure=["output/"],
+                structure=["output/", "archive/"],
                 git_versioning=True,
             ),
             base_path=base,
@@ -542,35 +556,88 @@ class TestFinalizeJobContentTree:
         ws.git_manager.commit("deliverable")
         return ws
 
+    @staticmethod
+    def _real_todo_manager(ws):
+        from src.managers.todo import TodoManager
+
+        return TodoManager(ws)
+
     @pytest.mark.skipif(
         shutil.which("git") is None, reason="Git not available on system"
     )
     @pytest.mark.parametrize("autonomy", ["partial", "full"])
-    def test_two_runs_with_no_content_change_record_the_same_value(
+    def test_three_rounds_with_no_content_change_record_the_same_value(
         self, tmp_path, autonomy
     ):
         ws = self._make_real_workspace(tmp_path)
-        tm = MagicMock()
+        tm = self._real_todo_manager(ws)
 
+        trees = []
+        heads = []
+        for _ in range(3):
+            # What a real agent leaves behind before completing: todos that
+            # finalize_job will archive into the workspace.
+            tm.add("do the thing")
+            tm.add("do the other thing")
+            self._seed_final_data()
+            freeze = finalize_job(
+                make_state(), ws, tm, config=make_config(autonomy)
+            ).freeze_data
+            trees.append(freeze["content_tree"])
+            heads.append(freeze["head_commit"])
+
+        assert all(trees), "no content_tree recorded at all"
+        assert len(set(trees)) == 1, (
+            "the no-progress guard is inert: three rounds over identical "
+            f"content recorded different values: {trees}"
+        )
+        # Contrast: the commit SHA moves every round because both freeze
+        # branches commit with allow_empty=True. That is why the guard cannot
+        # key on it.
+        assert len(set(heads)) == 3
+
+    @pytest.mark.skipif(
+        shutil.which("git") is None, reason="Git not available on system"
+    )
+    def test_a_todo_archive_alone_does_not_look_like_progress(self, tmp_path):
+        """Narrow regression for defect (3): the ONLY thing that changes
+        between these two rounds is a todo archive.
+
+        Round 1 has todos, so ``finalize_job`` archives them — but it does so
+        AFTER its own commit, so the archive is still untracked when round 1's
+        hash is taken. Round 2 adds no todos and changes no content; its
+        ``git add -A`` is what stages round 1's archive. The two hashes
+        therefore differ by exactly one ``archive/`` entry and nothing else.
+        """
+        ws = self._make_real_workspace(tmp_path)
+        tm = self._real_todo_manager(ws)
+
+        tm.add("a todo that will be archived into the workspace")
         self._seed_final_data()
         first = finalize_job(
-            make_state(), ws, tm, config=make_config(autonomy)
+            make_state(), ws, tm, config=make_config("partial")
         ).freeze_data
 
         self._seed_final_data()
         second = finalize_job(
-            make_state(), ws, tm, config=make_config(autonomy)
+            make_state(), ws, tm, config=make_config("partial")
         ).freeze_data
 
-        assert first["content_tree"], "no content_tree recorded at all"
-        assert first["content_tree"] == second["content_tree"], (
-            "the no-progress guard is inert: two runs over identical content "
-            "recorded different values"
+        # Sanity: the archive really did land in the repo, so this test is
+        # exercising the exclusion rather than a workspace where nothing
+        # happened at all.
+        listing = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=ws.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert any(p.startswith("archive/") for p in listing.splitlines()), (
+            "no todo archive was committed — this test would pass vacuously"
         )
-        # Contrast: the commit SHA moves every run because both freeze
-        # branches commit with allow_empty=True. That is why the guard cannot
-        # key on it.
-        assert first["head_commit"] != second["head_commit"]
+
+        assert first["content_tree"] == second["content_tree"]
 
     @pytest.mark.skipif(
         shutil.which("git") is None, reason="Git not available on system"
