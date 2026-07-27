@@ -437,7 +437,7 @@ async def _deliver_durable(
     # already showed the user the wake, and emailing them about it would be
     # noise. Failure here must not un-deliver the notice above.
     try:
-        await _notify_owner(thread, thread_id, row)
+        await _notify_owner(db, thread, thread_id, row)
     except Exception:
         logger.warning(
             "session wake: owner notification failed for thread %s", thread_id[:8]
@@ -446,13 +446,39 @@ async def _deliver_durable(
 
 
 async def _notify_owner(
-    thread: dict[str, Any], thread_id: str, row: dict[str, Any]
+    db: Any, thread: dict[str, Any], thread_id: str, row: dict[str, Any]
 ) -> None:
+    """Tell the owner out of band that a job their session launched finished.
+
+    The recipient MUST be resolved and passed explicitly.
+    ``notification_service.dispatch`` takes ``user_id`` for preference lookup
+    only — its email leg sends to ``recipient_email or ""``, so omitting it does
+    not fall back to the user's address; it hands the empty string to the email
+    service, which refuses to send and logs a warning. Nothing raises, so the
+    notification is silently dropped while the wake still reports success.
+    (Caught by the 2026-07-27 dev live gate: "Refusing to send email to
+    undeliverable recipient(s): ['']". Every other caller —
+    ``_notify_operator_freeze`` — resolves the user row first for this reason.)
+
+    This is the half of the durable branch that actually reaches a user who has
+    closed the tab, so a silent drop here defeats the branch's purpose.
+    """
     from services.notification_service import notification_service
 
     user_id = thread.get("user_id")
     if not user_id:
         return
+    try:
+        user = await db.get_user(str(user_id))
+    except Exception:
+        user = None
+    if not user or not user.get("email"):
+        logger.info(
+            "session wake: owner %s has no email — skipping out-of-band notice",
+            str(user_id)[:8],
+        )
+        return
+
     job_id = str(row["id"])
     short = job_id[:8]
     description = (row.get("description") or "")[:100]
@@ -470,6 +496,8 @@ async def _notify_owner(
         job_description=description,
         config_name=str(row.get("config_name") or "worker_base"),
         thread_id=thread_id,
+        recipient_email=user.get("email"),
+        recipient_name=user.get("display_name") or "User",
     )
 
 

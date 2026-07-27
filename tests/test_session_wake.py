@@ -28,6 +28,10 @@ import pytest
 
 from services import session_wake
 
+# Captured at import, before the autouse fixture replaces it with a mock — the
+# two tests below need the REAL implementation.
+_REAL_NOTIFY_OWNER = session_wake._notify_owner
+
 JOB_ID = "3f2a1b8c-0000-4000-8000-000000000001"
 THREAD_ID = "aa11bb22-0000-4000-8000-000000000002"
 AGENT_ID = "cc33dd44-0000-4000-8000-000000000003"
@@ -278,6 +282,59 @@ async def test_durable_branch_notifies_the_owner(monkeypatch):
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
     await session_wake.drain_pending_wakes(db)
     notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_owner_notification_resolves_the_recipient_address(monkeypatch):
+    """dispatch() takes user_id for PREFERENCES only — its email leg sends to
+    ``recipient_email or ""``, so omitting it does not fall back to the user's
+    address, it hands the empty string to the email service, which refuses to
+    send and merely logs. Nothing raises, so the notification is silently
+    dropped while the wake still reports success. (Live-gate regression,
+    2026-07-27.)"""
+    sent = {}
+
+    class _Svc:
+        async def dispatch(self, **kw):
+            sent.update(kw)
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "services.notification_service",
+        type("M", (), {"notification_service": _Svc()}),
+    )
+    db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
+    db.get_user = AsyncMock(
+        return_value={"id": "u", "email": "owner@example.test", "display_name": "Owner"}
+    )
+    monkeypatch.setattr(session_wake, "_notify_owner", _REAL_NOTIFY_OWNER)
+
+    assert await session_wake.drain_pending_wakes(db) == 1
+
+    assert sent.get("recipient_email") == "owner@example.test"
+    assert sent.get("recipient_name") == "Owner"
+    assert sent.get("thread_id") == THREAD_ID
+
+
+@pytest.mark.asyncio
+async def test_owner_without_an_email_is_skipped_not_dispatched(monkeypatch):
+    calls = []
+
+    class _Svc:
+        async def dispatch(self, **kw):
+            calls.append(kw)
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "services.notification_service",
+        type("M", (), {"notification_service": _Svc()}),
+    )
+    db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
+    db.get_user = AsyncMock(return_value={"id": "u", "email": None})
+    monkeypatch.setattr(session_wake, "_notify_owner", _REAL_NOTIFY_OWNER)
+
+    assert await session_wake.drain_pending_wakes(db) == 1
+    assert calls == [], "dispatching with no address just logs a refusal"
 
 
 @pytest.mark.asyncio

@@ -1240,6 +1240,70 @@ class PostgresDB:
                     )
         return total
 
+    async def prune_checkpoints_keep_last(self, keep_n: int) -> int:
+        """Keep only the newest ``keep_n`` checkpoints per (thread_id, checkpoint_ns)
+        across ALL threads, deleting older rows — the *in-flight* defense that
+        bounds a long-running job's checkpoint storage **while it runs**. The
+        terminal prune (:meth:`delete_checkpoint_thread`) only fires once a job
+        ends, so a job that runs for hours fills the checkpointer's PVC before it
+        is ever pruned; this method, run periodically, caps every live thread.
+
+        Safe because resume needs only the *latest* checkpoint, and LangGraph
+        writes ≤1 version per channel per super-step, so keeping the newest
+        ``keep_n`` versions per (thread, ns, channel) exactly covers the newest
+        ``keep_n`` checkpoints (no dangling blob refs). No-op unless
+        ``CHECKPOINTER_BACKEND=postgres``. Non-fatal and table-existence tolerant.
+        NOTE: like a plain DELETE this frees pages for reuse but does not shrink
+        the PVC — a full reclaim still needs ``VACUUM FULL``.
+
+        Returns the number of rows deleted.
+        """
+        if keep_n < 1:
+            # keep_n<1 would delete the latest checkpoint (the resume state). Refuse.
+            logger.warning("prune_checkpoints_keep_last: refusing keep_n=%s (<1)", keep_n)
+            return 0
+        if os.getenv("CHECKPOINTER_BACKEND", "sqlite").strip().lower() != "postgres":
+            return 0
+        # Order matters: prune `checkpoints` first, then the `checkpoint_writes`
+        # rows orphaned by that delete.
+        statements = (
+            (
+                "DELETE FROM checkpoints c USING ("
+                " SELECT thread_id, checkpoint_ns, checkpoint_id,"
+                " row_number() OVER (PARTITION BY thread_id, checkpoint_ns"
+                " ORDER BY checkpoint_id DESC) AS rn FROM checkpoints) r"
+                " WHERE c.thread_id = r.thread_id AND c.checkpoint_ns = r.checkpoint_ns"
+                " AND c.checkpoint_id = r.checkpoint_id AND r.rn > $1",
+                (keep_n,),
+            ),
+            (
+                "DELETE FROM checkpoint_writes cw WHERE NOT EXISTS ("
+                " SELECT 1 FROM checkpoints c WHERE c.thread_id = cw.thread_id"
+                " AND c.checkpoint_ns = cw.checkpoint_ns"
+                " AND c.checkpoint_id = cw.checkpoint_id)",
+                (),
+            ),
+            (
+                "DELETE FROM checkpoint_blobs cb USING ("
+                " SELECT thread_id, checkpoint_ns, channel, version,"
+                " row_number() OVER (PARTITION BY thread_id, checkpoint_ns, channel"
+                " ORDER BY version DESC) AS rn FROM checkpoint_blobs) r"
+                " WHERE cb.thread_id = r.thread_id AND cb.checkpoint_ns = r.checkpoint_ns"
+                " AND cb.channel = r.channel AND cb.version = r.version AND r.rn > $1",
+                (keep_n,),
+            ),
+        )
+        total = 0
+        async with self.acquire() as conn:
+            for sql, params in statements:
+                try:
+                    result = await conn.execute(sql, *params)
+                    if isinstance(result, str) and result.startswith("DELETE "):
+                        total += int(result.split()[1])
+                except Exception as e:
+                    logger.debug("prune_checkpoints_keep_last: skip (%s)", e)
+        return total
+
     async def update_job_merge_status(
         self,
         job_id: str,
@@ -2031,6 +2095,54 @@ class PostgresDB:
         )
         async with self.acquire() as conn:
             result = await conn.execute(query, json_module.dumps(vm_updates), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def shed_workspace_context(self, job_id: str, key: str) -> bool:
+        """Drop ``context.<key>``, stashing the old value as ``context.last_<key>``.
+
+        Recovering a job whose workspace never came up: the dispatcher decides
+        what to provision from this same context, and a parked ``context.vm``
+        (``status: 'failed'``) makes ``decide_vm_action`` return VM_PARKED, which
+        re-fails the job instead of re-provisioning it. Removing the key is what
+        selects VM_PROVISION (and, for the container tier, ``needs_create``); it
+        also resets the attempt budget, since ``provision_attempts`` lives inside
+        the shed blob.
+
+        Distinct from delete_job_context_keys(), which drops keys outright — that
+        is right for draining consumed keys like ``queued_feedback``, but here it
+        would destroy the diagnosis. ``context.vm.error`` is typically the only
+        surviving record of why provisioning failed (a failed resume overwrites
+        ``jobs.error_message`` with its own downstream symptom), so the value is
+        moved aside instead, mirroring queue_job_for_resume()'s stash of
+        ``freeze_data`` into ``context.last_freeze_data``. Shedding an absent key
+        is a no-op, so callers may shed defensively.
+
+        Args:
+            job_id: Job UUID as string
+            key: Context key to shed ('vm' or 'workspace_container')
+
+        Returns:
+            True if the row was updated, False if not found or job_id is invalid
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = CASE "
+            "        WHEN COALESCE(context, '{}'::jsonb) ? $2::text "
+            "        THEN (COALESCE(context, '{}'::jsonb) - $2::text) "
+            "             || jsonb_build_object('last_' || $2::text, context -> $2::text) "
+            "        ELSE COALESCE(context, '{}'::jsonb) "
+            "    END, "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $1"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, uuid_val, key)
 
         return result == "UPDATE 1"
 

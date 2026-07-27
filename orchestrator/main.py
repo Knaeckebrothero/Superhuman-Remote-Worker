@@ -2808,6 +2808,40 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         logger.warning(f"Agent {agent_id} has no pod IP — skipping resume dispatch")
         return False
 
+    # Never ship a workspace-backed job with no workspace to dial: the VM and
+    # container blocks below inject `remote` only when the context says 'ready',
+    # so without this the agent gets a backend and no host and hard-fails at
+    # init_workspace (0 tokens, no log). Returning False is this function's
+    # "caller should queue" contract — the dispatcher is the only thing that
+    # provisions, so the job has to go back to it.
+    missing_workspace = _resume_missing_workspace(job)
+    if missing_workspace:
+        logger.warning(
+            "Resume dispatch: job %s has no live %s workspace — refusing direct "
+            "resume so the dispatcher can re-provision it",
+            job_id,
+            missing_workspace,
+        )
+        # Shed the parked context too, or the job never actually heals: the
+        # dispatcher reads the same context to decide what to build, sees a
+        # 'failed' VM, and parks it again. On the dispatcher's own resume path
+        # (no shed anywhere else) that would bounce the job every tick without
+        # ever rebuilding the workspace. Best-effort — refusing the resume is
+        # valid on its own, and this runs outside the try below, so letting a
+        # shed error escape would break callers that expect a bool.
+        try:
+            await postgres_db.shed_workspace_context(
+                job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
+            )
+        except Exception:
+            logger.warning(
+                "Resume dispatch: could not shed stale %s context for job %s",
+                missing_workspace,
+                job_id,
+                exc_info=True,
+            )
+        return False
+
     try:
         # Re-resolve datasources in case they changed
         resolved_ds = await postgres_db.resolve_datasources_for_job(
@@ -3855,6 +3889,69 @@ def _get_container_context(job: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             ctx = {}
     return ctx.get("workspace_container", {})
+
+
+# Job context key holding each remote tier's live workspace, by tier name.
+_WORKSPACE_CONTEXT_KEYS = {"vm": "vm", "sandbox": "workspace_container"}
+
+
+def _resume_missing_workspace(job: dict) -> Optional[str]:
+    """Which remote workspace a resume would ship without an address, if any.
+
+    Returns ``'vm'`` / ``'sandbox'`` when the job's backend needs a remote
+    workspace but its context holds no live one, else ``None``.
+
+    ``_resume_job_on_agent`` injects ``workspace.remote`` only when the context
+    says the workspace is ready, and neither of its two injection blocks has an
+    else. So resuming a job whose workspace never came up — or was reaped —
+    silently skips injection while config_override still names the backend, and
+    the agent dies at ``init_workspace`` with "no workspace.remote config was
+    provided" (src/agent.py:1896). Job 4435994d hit exactly this.
+
+    Nothing in the resume path provisions; only the dispatcher does. So callers
+    must hand such a job to the dispatcher rather than push it at an agent.
+    This is the resume-side sibling of the dispatch backstop in
+    ``_dispatch_job_to_agent``, which *fails* the job instead — correct there,
+    because the dispatcher was supposed to have resolved the workspace already,
+    but wrong here: an explicit Resume means "re-provision it".
+
+    Uses the same ``_job_needs_vm`` / ``_job_needs_sandbox`` predicates the
+    dispatcher uses to decide what to provision, so resume and dispatch agree
+    on what a job needs. Keep the readiness conditions in step with the two
+    injection blocks in ``_resume_job_on_agent``.
+    """
+
+    def _vm_is_live() -> bool:
+        vm_ctx = _get_vm_context(job)
+        return bool(vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"))
+
+    def _container_is_live() -> bool:
+        ctx = _get_container_context(job)
+        return bool(
+            ctx.get("status") == "ready" and (ctx.get("host") or ctx.get("pod_ip"))
+        )
+
+    # An explicitly configured backend is decided on its own context, ahead of
+    # the needs-predicates below: _job_needs_sandbox() short-circuits to False
+    # the moment a container claims 'ready', which would mask a ready-but-
+    # address-less container — the very state that strands the agent.
+    backend = _backend_from_override(job.get("config_override"))
+    if backend in LITE_BACKENDS:
+        # virtual/none run with no workspace pod at all and legitimately have
+        # no remote — same exemption as the dispatch backstop.
+        return None
+    if backend in ("vm", "remote"):  # "remote" is legacy for VM
+        return None if _vm_is_live() else "vm"
+    if backend in ("sandbox", "container"):  # "container" is legacy
+        return None if _container_is_live() else "sandbox"
+
+    # No explicit backend — defer to the same predicates the dispatcher uses to
+    # decide what it would provision, so resume and dispatch stay in agreement.
+    if _job_needs_vm(job):
+        return None if _vm_is_live() else "vm"
+    if _job_needs_sandbox(job):
+        return None if _container_is_live() else "sandbox"
+    return None
 
 
 def _scholar_provision_parent_id(job: dict) -> str | None:
@@ -7272,7 +7369,8 @@ async def lifespan(app: FastAPI):
     # leadership lock; the run_when_leader-wrapped loops below run only while
     # this replica holds it. See services/leader_election.py.
     from database.lock_ids import LEADER_ID
-    from services.leader_election import run_as_leader, run_when_leader
+    from services.checkpoint_retention import run_retention_sweeper
+    from services.leader_election import is_leader, run_as_leader, run_when_leader
 
     leader_task = asyncio.create_task(
         run_as_leader(postgres_db, LEADER_ID, _shutdown_event)
@@ -7295,6 +7393,12 @@ async def lifespan(app: FastAPI):
     )
     security_events_prune_task = asyncio.create_task(
         security_events_prune_sweeper(_shutdown_event)
+    )
+    # In-flight checkpoint retention: bound every live thread's LangGraph
+    # checkpoints to the newest N while it runs (leader-gated), so a long job
+    # can't fill the checkpointer PVC before it terminates.
+    checkpoint_retention_task = asyncio.create_task(
+        run_retention_sweeper(postgres_db, _shutdown_event, is_leader.is_set)
     )
     headless_notify_task = asyncio.create_task(
         run_when_leader(thread_permission_notify_sweeper, _shutdown_event)
@@ -7496,6 +7600,7 @@ async def lifespan(app: FastAPI):
     await sudo_sweeper_task
     await thread_events_prune_task
     await security_events_prune_task
+    await checkpoint_retention_task
     await headless_notify_task
     await attention_sleep_task
     await ide_sweeper_task
@@ -10687,6 +10792,24 @@ async def resume_job(
             )
             _trigger_dispatch()
             return {"status": "queued", "message": message, "job_id": job_id}
+
+        # A workspace-backed job with no live workspace cannot be resumed onto an
+        # agent — nothing in this path provisions. Shed the stale context and hand
+        # it to the dispatcher, the only thing that rebuilds a workspace. This is
+        # the "clear context.vm and re-queue the job" that the VM park error tells
+        # operators to do by hand.
+        #
+        # Must run BEFORE agent selection: the "no agents available" branch below
+        # returns early, so a pre-flight shed is the only way that path re-queues
+        # a job the dispatcher will actually re-provision rather than re-park.
+        missing_workspace = _resume_missing_workspace(job)
+        if missing_workspace:
+            await postgres_db.shed_workspace_context(
+                job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
+            )
+            return await _queue_for_dispatch(
+                f"No live {missing_workspace} workspace — queued for re-provisioning"
+            )
 
         # Determine which agent to use
         # Convert to string since DB returns asyncpg UUID objects
