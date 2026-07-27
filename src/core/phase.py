@@ -763,6 +763,38 @@ def _finalize_with_verdict(
     )
 
 
+def _capture_content_tree(workspace: "WorkspaceManager") -> Optional[str]:
+    """Best-effort content hash for verification's no-progress detection.
+
+    Consumed by ``_verification_gate_decision`` (orchestrator/main.py): when a
+    later round records the same ``content_tree`` as this one while findings
+    are still open, the target produced nothing and the job escalates to a
+    human instead of spawning another critic.
+
+    MUST be called AFTER the final commit/push, not before: the value is a
+    hash of what is COMMITTED, and the whole point is that it stays equal
+    across two rounds that delivered identical content. Reading a commit SHA
+    beforehand (the previous shape) could never satisfy that — the freeze
+    commit runs with ``allow_empty=True``, so HEAD always moves.
+
+    Because it is captured after the file is written, the on-disk
+    ``job_frozen.json`` / ``job_completion.json`` does not carry the key; only
+    the returned ``freeze_data`` (what the orchestrator persists) does. That
+    is unavoidable — a file cannot contain the hash of a tree containing
+    itself — and harmless: nothing reads the key off disk.
+
+    Never raises: WorkspaceManager.get_content_tree already swallows its own
+    errors, but the call site stays defensive too, and ``workspace`` may be
+    falsy here (finalize_job already guards for that on the git path).
+    """
+    if not workspace:
+        return None
+    try:
+        return workspace.get_content_tree()
+    except Exception:  # noqa: BLE001 — best-effort, see docstring
+        return None
+
+
 def finalize_job(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
@@ -838,16 +870,16 @@ def finalize_job(
     # Clear the final phase data
     clear_final_phase_data(job_id)
 
-    # Best-effort HEAD commit for verification's no-progress detection
-    # (services/verification_ledger.py, consumed by
-    # _verification_gate_decision in orchestrator/main.py): if a later round
-    # sees the same head_commit as this one while blocking findings are
-    # still open, the target produced nothing and the job escalates instead
-    # of spawning another critic. Computed once and shared by both freeze
-    # shapes below. Must never raise or block completion — get_head_commit()
-    # already swallows its own errors, but the call site stays defensive too
-    # (this function already treats `workspace` as possibly falsy below, for
-    # the git commit/push step).
+    # Best-effort HEAD commit, recorded for diagnostics and for ledger rows
+    # written before ``content_tree`` existed. It is NOT the progress signal:
+    # both freeze branches below commit with ``allow_empty=True``, so HEAD
+    # moves on every round no matter what the agent produced — read here,
+    # BEFORE that commit, it was doubly unusable. ``content_tree`` (captured
+    # after the final commit/push, see ``_capture_content_tree``) is what
+    # ``_verification_gate_decision`` actually compares. Must never raise or
+    # block completion — get_head_commit() already swallows its own errors,
+    # but the call site stays defensive too (this function already treats
+    # `workspace` as possibly falsy below, for the git commit/push step).
     head_commit = None
     if workspace:
         try:
@@ -893,6 +925,10 @@ def finalize_job(
                 git_mgr.push()
             except Exception as e:
                 logger.warning(f"[{job_id}] Final git push failed: {e}")
+
+        # AFTER the final commit/push, so the hash covers what was actually
+        # delivered. See _capture_content_tree for why it is not in the file.
+        completion_data["content_tree"] = _capture_content_tree(workspace)
 
         # Archive todos
         if todo_manager:
@@ -961,6 +997,10 @@ def finalize_job(
             git_mgr.push()
         except Exception as e:
             logger.warning(f"[{job_id}] Final git push failed: {e}")
+
+    # AFTER the final commit/push, so the hash covers what was actually
+    # delivered. See _capture_content_tree for why it is not in the file.
+    freeze_data["content_tree"] = _capture_content_tree(workspace)
 
     # Archive todos if any remain
     if todo_manager:

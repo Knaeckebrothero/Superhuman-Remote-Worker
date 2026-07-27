@@ -500,6 +500,7 @@ class TestRecordVerificationRound:
             "opened": [],
             "dispositions": [],
             "head_commit": None,
+            "content_tree": None,
         }
 
     @pytest.mark.asyncio

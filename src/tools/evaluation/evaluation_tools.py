@@ -112,9 +112,19 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
                 "the review is complete."
             )
 
+        # Both are only FALLBACKS: the orchestrator prefers the TARGET's own
+        # completion freeze, because a critic runs on its own
+        # ``subjob/<id>/critic`` branch and its workspace state is a different
+        # thing from the target's. Sent anyway so a target whose freeze
+        # predates these fields still gets something comparable.
         head_commit = None
+        content_tree = None
         try:
             head_commit = context.workspace_manager.get_head_commit()
+        except Exception:  # noqa: BLE001 — progress detection is best-effort
+            pass
+        try:
+            content_tree = context.workspace_manager.get_content_tree()
         except Exception:  # noqa: BLE001 — progress detection is best-effort
             pass
 
@@ -126,6 +136,7 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
                 opened=findings or [],
                 dispositions=dispositions or [],
                 head_commit=head_commit,
+                content_tree=content_tree,
             )
         except Exception as e:  # VerdictRecordingError and anything unexpected
             logger.error(f"Verdict recording failed for {target_job_id}: {e}")
