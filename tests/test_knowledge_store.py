@@ -921,6 +921,7 @@ class TestListNotes:
                 "type": "decision",
                 "status": "active",
                 "confidence": "high",
+                "priority": 1,
             }
         ]
 

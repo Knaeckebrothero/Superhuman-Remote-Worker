@@ -1069,7 +1069,8 @@ class KnowledgeStore:
         row = await self.db.fetchrow(
             """
             SELECT note_id, title, note_type, status, content, confidence,
-                   tags, keywords, job_id, phase, created_at, modified_at
+                   tags, keywords, job_id, phase, created_at, modified_at,
+                   priority
             FROM knowledge_index
             WHERE kb_id = $1 AND note_id = $2 AND path IS NOT NULL
             LIMIT 1
@@ -1093,6 +1094,10 @@ class KnowledgeStore:
             "phase": r.get("phase"),
             "created": r.get("created_at"),
             "modified": r.get("modified_at"),
+            # Backlog rank (project-backlog-pipeline task 3) — read back so
+            # kb_update can preserve an existing ticket's priority when the
+            # caller doesn't specify a new one.
+            "priority": r.get("priority", 1),
         }
 
     async def list_notes(
@@ -1133,7 +1138,7 @@ class KnowledgeStore:
         where = " AND ".join(conditions)
         rows = await self.db.fetch(
             f"""
-            SELECT note_id, title, note_type, status, confidence
+            SELECT note_id, title, note_type, status, confidence, priority
             FROM knowledge_index
             WHERE {where}
             ORDER BY modified_at DESC NULLS LAST
@@ -1148,6 +1153,10 @@ class KnowledgeStore:
                 "type": r["note_type"],
                 "status": r["status"],
                 "confidence": r["confidence"],
+                # dict(r) rather than r["priority"]: tolerates fake rows in
+                # existing tests that predate this column (mock dicts without
+                # a "priority" key), same as a real row's column default.
+                "priority": dict(r).get("priority", 1),
             }
             for r in rows
         ]
