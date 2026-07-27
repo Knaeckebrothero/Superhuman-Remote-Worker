@@ -23,7 +23,10 @@ tags:
 > added the missing Office-on-Canvas guide coverage; its focused inventory
 > regression and the complete current-tree M1 union pass. The 2026-07-27
 > revalidation result is **774 passed, 0 deselected, 10 warnings**, with Ruff,
-> formatting, diff, and both Helm lint gates also green.
+> formatting, diff, and both Helm lint gates also green. The M2 code/seam audit
+> and five-slice implementation design are complete; implementation starts with
+> the typed M2a contract/registry. See
+> `docs/superpowers/plans/2026-07-27-app-guide-m2.md`.
 >
 > Companion to [[default_skill_roster]] (the bundled-skill roster),
 > [[agent_skills]] (the skills runtime), [[default_expert_roster]] (the shipped
@@ -533,9 +536,11 @@ runtime-aware:
   sessions do not currently record the exact resolved tool-name set in
   `ToolContext`; the orchestrator alone cannot infer all post-upgrade runtime
   state.
-- The final M1 agent image carries a verified full `BUILD_SHA`, but SRW still
-  lacks a surfaced orchestrator, Cockpit, guide, and logical release identity;
-  independently tagged component images can still produce mixed deployments.
+- M1 verification bound the tested agent image to a full source revision in
+  its evidence, but the normal runtime `BUILD_SHA` is agent-only and CI
+  supplies a short display SHA. SRW still lacks surfaced orchestrator,
+  Cockpit, guide, workspace, and logical-release identities; independently
+  tagged component images can still produce mixed deployments.
 - Cockpit still repeats connector IDs in TypeScript/UI source, but the canonical
   Python inventory now drives backend acceptance and CI asserts parity.
   Canvas/direct-browser and grant coverage consume current Python
@@ -736,10 +741,10 @@ components:
 visibility: public # public | conditional | hidden
 title_key: datasources.form.optEmail
 summary: Attach an IMAP/SMTP mailbox with scoped agent access.
-help_topic_id: datasources.email
-open_action_id: datasources.email.create # desired contract; not implemented yet
+help_topic_id: datasources-email
+open_action_id: null # datasources.email.create remains a future M4 contract
 guide_ref: references/datasources-email.md
-visual_id: datasources.email.create
+visual_id: null # visual help remains M4
 introduced_in: <logical-release-or-component-revisions>
 ```
 
@@ -748,11 +753,14 @@ The definition must not duplicate credentials or raw configuration values. The
 leading implementation location is an orchestrator service (for example,
 `orchestrator/services/product_capabilities.py`) because the orchestrator is
 already the authority for feature flags, users, grants, jobs, and deployment
-configuration. Whether the definitions live in Python or a checked YAML file
-is an open implementation detail; resolution stays server-side. Machine-
-readable inventories should become canonical seams where practical; a coverage
-test must not choose one of several duplicated datasource/UI lists and call it
-the product registry.
+configuration. M2 uses a typed, immutable Python registry in
+`src/core/product_capabilities.py`, shared by the orchestrator and agent
+images. The registry begins with the 18 capability IDs already present in
+reviewed App Guide reference metadata. Resolution stays server-side; the
+registry contains only public metadata and reviewed resolver keys. Machine-
+readable inventories should become canonical seams where practical, and a
+coverage test must not choose one of several duplicated datasource/UI lists
+and call it the product registry.
 
 Visibility is separate from permission. `public` capabilities may be explained
 even when admin-controlled; `conditional` capabilities are returned only when
@@ -767,22 +775,29 @@ steps use `presentation`, execution claims use `execution`, policy claims use
 
 ### 3. Effective product-capability API and tool
 
-Add an authenticated, user-scoped endpoint, provisionally:
+Add an authenticated, user-scoped endpoint:
 
 ```text
-GET /api/users/me/product-capabilities?thread_id=<owned-thread>&topic=<topic>&limit=<n>
+GET /api/users/me/product-capabilities
+    ?thread_id=<owned-thread>
+    &topic=<exact-topic-id>
+    &capability_id=<exact-capability-id>
+    &limit=<1..50>
 ```
 
-Add a persistent-session tool, provisionally:
+Add a persistent-session tool:
 
 ```text
 get_product_capabilities(topic?: str, capability_ids?: list[str])
 ```
 
 The API validates thread ownership before using a thread and resolves grants
-against that thread's active project scope. Without `thread_id`, session state
-is `not_applicable` or `unknown`; it is never guessed. The model does not supply
-the authenticated user, project IDs, repository, or component revision.
+against that thread's primary `project_id`, matching current session grant
+enforcement rather than meeting grants across every project visible to the
+user. Without `thread_id`, session state is `not_applicable`; it is never
+guessed. The model-facing tool does not accept a thread ID: it binds
+`ToolContext.thread_id` and the authenticated user. The model never supplies
+project IDs, repository, component revision, resolver key, or identity.
 
 Resolution has two explicit halves:
 
@@ -797,19 +812,28 @@ not part of the user-disableable Fleet Management group. It accepts only
 bounded topic/ID filters, applies hard result/byte limits, and returns validated
 structured content plus a concise text fallback. It may compose existing
 services internally instead of making the model join many broad tool results.
+M2 accepts at most 20 explicit endpoint IDs (12 from the model tool), defaults
+to 20 results, caps the endpoint at 50 results/64 KiB and the tool at 32 KiB,
+sorts before truncation, and sends `Cache-Control: private, no-store`. There is
+no application cache or cursor in M2.
 
 An effective result has an explicit state per layer:
 
 ```json
 {
   "schema_version": "1.0",
-  "registry_revision": "<opaque-content-revision>",
+  "registry_revision": "sha256:<registry-digest>",
   "evaluated_at": "<RFC-3339-timestamp>",
   "completeness": "complete",
+  "truncated": false,
+  "scope": {
+    "kind": "thread",
+    "thread_id": "<owned-thread-id>"
+  },
   "product": {
     "name": "Superhuman Remote Worker",
     "release_version": "<optional-logical-release>",
-    "mixed_build": false,
+    "mixed_build": null,
     "components": {
       "orchestrator": {
         "artifact_digest": "sha256:<digest>",
@@ -829,36 +853,46 @@ An effective result has an explicit state per layer:
       "build": {
         "state": "supported",
         "reason_code": "included_in_build",
-        "source_component": "orchestrator",
-        "freshness": "fresh"
+        "source_component": "registry",
+        "freshness": "fresh",
+        "observed_at": "<RFC-3339-timestamp>",
+        "qualifiers": []
       },
       "deployment": {
         "state": "enabled",
-        "reason_code": "feature_enabled",
-        "freshness": "fresh"
+        "reason_code": "connector_type_available",
+        "source_component": "orchestrator",
+        "freshness": "fresh",
+        "observed_at": "<RFC-3339-timestamp>",
+        "qualifiers": []
       },
       "user": {
         "state": "allowed",
-        "reason_code": "grant_present",
-        "freshness": "fresh"
+        "reason_code": "grant_allowed",
+        "source_component": "orchestrator",
+        "freshness": "fresh",
+        "observed_at": "<RFC-3339-timestamp>",
+        "qualifiers": []
       },
       "session": {
         "state": "needs_attachment",
         "reason_code": "datasource_not_attached",
         "source_component": "agent",
-        "freshness": "fresh"
+        "freshness": "fresh",
+        "observed_at": "<RFC-3339-timestamp>",
+        "qualifiers": []
       },
       "agent_action": "can_guide",
-      "open_action_id": "datasources.email.create",
-      "guide_ref": "references/datasources-email.md",
-      "visual_id": "datasources.email.create"
+      "open_action_id": null,
+      "help_topic_id": "datasources-email",
+      "visual_id": null
     }
   ],
   "evaluation_errors": []
 }
 ```
 
-Recommended bounded enums:
+M2 bounded enums:
 
 | Field | Values |
 |---|---|
@@ -867,8 +901,8 @@ Recommended bounded enums:
 | `build.state` | `supported`, `unsupported`, `unknown` |
 | `deployment.state` | `enabled`, `disabled`, `degraded`, `unknown` |
 | `user.state` | `allowed`, `denied`, `no_opinion`, `not_applicable`, `unknown` |
-| `session.state` | `ready`, `needs_attachment`, `needs_upgrade`, `not_applicable`, `unknown` |
-| `agent_action` | `can_execute`, `can_propose`, `can_guide`, `unavailable` |
+| `session.state` | `ready`, `not_ready`, `needs_attachment`, `needs_upgrade`, `degraded`, `not_applicable`, `unknown` |
+| `agent_action` | `can_execute`, `can_propose`, `can_guide`, `unavailable`, `unknown` |
 | `freshness` | `fresh`, `stale`, `unknown` |
 | `provenance_status` | `declared`, `verified`, `unavailable` |
 
@@ -881,9 +915,13 @@ free-form reasons.
 
 `registry_revision` changes when definitions/help mappings change.
 `evaluated_at`, freshness, and completeness describe the dynamic observation.
-HTTP `ETag`/conditional GET may cache identical bounded responses, but clients
-must refresh after grant, flag, attachment, workspace-tier, or tool-catalog
-changes. A stale cached snapshot cannot authorize an operation.
+M2 performs no application caching and returns `Cache-Control: private,
+no-store`; a later same-schema ETag optimization may be added only with
+explicit invalidation for grants, flags, attachments, workspace tiers, and
+tool-catalog changes. A stale snapshot can never authorize an operation.
+
+`mixed_build` is `null` when available component provenance is insufficient to
+decide, rather than falsely claiming a uniform build.
 
 The endpoint should include build/source metadata only when configured and
 safe. It must not expose:
@@ -1301,8 +1339,9 @@ hide it.
 - Fresh and pre-existing resumed persistent sessions invoke the managed guide
   with DB/expert resolution off and on `none`, returning the correct mental
   model from current immutable bytes.
-- The email question reports the right state under enabled, disabled, denied,
-  unattached, ready, degraded, partial, and unknown fixtures.
+- The email question reports the right state under denied, unattached, ready,
+  degraded, partial, unknown, and changed-before-action fixtures. A capability
+  with a real deployment gate covers enabled/disabled behavior.
 - Deep-link/action IDs reach the expected Cockpit page only after a user click.
 - Playwright journeys use role/label locators for user semantics and
   `data-help-id` only for the coach-mark anchor contract. They assert role,
@@ -1463,50 +1502,81 @@ dependency. **Passed 2026-07-26**; see
 **Outcome:** answers distinguish installed, enabled, allowed, ready, and
 agent-actionable state.
 
-- [ ] Define stable capability IDs, enums, reason codes, and schema versioning.
-- [ ] Define per-layer evaluation objects, visibility, completeness,
-  freshness, bounded errors, registry revision, and advisory/non-authorization
-  semantics.
-- [ ] Choose the definition format (Python registry or checked YAML) and add
-  schema validation.
-- [ ] Implement definitions and pure server-side resolvers in a dedicated
-  orchestrator service/router for the first capability set: sessions,
-  jobs, experts, projects/loops, automations, datasources, Canvas/browser,
-  cloud, knowledge, and workspace tiers.
-- [ ] Compose existing grants, flags, catalogs, service readiness, and session
-  context rather than duplicating their authority; scope grants to the active
-  owned thread/project rather than all visible projects.
-- [ ] Stamp orchestrator, agent, Cockpit, guide, and other relevant first-party
-  artifacts with full source revision, source URL, version/documentation OCI
-  metadata, and artifact digest; report declared/unavailable provenance and
-  mixed builds.
-- [ ] Add the authenticated endpoint with owned `thread_id`, topic/ID filters,
-  result/byte limits, and `not_applicable` session state when no thread is
-  supplied.
-- [ ] Record the final loaded tool-name set in persistent `ToolContext` after
-  tool instantiation.
-- [ ] Add `get_product_capabilities` in a dedicated always-on product-help tool
-  group and overlay exact loaded tools, backend features, datasource type/tier,
-  knowledge/cloud state, and attachments onto server facts.
-- [ ] Publish and validate the tool's formal structured-output schema with a
-  concise text fallback for clients that cannot consume structured content.
-- [ ] Update `app-guide` to require the tool for availability/permission/current
-  context questions.
-- [ ] Define snapshot refresh/cache behavior for grant, flag, attachment,
-  workspace, and tool-catalog changes; use `ETag` only as an optimization.
-- [ ] Dark-launch the resolver/endpoint, compare privacy-safe outcomes to known
-  fixtures/current seams, then canary the read-only agent tool.
-- [ ] Add resolver matrix, owned-thread/auth-scope, visibility, redaction,
-  payload-bound, partial/stale/error, mixed-build, and graceful-degradation
-  tests.
-- [ ] Add a revocation-between-snapshot-and-action test proving each real
-  operation authorizes again.
-- [ ] Add English and German reason-code presentation where exposed in UI.
+The executable design and seam audit are in
+`docs/superpowers/plans/2026-07-27-app-guide-m2.md`.
 
-**Exit gate:** the email evaluation correctly distinguishes at least supported
-but disabled, enabled but denied, allowed but unattached, ready, degraded,
-partial/unknown, and revoked-before-action states without leaking private
-configuration.
+- [x] Audit grants, ownership/project scope, managed product help, persistent
+  tool loading/rebinds, datasource tiers, browser readiness, and current
+  component provenance; lock the M2a–M2e sequence.
+
+#### M2a — typed contract and build registry
+
+- [ ] Add schema `1.0` models/enums, layer/state/reason compatibility,
+  visibility, qualifiers, bounded errors, provenance, and advisory semantics
+  in `src/core/product_capabilities.py`.
+- [ ] Register the 18 capability IDs already present in reviewed App Guide
+  metadata using a typed immutable Python registry.
+- [ ] Add schema, bounds, deterministic registry-revision, and guide-coverage
+  validation.
+
+#### M2b — server resolver and dark endpoint
+
+- [ ] Implement pure/server resolution in
+  `orchestrator/services/product_capabilities.py` and a dedicated router.
+- [ ] Compose real grants, flags, catalogs, readiness seams, and admitted
+  thread context; use the thread's primary project scope rather than every
+  visible project and do not trigger lazy state backfills.
+- [ ] Add `GET /api/users/me/product-capabilities` with owner admission,
+  exact filters, count/byte limits, no-store responses, visibility/redaction,
+  and `not_applicable` session state when no thread is supplied.
+- [ ] Dark-launch the endpoint and compare privacy-safe layer/state/reason
+  outcomes against known fixtures.
+
+#### M2c — live session overlay and agent tool
+
+- [ ] Record the final post-instantiation tool-name set in persistent
+  `ToolContext` and refresh it after backend/datasource rebinds.
+- [ ] Add a typed redacted runtime-facts snapshot for backend features,
+  aggregate datasource type/tier/connection state, knowledge, cloud, and
+  attachments.
+- [ ] Add `get_product_capabilities` as a separate always-on product-help tool,
+  bound to the current user/thread and independent of Fleet toggles or the
+  App Guide break-glass switch.
+- [ ] Validate the server schema, overlay only live facts the agent observed,
+  derive actionability from actual tools, and return bounded structured output
+  plus a concise deterministic text summary.
+
+#### M2d — component provenance
+
+- [ ] Stamp first-party orchestrator, agent, Cockpit, MCP, workspace, and guide
+  artifacts with full source revision/source URL/version/documentation
+  metadata; expose an artifact digest only when the deployment truly supplies
+  one.
+- [ ] Report declared/unavailable provenance and mixed/indeterminate builds
+  per component; keep short SHAs display-only and verified provenance deferred.
+
+#### M2e — guide integration and acceptance
+
+- [ ] Update `app-guide` to require the capability tool only for
+  availability/permission/current-context claims and preserve guide-only
+  stable how-to answers.
+- [ ] Add resolver, auth/scope, visibility, redaction, payload-bound,
+  partial/stale/error, mixed-build, graceful-degradation, and same-major
+  compatibility tests.
+- [ ] Add changed-state-between-snapshot-and-action tests. Claim revalidation
+  only where the real operation or binding lifecycle actually enforces it;
+  fix the owning enforcement path if the test exposes a gap.
+- [ ] Canary the read-only tool, run fresh/resumed live matrices, then make the
+  endpoint/tool default-on only after zero critical false-positive claims.
+- [ ] Add English and German reason-code presentation where a UI or
+  deterministic user-facing summary actually exposes it.
+
+**Exit gate:** email correctly distinguishes supported/available, denied by
+the real datasource grant, allowed but unattached, ready at its effective tier,
+connection/tool degraded, partial/unknown, and changed-before-action states
+without leaking private configuration. Deployment-disabled behavior is proven
+with a capability that has a real enforced gate, such as Protected Cloud or
+shared browser; M2 does not invent an unenforced email flag to fill that cell.
 
 ### Phase 3 — deterministic freshness gates
 
@@ -1708,13 +1778,16 @@ The feature is successful when:
 5. Capability payloads are owned-thread/project scoped, bounded, explicit about
    completeness/freshness/errors, and contain no secrets or private
    infrastructure/datasource details.
-6. Capability snapshots are never used as authorization; revocation or state
-   change before execution is enforced by the actual operation.
+6. Capability snapshots are never used as authorization. Changed-state tests
+   prove the actual operation or binding lifecycle enforces every recheck M2
+   claims; an uncovered enforcement gap blocks that capability claim.
 7. The email folder-allowlist example works end to end and changes correctly
-   under disabled, denied, unattached, ready, degraded, partial, and unknown
-   fixtures.
+   under denied, unattached, ready, degraded, partial, unknown, and
+   changed-before-action fixtures. Deployment-disabled behavior is covered by
+   a capability with a real enforced gate.
 8. Relevant orchestrator/agent/Cockpit/guide identities use full component
-   revisions and artifact digests, and mixed/unavailable provenance is visible.
+   revisions where declared, expose artifact digests only when supplied, and
+   make mixed/indeterminate/unavailable provenance visible.
 9. Adding or changing a registered user-visible capability requires a guide
    coverage decision in CI.
 10. Visual help uses complete text alternatives, current synthetic fixtures,
@@ -1746,10 +1819,11 @@ The feature is successful when:
    completeness, freshness, provenance, and safe reason codes.
 5. Capability state is authoritative for explaining the observation at
    `evaluated_at`, but is advisory for planning/UI and never authorizes an
-   operation. Execution always rechecks.
+   operation. The operation or binding lifecycle remains the enforcement
+   authority; M2 does not claim a recheck that path does not perform.
 6. Provenance is component-specific. Full immutable revisions and artifact
-   digests drive lookup; short/global SHAs are insufficient, and mixed builds
-   are represented explicitly.
+   digests, when genuinely available, drive lookup; short/global SHAs are
+   insufficient, and mixed or indeterminate builds are represented explicitly.
 7. The public repository is an isolated, server-selected, component-revision-
    pinned fallback, never an unpinned primary source or general browsing tool.
 8. Deterministic generation/checks cover inventory and exact claims; reviewed
@@ -1771,12 +1845,22 @@ The feature is successful when:
 15. M1 uses a dedicated bounded `read_product_guide(topic_id)` tool; ordinary
     `use_skill` and mutable workspace files are not authoritative for the
     managed guide.
+16. M2 uses a typed Python registry seeded by the 18 IDs already present in
+    reviewed App Guide metadata; a new ID requires a guide coverage decision.
+17. The M2 endpoint is `GET /api/users/me/product-capabilities`; the model tool
+    is `get_product_capabilities(topic?, capability_ids?)` and binds the current
+    user/thread rather than accepting identity/scope from the model.
+18. M2 has no application cache: endpoint responses are private/no-store and
+    bounded to 50 results/64 KiB; the model tool accepts at most 12 explicit
+    IDs and emits at most 32 KiB.
+19. The orchestrator resolves server facts and the live agent overlays actual
+    instantiated tools/runtime facts. A server-only result reports live
+    actionability as unknown rather than guessing.
 
 ## Open implementation decisions
 
-- Capability definitions in Python versus checked YAML/JSON.
-- Exact Phase 2 capability endpoint/tool names, payload/result limits, cache
-  TTL, and refresh/notification mechanism.
+- Whether a later optimization needs ETag/notifications after M2's no-store
+  baseline, and the exact invalidation transport if it does.
 - Mapping an optional logical release version over independently deployable
   component revisions.
 - The initial list of explicit capability coverage/exclusion registries.
