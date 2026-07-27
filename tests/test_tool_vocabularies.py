@@ -115,10 +115,14 @@ class TestVocabularyDrift:
             assert ticket_type in VALID_NOTE_TYPES
 
     def test_priority_literal_matches_priority_ranks(self):
+        """A set-of-keys comparison alone would still pass if the rank
+        numbers were scrambled (e.g. high=2, low=0), silently reversing the
+        backlog's sort order. Pin the actual word -> rank mapping."""
         from src.services.knowledge_graph import PRIORITY_RANKS
         from src.tools.knowledge.knowledge_tools import PriorityValue
 
         assert set(get_args(PriorityValue)) == set(PRIORITY_RANKS)
+        assert PRIORITY_RANKS == {"high": 0, "normal": 1, "low": 2}
 
 
 # =============================================================================
