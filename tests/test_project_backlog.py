@@ -529,8 +529,8 @@ class TestFetchBacklog:
         await fetch_backlog(vector_db, "p-1", exclude_note_id="issue-x")
 
         first_sql = conn.fetch.await_args_list[0].args[0]
-        assert "note_id <> $3" in first_sql
-        assert conn.fetch.await_args_list[0].args[3] == "issue-x"
+        assert "note_id <> $2" in first_sql
+        assert conn.fetch.await_args_list[0].args[2] == "issue-x"
 
     @pytest.mark.asyncio
     async def test_counts_query_also_excludes_the_in_progress_initiative(self):
@@ -546,14 +546,15 @@ class TestFetchBacklog:
         await fetch_backlog(vector_db, "p-1", exclude_note_id="issue-x")
 
         second_sql = conn.fetch.await_args_list[1].args[0]
-        assert "note_id <> $3" in second_sql
-        assert conn.fetch.await_args_list[1].args[3] == "issue-x"
+        assert "note_id <> $2" in second_sql
+        assert conn.fetch.await_args_list[1].args[2] == "issue-x"
 
     @pytest.mark.asyncio
     async def test_no_exclusion_binds_none(self):
         """The default (no in-progress campaign) must bind SQL NULL, not the
-        string 'None' -- the WHERE clause's `$3::text IS NULL` branch depends
-        on this."""
+        string 'None' -- the WHERE clause's `$2::text IS NULL` branch depends
+        on this. (Position $2, not $3: fix round 1, Finding 1 inlines the
+        note-type filter as a literal, so it no longer occupies a $-slot.)"""
         from orchestrator.services.project_backlog import fetch_backlog
 
         conn = MagicMock()
@@ -562,7 +563,7 @@ class TestFetchBacklog:
 
         await fetch_backlog(vector_db, "p-1")
 
-        assert conn.fetch.await_args_list[0].args[3] is None
+        assert conn.fetch.await_args_list[0].args[2] is None
 
     @pytest.mark.asyncio
     async def test_orders_by_priority_then_age_ascending(self):
@@ -581,7 +582,16 @@ class TestFetchBacklog:
         assert "ORDER BY priority ASC, created_at ASC" in first_sql
 
     @pytest.mark.asyncio
-    async def test_note_types_are_bound_to_the_backlog_ticket_types(self):
+    async def test_note_types_are_inlined_as_a_sql_literal_not_a_bound_param(self):
+        """Fix round 1, Finding 1: measured on pgvector/pgvector:pg15 (303k
+        rows / 300 projects), a bound `note_type = ANY($n::text[])` cannot be
+        proven under `force_generic_plan` to imply idx_knowledge_backlog's
+        literal partial predicate -- the planner fell back to a full
+        project scan + Filter + Sort for both queries, and the index went
+        unused. The fix inlines the note-type filter as a SQL literal,
+        derived from BACKLOG_NOTE_TYPES once so the tuple and the SQL can
+        never drift apart. A future "tidy-up" back to `= ANY($n)` must fail
+        this test."""
         from orchestrator.services.project_backlog import (
             BACKLOG_NOTE_TYPES,
             fetch_backlog,
@@ -593,11 +603,19 @@ class TestFetchBacklog:
 
         await fetch_backlog(vector_db, "p-1")
 
-        assert conn.fetch.await_args_list[0].args[2] == list(BACKLOG_NOTE_TYPES)
-        assert conn.fetch.await_args_list[0].args[2] == ["feature", "issue", "idea"]
+        expected_literal = (
+            "note_type IN (" + ", ".join(f"'{t}'" for t in BACKLOG_NOTE_TYPES) + ")"
+        )
+        for call in conn.fetch.await_args_list:
+            sql = " ".join(call.args[0].split())
+            assert "note_type IN (" in sql
+            assert expected_literal in sql
+            assert "= ANY(" not in sql
 
     @pytest.mark.asyncio
-    async def test_limit_is_bound_as_the_fourth_row_query_parameter(self):
+    async def test_limit_is_bound_as_the_third_row_query_parameter(self):
+        """Position $3, not $4: fix round 1, Finding 1 inlines the note-type
+        filter as a literal, so it no longer occupies a $-slot."""
         from orchestrator.services.project_backlog import fetch_backlog
 
         conn = MagicMock()
@@ -606,7 +624,7 @@ class TestFetchBacklog:
 
         await fetch_backlog(vector_db, "p-1", limit=5)
 
-        assert conn.fetch.await_args_list[0].args[4] == 5
+        assert conn.fetch.await_args_list[0].args[3] == 5
 
     @pytest.mark.asyncio
     async def test_high_priority_rank_zero_survives_the_round_trip(self):
