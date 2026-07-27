@@ -318,7 +318,7 @@ class KnowledgeStore:
                 SET title = $3, note_type = $4, status = $5, confidence = $6,
                     tags = $7, keywords = $8, job_id = $9, phase = $10,
                     retrieval_messages = $11, modified_at = $12,
-                    indexed_at = NOW()
+                    indexed_at = NOW(), priority = $13
                 WHERE project_id = $1 AND note_id = $2
                 RETURNING id
                 """,
@@ -334,6 +334,7 @@ class KnowledgeStore:
                 phase,
                 retrieval_list,
                 modified_at,
+                priority,
             )
             logger.debug(f"Updated knowledge index (metadata only): {note_id}")
             return row_id
