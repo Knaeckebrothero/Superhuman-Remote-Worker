@@ -41,6 +41,7 @@ from src.api.persistent_app import (
     _save_message,
     _save_turn_ai_messages,
     _session_backend_is_lite,
+    _session_backend_is_vm,
     _upgrade_already_satisfied,
     _ws_send,
     create_persistent_app,
@@ -1745,6 +1746,94 @@ class TestPollWorkspaceReady:
         assert result["backend"] == "vm"
         assert result["remote"]["host"] == "vm-host"
         assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_never_accepts_a_ready_container(self):
+        """Defect 2: a vm-tier session must NOT attach to a sandbox container
+        that happens to be ready. The container wins the race by minutes (8s vs
+        a multi-minute KubeVirt boot), so without this the session silently runs
+        on the wrong tier while its VM is orphaned.
+        docs/issues/session_vm_backend_never_attaches.md"""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {
+            # Exactly the incident state: VM still booting, container ready.
+            "vm_status": "created",
+            "status": "ready",
+            "pod_ip": "10.42.2.32",
+        }
+
+        with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
+            with patch("time.monotonic", side_effect=[0, 0.5, 2]):
+                result = await _poll_workspace_ready(
+                    client,
+                    "tid",
+                    timeout=1,
+                    vm_timeout=1,
+                    poll_interval=0.01,
+                    require_vm=True,
+                )
+
+        assert result is None  # timed out waiting for the VM — never downgraded
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_returns_vm_when_ready(self):
+        """require_vm still attaches normally once the VM reports ready."""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {
+            "vm_status": "ready",
+            "vm_ssh_host": "vm-host",
+            "vm_ssh_port": 22,
+        }
+
+        result = await _poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+
+        assert result is not None
+        assert result["backend"] == "vm"
+        assert result["remote"]["host"] == "vm-host"
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_bails_immediately_on_vm_failed(self):
+        """A failed VM on a vm-tier session is terminal — bail instead of burning
+        the full VM budget. The pre-existing bail required the CONTAINER to have
+        failed too, which never happens when no container exists."""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {"vm_status": "failed"}
+
+        result = await _poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+
+        assert result is None
+        assert client.get_thread_workspace.call_count == 1  # no retry
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_bails_immediately_when_no_vm_context(self):
+        """A vm-tier thread with no VM context was never provisioned a VM —
+        terminal, so fail fast instead of sitting out the whole VM budget.
+        Mirrors the container branch's status=='none' bail."""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {"status": "none"}
+
+        result = await _poll_workspace_ready(client, "tid", timeout=5, require_vm=True)
+
+        assert result is None
+        assert client.get_thread_workspace.call_count == 1  # no retry
+
+    @pytest.mark.asyncio
+    async def test_default_caller_still_accepts_a_ready_container(self):
+        """Regression guard for the sandbox-upgrade caller
+        (_handle_workspace_upgrade), which polls without require_vm and must keep
+        accepting a container even if a vm context is present."""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {
+            "vm_status": "created",
+            "status": "ready",
+            "pod_ip": "10.42.2.32",
+        }
+
+        result = await _poll_workspace_ready(client, "tid", timeout=5)
+
+        assert result is not None
+        assert result["backend"] == "sandbox"
+        assert result["remote"]["host"] == "10.42.2.32"
 
 
 # ---------------------------------------------------------------------------
@@ -5031,3 +5120,42 @@ class TestSessionBackendIsLite:
     def test_non_dict_is_not_lite(self):
         assert _session_backend_is_lite(None) is False
         assert _session_backend_is_lite("virtual") is False
+
+
+# ---------------------------------------------------------------------------
+# _session_backend_is_vm() — VM-tier boot detection
+# (docs/issues/session_vm_backend_never_attaches.md Defect 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionBackendIsVm:
+    """_attach_session uses this to require a VM (never a container) for a
+    vm-tier session. Same dual-shape contract as _session_backend_is_lite:
+    FLAT config_override ({workspace: ...}) and NESTED resolved_config
+    (agent.workspace)."""
+
+    def test_flat_vm_is_vm(self):
+        assert _session_backend_is_vm({"workspace": {"backend": "vm"}}) is True
+
+    def test_flat_remote_alias_is_vm(self):
+        # "remote" is the legacy alias for "vm"; stored overrides still carry it.
+        assert _session_backend_is_vm({"workspace": {"backend": "remote"}}) is True
+
+    def test_nested_vm_is_vm(self):
+        assert (
+            _session_backend_is_vm({"agent": {"workspace": {"backend": "vm"}}}) is True
+        )
+
+    def test_flat_sandbox_is_not_vm(self):
+        assert _session_backend_is_vm({"workspace": {"backend": "sandbox"}}) is False
+
+    def test_lite_is_not_vm(self):
+        assert _session_backend_is_vm({"workspace": {"backend": "virtual"}}) is False
+
+    def test_missing_backend_is_not_vm(self):
+        assert _session_backend_is_vm({"workspace": {}}) is False
+        assert _session_backend_is_vm({}) is False
+
+    def test_non_dict_is_not_vm(self):
+        assert _session_backend_is_vm(None) is False
+        assert _session_backend_is_vm("vm") is False
