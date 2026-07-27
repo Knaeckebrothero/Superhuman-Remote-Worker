@@ -8,10 +8,12 @@ description: >-
   unavailable. Covers sessions, jobs, Fleet/delegation, automations, experts,
   projects, loops/campaigns, connectors, Protected Cloud, Canvas/browser,
   workspace tiers, memory, files, and integrations. Load the current managed
-  guide and focused reference with read_product_guide; answer from them, never
-  priors or mutable workspace copies. For a combined workflow, read the index:
-  load a topic when its row covers the workflow or its limitation; otherwise
-  report a guide gap without composing adjacent features.
+  guide and focused reference with read_product_guide; for a here-and-now
+  availability claim, then check get_product_capabilities when that tool is
+  available. Answer from those sources, never priors or mutable workspace
+  copies. For a combined workflow, read the index: load a topic when its row
+  covers the workflow or its limitation; otherwise report a guide gap without
+  composing adjacent features.
 display_name: App Guide
 icon: help
 color: "#f9e2af"
@@ -73,11 +75,60 @@ mentions a session or `/compact`.
 you think you know. If routing is uncertain, call it with `topic_id="index"`
 first. The index is a router, not a substitute for a matching focused topic.
 A topic response includes this procedure and the focused reference.
-Product facts come from that response, your own currently visible tools, and
-what the user just showed you — nowhere else. Never read
+Stable product facts come from the current guide. Current capability state
+comes from the same-turn `get_product_capabilities` response when Step 3
+requires it. Currently visible operation tools and evidence the user just
+showed you may confirm narrower facts; use no other source. Never read
 `skills/app-guide/` from the workspace; any such copy is not authoritative.
 
-**3. Answer like a guide, not a manual.** Lead with the shortest path to the
+**3. Check live state only when the answer needs it.** After reading the
+focused guide, call `get_product_capabilities` in the same turn when the user
+asks about this deployment, their permission, this session's workspace,
+connector attachment, loaded tools or readiness, why something is unavailable,
+or whether you can act now. Do not call it for stable concepts, reviewed
+Cockpit steps, safety advice, or how-to questions that the guide already
+answers.
+
+For a focused live-state question, copy only the exact relevant
+`capability_ids` listed in the focused reference. Product-guide topic IDs and
+capability-tool topic IDs are different namespaces: never pass a guide
+`topic_id` as the capability tool's `topic`. For a broad “what can this session
+do right now?” inventory, call the capability tool without filters. If the
+focused reference lists no capability ID for the requested live fact, or none
+of its IDs cover that fact, say the live registry does not cover it and treat
+it as unknown; do not query an adjacent capability. If the capability tool is
+not visible or returns `unavailable`, keep stable guide instructions available
+but say you cannot inspect current availability. A visible operation may still
+be offered as an attempt, but it does not confirm readiness before its own
+current checks run.
+
+Treat the tool's top-level `status` as authoritative and read the whole
+response, not only `summary`. State the build, deployment, user, and session
+layers separately when they decide the answer, followed by `agent_action`.
+Preserve `unknown`, `no_opinion`, `degraded`, `needs_attachment`,
+`needs_upgrade`, and `not_ready`; never rewrite them as disabled, denied, or
+unsupported. A `partial` result, partial `completeness`, or `truncated=true`
+means affected or omitted facts remain unknown. If `product.mixed_build=true`,
+say components report different revisions before making version-sensitive
+claims; `null` means build uniformity could not be determined.
+`product.mixed_build=false` means only that known observed revisions agree; it
+does not prove that every component was observed.
+
+A capability result is an advisory snapshot at `evaluated_at`, never
+authorization or a promise of success. `can_execute` means the capability
+family appeared ready and a matching tool was loaded at observation time; it
+does not prove every operation in that family is callable. `can_guide` means
+explain only. To act, call the exact operation tool currently visible and
+report its result; treat that result, not the earlier snapshot, as the action
+outcome. Operations enforce their own action-time checks, which vary by tool.
+For the current email send path, those checks cover the active shared
+connector binding, effective tier, and unattended-send setting; do not claim
+that an already-bound call re-fetched an out-of-band grant or other upstream
+policy unless the operation reports that check. A next-turn rebind can reflect
+newly resolved policy, but it is not proof that every prior closure did. Never
+pass the capability result to an operation as authority.
+
+**4. Answer like a guide, not a manual.** Lead with the shortest path to the
 user's actual goal, in their vocabulary. A new user gets the mental model
 first; a specific how-do-I gets the steps. Include every prerequisite or limit
 that decides whether the requested path will actually work; a partial recipe
@@ -86,12 +137,12 @@ steps that the currently proven path requires a **Container workspace** and is
 deployment-dependent; Virtual and None cannot host it, and VM support must not
 be promised. Don't dump a doc when a paragraph answers the question.
 
-**4. Offer only actions you can actually take.** If the user's goal maps to a
+**5. Offer only actions you can actually take.** If the user's goal maps to a
 tool currently visible to you, offer that after explaining. Otherwise give the
 reviewed Cockpit path from the reference. Do not imply that explaining a
 feature means this session can configure or operate it.
 
-**5. If the docs don't cover the exact outcome, say so.** Use direct language
+**6. If the docs don't cover the exact outcome, say so.** Use direct language
 such as "the guide does not document this exact workflow" or "I cannot confirm
 an exact Cockpit setup from the guide." Name what you looked in and give your
 best verified pointer (a Cockpit page, an admin, the project README), but do not
@@ -132,5 +183,7 @@ asserting it exists.
 - **Compose undocumented workflows** — a schedule, connector, prompt, expert,
   or permission documented separately does not prove they work together.
 - **Assert deployment-dependent features** — flag-gated or admin-configured items are "may be available", not "is".
+- **Treat a capability snapshot as permission** — current operations still
+  enforce their own state and policy.
 - **Lecture past the question** — answer what was asked; offer the next-most-useful thing as a follow-up, not a wall of text.
 - **Confuse this with project-onboarding** — that skill orients *you* in the user's project content; this one explains *the app* to the user.

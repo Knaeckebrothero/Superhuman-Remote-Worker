@@ -485,6 +485,41 @@ def _ds(ds_type, name, read_only=False):
 
 class TestResetupDatasources:
     @pytest.mark.asyncio
+    async def test_live_detach_invalidates_an_already_bound_email_send_tool(self):
+        """A prior ready observation and stale closure are not authorization."""
+
+        from src.tools.context import ToolContext
+        from src.tools.email.tools import create_email_tools
+
+        old_connection = SimpleNamespace(
+            access="send",
+            unattended_send=True,
+            open_smtp=MagicMock(),
+        )
+        session = _make_session(
+            datasource_configs=[_ds("email", "Mailbox")],
+            datasources={"email": old_connection},
+        )
+        action_context = ToolContext(datasources=session.datasources)
+        bound_send = next(
+            tool
+            for tool in create_email_tools(action_context)
+            if tool.name == "email_send"
+        )
+
+        with patch(
+            "src.core.datasource_setup.process_datasources",
+            return_value=({}, {}, []),
+        ):
+            await session.resetup_datasources([])
+
+        result = bound_send.invoke(
+            {"subject": "Hi", "body": "text", "to": ["person@example.test"]}
+        )
+        assert "Error" in result and "binding changed" in result
+        old_connection.open_smtp.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_email_runtime_facts_refresh_on_failed_ready_and_removed_attachment(
         self,
     ):

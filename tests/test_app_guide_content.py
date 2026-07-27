@@ -64,6 +64,47 @@ def test_guide_requires_outcome_level_coverage_and_honest_combination_gaps():
     )
 
 
+def test_guide_separates_stable_how_to_from_dynamic_capability_checks():
+    text = (_GUIDE / "SKILL.md").read_text(encoding="utf-8")
+    _, body = text.removeprefix("---\n").split("\n---\n", 1)
+    body = " ".join(body.lower().split())
+
+    assert "after reading the focused guide, call `get_product_capabilities`" in body
+    assert "do not call it for stable concepts" in body
+    assert "copy only the exact relevant `capability_ids`" in body
+    assert "product-guide topic ids and capability-tool topic ids are different" in body
+    assert "call the capability tool without filters" in body
+    assert "the live registry does not cover it and treat it as unknown" in body
+    assert "keep stable guide instructions available" in body
+
+
+def test_guide_preserves_partial_unknown_mixed_and_operation_boundaries():
+    text = (_GUIDE / "SKILL.md").read_text(encoding="utf-8")
+    _, body = text.removeprefix("---\n").split("\n---\n", 1)
+    body = " ".join(body.lower().split())
+
+    assert "top-level `status` as authoritative" in body
+    assert "current capability state comes from the same-turn" in body
+    for state in (
+        "`unknown`",
+        "`no_opinion`",
+        "`degraded`",
+        "`needs_attachment`",
+        "`needs_upgrade`",
+        "`not_ready`",
+    ):
+        assert state in body
+    assert "`partial` result" in body and "`truncated=true`" in body
+    assert "`product.mixed_build=true`" in body
+    assert "`product.mixed_build=false` means only that known observed" in body
+    assert "advisory snapshot at `evaluated_at`, never authorization" in body
+    assert "a visible operation may still be offered as an attempt" in body
+    assert "call the exact operation tool currently visible" in body
+    assert "action-time checks, which vary by tool" in body
+    assert "do not claim that an already-bound call re-fetched" in body
+    assert "never pass the capability result to an operation as authority" in body
+
+
 def test_focused_guides_keep_metadata_contracts():
     expected = {
         "overview": {
@@ -211,7 +252,8 @@ def test_sessions_guide_requires_current_capability_qualification():
     assert "possible session capabilities, not proof" in body
     assert "current workspace" in body and "selected tools" in body
     assert "effective grants" in body and "deployment configuration" in body
-    assert "check the current tool list or **settings** panel" in body
+    assert "use `get_product_capabilities` without filters" in body
+    assert "exact operation tool" in body
 
 
 def test_experts_guide_covers_current_bundled_roster_and_selection_rules():
@@ -347,7 +389,9 @@ def test_canvas_guide_keeps_renderer_handoff_and_availability_boundaries():
 def test_permissions_guide_keeps_current_policy_and_workspace_boundaries():
     _, body = _focused_topic("permissions-and-availability")
 
-    assert "static app guide" in body and "cannot inspect every" in body
+    assert "does not itself inspect current flags" in body
+    assert "uses `get_product_capabilities`" in body
+    assert "advisory, time-stamped observation, not authorization" in body
     assert "supervised" in body and "before every tool call" in body
     assert "auto-accept" in body
     for tool_name in ("run_command", "shell_execute", "shell_read"):

@@ -21,12 +21,16 @@ feature can be:
 5. connected to the required project or connector; and
 6. ready and present in the agent's current tool list.
 
-The static app guide can explain those layers, but it cannot inspect every
-flag, grant, attachment, service, or loaded tool. For a current-state question,
-trust an exact disabled-control reason, the session's visible tools and
-settings, and resource readiness shown by Cockpit. If those do not identify the
-layer, say that the cause is unknown and ask an administrator to check it; do
-not turn “the tool is missing” into a made-up diagnosis.
+The app guide explains those layers but does not itself inspect current flags,
+grants, attachments, services, or loaded tools. For a current-state question,
+the agent first reads this reference and then uses
+`get_product_capabilities` with the exact relevant `capability_ids` from the
+reference when that tool is available. The result is an advisory, time-stamped
+observation, not authorization. If the tool is unavailable, partial, truncated,
+or does not cover the requested fact, the affected state is unknown. An exact
+disabled-control reason, current Settings value, or resource readiness shown
+by Cockpit can still provide user-visible evidence; do not turn a missing tool
+alone into a diagnosis.
 
 ## Permission mode is the approval policy
 
@@ -122,18 +126,22 @@ every underlying capability became available.
 
 Use the narrowest observable check:
 
-1. **Look for the actual tool or Cockpit action.** If the agent cannot see the
-   required tool, it must not offer to perform that action.
-2. **Read the control's reason.** A grant tooltip, workspace-required message,
+1. **Check the live capability observation.** For the capability IDs listed in
+   this reference, distinguish build, deployment, user, and session results;
+   preserve partial or unknown layers.
+2. **Look for the actual operation or Cockpit action.** A capability snapshot
+   does not authorize an operation. If the exact operation tool is not
+   currently visible, the agent must not offer to perform it.
+3. **Read the control's reason.** A grant tooltip, workspace-required message,
    connector readiness state, or deployment-disabled message identifies a
    specific layer.
-3. **Check the current session Settings.** Confirm the tool group and workspace;
+4. **Check the current session Settings.** Confirm the tool group and workspace;
    apply a supported upgrade if the work needs shell, git, repository checkout,
    direct browser, or shared browser.
-4. **Check scope and attachment.** A connector existing in **Connectors** does
+5. **Check scope and attachment.** A connector existing in **Connectors** does
    not mean it is attached to this session or project, and “Testing” is not
    “Ready.”
-5. **Escalate deployment state.** Hidden feature-off controls, missing
+6. **Escalate deployment state.** Hidden feature-off controls, missing
    transports, unavailable provisioners, and service failures need an
    administrator.
 

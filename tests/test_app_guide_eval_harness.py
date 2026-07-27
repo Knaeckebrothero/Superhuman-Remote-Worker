@@ -1,6 +1,7 @@
 """Contract tests for the held-out App Guide model-evaluation harness."""
 
 import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -564,3 +565,37 @@ def test_validate_only_cli_does_not_require_model_credentials(monkeypatch, capsy
     assert '"cases":' in output
     assert '"corpus_sha256":' in output
     assert "api_key" not in output.casefold()
+
+
+@pytest.mark.parametrize(
+    ("complete", "release_gate", "expected_exit"),
+    [
+        (True, False, 1),
+        (True, True, 0),
+        (False, False, 0),
+    ],
+)
+def test_cli_fails_only_a_complete_failed_release_gate(
+    monkeypatch,
+    capsys,
+    complete,
+    release_gate,
+    expected_exit,
+):
+    import eval.app_guide.run as harness
+
+    async def fake_run(_args):
+        return Path("/synthetic/eval"), {
+            "arms": {
+                "current": {
+                    "errors": 0,
+                    "complete_corpus": complete,
+                    "release_gate_pass": release_gate,
+                }
+            }
+        }
+
+    monkeypatch.setattr(harness, "run", fake_run)
+
+    assert main([]) == expected_exit
+    assert "api_key" not in capsys.readouterr().out.casefold()

@@ -360,9 +360,23 @@ def create_email_tools(context: ToolContext) -> List[Any]:
 
     workspace = context.workspace_manager
 
-    from imap_tools.query import A
-
     # -- shared closure helpers ------------------------------------------
+
+    def _imap_query(**kwargs: Any) -> Any:
+        from imap_tools.query import A
+
+        return A(**kwargs)
+
+    def _binding_refusal() -> Optional[str]:
+        """Reject a closure whose captured datasource is no longer current."""
+
+        if context.get_datasource("email") is conn:
+            return None
+        return (
+            "Error: the email connector binding changed or was detached after "
+            "this tool was loaded. Retry on the next turn so the current "
+            "mailbox tools and access policy can be applied."
+        )
 
     def _can_write_workspace() -> bool:
         if workspace is None:
@@ -371,6 +385,9 @@ def create_email_tools(context: ToolContext) -> List[Any]:
         return bool(getattr(backend, "supports_file_tools", True))
 
     def _tier_refusal(required: str) -> Optional[str]:
+        binding_refusal = _binding_refusal()
+        if binding_refusal:
+            return binding_refusal
         have = _TIER_RANK.get(getattr(conn, "access", "read"), 0)
         if have < _TIER_RANK[required]:
             return (
@@ -440,7 +457,10 @@ def create_email_tools(context: ToolContext) -> List[Any]:
     def _fetch_one(mailbox: Any, uid: str, headers_only: bool) -> Optional[Any]:
         messages = list(
             mailbox.fetch(
-                A(uid=uid), mark_seen=False, headers_only=headers_only, limit=1
+                _imap_query(uid=uid),
+                mark_seen=False,
+                headers_only=headers_only,
+                limit=1,
             )
         )
         return messages[0] if messages else None
@@ -599,6 +619,9 @@ def create_email_tools(context: ToolContext) -> List[Any]:
         Returns:
             Folder list with counts, or error message
         """
+        binding_refusal = _binding_refusal()
+        if binding_refusal:
+            return binding_refusal
         try:
             with conn.connect() as mailbox:
                 infos = conn.selectable_allowed_folders(mailbox)
@@ -649,6 +672,9 @@ def create_email_tools(context: ToolContext) -> List[Any]:
         Returns:
             Envelope listing with UIDVALIDITY, or error message
         """
+        binding_refusal = _binding_refusal()
+        if binding_refusal:
+            return binding_refusal
         try:
             limit_n = max(1, min(int(limit), MAX_PAGE_SIZE))
             page_n = max(1, int(page))
@@ -666,7 +692,7 @@ def create_email_tools(context: ToolContext) -> List[Any]:
                 if page_uids:
                     messages = list(
                         mailbox.fetch(
-                            A(uid=page_uids),
+                            _imap_query(uid=page_uids),
                             mark_seen=False,
                             headers_only=True,
                             bulk=True,
@@ -728,6 +754,9 @@ def create_email_tools(context: ToolContext) -> List[Any]:
         Returns:
             Matching envelopes grouped by folder, or error message
         """
+        binding_refusal = _binding_refusal()
+        if binding_refusal:
+            return binding_refusal
         try:
             limit_n = max(1, min(int(limit), MAX_SEARCH_RESULTS))
             criteria_kwargs: Dict[str, Any] = {}
@@ -745,7 +774,7 @@ def create_email_tools(context: ToolContext) -> List[Any]:
                 criteria_kwargs["date_lt"] = _parse_date_arg(before, "before")
             if unseen is not None:
                 criteria_kwargs["seen"] = not unseen
-            criteria = A(**criteria_kwargs) if criteria_kwargs else "ALL"
+            criteria = _imap_query(**criteria_kwargs) if criteria_kwargs else "ALL"
 
             with conn.connect() as mailbox:
                 if folder and folder.strip():
@@ -787,7 +816,7 @@ def create_email_tools(context: ToolContext) -> List[Any]:
                     take = ordered[: limit_n - shown]
                     messages = list(
                         mailbox.fetch(
-                            A(uid=take),
+                            _imap_query(uid=take),
                             mark_seen=False,
                             headers_only=True,
                             bulk=True,
@@ -840,6 +869,9 @@ def create_email_tools(context: ToolContext) -> List[Any]:
             Headers (incl. Message-ID/In-Reply-To/References), fenced snippet,
             and saved-file pointers, or error message
         """
+        binding_refusal = _binding_refusal()
+        if binding_refusal:
+            return binding_refusal
         try:
             uid_str = str(uid).strip()
             if not uid_str.isdigit():
@@ -1169,18 +1201,25 @@ def create_email_tools(context: ToolContext) -> List[Any]:
         Returns:
             Confirmation, or error message
         """
-        refusal = _tier_refusal("send")
-        if refusal:
-            return refusal
-        if not getattr(conn, "unattended_send", False):
-            # Fail closed: the human-approval flow for gated sends (freeze +
-            # approve/deny) is not built yet — never send on the gated path.
+
+        def _send_refusal() -> Optional[str]:
+            refusal = _tier_refusal("send")
+            if refusal:
+                return refusal
+            if getattr(conn, "unattended_send", False):
+                return None
+            # Fail closed: the human-approval flow for gated sends is not
+            # built yet — never send on the gated path.
             return (
                 "Error: sending is gated for this mailbox (unattended send is "
                 "disabled) and the human-approval flow for gated sends is not "
                 "available yet. Use email_draft instead — the user can review "
                 "and send the draft from their own mail client."
             )
+
+        refusal = _send_refusal()
+        if refusal:
+            return refusal
         try:
             if _SEND_STATE["count"] >= MAX_SENDS_PER_JOB:
                 return (
@@ -1205,11 +1244,24 @@ def create_email_tools(context: ToolContext) -> List[Any]:
                     None, subject, body, to, cc, reply_to_uid, folder, reply_all
                 )
 
-            # Count the attempt (not just successes) so a retry loop cannot
-            # exceed the cap in SMTP submits.
-            _SEND_STATE["count"] += 1
+            # Recheck immediately before the irreversible SMTP submission.
+            # A live detach/rebind can arrive while a reply is being composed;
+            # neither an earlier capability snapshot nor this stale closure
+            # authorizes a send through the replaced connection.
+            refusal = _send_refusal()
+            if refusal:
+                return refusal
+
             smtp = conn.open_smtp()
             try:
+                # Opening a transport may block while a live binding change is
+                # applied elsewhere. Recheck once more at the submit boundary.
+                refusal = _send_refusal()
+                if refusal:
+                    return refusal
+                # Count the submit attempt (not just successes) so a retry
+                # loop cannot exceed the cap.
+                _SEND_STATE["count"] += 1
                 smtp.send_message(msg)
             finally:
                 try:

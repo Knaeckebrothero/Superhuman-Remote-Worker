@@ -6,7 +6,9 @@ import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 from uuid import UUID
 
 import httpx
@@ -25,6 +27,7 @@ from src.core.product_capabilities import (
     UserState,
 )
 from src.tools.context import SessionRuntimeFacts, ToolContext
+from src.tools.email.tools import create_email_tools
 from src.tools.product_capabilities import (
     CapabilityToolErrorCode,
     CapabilityToolRequest,
@@ -249,6 +252,30 @@ def test_model_schema_cannot_supply_identity_scope_or_resolver():
         "source_revision",
     ):
         assert forbidden not in tool.args
+
+
+@pytest.mark.asyncio
+async def test_unknown_guide_topic_fails_closed_before_fetch():
+    fetched = False
+
+    async def fetcher(
+        _context: ToolContext,
+        _request: CapabilityToolRequest,
+    ) -> bytes:
+        nonlocal fetched
+        fetched = True
+        return b"{}"
+
+    capability_tool = create_product_capability_tools(
+        _context(_facts()),
+        fetcher=fetcher,
+    )[0]
+    raw = await capability_tool.ainvoke({"topic": "datasources-email"})
+    output = ProductCapabilitiesToolOutput.model_validate_json(raw)
+
+    assert output.status is CapabilityToolStatus.UNAVAILABLE
+    assert output.error_code is CapabilityToolErrorCode.INVALID_REQUEST
+    assert fetched is False
 
 
 @pytest.mark.asyncio
@@ -501,6 +528,50 @@ async def test_send_tool_without_current_unattended_send_gate_can_only_guide():
 
     assert _only(output).session.state is SessionState.READY
     assert _only(output).agent_action is AgentAction.CAN_GUIDE
+
+
+@pytest.mark.asyncio
+async def test_ready_snapshot_cannot_authorize_send_after_live_detach():
+    connection = SimpleNamespace(
+        access="send",
+        unattended_send=True,
+        open_smtp=MagicMock(),
+    )
+    facts = _facts(
+        datasource_types=("email",),
+        email_tier="send",
+        email_direct_send=True,
+        tools=("email_send",),
+    )
+    context = ToolContext(
+        _thread_id=_THREAD_ID,
+        user_id=_USER_ID,
+        config={},
+        datasources={"email": connection},
+        session_runtime_facts=facts,
+    )
+    _raw, output = await _invoke(
+        await _server_payload("datasources.email.send"),
+        facts=None,
+        args={"capability_ids": ["datasources.email.send"]},
+        context=context,
+    )
+    assert _only(output).agent_action is AgentAction.CAN_EXECUTE
+
+    bound_send = next(
+        tool for tool in create_email_tools(context) if tool.name == "email_send"
+    )
+    context.datasources.clear()
+    result = bound_send.invoke(
+        {
+            "subject": "M2 check",
+            "body": "Synthetic test",
+            "to": ["person@example.test"],
+        }
+    )
+
+    assert "Error" in result and "binding changed" in result
+    connection.open_smtp.assert_not_called()
 
 
 @pytest.mark.asyncio
