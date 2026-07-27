@@ -12223,120 +12223,141 @@ async def llm_outage_redispatch_sweeper(shutdown_event: asyncio.Event) -> None:
     logger.info("LLM-outage re-dispatch sweeper stopped")
 
 
+_CRITIC_TERMINAL_OK = {"completed"}
+
+# Statuses worth resolving a verdict for. Anything else — paused for an
+# LLM/memory/vm-upgrade retry, still processing, etc. — means the critic
+# hasn't reached a resting state yet and may still deliver a trustworthy
+# verdict on its own; escalating the target here would yank it out from
+# under a critic that's about to retry. Mirrors the equivalent gate in
+# _handle_scholar_completion ("A NON-TERMINAL scholar report must not
+# unblock the parent").
+_CRITIC_ACTIONABLE_STATUSES = {"completed", "failed", "cancelled", "pending_review"}
+
+
+def _is_verification_critic(job: dict[str, Any]) -> bool:
+    """True only for verification critics.
+
+    ``parent_job_id`` alone is not enough: scholars and delegation children
+    share it, and a delegation child completing normally would otherwise be
+    read as a verdict-less critic and advance its parent.
+    """
+    ctx = job.get("context")
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            return False
+    return bool(isinstance(ctx, dict) and ctx.get("verification_target"))
+
+
+def _resolve_critic_outcome(
+    critic_job_id: str, critic_status: str, rounds: list[dict[str, Any]]
+) -> tuple[str, str]:
+    """Resolve what a finished critic means for its target.
+
+    Returns ("approved"|"returned"|"escalate", reason). Absence of a verdict is
+    NOT approval — that conflation is the defect this design removes (CWE-636).
+    """
+    if critic_status not in _CRITIC_TERMINAL_OK:
+        return (
+            "escalate",
+            f"Critic {critic_job_id} ended in status {critic_status!r}; "
+            f"no trustworthy verdict.",
+        )
+
+    for rnd in rounds:
+        if rnd.get("critic_job_id") == critic_job_id:
+            return (rnd.get("verdict", "returned"), "")
+
+    return (
+        "escalate",
+        f"Critic {critic_job_id} finished with no verdict recorded on the "
+        f"verification ledger.",
+    )
+
+
 async def _handle_critic_verdict_on_complete(
     job: dict[str, Any],
     actions: list[str],
 ) -> None:
-    """Handle deferred critic verdict after a critic job completes.
+    """Handle a critic's verdict (or lack of one) after it finishes.
 
-    If this job has a parent_job_id and freeze_data with a verdict,
-    process the approve/return logic.
+    Fail-closed: the outcome is driven entirely by the durable ledger on the
+    TARGET job (``context.verification_rounds``, via ``_verification_rounds``
+    + ``_resolve_critic_outcome``) — never by the critic's own freeze_data. A
+    missing verdict is never read as approval; see
+    docs/superpowers/specs/2026-07-27-verification-fail-closed-design.md.
     """
-    from services.completion import (
-        _parse_freeze_data,
-        is_curation_enabled,
-    )
-
-    parent_job_id = job.get("parent_job_id")
-    if parent_job_id is None:
-        return  # Not a subjob
+    if not _is_verification_critic(job):
+        return  # scholar / delegation child / ordinary subjob — not a critic
 
     job_id = str(job["id"])
 
-    # Skip scholar jobs — they are not critics
-    ctx_raw = job.get("context")
-    if isinstance(ctx_raw, str):
+    ctx = job.get("context")
+    if isinstance(ctx, str):
         try:
-            ctx_dict = json.loads(ctx_raw)
+            ctx = json.loads(ctx)
         except (json.JSONDecodeError, ValueError):
-            ctx_dict = {}
-    else:
-        ctx_dict = ctx_raw if isinstance(ctx_raw, dict) else {}
-    if ctx_dict.get("scholar_target"):
-        logger.debug(f"Job {job_id} is a scholar — skipping critic verdict handling")
+            ctx = {}
+    target_job_id = str((ctx or {}).get("verification_target"))
+
+    critic_status = job.get("status")
+    if critic_status not in _CRITIC_ACTIONABLE_STATUSES:
+        # Still in flight (e.g. paused for an outage/backoff retry) — leave
+        # the target alone; the critic may yet deliver a trustworthy verdict.
+        logger.debug(
+            f"Critic {job_id} in non-actionable status {critic_status!r} — "
+            f"target {target_job_id} left untouched"
+        )
         return
 
-    target_job_id = str(parent_job_id)
-
-    freeze_data = _parse_freeze_data(job)
-    if not freeze_data:
-        logger.debug(f"No freeze_data for critic job {job_id} — no verdict to process")
+    target_job = await postgres_db.get_job(target_job_id)
+    if not target_job:
+        logger.warning(f"Critic {job_id}: target job {target_job_id} not found")
         return
 
-    verdict = freeze_data.get("verdict")
-    if not verdict:
-        # Critic completed without using approve_job/return_job_with_feedback.
-        # If the job completed normally (not failed), treat as implicit approval
-        # so the target job doesn't get stuck in "reviewing".
-        if job.get("status") == "completed":
-            logger.warning(
-                f"Critic job {job_id} completed without verdict — "
-                f"treating as implicit approval for target {target_job_id}"
-            )
-            verdict = "approved"
-        else:
-            logger.debug(f"No verdict in freeze_data for critic job {job_id}")
-            return
+    rounds = _verification_rounds(target_job)
+    outcome, reason = _resolve_critic_outcome(job_id, critic_status, rounds)
 
-    # Parse critic context for round tracking
-    ctx_raw = job.get("context")
-    if isinstance(ctx_raw, str):
-        try:
-            critic_context = json.loads(ctx_raw)
-        except (json.JSONDecodeError, ValueError):
-            critic_context = {}
-    else:
-        critic_context = ctx_raw or {}
-
-    if verdict == "approved":
+    if outcome == "approved":
         logger.info(f"Critic {job_id} approved target {target_job_id}")
         new_status = await _set_target_to_autonomy_status(target_job_id)
         actions.append(f"target {target_job_id} set to '{new_status}' (approved)")
 
         # Trigger curator final pass if curation is enabled on the TARGET job
-        target_job = await postgres_db.get_job(target_job_id)
-        if target_job and is_curation_enabled(target_job):
+        from services.completion import is_curation_enabled
+
+        if is_curation_enabled(target_job):
             await _trigger_curation_final_pass(target_job_id, target_job)
             actions.append(f"curation final pass triggered for {target_job_id}")
 
-    elif verdict == "returned":
-        current_round = critic_context.get("verification_round", 0)
-        max_rounds = critic_context.get("max_verification_rounds", 3)
+    elif outcome == "returned":
+        # Render the open findings with their IDs so the target sees what to
+        # fix and the next round's critic can match dispositions against
+        # them. The round record itself carries no free-text narrative (Task
+        # 5's verdict tools never send one to record_verification_round) —
+        # the structured `claim` on each finding IS the substantive content.
+        from services.verification_ledger import fold_open_findings
 
-        if max_rounds > 0 and current_round >= max_rounds:
-            # Round limit reached — auto-accept
-            logger.warning(
-                f"Critic {job_id} returned feedback but round limit reached "
-                f"({current_round}/{max_rounds}). Auto-accepting target {target_job_id}."
+        open_findings = fold_open_findings(rounds)
+        feedback_lines = ["## Open findings", ""]
+        for f in sorted(open_findings, key=lambda x: x.get("id", "")):
+            feedback_lines.append(
+                f"- **{f['id']}** [{f['severity']}]: {f.get('claim', '')}"
             )
-            await postgres_db.update_job_status(
-                job_id,
-                status="failed",
-                error_message=f"Verification limit reached ({max_rounds} rounds)",
-            )
-            new_status = await _set_target_to_autonomy_status(target_job_id)
-            actions.append(
-                f"critic {job_id} failed (round limit), "
-                f"target {target_job_id} auto-accepted to '{new_status}'"
-            )
-            # Trigger curation even on auto-accept
-            target_job = await postgres_db.get_job(target_job_id)
-            if target_job and is_curation_enabled(target_job):
-                await _trigger_curation_final_pass(target_job_id, target_job)
-                actions.append(f"curation final pass triggered for {target_job_id}")
-        else:
-            # Resume target with feedback
-            feedback = freeze_data.get("feedback", "")
-            logger.info(
-                f"Critic {job_id} returned feedback for target {target_job_id} "
-                f"(round {current_round}/{max_rounds})"
-            )
-            await _internal_resume_job(target_job_id, feedback=feedback)
-            actions.append(
-                f"target {target_job_id} resumed with feedback (round {current_round})"
-            )
-    else:
-        logger.warning(f"Unknown verdict '{verdict}' for critic job {job_id}")
+        logger.info(
+            f"Critic {job_id} returned target {target_job_id} "
+            f"({len(open_findings)} open finding(s))"
+        )
+        await _internal_resume_job(target_job_id, feedback="\n".join(feedback_lines))
+        actions.append(
+            f"target {target_job_id} resumed with feedback from critic {job_id}"
+        )
+
+    else:  # escalate
+        status = await _escalate_target(target_job_id, target_job, reason)
+        actions.append(f"target {target_job_id} escalated to '{status}': {reason}")
 
 
 def _verification_gate_decision(
@@ -12490,24 +12511,20 @@ async def _trigger_verification_on_complete(
         "summary": freeze_data.get("summary", ""),
         "confidence": freeze_data.get("confidence", 0),
         "verification_round": len(rounds),
-        # NOTE: kept, despite Task 6's brief saying to delete this — the cap
-        # itself now lives with the target's config and IS read fresh at
-        # decision time above (_verification_gate_decision), never from this
-        # stamp. But _handle_critic_verdict_on_complete (this file, the
-        # 'elif verdict == "returned":' branch above) still reads
-        # critic_context.get("max_verification_rounds", 3) to decide its own
-        # (separately still-live, not part of this task) round-cap
-        # auto-accept. Deleting this key would make THAT check silently fall
-        # back to the hardcoded default of 3 for every critic regardless of
-        # the target's real configured max_rounds — including "0 = unlimited"
-        # — which would auto-accept a target a critic just returned, on a cap
-        # the target never configured. Keeping it stamped correctly costs
-        # nothing (the gate above already escalates at the target's real cap
-        # before a critic old enough to trip that check could ever be
-        # spawned) and avoids a live regression until that function is made
-        # ledger-aware (docs/superpowers/specs/
-        # 2026-07-27-verification-fail-closed-design.md, "_handle_critic_
-        # verdict_on_complete gains ... a terminal-status gate").
+        # NOTE (Task 6 kept this, Task 8 re-confirmed it): as of Task 8,
+        # _handle_critic_verdict_on_complete no longer has a round-cap
+        # auto-accept branch at all — the cap is enforced exactly once, here,
+        # at decision time (_verification_gate_decision), read fresh from the
+        # target's resolved_config on every round, so a target configured
+        # with `max_rounds: 0` (unlimited) is honored correctly. That means
+        # this stamp now has NO reader anywhere in production code (verified:
+        # `grep -rn max_verification_rounds` turns up only this write and
+        # test fixtures). Left in place anyway, on Task 6's original
+        # reasoning: removing a still-read key is what caused the bug this
+        # design replaces (a silent fallback to a hardcoded default of 3),
+        # and confirming "no reader" is a point-in-time fact a future change
+        # could invalidate. Removal, if ever wanted, belongs to a dedicated
+        # cleanup pass with its own grep, not a byproduct of this comment.
         "max_verification_rounds": max_rounds,
     }
 
