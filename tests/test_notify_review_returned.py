@@ -64,6 +64,34 @@ class TestNotifyReviewReturnedToManual:
         email.send_system_notification.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_reason_reaches_the_owner_verbatim(self):
+        """The gate's escalation reason (round cap / no progress / no verdict)
+        is the only thing that tells the owner WHY nobody approved the job."""
+        svc, feed, email = _connected_service()
+
+        reason = "Round limit reached (3) with 1 finding(s) still open (F1)."
+        await svc.notify_review_returned_to_manual(
+            user_id="u1", job_id="job-123", config_name="scholar", reason=reason
+        )
+
+        assert reason in email.send_system_notification.await_args.kwargs["body_md"]
+        assert feed.broadcast.call_args.kwargs["data"]["reason"] == reason
+
+    @pytest.mark.asyncio
+    async def test_without_a_reason_keeps_the_pipeline_died_wording(self):
+        """The sweeper's caller passes no reason — its cause IS the pipeline,
+        and that wording must not regress into a dangling empty quote."""
+        svc, feed, email = _connected_service()
+
+        await svc.notify_review_returned_to_manual(
+            user_id="u1", job_id="job-123", config_name="scholar"
+        )
+
+        body = email.send_system_notification.await_args.kwargs["body_md"]
+        assert "the review pipeline died" in body
+        assert ">" not in body  # no empty blockquote
+
+    @pytest.mark.asyncio
     async def test_returns_error_when_not_connected(self):
         svc = NotificationService()  # not connected → _available False
 

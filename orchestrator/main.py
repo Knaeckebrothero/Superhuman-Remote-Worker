@@ -11488,13 +11488,54 @@ async def _escalate_target(job_id: str, job: dict[str, Any], reason: str) -> str
     Loop jobs must NOT park on ``pending_review`` — the loop advance hook fires
     only on terminal statuses, so a parked loop job wedges the whole loop. They
     resolve ``completed`` with the reason in ``error_message`` for the retro.
+
+    Like its sibling ``_set_target_to_autonomy_status``, this is a TERMINAL
+    transition with no obvious hook point: the target reaches its final state
+    HERE, from the critic's completion or the gate's decision, and never calls
+    /complete of its own. So it owns both follow-ups itself:
+
+    - the session wake, or it arrives a sweeper tick late for every escalation;
+    - a notification, or "escalates to a human" means "sits in a queue nobody
+      is paged about". The unstick watchdog already notifies on ITS path
+      (stale_verification_sweeper); this is the primary one.
+
+    Both are best-effort. The status write is the load-bearing part — a
+    notifier or wake-queue outage must never leave the target in 'reviewing',
+    which is the exact wedge this design exists to remove.
     """
     from services.project_loops import job_loop_id
     from services.verification_ledger import escalation_status
 
-    status = escalation_status(is_loop_job=bool(job_loop_id(job)))
+    is_loop_job = bool(job_loop_id(job))
+    status = escalation_status(is_loop_job=is_loop_job)
     await postgres_db.update_job_status(job_id, status=status, error_message=reason)
     logger.warning("Verification escalated target %s to %s: %s", job_id, status, reason)
+
+    try:
+        await maybe_wake_session(postgres_db, job_id, status)
+        _kick_session_wake_drain(postgres_db)
+    except Exception:
+        logger.exception(
+            "Session wake for escalated target %s failed (non-fatal)", job_id
+        )
+
+    # Loop jobs are deliberately not notified: they resolve 'completed' and the
+    # loop retro reads the reason off ``error_message``, so paging a human per
+    # iteration is noise, not signal.
+    user_id = job.get("user_id")
+    if not is_loop_job and user_id:
+        try:
+            await notification_service.notify_review_returned_to_manual(
+                user_id=str(user_id),
+                job_id=job_id,
+                config_name=job.get("config_name") or "",
+                reason=reason,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to notify owner of escalated target %s (non-fatal)", job_id
+            )
+
     return status
 
 

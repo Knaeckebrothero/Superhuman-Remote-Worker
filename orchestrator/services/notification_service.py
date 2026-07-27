@@ -292,16 +292,24 @@ class NotificationService:
         user_id: str,
         job_id: str,
         config_name: str,
+        reason: str | None = None,
     ) -> dict[str, Any]:
-        """Notify the owner that automated review died and the job is back to manual review.
+        """Notify the owner that automated review ended and a human must decide.
 
-        Called from ``stale_verification_sweeper`` after
-        ``unstick_reviewing_parents`` flips a parent 'reviewing' →
-        'pending_review' because its critic pipeline died. Mirrors
-        ``notify_automation_auto_disabled``: SSE for real-time cockpit plus an
-        email if the user has that channel enabled. Does NOT respect quiet
-        hours — an unattended job needing manual review should reach the owner
-        promptly. Best-effort; failures are logged, never raised.
+        Two callers, both meaning "nothing was approved, it is yours now":
+
+        - ``stale_verification_sweeper``, after ``unstick_reviewing_parents``
+          flips a parent 'reviewing' → 'pending_review' because its critic
+          pipeline died. No ``reason`` — the cause is the pipeline itself.
+        - ``_escalate_target`` (orchestrator/main.py), the verification gate's
+          primary escalation: round cap reached, no progress since the last
+          round, or a critic that finished with no verdict. Passes ``reason``,
+          which is the same text written to the job's ``error_message``.
+
+        Mirrors ``notify_automation_auto_disabled``: SSE for real-time cockpit
+        plus an email if the user has that channel enabled. Does NOT respect
+        quiet hours — an unattended job needing manual review should reach the
+        owner promptly. Best-effort; failures are logged, never raised.
         """
         if not self._available:
             return {"error": "NotificationService not initialized"}
@@ -312,12 +320,21 @@ class NotificationService:
         label = config_name or "job"
         review_path = f"/inbox?job={job_id}&review=1"
         subject = "Job needs manual review — automated verification failed"
-        body_md = (
-            f"Automated verification for your **{label}** job did not complete "
-            f"(the review pipeline died), so it has been returned to **manual "
-            f"review**. Open it in the cockpit to approve it or send it back "
-            f"with feedback."
-        )
+        if reason:
+            body_md = (
+                f"Automated verification for your **{label}** job stopped without "
+                f"approving it, so it needs **manual review**.\n\n"
+                f"> {reason}\n\n"
+                f"Open it in the cockpit to approve it or send it back with "
+                f"feedback."
+            )
+        else:
+            body_md = (
+                f"Automated verification for your **{label}** job did not complete "
+                f"(the review pipeline died), so it has been returned to **manual "
+                f"review**. Open it in the cockpit to approve it or send it back "
+                f"with feedback."
+            )
 
         # SSE broadcast — real-time cockpit notification.
         if self._notification_feed:
@@ -328,6 +345,7 @@ class NotificationService:
                     data={
                         "job_id": job_id,
                         "config_name": config_name,
+                        "reason": reason or "",
                         "cockpit_url": f"{self._cockpit_url}{review_path}",
                     },
                 )
