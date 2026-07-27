@@ -259,17 +259,25 @@ async def test_does_not_fire_while_critic_still_processing(db):
 
 @pytest.mark.asyncio
 async def test_does_not_fire_while_critic_waiting_for_reply(db):
-    """Round-1 fix-loop finding: a critic can legitimately reach
-    'waiting_for_reply' itself. `config/worker_base.yaml` sets
+    """Defence in depth: 'waiting_for_reply' should now be UNREACHABLE for a
+    critic, and the watchdog must still handle it if it ever isn't.
+
+    It used to be reachable: `config/worker_base.yaml` sets
     `tools.communication: [send_message]`; `config/experts/critic/config.yaml`
     never overrides the `communication` key, and `deep_merge`
     (src/core/loader.py) merges the `tools` dict by key rather than replacing
-    it wholesale, so the critic inherits `send_message`. A blocking-mode
+    it wholesale, so the critic inherited `send_message`. A blocking-mode
     `send_message` call sets the CALLER's own job status to
-    'waiting_for_reply' (orchestrator/main.py's send_message handler). That
-    critic is alive, blocked on a human reply — not dead — and the watchdog
-    must not treat it as absent just because 'waiting_for_reply' isn't
-    'waiting'.
+    'waiting_for_reply' (orchestrator/main.py's send_message handler), and
+    NOTHING reaps that state — `communication.blocking_timeout_hours` has no
+    implementation — so the target sat in 'reviewing' forever.
+
+    That is now closed upstream: `_critic_config_override` stamps
+    `tools.communication: []`. This case is kept because the cost of one
+    unreachable branch is far below the cost of a critic silently parked
+    there again: it is alive, blocked on a human reply — not dead — and the
+    watchdog must not treat it as absent just because 'waiting_for_reply'
+    isn't 'waiting'.
     """
     target = uuid4()
     critic = uuid4()

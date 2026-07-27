@@ -12478,15 +12478,26 @@ def _verification_gate_decision(
 def _critic_config_override(parent_llm: dict[str, Any] | None) -> dict[str, Any]:
     """Config override stamped onto every verification critic.
 
-    ``core`` is spelled out explicitly because ``deep_merge`` replaces lists but
-    merges dicts by key: without this, the critic inherits ``job_complete`` and
-    ``mark_complete`` from worker_base and can close itself without a verdict.
+    Each tool group is spelled out explicitly because ``deep_merge`` replaces
+    lists but merges dicts by key — an omitted group is INHERITED, not empty.
+
+    - ``core`` is narrowed so the critic cannot inherit ``job_complete`` /
+      ``mark_complete`` and close itself without a verdict.
+    - ``communication`` is emptied so the critic cannot call ``send_message``
+      in blocking mode, which would flip its OWN job to ``waiting_for_reply``.
+      Nothing reaps that state: ``communication.blocking_timeout_hours`` in
+      config/worker_base.yaml has no implementation anywhere (it appears only
+      in that file and two docs, never in Python), so a critic parked there
+      leaves its target in 'reviewing' forever. A verification critic has no
+      business blocking on a human reply — removing the state upstream is
+      strictly better than adding a reaper for it.
     """
     override: dict[str, Any] = {
         "autonomy": "full",
         "tools": {
             "evaluation": ["approve_job", "return_job_with_feedback"],
             "core": ["next_phase_todos", "todo_complete", "todo_list", "todo_rewind"],
+            "communication": [],
         },
     }
     if parent_llm is not None:
