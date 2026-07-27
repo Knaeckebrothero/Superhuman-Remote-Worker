@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import security.access as access_module
 
@@ -161,6 +162,20 @@ class TestRequireInternalOrJobAccess:
 
 
 class TestPureInternalEndpoints:
+    def test_agent_registration_rejects_self_verified_provenance(self):
+        from main import AgentRegistration
+
+        with pytest.raises(ValidationError, match="self-assert verified"):
+            AgentRegistration(
+                config_name="scholar",
+                pod_ip="10.0.0.1",
+                product_provenance={
+                    "source_revision": "a" * 40,
+                    "artifact_digest": f"sha256:{'b' * 64}",
+                    "provenance_status": "verified",
+                },
+            )
+
     @pytest.mark.asyncio
     async def test_agent_register_without_key_401(self, fake_request):
         from main import AgentRegistration, register_agent

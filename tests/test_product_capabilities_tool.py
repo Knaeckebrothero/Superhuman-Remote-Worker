@@ -16,7 +16,10 @@ from services.product_capabilities import ProductCapabilityService, ResolutionRe
 from services.shared_browser_canvas import BrowserCapabilityResponse
 from src.core.product_capabilities import (
     AgentAction,
+    ComponentProvenance,
     ProductComponent,
+    ProvenanceStatus,
+    SCHEMA_VERSION,
     SchemaCompatibility,
     SessionState,
     UserState,
@@ -120,6 +123,7 @@ def _facts(
     cloud: bool = False,
     protected: bool = False,
     tools: tuple[str, ...] = (),
+    component_provenance: tuple[tuple[ProductComponent, ComponentProvenance], ...] = (),
 ) -> SessionRuntimeFacts:
     if "email" in datasource_types and email_tier is None:
         email_tier = "read"
@@ -145,6 +149,7 @@ def _facts(
             "read_product_guide",
             *tools,
         ),
+        runtime_component_provenance=component_provenance,
     )
 
 
@@ -688,7 +693,7 @@ async def test_same_major_projects_only_known_fields_before_model_exposure():
     assert output.status is CapabilityToolStatus.READY
     assert output.schema_compatibility is SchemaCompatibility.SAME_MAJOR
     assert output.response is not None
-    assert output.response.schema_version == "1.0"
+    assert output.response.schema_version == SCHEMA_VERSION
     for marker in (
         "top-secret-marker",
         "cap-secret-marker",
@@ -698,6 +703,70 @@ async def test_same_major_projects_only_known_fields_before_model_exposure():
         "future_session_field",
     ):
         assert marker not in raw
+
+
+@pytest.mark.asyncio
+async def test_new_agent_projects_schema_1_0_orchestrator_without_m2d_minor_fields():
+    raw_payload = json.loads(await _server_payload("datasources.email"))
+    raw_payload["schema_version"] = "1.0"
+    for component in raw_payload["product"]["components"].values():
+        component.pop("release_version", None)
+        component.pop("documentation_url", None)
+
+    _raw, output = await _invoke(
+        json.dumps(raw_payload).encode(),
+        facts=_facts(),
+    )
+
+    assert output.status is CapabilityToolStatus.READY
+    assert output.schema_compatibility is SchemaCompatibility.SAME_MAJOR
+    assert output.response is not None
+    assert output.response.schema_version == SCHEMA_VERSION
+
+
+@pytest.mark.asyncio
+async def test_live_component_provenance_replaces_server_view_and_detects_mixed_build():
+    raw_payload = json.loads(await _server_payload("datasources.email"))
+    raw_payload["product"] = {
+        "name": "Superhuman Remote Worker",
+        "release_version": "v1.2.3",
+        "mixed_build": None,
+        "components": {
+            "orchestrator": {
+                "source_revision": "a" * 40,
+                "source_url": None,
+                "artifact_digest": None,
+                "content_digest": None,
+                "release_version": "v1.2.3",
+                "documentation_url": None,
+                "provenance_status": "declared",
+            }
+        },
+    }
+    agent = ComponentProvenance(
+        source_revision="b" * 40,
+        provenance_status=ProvenanceStatus.DECLARED,
+    )
+    guide = ComponentProvenance(
+        source_revision="b" * 40,
+        content_digest=f"sha256:{'c' * 64}",
+        provenance_status=ProvenanceStatus.DECLARED,
+    )
+
+    _raw, output = await _invoke(
+        json.dumps(raw_payload).encode(),
+        facts=_facts(
+            component_provenance=(
+                (ProductComponent.AGENT, agent),
+                (ProductComponent.GUIDE, guide),
+            )
+        ),
+    )
+
+    assert output.response is not None
+    assert output.response.product.mixed_build is True
+    assert output.response.product.components[ProductComponent.AGENT] == agent
+    assert output.response.product.components[ProductComponent.GUIDE] == guide
 
 
 @pytest.mark.asyncio
@@ -822,6 +891,30 @@ def test_runtime_facts_are_immutable_canonical_and_reject_private_shape_drift():
         replace(facts, backend_id="remote")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unknown email tier"):
         replace(facts, email_access_tier="admin")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid component provenance"):
+        replace(
+            facts,
+            runtime_component_provenance=(
+                (
+                    ProductComponent.ORCHESTRATOR,
+                    ComponentProvenance(provenance_status=ProvenanceStatus.UNAVAILABLE),
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="invalid component provenance"):
+        replace(
+            facts,
+            runtime_component_provenance=(
+                (
+                    ProductComponent.AGENT,
+                    ComponentProvenance(
+                        source_revision="a" * 40,
+                        artifact_digest=f"sha256:{'b' * 64}",
+                        provenance_status=ProvenanceStatus.VERIFIED,
+                    ),
+                ),
+            ),
+        )
     with pytest.raises(ValueError, match="attached email"):
         SessionRuntimeFacts(
             observed_at=_NOW,

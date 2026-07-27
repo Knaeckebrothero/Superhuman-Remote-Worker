@@ -38,8 +38,24 @@ RUN npm run build
 # Production image
 FROM nginx:alpine
 
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+
 LABEL maintainer="SRW Team"
 LABEL description="Cockpit Angular Frontend"
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="cockpit"
+
+ENV SRW_COMPONENT=cockpit \
+    SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
+    SRW_SOURCE_URL=${SRW_SOURCE_URL} \
+    SRW_RELEASE_VERSION=${SRW_RELEASE_VERSION} \
+    SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
 # Copy built static assets from builder
 COPY --from=builder /app/dist/cockpit/browser /usr/share/nginx/html

@@ -1,7 +1,18 @@
 # Static marketing site + Helm config generator, served by nginx.
 # Build (from repo root):  podman build -t srw-website -f docker/Dockerfile.website .
 FROM nginx:alpine
+
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+
 LABEL description="SRW sales page + self-host config generator"
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="website"
 
 # Only the runtime assets — NOT website/test/ or anything else.
 COPY website/index.html website/configure.html website/generator.mjs website/og-image.png /usr/share/nginx/html/

@@ -74,6 +74,34 @@
           ]
         }
       ]
+    },
+    "firstPartyImage": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1 },
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[a-f0-9]{64}$"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "componentProvenanceDeclaration": {
+      "type": "object",
+      "properties": {
+        "sourceRevision": {
+          "type": "string",
+          "pattern": "^$|^[a-f0-9]{40,64}$"
+        },
+        "releaseVersion": {
+          "type": "string",
+          "pattern": "^$|^[a-z0-9][a-z0-9_.:-]{0,79}$"
+        }
+      }
     }
   },
   "properties": {
@@ -87,6 +115,53 @@
       "type": "object",
       "properties": {
         "domain": { "type": "string" }
+      }
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "orchestrator": { "$ref": "#/definitions/firstPartyImage" },
+        "agent": { "$ref": "#/definitions/firstPartyImage" },
+        "cockpit": { "$ref": "#/definitions/firstPartyImage" },
+        "mcp": { "$ref": "#/definitions/firstPartyImage" },
+        "workspace": { "$ref": "#/definitions/firstPartyImage" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "sourceUrl": {
+          "type": "string",
+          "pattern": "^https://[^@\\s]+$"
+        },
+        "documentationUrl": {
+          "type": "string",
+          "pattern": "^https://[^@\\s]+$"
+        },
+        "releaseVersion": {
+          "type": "string",
+          "pattern": "^$|^[a-z0-9][a-z0-9_.:-]{0,79}$"
+        },
+        "components": {
+          "type": "object",
+          "properties": {
+            "orchestrator": {
+              "$ref": "#/definitions/componentProvenanceDeclaration"
+            },
+            "agent": {
+              "$ref": "#/definitions/componentProvenanceDeclaration"
+            },
+            "cockpit": {
+              "$ref": "#/definitions/componentProvenanceDeclaration"
+            },
+            "mcp": {
+              "$ref": "#/definitions/componentProvenanceDeclaration"
+            },
+            "workspace": {
+              "$ref": "#/definitions/componentProvenanceDeclaration"
+            }
+          }
+        }
       }
     },
     "externalSecrets": {

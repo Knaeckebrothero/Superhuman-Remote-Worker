@@ -35,6 +35,17 @@ from ..core.loader import (
     render_instruction_content,
     supports_parallel_tool_calls,
 )
+from ..core.product_capabilities import ProductComponent
+from ..core.runtime_provenance import (
+    component_provenance_from_environment,
+    inherited_content_provenance,
+    unavailable_component_provenance,
+)
+from ..core.skill_resolution import (
+    APP_GUIDE_LOADER_TOOL,
+    APP_GUIDE_SKILL,
+    skill_bundle_digest,
+)
 from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from ..core.workspace_backend import WorkspaceUnavailableError
 from ..tools import ToolContext, load_tools, apply_instruction_enforcement
@@ -1279,10 +1290,64 @@ class PersistentSession:
             backend is not None and getattr(backend, "supports_file_tools", True)
         )
 
+        backend_id = self._runtime_backend_id(backend)
+        agent_provenance = component_provenance_from_environment(
+            os.environ,
+            ProductComponent.AGENT,
+            include_common=True,
+        )
+        guide_provenance = unavailable_component_provenance()
+        scoped_skills = self.config.extra.get("_resolved_skills", {})
+        if isinstance(scoped_skills, dict):
+            menu = scoped_skills.get("menu")
+            files_by_skill = scoped_skills.get("files")
+            guide_entry = (
+                next(
+                    (
+                        item
+                        for item in menu
+                        if isinstance(item, dict)
+                        and item.get("name") == APP_GUIDE_SKILL
+                        and item.get("system_managed") is True
+                        and item.get("loader_tool") == APP_GUIDE_LOADER_TOOL
+                    ),
+                    None,
+                )
+                if isinstance(menu, list)
+                else None
+            )
+            guide_files = (
+                files_by_skill.get(APP_GUIDE_SKILL)
+                if isinstance(files_by_skill, dict)
+                else None
+            )
+            if (
+                isinstance(guide_entry, dict)
+                and isinstance(guide_files, dict)
+                and all(
+                    isinstance(path, str) and isinstance(content, str)
+                    for path, content in guide_files.items()
+                )
+            ):
+                expected_digest = guide_entry.get("bundle_digest")
+                actual_digest = skill_bundle_digest(guide_files)
+                if expected_digest == actual_digest:
+                    guide_provenance = inherited_content_provenance(
+                        agent_provenance,
+                        content_digest=f"sha256:{actual_digest}",
+                    )
+
+        workspace_provenance = unavailable_component_provenance()
+        if backend_id in {"sandbox", "vm"}:
+            workspace_provenance = component_provenance_from_environment(
+                os.environ,
+                ProductComponent.WORKSPACE,
+            )
+
         try:
             facts = SessionRuntimeFacts(
                 observed_at=datetime.now(timezone.utc),
-                backend_id=self._runtime_backend_id(backend),
+                backend_id=backend_id,
                 backend_supports_shell=bool(getattr(backend, "supports_shell", False)),
                 backend_supports_file_tools=supports_file_tools,
                 backend_supports_canvas_presentation=bool(
@@ -1313,6 +1378,11 @@ class PersistentSession:
                 cloud_mount_active=cloud_active,
                 protected_cloud_active=protected_active,
                 loaded_tool_names=tuple(safe_tool_names),
+                runtime_component_provenance=(
+                    (ProductComponent.AGENT, agent_provenance),
+                    (ProductComponent.GUIDE, guide_provenance),
+                    (ProductComponent.WORKSPACE, workspace_provenance),
+                ),
             )
         except Exception as exc:
             logger.warning(

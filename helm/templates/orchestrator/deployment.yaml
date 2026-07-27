@@ -52,7 +52,7 @@ spec:
         {{- end }}
       containers:
         - name: orchestrator
-          image: "{{ .Values.image.orchestrator.repository }}:{{ .Values.image.orchestrator.tag }}"
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.orchestrator) | quote }}
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
           ports:
             - containerPort: 8085
@@ -121,6 +121,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: PRODUCT_CAPABILITIES_ENDPOINT_ENABLED
+            - name: SRW_DEPLOYMENT_PROVENANCE_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_DEPLOYMENT_PROVENANCE_JSON
             - name: MCP_DATASOURCES_ENABLED
               valueFrom:
                 configMapKeyRef:

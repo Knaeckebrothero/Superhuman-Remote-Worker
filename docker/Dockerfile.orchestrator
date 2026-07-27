@@ -31,13 +31,28 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Production image
 FROM python:3.11-slim
 
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
+
 LABEL maintainer="SRW Team"
 LABEL description="Orchestrator API for agent management and cockpit backend"
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="orchestrator"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
-    PORT=8085
+    PORT=8085 \
+    SRW_COMPONENT=orchestrator \
+    SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
+    SRW_SOURCE_URL=${SRW_SOURCE_URL} \
+    SRW_RELEASE_VERSION=${SRW_RELEASE_VERSION} \
+    SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
 # Create non-root user early so COPY --chown can reference it
 RUN groupadd -r srw && useradd -r -g srw srw

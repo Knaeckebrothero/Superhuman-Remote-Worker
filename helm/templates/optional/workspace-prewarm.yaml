@@ -39,7 +39,7 @@ spec:
         - operator: Exists
       initContainers:
         - name: pull-workspace
-          image: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.workspace) | quote }}
           imagePullPolicy: Always
           command: ["true"]
           resources:
@@ -50,7 +50,7 @@ spec:
               cpu: "100m"
               memory: "64Mi"
         - name: pull-agent
-          image: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.agent) | quote }}
           imagePullPolicy: Always
           command: ["true"]
           resources:

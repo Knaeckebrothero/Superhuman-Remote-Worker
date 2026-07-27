@@ -78,6 +78,52 @@ async def test_register_payload_pod_uid_empty_when_env_unset(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_register_payload_separates_full_declared_provenance_from_short_sha(
+    monkeypatch,
+):
+    revision = "a" * 40
+    monkeypatch.setenv("SRW_COMPONENT", "agent")
+    monkeypatch.setenv("SRW_SOURCE_REVISION", revision)
+    monkeypatch.setenv(
+        "SRW_SOURCE_URL",
+        "https://github.com/knaeckebrothero/Superhuman-Remote-Worker",
+    )
+    monkeypatch.setenv("SRW_RELEASE_VERSION", "v1.2.3")
+    monkeypatch.setenv("BUILD_SHA", revision[:7])
+
+    client = OrchestratorClient(
+        orchestrator_url="http://test-orch:8085",
+        pod_ip="10.0.0.5",
+        pod_port=8001,
+        hostname="srw-agent-test",
+        config_name="defaults",
+        pid=1234,
+    )
+    fake_http = AsyncMock()
+    fake_http.post = AsyncMock(
+        return_value=MagicMock(
+            status_code=200,
+            json=lambda: {"agent_id": "a-1", "heartbeat_interval_seconds": 60},
+        )
+    )
+    client._client = fake_http
+
+    assert await client.register(agent_mode="worker") is True
+
+    payload = fake_http.post.call_args.kwargs["json"]
+    assert payload["build_sha"] == revision[:7]
+    assert payload["product_provenance"] == {
+        "source_revision": revision,
+        "source_url": ("https://github.com/knaeckebrothero/Superhuman-Remote-Worker"),
+        "artifact_digest": None,
+        "content_digest": None,
+        "release_version": "v1.2.3",
+        "documentation_url": None,
+        "provenance_status": "declared",
+    }
+
+
+@pytest.mark.asyncio
 async def test_register_raises_on_409_for_thread_bound():
     """A thread-bound registration that loses the provisioning race gets a 409
     ("thread already bound to another live agent"). register() must raise

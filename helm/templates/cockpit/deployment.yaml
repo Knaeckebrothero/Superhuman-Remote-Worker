@@ -62,7 +62,7 @@ spec:
           command: ["sh", "-c", "until nc -z -w 2 {{ include "srw.fullname" . }}-orchestrator 8085; do sleep 2; done"]
       containers:
         - name: cockpit
-          image: "{{ .Values.image.cockpit.repository }}:{{ .Values.image.cockpit.tag }}"
+          image: {{ include "srw.imageRef" (dict "image" .Values.image.cockpit) | quote }}
           imagePullPolicy: {{ .Values.image.cockpit.pullPolicy }}
           ports:
             - containerPort: 4000

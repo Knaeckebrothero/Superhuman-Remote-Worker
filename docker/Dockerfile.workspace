@@ -10,6 +10,10 @@
 
 FROM ubuntu:24.04
 
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CODE_SERVER_VERSION=4.100.3
 ARG NODE_MAJOR=22
@@ -21,6 +25,18 @@ ARG NODE_MAJOR=22
 # an ARG named RCLONE_VERSION crashes `rclone version` inside the RUN.
 ARG SRW_RCLONE_VERSION=1.74.3
 ARG SRW_RCLONE_SHA256=408cde598307dedc26b7108553cb2147a8d2d12853100447e802f47454582ecc
+
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL io.srw.component="workspace"
+
+ENV SRW_COMPONENT=workspace \
+    SRW_SOURCE_REVISION=${SRW_SOURCE_REVISION} \
+    SRW_SOURCE_URL=${SRW_SOURCE_URL} \
+    SRW_RELEASE_VERSION=${SRW_RELEASE_VERSION} \
+    SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
 # ---------------------------------------------------------------------------
 # 0. Apt tuning: prefer Azure mirror (faster from GHA Azure runners) but keep
