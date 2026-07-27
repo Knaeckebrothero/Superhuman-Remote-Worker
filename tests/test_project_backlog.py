@@ -878,3 +878,219 @@ class TestSpawnLoopJobBacklogWiring(_SpawnLoopJobHarness):
 
         fetch.assert_not_awaited()
         assert create.await_args.kwargs["backlog_block"] is None
+
+
+# =============================================================================
+# Task 6: close the ticket when the campaign is disposed
+# =============================================================================
+
+
+class TestCloseBacklogTicket:
+    @pytest.mark.asyncio
+    async def test_writes_file_and_index(self):
+        """Index-only would be reverted by the next kb_reindex pass, which
+        re-ingests status from the markdown frontmatter."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(
+            return_value="---\nid: feature-x\ntype: feature\nstatus: active\n---\n# T\n"
+        )
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+
+        ok = await close_backlog_ticket(
+            vector_db,
+            gitea,
+            "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+            "feature-x",
+            "resolved",
+        )
+
+        assert ok is True
+        written = gitea.create_or_update_file.await_args.args[2]
+        assert "status: resolved" in written
+        assert "status: active" not in written
+        conn.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gitea_failure_is_not_fatal(self):
+        """A disposition must never fail because a mirror write failed."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(side_effect=RuntimeError("gitea down"))
+
+        ok = await close_backlog_ticket(
+            vector_db,
+            gitea,
+            "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+            "feature-x",
+            "resolved",
+        )
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_gitea_failure_still_updates_the_index(self):
+        """The two writes are independent. If a raised Gitea exception also
+        skipped the index update, a KB/Gitea hiccup would leave the ticket
+        sitting in the pool with no write anywhere to correct it until the
+        note file itself is fixed by hand -- worse than the plain best-effort
+        contract promises."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(side_effect=RuntimeError("gitea down"))
+
+        ok = await close_backlog_ticket(
+            vector_db,
+            gitea,
+            "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+            "feature-x",
+            "resolved",
+        )
+
+        assert ok is False  # the durable (file) write did not happen
+        conn.execute.assert_awaited_once()
+        args = conn.execute.await_args.args
+        assert args[1] == "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"  # project_id
+        assert args[2] == "feature-x"  # note_id
+        assert args[3] == "resolved"  # new_status
+
+    @pytest.mark.asyncio
+    async def test_missing_note_file_degrades_to_index_only(self, caplog):
+        """get_file_content returning None (a 404, not an exception) is the
+        "note file doesn't exist" case called out explicitly in the task
+        constraints. The index must still close -- only the durable write is
+        skipped -- and the skip must be logged, not silent."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(return_value=None)
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+
+        with caplog.at_level(
+            logging.INFO, logger="orchestrator.services.project_backlog"
+        ):
+            ok = await close_backlog_ticket(
+                vector_db,
+                gitea,
+                "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+                "feature-x",
+                "resolved",
+            )
+
+        assert ok is False
+        gitea.create_or_update_file.assert_not_awaited()
+        conn.execute.assert_awaited_once()
+        assert any("index-only close" in r.message for r in caplog.records)
+
+    def test_no_status_line_gains_one(self):
+        """A note that predates the status field (or never had one) must gain
+        exactly one status line, not be left untouched and not gain a
+        duplicate on a second close."""
+        from orchestrator.services.project_backlog import _rewrite_status
+
+        original = "---\nid: feature-x\ntype: feature\n---\n# T\nbody\n"
+        updated = _rewrite_status(original, "resolved")
+
+        assert updated.count("status:") == 1
+        assert "status: resolved" in updated
+        assert "id: feature-x" in updated
+        assert "type: feature" in updated
+        assert updated.endswith("# T\nbody\n")
+
+    def test_surrounding_document_is_byte_identical_except_status_line(self):
+        """_rewrite_status is deliberately a line rewrite, not a YAML
+        round-trip (its own docstring) -- reserializing would reformat every
+        note a human ever wrote. Prove every other line, including odd
+        spacing, blank lines, and the body, survives untouched."""
+        from orchestrator.services.project_backlog import _rewrite_status
+
+        original = (
+            "---\n"
+            "id: feature-x\n"
+            "type: feature\n"
+            "status:   active   \n"  # deliberately odd spacing
+            "tags: [a, b]\n"
+            "\n"
+            "priority: high\n"
+            "---\n"
+            "# A Title\n"
+            "\n"
+            "Some body text with  double  spaces and a trailing note.\n"
+            "  - indented bullet\n"
+        )
+        updated = _rewrite_status(original, "resolved")
+
+        orig_lines = original.splitlines()
+        new_lines = updated.splitlines()
+        assert len(orig_lines) == len(new_lines)  # no lines added or removed
+
+        diffs = [
+            (i, o, n) for i, (o, n) in enumerate(zip(orig_lines, new_lines)) if o != n
+        ]
+        assert len(diffs) == 1
+        _, old_line, new_line = diffs[0]
+        assert old_line.startswith("status:")
+        assert new_line == "status: resolved"

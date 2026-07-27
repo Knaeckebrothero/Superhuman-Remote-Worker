@@ -13345,6 +13345,21 @@ async def _advance_planner_campaign(
             ),
         )
 
+        # Mirror the verdict onto the ticket. ship → resolved, kill → archived;
+        # extend leaves it active because the continuing campaign still owns it.
+        ticket_status = {"ship": "resolved", "kill": "archived"}.get(outcome)
+        ticket_id = campaign.get("initiative_note_id")
+        if ticket_status and ticket_id and vector_db is not None:
+            from services.project_backlog import close_backlog_ticket
+
+            await close_backlog_ticket(
+                vector_db,
+                gitea_client,
+                str(loop.get("project_id")),
+                str(ticket_id),
+                ticket_status,
+            )
+
     if not normalized["stages"]:
         # Dispose-only filing: the campaign was closed above; open nothing and
         # fall back to plain rotation for the next turn. Persisted in its own

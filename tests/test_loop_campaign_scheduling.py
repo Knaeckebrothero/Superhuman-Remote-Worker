@@ -1416,6 +1416,156 @@ class TestLoopNotifications:
         assert "evidence green" in kw["message"]
 
 
+class TestDispositionClosesBacklogTicket:
+    """Task 6: the critic's verdict mirrors onto the ticket the campaign was
+    built from. ship/kill close it (docs/superpowers/specs/
+    2026-07-26-project-backlog-pipeline-design.md); extend must NOT -- the
+    continuing campaign still owns it, and getting this wrong would close a
+    ticket that is still being worked. close_backlog_ticket itself (its
+    file+index dual write, best-effort contract, and frontmatter rewrite) is
+    covered at the unit level in test_project_backlog.py::
+    TestCloseBacklogTicket -- these prove the *mapping* main.py performs
+    before it ever gets there.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ship_closes_the_ticket_as_resolved(self):
+        from main import _rotate_loop_to_next_stage
+
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        close = AsyncMock(return_value=True)
+        prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+        reviewed = _campaign(
+            status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
+        )
+        plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
+        pid = str(uuid.uuid4())
+        with _patched_main(db, spawn):
+            with patch("main.vector_db", MagicMock()):
+                with patch("services.project_backlog.close_backlog_ticket", close):
+                    await _rotate_loop_to_next_stage(
+                        _loop(campaign=reviewed, project_id=pid),
+                        seq_index_completed=1,
+                        base_total=13,
+                        next_remaining=16,
+                        consecutive=0,
+                        last_error=None,
+                        actions=[],
+                        completed_job=_critic_job(plan),
+                        completed_ctx=_critic_job(plan)["context"],
+                        completed_failed=False,
+                    )
+        close.assert_awaited_once()
+        args = close.await_args.args
+        assert args[2] == pid  # project_id
+        assert args[3] == "qa-finding-f5"  # _campaign()'s default initiative
+        assert args[4] == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_kill_closes_the_ticket_as_archived(self):
+        from main import _rotate_loop_to_next_stage
+
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        close = AsyncMock(return_value=True)
+        prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+        reviewed = _campaign(
+            status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
+        )
+        plan = {"disposition": {"outcome": "kill", "notes": "dead end"}}
+        with _patched_main(db, spawn):
+            with patch("main.vector_db", MagicMock()):
+                with patch("services.project_backlog.close_backlog_ticket", close):
+                    await _rotate_loop_to_next_stage(
+                        _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                        seq_index_completed=1,
+                        base_total=13,
+                        next_remaining=16,
+                        consecutive=0,
+                        last_error=None,
+                        actions=[],
+                        completed_job=_critic_job(plan),
+                        completed_ctx=_critic_job(plan)["context"],
+                        completed_failed=False,
+                    )
+        close.assert_awaited_once()
+        assert close.await_args.args[4] == "archived"
+
+    @pytest.mark.asyncio
+    async def test_extend_does_not_touch_the_ticket(self):
+        """The highest-stakes case: getting this wrong closes a ticket that
+        is still being worked by the very campaign that just extended
+        itself."""
+        from main import _rotate_loop_to_next_stage
+
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        close = AsyncMock(return_value=True)
+        prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+        reviewed = _campaign(
+            status="review",
+            stages_done=3,
+            extensions_used=0,
+            id=prior_critic,
+            plan_job_id=prior_critic,
+        )
+        plan = _plan(
+            stages=["developer"],
+            disposition={"outcome": "extend", "notes": "one more push"},
+        )
+        with _patched_main(db, spawn):
+            with patch("main.vector_db", MagicMock()):
+                with patch("services.project_backlog.close_backlog_ticket", close):
+                    await _rotate_loop_to_next_stage(
+                        _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                        seq_index_completed=1,
+                        base_total=13,
+                        next_remaining=16,
+                        consecutive=0,
+                        last_error=None,
+                        actions=[],
+                        completed_job=_critic_job(plan),
+                        completed_ctx=_critic_job(plan)["context"],
+                        completed_failed=False,
+                    )
+        close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_vector_db_skips_the_close_call(self):
+        """A KB/pgvector outage must cost the mirror, never the disposition
+        itself -- the guard short-circuits before close_backlog_ticket, and
+        the campaign_history entry still gets written."""
+        from main import _rotate_loop_to_next_stage
+
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        close = AsyncMock(return_value=True)
+        prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+        reviewed = _campaign(
+            status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
+        )
+        plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
+        with _patched_main(db, spawn):
+            with patch("main.vector_db", None):
+                with patch("services.project_backlog.close_backlog_ticket", close):
+                    await _rotate_loop_to_next_stage(
+                        _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                        seq_index_completed=1,
+                        base_total=13,
+                        next_remaining=16,
+                        consecutive=0,
+                        last_error=None,
+                        actions=[],
+                        completed_job=_critic_job(plan),
+                        completed_ctx=_critic_job(plan)["context"],
+                        completed_failed=False,
+                    )
+        close.assert_not_awaited()
+        pre_spawn = db.update_project_loop.call_args_list[0].kwargs
+        assert pre_spawn["campaign_history"][-1]["outcome"] == "ship"
+
+
 class TestLoopPlanTool:
     class _FakeResp:
         def __init__(self, status_code: int, payload: Any):
