@@ -19,6 +19,7 @@ import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {ProjectLoopComponent} from './project-loop.component';
+import {ProjectBacklogComponent} from './project-backlog.component';
 import {ExternalImageDirective} from '../../ui/external-image';
 import {
     Datasource,
@@ -59,6 +60,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     MarkdownComponent,
     ExternalImageDirective,
     ProjectLoopComponent,
+    ProjectBacklogComponent,
   ],
   template: `
     <div class="page-container">
@@ -764,6 +766,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           <!-- SETTINGS TAB -->
           @if (activeTab() === 'loop') {
             <app-project-loop [projectId]="project()?.id ?? ''" />
+            <app-project-backlog [projectId]="project()?.id ?? ''" />
           }
 
           @if (activeTab() === 'settings') {

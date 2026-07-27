@@ -1229,6 +1229,23 @@
       "deleteConfirm": "Are you sure you want to permanently delete this project? This cannot be undone."
     }
   },
+  "projectBacklog": {
+    "title": "Backlog",
+    "refresh": "Refresh",
+    "totalLabel": "Total",
+    "inProgress": "In progress",
+    "empty": "No open tickets yet — the loop's scholars will file ideas here.",
+    "priority": {
+      "high": "High",
+      "normal": "Normal",
+      "low": "Low"
+    },
+    "type": {
+      "feature": "Feature",
+      "issue": "Issue",
+      "idea": "Idea"
+    }
+  },
   "chat": {
     "defaultTitle": "Persistent Agent",
     "connection": {
