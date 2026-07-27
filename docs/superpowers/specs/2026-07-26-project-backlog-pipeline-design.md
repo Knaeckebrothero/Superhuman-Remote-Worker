@@ -79,9 +79,21 @@ Storage: the human-facing frontmatter value is the word; `knowledge_index` carri
 
 ### 3. Injection, not search
 
-The orchestrator runs the pool query and **injects the rendered list into the kickoff**: id, type, priority, title; capped at the top 20 by priority with a count of the remainder. The fictional "check the KB for … the current open backlog" line is deleted.
+The orchestrator runs the pool query and **injects the rendered list into the kickoff** — no tool call, no search. The fictional "check the KB for … the current open backlog" line is deleted.
 
-This mirrors the handover-brief principle: the platform hands over state, the agent never re-derives it. Every loop role receives the list (a developer benefits from the context); only the critic carries selection duty.
+Rendered shape, in this order: a **totals line broken down by priority**, then the in-progress ticket, then the list capped at the top 20 (priority first, oldest-first within a priority):
+
+```
+PROJECT BACKLOG — 34 open: 12 high, 15 normal, 7 low (showing top 20)
+IN PROGRESS: [high] issue-deploy-docs-missing — Deployment docs missing for self-host
+  [high]   feature  feature-permission-aware-rag — Permission-aware RAG boundary
+  [normal] idea     idea-cache-warm-on-boot — Warm the embedding cache on boot
+  … 18 more
+```
+
+**The per-priority counts come before the list and are not optional.** With a hard cap, a large pool hides its own tail: fifty `high` tickets and the `low` ideas are never rendered, so the idea bucket silently becomes write-only — the exact failure the feature exists to prevent. The counts tell the reader a tail exists and roughly what is in it, so it can ask for more (`kb_list`) instead of believing the visible list is the whole world. One line of prompt.
+
+This mirrors the handover-brief principle: the platform hands over state, the agent never re-derives it. Every loop role receives the block (a developer benefits from the context); only the critic carries selection duty.
 
 ### 4. Lifecycle
 
@@ -125,7 +137,7 @@ The rule that keeps this out of the un-healable-state trap: **the engine never r
 | Empty pool | Critic falls back to today's self-directed selection from the loop goal, and is instructed to file tickets. No wedge. |
 | Mirror write fails | Logged; DB authoritative; repaired at the next disposition. |
 | Ticket deleted mid-campaign | Campaign carries its own `title` and `acceptance`, so it continues; the mirror write no-ops. |
-| Very large pool | Bounded injection (top 20 + remainder count) keeps kickoff size sane. |
+| Very large pool | Bounded injection keeps kickoff size sane; the per-priority totals line (§3) prevents the cap from hiding the tail, and `kb_list` reaches the rest on demand. |
 | Duplicate ideas | v1 relies on the overseer seeing the whole list at once — already strictly better than similarity-guessing. Automatic dedup is out of scope. |
 | Priority absent (legacy note) | Defaults to `normal` rank; no migration backfill needed beyond the column default. |
 
