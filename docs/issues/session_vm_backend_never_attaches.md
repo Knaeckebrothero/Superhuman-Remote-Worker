@@ -19,7 +19,9 @@ tags:
   gate not yet run.** Caveat below on where the failure reason surfaces.
 - **Defect 3 — split out**, root cause unknown:
   `docs/issues/vm_guest_boots_to_emergency_shell.md`.
-- **Defect 4 — open.**
+- **Defect 4 — FIXED** (2026-07-27, uncommitted): `_thread_vm_ids` deleted,
+  replaced by a per-event DB lookup. Unit-verified; **dev live gate not yet
+  run.**
 - Sibling bug found while fixing 1, filed separately:
   `docs/issues/workspace_suspension_infers_tier_from_metadata_presence.md`.
 
@@ -239,11 +241,36 @@ publishing replica *is also* the leader:
 That is a coin flip per VM session. Any orchestrator restart also drops the set
 entirely, orphaning every in-flight VM session it had published.
 
-**Fix:** stop inferring entity type from process memory. The entity kind is
-already durable — resolve it per event (thread row vs job row lookup, or an
-`entity_type` field echoed by the controller in the payload it already carries),
-and drop `_thread_vm_ids`. Worth confirming whether the leader gate on
-`_on_daemon_register` is still load-bearing once routing is durable.
+**FIXED 2026-07-27 (uncommitted).** `_thread_vm_ids` is deleted. A new
+`NatsBridge._vm_entity_is_thread(entity_id)` resolves the owning entity per event
+by DB lookup (`get_thread` → `get_job`), returning `True`/`False`/`None`, and all
+three call sites (`_on_vm_lifecycle_status`, `_on_daemon_register`,
+`_on_daemon_heartbeat`) use it.
+
+Chosen over having the controller echo `entity_type`: the register event
+originates from the *in-VM daemon*, seeded from the `job-config.json` baked into
+the golden image, so that route would need a golden-image + daemon change and
+would not fix VMs already running. The DB lookup needs no cross-component
+coordination.
+
+`None` (neither a thread nor a job) is treated as **do not write** rather than
+defaulting to job — guessing a table is the failure mode being removed — and logs
+as `unknown-entity`.
+
+Two deliberate non-changes:
+
+- **The leader gate on `_on_daemon_register` stays.** It guards the one-shot
+  promotion side-effects (`_notify_vm_ready` → IDE seed + dispatch poke), which
+  should fire once per VM. It is now *correct* rather than accidentally correct:
+  the leader can resolve any entity, so it no longer matters which replica
+  published the create.
+- **`_on_vm_lifecycle_status` remains un-gated**, so both replicas now write the
+  same row instead of one writing to a nonexistent job row. The merges are
+  idempotent, so the duplicate write is harmless.
+
+Cost is one indexed lookup per VM lifecycle event. These are rare (create/status/
+register); the heartbeat is the only repeating one and is per-VM low-frequency,
+so no cache was added.
 
 ## Scope
 
