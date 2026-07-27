@@ -12564,6 +12564,25 @@ async def _trigger_verification_on_complete(
         actions.append(f"target {job_id} escalated: {reason}")
         return
 
+    # A critic for this target is already in flight. `complete_job` accepts
+    # entry statuses processing/reviewing/pending_review/completed, so a
+    # retried /complete on a target already in 'reviewing' lands here a second
+    # time; without this the round gets a SECOND critic. Both would then
+    # compute their round number and finding ids from a pre-append read, so
+    # the ids collide — and because `fold_open_findings` keys by id, that is
+    # the one interleaving able to make a blocking finding vanish from the
+    # open set and produce an unwarranted approval.
+    #
+    # Deliberately checked AFTER the gate decision: an in-flight critic must
+    # not suppress an escalation the ledger already justifies.
+    if await postgres_db.has_live_verification_critic(job_id):
+        logger.info(
+            f"Critic skipped for job {job_id}: one is already in flight "
+            f"(duplicate /complete for round {len(rounds) + 1})"
+        )
+        actions.append(f"critic already in flight for {job_id} — spawn skipped")
+        return
+
     # Fall through to create a FRESH critic. This is now the ONLY path — round
     # number and the open-findings brief come from the ledger (`rounds`),
     # never from a counter or resumed state on a critic, so a critic that

@@ -444,6 +444,87 @@ async def test_survives_a_non_array_verification_rounds(db):
         assert [str(r["id"]) for r in rows] == [str(target)], f"failed for {bad}"
 
 
+# ---------------------------------------------------------------------------
+# has_live_verification_critic — the duplicate-spawn guard's predicate.
+#
+# Lives here rather than in tests/test_atomic_job_context.py because it needs
+# real `parent_job_id` + `context` columns, which only the full
+# schema_current.sql fixture above provides. Same "NULL semantics and JSON
+# operator propagation aren't safe to trust to mocks" rationale as the rest of
+# this module.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", ["created", "processing", "paused", "waiting", "waiting_for_reply"]
+)
+async def test_live_critic_is_detected(db, status):
+    target = uuid4()
+    critic = uuid4()
+    await _insert_job(db, job_id=target, status="reviewing")
+    await _insert_job(
+        db,
+        job_id=critic,
+        status=status,
+        parent_job_id=target,
+        context={"verification_target": str(target)},
+    )
+
+    assert await db.has_live_verification_critic(str(target)) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "pending_review"])
+async def test_finished_critic_is_not_live(db, status):
+    target = uuid4()
+    critic = uuid4()
+    await _insert_job(db, job_id=target, status="reviewing")
+    await _insert_job(
+        db,
+        job_id=critic,
+        status=status,
+        parent_job_id=target,
+        context={"verification_target": str(target)},
+    )
+
+    assert await db.has_live_verification_critic(str(target)) is False
+
+
+@pytest.mark.asyncio
+async def test_no_children_is_not_live(db):
+    target = uuid4()
+    await _insert_job(db, job_id=target, status="reviewing")
+
+    assert await db.has_live_verification_critic(str(target)) is False
+
+
+@pytest.mark.asyncio
+async def test_live_scholar_child_is_not_a_critic(db):
+    """`parent_job_id` alone also matches scholars and delegation children —
+    only rows carrying `context->>'verification_target'` count, or a job with
+    a live scholar could never get its first critic."""
+    target = uuid4()
+    scholar = uuid4()
+    await _insert_job(db, job_id=target, status="reviewing")
+    await _insert_job(
+        db,
+        job_id=scholar,
+        status="processing",
+        parent_job_id=target,
+        context={"scholar_target": str(target)},
+    )
+
+    assert await db.has_live_verification_critic(str(target)) is False
+
+
+@pytest.mark.asyncio
+async def test_invalid_uuid_is_reported_live(db):
+    """Fail CLOSED: an unusable id must not read as "no critic exists" and
+    licence a spawn."""
+    assert await db.has_live_verification_critic("not-a-uuid") is True
+
+
 @pytest.mark.asyncio
 async def test_cas_does_not_touch_non_reviewing_targets(db):
     """The CAS (`WHERE p.status = 'reviewing'`) — a target already moved on
