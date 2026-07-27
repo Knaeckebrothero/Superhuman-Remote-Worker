@@ -21,6 +21,7 @@ work because of it — it only sorts what the agent is shown.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -187,3 +188,95 @@ def render_backlog_block(
         lines.append(f"  … {remainder} more (use kb_list to see them)")
 
     return "\n".join(lines)
+
+
+_STATUS_LINE = re.compile(r"^status:.*$", re.MULTILINE)
+
+
+def _rewrite_status(markdown: str, new_status: str) -> str:
+    """Replace the frontmatter ``status:`` line, or insert one if absent.
+
+    Deliberately a line rewrite rather than a YAML round-trip: the note is a
+    human-editable document and reserializing it would reformat everything the
+    author wrote.
+    """
+    if not markdown.startswith("---"):
+        return markdown
+    head, sep, tail = markdown[3:].partition("\n---")
+    if not sep:
+        return markdown
+    if _STATUS_LINE.search(head):
+        head = _STATUS_LINE.sub(f"status: {new_status}", head, count=1)
+    else:
+        head = head.rstrip("\n") + f"\nstatus: {new_status}\n"
+    return "---" + head + sep + tail
+
+
+async def close_backlog_ticket(
+    vector_db: Any,
+    gitea: Any,
+    project_id: str,
+    note_id: str,
+    new_status: str,
+) -> bool:
+    """Mirror a ticket's closed status to the note file AND the index row.
+
+    The database (campaign + campaign_history) stays authoritative for what the
+    loop did; this only keeps the pool and the human-readable note in step.
+    Best-effort by contract: a disposition must never fail because a mirror
+    write failed. Returns True only when the durable (file) write succeeded.
+    """
+    repo_name = f"project-{str(project_id)[:8]}-jobs"
+    file_path = f"knowledge/{note_id}.md"
+    file_written = False
+    try:
+        current = await gitea.get_file_content(repo_name, file_path)
+        if current:
+            updated = _rewrite_status(current, new_status)
+            file_written = bool(
+                await gitea.create_or_update_file(
+                    repo_name,
+                    file_path,
+                    updated,
+                    f"backlog: {note_id} → {new_status}",
+                )
+            )
+        else:
+            logger.info(
+                "backlog: note file %s not found in %s — index-only close",
+                file_path,
+                repo_name,
+            )
+    except Exception:
+        logger.warning(
+            "backlog: file mirror failed for %s (%s) — the next kb_reindex will "
+            "restore the pool entry and the overseer will see it again",
+            note_id,
+            new_status,
+            exc_info=True,
+        )
+
+    try:
+        async with vector_db.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE knowledge_index
+                   SET status = $3, modified_at = NOW()
+                 WHERE project_id = $1::uuid
+                   AND note_id = $2
+                   AND note_type = ANY($4::text[])
+                """,
+                project_id,
+                note_id,
+                new_status,
+                list(BACKLOG_NOTE_TYPES),
+            )
+    except Exception:
+        logger.warning(
+            "backlog: index mirror failed for %s (%s)",
+            note_id,
+            new_status,
+            exc_info=True,
+        )
+
+    return file_written
