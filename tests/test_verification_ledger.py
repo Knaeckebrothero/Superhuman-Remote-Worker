@@ -126,3 +126,102 @@ class TestComputeVerdict:
     def test_mixed_returns(self):
         assert compute_verdict([{"id": "F1", "severity": "low"},
                                 {"id": "F2", "severity": "high"}]) == "returned"
+
+
+from orchestrator.services.verification_ledger import (  # noqa: E402
+    escalation_status,
+    render_prior_findings,
+    validate_dispositions,
+    validate_verdict_call,
+)
+
+OPEN_HIGH = [{"id": "F1", "severity": "high", "claim": "missing source"}]
+
+
+class TestValidateDispositions:
+    def test_valid_resolved(self):
+        assert validate_dispositions(
+            [{"id": "F1", "disposition": "RESOLVED", "quote": "new text"}], OPEN_HIGH
+        ) == []
+
+    def test_resolved_without_quote_rejected(self):
+        errors = validate_dispositions(
+            [{"id": "F1", "disposition": "RESOLVED"}], OPEN_HIGH
+        )
+        assert len(errors) == 1
+        assert "quote" in errors[0].lower()
+
+    def test_disputed_without_reason_rejected(self):
+        errors = validate_dispositions(
+            [{"id": "F1", "disposition": "DISPUTED"}], OPEN_HIGH
+        )
+        assert len(errors) == 1
+        assert "reason" in errors[0].lower()
+
+    def test_missing_disposition_for_open_blocking_rejected(self):
+        errors = validate_dispositions([], OPEN_HIGH)
+        assert len(errors) == 1
+        assert "F1" in errors[0]
+
+    def test_unknown_id_rejected(self):
+        errors = validate_dispositions(
+            [{"id": "F1", "disposition": "STILL_OPEN"},
+             {"id": "F99", "disposition": "RESOLVED", "quote": "q"}], OPEN_HIGH
+        )
+        assert any("F99" in e for e in errors)
+
+    def test_unknown_disposition_value_rejected(self):
+        errors = validate_dispositions(
+            [{"id": "F1", "disposition": "PROBABLY_FINE"}], OPEN_HIGH
+        )
+        assert any("PROBABLY_FINE" in e for e in errors)
+
+    def test_non_blocking_findings_need_no_disposition(self):
+        # Otherwise low-severity nits accumulate and must be re-answered forever.
+        open_low = [{"id": "F1", "severity": "low", "claim": "typo"}]
+        assert validate_dispositions([], open_low) == []
+
+
+class TestValidateVerdictCall:
+    def test_returned_with_no_findings_rejected(self):
+        # The incident: `issues: "[]"` recorded as "Issues: 0, Severity: high".
+        errors = validate_verdict_call("returned", [])
+        assert len(errors) == 1
+        assert "no findings" in errors[0].lower()
+
+    def test_returned_with_findings_ok(self):
+        assert validate_verdict_call("returned", [{"claim": "x", "severity": "high"}]) == []
+
+    def test_approved_with_no_findings_ok(self):
+        assert validate_verdict_call("approved", []) == []
+
+
+class TestRenderPriorFindings:
+    def test_empty_states_none_open(self):
+        assert "No open findings" in render_prior_findings([])
+
+    def test_lists_ids_and_claims(self):
+        text = render_prior_findings(
+            [{"id": "F1", "severity": "high", "claim": "missing source",
+              "evidence": "line 44", "opened_round": 1, "disputed": False}]
+        )
+        assert "F1" in text
+        assert "missing source" in text
+        assert "RESOLVED" in text  # the instruction block explains dispositions
+
+    def test_marks_disputed(self):
+        text = render_prior_findings(
+            [{"id": "F1", "severity": "high", "claim": "c", "opened_round": 1,
+              "disputed": True, "dispute_reason": "disagree"}]
+        )
+        assert "DISPUTED" in text
+
+
+class TestEscalationStatus:
+    def test_ordinary_job_goes_to_human_gate(self):
+        assert escalation_status(is_loop_job=False) == "pending_review"
+
+    def test_loop_job_must_not_park(self):
+        # A pending_review loop job wedges the loop forever: the advance hook
+        # only fires on terminal statuses.
+        assert escalation_status(is_loop_job=True) == "completed"
