@@ -4586,7 +4586,26 @@ class PostgresDB:
     # The inner scalar subquery returns NULL when no critic child exists at
     # all; `r->>'critic_job_id' = NULL` can then never match any row, so the
     # NOT EXISTS is true and the watchdog is eligible to fire — mirroring the
-    # old query's "(or none exists)" case.
+    # old query's "(or none exists)" case. Its `ORDER BY` breaks ties on
+    # `c.id` — two critic children can never share a `created_at` in
+    # practice (one is always spawned strictly after the other resolves),
+    # but the tiebreaker removes the theoretical ambiguity of picking an
+    # arbitrary row when timestamps happen to collide.
+    #
+    # The non-terminal list is every status a critic can actually be in
+    # while still possibly delivering a trustworthy verdict — NOT just
+    # "hasn't reached a terminal job status yet". `waiting_for_reply` is in
+    # it because a critic inherits `communication: [send_message]` from
+    # worker_base.yaml (its own expert config never overrides that tools
+    # key, and `deep_merge` merges the `tools` dict by key rather than
+    # replacing it — see src/core/loader.py), and a blocking `send_message`
+    # call flips the CALLER's own job to `waiting_for_reply`
+    # (orchestrator/main.py's send_message handler) — so a critic legitimately
+    # blocked on a human reply must not be treated as absent. `reviewing` is
+    # deliberately absent: a critic can never reach it itself —
+    # `_trigger_verification_on_complete` skips any job with a
+    # `parent_job_id`, and a critic always has one, so it is never
+    # verification-wrapped into `reviewing`.
     #
     # The CAS (``WHERE p.status = 'reviewing'``) makes this idempotent and
     # safe against a concurrent sweeper tick / the verdict handler.
@@ -4602,7 +4621,10 @@ class PostgresDB:
                  SELECT 1 FROM jobs c
                   WHERE c.parent_job_id = p.id
                     AND c.context->>'verification_target' IS NOT NULL
-                    AND c.status IN ('created', 'processing', 'paused', 'waiting')
+                    AND c.status IN (
+                        'created', 'processing', 'paused', 'waiting',
+                        'waiting_for_reply'
+                    )
                )
            AND NOT EXISTS (
                  SELECT 1
@@ -4614,7 +4636,7 @@ class PostgresDB:
                               FROM jobs c
                              WHERE c.parent_job_id = p.id
                                AND c.context->>'verification_target' IS NOT NULL
-                             ORDER BY c.created_at DESC
+                             ORDER BY c.created_at DESC, c.id DESC
                              LIMIT 1
                         )
                )
@@ -4638,9 +4660,10 @@ class PostgresDB:
         recently spawned critic — see ``_UNSTICK_REVIEWING_SQL`` above for the
         full "why not just check every child is failed/cancelled" reasoning:
 
-        - A live critic ('processing'/'created'/'paused'/'waiting') keeps the
-          parent untouched — a long review or a recovering (paused) critic is
-          never pre-empted.
+        - A live critic ('processing'/'created'/'paused'/'waiting'/
+          'waiting_for_reply') keeps the parent untouched — a long review, a
+          recovering (paused) critic, or one blocked on a human reply via a
+          blocking ``send_message`` is never pre-empted.
         - A `completed` critic whose id is already on the ledger ALSO keeps
           the parent untouched — that is the verdict handler's job; the
           ledger check (not a blanket 'completed' exclusion, which an old
