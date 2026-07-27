@@ -12,15 +12,23 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+TARGET_ID = "t1"
+
+
 @pytest.fixture
 def ledger_state():
     """In-memory stand-in for jobs.context.verification_rounds.
 
     ``freeze_data`` defaults to ``None`` (matching a target row with no
-    completion freeze yet); tests that need to pin the TARGET's HEAD commit
-    set it explicitly.
+    completion freeze yet); tests that need to pin the TARGET's progress
+    markers set it explicitly.
+
+    ``critic_targets`` maps a critic job id to the target its
+    ``context.verification_target`` names. Anything not listed defaults to
+    ``TARGET_ID`` — the ordinary case, where the critic really was spawned for
+    the job it is writing to.
     """
-    return {"rounds": [], "freeze_data": None}
+    return {"rounds": [], "freeze_data": None, "critic_targets": {}}
 
 
 @pytest.fixture
@@ -37,10 +45,21 @@ def fake_db(ledger_state):
         return len(ledger_state["rounds"])
 
     async def _get_job(job_id):
+        if job_id == TARGET_ID:
+            return {
+                "id": job_id,
+                "context": {"verification_rounds": ledger_state["rounds"]},
+                "freeze_data": ledger_state.get("freeze_data"),
+            }
+        # A critic row: parented to, and pointed at, its target.
+        target = ledger_state["critic_targets"].get(job_id, TARGET_ID)
+        if target is None:
+            return None  # critic row missing entirely
         return {
             "id": job_id,
-            "context": {"verification_rounds": ledger_state["rounds"]},
-            "freeze_data": ledger_state.get("freeze_data"),
+            "parent_job_id": target,
+            "context": {"verification_target": target},
+            "freeze_data": None,
         }
 
     db.append_verification_round = AsyncMock(side_effect=_append)
@@ -338,6 +357,148 @@ class TestReturnWithNoNewFindingsButPriorOpen:
                 head_commit="aaa",
             )
         assert exc.value.status_code == 409
+
+
+class TestCriticMustBelongToTheTarget:
+    """The endpoint takes ``target_job_id`` from the URL and ``critic_job_id``
+    from the body, authenticated only by ``X-Internal-Key`` — and the target is
+    chosen by the MODEL (``approve_job(job_id=...)`` flows straight through).
+
+    A confused critic writing to the wrong job's ledger is fail-closed for its
+    REAL target (which then escalates for lack of a verdict), but it pollutes
+    an unrelated job's ledger with phantom findings that get injected into that
+    job's next critic brief and can force its cap / no-progress escalation.
+    Same principle as the rest of this design: don't trust the model's
+    assertion about which job it is judging.
+    """
+
+    @pytest.mark.asyncio
+    async def test_critic_pointed_at_another_target_is_rejected(
+        self, fake_db, ledger_state
+    ):
+        from fastapi import HTTPException
+
+        from orchestrator.main import _record_verification_round_impl
+
+        ledger_state["critic_targets"]["c-elsewhere"] = "some-other-job"
+
+        with pytest.raises(HTTPException) as exc:
+            await _record_verification_round_impl(
+                postgres_db=fake_db,
+                target_job_id=TARGET_ID,
+                critic_job_id="c-elsewhere",
+                asserted_verdict="returned",
+                opened=[{"severity": "high", "claim": "x"}],
+                dispositions=[],
+                head_commit="aaa",
+            )
+
+        assert exc.value.status_code == 403
+        assert ledger_state["rounds"] == [], "a stranger's finding reached the ledger"
+
+    @pytest.mark.asyncio
+    async def test_non_critic_job_id_is_rejected(self, fake_db, ledger_state):
+        """A job with no ``verification_target`` at all — a scholar, a
+        delegation child, or an ordinary job id typed by the model."""
+        from fastapi import HTTPException
+
+        from orchestrator.main import _record_verification_round_impl
+
+        ledger_state["critic_targets"]["not-a-critic"] = ""
+
+        with pytest.raises(HTTPException) as exc:
+            await _record_verification_round_impl(
+                postgres_db=fake_db,
+                target_job_id=TARGET_ID,
+                critic_job_id="not-a-critic",
+                asserted_verdict="approved",
+                opened=[],
+                dispositions=[],
+                head_commit="aaa",
+            )
+
+        assert exc.value.status_code == 403
+        assert ledger_state["rounds"] == []
+
+    @pytest.mark.asyncio
+    async def test_missing_critic_job_is_rejected(self, fake_db, ledger_state):
+        from fastapi import HTTPException
+
+        from orchestrator.main import _record_verification_round_impl
+
+        ledger_state["critic_targets"]["ghost"] = None  # get_job returns None
+
+        with pytest.raises(HTTPException) as exc:
+            await _record_verification_round_impl(
+                postgres_db=fake_db,
+                target_job_id=TARGET_ID,
+                critic_job_id="ghost",
+                asserted_verdict="approved",
+                opened=[],
+                dispositions=[],
+                head_commit="aaa",
+            )
+
+        assert exc.value.status_code == 403
+        assert ledger_state["rounds"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_right_critic_still_records(self, fake_db, ledger_state):
+        """Contrast case: an implementation that rejects everything would pass
+        the three tests above."""
+        from orchestrator.main import _record_verification_round_impl
+
+        result = await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id=TARGET_ID,
+            critic_job_id="c1",
+            asserted_verdict="approved",
+            opened=[],
+            dispositions=[],
+            head_commit="aaa",
+        )
+
+        assert result["verdict"] == "approved"
+
+    @pytest.mark.asyncio
+    async def test_jsonb_string_context_is_parsed_not_rejected(
+        self, fake_db, ledger_state
+    ):
+        """asyncpg returns JSONB as a string on the app pool (no codec
+        registered), so an isinstance-only check would reject EVERY real
+        critic — the failure mode documented in
+        docs/issues/jsonb_isinstance_guard_without_parse_silent_dead_paths.md.
+        """
+        import json
+
+        from orchestrator.main import _record_verification_round_impl
+
+        async def _get_job(job_id):
+            if job_id == TARGET_ID:
+                return {
+                    "id": job_id,
+                    "context": {"verification_rounds": ledger_state["rounds"]},
+                    "freeze_data": None,
+                }
+            return {
+                "id": job_id,
+                "context": json.dumps({"verification_target": TARGET_ID}),
+                "freeze_data": None,
+            }
+
+        fake_db.get_job = AsyncMock(side_effect=_get_job)
+
+        result = await _record_verification_round_impl(
+            postgres_db=fake_db,
+            target_job_id=TARGET_ID,
+            critic_job_id="c1",
+            asserted_verdict="approved",
+            opened=[],
+            dispositions=[],
+            head_commit="aaa",
+        )
+
+        assert result["verdict"] == "approved"
 
 
 class TestRecordVerificationRoundContentTree:
