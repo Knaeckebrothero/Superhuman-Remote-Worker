@@ -226,11 +226,38 @@ class TestComputeVerdict:
             == "returned"
         )
 
-    def test_asserted_returned_with_nothing_open_approves(self):
-        """Nothing is open, so there is nothing to return on. Unreachable in
-        practice (``validate_verdict_call`` rejects the call first), but the
-        computation must still be total."""
-        assert compute_verdict("returned", []) == "approved"
+    def test_asserted_returned_with_nothing_open_still_returns(self):
+        """An asserted ``returned`` is honoured unconditionally.
+
+        This shape is REACHABLE, and a previous version of this test asserted
+        the opposite on a false claim that it was not: a round may supply no
+        new findings (legal once ``validate_verdict_call`` learned about prior
+        open findings) while dispositioning the last open one ``RESOLVED``.
+        ``open_after`` is then empty, and computing ``approved`` there advances
+        a target the critic explicitly refused to pass — the server being
+        LAXER than the model asserted, which the rule forbids in every case.
+        """
+        assert compute_verdict("returned", []) == "returned"
+
+    def test_resolving_the_last_finding_while_returning_does_not_approve(self):
+        """The concrete reachable path, assembled from the real helpers."""
+        f1 = {"id": "F1", "severity": "high", "claim": "missing tests"}
+        rounds = [_round(1, opened=[f1])]
+        open_before = fold_open_findings(rounds)
+        dispositions = [{"id": "F1", "disposition": "RESOLVED", "quote": "here"}]
+
+        # Every upstream gate accepts this call...
+        assert validate_verdict_call("returned", [], open_before) == []
+        assert validate_dispositions(dispositions, open_before) == []
+
+        # ...and the fold legitimately leaves nothing open.
+        open_after = fold_open_findings(
+            rounds + [_round(2, opened=[], dispositions=dispositions)]
+        )
+        assert open_after == []
+
+        # The verdict must still honour what the critic said.
+        assert compute_verdict("returned", open_after) == "returned"
 
     def test_asserted_verdict_is_case_insensitive(self):
         assert (
