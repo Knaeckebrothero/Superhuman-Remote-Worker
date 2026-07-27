@@ -106,3 +106,118 @@ def assign_ids(
 def compute_verdict(open_findings: List[Dict[str, Any]]) -> str:
     """Derive the verdict from the open set. Never trusts a model assertion."""
     return "returned" if any(is_blocking(f) for f in open_findings) else "approved"
+
+
+_VALID_DISPOSITIONS = {"RESOLVED", "STILL_OPEN", "DISPUTED"}
+
+
+def validate_dispositions(
+    dispositions: List[Dict[str, Any]], open_findings: List[Dict[str, Any]]
+) -> List[str]:
+    """Validate a critic's dispositions against the currently-open findings.
+
+    Returns human-readable errors (empty list = valid). These are surfaced
+    verbatim to the model so it can correct itself, so they must name the
+    offending finding ID.
+
+    Disposition is required for BLOCKING findings only — non-blocking findings
+    are advisory and would otherwise accumulate across rounds forever.
+    """
+    errors: List[str] = []
+    open_ids = {f["id"] for f in open_findings if f.get("id")}
+    blocking_ids = {f["id"] for f in open_findings if f.get("id") and is_blocking(f)}
+    seen: set[str] = set()
+
+    for disp in dispositions:
+        fid = disp.get("id")
+        if fid not in open_ids:
+            errors.append(
+                f"Unknown finding id {fid!r}: there is no open finding with that id."
+            )
+            continue
+        seen.add(fid)
+        kind = str(disp.get("disposition", "")).upper()
+        if kind not in _VALID_DISPOSITIONS:
+            errors.append(
+                f"{fid}: unknown disposition {disp.get('disposition')!r}. "
+                f"Use one of: {', '.join(sorted(_VALID_DISPOSITIONS))}."
+            )
+        elif kind == "RESOLVED" and not str(disp.get("quote", "")).strip():
+            errors.append(
+                f"{fid}: RESOLVED requires a `quote` from the NEW deliverable "
+                f"showing the finding was addressed."
+            )
+        elif kind == "DISPUTED" and not str(disp.get("reason", "")).strip():
+            errors.append(f"{fid}: DISPUTED requires a `reason`.")
+
+    for fid in sorted(blocking_ids - seen):
+        errors.append(
+            f"{fid}: no disposition supplied. Every open blocking finding must be "
+            f"marked RESOLVED, STILL_OPEN, or DISPUTED."
+        )
+
+    return errors
+
+
+def validate_verdict_call(asserted: str, opened: List[Dict[str, Any]]) -> List[str]:
+    """Reject internally inconsistent verdict calls at the tool boundary.
+
+    A JSON schema cannot express this: ``{"issues": [], "severity": "high"}`` is
+    a structurally valid document, and the live incident recorded it as
+    "Issues: 0, Severity: high" without complaint.
+    """
+    if str(asserted).lower() == "returned" and not opened:
+        return [
+            "Cannot return a job with no findings. Supply at least one finding "
+            "in `opened`, or approve instead."
+        ]
+    return []
+
+
+def render_prior_findings(open_findings: List[Dict[str, Any]]) -> str:
+    """Render the open findings block injected into a fresh critic's brief."""
+    if not open_findings:
+        return (
+            "No open findings from previous rounds. This is a first review — "
+            "evaluate the deliverables against the original requirements."
+        )
+
+    lines = [
+        "The following findings were left OPEN by previous review rounds. "
+        "You MUST disposition EVERY one of them by id.",
+        "",
+        "**You may not close a finding by re-judging it.** A finding closes only "
+        "if you can quote text from the CURRENT deliverable that addresses it.",
+        "",
+    ]
+    for finding in sorted(open_findings, key=lambda f: f.get("id", "")):
+        flag = " *(you previously disputed this)*" if finding.get("disputed") else ""
+        lines.append(
+            f"- **{finding.get('id')}** [{finding.get('severity')}, opened round "
+            f"{finding.get('opened_round')}]{flag}: {finding.get('claim', '')}"
+        )
+        evidence = str(finding.get("evidence", "")).strip()
+        if evidence:
+            lines.append(f"  - Evidence when opened: {evidence}")
+
+    lines += [
+        "",
+        "For each, supply one disposition:",
+        "- `RESOLVED` — include `quote`: the text in the CURRENT deliverable that "
+        "addresses it.",
+        "- `STILL_OPEN` — not addressed.",
+        "- `DISPUTED` — include `reason`. **This does not close the finding**; it "
+        "flags it for a human.",
+    ]
+    return "\n".join(lines)
+
+
+def escalation_status(is_loop_job: bool) -> str:
+    """Terminal status for an escalation (no verdict / cap / no progress).
+
+    Project-loop jobs must NEVER land on ``pending_review``: the loop advance
+    hook fires only on terminal statuses, so a parked loop job wedges the whole
+    loop. They resolve to ``completed`` with the findings recorded in
+    ``error_message`` for the retro instead.
+    """
+    return "completed" if is_loop_job else "pending_review"
