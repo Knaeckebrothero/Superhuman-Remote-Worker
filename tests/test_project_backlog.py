@@ -474,6 +474,42 @@ class TestRenderBacklogBlock:
         block = render_backlog_block([_row("a")], {1: 1})
         assert "IN PROGRESS: (none)" in block
 
+    def test_in_progress_without_priority_omits_the_tag(self):
+        """Fix round 1, Finding 2: the caller (main.py's _spawn_loop_job)
+        cannot honestly assert a priority for the campaign's in-progress
+        initiative — it never read one. Asserting a guessed value (the old
+        hardcoded `priority: 1`) would make a genuinely-high ticket render
+        `[normal]`. The honest renderer omits the `[...]` tag entirely when
+        the caller didn't supply a priority, rather than defaulting to one."""
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        block = render_backlog_block(
+            [_row("a")],
+            {1: 1},
+            in_progress={"note_id": "issue-underway", "title": "Underway thing"},
+        )
+        lines = block.splitlines()
+        assert lines[1] == "IN PROGRESS: issue-underway — Underway thing"
+        assert "[" not in lines[1]
+
+    def test_in_progress_with_explicit_priority_still_shows_the_tag(self):
+        """Non-regression companion to the omission test above: a caller that
+        DOES have a real priority (rank 0 / high — the falsy-int footgun)
+        must still see it rendered, not silently omitted."""
+        from orchestrator.services.project_backlog import render_backlog_block
+
+        block = render_backlog_block(
+            [_row("a")],
+            {1: 1},
+            in_progress={
+                "note_id": "issue-underway",
+                "title": "Underway thing",
+                "priority": 0,
+            },
+        )
+        lines = block.splitlines()
+        assert lines[1] == "IN PROGRESS: [high] issue-underway — Underway thing"
+
     def test_remainder_is_reported_when_capped(self):
         from orchestrator.services.project_backlog import render_backlog_block
 
@@ -711,6 +747,22 @@ class TestKickoffInjection:
         kickoff = build_loop_kickoff(self._loop(), role="scholar", iteration=1)
         assert "PROJECT GOAL" in kickoff
 
+    def test_no_block_kickoff_tells_the_truth_about_unavailability(self):
+        """Fix round 1, Finding 1: the realistic route to backlog_block=None
+        in production is the fetch-failure path in _spawn_loop_job (project_id
+        is NOT NULL on project_loops; vector_db is assigned unconditionally at
+        import) -- i.e. a KB outage, not "there is nothing to show". The old
+        unconditional "The open backlog is listed above ... do not go
+        searching for it" is worse than the pre-Task-5 fiction in exactly this
+        case: it asserts a block exists (false) AND forbids the agent from
+        doing anything about the gap. When no block was supplied, the kickoff
+        must say so plainly instead of pointing at nothing."""
+        from orchestrator.services.project_loops import build_loop_kickoff
+
+        kickoff = build_loop_kickoff(self._loop(), role="critic", iteration=3)
+        assert "listed above" not in kickoff
+        assert "could not be read this turn" in kickoff
+
 
 class _SpawnLoopJobHarness:
     """Shared plumbing for exercising ``main._spawn_loop_job`` end to end —
@@ -786,7 +838,16 @@ class TestSpawnLoopJobBacklogWiring(_SpawnLoopJobHarness):
     async def test_in_progress_campaign_initiative_is_excluded_and_surfaced(self):
         """A ticket the loop is already working (campaign.initiative_note_id)
         keeps status='active' in the KB, so the pool query must exclude it —
-        it is surfaced on the IN PROGRESS line instead, never offered twice."""
+        it is surfaced on the IN PROGRESS line instead, never offered twice.
+
+        Fix round 1, Finding 2: this line used to assert the hardcoded
+        `[normal]` tag main.py synthesized without ever reading a real
+        priority (a genuinely-high in-progress ticket would have rendered
+        `[normal]`, undermining the one block agents are meant to trust).
+        _spawn_loop_job no longer asserts a priority it didn't read, and the
+        renderer omits the tag entirely rather than default one in — see
+        TestRenderBacklogBlock.test_in_progress_without_priority_omits_the_tag
+        for the renderer-level proof."""
         fetch = AsyncMock(return_value=([], {}))
         loop = self._loop(
             campaign={"initiative_note_id": "issue-underway", "title": "Underway thing"}
@@ -795,7 +856,8 @@ class TestSpawnLoopJobBacklogWiring(_SpawnLoopJobHarness):
 
         assert fetch.await_args.kwargs["exclude_note_id"] == "issue-underway"
         block = create.await_args.kwargs["backlog_block"]
-        assert "IN PROGRESS: [normal] issue-underway — Underway thing" in block
+        assert "IN PROGRESS: issue-underway — Underway thing" in block
+        assert "[normal] issue-underway" not in block
 
     @pytest.mark.asyncio
     async def test_fetch_failure_still_spawns_with_no_block(self):

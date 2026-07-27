@@ -12619,10 +12619,14 @@ async def _spawn_loop_job(
             )
             in_progress = None
             if in_progress_id:
+                # No "priority" key: the campaign dict carries no real rank
+                # for its initiative note, and asserting a guessed one (fix
+                # round 1, Finding 2) would render a genuinely-high ticket as
+                # "[normal]". render_backlog_block omits the tag when the key
+                # is absent rather than defaulting it.
                 in_progress = {
                     "note_id": in_progress_id,
                     "title": campaign.get("title") or "",
-                    "priority": 1,
                     "note_type": "feature",
                 }
             backlog_block = render_backlog_block(

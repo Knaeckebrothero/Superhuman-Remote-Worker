@@ -722,12 +722,27 @@ def build_loop_kickoff(
     # role block so selection duty reads it in order.
     if backlog_block:
         parts.append(backlog_block)
+        backlog_note = (
+            "The open backlog is listed above — it is given to you, do not go "
+            "searching for it."
+        )
+    else:
+        # Fix round 1, Finding 1: backlog_block=None in production means the
+        # fetch failed (a KB outage) -- project_id is NOT NULL and vector_db is
+        # assigned unconditionally, so this is the only realistic route. Saying
+        # "listed above" here would assert a block that isn't there AND forbid
+        # the agent from doing anything about the gap -- worse than the old
+        # fiction it replaced. Tell the truth instead.
+        backlog_note = (
+            "The project backlog could not be read this turn (KB unavailable) "
+            "— proceed without it rather than hunting for a substitute; note "
+            "the gap in your write-back."
+        )
 
     parts += [
         "BEFORE you act: restate the goal in one line, then check the KB for "
         "(a) what's already done and (b) what's been TRIED AND REJECTED (do "
-        "not re-propose it). The open backlog is listed above — it is given to "
-        "you, do not go searching for it.",
+        f"not re-propose it). {backlog_note}",
         f"YOUR ROLE THIS ITERATION — {role.upper()}:\n{role_block}",
         "WHEN DONE: write to the KB what you did, what you learned, and what the "
         "next agent should do. If you closed or abandoned an approach, record it "
