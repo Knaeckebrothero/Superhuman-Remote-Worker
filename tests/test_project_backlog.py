@@ -698,6 +698,55 @@ class TestFetchBacklog:
         assert 0 in counts
         assert counts[0] == 3
 
+    @pytest.mark.asyncio
+    async def test_order_by_is_total_priority_created_then_note_id(self):
+        """B3: `created_at ASC` alone leaves ties (same priority, same or
+        NULL created_at) broken by physical row order -- which a non-HOT
+        UPDATE (every reindex re-upsert is one) can silently reshuffle,
+        changing which 20 tickets the critic is shown between one kickoff
+        and the next with no ticket actually added or removed. `note_id`
+        as a final tiebreaker makes the order total and reproducible."""
+        from orchestrator.services.project_backlog import fetch_backlog
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(return_value=[])
+        vector_db = _fake_vector_db(conn)
+
+        await fetch_backlog(vector_db, "p-1")
+
+        first_sql = " ".join(conn.fetch.await_args_list[0].args[0].split())
+        assert (
+            "ORDER BY priority ASC, created_at ASC NULLS LAST, note_id ASC"
+            in first_sql
+        )
+
+
+class TestBacklogIndexPredicateMatchesNoteTypes:
+    """M2: the partial index in migration 0014 hardcodes its own
+    ``note_type IN (...)`` predicate as a SQL literal, independent of
+    ``BACKLOG_NOTE_TYPES``. Measured: adding a 4th ticket type to the
+    constant alone (without a matching migration) makes
+    ``idx_knowledge_backlog`` silently unusable for the new type's rows --
+    ``fetch_backlog``'s WHERE clause (inlined from the SAME constant) then
+    asks for a note_type set the index's predicate doesn't cover, so
+    Postgres can't prove the predicate implies the query and falls back to
+    a full scan -- a ~44x cost regression, silent, under both plan modes.
+    """
+
+    def test_index_predicate_matches_backlog_note_types(self):
+        import re
+        from pathlib import Path
+
+        from orchestrator.services.project_backlog import BACKLOG_NOTE_TYPES
+
+        sql = Path(
+            "orchestrator/database/migrations/vector/0014_kb_backlog_index.notx.sql"
+        ).read_text()
+        m = re.search(r"note_type IN \(([^)]+)\)", sql)
+        assert m, "note_type IN (...) predicate not found in migration 0014"
+        types_in_index = {t.strip().strip("'") for t in m.group(1).split(",")}
+        assert types_in_index == set(BACKLOG_NOTE_TYPES)
+
 
 # =============================================================================
 # Task 5: inject the backlog into every kickoff
@@ -1094,6 +1143,169 @@ class TestCloseBacklogTicket:
         _, old_line, new_line = diffs[0]
         assert old_line.startswith("status:")
         assert new_line == "status: resolved"
+
+    @pytest.mark.asyncio
+    async def test_index_update_matching_zero_rows_is_logged_not_silent(
+        self, caplog
+    ):
+        """B1 finding 3 repro: filing a `decision` note (or any non-ticket
+        type) as a campaign's initiative makes the index UPDATE's
+        `note_type = ANY(...)` filter match zero rows -- UPDATE 0, vs
+        UPDATE 1 for a real ticket -- and the pre-fix code never inspected
+        the command-status tag, so a close that closed nothing was
+        completely silent."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        conn.fetchval = AsyncMock(return_value="decision")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger="orchestrator.services.project_backlog"
+        ):
+            await close_backlog_ticket(
+                vector_db,
+                gitea,
+                "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+                "decision-verdict-1",
+                "resolved",
+            )
+
+        matches = [r for r in caplog.records if "0 rows" in r.message]
+        assert matches, "expected a warning naming the zero-row index close"
+        assert "decision-verdict-1" in matches[0].message
+        assert "decision" in matches[0].message  # names the mismatched type
+
+    @pytest.mark.asyncio
+    async def test_index_update_matching_one_row_does_not_warn(self, caplog):
+        """Non-regression: the ordinary, successful close must stay quiet
+        and must not pay for the extra note_type lookup."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger="orchestrator.services.project_backlog"
+        ):
+            await close_backlog_ticket(
+                vector_db,
+                gitea,
+                "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+                "issue-real-ticket",
+                "resolved",
+            )
+
+        assert not any("0 rows" in r.message for r in caplog.records)
+        conn.fetchval.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_frontmatter_less_file_reports_failure_not_success(self):
+        """M5: a byte-identical no-op write (no frontmatter block to carry a
+        status line at all) must not report success -- the pre-fix code
+        called create_or_update_file regardless of whether anything in the
+        file actually changed and trusted its truthy return."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        # No frontmatter block -- _rewrite_status is a byte-identical passthrough.
+        gitea.get_file_content = AsyncMock(return_value="# Just a heading\n\nbody\n")
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+
+        ok = await close_backlog_ticket(
+            vector_db,
+            gitea,
+            "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+            "feature-x",
+            "resolved",
+        )
+
+        assert ok is False
+        gitea.create_or_update_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_frontmatter_less_no_op_is_logged(self, caplog):
+        """The skip in the test above must be visible, not silent either."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(return_value="# Just a heading\n\nbody\n")
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+
+        with caplog.at_level(
+            logging.WARNING, logger="orchestrator.services.project_backlog"
+        ):
+            await close_backlog_ticket(
+                vector_db,
+                gitea,
+                "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+                "feature-x",
+                "resolved",
+            )
+        assert any("no rewritable" in r.message for r in caplog.records)
 
 
 # =============================================================================

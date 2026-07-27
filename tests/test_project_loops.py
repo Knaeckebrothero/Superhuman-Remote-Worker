@@ -185,7 +185,10 @@ class TestProductQaLoopWiring:
         # QA-specific, not the "advance the goal acting as 'product-qa'" default.
         assert "advance the goal acting as" not in kick
         # Core QA behaviors: audits shipped product, files findings, doesn't fix.
-        assert "qa-finding" in kick
+        # `issue`, not the old `qa-finding` tag (B2: the ticket model reconcile
+        # — a `qa-finding`-tagged `plan` note is never in the backlog pool).
+        assert "`issue` note" in kick
+        assert "qa-finding" not in kick
         low = kick.lower()
         assert "do not fix" in low or "do not fix anything" in low
         assert "scholar" in low  # counterpart framing / be-fair-to-scholar
@@ -195,13 +198,39 @@ class TestProductQaLoopWiring:
         assert "PRODUCT-QA" in desc
         assert "audit" in desc.lower()
 
-    def test_critic_block_triages_both_streams(self) -> None:
+    def test_critic_block_reads_the_injected_pool_not_old_note_types(self) -> None:
+        """B1 fix: the critic's candidate set is the injected PROJECT BACKLOG
+        pool, not Scholar's old `proposal` notes / Product-QA's old
+        `qa-finding` notes — neither type was ever in the pool, so selecting
+        one made close_backlog_ticket's index mirror match zero rows
+        silently and left the whole second half of the pipeline inert."""
         kick = build_loop_kickoff(_loop(), role="critic", iteration=5)
         low = kick.lower()
-        # Critic must see BOTH candidate streams and treat fix-vs-build as a choice.
-        assert "proposal" in low
-        assert "qa-finding" in kick
-        assert "first-class" in low
+        assert "backlog pool" in low
+        assert "first-class" in low  # fix-vs-build is still a first-class choice
+        # The old, now-inert candidate universe must not survive the rewrite.
+        assert "qa-finding" not in kick
+        assert "proposal" not in low
+
+    def test_critic_block_initiative_is_the_ticket_not_the_verdict_note(self) -> None:
+        """The other half of B1: the verdict/decision note is a rationale
+        record, never the thing selected — the note_id that becomes a
+        campaign's initiative must be the chosen ticket's own id."""
+        kick = build_loop_kickoff(_loop(), role="critic", iteration=5)
+        assert "verdict" in kick
+        assert "NOT the ticket itself" in kick or "not the ticket itself" in kick.lower()
+
+    def test_critic_block_does_not_mass_supersede_tickets(self) -> None:
+        """B2's second contradiction: 'mark every non-selected candidate...
+        superseded' would drain the entire pool every turn once feature/
+        issue/idea notes ARE the pool (superseded != active). The critic
+        must be told NOT to do that merely for not being picked this turn."""
+        kick = build_loop_kickoff(_loop(), role="critic", iteration=5)
+        low = kick.lower()
+        assert "do not flip it to `superseded`" in low or (
+            "not flip it to `superseded`" in low
+        )
+        assert "genuine duplicate" in low
 
 
 class TestNormalizeStage:
