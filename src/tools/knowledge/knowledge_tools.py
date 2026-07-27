@@ -68,9 +68,13 @@ NoteTypeValue = Literal[
     "state",
     "retrospective",
     "datasource",
+    "feature",
+    "issue",
+    "idea",
 ]
 NoteStatusValue = Literal["active", "resolved", "superseded", "archived"]
 NoteConfidenceValue = Literal["high", "medium", "low"]
+PriorityValue = Literal["high", "normal", "low"]
 
 # Shown by the genuinely graph-shaped tools when Neo4j is absent (slice-3 PR4c).
 # CONTRADICTS / DERIVED_FROM / ANSWERS edges and the Neo4j export have no

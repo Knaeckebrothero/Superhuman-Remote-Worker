@@ -55,10 +55,24 @@ NOTE_TYPES = frozenset(
         "state",
         "retrospective",
         "datasource",
+        # Backlog ticket types (docs/superpowers/specs/
+        # 2026-07-26-project-backlog-pipeline-design.md). These carry no TTL —
+        # KB_TTL_BY_NOTE_TYPE's default of None already covers them, so a
+        # backlog entry never expires on a clock.
+        "feature",
+        "issue",
+        "idea",
     }
 )
 
 NOTE_STATUSES = frozenset({"active", "resolved", "superseded", "archived"})
+
+# Backlog priority. A LABEL, never a contract: it orders the list agents are
+# shown and nothing in the engine may gate, refuse, or reorder work on it.
+# Stored as a rank so ordering is an index scan rather than a CASE.
+PRIORITY_RANKS: dict[str, int] = {"high": 0, "normal": 1, "low": 2}
+PRIORITY_WORDS: dict[int, str] = {0: "high", 1: "normal", 2: "low"}
+DEFAULT_PRIORITY_RANK = 1
 
 CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 
