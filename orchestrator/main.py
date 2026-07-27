@@ -12399,6 +12399,25 @@ def _verification_gate_decision(
     return ("spawn", "")
 
 
+def _critic_config_override(parent_llm: dict[str, Any] | None) -> dict[str, Any]:
+    """Config override stamped onto every verification critic.
+
+    ``core`` is spelled out explicitly because ``deep_merge`` replaces lists but
+    merges dicts by key: without this, the critic inherits ``job_complete`` and
+    ``mark_complete`` from worker_base and can close itself without a verdict.
+    """
+    override: dict[str, Any] = {
+        "autonomy": "full",
+        "tools": {
+            "evaluation": ["approve_job", "return_job_with_feedback"],
+            "core": ["next_phase_todos", "todo_complete", "todo_list", "todo_rewind"],
+        },
+    }
+    if parent_llm:
+        override["llm"] = parent_llm
+    return override
+
+
 async def _trigger_verification_on_complete(
     job: dict[str, Any],
     result: dict[str, Any],
@@ -12547,22 +12566,18 @@ async def _trigger_verification_on_complete(
         context["workspace_container"] = parent_ctx["workspace_container"]
         context["inherits_parent_workspace"] = True
 
-    config_override = {
-        "autonomy": "full",
-        "tools": {
-            "evaluation": ["approve_job", "return_job_with_feedback"],
-        },
-    }
-
-    # Propagate parent's LLM override so the critic uses the same model
+    # Extract parent's LLM override so the critic uses the same model
     parent_override = job.get("config_override")
     if isinstance(parent_override, str):
         try:
             parent_override = json.loads(parent_override)
         except (json.JSONDecodeError, ValueError):
             parent_override = None
+    parent_llm = None
     if parent_override and isinstance(parent_override.get("llm"), dict):
-        config_override["llm"] = parent_override["llm"]
+        parent_llm = parent_override["llm"]
+
+    config_override = _critic_config_override(parent_llm)
 
     project_id = str(job["project_id"]) if job.get("project_id") else None
 
