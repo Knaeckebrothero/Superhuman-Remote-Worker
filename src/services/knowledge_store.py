@@ -85,6 +85,7 @@ class KnowledgeRecord:
     title: str = ""
     note_type: str = ""
     status: str = "active"
+    priority: int = 1
     confidence: Optional[str] = None
     tags: List[str] = field(default_factory=list)
     keywords: List[str] = field(default_factory=list)
@@ -108,6 +109,7 @@ class KnowledgeRecord:
             title=row.get("title", ""),
             note_type=row.get("note_type", ""),
             status=row.get("status", "active"),
+            priority=row.get("priority", 1),
             confidence=row.get("confidence"),
             tags=row.get("tags") or [],
             keywords=row.get("keywords") or [],
@@ -266,6 +268,7 @@ class KnowledgeStore:
         retrieval_messages: Optional[List[str]] = None,
         created_at: Optional[datetime] = None,
         modified_at: Optional[datetime] = None,
+        priority: int = 1,
     ) -> uuid.UUID:
         """Upsert a note into the search index (write-through from Neo4j).
 
@@ -286,6 +289,8 @@ class KnowledgeStore:
             retrieval_messages: Retrieval query strings
             created_at: Original creation timestamp
             modified_at: Last modification timestamp
+            priority: Backlog rank — 0=high, 1=normal (default), 2=low. A
+                non-binding label; see PRIORITY_RANKS in knowledge_graph.py.
 
         Returns:
             UUID of the upserted row
@@ -366,12 +371,12 @@ class KnowledgeStore:
                 note_id, project_id, title, note_type, status, confidence,
                 tags, keywords, job_id, phase, content, retrieval_messages,
                 embedding, search_doc, created_at, modified_at, indexed_at,
-                content_hash, remaining_cycles
+                content_hash, remaining_cycles, priority
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11, $12,
                 $13, to_tsvector('english', $14), $15, $16, NOW(),
-                $17, $18
+                $17, $18, $19
             )
             ON CONFLICT (project_id, note_id) DO UPDATE SET
                 title = EXCLUDED.title,
@@ -388,7 +393,8 @@ class KnowledgeStore:
                 search_doc = EXCLUDED.search_doc,
                 modified_at = EXCLUDED.modified_at,
                 indexed_at = NOW(),
-                content_hash = EXCLUDED.content_hash
+                content_hash = EXCLUDED.content_hash,
+                priority = EXCLUDED.priority
             RETURNING id
             """,
             note_id,
@@ -409,6 +415,7 @@ class KnowledgeStore:
             modified_at,
             new_hash,
             ttl_value,
+            priority,
         )
 
         logger.debug(f"Upserted knowledge index: {note_id} (content changed)")
@@ -741,6 +748,7 @@ class KnowledgeStore:
         phase: Optional[int] = None,
         created_at: Optional[datetime] = None,
         modified_at: Optional[datetime] = None,
+        priority: int = 1,
     ) -> uuid.UUID:
         """Upsert a note-level row keyed by ``(kb_id, path)``.
 
@@ -750,7 +758,11 @@ class KnowledgeStore:
         ``embedding_version`` as None and stamps them via
         :meth:`stamp_note_indexed` only after the chunk write succeeds; the row
         also carries ``project_id = kb_id`` so legacy project-scoped queries keep
-        working through the transition. Returns the row id (for the chunk FK).
+        working through the transition. ``priority`` is the backlog rank parsed
+        by ``note_fields`` from frontmatter (0=high/1=normal/2=low) — this is
+        the file-edit path onto ``knowledge_index.priority``, the counterpart to
+        :meth:`upsert_note`'s agent-write path. Returns the row id (for the
+        chunk FK).
         """
         content_hash = self._content_hash(content)
         return await self.db.fetchval(
@@ -759,19 +771,22 @@ class KnowledgeStore:
                 (kb_id, project_id, note_id, path, title, note_type, content,
                  status, confidence, tags, keywords, retrieval_messages,
                  blob_sha, embedding_version, superseded_by, invalidated_at,
-                 job_id, phase, content_hash, created_at, modified_at, indexed_at)
+                 job_id, phase, content_hash, created_at, modified_at, indexed_at,
+                 priority)
             VALUES
                 ($1, $1, $2, $3, $4, $5, $6,
                  $7, $8, $9, $10, $11,
                  $12, $13, $14, $15,
-                 $16, $17, $18, $19, $20, NOW())
+                 $16, $17, $18, $19, $20, NOW(),
+                 $21)
             ON CONFLICT (kb_id, path) WHERE kb_id IS NOT NULL AND path IS NOT NULL
             DO UPDATE SET
                 note_id = $2, title = $4, note_type = $5, content = $6,
                 status = $7, confidence = $8, tags = $9, keywords = $10,
                 retrieval_messages = $11, blob_sha = $12, embedding_version = $13,
                 superseded_by = $14, invalidated_at = $15, job_id = $16,
-                phase = $17, content_hash = $18, modified_at = $20, indexed_at = NOW()
+                phase = $17, content_hash = $18, modified_at = $20, indexed_at = NOW(),
+                priority = $21
             RETURNING id
             """,
             kb_id,
@@ -794,6 +809,7 @@ class KnowledgeStore:
             content_hash,
             created_at,
             modified_at,
+            priority,
         )
 
     async def stamp_note_indexed(

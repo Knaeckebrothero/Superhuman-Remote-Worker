@@ -86,6 +86,11 @@ VALID_STATUSES = {"active", "resolved", "superseded", "archived"}
 _DEFAULT_NOTE_TYPE = "learning"
 _DEFAULT_STATUS = "active"
 
+# Canonical copy: src/services/knowledge_graph.py PRIORITY_RANKS (not importable
+# here — the orchestrator image has no agent deps).
+PRIORITY_RANKS = {"high": 0, "normal": 1, "low": 2}
+_DEFAULT_PRIORITY_RANK = 1
+
 # knowledge_index.note_id is VARCHAR(100); superseded_by VARCHAR(100),
 # confidence VARCHAR(20).
 _NOTE_ID_MAX = 100
@@ -158,11 +163,12 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     """Map a parsed note file onto ``upsert_kb_note`` arguments.
 
     The inverse of ``_render_note_md``'s frontmatter (id/type/tags/keywords/
-    confidence/status/superseded_by), hardened for human-authored files: a
-    missing frontmatter block derives the id from the filename stem and the
-    title from the first H1; values outside the CHECK-constraint vocabularies
-    (valid_note_type / valid_note_status) fall back to safe defaults rather
-    than failing the INSERT.
+    confidence/status/priority/superseded_by), hardened for human-authored
+    files: a missing frontmatter block derives the id from the filename stem
+    and the title from the first H1; values outside the CHECK-constraint
+    vocabularies (valid_note_type / valid_note_status) — and unrecognised
+    ``priority`` words — fall back to safe defaults rather than failing the
+    INSERT.
     """
     fm = fm or {}
 
@@ -182,6 +188,10 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     if status not in VALID_STATUSES:
         status = _DEFAULT_STATUS
 
+    priority = PRIORITY_RANKS.get(
+        str(fm.get("priority", "")).strip().lower(), _DEFAULT_PRIORITY_RANK
+    )
+
     def _as_list(value: Any) -> List[str]:
         if value is None:
             return []
@@ -197,6 +207,7 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
         "title": title,
         "note_type": note_type,
         "status": status,
+        "priority": priority,
         "tags": _as_list(fm.get("tags")),
         "keywords": _as_list(fm.get("keywords")),
         "confidence": str(confidence)[:_CONFIDENCE_MAX] if confidence else None,
@@ -611,6 +622,7 @@ async def _reindex_snapshot(
                 tags=fields["tags"],
                 keywords=fields["keywords"],
                 superseded_by=fields["superseded_by"],
+                priority=fields["priority"],
             )
             await store.replace_note_chunks(
                 note_row=note_row,
