@@ -599,13 +599,29 @@ class GitManager:
         except Exception:
             return None
 
-    # Files the agent writes ABOUT its own completion, not deliverables. Each
-    # carries a fresh ``timestamp``, so including them would make the content
-    # hash differ between two byte-identical rounds — reintroducing exactly
-    # the inertness ``get_content_tree`` exists to remove.
-    COMPLETION_BOOKKEEPING_PATHS = (
+    # Paths the agent writes ABOUT its own run rather than as deliverables.
+    # Each changes on EVERY round regardless of what was produced, so counting
+    # them makes the content hash differ between two byte-identical rounds —
+    # reintroducing exactly the inertness ``get_content_tree`` exists to
+    # remove. Every entry here was found empirically, by diffing `ls-tree`
+    # round-over-round against a real workspace; do not add to it by guess.
+    #
+    # Entries ending in "/" match by PREFIX, everything else exactly — the
+    # same convention as ``SYNC_IGNORE_PATTERNS`` in
+    # src/services/cloud_sync/base.py, which independently classifies
+    # ``archive/`` as process bookkeeping that is never delivered to the user.
+    #
+    # - output/job_{completion,frozen}.json carry a fresh ``timestamp``.
+    # - archive/ holds ``todos_phase_{N}_{type}_{TIMESTAMP}.md``, written by
+    #   ``TodoManager.archive`` (src/managers/todo.py) which ``finalize_job``
+    #   calls AFTER this hash is captured — so round N's archive is a NEW
+    #   tracked path staged by round N+1's ``git add -A``. That alone made the
+    #   guard inert for any job whose agent used todos, i.e. essentially all
+    #   of them, and it is invisible to any test that mocks the TodoManager.
+    NON_DELIVERABLE_PATHS = (
         "output/job_completion.json",
         "output/job_frozen.json",
+        "archive/",
     )
 
     def get_content_tree(self, exclude: Optional[Iterable[str]] = None) -> str | None:
@@ -629,12 +645,13 @@ class GitManager:
 
         Derived from ``git ls-tree -r HEAD`` (mode/type/blob-sha/path for
         every tracked file) rather than ``rev-parse HEAD^{tree}`` so that the
-        completion bookkeeping files can be excluded — see
-        ``COMPLETION_BOOKKEEPING_PATHS``.
+        agent's own run bookkeeping can be excluded — see
+        ``NON_DELIVERABLE_PATHS``.
 
         Args:
-            exclude: Repo-relative paths to leave out of the hash. Defaults to
-                ``COMPLETION_BOOKKEEPING_PATHS``; pass ``()`` to hash
+            exclude: Repo-relative paths to leave out of the hash. An entry
+                ending in ``/`` matches by prefix, everything else exactly.
+                Defaults to ``NON_DELIVERABLE_PATHS``; pass ``()`` to hash
                 everything tracked.
 
         Returns:
@@ -653,12 +670,15 @@ class GitManager:
         except Exception:
             return None
 
-        skip = set(self.COMPLETION_BOOKKEEPING_PATHS if exclude is None else exclude)
+        patterns = self.NON_DELIVERABLE_PATHS if exclude is None else tuple(exclude)
+        exact = {p for p in patterns if not p.endswith("/")}
+        prefixes = tuple(p for p in patterns if p.endswith("/"))
+
         kept: List[str] = []
         for line in listing.splitlines():
             # "<mode> <type> <sha>\t<path>"
             path = line.split("\t", 1)[1] if "\t" in line else ""
-            if path in skip:
+            if path in exact or path.startswith(prefixes):
                 continue
             kept.append(line)
 
