@@ -141,9 +141,18 @@ CREATE TABLE public.knowledge_index (
     superseded_by character varying(100),
     invalidated_at timestamp with time zone,
     embedding_version text,
+    priority smallint DEFAULT 1 NOT NULL,
+    CONSTRAINT knowledge_index_priority_valid CHECK (((priority >= 0) AND (priority <= 2))),
     CONSTRAINT valid_note_status CHECK (((status)::text = ANY ((ARRAY['active'::character varying, 'resolved'::character varying, 'superseded'::character varying, 'archived'::character varying])::text[]))),
-    CONSTRAINT valid_note_type CHECK (((note_type)::text = ANY ((ARRAY['goal'::character varying, 'plan'::character varying, 'decision'::character varying, 'learning'::character varying, 'code'::character varying, 'source'::character varying, 'question'::character varying, 'state'::character varying, 'retrospective'::character varying, 'datasource'::character varying])::text[])))
+    CONSTRAINT valid_note_type CHECK (((note_type)::text = ANY ((ARRAY['goal'::character varying, 'plan'::character varying, 'decision'::character varying, 'learning'::character varying, 'code'::character varying, 'source'::character varying, 'question'::character varying, 'state'::character varying, 'retrospective'::character varying, 'datasource'::character varying, 'feature'::character varying, 'issue'::character varying, 'idea'::character varying])::text[])))
 );
+
+
+--
+-- Name: COLUMN knowledge_index.priority; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.knowledge_index.priority IS 'Backlog rank: 0=high, 1=normal, 2=low. A display label only — no code path may gate or reorder work on it.';
 
 
 --
@@ -1060,6 +1069,13 @@ CREATE INDEX idx_citations_source_id ON public.citations USING btree (source_id)
 --
 
 CREATE INDEX idx_citations_verification_status ON public.citations USING btree (verification_status);
+
+
+--
+-- Name: idx_knowledge_backlog; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_backlog ON public.knowledge_index USING btree (project_id, priority, created_at) WHERE (((status)::text = 'active'::text) AND ((note_type)::text = ANY ((ARRAY['feature'::character varying, 'issue'::character varying, 'idea'::character varying])::text[])));
 
 
 --

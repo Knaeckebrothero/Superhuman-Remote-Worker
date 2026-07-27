@@ -12,6 +12,11 @@ pg_version = "16.0"
 # and orthogonal to the lock-safety / breakage rules we actually care about.
 excluded_rules = [
     "prefer-bigint-over-int",
+    # Sibling of prefer-bigint-over-int above, same stylistic/noisy bucket:
+    # widening a deliberately tiny, CHECK-bounded column (e.g.
+    # knowledge_index.priority, a 0-2 rank) to 64 bits to satisfy this rule
+    # would be strictly worse, not safer.
+    "prefer-bigint-over-smallint",
     "prefer-text-field",
     # Unsatisfiable for our runner model. `.notx.sql` migrations
     # (CREATE/DROP INDEX CONCURRENTLY) must be a SINGLE statement: the runner
