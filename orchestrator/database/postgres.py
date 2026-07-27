@@ -4603,14 +4603,23 @@ class PostgresDB:
     #
     # The non-terminal list is every status a critic can actually be in
     # while still possibly delivering a trustworthy verdict — NOT just
-    # "hasn't reached a terminal job status yet". `waiting_for_reply` is in
-    # it because a critic inherits `communication: [send_message]` from
-    # worker_base.yaml (its own expert config never overrides that tools
-    # key, and `deep_merge` merges the `tools` dict by key rather than
-    # replacing it — see src/core/loader.py), and a blocking `send_message`
-    # call flips the CALLER's own job to `waiting_for_reply`
-    # (orchestrator/main.py's send_message handler) — so a critic legitimately
-    # blocked on a human reply must not be treated as absent. `reviewing` is
+    # "hasn't reached a terminal job status yet".
+    #
+    # `waiting_for_reply` is RETAINED as defence in depth, though a critic
+    # should no longer be able to reach it. It used to be reachable: a critic
+    # inherited `communication: [send_message]` from worker_base.yaml (its
+    # expert config never overrode that key, and `deep_merge` merges the
+    # `tools` dict by key rather than replacing it — see src/core/loader.py),
+    # and a blocking `send_message` flips the CALLER's own job to
+    # `waiting_for_reply` (orchestrator/main.py's send_message handler). That
+    # is now closed upstream: `_critic_config_override` sets
+    # `tools.communication: []`. The status stays in this list anyway because
+    # nothing reaps `waiting_for_reply` — `communication.blocking_timeout_hours`
+    # has no implementation — so if any future path reopens it, a critic
+    # legitimately blocked on a human reply must still not be treated as
+    # absent, and the cost of keeping it is one unreachable branch.
+    #
+    # `reviewing` is
     # deliberately absent: a critic can never reach it itself —
     # `_trigger_verification_on_complete` skips any job with a
     # `parent_job_id`, and a critic always has one, so it is never
