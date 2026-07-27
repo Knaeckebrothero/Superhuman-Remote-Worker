@@ -1127,12 +1127,21 @@ def format_verification_instructions(
     description: str,
     freeze_data: dict[str, Any],
     config_name: str,
+    prior_findings: str = "",
 ) -> str | None:
     """Load and format the verification instructions template.
 
     Moved from ``OrchestratorClient._format_verification_instructions``.
     Template is loaded from ``config/experts/critic/verification_instructions.md``
     with fallback to ``config/templates/verification_instructions.md``.
+
+    ``prior_findings`` defaults to ``""`` rather than being required: this is
+    formatted with ``str.format``, which raises ``KeyError`` for a missing
+    key, and the ``except KeyError`` branch below returns ``None`` — which
+    would abort critic creation entirely at the caller. Callers should pass
+    ``render_prior_findings(fold_open_findings(rounds))`` (see
+    ``services.verification_ledger``); the fallback text below only covers
+    callers that don't.
     """
     search_paths = [
         _REPO_ROOT / "config" / "experts" / "critic" / "verification_instructions.md",
@@ -1178,6 +1187,8 @@ def format_verification_instructions(
             deliverables_list=deliverables_list,
             agent_summary=freeze_data.get("summary", "*(no summary provided)*"),
             agent_confidence=confidence_str,
+            prior_findings=prior_findings
+            or "No open findings from previous rounds. This is a first review.",
         )
     except KeyError as e:
         logger.error("Verification template has unknown placeholder: %s", e)

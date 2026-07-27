@@ -20,6 +20,10 @@ You are reviewing the output of another agent's completed job. Your goal is to d
 
 {agent_confidence}
 
+## Open Findings From Previous Rounds
+
+{prior_findings}
+
 ## Your Task
 
 ### 1. Understand the Requirements
@@ -48,13 +52,30 @@ For each deliverable, check:
 
 ### 4. Render Your Verdict
 
+If there are any open findings from previous rounds (see "Open Findings From
+Previous Rounds" above), you MUST supply a `dispositions` entry for every one
+of them, by id:
+- `RESOLVED` — only with a `quote` from the CURRENT deliverable showing it
+  was addressed. You cannot close a finding by re-judging it — only a quote
+  from what you see now closes it.
+- `STILL_OPEN` — not addressed.
+- `DISPUTED` — only with a `reason`. This does NOT close the finding; it
+  flags it for a human.
+
+If this is the first review round (no open findings), omit `dispositions` or
+pass an empty list.
+
 **If the work meets the requirements** — even if imperfect, as long as the core ask is satisfied:
-- Call `approve_job(job_id="{target_job_id}", report="your summary")`
-- Include strengths and any minor non-blocking notes
+- Call `approve_job(job_id="{target_job_id}", report="your summary", dispositions=[{{"id": "F1", "disposition": "RESOLVED", "quote": "..."}}])`
+- `report`: a 2-5 sentence summary of the review — include strengths and any minor non-blocking notes
+- `dispositions`: required whenever findings are open (see above); omit only when there are none
+- If any open blocking finding is not dispositioned `RESOLVED`, the recorded verdict will be `returned` regardless of this call — the server computes the verdict from the open findings, not from which tool you called
 
 **If the work has issues that need fixing**:
-- Call `return_job_with_feedback(job_id="{target_job_id}", feedback="detailed feedback", issues=["issue 1", "issue 2"], severity="high|medium|low")`
-- Be specific: what's wrong, where, and what should be different
+- Call `return_job_with_feedback(job_id="{target_job_id}", feedback="detailed feedback", findings=[{{"claim": "...", "severity": "high|medium|low", "evidence": "..."}}], dispositions=[{{"id": "F1", "disposition": "STILL_OPEN"}}])`
+- `findings`: NEW problems you found this round — the server assigns each a stable id, do not invent your own
+- `feedback`: detailed narrative — be specific: what's wrong, where, and what should be different
+- `dispositions`: required whenever findings are open (see above)
 - Focus on substance, not style — only return for real problems
 
 ### 5. Write Your Report
