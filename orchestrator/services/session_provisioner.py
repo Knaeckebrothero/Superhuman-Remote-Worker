@@ -18,7 +18,7 @@ from services.workspace_lifecycle import (
     ensure_workspace,
 )
 from services.workspace_binding import ensure_virtual_thread_workspace_binding
-from src.core.backends.factory import LITE_BACKENDS
+from src.core.backends.factory import LITE_BACKENDS, VM_BACKENDS
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +50,12 @@ def _thread_backend(thread: dict) -> Optional[str]:
 async def ensure_session_workspace(
     thread_id: str, *, db, provisioner, suspension
 ) -> Optional[EnsureResult]:
-    """Idempotently drive a session's workspace toward ready. Returns None when
-    the thread is gone or ended (nothing to do)."""
+    """Idempotently drive a session's *container* workspace toward ready.
+
+    Returns None when there is nothing for this function to provision: the thread
+    is gone or ended, or its tier owns no workspace container — ``virtual``/
+    ``none`` (no workspace pod at all) and ``vm`` (the workspace is the VM in
+    ``metadata.vm``). Only container-backed tiers reach ``ensure_workspace``."""
     thread = await db.get_thread(thread_id)
     if not thread or thread.get("status") == "ended":
         return None
@@ -66,6 +70,24 @@ async def ensure_session_workspace(
         )
         if backend == "virtual":
             await ensure_virtual_thread_workspace_binding(db, thread_id)
+        return None
+    if backend in VM_BACKENDS:
+        # A vm-tier session's workspace IS the VM (metadata.vm, provisioned at
+        # create by vm_provisioner.create_thread_vm and reconciled by the VM
+        # lifecycle manager). Provisioning a sandbox container alongside it makes
+        # the agent attach to the container instead — it wins the readiness race
+        # by minutes — so the session silently runs on the wrong tier while the
+        # VM is orphaned. Centralized here rather than at the call site because
+        # THREE paths reach this function: /prepare (routers/sessions.py),
+        # resume, and the periodic reconcile sweep. The sweep is an independent
+        # trigger: _setup_gitea writes workspace_container={git_remote_url,
+        # repo_name} for every thread including vm-tier ones, and that
+        # status-less entry matches list_threads_needing_workspace's filter.
+        # docs/issues/session_vm_backend_never_attaches.md (Defect 1)
+        logger.debug(
+            "session %s is vm-tier — workspace is the VM, no container to provision",
+            thread_id,
+        )
         return None
     return await ensure_workspace(
         WorkspaceOwner.session(thread_id),
