@@ -665,37 +665,42 @@ def _finalize_with_verdict(
     """
     verdict_type = verdict.get("_verdict")
     target_job_id = verdict.get("_target_job_id", "unknown")
+    # `verdict` is the module-level mirror populated by
+    # evaluation_tools._submit_verdict AFTER the orchestrator has durably
+    # recorded the round (src/tools/evaluation/evaluation_tools.py). Its
+    # shape is the ledger's own vocabulary — `round` + `open_findings` — not
+    # a `report`/`strengths`/`minor_notes`/`feedback`/`issues`/`severity`
+    # shape; nothing populates those keys any more, so reading them here
+    # silently rendered the freeze (and output/critic_verdict.json) blank.
+    round_num = verdict.get("round")
+    open_findings = verdict.get("open_findings") or []
 
-    if verdict_type == "approved":
+    if verdict_type in ("approved", "returned"):
         freeze_data = {
+            # Critics no longer park in 'waiting' between rounds: a fresh
+            # critic is spawned every round from the target's ledger
+            # (orchestrator's _trigger_verification_on_complete), so a
+            # 'returned' critic has nothing left to wait FOR. Both verdicts
+            # freeze the critic as an ordinary completed subjob;
+            # determine_job_status reads this value directly as the
+            # critic's OWN status — it has no bearing on the TARGET job,
+            # which orchestrator/main.py's _handle_critic_verdict_on_complete
+            # resolves separately from the same ledger.
             "status": "completed",
             "freeze_type": "verdict",
-            "verdict": "approved",
+            "verdict": verdict_type,
             "target_job_id": target_job_id,
-            "report": verdict.get("report", ""),
-            "strengths": verdict.get("strengths", []),
-            "minor_notes": verdict.get("minor_notes", []),
+            "round": round_num,
+            "open_findings": open_findings,
             "timestamp": datetime.now().isoformat(),
             "job_id": job_id,
         }
-        goal_achieved = True
-        log_msg = f"[{job_id}] Critic verdict: APPROVED target job {target_job_id}"
-
-    elif verdict_type == "returned":
-        freeze_data = {
-            "status": "waiting",
-            "freeze_type": "verdict",
-            "verdict": "returned",
-            "target_job_id": target_job_id,
-            "feedback": verdict.get("_feedback", ""),
-            "feedback_raw": verdict.get("feedback_raw", ""),
-            "issues": verdict.get("issues", []),
-            "severity": verdict.get("severity", "medium"),
-            "timestamp": datetime.now().isoformat(),
-            "job_id": job_id,
-        }
-        goal_achieved = False
-        log_msg = f"[{job_id}] Critic verdict: RETURNED target job {target_job_id} with feedback"
+        goal_achieved = verdict_type == "approved"
+        log_msg = (
+            f"[{job_id}] Critic verdict: {verdict_type.upper()} target job "
+            f"{target_job_id} (round {round_num}, "
+            f"{len(open_findings)} open finding(s))"
+        )
 
     else:
         # Unknown verdict type — warn and fall through to normal completion
@@ -800,33 +805,21 @@ def finalize_job(
         clear_final_phase_data(job_id)
         return _finalize_with_verdict(state, workspace, todo_manager, verdict, job_id)
 
-    # Edge case: critic job reached finalize_job without verdict data.
-    # This means the critic called job_complete instead of an evaluation tool.
-    # Treat as implicit approval so the target job doesn't get stuck in "reviewing".
+    # Edge case: critic job reached finalize_job without verdict data. This
+    # means the critic called job_complete instead of approve_job /
+    # return_job_with_feedback. A missing verdict must NEVER be read as
+    # approval (CWE-636 — the exact defect this fail-closed design removes).
+    # Log a refusal and fall through to the NORMAL (non-verdict) completion
+    # path below: no "verdict" key anywhere in freeze_data, so the
+    # orchestrator's _resolve_critic_outcome (a fresh lookup on the TARGET's
+    # own ledger, keyed by this critic_job_id) finds no round and escalates
+    # the target to a human instead of silently advancing it.
     metadata = state.get("metadata") or {}
     if metadata.get("verification_target"):
-        target_job_id = metadata["verification_target"]
-        logger.warning(
-            f"[{job_id}] Critic job finalizing WITHOUT verdict data. "
-            f"The critic called job_complete instead of approve_job/return_job_with_feedback. "
-            f"Synthesizing implicit approval for target job {target_job_id}."
-        )
-        final_data = get_final_phase_data(job_id)
-        clear_final_phase_data(job_id)
-        implicit_verdict = {
-            "_verdict": "approved",
-            "_target_job_id": target_job_id,
-            "report": (final_data or {}).get(
-                "summary",
-                "Critic completed without explicit verdict — implicit approval.",
-            ),
-            "strengths": [],
-            "minor_notes": [
-                "Critic used job_complete instead of approve_job — treated as implicit approval."
-            ],
-        }
-        return _finalize_with_verdict(
-            state, workspace, todo_manager, implicit_verdict, job_id
+        logger.error(
+            f"[{job_id}] Critic finalizing WITHOUT a recorded verdict. "
+            f"NOT synthesizing an approval — the orchestrator will escalate "
+            f"target {metadata['verification_target']} to a human."
         )
 
     # Get the final phase data (set by job_complete tool)

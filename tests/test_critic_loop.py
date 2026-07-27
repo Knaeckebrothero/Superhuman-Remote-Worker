@@ -57,6 +57,11 @@ def make_workspace():
     ws = MagicMock()
     ws.write_file = MagicMock()
     ws.git_manager = None
+    # An unconfigured MagicMock() return value breaks json.dumps in
+    # finalize_job's normal (non-verdict) completion path, which always
+    # reads this for freeze_data["head_commit"] — a real WorkspaceManager
+    # returns str | None.
+    ws.get_head_commit = MagicMock(return_value=None)
     return ws
 
 
@@ -113,7 +118,17 @@ class TestVerdictData:
 
 
 class TestFinalizeWithVerdict:
-    """Tests for _finalize_with_verdict."""
+    """Tests for _finalize_with_verdict.
+
+    ``verdict`` here is shaped exactly like the module-level mirror
+    ``evaluation_tools._verdict_data`` actually populates (Task 5):
+    ``_verdict``, ``_target_job_id``, ``round``, ``open_findings`` — NOT the
+    older ``report``/``strengths``/``minor_notes``/``_feedback``/``issues``/
+    ``severity`` shape, which nothing writes any more (verified by reading
+    ``_submit_verdict`` in src/tools/evaluation/evaluation_tools.py). Task 8
+    reconciled ``_finalize_with_verdict`` to read the real shape so the
+    freeze no longer renders those fields blank.
+    """
 
     def test_approved_verdict(self):
         state = make_state()
@@ -123,9 +138,8 @@ class TestFinalizeWithVerdict:
         verdict = {
             "_verdict": "approved",
             "_target_job_id": "target-job-1",
-            "report": "Great work!",
-            "strengths": ["clean code"],
-            "minor_notes": [],
+            "round": 2,
+            "open_findings": [],
         }
 
         result = _finalize_with_verdict(state, ws, tm, verdict, "critic-job-1")
@@ -138,7 +152,8 @@ class TestFinalizeWithVerdict:
         assert result.freeze_data["freeze_type"] == "verdict"
         assert result.freeze_data["verdict"] == "approved"
         assert result.freeze_data["target_job_id"] == "target-job-1"
-        assert result.freeze_data["report"] == "Great work!"
+        assert result.freeze_data["round"] == 2
+        assert result.freeze_data["open_findings"] == []
 
         # Should write critic_verdict.json
         ws.write_file.assert_called_once()
@@ -156,10 +171,21 @@ class TestFinalizeWithVerdict:
         verdict = {
             "_verdict": "returned",
             "_target_job_id": "target-job-1",
-            "_feedback": "## Verification Feedback\n\nFix the tests",
-            "feedback_raw": "Fix the tests",
-            "issues": ["Test coverage too low", "Missing edge cases"],
-            "severity": "high",
+            "round": 1,
+            "open_findings": [
+                {
+                    "id": "F1",
+                    "severity": "high",
+                    "claim": "Test coverage too low",
+                    "opened_round": 1,
+                },
+                {
+                    "id": "F2",
+                    "severity": "medium",
+                    "claim": "Missing edge cases",
+                    "opened_round": 1,
+                },
+            ],
         }
 
         result = _finalize_with_verdict(state, ws, tm, verdict, "critic-job-1")
@@ -167,15 +193,21 @@ class TestFinalizeWithVerdict:
         assert result.success is True
         assert result.state_updates["should_stop"] is True
         assert result.state_updates["goal_achieved"] is False
-        assert result.freeze_data["status"] == "waiting"
+        # Critics no longer park in 'waiting' between rounds (Task 8): a
+        # fresh critic is spawned every round from the ledger
+        # (_trigger_verification_on_complete), so a 'returned' critic has
+        # nothing left to wait FOR. determine_job_status reads freeze_data
+        # ["status"] directly as the CRITIC's own DB status — this is
+        # unrelated to the target job's status, which
+        # _handle_critic_verdict_on_complete resolves separately from the
+        # ledger in orchestrator/main.py.
+        assert result.freeze_data["status"] == "completed"
         assert result.freeze_data["freeze_type"] == "verdict"
         assert result.freeze_data["verdict"] == "returned"
         assert result.freeze_data["target_job_id"] == "target-job-1"
-        assert (
-            result.freeze_data["feedback"]
-            == "## Verification Feedback\n\nFix the tests"
-        )
-        assert len(result.freeze_data["issues"]) == 2
+        assert result.freeze_data["round"] == 1
+        assert len(result.freeze_data["open_findings"]) == 2
+        assert result.freeze_data["open_findings"][0]["id"] == "F1"
 
     def test_unknown_verdict_defaults_to_completed(self):
         state = make_state()
@@ -192,6 +224,67 @@ class TestFinalizeWithVerdict:
         assert result.success is True
         assert result.state_updates["goal_achieved"] is True
         assert result.freeze_data["status"] == "completed"
+
+
+# =============================================================================
+# finalize_job: no implicit approval when a critic reaches finalize_job
+# without ever calling approve_job/return_job_with_feedback (Task 8).
+# =============================================================================
+
+
+class TestFinalizeJobNoImplicitApproval:
+    """A critic that calls job_complete instead of a verdict tool must NOT be
+    read as an implicit approval (CWE-636: a missing verdict is not consent).
+
+    Previously this synthesized ``{"_verdict": "approved", ...}`` and froze
+    the critic exactly as if it had called approve_job. The fix logs a
+    refusal and falls through to the ordinary (non-verdict) completion path
+    — no 'verdict' key anywhere in freeze_data — so the orchestrator's
+    ``_resolve_critic_outcome`` (a fresh ledger lookup on the TARGET, keyed
+    by this critic_job_id) finds no round and escalates instead of
+    advancing the target.
+    """
+
+    def setup_method(self):
+        _verdict_data.clear()
+
+    def test_critic_without_verdict_does_not_synthesize_approval(self, caplog):
+        import logging
+
+        from src.core.phase import finalize_job
+
+        state = make_state()  # metadata.verification_target == "target-job-1"
+        ws = make_workspace()
+        tm = make_todo_manager()
+        config = MagicMock(autonomy="full")  # critics always run autonomy=full
+
+        with caplog.at_level(logging.ERROR):
+            result = finalize_job(state, ws, tm, config=config)
+
+        # The crux of the fix: no verdict anywhere in the freeze.
+        assert result.freeze_data.get("verdict") is None
+        assert result.freeze_data.get("status") != "waiting"
+        assert "approved" not in json.dumps(result.freeze_data).lower()
+
+        # A human operator can see WHY nothing was recorded.
+        messages = [rec.message for rec in caplog.records]
+        assert any("WITHOUT a recorded verdict" in m for m in messages)
+        assert any("target-job-1" in m for m in messages)
+
+    def test_critic_without_verdict_still_completes_its_own_job(self):
+        """The critic's own job must still resolve (not hang) — only the
+        TARGET's advancement is refused, not the critic's own completion."""
+        from src.core.phase import finalize_job
+
+        state = make_state()
+        ws = make_workspace()
+        tm = make_todo_manager()
+        config = MagicMock(autonomy="full")
+
+        result = finalize_job(state, ws, tm, config=config)
+
+        assert result.success is True
+        assert result.state_updates["should_stop"] is True
 
 
 # =============================================================================

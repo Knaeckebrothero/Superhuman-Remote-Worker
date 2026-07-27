@@ -646,3 +646,322 @@ class TestTriggerVerificationInstructionsWiring:
         # text was delivered.
         assert "F1" in instructions
         assert "still broken" in instructions
+
+
+class TestFailClosedVerdictHandling:
+    def test_non_critic_subjob_is_ignored(self):
+        """A delegation child has parent_job_id and freeze_data but no verdict.
+
+        Without the verification_target discriminator it hits the implicit
+        approval branch and advances its parent before siblings finish.
+        """
+        from orchestrator.main import _is_verification_critic
+
+        assert (
+            _is_verification_critic({"context": {"verification_target": "t1"}}) is True
+        )
+        assert _is_verification_critic({"context": {"scholar_target": "t1"}}) is False
+        assert _is_verification_critic({"context": {}}) is False
+        assert (
+            _is_verification_critic({"context": '{"verification_target": "t1"}'})
+            is True
+        )
+
+    def test_completed_critic_without_ledger_record_escalates(self, ledger_state):
+        """No verdict must never mean approval."""
+        from orchestrator.main import _resolve_critic_outcome
+
+        outcome, reason = _resolve_critic_outcome(
+            critic_job_id="c1", critic_status="completed", rounds=[]
+        )
+        assert outcome == "escalate"
+        assert "no verdict" in reason.lower()
+
+    def test_failed_critic_with_verdict_still_escalates(self):
+        """A critic that failed must not approve its target."""
+        from orchestrator.main import _resolve_critic_outcome
+
+        outcome, _ = _resolve_critic_outcome(
+            critic_job_id="c1",
+            critic_status="failed",
+            rounds=[{"critic_job_id": "c1", "verdict": "approved"}],
+        )
+        assert outcome == "escalate"
+
+    def test_completed_critic_with_record_uses_computed_verdict(self):
+        from orchestrator.main import _resolve_critic_outcome
+
+        outcome, _ = _resolve_critic_outcome(
+            critic_job_id="c1",
+            critic_status="completed",
+            rounds=[{"critic_job_id": "c1", "verdict": "returned"}],
+        )
+        assert outcome == "returned"
+
+
+def _make_critic_job(
+    *,
+    critic_job_id: str = "critic-1",
+    target_job_id: str = "target-1",
+    status: str = "completed",
+    verdict_in_context: bool = True,
+    creation_order=None,
+) -> dict:
+    """A minimal critic (or non-critic subjob) job row for
+    _handle_critic_verdict_on_complete wiring tests."""
+    context: dict = {}
+    if verdict_in_context:
+        context["verification_target"] = target_job_id
+    return {
+        "id": critic_job_id,
+        "parent_job_id": target_job_id,
+        "context": context,
+        "status": status,
+        "creation_order": creation_order,
+        "freeze_data": None,
+    }
+
+
+def _make_target_job(
+    *,
+    job_id: str = "target-1",
+    rounds=None,
+    is_loop: bool = False,
+) -> dict:
+    context: dict = {"verification_rounds": rounds or []}
+    if is_loop:
+        context["loop_id"] = "loop-1"
+    return {
+        "id": job_id,
+        "context": context,
+        "resolved_config": {},
+        "status": "reviewing",
+    }
+
+
+class TestHandleCriticVerdictOnCompleteWiring:
+    """Wiring-level regression tests for the rewritten
+    ``_handle_critic_verdict_on_complete``. ``TestFailClosedVerdictHandling``
+    above proves the two pure helpers in isolation; these prove the real
+    async function actually uses them end to end — including the two extra
+    fail-closed properties that have no dedicated pure-function test:
+    delegation children must not be misread as verdict-less critics, and a
+    critic that hasn't reached a resting state (paused mid-retry) must not
+    have its target judged at all yet.
+    """
+
+    @pytest.mark.asyncio
+    async def test_delegation_child_is_ignored_not_read_as_verdictless_critic(
+        self, monkeypatch
+    ):
+        """THE defect this task removes: previously any parent_job_id +
+        freeze_data with no 'verdict' key was implicit approval — including a
+        delegation child's own ordinary completion freeze, which would
+        advance the parent before its siblings finish."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        get_job_mock = AsyncMock()
+        update_mock = AsyncMock()
+        monkeypatch.setattr(main_module.postgres_db, "get_job", get_job_mock)
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+
+        job = _make_critic_job(
+            critic_job_id="child-1",
+            verdict_in_context=False,
+            creation_order=0,
+        )
+        job["freeze_data"] = {"freeze_type": "job_complete", "summary": "child done"}
+        actions: list[str] = []
+
+        await _handle_critic_verdict_on_complete(job, actions)
+
+        get_job_mock.assert_not_awaited()
+        update_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_non_actionable_critic_status_leaves_target_untouched(
+        self, monkeypatch
+    ):
+        """A critic paused mid-retry (LLM outage, budget, vm-upgrade, ...)
+        has not reached a resting state — escalating the target here would
+        yank it out from under a critic that may still deliver a real
+        verdict on its own once it resumes."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        get_job_mock = AsyncMock()
+        update_mock = AsyncMock()
+        monkeypatch.setattr(main_module.postgres_db, "get_job", get_job_mock)
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+
+        job = _make_critic_job(status="paused")
+        job["freeze_data"] = {"freeze_type": "llm_unavailable"}
+        actions: list[str] = []
+
+        await _handle_critic_verdict_on_complete(job, actions)
+
+        get_job_mock.assert_not_awaited()
+        update_mock.assert_not_awaited()
+        assert actions == []
+
+    @pytest.mark.asyncio
+    async def test_approved_sets_target_autonomy_status(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        target = _make_target_job(
+            rounds=[
+                {
+                    "round": 1,
+                    "critic_job_id": "critic-1",
+                    "verdict": "approved",
+                    "asserted_verdict": "approved",
+                    "opened": [],
+                    "dispositions": [],
+                    "ts": "t",
+                }
+            ]
+        )
+        monkeypatch.setattr(
+            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+        )
+        set_status_mock = AsyncMock(return_value="completed")
+        monkeypatch.setattr(
+            main_module, "_set_target_to_autonomy_status", set_status_mock
+        )
+
+        job = _make_critic_job()
+        actions: list[str] = []
+
+        await _handle_critic_verdict_on_complete(job, actions)
+
+        set_status_mock.assert_awaited_once_with("target-1")
+        assert any("approved" in a for a in actions)
+
+    @pytest.mark.asyncio
+    async def test_returned_resumes_target_with_rendered_findings(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        target = _make_target_job(
+            rounds=[
+                {
+                    "round": 1,
+                    "critic_job_id": "critic-1",
+                    "verdict": "returned",
+                    "asserted_verdict": "returned",
+                    "opened": [
+                        {"id": "F1", "severity": "high", "claim": "missing tests"}
+                    ],
+                    "dispositions": [],
+                    "ts": "t",
+                }
+            ]
+        )
+        monkeypatch.setattr(
+            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+        )
+        resume_mock = AsyncMock()
+        monkeypatch.setattr(main_module, "_internal_resume_job", resume_mock)
+
+        job = _make_critic_job()
+        actions: list[str] = []
+
+        await _handle_critic_verdict_on_complete(job, actions)
+
+        resume_mock.assert_awaited_once()
+        _, kwargs = resume_mock.call_args
+        assert resume_mock.call_args.args[0] == "target-1"
+        feedback = kwargs.get("feedback", "")
+        assert "F1" in feedback
+        assert "missing tests" in feedback
+        assert "high" in feedback
+
+    @pytest.mark.asyncio
+    async def test_completed_with_no_ledger_record_escalates_target(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        target = _make_target_job(rounds=[])
+        monkeypatch.setattr(
+            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+        )
+        update_mock = AsyncMock()
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+
+        job = _make_critic_job()
+        actions: list[str] = []
+
+        await _handle_critic_verdict_on_complete(job, actions)
+
+        update_mock.assert_awaited_once()
+        assert update_mock.call_args.kwargs["status"] == "pending_review"
+        assert "no verdict" in update_mock.call_args.kwargs["error_message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_completed_loop_target_escalates_to_completed(self, monkeypatch):
+        """Escalation is status-aware: a project-loop target must resolve
+        'completed' (never 'pending_review'), reusing _escalate_target."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        target = _make_target_job(rounds=[], is_loop=True)
+        monkeypatch.setattr(
+            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+        )
+        update_mock = AsyncMock()
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+
+        job = _make_critic_job()
+        actions: list[str] = []
+
+        await _handle_critic_verdict_on_complete(job, actions)
+
+        update_mock.assert_awaited_once()
+        assert update_mock.call_args.kwargs["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_failed_critic_with_prior_approved_round_escalates_not_approves(
+        self, monkeypatch
+    ):
+        """A critic that approved, then hit an infra error before its own
+        job finished, must not approve the target — the scholar handler
+        already gates on this ('a NON-TERMINAL scholar report must not
+        unblock the parent'); the critic handler previously had no
+        equivalent gate."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        target = _make_target_job(
+            rounds=[
+                {
+                    "round": 1,
+                    "critic_job_id": "critic-1",
+                    "verdict": "approved",
+                    "asserted_verdict": "approved",
+                    "opened": [],
+                    "dispositions": [],
+                    "ts": "t",
+                }
+            ]
+        )
+        monkeypatch.setattr(
+            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+        )
+        update_mock = AsyncMock()
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        set_status_mock = AsyncMock()
+        monkeypatch.setattr(
+            main_module, "_set_target_to_autonomy_status", set_status_mock
+        )
+
+        job = _make_critic_job(status="failed")
+        actions: list[str] = []
+
+        await _handle_critic_verdict_on_complete(job, actions)
+
+        set_status_mock.assert_not_awaited()
+        update_mock.assert_awaited_once()
+        assert update_mock.call_args.kwargs["status"] == "pending_review"
