@@ -26,6 +26,7 @@ from ...services.knowledge_graph import (
     CONFIDENCE_LEVELS,
     NOTE_STATUSES,
     NOTE_TYPES,
+    PRIORITY_WORDS,
     slugify,
 )
 from ...services.knowledge.bindings import KnowledgeBinding, split_note_handle
@@ -400,8 +401,9 @@ def _render_note_md(note: Dict[str, Any]) -> str:
 
     Expected keys (all optional except ``id``/``type``): ``id``, ``type``,
     ``title``, ``description``, ``content``, ``tags``, ``keywords``,
-    ``confidence``, ``status``, ``author``, ``job``, ``branch``, ``created``,
-    ``modified``, ``superseded_by``, ``relationships`` ([{type, target}]).
+    ``confidence``, ``status``, ``priority``, ``author``, ``job``, ``branch``,
+    ``created``, ``modified``, ``superseded_by``, ``relationships``
+    ([{type, target}]).
     """
     note_id = note.get("id", "unknown")
     content = note.get("content", "") or ""
@@ -416,6 +418,17 @@ def _render_note_md(note: Dict[str, Any]) -> str:
         fm.append(f"keywords: [{', '.join(_yaml_quote(k) for k in note['keywords'])}]")
     if note.get("confidence"):
         fm.append(f"confidence: {note['confidence']}")
+    # Backlog rank as a human-facing word. Omitted when absent so non-ticket
+    # notes keep their existing frontmatter byte-for-byte.
+    if note.get("priority") is not None:
+        raw_priority = note["priority"]
+        word = (
+            PRIORITY_WORDS.get(int(raw_priority))
+            if isinstance(raw_priority, int)
+            else str(raw_priority).strip().lower()
+        )
+        if word in ("high", "normal", "low"):
+            fm.append(f"priority: {word}")
     fm.append(f"status: {note.get('status', 'active')}")
     # Provenance (§7) — origin binding that git authorship can't carry.
     if note.get("author"):

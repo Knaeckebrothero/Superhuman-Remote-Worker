@@ -78,8 +78,9 @@ class TestUpsertSetsTtl:
         )
         insert_call = mock_db.fetchval.call_args_list[1]
         assert "remaining_cycles" in insert_call[0][0]
-        # ttl_value is the last positional arg
-        assert insert_call[0][-1] == 2
+        # ttl_value is second-to-last positional arg (priority — project
+        # backlog pipeline task 2 — is now appended after it).
+        assert insert_call[0][-2] == 2
 
     @pytest.mark.asyncio
     async def test_insert_sets_null_ttl_for_durable(self):
@@ -92,7 +93,7 @@ class TestUpsertSetsTtl:
             note_type="decision",
             content="body",
         )
-        assert mock_db.fetchval.call_args_list[1][0][-1] is None
+        assert mock_db.fetchval.call_args_list[1][0][-2] is None
 
     @pytest.mark.asyncio
     async def test_on_conflict_branch_preserves_ttl(self):
