@@ -12727,7 +12727,6 @@ async def _spawn_loop_job(
                 in_progress = {
                     "note_id": in_progress_id,
                     "title": campaign.get("title") or "",
-                    "note_type": "feature",
                 }
             backlog_block = render_backlog_block(
                 rows, counts, in_progress=in_progress
@@ -13452,13 +13451,22 @@ async def _advance_planner_campaign(
         if ticket_status and ticket_id and vector_db is not None:
             from services.project_backlog import close_backlog_ticket
 
-            await close_backlog_ticket(
+            closed = await close_backlog_ticket(
                 vector_db,
                 gitea_client,
                 str(loop.get("project_id")),
                 str(ticket_id),
                 ticket_status,
             )
+            if not closed:
+                logger.warning(
+                    "project loop %s: close_backlog_ticket reported failure "
+                    "for ticket %s → %s — the durable (file) mirror did not "
+                    "land; see its own logs for the cause",
+                    loop_id[:8],
+                    str(ticket_id),
+                    ticket_status,
+                )
 
     if not normalized["stages"]:
         # Dispose-only filing: the campaign was closed above; open nothing and
@@ -13474,7 +13482,12 @@ async def _advance_planner_campaign(
             f"project loop {loop_id[:8]}: no successor campaign opened — "
             "returning to rotation"
         )
-        return False, _WB_UNSET
+        # None, not _WB_UNSET: the campaign really was just cleared (above),
+        # and the caller's loop_for_spawn is a snapshot of `loop` taken
+        # BEFORE this call — without a real value here, the very next
+        # spawn's kickoff still shows the just-disposed campaign as "IN
+        # PROGRESS" (fix: M7). _WB_UNSET means "unchanged"; that isn't true.
+        return False, None
 
     new_campaign = {
         # Deterministic id = the plan job — a healed re-run recreates the SAME

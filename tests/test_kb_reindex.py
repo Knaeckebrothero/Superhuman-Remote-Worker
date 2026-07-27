@@ -253,6 +253,81 @@ class TestNoteFields:
         f = note_fields("knowledge/n.md", fm, "b")
         assert f["priority"] == 2
 
+    def test_numeric_priority_rank_round_trips(self):
+        # M8 repro: a user who reads knowledge_index.priority (0=high)
+        # elsewhere and writes it straight back into frontmatter as
+        # `priority: 0` (an unquoted int, not the word "high") must get
+        # rank 0 back -- the pre-fix code did
+        # str(0).strip().lower() == "0", which is not a key in
+        # PRIORITY_RANKS (word-keyed), and silently fell back to "normal".
+        for rank in (0, 1, 2):
+            fm = {"id": "n", "type": "feature", "priority": rank}
+            f = note_fields("knowledge/n.md", fm, "b")
+            assert f["priority"] == rank, f"rank {rank} did not round-trip"
+
+    def test_numeric_priority_as_quoted_string_also_round_trips(self):
+        fm = {"id": "n", "type": "feature", "priority": "0"}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["priority"] == 0
+
+    def test_out_of_range_numeric_priority_falls_back_to_normal(self):
+        fm = {"id": "n", "type": "feature", "priority": 7}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["priority"] == 1
+
+    def test_boolean_priority_is_not_mistaken_for_a_rank(self):
+        # bool is an int subclass in Python -- int(True) == 1 must not
+        # silently alias a stray `priority: true` to rank 1.
+        fm = {"id": "n", "type": "feature", "priority": True}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["priority"] == 1  # falls through to the default, not a fluke
+
+
+# =============================================================================
+# note_fields — created (frontmatter) -> created_at (project-backlog-pipeline
+# fix wave, finding B3)
+# =============================================================================
+
+
+class TestNoteFieldsCreatedAt:
+    def test_frontmatter_created_maps_to_created_at(self):
+        """The realistic path: _render_note_md writes `created:` unquoted, so
+        parse_note_md's YAML load already turns it into a native datetime
+        before note_fields ever sees it."""
+        from datetime import datetime, timezone
+
+        fm, body = parse_note_md(
+            "---\nid: feature-x\ntype: feature\n"
+            "created: 2026-01-15T10:30:00+00:00\n---\n# T\nbody\n"
+        )
+        f = note_fields("knowledge/feature-x.md", fm, body)
+        assert f["created_at"] == datetime(2026, 1, 15, 10, 30, tzinfo=timezone.utc)
+
+    def test_quoted_string_created_is_still_parsed(self):
+        from datetime import datetime, timezone
+
+        fm, body = parse_note_md(
+            '---\nid: feature-x\ntype: feature\n'
+            'created: "2026-01-15T10:30:00+00:00"\n---\n# T\nbody\n'
+        )
+        f = note_fields("knowledge/feature-x.md", fm, body)
+        assert f["created_at"] == datetime(2026, 1, 15, 10, 30, tzinfo=timezone.utc)
+
+    def test_absent_created_maps_to_none(self):
+        """Every note without a `created:` line (the common case today, per
+        the finding: the cockpit panel is read-only so a hand-authored file
+        is the only user path to create a ticket, and a user is unlikely to
+        know to add this line) must not crash -- and must not fabricate a
+        timestamp; NULLS LAST in the pool query is what covers this."""
+        fm = {"id": "n", "type": "feature"}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["created_at"] is None
+
+    def test_unparseable_created_degrades_to_none_not_a_crash(self):
+        fm = {"id": "n", "type": "feature", "created": "not-a-date-at-all"}
+        f = note_fields("knowledge/n.md", fm, "b")
+        assert f["created_at"] is None
+
 
 # =============================================================================
 # reindex_kb — the orchestration
@@ -475,6 +550,73 @@ class TestReindexKbIncremental:
         assert expected["priority"] is None  # sanity: no priority: line
         up_kwargs = store.upsert_kb_note.await_args[1]
         assert up_kwargs["priority"] is None
+
+    @pytest.mark.asyncio
+    async def test_forwards_parsed_created_at_to_upsert_kb_note(self):
+        # B3 repro: note_fields correctly parsing frontmatter `created` into
+        # `created_at` was never enough on its own -- deleting the
+        # forwarding kwarg at the reindexer's store.upsert_kb_note(...) call
+        # site left every existing test green (created_at simply wasn't
+        # asserted anywhere), and every INSERTed row kept created_at NULL.
+        from datetime import datetime, timezone
+
+        kb = uuid.uuid4()
+        endpoint_stamp = f"{EMBEDDING_VERSION}:pf-effective-profile"
+        endpoint_pipeline = reindex_pipeline_version(endpoint_stamp, "knowledge")
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=endpoint_pipeline
+        )
+        note_text = _note_md("changed", "fresh insight", note_type="feature").replace(
+            "status: active\n", "status: active\ncreated: 2026-01-15T10:30:00+00:00\n"
+        )
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/changed.md": "OLD", "knowledge/same.md": "same1"},
+            contents={"knowledge/changed.md": note_text},
+        )
+        svc.profile_fingerprint = "pf-effective-profile"
+        await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        up_kwargs = store.upsert_kb_note.await_args[1]
+        assert up_kwargs["created_at"] == datetime(
+            2026, 1, 15, 10, 30, tzinfo=timezone.utc
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_created_forwards_none_to_upsert_kb_note(self):
+        # The common case (every pre-existing note) must forward None, not
+        # crash and not fabricate a timestamp.
+        kb = uuid.uuid4()
+        endpoint_stamp = f"{EMBEDDING_VERSION}:pf-effective-profile"
+        endpoint_pipeline = reindex_pipeline_version(endpoint_stamp, "knowledge")
+        wm = KbWatermark(
+            kb_id=kb, indexed_commit="old", pipeline_version=endpoint_pipeline
+        )
+        note_text = _note_md("changed", "fresh insight", note_type="feature")
+        gitea, store, svc = _make_deps(
+            head="headsha",
+            watermark=wm,
+            tree=self._tree(),
+            indexed={"knowledge/changed.md": "OLD", "knowledge/same.md": "same1"},
+            contents={"knowledge/changed.md": note_text},
+        )
+        svc.profile_fingerprint = "pf-effective-profile"
+        await reindex_kb(
+            gitea_client=gitea,
+            store=store,
+            embedding_service=svc,
+            kb_id=kb,
+            repo_name="r",
+        )
+        up_kwargs = store.upsert_kb_note.await_args[1]
+        assert up_kwargs["created_at"] is None
 
     @pytest.mark.asyncio
     async def test_progress_counters_reset_and_finalize(self):

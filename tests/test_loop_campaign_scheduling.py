@@ -807,9 +807,49 @@ async def test_dispose_only_plan_closes_campaign_and_rotates():
     spawn.assert_awaited_once()
     assert spawn.call_args.kwargs["stage"] == "developer"
     assert spawn.call_args.kwargs.get("extra_context") is None
-    # ...and the rotation write-back does not resurrect a campaign.
-    assert "campaign" not in db.update_project_loop.call_args_list[-1].kwargs
+    # ...and the rotation write-back carries the clear too -- None, not
+    # _WB_UNSET (fix: M7) -- so the very next spawn's kickoff (built from
+    # loop_for_spawn, a snapshot of `loop` taken before this call, not from
+    # this DB row) reflects "no campaign", not the just-disposed one.
+    assert db.update_project_loop.call_args_list[-1].kwargs["campaign"] is None
     assert any("disposed" in a for a in actions)
+
+
+@pytest.mark.asyncio
+async def test_dispose_only_plan_next_spawn_sees_campaign_cleared():
+    """M7 repro: the `loop` dict `_rotate_loop_to_next_stage` receives still
+    carries the OLD (just-disposed) campaign -- it's a snapshot taken before
+    this advance ran. Before the fix, `_advance_planner_campaign` returned
+    `_WB_UNSET` ("unchanged") for campaign_update on the dispose-only path
+    even though it had just persisted campaign=None, so
+    `loop_for_spawn["campaign"]` kept the disposed campaign and the very
+    next job's kickoff would assert an IN PROGRESS campaign that no longer
+    exists -- in the one block agents are told to trust."""
+    from main import _rotate_loop_to_next_stage
+
+    db = AsyncMock()
+    spawn = _spawn_mock()
+    prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+    reviewed = _campaign(
+        status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
+    )
+    plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
+    with _patched_main(db, spawn):
+        await _rotate_loop_to_next_stage(
+            _loop(campaign=reviewed),
+            seq_index_completed=1,
+            base_total=13,
+            next_remaining=16,
+            consecutive=0,
+            last_error=None,
+            actions=[],
+            completed_job=_critic_job(plan),
+            completed_ctx=_critic_job(plan)["context"],
+            completed_failed=False,
+        )
+    # _spawn_loop_stage received loop_for_spawn as its first positional arg.
+    spawned_loop = spawn.call_args.args[0]
+    assert spawned_loop["campaign"] is None
 
 
 @pytest.mark.asyncio
@@ -1530,6 +1570,84 @@ class TestDispositionClosesBacklogTicket:
                         completed_failed=False,
                     )
         close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_close_failure_is_logged_not_discarded(self, caplog):
+        """B1 finding 3 (main.py side): the return value of
+        close_backlog_ticket used to be discarded entirely -- a close that
+        reported failure (e.g. the decision-note-as-initiative bug, or any
+        other mirror-write failure) left no trace anywhere in the loop's own
+        logs."""
+        import logging
+
+        from main import _rotate_loop_to_next_stage
+
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        close = AsyncMock(return_value=False)
+        prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+        reviewed = _campaign(
+            status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
+        )
+        plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
+        with _patched_main(db, spawn):
+            with patch("main.vector_db", MagicMock()):
+                with patch("services.project_backlog.close_backlog_ticket", close):
+                    with caplog.at_level(logging.WARNING, logger="main"):
+                        await _rotate_loop_to_next_stage(
+                            _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                            seq_index_completed=1,
+                            base_total=13,
+                            next_remaining=16,
+                            consecutive=0,
+                            last_error=None,
+                            actions=[],
+                            completed_job=_critic_job(plan),
+                            completed_ctx=_critic_job(plan)["context"],
+                            completed_failed=False,
+                        )
+        close.assert_awaited_once()
+        assert any(
+            "close_backlog_ticket reported failure" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_close_success_does_not_warn(self, caplog):
+        """Non-regression companion: the ordinary successful path must not
+        spuriously log a failure warning."""
+        import logging
+
+        from main import _rotate_loop_to_next_stage
+
+        db = AsyncMock()
+        spawn = _spawn_mock()
+        close = AsyncMock(return_value=True)
+        prior_critic = "aaaaaaaa-0000-0000-0000-00000000dead"
+        reviewed = _campaign(
+            status="review", stages_done=3, id=prior_critic, plan_job_id=prior_critic
+        )
+        plan = {"disposition": {"outcome": "ship", "notes": "acceptance passed"}}
+        with _patched_main(db, spawn):
+            with patch("main.vector_db", MagicMock()):
+                with patch("services.project_backlog.close_backlog_ticket", close):
+                    with caplog.at_level(logging.WARNING, logger="main"):
+                        await _rotate_loop_to_next_stage(
+                            _loop(campaign=reviewed, project_id=str(uuid.uuid4())),
+                            seq_index_completed=1,
+                            base_total=13,
+                            next_remaining=16,
+                            consecutive=0,
+                            last_error=None,
+                            actions=[],
+                            completed_job=_critic_job(plan),
+                            completed_ctx=_critic_job(plan)["context"],
+                            completed_failed=False,
+                        )
+        assert not any(
+            "close_backlog_ticket reported failure" in r.message
+            for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_no_vector_db_skips_the_close_call(self):

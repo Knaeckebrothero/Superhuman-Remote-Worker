@@ -124,6 +124,30 @@ class TestVocabularyDrift:
         assert set(get_args(PriorityValue)) == set(PRIORITY_RANKS)
         assert PRIORITY_RANKS == {"high": 0, "normal": 1, "low": 2}
 
+    def test_backlog_vocab_copies_match_their_canonical_sources(self):
+        """M1: the orchestrator cannot import src/ at runtime (no agent deps
+        in that image), so orchestrator/services/project_backlog.py and
+        kb_reindex.py each hand-duplicate a copy of the priority maps /
+        ticket-type tuple canonical in knowledge_graph.py / knowledge_tools.py
+        -- that duplication is deliberate and the copies must STAY copies,
+        but a test (unlike the orchestrator at runtime) CAN import both
+        sides and pin them in sync. They are all in sync today; this only
+        fails if a future edit touches one side and not its mirror."""
+        from orchestrator.services.kb_reindex import PRIORITY_RANKS as reindex_ranks
+        from orchestrator.services.project_backlog import BACKLOG_NOTE_TYPES
+        from orchestrator.services.project_backlog import (
+            PRIORITY_WORDS as backlog_words,
+        )
+        from src.services.knowledge_graph import (
+            PRIORITY_RANKS as canonical_ranks,
+            PRIORITY_WORDS as canonical_words,
+        )
+        from src.tools.knowledge.knowledge_tools import _TICKET_TYPES
+
+        assert backlog_words == canonical_words
+        assert reindex_ranks == canonical_ranks
+        assert set(BACKLOG_NOTE_TYPES) == set(_TICKET_TYPES)
+
 
 # =============================================================================
 # 2 + 3. CONSTRAINT and SURVIVAL — the schema carries enum, and keeps it
