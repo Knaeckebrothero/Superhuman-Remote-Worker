@@ -684,6 +684,15 @@ export class PersistentChatService {
     /** localIds of queued (not-yet-accepted) sends — drives queued-bubble
      *  styling in the template. */
     readonly outboxIds = computed(() => new Set(this.outbox().map((i) => i.localId)));
+    /**
+     * True when a flush attempt failed and items are still queued — i.e. the
+     * queue is *stalled*, not merely waiting for the session to come up.
+     * Because the flush has no timed auto-retry (see _flushOutbox), a stalled
+     * queue needs either a reconnect or the user; this signal is what puts a
+     * retry/discard affordance on the queued bubble instead of leaving it
+     * spinning forever.
+     */
+    readonly outboxStalled = signal(false);
     // Single-flight guard for _flushOutbox (one POST in flight per tab).
     private flushingOutbox = false;
     // localId of the item whose POST is currently in flight (skipped by
@@ -2313,15 +2322,23 @@ export class PersistentChatService {
                     // localId (never positionally: the head may have shifted)
                     // and keep the bubble; SSE renders the turn.
                     this._removeFromOutbox(head.localId);
+                    // The send that produced any stall banner just landed, so
+                    // the banner is now lying. Clear both.
+                    this.outboxStalled.set(false);
+                    this.error.set(null);
                     continue;
                 }
                 if (result.status === 404 || result.status === 410) {
                     // Thread gone — draining is correct; roll back the bubbles.
+                    this.outboxStalled.set(false);
                     this._drainOutboxWithRollback();
                     return;
                 }
                 // Any other failure: stop, keep the item + bubble queued. The
                 // banner (_postInput set it) explains; next trigger retries.
+                // Mark the queue stalled so the bubble offers retry/discard —
+                // without it a failure here reads as "still sending" forever.
+                this.outboxStalled.set(true);
                 return;
             }
         } finally {
@@ -2331,6 +2348,34 @@ export class PersistentChatService {
 
     private _removeFromOutbox(localId: string): void {
         this.outbox.update((q) => q.filter((i) => i.localId !== localId));
+    }
+
+    /**
+     * User-initiated retry of a stalled queue. The flush deliberately has no
+     * timed auto-retry (a masked accept would double-send), so when the
+     * transport fails the only ways out are a reconnect or this. Exposed on
+     * the queued bubble.
+     */
+    retryQueuedSends(): void {
+        this.outboxStalled.set(false);
+        this.error.set(null);
+        void this._flushOutbox();
+    }
+
+    /**
+     * Drop one queued send and its optimistic bubble — the escape hatch for a
+     * message the user no longer wants stuck in the queue. Refuses the item
+     * whose POST is currently in flight: its fate isn't decided yet.
+     */
+    discardQueuedSend(localId: string): void {
+        if (this.flushingHeadId === localId) return;
+        if (!this.outbox().some((i) => i.localId === localId)) return;
+        this._removeFromOutbox(localId);
+        this.dispatch({type: 'remove_turn', id: localId});
+        if (this.outbox().length === 0) {
+            this.outboxStalled.set(false);
+            this.error.set(null);
+        }
     }
 
     /** Drop the whole outbox and remove its optimistic bubbles (thread gone). */
@@ -2391,6 +2436,19 @@ export class PersistentChatService {
             if (status === 409) {
                 this._armSendKickstart(tid);
                 return {ok: true, status};
+            }
+            if (status === 0) {
+                // Angular's fetch backend reports a rejected fetch() (network
+                // drop, dead connection, blocked preflight) as status 0 with an
+                // undefined statusText, whose .message is the internal
+                // "Http failure response for <url>: 0 undefined". Never show
+                // that: it isn't an HTTP status and it tells the user nothing.
+                console.warn('[persistent-chat] input POST transport failure:', err?.message);
+                this.error.set(
+                    "Couldn't reach the server — your message wasn't sent. " +
+                    'It stays queued below; retry when you\'re back online.',
+                );
+                return {ok: false, status};
             }
             this.error.set(this.sanitizeError(err?.error?.detail || err?.message));
             return {ok: false, status};
@@ -3448,22 +3506,35 @@ export class PersistentChatService {
 
     /** Mark the session as ready and flush any pending message. */
     private markSessionReady(): void {
-        if (this.sessionReady()) return;
-        this.sessionReady.set(true);
+        if (!this.sessionReady()) {
+            this.sessionReady.set(true);
 
-        // Clear any transient error left over from the WS reconnect storm
-        // during session attach: when the orchestrator polls /ready faster
-        // than the agent finishes attaching its session, the agent rejects
-        // each WS with an "Agent not ready" frame (persistent_app.py:1489)
-        // until attach completes. Those errors are stale the moment we get
-        // session.state — keep them on screen and the user sees a red
-        // banner contradicting a healthy session.
-        this.error.set(null);
+            // Clear any transient error left over from the WS reconnect storm
+            // during session attach: when the orchestrator polls /ready faster
+            // than the agent finishes attaching its session, the agent rejects
+            // each WS with an "Agent not ready" frame (persistent_app.py:1489)
+            // until attach completes. Those errors are stale the moment we get
+            // session.state — keep them on screen and the user sees a red
+            // banner contradicting a healthy session.
+            this.error.set(null);
+            this.isWaitingForInput.set(false);
+        }
 
         // Flush anything the user queued before the session was ready. The
         // bubbles are already on screen (dispatched at send time); _flushOutbox
         // just POSTs them FIFO, one in flight at a time.
-        this.isWaitingForInput.set(false);
+        //
+        // Deliberately OUTSIDE the ready-edge guard above. This used to be a
+        // one-shot latch, so a send that failed *after* the session was already
+        // ready could never be retried by any readiness signal — every later
+        // markSessionReady returned early before reaching the flush, and the
+        // message sat showing "sending" forever (observed live: a session fully
+        // reattached, /connection 200, and the queued item was still never
+        // POSTed). Re-running the flush on every readiness signal costs nothing
+        // when the queue is empty (immediate return) and is single-flighted by
+        // `flushingOutbox` when it isn't. It adds no new double-send risk: the
+        // false→true edge already flushed after a reconnect, so this only
+        // covers the case that edge misses.
         void this._flushOutbox();
     }
 

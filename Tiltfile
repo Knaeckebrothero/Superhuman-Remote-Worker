@@ -299,6 +299,29 @@ docker_build(
 )
 
 # -----------------------------------------------------------------------------
+# Vendored chart dependencies. `helm/charts/` is gitignored (*.tgz), so a fresh
+# clone has no collabora-online tarball and `helm upgrade` refuses to run at all
+# — the dependency-presence check fires before `collabora.enabled` is evaluated,
+# so this bites even though Collabora is off in every local values file.
+#
+# CI does the same repo-add + build before each helm invocation. Doing it here
+# rather than in local-dev-tilt-up.sh covers a bare `tilt up` too, which is the
+# documented path for every session after the first.
+#
+# `helm dependency list` is offline and instant, so the common case (deps
+# already vendored) adds nothing to Tiltfile evaluation.
+# -----------------------------------------------------------------------------
+local(
+    """
+    if helm dependency list ./helm | grep -q 'missing'; then
+        helm repo add collabora https://collaboraonline.github.io/online --force-update
+        helm dependency build ./helm
+    fi
+    """,
+    quiet=True,
+)
+
+# -----------------------------------------------------------------------------
 # Helm chart — same chart as production. Values stack (last wins):
 #   1. helm/values.yaml                      chart defaults
 #   2. deployment/values-local.yaml          gitignored — dev secrets +
