@@ -1,0 +1,262 @@
+"""Supervised gate outcomes in the src/persistent_graph.py tool loop.
+
+Regression tests for
+docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+
+A supervised gate is a *question to the user*, so the loop must
+distinguish three outcomes and never fabricate a decision the user did
+not make:
+
+* ``approved``  -> run the tool.
+* ``declined``  -> the user really said no; tell the model so.
+* no answer     -> the gate was never answered (timed out / the card
+  never reached the browser). The loop must NOT tell the model the user
+  denied it, and must not run the tool.
+
+The live repro that motivated this: a model emitted four parallel
+``web_search`` calls, the user approved the first, and each remaining
+gate hit the 300 s TTL and was written into the conversation as the
+literal "User denied this tool call." — a refusal the user never made.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+
+from src.persistent_graph import (
+    PermissionOutcome,
+    PersistentLoopCallbacks,
+    run_persistent_loop,
+)
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
+    defaults = dict(
+        get_user_input=AsyncMock(return_value="hello"),
+        on_token=AsyncMock(),
+        on_thinking=AsyncMock(),
+        on_tool_start=AsyncMock(),
+        on_tool_result=AsyncMock(),
+        permission_check=AsyncMock(return_value=True),
+        on_turn_start=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_error=AsyncMock(),
+        check_interrupt=MagicMock(return_value=False),
+        on_vm_upgrade_needed=None,
+    )
+    defaults.update(overrides)
+    return PersistentLoopCallbacks(**defaults)
+
+
+def _make_config():
+    cfg = MagicMock()
+    cfg.llm.timeout = 600
+    cfg.memory.enabled = False
+    cfg.memory.observer_interval = 5
+    cfg.context_management.max_summary_length = 10000
+    return cfg
+
+
+def _make_tool(name: str, result: str):
+    tool = MagicMock()
+    tool.name = name
+    tool.ainvoke = AsyncMock(return_value=result)
+    return tool
+
+
+async def _run_turn_with_parallel_tools(
+    *,
+    permission_check,
+    messages: list[BaseMessage],
+    n_calls: int = 2,
+):
+    """Drive one turn whose single AIMessage carries ``n_calls`` parallel
+    tool calls, then a final tool-free AIMessage ends the turn."""
+    response_with_tools = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "web_search",
+                "args": {"query": f"capital of {country}"},
+                "id": f"tc_{i}",
+            }
+            for i, country in enumerate(
+                ["France", "Japan", "Brazil", "Egypt"][:n_calls]
+            )
+        ],
+    )
+    final_response = AIMessage(content="Done.")
+
+    call_count = 0
+
+    async def _astream(_messages, **kw):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            yield response_with_tools
+        else:
+            yield final_response
+
+    llm = AsyncMock()
+    llm.reasoning = None
+    llm.astream = _astream
+
+    tool = _make_tool("web_search", "Results: Paris.")
+
+    turns = 0
+
+    async def _input():
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return "look up four capitals"
+        raise asyncio.CancelledError
+
+    callbacks = _make_callbacks(
+        get_user_input=_input,
+        permission_check=permission_check,
+    )
+
+    await run_persistent_loop(
+        llm_with_tools=llm,
+        tools=[tool],
+        context_manager=AsyncMock(
+            ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+        ),
+        config=_make_config(),
+        system_prompt="sys",
+        callbacks=callbacks,
+        messages=messages,
+    )
+    return tool
+
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+
+class TestUnansweredGateIsNotADenial:
+    @pytest.mark.asyncio
+    async def test_unanswered_gate_does_not_tell_model_user_denied(self):
+        """The live bug: approve #1, leave #2 unanswered -> the model was
+        told "User denied this tool call." for a call the user never saw."""
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            if tool_call_id == "tc_0":
+                return PermissionOutcome.APPROVED
+            return PermissionOutcome.NO_ANSWER
+
+        messages: list[BaseMessage] = []
+        await _run_turn_with_parallel_tools(
+            permission_check=_permission_check, messages=messages
+        )
+
+        tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+        bodies = [str(m.content) for m in tool_msgs]
+
+        # The whole point: no fabricated refusal anywhere in the transcript.
+        assert not any("User denied" in b for b in bodies), (
+            f"unanswered gate was reported to the model as a denial: {bodies}"
+        )
+
+        # The approved call still ran and produced its real result.
+        assert any("Results: Paris." in b for b in bodies)
+
+        # The unanswered call contributed no ToolMessage at all — it is
+        # still pending, not resolved.
+        assert not any(m.tool_call_id == "tc_1" for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    async def test_unanswered_gate_does_not_execute_the_tool(self):
+        """No answer must never be read as consent."""
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.NO_ANSWER
+
+        messages: list[BaseMessage] = []
+        tool = await _run_turn_with_parallel_tools(
+            permission_check=_permission_check, messages=messages, n_calls=1
+        )
+
+        tool.ainvoke.assert_not_called()
+
+
+class TestExplicitDenyStillReported:
+    @pytest.mark.asyncio
+    async def test_explicit_deny_tells_model_the_user_declined(self):
+        """A real "no" must still reach the model — and read as the user's
+        decision, not as a timeout."""
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.DECLINED
+
+        messages: list[BaseMessage] = []
+        tool = await _run_turn_with_parallel_tools(
+            permission_check=_permission_check, messages=messages, n_calls=1
+        )
+
+        tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+        assert len(tool_msgs) == 1
+        assert "declined" in str(tool_msgs[0].content).lower()
+        tool.ainvoke.assert_not_called()
+
+
+class TestApprovedPathUnchanged:
+    @pytest.mark.asyncio
+    async def test_approved_calls_all_run(self):
+        """Regression guard: approving every gate runs every tool."""
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        tool = await _run_turn_with_parallel_tools(
+            permission_check=_permission_check, messages=messages, n_calls=2
+        )
+
+        tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+        assert len(tool_msgs) == 2
+        assert all("Results: Paris." in str(m.content) for m in tool_msgs)
+        assert tool.ainvoke.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_legacy_bool_true_still_approves(self):
+        """Back-compat: callbacks that still return a plain bool keep working."""
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return True
+
+        messages: list[BaseMessage] = []
+        tool = await _run_turn_with_parallel_tools(
+            permission_check=_permission_check, messages=messages, n_calls=1
+        )
+
+        assert tool.ainvoke.await_count == 1
+        tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+        assert "Results: Paris." in str(tool_msgs[0].content)
+
+    @pytest.mark.asyncio
+    async def test_legacy_bool_false_reads_as_explicit_deny(self):
+        """Back-compat: a plain False keeps its old "user said no" meaning."""
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return False
+
+        messages: list[BaseMessage] = []
+        tool = await _run_turn_with_parallel_tools(
+            permission_check=_permission_check, messages=messages, n_calls=1
+        )
+
+        tool.ainvoke.assert_not_called()
+        tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+        assert len(tool_msgs) == 1

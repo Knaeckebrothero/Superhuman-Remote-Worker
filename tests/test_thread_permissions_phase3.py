@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.persistent_graph import PermissionOutcome
+
 
 # ---------------------------------------------------------------------------
 # Helper: a fake postgres_conn that returns a context-managed asyncpg-like
@@ -115,7 +117,9 @@ class TestPermissionCheckEarlyReturns:
         import src.api.persistent_app as mod
 
         result = await mod._loop_permission_check("read_file", {}, "tc1")
-        assert result is False
+        # A gone session can never be answered — a real stop, not a pending
+        # question, so DECLINED (not NO_ANSWER).
+        assert result is PermissionOutcome.DECLINED
 
     @pytest.mark.asyncio
     async def test_autonomous_approves_without_db(self):
@@ -123,7 +127,7 @@ class TestPermissionCheckEarlyReturns:
 
         _install_session(postgres_conn=None, permission_mode="autonomous")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
-        assert result is True
+        assert result is PermissionOutcome.APPROVED
 
     @pytest.mark.asyncio
     async def test_auto_accept_approves_non_shell(self):
@@ -131,7 +135,7 @@ class TestPermissionCheckEarlyReturns:
 
         _install_session(postgres_conn=None, permission_mode="auto_accept")
         result = await mod._loop_permission_check("read_file", {}, "tc1")
-        assert result is True
+        assert result is PermissionOutcome.APPROVED
 
     @pytest.mark.asyncio
     async def test_auto_accept_falls_through_for_shell(self):
@@ -141,7 +145,8 @@ class TestPermissionCheckEarlyReturns:
 
         session = _install_session(postgres_conn=None, permission_mode="auto_accept")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
-        assert result is False
+        # No durable row can exist, so no later answer is possible: DECLINED.
+        assert result is PermissionOutcome.DECLINED
         assert session.tool_decisions["tc1"] == "denied"
 
 
@@ -414,7 +419,7 @@ class TestLoopPermissionCheckDBPath:
 
         session = _install_session(postgres_conn=None, permission_mode="supervised")
         result = await mod._loop_permission_check("run_command", {}, "tc1")
-        assert result is False
+        assert result is PermissionOutcome.DECLINED
         assert session.tool_decisions["tc1"] == "denied"
 
     @pytest.mark.asyncio
@@ -427,7 +432,7 @@ class TestLoopPermissionCheckDBPath:
         )
         session = _install_session(postgres_conn=postgres, permission_mode="supervised")
         result = await mod._loop_permission_check("run_command", {"cmd": "ls"}, "tc1")
-        assert result is True
+        assert result is PermissionOutcome.APPROVED
         assert session.tool_decisions["tc1"] == "approved"
 
     @pytest.mark.asyncio
@@ -442,7 +447,8 @@ class TestLoopPermissionCheckDBPath:
         result = await mod._loop_permission_check(
             "run_command", {"cmd": "rm -rf /"}, "tc1"
         )
-        assert result is False
+        # An explicit user "no" — DECLINED, distinct from an unanswered gate.
+        assert result is PermissionOutcome.DECLINED
         assert session.tool_decisions["tc1"] == "denied"
 
     @pytest.mark.asyncio

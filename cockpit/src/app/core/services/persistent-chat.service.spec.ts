@@ -1284,6 +1284,49 @@ describe('PersistentChatService — SSE event dispatch', () => {
         });
     });
 
+    it('re-surfaces a pending gate from the session.state welcome frame', async () => {
+        // A dropped live stream (or a reload) must not strand a gate that is
+        // still waiting on the user — otherwise it can never be answered and
+        // times out. See
+        // docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'session.state',
+            params: {
+                pending_permissions: [
+                    {
+                        id: 'tc-9',
+                        approval_id: 'approval-9',
+                        tool: 'web_search',
+                        args: {query: 'capital of Japan'},
+                    },
+                ],
+            },
+        }, '1:1');
+        expect(service.pendingPermission()).toEqual({
+            id: 'tc-9',
+            approvalId: 'approval-9',
+            tool: 'web_search',
+            args: {query: 'capital of Japan'},
+        });
+    });
+
+    it('leaves pendingPermission alone when session.state omits the key', async () => {
+        // Presence-check discipline: a metadata-only session.state from
+        // another channel must not clobber a live approval card.
+        const {service, es} = await setup();
+        (service as any).pendingPermission.set({
+            id: 'tc-live',
+            tool: 'run_command',
+            args: {cmd: 'ls'},
+        });
+        fireSseMessage(es, {
+            method: 'session.state',
+            params: {permission_mode: 'supervised'},
+        }, '1:1');
+        expect(service.pendingPermission()?.id).toBe('tc-live');
+    });
+
     it('promotes ready event to sessionReady=true and flushes the outbox', async () => {
         const {service, es, mockHttp} = await setup();
         // Queue a send as if the user typed while the session wasn't ready.

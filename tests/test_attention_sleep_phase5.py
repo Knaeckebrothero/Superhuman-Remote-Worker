@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.persistent_graph import PermissionOutcome
+
 
 # ---------------------------------------------------------------------------
 # Helpers: fake postgres pool + acquire() context manager
@@ -209,7 +211,7 @@ class TestPermissionCheckWakePathGuard:
         mod._session = session
 
         result = await mod._loop_permission_check("run_command", {}, "tc-1")
-        assert result is True
+        assert result is PermissionOutcome.APPROVED
         assert session.tool_decisions.get("tc-1") == "approved"
         # We never reached the INSERT step.
         db._fake_conn.fetchval.assert_not_called()
@@ -224,7 +226,8 @@ class TestPermissionCheckWakePathGuard:
         mod._session = session
 
         result = await mod._loop_permission_check("run_command", {}, "tc-2")
-        assert result is False
+        # A prior *explicit* deny replays as DECLINED, not as an unanswered gate.
+        assert result is PermissionOutcome.DECLINED
         assert session.tool_decisions.get("tc-2") == "denied"
 
     @pytest.mark.asyncio
@@ -249,7 +252,7 @@ class TestPermissionCheckWakePathGuard:
         result = await mod._loop_permission_check("run_command", {}, "tc-3")
         # Fell through to insert + wait, picked up the (mocked) "approved"
         # status on the race-check select.
-        assert result is True
+        assert result is PermissionOutcome.APPROVED
         assert db._fake_conn.fetchval.await_count >= 1
 
 
