@@ -11,9 +11,19 @@ tags:
 # Issue — workspace suspension infers tier from metadata *presence*, so VM sessions never suspend
 
 **Status:** Found 2026-07-27 while fixing Defect 1 of
-`docs/issues/session_vm_backend_never_attaches.md`. **FIXED 2026-07-28** (thread
-paths only — see "Job path" below). Unit-verified; live gate owed. Work on
-`develop`.
+`docs/issues/session_vm_backend_never_attaches.md`. **FIXED 2026-07-28**
+(`6d66f7c4`, thread paths only — see "Job path" below). Unit-verified; **live
+gate run 2026-07-28 and it exposed a second gate behind this one.**
+
+> **This fix does NOT stop VM sessions leaking their VMs.** The live gate showed
+> suspend now correctly resolving the VM tier, using ssh_host on port 22, and
+> reaching `capture_vm_snapshot` — which then refused, because a VM workspace is
+> only reachable over the tailnet and the orchestrator has no route there. So the
+> VM still keeps running. That second, architectural gate is filed separately as
+> `docs/issues/vm_session_suspend_unreachable_from_orchestrator.md` and needs a
+> decision. What this fix *does* deliver: the tier is read correctly, the snapshot
+> manifest is no longer mislabelled `pod`, the SSH port is no longer the pod's
+> 30022, and the failure is now visible instead of a silent tier misread.
 
 **One line:** `workspace_suspension.py` decides "is this pod-tier or VM-tier?" by
 asking whether `metadata.workspace_container` exists — but `_setup_gitea` writes
@@ -108,7 +118,8 @@ pass it, job callers omit it and keep the presence behaviour.
 
 **The idle sweeper needed no change.** `check_idle_threads`' SQL already selected
 vm-tier rows (`metadata->'vm'->>'status' = 'ready'`). The blockage was entirely
-inside `suspend_thread_workspace`, which bailed on every one it was handed.
+inside `suspend_thread_workspace`, which bailed on every one it was handed —
+though see the banner above: clearing that blockage reveals the next one.
 
 ### Job path: deliberately unchanged
 
