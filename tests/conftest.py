@@ -60,6 +60,48 @@ except Exception:
 
 
 # =============================================================================
+# Hermetic build-provenance environment
+# =============================================================================
+#
+# Both workflows declare SRW_SOURCE_URL, SRW_DOCUMENTATION_URL and
+# SRW_RELEASE_VERSION in their top-level ``env:`` block, so GitHub injects them
+# into every step of every job — including ``pytest tests/``. Those are exactly
+# the names src/core/runtime_provenance.py reads, so a test asserting that a
+# provenance field is absent passes locally (unset) and fails in CI (set), which
+# no local run can reproduce. Strip the whole surface before each test; a test
+# that wants a value still sets it via monkeypatch, which runs after this.
+
+from src.core.product_capabilities import ProductComponent  # noqa: E402
+
+_PROVENANCE_FIELDS = (
+    "SOURCE_REVISION",
+    "SOURCE_URL",
+    "ARTIFACT_DIGEST",
+    "RELEASE_VERSION",
+    "DOCUMENTATION_URL",
+)
+_PROVENANCE_ENV_VARS = (
+    "SRW_COMPONENT",
+    "SRW_DEPLOYMENT_PROVENANCE_JSON",
+    # Declared alongside the fields above in the register payload.
+    "BUILD_SHA",
+    *(f"SRW_{field}" for field in _PROVENANCE_FIELDS),
+    *(
+        f"SRW_{component.value.upper()}_{field}"
+        for component in ProductComponent
+        for field in _PROVENANCE_FIELDS
+    ),
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_declared_provenance_env(monkeypatch):
+    """Keep ambient build metadata out of every test's environment."""
+    for name in _PROVENANCE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+# =============================================================================
 # F1 multi-tenancy fixture — three users, two projects, jobs/threads/sessions
 # =============================================================================
 #
