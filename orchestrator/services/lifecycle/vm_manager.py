@@ -34,7 +34,11 @@ from typing import Any
 from services.ssh_helpers import orchestrator_can_reach
 
 from .types import Instance
-from .workspace_manager import orphan_grace_seconds, paused_within_grace
+from .workspace_manager import (
+    infra_transient_retry_pending,
+    orphan_grace_seconds,
+    paused_within_grace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +216,12 @@ class VMInstanceManager:
             # minutes into that window. Mirrors WorkspaceInstanceManager.
             if paused_within_grace(inst.metadata):
                 return False
+            # A job paused for a transient-infra retry is NOT idle — it is
+            # mid-recovery and will resume onto this exact VM. Reaping it would
+            # hand the retry an empty workspace, which is the loss the retry
+            # exists to avoid. Bounded by next_retry_at (≤1h). (Defect 1b)
+            if infra_transient_retry_pending(inst.metadata):
+                return False
             return job_status in _IDLE_JOB_STATUSES
         if thread_status:
             return thread_status in _IDLE_THREAD_STATUSES
@@ -254,6 +264,12 @@ class VMInstanceManager:
         if job_status:
             # Warm grace for 'paused' — see is_idle.
             if paused_within_grace(inst.metadata):
+                return False
+            # A job paused for a transient-infra retry is NOT idle — it is
+            # mid-recovery and will resume onto this exact VM. Reaping it would
+            # hand the retry an empty workspace, which is the loss the retry
+            # exists to avoid. Bounded by next_retry_at (≤1h). (Defect 1b)
+            if infra_transient_retry_pending(inst.metadata):
                 return False
             return job_status in _REAPABLE_JOB_STATUSES
         if thread_status:
@@ -538,7 +554,7 @@ class VMInstanceManager:
             async with self._db.acquire() as conn:
                 job_rows = await conn.fetch(
                     """
-                    SELECT id, status, context, updated_at,
+                    SELECT id, status, context, updated_at, freeze_data,
                            (assigned_agent_id IS NULL) AS unassigned,
                            (freeze_data IS NULL) AS freeze_free
                     FROM jobs
@@ -578,6 +594,10 @@ class VMInstanceManager:
                     "owner_status": r.get("status"),
                     "owner_updated_at": r.get("updated_at"),
                     "job_dispatchable": dispatchable,
+                    # Carried for the infra_transient reap carve-out: a job
+                    # paused for a DB-blip retry must keep its VM, or the retry
+                    # resumes into an empty workspace. (Defect 1b)
+                    "job_freeze_data": _coerce_jsonb(r.get("freeze_data")),
                     "vm_ctx": vm_ctx,
                     "ide_session_status": _coerce_jsonb(ctx.get("ide_session")).get(
                         "status"
@@ -645,6 +665,7 @@ class VMInstanceManager:
             metadata["job_status"] = row.get("owner_status")
             metadata["job_updated_at"] = row.get("owner_updated_at")
             metadata["job_dispatchable"] = bool(row.get("job_dispatchable"))
+            metadata["job_freeze"] = row.get("job_freeze_data") or {}
         else:
             metadata["thread_status"] = row.get("owner_status")
             metadata["total_turns"] = row.get("total_turns") or 0

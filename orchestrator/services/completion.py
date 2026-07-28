@@ -249,6 +249,74 @@ def is_job_completion_freeze(job: dict[str, Any]) -> bool:
     return freeze_type == "job_complete" or freeze_data.get("status") == "job_completed"
 
 
+# Transient-infrastructure retry policy (Defect 1). Mirrors the shape of the
+# LLM-outage backoff: a fixed escalating ladder, capped, with a hard attempt
+# ceiling after which the job fails terminally with the infra cause named.
+#
+# The ceiling is what makes a MISCLASSIFICATION safe: if a genuinely permanent
+# error is ever matched by is_transient_infra_error, it costs five paused
+# retries over ~1.8h and then fails — it cannot retry forever.
+INFRA_TRANSIENT_MAX_ATTEMPTS = 5
+_INFRA_TRANSIENT_BACKOFF_SECONDS = (60, 300, 900, 1800, 3600)
+
+
+def infra_transient_backoff_seconds(attempt: int) -> float:
+    """Seconds to wait before re-dispatching after transient-infra attempt ``n``.
+
+    ``attempt`` is 1-based (the first pause waits 60s). Past the ladder the cap
+    (1h) repeats, which also bounds how long the reaper carve-out can pin a VM.
+    """
+    index = max(1, int(attempt)) - 1
+    if index >= len(_INFRA_TRANSIENT_BACKOFF_SECONDS):
+        return float(_INFRA_TRANSIENT_BACKOFF_SECONDS[-1])
+    return float(_INFRA_TRANSIENT_BACKOFF_SECONDS[index])
+
+
+def is_late_completion_report(job: dict[str, Any], result: dict[str, Any]) -> bool:
+    """True when a report on an already-``failed`` job says the job finished.
+
+    The ``/complete`` gate rejects any report on a terminal job *before*
+    inspecting it, which strands two real cases:
+
+      * a job that genuinely completed, whose ``job_complete`` freeze arrives
+        after something failed it out-of-band — it stays ``failed`` forever, and
+        ``determine_job_status``' carve-outs never run because they sit
+        downstream of the gate (see
+        docs/done/coincident_infra_error_overrides_reported_job_outcome.md);
+      * a recoverable ``workspace_unavailable`` report, whose recovery arm is
+        47 lines further down and therefore unreachable.
+
+    This predicate authorises ONLY the first: a completion freeze re-resolves
+    the job. It is deliberately narrow.
+
+      * ``failed`` only. ``cancelled`` is explicit human intent and is never
+        overridden by a late machine report.
+      * The freeze must come from the REQUEST BODY. A failed job's DB
+        ``freeze_data`` is NULL (the freeze write is what did not happen), so
+        reading the row would always say no.
+      * Re-resolve, never re-open: this returns True only for a completion
+        freeze, so a recoverable error report cannot use it to re-dispatch a
+        job that already ran — that is the hazard that made us reconstruct job
+        c6dd288d by hand rather than resume it.
+
+    docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 2)
+    """
+    if job.get("status") != "failed":
+        return False
+    freeze = result.get("freeze_data")
+    if isinstance(freeze, str):
+        try:
+            freeze = json.loads(freeze)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(freeze, dict):
+        return False
+    return (
+        freeze.get("freeze_type") == "job_complete"
+        or freeze.get("status") == "job_completed"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Status determination
 # ---------------------------------------------------------------------------

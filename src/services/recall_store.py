@@ -41,6 +41,40 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+# Mirrors the ``valid_memory_type`` CHECK constraint in
+# orchestrator/database/vector_schema.sql. Held as a Python constant so the two
+# cannot drift silently, and so an out-of-set value is COERCED rather than
+# raising CheckViolationError and discarding the whole memory.
+#
+# ``memory_type`` is LLM-authored (the extractor's ``mem.type``), so it is
+# untrusted input: job c6dd288d lost an extraction to
+# ``CheckViolationError: valid_memory_type`` on the value "factial" — a typo for
+# "factual". docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
+# (Defect 7).
+#
+# Deliberately NOT fuzzy nearest-match: "factial" is obviously "factual", but
+# nearest-match could silently mis-file a genuinely wrong type. A known default
+# plus a loud log keeps the mistake visible.
+VALID_MEMORY_TYPES = frozenset(
+    {"factual", "procedural", "error_solution", "vocabulary", "relational"}
+)
+DEFAULT_MEMORY_TYPE = "factual"
+
+
+def coerce_memory_type(memory_type: Optional[str]) -> str:
+    """Return a constraint-safe ``memory_type``, logging any substitution."""
+    if memory_type in VALID_MEMORY_TYPES:
+        return memory_type
+    logger.warning(
+        "Invalid memory_type %r coerced to %r (valid: %s) — the memory is kept; "
+        "before this guard the CHECK constraint discarded the whole row",
+        memory_type,
+        DEFAULT_MEMORY_TYPE,
+        ", ".join(sorted(VALID_MEMORY_TYPES)),
+    )
+    return DEFAULT_MEMORY_TYPE
+
 # English stopwords — small hardcoded set for keyword extraction
 _STOPWORDS = frozenset(
     {
@@ -458,6 +492,10 @@ class RecallStore:
             token_count = len(content) // 4
 
         ttl = remaining_turns if remaining_turns is not None else self.default_ttl
+
+        # Single funnel for all three store paths — coerce here so no caller can
+        # bypass the CHECK constraint guard. (Defect 7)
+        memory_type = coerce_memory_type(memory_type)
 
         keywords_list = keywords or []
         keywords_text = " ".join(keywords_list) + " " + content

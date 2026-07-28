@@ -21,23 +21,149 @@ class WorkspaceUnavailableError(Exception):
     pass
 
 
+# --- transient infrastructure classification --------------------------------
+#
+# Matching is by exception CLASS NAME across the MRO rather than by importing
+# driver exception trees. The agent and orchestrator images do not carry the
+# same drivers (psycopg rides with the LangGraph checkpointer, asyncpg with the
+# orchestrator), so a hard import would either crash on the wrong image or force
+# a try/except ladder that silently degrades. Name matching is stringly-typed,
+# but the deny-list below is checked FIRST, so the failure mode of an accidental
+# match is "stays terminal", never "a real bug becomes an infinite retry".
+#
+# docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1)
+
+# Real bugs. These must never be retried — retrying a constraint violation or a
+# missing column just burns the attempt ceiling and hides the defect.
+_NEVER_TRANSIENT_EXC_NAMES = frozenset(
+    {
+        "CheckViolationError",
+        "UniqueViolationError",
+        "ForeignKeyViolationError",
+        "NotNullViolationError",
+        "IntegrityConstraintViolationError",
+        "IntegrityError",
+        "UndefinedColumnError",
+        "UndefinedTableError",
+        "UndefinedFunctionError",
+        "UndefinedObjectError",
+        "InvalidTextRepresentationError",
+        "DatatypeMismatchError",
+        "SyntaxOrAccessError",
+        "ProgrammingError",
+        "DataError",
+    }
+)
+
+# Unambiguously a lost/unavailable connection whatever the message says.
+_ALWAYS_TRANSIENT_EXC_NAMES = frozenset(
+    {
+        # asyncpg
+        "ConnectionDoesNotExistError",
+        "ConnectionFailureError",
+        "CannotConnectNowError",
+        "TooManyConnectionsError",
+        "AdminShutdownError",
+        "CrashShutdownError",
+        "IdleSessionTimeoutError",
+        "PostgresConnectionError",
+        # Resource exhaustion (SQLSTATE 53xxx). Job e1192a9d died to a raw
+        # "No space left on device" — an operator can expand the volume inside
+        # the retry window, and if they don't, the ceiling fails the job anyway
+        # with the infra cause named. asyncpg / psycopg spellings both listed.
+        "DiskFullError",
+        "DiskFull",
+        "OutOfMemoryError",
+        "OutOfMemory",
+        "InsufficientResourcesError",
+        # builtins raised through the socket layer
+        "ConnectionResetError",
+        "BrokenPipeError",
+        "ConnectionAbortedError",
+        "ConnectionRefusedError",
+    }
+)
+
+# Overloaded classes — psycopg raises OperationalError for genuine config
+# problems too, so these are gated on the message.
+_MESSAGE_GATED_EXC_NAMES = frozenset({"OperationalError", "InterfaceError"})
+
+_CONNECTION_LOST_MARKERS = (
+    "the connection is closed",  # psycopg, the exact 2026-07-27 message
+    "connection already closed",
+    "connection is closed",
+    "connection was closed",
+    "server closed the connection unexpectedly",
+    "terminating connection",
+    "consuming input failed",
+    "no connection to the server",
+    "ssl connection has been closed",
+    "connection reset",
+    "connection refused",
+    "could not connect",
+    "server is not accepting connections",
+    "the database system is in recovery mode",
+    "the database system is starting up",
+    "no space left on device",  # the error that killed job e1192a9d
+)
+
+
+def is_transient_infra_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a lost/unavailable backing service, not a job fault.
+
+    A dropped Postgres connection terminally failed three multi-day jobs on
+    2026-07-27 because the error taxonomy was binary: ``WorkspaceUnavailableError``
+    was recoverable and *everything else* was death. This predicate adds the
+    third class.
+
+    Deliberately conservative — an unmatched exception keeps today's behaviour
+    (terminal). The attempt ceiling on the retry path is the backstop for a
+    misclassification in the other direction: a genuinely permanent error that
+    slips in here fails the job after N attempts with the infra cause named,
+    rather than retrying forever.
+    """
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    if names & _NEVER_TRANSIENT_EXC_NAMES:
+        return False
+    if names & _ALWAYS_TRANSIENT_EXC_NAMES:
+        return True
+    if names & _MESSAGE_GATED_EXC_NAMES:
+        message = str(exc).lower()
+        return any(marker in message for marker in _CONNECTION_LOST_MARKERS)
+    return False
+
+
 def completion_error_payload(exc: BaseException) -> Dict[str, Any]:
     """Build the completion-report ``error`` dict for an exception.
 
-    The orchestrator's ``/complete`` recovery arm routes purely on
-    ``error.type == "workspace_unavailable"`` — an untyped
-    ``{"message": str(e)}`` report turns a recoverable dead-workspace
-    failure into a terminal job failure plus workspace teardown. Every
-    app-layer ``except`` that reports an exception to ``/complete`` must
+    The orchestrator's ``/complete`` recovery arms route purely on
+    ``error.type`` — an untyped ``{"message": str(e)}`` report turns a
+    recoverable failure into a terminal job failure plus workspace teardown.
+    Every app-layer ``except`` that reports an exception to ``/complete`` must
     build its payload here so the classification survives.
-    docs/issues/streaming_strips_workspace_unavailable_type.md
+
+    Three classes:
+      * ``workspace_unavailable`` — the VM/pod is gone; pause, reprovision,
+        resume (docs/issues/streaming_strips_workspace_unavailable_type.md).
+      * ``infra_transient`` — a backing service blipped; pause, KEEP the
+        workspace, retry with backoff
+        (docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md).
+      * ``job_error`` — the job itself failed. Terminal.
+
+    Order matters: a dead workspace is checked first, since a workspace error
+    could otherwise be caught by the socket-level names in the transient set.
     """
-    is_ws = isinstance(exc, WorkspaceUnavailableError)
+    if isinstance(exc, WorkspaceUnavailableError):
+        error_type, recoverable = "workspace_unavailable", True
+    elif is_transient_infra_error(exc):
+        error_type, recoverable = "infra_transient", True
+    else:
+        error_type, recoverable = "job_error", False
     return {
         "error": {
             "message": str(exc),
-            "type": "workspace_unavailable" if is_ws else "job_error",
-            "recoverable": is_ws,
+            "type": error_type,
+            "recoverable": recoverable,
         }
     }
 
