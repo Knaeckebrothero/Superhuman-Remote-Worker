@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Local development bootstrap: k3d cluster + cert-manager + mkcert ClusterIssuer
-# + namespace + vm-ssh-key Secret.
+# + namespace + vm-ssh-key Secret + vendored Helm chart dependencies.
 #
 # Idempotent: re-runs are safe. Skips anything that already exists.
 #
@@ -16,6 +16,9 @@
 #   - `sudo CAROOT="$HOME/.local/share/mkcert" mkcert -install` (system + Chrome trust)
 # =============================================================================
 set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
 CLUSTER_NAME="${CLUSTER_NAME:-srw}"
 NAMESPACE="${NAMESPACE:-srw}"
@@ -150,6 +153,25 @@ COREDNS_EOF
   ok "coredns-custom override applied (cloud/auth/git.localhost -> $TRAEFIK_IP)"
 fi
 
+# --- 6. Vendored Helm chart dependencies ------------------------------------
+# `helm/charts/` is gitignored (*.tgz), so a fresh clone has no
+# collabora-online tarball and every `helm install|upgrade` refuses to run:
+# the dependency-presence check fires before `collabora.enabled` is evaluated,
+# so it blocks the whole release even though Collabora is off locally. CI does
+# the same repo-add + build before each helm invocation. `dependency build`
+# (not `update`) installs the Chart.lock pins, so local matches CI exactly.
+#
+# `dependency list` is offline and instant, so re-runs cost nothing.
+CHART_DEPS=$(helm dependency list "$REPO_ROOT/helm" 2>/dev/null || true)
+if [[ "$CHART_DEPS" == *missing* ]]; then
+  log "vendoring Helm chart dependencies into helm/charts/"
+  helm repo add collabora https://collaboraonline.github.io/online --force-update >/dev/null
+  helm dependency build "$REPO_ROOT/helm" >/dev/null
+  ok "chart dependencies vendored"
+else
+  skip "Helm chart dependencies already vendored"
+fi
+
 # --- Done -------------------------------------------------------------------
 cat <<EOF
 
@@ -158,8 +180,6 @@ $(printf '\033[1;32m✓ Local cluster ready.\033[0m')
 Next:
   cp deployment/values-local.yaml.example deployment/values-local.yaml
   \$EDITOR deployment/values-local.yaml      # paste at least one LLM key
-  helm repo add collabora https://collaboraonline.github.io/online --force-update
-  helm dependency build ./helm
   helm install srw ./helm -n $NAMESPACE -f deployment/values-local.yaml
 
 Then open https://localhost/ and log in as test / test.

@@ -1309,6 +1309,12 @@
       "foldMore": "+{{count}} weitere",
       "foldFailed": "⚠ {{count}} fehlgeschlagen"
     },
+    "queued": {
+      "notSent": "Nicht gesendet",
+      "waiting": "In Warteschlange – wird gesendet",
+      "retry": "Erneut versuchen",
+      "discard": "Verwerfen"
+    },
     "diff": {
       "replace": "Diff",
       "append": "Angehängt",
