@@ -1024,6 +1024,9 @@ class TestThreadTierIsExplicit:
         kwargs = svc._snapshot_service.capture_vm_snapshot.await_args.kwargs
         assert kwargs["source_type"] == "vm"
         assert kwargs["ssh_host"] == "100.64.0.235"
+        # _resolve_ssh_port also branched on ws_ctx presence, so a vm-tier thread
+        # (whose ws_ctx holds git coordinates) was handed the POD port 30022.
+        assert kwargs["ssh_port"] == 22
 
     @pytest.mark.asyncio
     async def test_vm_tier_status_markers_go_to_vm_context(self):
