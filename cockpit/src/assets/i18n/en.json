@@ -1309,6 +1309,12 @@
       "foldMore": "+{{count}} more",
       "foldFailed": "⚠ {{count}} failed"
     },
+    "queued": {
+      "notSent": "Not sent",
+      "waiting": "Queued — waiting to send",
+      "retry": "Retry",
+      "discard": "Discard"
+    },
     "diff": {
       "replace": "Diff",
       "append": "Appended",

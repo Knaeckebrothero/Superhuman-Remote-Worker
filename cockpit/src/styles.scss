@@ -8,6 +8,7 @@
 @use 'styles/katex';              // Global presentation tweaks for KaTeX math in <markdown>
 @use 'styles/canvas-content';     // Sanitized Dynamic Canvas markdown typography
 @use 'styles/external-image';     // Inert click-to-load cards in untrusted Markdown
+@use 'styles/chat-queued';        // Retry/discard affordances on a stalled chat send
 
 // --- Theme classes (body-class swap) ---
 // Default look = senate (dark). <body class="theme-senate"> applies these tokens.

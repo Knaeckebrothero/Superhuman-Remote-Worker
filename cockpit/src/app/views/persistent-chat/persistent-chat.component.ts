@@ -991,12 +991,20 @@ export function clearDraft(threadId: string | null): void {
               }
             }
             @case ('user') {
+              @let queued = chat.outboxIds().has(turn.id);
+              @let stalled = queued && chat.outboxStalled();
               <div class="message message-user"
                    [class.historical]="turn.historical"
-                   [class.queued]="chat.outboxIds().has(turn.id)">
+                   [class.queued]="queued"
+                   [class.stalled]="stalled">
                 <div class="avatar">
-                  @if (chat.outboxIds().has(turn.id)) {
-                    <app-icon size="sm" class="avatar-icon" title="Queued — waiting to send">schedule</app-icon>
+                  @if (stalled) {
+                    <!-- Not "waiting to send" — the send actually failed. -->
+                    <app-icon size="sm" class="avatar-icon"
+                              [title]="'chat.queued.notSent' | transloco">error_outline</app-icon>
+                  } @else if (queued) {
+                    <app-icon size="sm" class="avatar-icon"
+                              [title]="'chat.queued.waiting' | transloco">schedule</app-icon>
                   } @else {
                     <app-icon size="sm" class="avatar-icon">person</app-icon>
                   }
@@ -1029,6 +1037,17 @@ export function clearDraft(threadId: string | null): void {
                           <span class="user-attachment-name">{{ att.name }}</span>
                         </span>
                       }
+                    </div>
+                  }
+                  <!-- Stalled queue: the flush has no timed auto-retry, so
+                       without these the bubble spins on "sending" forever. -->
+                  @if (stalled) {
+                    <div class="queued-actions">
+                      <span class="queued-note">{{ 'chat.queued.notSent' | transloco }}</span>
+                      <button type="button" class="queued-action"
+                              (click)="chat.retryQueuedSends()">{{ 'chat.queued.retry' | transloco }}</button>
+                      <button type="button" class="queued-action"
+                              (click)="chat.discardQueuedSend(turn.id)">{{ 'chat.queued.discard' | transloco }}</button>
                     </div>
                   }
                 </div>

@@ -1859,6 +1859,105 @@ describe('PersistentChatService — REST sends', () => {
         expect(ctx.service.error()).not.toBeNull();
     });
 
+    it('re-flushes a stalled outbox on a readiness signal received while already ready', async () => {
+        // Regression: markSessionReady used to early-return when sessionReady
+        // was already true, so a send that failed *after* the session came up
+        // could never be retried by any readiness signal — the message sat
+        // showing "sending" forever even across a full reattach. Observed live
+        // on thread b1758f38: /connection 200, queued item never POSTed.
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockReturnValue(throwError(() => ({status: 0})));
+        await ctx.service.sendMessage('stalled by transport');
+        await new Promise((r) => setTimeout(r, 0));
+        expect(ctx.service.outbox().length).toBe(1);
+        expect(ctx.service.outboxStalled()).toBe(true);
+        expect(ctx.service.sessionReady()).toBe(true);
+
+        // Transport recovers; a further readiness frame arrives. sessionReady
+        // never transitioned false→true, so this is the case the old latch
+        // dropped on the floor.
+        ctx.mockHttp.post.mockReturnValue(of({accepted: true, turn_id: 1}));
+        ctx.mockHttp.post.mockClear();
+        fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:2');
+        await new Promise((r) => setTimeout(r, 0));
+
+        const inputCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/persistent/threads/thread-r/input'),
+        );
+        expect(inputCalls).toHaveLength(1);
+        expect(inputCalls[0][1]).toEqual({content: 'stalled by transport'});
+        expect(ctx.service.outbox()).toEqual([]);
+        expect(ctx.service.outboxStalled()).toBe(false);
+        expect(ctx.service.error()).toBeNull();
+    });
+
+    it('surfaces human copy (not Angular internals) when the fetch itself fails', async () => {
+        const ctx = await readySession();
+        // Exactly what Angular's fetch backend emits when fetch() rejects:
+        // status 0, statusText undefined, message built from both.
+        ctx.mockHttp.post.mockReturnValue(
+            throwError(() => ({
+                status: 0,
+                message:
+                    'Http failure response for https://api.example/api/persistent/threads/t/input: 0 undefined',
+            })),
+        );
+        await ctx.service.sendMessage('offline send');
+        await new Promise((r) => setTimeout(r, 0));
+
+        const banner = ctx.service.error();
+        expect(banner).not.toBeNull();
+        expect(banner).not.toContain('Http failure response');
+        expect(banner).not.toContain('undefined');
+        expect(banner).toContain("Couldn't reach the server");
+        // Not terminal: the message is kept for a retry.
+        expect(ctx.service.outbox().length).toBe(1);
+        expect(ctx.service.outboxStalled()).toBe(true);
+    });
+
+    it('retryQueuedSends re-POSTs a stalled item and clears the stall', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockReturnValue(throwError(() => ({status: 0})));
+        await ctx.service.sendMessage('retry me');
+        await new Promise((r) => setTimeout(r, 0));
+        expect(ctx.service.outboxStalled()).toBe(true);
+
+        ctx.mockHttp.post.mockReturnValue(of({accepted: true, turn_id: 1}));
+        ctx.mockHttp.post.mockClear();
+        ctx.service.retryQueuedSends();
+        await new Promise((r) => setTimeout(r, 0));
+
+        const inputCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/persistent/threads/thread-r/input'),
+        );
+        expect(inputCalls).toHaveLength(1);
+        expect(ctx.service.outbox()).toEqual([]);
+        expect(ctx.service.outboxStalled()).toBe(false);
+        expect(ctx.service.error()).toBeNull();
+        // The bubble stays — SSE renders the turn from here.
+        expect(
+            ctx.service.turns().some((t) => isUserTurn(t) && t.content === 'retry me'),
+        ).toBe(true);
+    });
+
+    it('discardQueuedSend drops the queued item and its optimistic bubble', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockReturnValue(throwError(() => ({status: 0})));
+        await ctx.service.sendMessage('forget this');
+        await new Promise((r) => setTimeout(r, 0));
+        expect(ctx.service.outbox().length).toBe(1);
+
+        const localId = ctx.service.outbox()[0].localId;
+        ctx.service.discardQueuedSend(localId);
+
+        expect(ctx.service.outbox()).toEqual([]);
+        expect(ctx.service.outboxStalled()).toBe(false);
+        expect(ctx.service.error()).toBeNull();
+        expect(
+            ctx.service.turns().some((t) => isUserTurn(t) && t.content === 'forget this'),
+        ).toBe(false);
+    });
+
     it('keeps the bubble and resolves true on a 409 dup', async () => {
         const ctx = await readySession();
         ctx.mockHttp.post.mockReturnValue(throwError(() => ({status: 409})));

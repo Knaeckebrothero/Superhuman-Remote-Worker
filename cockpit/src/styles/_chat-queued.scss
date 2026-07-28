@@ -1,0 +1,39 @@
+// Stalled-send affordances on a queued chat bubble.
+//
+// Lives here rather than in persistent-chat.component.scss purely for the
+// anyComponentStyle budget: that component is a kitchen sink already sitting
+// ~0.5 kB under its cap, and the agreed rule is to keep new styling out of it
+// until it is split (docs/issues/persistent_chat_component_style_budget.md).
+//
+// Scoped under `.message-user.stalled` so nothing leaks globally — the class is
+// only ever set by the chat message list on an outbox item whose POST failed.
+.message-user.stalled {
+  // Queued bubbles are muted to read as "in flight"; a stalled one needs
+  // attention instead, so undo the muting.
+  opacity: 1;
+
+  .avatar-icon,
+  .queued-note {
+    color: var(--danger);
+  }
+
+  .queued-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+    font-size: 0.8rem;
+  }
+
+  .queued-action {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-secondary);
+    text-decoration: underline;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--text-primary);
+    }
+  }
+}
