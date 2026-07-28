@@ -554,6 +554,25 @@ class KnowledgeStore:
         after every changed row is written, so an interrupted run leaves the old
         commit and the next run re-diffs from there (per-row ``blob_sha`` skips the
         already-current rows).
+
+        The ``::varchar`` casts on $4/$6 are load-bearing, not decoration. Both
+        parameters feed ``VARCHAR(64)`` columns *and* appear inside
+        ``COALESCE($6, $4)``. Left uncast, that COALESCE has two untyped
+        arguments, so Postgres resolves it to its preferred unknown type
+        ``text`` and records $4 as ``text``; the direct ``indexed_commit = $4``
+        then wants ``character varying`` and the whole statement is rejected at
+        parse time with ``inconsistent types deduced for parameter $4``. That
+        killed *every* watermark write — the reindex wrote all its rows and then
+        died on this last statement, so ``indexed_commit`` never advanced and
+        each run re-embedded the whole vault
+        (docs/issues/kb_reindex_watermark_never_advances.md). Casting at every
+        occurrence pins both parameters to the column type regardless of which
+        use Postgres resolves first. ``::varchar`` (unqualified) rather than
+        ``::varchar(64)`` deliberately: a cast to a length-qualified type
+        silently truncates, whereas assignment to the column keeps its length
+        check and errors loudly on an over-long commit id.
+        ``set_watermark_status`` below needs no such cast — its COALESCE's
+        second argument is a column, which pins the type on its own.
         """
         await self.db.execute(
             """
@@ -561,14 +580,15 @@ class KnowledgeStore:
                 (kb_id, repo_name, branch, indexed_commit, pipeline_version,
                  source_head, status, last_attempt_at, last_success_at,
                  last_error, updated_at)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, $4), $7, NOW(),
+            VALUES ($1, $2, $3, $4::varchar, $5,
+                    COALESCE($6::varchar, $4::varchar), $7, NOW(),
                     CASE WHEN $7 = 'ready' THEN NOW() ELSE NULL END, $8, NOW())
             ON CONFLICT (kb_id) DO UPDATE
                SET repo_name = $2,
                    branch = $3,
-                   indexed_commit = $4,
+                   indexed_commit = $4::varchar,
                    pipeline_version = $5,
-                   source_head = COALESCE($6, $4),
+                   source_head = COALESCE($6::varchar, $4::varchar),
                    status = $7,
                    last_attempt_at = NOW(),
                    last_success_at = CASE
