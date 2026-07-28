@@ -63,35 +63,35 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-1391831
+    tag: sha-5eb436e
   agent:
-    tag: sha-1391831
+    tag: sha-5eb436e
   cockpit:
-    tag: sha-1391831
+    tag: sha-5eb436e
   mcp:
-    tag: sha-9710244
+    tag: sha-5eb436e
   workspace:
-    tag: sha-9710244
+    tag: sha-5eb436e
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: ""
+  releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
   components:
     orchestrator:
-      sourceRevision: 1391831bbaa2ec8ad0cdbd4210f4f7c70815a7df
-      releaseVersion: ""
+      sourceRevision: 5eb436eb9181b3271aef223e89c8d87861d95b4c
+      releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
     agent:
-      sourceRevision: 1391831bbaa2ec8ad0cdbd4210f4f7c70815a7df
-      releaseVersion: ""
+      sourceRevision: 5eb436eb9181b3271aef223e89c8d87861d95b4c
+      releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
     cockpit:
-      sourceRevision: 1391831bbaa2ec8ad0cdbd4210f4f7c70815a7df
-      releaseVersion: ""
+      sourceRevision: 5eb436eb9181b3271aef223e89c8d87861d95b4c
+      releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
     mcp:
-      sourceRevision: 9710244e267ac724e224c1b55a75ab3ec07b9e70
-      releaseVersion: ""
+      sourceRevision: 5eb436eb9181b3271aef223e89c8d87861d95b4c
+      releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
     workspace:
-      sourceRevision: 9710244e267ac724e224c1b55a75ab3ec07b9e70
-      releaseVersion: ""
+      sourceRevision: 5eb436eb9181b3271aef223e89c8d87861d95b4c
+      releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
 # (docs/operations/orchestrator_m1_go_live.md)
