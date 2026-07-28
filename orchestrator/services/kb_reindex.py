@@ -282,6 +282,81 @@ def note_fields(path: str, fm: Optional[Dict[str, Any]], body: str) -> Dict[str,
     }
 
 
+# The project-scoped identity constraint on knowledge_index. A violation here
+# is never a transient fault: it means one OKF note id exists at two paths in
+# the same vault, and neither adopt_legacy_row (which only claims a pathless or
+# being-deleted row) nor upsert_kb_note's `(kb_id, path)` arbiter can absorb a
+# conflict raised by a *different* unique constraint. The INSERT dies once per
+# affected note, on every run, forever.
+_NOTE_ID_CONSTRAINT = "uq_knowledge_project_note"
+
+
+def _violated_constraint(exc: BaseException) -> str:
+    """Best-effort constraint name for a driver error.
+
+    asyncpg puts it on ``constraint_name``; anything that wrapped or
+    re-raised the error only has the rendered message. Both are checked so
+    the diagnostic below survives a driver swap or a wrapping layer.
+    """
+    name = getattr(exc, "constraint_name", None)
+    return str(name) if name else str(exc)
+
+
+async def _log_duplicate_note_id(
+    store: Any,
+    kb_id: uuid.UUID,
+    path: str,
+    note_id: Optional[str],
+    exc: BaseException,
+) -> bool:
+    """Turn a duplicate-key error into a statement of what is actually wrong.
+
+    The raw Postgres error names the note id and nothing else — not the path
+    being indexed, not the path the index already holds, and not the fact that
+    those are two different files claiming one identity. Read literally it
+    suggests the reindexer is retrying a write that should have succeeded; the
+    truth is the opposite (the constraint is correct and the insert is
+    impossible), which is why this shipped as a quiet per-note error for as
+    long as it did.
+
+    Emits ONE line carrying the note id, both paths, and which one the index
+    holds, so a future occurrence is readable without a database session.
+
+    Returns True when it recognised and logged the condition; False leaves the
+    caller's generic error line in place. Never raises: this runs inside an
+    ``except`` block and a failure to explain an error must not replace it.
+    """
+    if _NOTE_ID_CONSTRAINT not in _violated_constraint(exc):
+        return False
+
+    incumbent: Optional[Dict[str, Any]] = None
+    if note_id:
+        try:
+            incumbent = await store.find_note_id_owner(kb_id, note_id)
+        except Exception as lookup_exc:  # pragma: no cover - diagnostic only
+            logger.debug(
+                "kb_reindex[%s]: duplicate-id lookup failed for %s: %s",
+                kb_id,
+                note_id,
+                lookup_exc,
+            )
+
+    held = (incumbent or {}).get("path")
+    logger.error(
+        "kb_reindex[%s]: note id %r exists at two paths — indexing %s but the "
+        "index holds %s; the %s row wins and %s stays unindexed every run. "
+        "One of the two files must be removed or given a distinct OKF id "
+        "(a note filename used as a DIRECTORY is the usual cause).",
+        kb_id,
+        note_id or "<unknown>",
+        path,
+        held or "a pathless legacy row (no file)",
+        "existing" if held else "pathless",
+        path,
+    )
+    return True
+
+
 _kb_locks: Dict[uuid.UUID, asyncio.Lock] = {}
 
 
@@ -636,6 +711,10 @@ async def _reindex_snapshot(
     upserted = skipped = errors = 0
     invalid_paths: List[str] = []
     for path in upsert_paths:
+        # Set once the frontmatter is parsed, so the duplicate-id diagnostic
+        # below can name the OKF id rather than guessing it from the filename
+        # (they differ exactly in the cases that hit the constraint).
+        note_id: Optional[str] = None
         try:
             text = await snapshot.get_file(path)
             if text is None:
@@ -654,6 +733,7 @@ async def _reindex_snapshot(
                 skipped += 1
                 continue
             fields = note_fields(path, fm, body)
+            note_id = fields["note_id"]
             # Embed BEFORE writing: a failed embed leaves the stale blob_sha in
             # place, so the next run retries this note.
             chunk_rows, _ = await embed_note_chunks(
@@ -725,7 +805,8 @@ async def _reindex_snapshot(
                         "kb_reindex[%s]: progress bump skipped: %s", kb_id, exc
                     )
         except Exception as exc:
-            logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, exc)
+            if not await _log_duplicate_note_id(store, kb_id, path, note_id, exc):
+                logger.warning("kb_reindex[%s]: error on %s: %s", kb_id, path, exc)
             errors += 1
 
     deleted = 0

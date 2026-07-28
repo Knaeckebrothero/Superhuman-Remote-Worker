@@ -967,6 +967,120 @@ class TestKbExport:
 
 
 # =============================================================================
+# kb_export destination guard — the writer behind `.md`-shaped directories
+# =============================================================================
+
+
+class TestKbExportDestinationGuard:
+    """`path` is a DIRECTORY the tool fills with one `<note_id>.md` per note.
+
+    Two destinations silently corrupt a vault, both observed live on project
+    68137e29: a note filename (creates a directory whose name ends in `.md`,
+    which git then cannot also hold a blob at) and anywhere under
+    `knowledge/` (the reindexer globs `knowledge/**/*.md`, so every note
+    gains a second file with the same OKF id and collides forever on
+    uq_knowledge_project_note).
+    """
+
+    def test_rejects_note_filename_as_destination(self):
+        tools, ctx = _make_tools()
+        ctx.has_workspace.return_value = True
+        ws, writes = _capture_workspace()
+        ctx.workspace_manager = ws
+        ctx.knowledge_graph.get_all_notes_for_export.return_value = [
+            {"id": "n1", "type": "decision", "status": "active", "content": "x"},
+        ]
+
+        result = _invoke(
+            _get_tool(tools, "kb_export"),
+            {"path": "archive/kb_index_regenerated_2026-07-06.md"},
+        )
+
+        assert "Error" in result
+        assert "DIRECTORY" in result
+        # Nothing written and no directory created — the whole point is that
+        # the damage is a thousand files that must be removed by hand.
+        assert writes == {}
+        ws.create_directory.assert_not_called()
+
+    def test_rejects_export_into_the_vault(self):
+        tools, ctx = _make_tools()
+        ctx.has_workspace.return_value = True
+        ws, writes = _capture_workspace()
+        ctx.workspace_manager = ws
+        ctx.knowledge_graph.get_all_notes_for_export.return_value = [
+            {"id": "n1", "type": "decision", "status": "active", "content": "x"},
+        ]
+
+        result = _invoke(
+            _get_tool(tools, "kb_export"),
+            {"path": "knowledge/iter-33-developer-plan-v1-adapt.md"},
+        )
+
+        assert "Error" in result
+        assert "knowledge/" in result
+        assert writes == {}
+        ws.create_directory.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "knowledge",
+            "knowledge/",
+            "./knowledge/exports",
+            "knowledge/sub/dir",
+            "knowledge\\windows-sep",
+        ],
+    )
+    def test_rejects_every_spelling_of_the_vault_root(self, path):
+        # Normalization matters: the guard must not be defeated by a trailing
+        # slash, a `./` prefix, or a backslash separator.
+        tools, ctx = _make_tools()
+        ctx.has_workspace.return_value = True
+        ws, writes = _capture_workspace()
+        ctx.workspace_manager = ws
+        ctx.knowledge_graph.get_all_notes_for_export.return_value = [
+            {"id": "n1", "type": "decision", "status": "active", "content": "x"},
+        ]
+
+        result = _invoke(_get_tool(tools, "kb_export"), {"path": path})
+
+        assert "Error" in result
+        assert writes == {}
+
+    def test_rejects_empty_destination(self):
+        tools, ctx = _make_tools()
+        ctx.has_workspace.return_value = True
+        ws, writes = _capture_workspace()
+        ctx.workspace_manager = ws
+        result = _invoke(_get_tool(tools, "kb_export"), {"path": "   "})
+        assert "Error" in result
+        assert writes == {}
+
+    def test_still_allows_an_ordinary_directory(self):
+        # The guard must not break the legitimate use — a regression here
+        # would be worse than the bug, since export is the migration hatch.
+        tools, ctx = _make_tools()
+        ctx.has_workspace.return_value = True
+        ws, writes = _capture_workspace()
+        ctx.workspace_manager = ws
+        ctx.knowledge_graph.get_all_notes_for_export.return_value = [
+            {
+                "id": "n1",
+                "title": "N1",
+                "type": "decision",
+                "status": "active",
+                "content": "body",
+            },
+        ]
+
+        result = _invoke(_get_tool(tools, "kb_export"), {"path": "exports/kb-dump"})
+
+        assert "1 note" in result
+        assert "exports/kb-dump/n1.md" in writes
+
+
+# =============================================================================
 # Slice 2 PR1: kb_lint / kb_index gardener tools
 # =============================================================================
 
