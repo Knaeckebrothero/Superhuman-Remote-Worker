@@ -218,7 +218,9 @@ class TestProductQaLoopWiring:
         campaign's initiative must be the chosen ticket's own id."""
         kick = build_loop_kickoff(_loop(), role="critic", iteration=5)
         assert "verdict" in kick
-        assert "NOT the ticket itself" in kick or "not the ticket itself" in kick.lower()
+        assert (
+            "NOT the ticket itself" in kick or "not the ticket itself" in kick.lower()
+        )
 
     def test_critic_block_does_not_mass_supersede_tickets(self) -> None:
         """B2's second contradiction: 'mark every non-selected candidate...

@@ -1608,8 +1608,7 @@ class TestDispositionClosesBacklogTicket:
                         )
         close.assert_awaited_once()
         assert any(
-            "close_backlog_ticket reported failure" in r.message
-            for r in caplog.records
+            "close_backlog_ticket reported failure" in r.message for r in caplog.records
         )
 
     @pytest.mark.asyncio
@@ -1645,8 +1644,7 @@ class TestDispositionClosesBacklogTicket:
                             completed_failed=False,
                         )
         assert not any(
-            "close_backlog_ticket reported failure" in r.message
-            for r in caplog.records
+            "close_backlog_ticket reported failure" in r.message for r in caplog.records
         )
 
     @pytest.mark.asyncio

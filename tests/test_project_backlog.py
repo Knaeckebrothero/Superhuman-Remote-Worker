@@ -461,8 +461,12 @@ class TestRenderBacklogBlock:
         block = render_backlog_block(
             [_row("a")],
             {1: 1},
-            in_progress={"note_id": "issue-deploy", "title": "Deploy docs",
-                         "priority": 0, "note_type": "issue"},
+            in_progress={
+                "note_id": "issue-deploy",
+                "title": "Deploy docs",
+                "priority": 0,
+                "note_type": "issue",
+            },
         )
         lines = block.splitlines()
         assert lines[1].startswith("IN PROGRESS: [high] issue-deploy — Deploy docs")
@@ -716,8 +720,7 @@ class TestFetchBacklog:
 
         first_sql = " ".join(conn.fetch.await_args_list[0].args[0].split())
         assert (
-            "ORDER BY priority ASC, created_at ASC NULLS LAST, note_id ASC"
-            in first_sql
+            "ORDER BY priority ASC, created_at ASC NULLS LAST, note_id ASC" in first_sql
         )
 
 
@@ -1145,9 +1148,7 @@ class TestCloseBacklogTicket:
         assert new_line == "status: resolved"
 
     @pytest.mark.asyncio
-    async def test_index_update_matching_zero_rows_is_logged_not_silent(
-        self, caplog
-    ):
+    async def test_index_update_matching_zero_rows_is_logged_not_silent(self, caplog):
         """B1 finding 3 repro: filing a `decision` note (or any non-ticket
         type) as a campaign's initiative makes the index UPDATE's
         `note_type = ANY(...)` filter match zero rows -- UPDATE 0, vs
