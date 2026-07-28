@@ -12,16 +12,21 @@ tags:
 **Status:** Diagnosed 2026-07-26 from live dev thread
 `77b3d3e6-6dfc-422e-a8ec-a5848cb8febc`. Work on `develop`.
 
+**DEV LIVE GATE PASSED 2026-07-28** on image `sha-5eb436e`, thread
+`6e9f7aad-fcef-490e-97be-d570ca3f6a98` ("VM live gate D1/D2/D4"). All three
+orchestrator-side defects verified against the real cluster; evidence in
+"Live gate result" below. A VM session now boots on its VM and attaches over
+SSH — the feature works end to end.
+
 - **Defect 1 — FIXED** (2026-07-27, commit `5a40c4ce`): `VM_BACKENDS` arm in
-  `ensure_session_workspace`. Unit-verified; **dev live gate not yet run.**
-- **Defect 2 — FIXED** (2026-07-27, uncommitted): `require_vm` in
-  `_poll_workspace_ready` + `_session_backend_is_vm`. Unit-verified; **dev live
-  gate not yet run.** Caveat below on where the failure reason surfaces.
+  `ensure_session_workspace`. Unit-verified + **live gate passed.**
+- **Defect 2 — FIXED** (2026-07-27, commit `0f32744a`): `require_vm` in
+  `_poll_workspace_ready` + `_session_backend_is_vm`. Unit-verified + **live gate
+  passed.** Caveat below on where the failure reason surfaces.
 - **Defect 3 — split out**, root cause unknown:
   `docs/issues/vm_guest_boots_to_emergency_shell.md`.
-- **Defect 4 — FIXED** (2026-07-27, uncommitted): `_thread_vm_ids` deleted,
-  replaced by a per-event DB lookup. Unit-verified; **dev live gate not yet
-  run.**
+- **Defect 4 — FIXED** (2026-07-27, commit `469aa67a`): `_thread_vm_ids` deleted,
+  replaced by a per-event DB lookup. Unit-verified + **live gate passed.**
 - Sibling bug found while fixing 1, filed separately:
   `docs/issues/workspace_suspension_infers_tier_from_metadata_presence.md`.
 
@@ -302,10 +307,56 @@ returns a clean 503 there), so the gate is the dev `main` cluster:
    the thread's VM failed and surfaces a truthful error instead of hanging.
 5. End the session; assert the VM is reaped.
 
+## Live gate result — 2026-07-28, PASSED
+
+Run on dev (`main` ctx, ns `superhuman-remote-worker`), image `sha-5eb436e`
+(contains `5a40c4ce`, `0f32744a`, `469aa67a`; verified by grepping the running
+containers, not just git). Session created through the cockpit UI:
+New Session → Advanced → Workspace → Backend: VM (QEMU).
+
+Timeline for thread `6e9f7aad-fcef-490e-97be-d570ca3f6a98`:
+
+| Time (UTC) | Event |
+|---|---|
+| 13:11:26 | Thread created; `vm.lifecycle.create.srw-dev` published |
+| 13:11:28 | `POST /prepare 202` — **no "Workspace container created" line follows** |
+| 13:11:28 | Agent: "VM workspace provisioning detected — extending budget to 900s" |
+| 13:15:36 | VMI `Running` (4m10s of DataVolume clone) |
+| 13:16:09 | `VM SSH ready for **thread** … (100.64.0.235:22, evidence: daemon)` |
+| 13:16:15 | Agent: `Remote workspace backend connected to 100.64.0.235` |
+| 13:16:35 | `Session attached` |
+
+Assertions:
+
+1. **No workspace container, ever.** A 5s-interval sampler ran 45 min. It caught
+   236 samples containing a `ws-thread-*` pod — **all of them a different,
+   `sandbox`-tier thread** (`b1758f38`, resumed mid-window). Zero for the vm-tier
+   thread. That accident is worth more than the negative alone: it shows the
+   guard *discriminates* by tier rather than suppressing containers globally,
+   which a blanket-suppression bug would not.
+2. **Attached only on VM ready.** The agent polled `/workspace` every ~2.1 s for
+   4m40s without attaching, then took the VM the moment it reported ready, over a
+   tailnet address with `backend=remote`.
+3. **`workspace_container` carries no pod state.** `(metadata->'workspace_container')
+   ? 'status'` → `f`; the key holds only `git_remote_url`/`repo_name`.
+4. **Survives the reconcile sweep.** 45 minutes spans many ticks; still zero.
+
+**Defect 4's evidence is the strongest.** The register was handled by replica
+`fl89k`, while `sqxdm` served the `/prepare` — i.e. the publisher was *not* the
+leader. That is exactly the coin-flip case that previously wrote `ssh_host` into a
+nonexistent jobs row and stranded the thread at `created` forever. Both replicas
+also logged the status event as `thread`, where they previously disagreed.
+
+**Consequence for Defect 3:** the guest booted cleanly from the *same* golden PVC
+that produced an emergency shell on 07-26. Session-on-VM demonstrably works, so
+Defects 1+2 were not masking a permanently broken path — the boot failure is
+intermittent. See that issue for what remains.
+
 ## Related
 
 - `docs/features/session_create_on_vm.md` — the design this violates; its create
-  path is correct, its verification step appears never to have been run live.
+  path is correct, and its verification step ("create a VM session → VM boots →
+  session attaches over SSH → usable") passed for the first time on 2026-07-28.
 - `docs/issues/vm_ssh_readiness_probe_unroutable_from_orchestrator.md` — why
   readiness evidence must come from the in-VM daemon, which is precisely the
   signal Defect 3 destroys.

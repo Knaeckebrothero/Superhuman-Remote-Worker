@@ -11,7 +11,9 @@ tags:
 
 **Status:** Observed 2026-07-26 on dev, VM
 `agent-vm-77b3d3e6-6dfc-422e-a8ec-a5848cb8febc` (`agent-vms` ns, `vm` context).
-**Root cause NOT determined.** Split out of
+**Root cause NOT determined.** Confirmed **intermittent** on 2026-07-28 — a
+later VM booted cleanly from the same golden PVC (see Open question 1). Split
+out of
 `docs/issues/session_vm_backend_never_attaches.md` (Defect 3) so the three
 orchestrator-side defects there can be fixed without waiting on this.
 
@@ -84,11 +86,15 @@ The evidence points to an intermittent clone-or-first-boot failure of the golden
 image rather than anything session-specific — but "intermittent" is an inference
 from a single occurrence, not a finding. In priority order:
 
-1. **Has a session-on-VM *ever* reached `vm_status = "ready"` on dev?** The
-   `docs/features/session_create_on_vm.md` verification step ("create a VM
-   session → VM boots → session attaches over SSH → usable") may never have been
-   executed against a live cluster. If it never has, this is not intermittent at
-   all — it is a permanently broken path that Defects 1+2 were masking.
+1. ~~**Has a session-on-VM *ever* reached `vm_status = "ready"` on dev?**~~
+   **ANSWERED 2026-07-28: yes.** Thread `6e9f7aad-fcef-490e-97be-d570ca3f6a98`
+   booted cleanly and attached over SSH (`100.64.0.235`) during the Defect 1/2/4
+   live gate — from the **same golden PVC** (`agent-vm-golden-5d0ff629e0e0`) that
+   produced the emergency shell on 07-26. So this is **genuinely intermittent**,
+   not a permanently broken path, and Defects 1+2 were not masking a dead
+   feature. One success isolates the cause no better than one failure did.
+   Evidence: `docs/issues/session_vm_backend_never_attaches.md` § Live gate
+   result.
 2. **Do freshly created *job* VMs boot reliably right now?** The three healthy
    ones were 2-4 h old. Creating one fresh VM is the cheap discriminator between
    "golden image is fine, this was a one-off clone fault" and "the golden image
