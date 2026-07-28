@@ -1,9 +1,18 @@
 # DB Capacity Alerting — Design
 
 - **Date:** 2026-07-23
-- **Status:** Approved (design); v1 scoped to the proactive monitor
+- **Status:** SUPERSEDED IN PART (2026-07-27) — see **Decision** below. Retention shipped in-app; the app-level capacity monitor is dropped in favour of infra-level alerting.
 - **Author:** Investigation + design pairing
-- **Related incident:** dev thread `accfbc56` wedged 2026-07-23 — Postgres PVC (`srw-postgres-data`, 10 Gi Longhorn) hit 100 %, message/checkpoint saves failed as "non-fatal" WARNINGs, and no one was alerted until a session visibly froze.
+- **Related incident:** dev thread `accfbc56` wedged 2026-07-23 — Postgres PVC (`srw-postgres-data`, 10 Gi Longhorn) hit 100 %, message/checkpoint saves failed as "non-fatal" WARNINGs, and no one was alerted until a session visibly froze. **Recurred 2026-07-27** (job `e1192a9d`; the 16 Gi PVC refilled in 4 days) because the durable defenses had not yet shipped.
+
+## Decision (2026-07-27) — split by concern; capacity alerting re-homed to infra
+
+The two halves of this design have different natural homes, and we build them accordingly:
+
+- **Retention (prevent the fill) = application layer. ✅ IMPLEMENTED this session.** A data-lifecycle concern the app owns. In-flight keep-last-N sweeper: `PostgresDB.prune_checkpoints_keep_last` + `orchestrator/services/checkpoint_retention.py` (leader-gated) + `main.py` lifespan wiring + `tests/test_checkpoint_retention.py`. Env: `CHECKPOINT_RETENTION_KEEP` (3), `CHECKPOINT_RETENTION_INTERVAL_S` (600). Committed as `9bb24cea` (the repo's auto-committer bundled it with unrelated work; `develop` is ~39 commits ahead of origin — **not yet pushed/deployed**). This is the **primary** defense — see the *Companion: checkpoint retention* section.
+- **Capacity alerting (detect a filling PVC) = infrastructure / observability layer. ❌ DROP the app-level monitor (Components A + B below); do NOT build it in the orchestrator.** Two reasons: (1) an app-level monitor that polls Postgres is **blind exactly when it matters** — a full disk crash-loops Postgres, so the orchestrator can't query it and no alert fires; infra monitoring watches the PVC from *outside* the app and still fires. (2) PVC/disk capacity is a **generic, cross-volume** concern (postgres, pgvector, neo4j, gitea, garage, workspace PVCs + nodes), not app-specific. **Implement with Prometheus + Alertmanager** on `kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.8` per PVC (or Longhorn `longhorn_volume_actual_size_bytes` vs capacity) → Ntfy/Slack/email; or, if a full stack is too much now, a minimal CronJob hitting the kubelet stats API. This needs a metrics stack stood up/revived (none in the app cluster today — only an OLD kube-prometheus-stack in `HomeLab/`), which is a separate infra decision.
+
+**Everything below (Components A + B — the app-level `db_capacity_monitor` + `critical_admin_alert`) is retained for context only and is NOT to be built in the app.** The *Companion: checkpoint retention* section is the part that shipped.
 
 ## Problem
 

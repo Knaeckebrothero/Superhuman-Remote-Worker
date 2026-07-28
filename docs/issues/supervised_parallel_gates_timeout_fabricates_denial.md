@@ -1,6 +1,6 @@
 # Supervised parallel tool calls: approve one, the rest are reported to the model as "User denied" (timeout fabricates a denial)
 
-**Status:** Filed — **root cause confirmed via live reproduction** on the dev cluster; **fix planned (below), not yet implemented.**
+**Status:** **Scope A IMPLEMENTED on `develop` 2026-07-27 (uncommitted; live gate OWED).** Root cause confirmed via live reproduction on the dev cluster. Fix 1 (three-state gate, park instead of fabricating a denial, tethered wait, interrupt-cancellable) + Fix 2 (pending gates re-surface on attach) are done with tests; see "Implementation" below. Out-of-scope items (Defect A stream, batch-approval UX, reload "completed" mislabel) remain open.
 **Found:** 2026-07-24 (user report: *"When the AI sends multi tool calls but is on supervised we can only approve one — the rest fails"*). Root cause confirmed via live repro 2026-07-25, session `83dc7f7a-75b0-4141-ace6-0c5413a3e5cf` (dev `cockpit.srw.works`, user `operator@redacted.invalid`, model `MiniMax-M3`).
 **Severity:** High. Silent and damaging: the model is told the user *refused* tool calls the user never saw, so it abandons real work. With a parallel tool batch the user approves the first and watches the rest "fail."
 **Component:** agent gate loop (`src/persistent_graph.py`) · DB-backed permission gate + WS welcome frame (`src/api/persistent_app.py`) · cockpit approval card (`cockpit/.../persistent-chat.service.ts`, `persistent-chat.component.ts`).
@@ -92,6 +92,39 @@ With Fix 1 + Fix 2, the sequential one-card-at-a-time flow becomes reliable: no 
 ### Risks / trade-offs
 - **Parked turn holds the loop** while awaiting approval. Acceptable: it is already mid-turn, the idle-sweeper/reaper handles a genuinely abandoned session, and the wait stays interrupt-cancellable. Confirm no turn-accounting/metrics or prompt-cache assumption breaks for a long-parked turn.
 - **Untethered/headless semantics** must not regress: `awaiting_user` + later email approval should still resolve the same row; only the *fabricated denial on timeout* is removed.
+
+---
+
+## Implementation (2026-07-27, `develop`, uncommitted)
+
+Done test-first: every behavior below had a failing test watched fail before the code existed.
+
+**`src/persistent_graph.py`**
+- New `PermissionOutcome` enum (`APPROVED` / `DECLINED` / `NO_ANSWER`) with `.coerce()` so legacy `bool`-returning callbacks keep working (`True`→APPROVED, `False`→DECLINED).
+- `permission_check` is typed to return the outcome (or a legacy bool).
+- Gate loop: `DECLINED` writes **`"User declined this tool call."`**; `NO_ANSWER` writes **nothing at all** and returns `TurnResult(awaiting_permission=True)`, leaving this call and every call after it un-run.
+  - **Pairing is safe:** parking leaves the turn's `AIMessage.tool_calls` without matching `ToolMessage`s, which strict-pairing APIs 400 on. The pre-existing `repair_tool_pairing` (`src/core/context.py:286`) already runs before *every* live LLM call (`persistent_graph.py:1406`) and on resume, and strips orphaned calls bidirectionally — verified, this is the same class it already names ("an interrupted turn").
+  - **Scope note — no auto-resume:** because that repair strips the orphaned call, a *late* approval does **not** replay the tool automatically; the parked turn simply ends without it and the model re-decides on the next turn. With Fix 1b below, a tethered user's gate no longer expires at all, so this path is reached mainly when untethered or interrupted — i.e. when the turn is over anyway. Wiring true replay-on-late-approval is deliberately out of scope.
+- New `TurnResult.awaiting_permission` field.
+- The string `"User denied this tool call."` **no longer exists anywhere in `src/`.**
+
+**`src/api/persistent_app.py`**
+- `_loop_permission_check` returns the three-state outcome instead of a bool. `expired`→`NO_ANSWER`; `denied`→`DECLINED`; dead session / DB-unavailable →`DECLINED` (a gate that can never be answered is a real stop, not a pending question). `tool_decisions` still records the **raw** status so audit can tell a timeout from a refusal.
+- `_wait_for_permission_resolution`: `timeout` is now a **polling slice, not a deadline**. While **tethered** (subscribers attached) the gate is never CAS-expired — a slow-but-present user keeps their card, and their later click still works. While **untethered** it CAS-expires as before so the loop can't hang on a client that isn't coming back. A hard interrupt (Stop) breaks the wait promptly and returns `"interrupted"` (→`NO_ANSWER`), leaving the row `pending` — no decision is recorded that the user did not make.
+- New `_pending_permission_requests()` → the pending gates for the thread, shaped like the `permission.request` payload (JSONB `tool_args` parsed, not passed through as a raw string). Soft-fails to `[]`.
+- `session.state` welcome frame now carries `pending_permissions`.
+
+**`cockpit/.../persistent-chat.service.ts`**
+- `session.state` hydrates `pendingPermission` + dispatches `permission_request` per pending gate, so a reload/reconnect re-renders the card. Presence-checked (`'pending_permissions' in params`) so a metadata-only frame can't clobber a live card.
+- Maps wire `approval_id`→`approvalId`. **A test caught this**: without the mapping the decision POST would fall back to "most-recent-pending" instead of targeting that specific gate.
+
+**Tests** — new: `tests/test_persistent_graph_permission_outcomes.py` (6), `tests/test_persistent_app_permission_outcomes.py` (12), 2 cockpit specs. Updated to the new contract (intended behavior change, intent preserved): `test_permission_denied_tool` (wording), `tests/test_thread_permissions_phase3.py` (7), `tests/test_attention_sleep_phase5.py` (3).
+
+**Verification run:** full backend suite **10965 passed**, 27 skipped, 3 failed — all 3 pre-existing and unrelated (`test_database_phase1` ×2 need a local Postgres on :5432; `test_endpoint_inventory` is stale from the in-flight `POST /api/jobs/{target_job_id}/verification/rounds` work in `orchestrator/main.py`, a file this change never touches). Full cockpit suite **1395 passed**; `tsc --noEmit` clean; `ruff check src/` clean.
+
+**Still owed:** live gate on dev — repeat the repro below, confirm via `get_persistent_thread_messages` that unanswered siblings stay pending with **no** `"User denied"`, and that a reload re-surfaces the card and approving it runs the tool.
+
+---
 
 ## Reproduce
 1. Supervised session on a model that emits parallel tool calls (e.g. `MiniMax-M3`); prompt: *"issue four parallel `web_search` calls at once."*

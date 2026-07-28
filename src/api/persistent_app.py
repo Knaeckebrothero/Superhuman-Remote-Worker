@@ -49,6 +49,7 @@ from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
     PERSIST_ROLE_KEY as _PERSIST_ROLE_KEY,
     IdleTimeoutError,
+    PermissionOutcome,
     PersistentLoopCallbacks,
     run_persistent_loop,
 )
@@ -2802,6 +2803,12 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     # tool_call lives only in memory (not persisted until the turn ends), so a
     # cold reload mid-turn can't recover it from REST history — this welcome
     # frame is the only channel for it.
+    #
+    # pending_permissions: same idea for supervised gates that are still
+    # waiting on an answer. The durable row survives, but REST history does
+    # not carry it, so without this a reload (or a dropped live stream) leaves
+    # the approval card unrenderable and the gate unanswerable — the failure
+    # in docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
     running_tool = inflight_tool_call(_session.messages) if _tool_inflight else None
     if running_tool is not None:
         running_tool = {
@@ -2821,6 +2828,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             "model": _session.config.llm.model,
             "temperature": _session.config.llm.temperature,
             "running_tool": running_tool,
+            "pending_permissions": await _pending_permission_requests(),
         },
     )
 
@@ -4152,18 +4160,77 @@ async def _insert_permission_request(
         return None
 
 
+async def _pending_permission_requests() -> List[Dict[str, Any]]:
+    """Every still-pending gate for this thread, shaped like the
+    ``permission.request`` broadcast payload.
+
+    Rides the ``session.state`` welcome frame so a (re)attaching client can
+    re-render an approval card it never received — or received and then lost
+    when the live stream dropped. REST history does not carry pending gates,
+    so without this a reload leaves the gate stranded and the user has no way
+    to answer it (docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md).
+
+    Soft-fails to ``[]``: a welcome frame must still go out if this lookup
+    breaks.
+    """
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return []
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, tool_call_id, tool_name, tool_args "
+                "FROM thread_permission_requests "
+                "WHERE thread_id = $1 AND status = 'pending' "
+                "ORDER BY requested_at ASC",
+                _thread_id,
+            )
+    except Exception as e:
+        logger.warning("Pending permission lookup failed: %s", e)
+        return []
+
+    pending: List[Dict[str, Any]] = []
+    for row in rows:
+        # asyncpg hands JSONB back as a raw string on this pool — parse it so
+        # the client gets an object, not a quoted blob (see the JSONB
+        # guard-without-parse family of bugs).
+        raw_args = row["tool_args"]
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {}
+        else:
+            args = raw_args or {}
+        pending.append(
+            {
+                "id": row["tool_call_id"],
+                "approval_id": str(row["id"]),
+                "tool": row["tool_name"],
+                "args": args,
+            }
+        )
+    return pending
+
+
 async def _wait_for_permission_resolution(
     request_id: str, timeout: float = _PERMISSION_TIMEOUT_S
 ) -> str:
     """Block until the row's status flips from pending. Returns the final
-    status string ('approved'/'denied'/'expired'). On any failure, returns
-    'denied' as the conservative default.
+    status string ('approved'/'denied'/'expired'/'interrupted'). On any
+    failure, returns 'denied' as the conservative default.
 
     Uses asyncpg's connection-scoped add_listener on the global NOTIFY
     channel; filters by row id. After registering the listener, re-SELECTs
     the row's status to close the race window between INSERT and listen
-    setup. On timeout, atomically marks the row 'expired' (only if it's
-    still 'pending') before reading the canonical final status back.
+    setup.
+
+    ``timeout`` is a *polling slice*, not a deadline, while a client is
+    attached: a user who is simply slow to click must not have the gate
+    expired under them (their later click would 404 and the tool would never
+    run). Only when untethered — nobody is there to answer — does the slice
+    CAS-expire the row so the loop can't hang on a client that isn't coming
+    back. A hard interrupt (Stop) always breaks the wait promptly.
+    See docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
     """
     if _session is None or _session.postgres_conn is None:
         return "denied"
@@ -4192,17 +4259,58 @@ async def _wait_for_permission_resolution(
                 if current in ("approved", "denied", "expired"):
                     return str(current)
 
-                try:
-                    await asyncio.wait_for(resolved.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    # CAS-style expire: only if nobody beat us to it.
-                    await conn.execute(
-                        "UPDATE thread_permission_requests "
-                        "SET status = 'expired', decided_at = now(), "
-                        "    decided_by = 'system' "
-                        "WHERE id = $1 AND status = 'pending'",
+                while True:
+                    waits = [asyncio.ensure_future(resolved.wait())]
+                    if _hard_interrupt_event is not None:
+                        waits.append(
+                            asyncio.ensure_future(_hard_interrupt_event.wait())
+                        )
+                    try:
+                        await asyncio.wait(
+                            waits,
+                            timeout=timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for w in waits:
+                            w.cancel()
+
+                    if _hard_interrupt_event is not None and (
+                        _hard_interrupt_event.is_set()
+                    ):
+                        # Stop pressed. Leave the row pending — the user made
+                        # no decision, so nothing may be recorded as one.
+                        logger.info(
+                            "Permission wait interrupted (req=%s) — leaving pending",
+                            request_id,
+                        )
+                        return "interrupted"
+
+                    if resolved.is_set():
+                        break
+
+                    if not _subscribers:
+                        # Untethered: nobody can answer. CAS-style expire —
+                        # only if nobody beat us to it.
+                        await conn.execute(
+                            "UPDATE thread_permission_requests "
+                            "SET status = 'expired', decided_at = now(), "
+                            "    decided_by = 'system' "
+                            "WHERE id = $1 AND status = 'pending'",
+                            request_id,
+                        )
+                        break
+
+                    # Tethered: a client is watching, so keep the question
+                    # open. Re-read in case a resolution raced the NOTIFY
+                    # (a decision from another path fires NOTIFY once; if we
+                    # were between waits it would otherwise be missed).
+                    status_now = await conn.fetchval(
+                        "SELECT status FROM thread_permission_requests WHERE id = $1",
                         request_id,
                     )
+                    if status_now in ("approved", "denied", "expired"):
+                        return str(status_now)
 
                 final = await conn.fetchval(
                     "SELECT status FROM thread_permission_requests WHERE id = $1",
@@ -4265,31 +4373,40 @@ async def _resolve_pending_permission(
 
 async def _loop_permission_check(
     tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
-) -> bool:
-    """Check whether a tool call is approved. INSERTs a pending row, waits
-    for the DB to flip via LISTEN/NOTIFY, returns True iff approved.
+) -> PermissionOutcome:
+    """Resolve a supervised gate. INSERTs a pending row and waits for the DB
+    to flip via LISTEN/NOTIFY.
+
+    Returns a THREE-state outcome, because a gate is a question to the user:
+
+      APPROVED  — the user said yes; run the tool.
+      DECLINED  — the user said no (or no answer is possible: the session is
+                  gone / the DB can't hold a gate), so the call really is off.
+      NO_ANSWER — the gate was never answered. NOT a refusal: the loop parks
+                  the turn instead of telling the model the user denied it
+                  (docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md).
 
     The race-fix from commit 3a1d265: if _terminate_session nulled _session
-    while permission_check was being scheduled, this returns False — the
-    session is gone, the tool result has nowhere to land.
+    while permission_check was being scheduled, this DECLINEs — the session is
+    gone, the tool result has nowhere to land, and no later answer can arrive.
     """
     if _session is None:
         logger.warning(
-            "permission_check fired with _session=None for tool %s — denying",
+            "permission_check fired with _session=None for tool %s — declining",
             tool_name,
         )
-        return False
+        return PermissionOutcome.DECLINED
 
     mode = _session.permission_mode
 
     if mode == "autonomous":
-        return True
+        return PermissionOutcome.APPROVED
 
     if mode == "auto_accept":
         # Auto-accept reads and writes; still ask for shell commands.
         shell_tools = {"run_command", "shell_execute", "shell_read"}
         if tool_name not in shell_tools:
-            return True
+            return PermissionOutcome.APPROVED
 
     # Phase 5 wake path: if this tool_call_id was already resolved (typical
     # case: user clicked the magic-link approve/deny while the agent was
@@ -4319,7 +4436,11 @@ async def _loop_permission_check(
                     tool_call_id,
                     tool_name,
                 )
-                return decision == "approved"
+                return (
+                    PermissionOutcome.APPROVED
+                    if decision == "approved"
+                    else PermissionOutcome.DECLINED
+                )
         except Exception as e:
             # Soft-fail: fall through to the regular INSERT-and-wait path.
             logger.warning(
@@ -4333,10 +4454,12 @@ async def _loop_permission_check(
     request_id = await _insert_permission_request(tool_call_id, tool_name, tool_args)
     if request_id is None:
         # DB unavailable — conservative deny rather than risk silent
-        # auto-approval. Logged at WARNING by the insert helper.
+        # auto-approval. Logged at WARNING by the insert helper. This is a
+        # real DECLINE, not a park: with no durable row there is nothing a
+        # later approval could resolve.
         if _session is not None:
             _session.tool_decisions[tool_call_id] = "denied"
-        return False
+        return PermissionOutcome.DECLINED
 
     # Broadcast carries both ids so clients can refer back via either.
     _broadcast(
@@ -4359,8 +4482,16 @@ async def _loop_permission_check(
         )
 
     final_status = await _wait_for_permission_resolution(request_id)
-    approved = final_status == "approved"
+    # Three-state, deliberately NOT collapsed to a bool: 'expired' means the
+    # question was never answered, which is not the user refusing.
+    if final_status == "approved":
+        outcome = PermissionOutcome.APPROVED
+    elif final_status == "denied":
+        outcome = PermissionOutcome.DECLINED
+    else:  # 'expired' (or any unknown status) — unanswered, so park.
+        outcome = PermissionOutcome.NO_ANSWER
     if _session is not None:
+        # Record the raw status so audit can tell a timeout from a refusal.
         _session.tool_decisions[tool_call_id] = final_status
     # Journal the outcome too: SSE replay-from-cursor re-delivers the
     # permission.request frame, and without a matching resolution event a
@@ -4374,7 +4505,7 @@ async def _loop_permission_check(
             "decision": final_status,
         },
     )
-    return approved
+    return outcome
 
 
 async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
