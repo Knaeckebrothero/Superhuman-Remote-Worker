@@ -3823,6 +3823,24 @@ def _get_vm_context(job: dict) -> dict:
     return ctx.get("vm", {})
 
 
+def _get_infra_transient_context(job: dict) -> dict:
+    """Extract the infra_transient sub-dict from job context.
+
+    The attempt counter lives in ``context``, NOT in ``freeze_data``: the
+    sweeper clears ``freeze_data`` to make the job dispatchable again, so a
+    counter kept there would reset to zero on every retry and the give-up
+    ceiling would never be reached. Mirrors ``context.llm_outage``.
+    """
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    value = ctx.get("infra_transient")
+    return value if isinstance(value, dict) else {}
+
+
 async def _fail_vm_parked_job(job_id: str, vm_error: str) -> None:
     """Fail a job whose VM provisioning parked terminally.
 
@@ -7463,6 +7481,9 @@ async def lifespan(app: FastAPI):
     llm_outage_task = asyncio.create_task(
         run_when_leader(llm_outage_redispatch_sweeper, _shutdown_event)
     )
+    infra_transient_task = asyncio.create_task(
+        run_when_leader(infra_transient_redispatch_sweeper, _shutdown_event)
+    )
     pool_reconciler_task = asyncio.create_task(
         run_when_leader(agent_pool_reconciler, _shutdown_event)
     )
@@ -7640,6 +7661,7 @@ async def lifespan(app: FastAPI):
     await digest_task
     await delegation_timeout_task
     await llm_outage_task
+    await infra_transient_task
     await pool_reconciler_task
     if ro_reader_reconciler_task is not None:
         await ro_reader_reconciler_task
@@ -12270,6 +12292,62 @@ async def llm_outage_redispatch_sweeper(shutdown_event: asyncio.Event) -> None:
     logger.info("LLM-outage re-dispatch sweeper stopped")
 
 
+async def _infra_transient_sweep_once() -> tuple[int, int]:
+    """One tick: re-dispatch jobs whose transient-infra backoff is due.
+
+    Returns ``(seen, redispatched)``. The give-up ceiling is enforced at pause
+    time in the ``/complete`` handler (a job past it is failed there and never
+    reaches 'paused'), so this sweeper only has to release due jobs.
+    """
+    due = await postgres_db.list_due_backoff_jobs("infra_transient", limit=50)
+    redispatched = 0
+    for row in due:
+        job_id = str(row["id"])
+        try:
+            if await postgres_db.claim_backoff_redispatch(job_id, "infra_transient"):
+                redispatched += 1
+                logger.info(
+                    "Job %s: transient-infra backoff elapsed — released for "
+                    "re-dispatch (workspace was kept, agent will reattach)",
+                    job_id,
+                )
+        except Exception as e:
+            logger.error(
+                "infra_transient sweeper: failed to release job %s: %s", job_id, e
+            )
+    if redispatched:
+        _trigger_dispatch()
+    return len(due), redispatched
+
+
+async def infra_transient_redispatch_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Release jobs paused for a transient infrastructure failure once due.
+
+    Leader-gated (``run_when_leader``) + per-row CAS
+    (``claim_backoff_redispatch``) so N replicas can't double-dispatch. Mirrors
+    ``llm_outage_redispatch_sweeper``.
+    docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1)
+    """
+    try:
+        tick = float((os.getenv("INFRA_TRANSIENT_SWEEP_SECONDS") or "").strip() or 30)
+    except (ValueError, TypeError):
+        tick = 30.0
+    logger.info("Transient-infra re-dispatch sweeper started (tick=%.0fs)", tick)
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=tick)
+            break  # shutdown requested
+        except asyncio.TimeoutError:
+            pass  # tick elapsed — run the sweep
+        try:
+            await _infra_transient_sweep_once()
+        except Exception as e:
+            logger.error(
+                f"Transient-infra re-dispatch sweeper error: {e}", exc_info=True
+            )
+    logger.info("Transient-infra re-dispatch sweeper stopped")
+
+
 _CRITIC_TERMINAL_OK = {"completed"}
 
 # Statuses worth resolving a verdict for. Anything else — paused for an
@@ -14228,6 +14306,7 @@ async def complete_job(
         determine_job_status,
         handle_pod_workspace_recovery,
         is_curation_enabled,
+        is_late_completion_report,
         is_verification_enabled,
         should_reset_recovery_counter,
     )
@@ -14237,19 +14316,55 @@ async def complete_job(
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
+        result = body.model_dump()
+        actions: list[str] = []
+
         if job["status"] not in (
             "processing",
             "reviewing",
             "pending_review",
             "completed",
         ):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Job cannot be completed (status: {job['status']})",
-            )
-
-        result = body.model_dump()
-        actions: list[str] = []
+            # Narrow re-resolve: a job that genuinely finished, whose completion
+            # freeze arrived after something failed it out-of-band. Without this
+            # the report is rejected before anything inspects it, and a finished
+            # job stays 'failed' forever — job e1192a9d had to be repaired by
+            # hand. See is_late_completion_report for why this is failed-only,
+            # completion-freeze-only, and never re-opens a job for re-dispatch.
+            if is_late_completion_report(job, result):
+                logger.warning(
+                    "Job %s: late job_complete freeze accepted on a terminal job "
+                    "— re-resolving. It was failed out-of-band while the agent "
+                    "was still finishing (prior error: %r).",
+                    job_id,
+                    job.get("error_message"),
+                )
+                await postgres_db.clear_job_failure(job_id)
+                job["error_message"] = None
+                job["error_details"] = None
+                actions.append("late completion freeze re-resolved a terminal job")
+            else:
+                # Everything else stays rejected — but LOUDLY. This silence is
+                # why the gate hid through two incidents: a VALID
+                # workspace_unavailable recovery request vanished into a 400
+                # that only the agent ever saw, so the recovery arm 47 lines
+                # below was never reached.
+                err = result.get("error") if isinstance(result.get("error"), dict) else {}
+                logger.warning(
+                    "Job %s: DISCARDING completion report on terminal job "
+                    "(status=%s, error_type=%s, recoverable=%s, has_freeze=%s). "
+                    "A recoverable failure reported here never reaches its "
+                    "recovery arm.",
+                    job_id,
+                    job["status"],
+                    err.get("type"),
+                    err.get("recoverable"),
+                    bool(result.get("freeze_data")),
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Job cannot be completed (status: {job['status']})",
+                )
 
         # Write freeze_data from the completion report.
         # The orchestrator is the single authority for DB writes — agents
@@ -14284,6 +14399,115 @@ async def complete_job(
         #    not be routed into the VM arm (that was the wedge in
         #    docs/issues/loop_job_workspace_lost_wedged_in_recovery.md).
         error = result.get("error") or {}
+
+        # 0a. Transient infrastructure failure (a backing service blipped, not a
+        #     job fault). Pause with a backoff freeze and KEEP the workspace —
+        #     the re-dispatched agent reattaches the surviving VM and resumes
+        #     from checkpoint. Checkpoints survive automatically: the prune only
+        #     fires on terminal status, and this is 'paused'.
+        #
+        #     On 2026-07-27 a dropped Postgres connection took this path's place
+        #     as a terminal `job_error`, killing three multi-day jobs and
+        #     destroying two workspaces.
+        #     docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md
+        if isinstance(error, dict) and error.get("type") == "infra_transient":
+            from services.completion import (
+                INFRA_TRANSIENT_MAX_ATTEMPTS,
+                infra_transient_backoff_seconds,
+            )
+
+            _prev = _get_infra_transient_context(job)
+            _attempt = int(_prev.get("attempts") or 0) + 1
+            _msg = str(error.get("message") or "transient infrastructure failure")
+
+            if _attempt > INFRA_TRANSIENT_MAX_ATTEMPTS:
+                # Ceiling. Fail terminally, but NAME the infra cause so this is
+                # never mistaken for a job defect in triage.
+                _detail = (
+                    f"Transient infrastructure failure did not clear after "
+                    f"{INFRA_TRANSIENT_MAX_ATTEMPTS} retries: {_msg}"
+                )
+                logger.error("Job %s: %s", job_id, _detail)
+                await postgres_db.update_job_status(
+                    job_id,
+                    status="failed",
+                    error_message=_detail,
+                    error_details={
+                        "type": "infra_transient",
+                        "message": _msg,
+                        "recoverable": False,
+                        "attempts": _attempt - 1,
+                    },
+                )
+                return {
+                    "status": "handled",
+                    "job_id": job_id,
+                    "new_status": "failed",
+                    "actions": [
+                        f"infra_transient: give-up after "
+                        f"{INFRA_TRANSIENT_MAX_ATTEMPTS} attempts"
+                    ],
+                }
+
+            _delay = infra_transient_backoff_seconds(_attempt)
+            _next = datetime.now(timezone.utc) + timedelta(seconds=_delay)
+            _freeze = {
+                "freeze_type": "infra_transient",
+                "next_retry_at": _next.isoformat(),
+                "attempts": _attempt,
+                "last_error": _msg[:500],
+            }
+            try:
+                # Durable attempt counter first — it must survive the sweeper
+                # clearing freeze_data, or the ceiling is unreachable.
+                await postgres_db.merge_job_context(
+                    job_id,
+                    {
+                        "infra_transient": {
+                            "attempts": _attempt,
+                            "last_error": _msg[:500],
+                            "next_retry_at": _next.isoformat(),
+                        }
+                    },
+                )
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
+                        json.dumps(_freeze),
+                        job_id,
+                    )
+            except Exception as e:
+                # Without the freeze the sweeper cannot find the job again, so
+                # do NOT pause into an unreachable state — fall through and let
+                # the normal path resolve it.
+                logger.error(
+                    "Job %s: failed to write infra_transient freeze (%s) — "
+                    "not pausing, falling through to normal resolution",
+                    job_id,
+                    e,
+                )
+            else:
+                if await postgres_db.pause_job(job_id):
+                    logger.warning(
+                        "Job %s: paused for transient infrastructure failure "
+                        "(attempt %d/%d, retry in %.0fs, workspace KEPT): %s",
+                        job_id,
+                        _attempt,
+                        INFRA_TRANSIENT_MAX_ATTEMPTS,
+                        _delay,
+                        _msg[:200],
+                    )
+                    return {
+                        "status": "handled",
+                        "job_id": job_id,
+                        "new_status": "paused",
+                        "actions": [
+                            f"infra_transient: paused for retry "
+                            f"(attempt {_attempt}/{INFRA_TRANSIENT_MAX_ATTEMPTS}, "
+                            f"next retry in {_delay:.0f}s, workspace kept)"
+                        ],
+                    }
+
         if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
             # Decide on the ORIGINAL job (before any stamp): a pod/sandbox job has
             # no vm.requested, so _job_needs_vm is False and it recovers via PVC
@@ -20758,11 +20982,37 @@ async def agent_heartbeat(
             except Exception:
                 pass  # Non-critical — don't fail heartbeat
 
+        # Report the CURRENT status of the job the agent thinks it is running.
+        # The heartbeat is the only channel that already runs on the right
+        # cadence, and it was one-directional: the agent asserted liveness and
+        # learned nothing back. So when a job was terminated out-of-band, the
+        # agent kept executing — 21 minutes and 45 LLM calls in the observed
+        # case — and only found out when its VM was collected underneath it.
+        #
+        # A push stop signal already exists and stays the fast path; this is the
+        # BACKSTOP that catches the 13+ call sites which can write a terminal
+        # status without sending one.
+        # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
+        job_status: str | None = None
+        if heartbeat.current_job_id:
+            try:
+                _hb_job = await postgres_db.get_job(heartbeat.current_job_id)
+                if _hb_job:
+                    job_status = _hb_job.get("status")
+            except Exception:
+                # Never fail a heartbeat over this — a missing job_status just
+                # degrades to the old push-only behaviour.
+                job_status = None
+
         # Surface orchestrator-set intents (drain, version-upgrade hints)
         # so the agent can react on the next heartbeat tick. Keeping the
         # legacy {"status": "ok"} key for back-compat with older agent
         # builds that don't read intents.
-        return {"status": "ok", "intents": result.get("intents") or {}}
+        return {
+            "status": "ok",
+            "intents": result.get("intents") or {},
+            "job_status": job_status,
+        }
     except HTTPException:
         raise
     except Exception as e:

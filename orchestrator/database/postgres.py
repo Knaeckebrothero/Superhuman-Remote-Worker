@@ -49,6 +49,12 @@ _DOCKER_WORKSPACE_TRANSITION_PRESERVED_FIELDS = _DOCKER_WORKSPACE_PRESERVED_FIEL
     "ide_host",
     "ide_port",
 }
+# Terminal checkpoint prune batch size. An unbounded single-statement DELETE is
+# what got cancelled under bloat on 2026-07-27 (Defect 6); batching makes the
+# prune insensitive to row count. The max-batches value is a runaway guard.
+_CHECKPOINT_DELETE_BATCH = 1000
+_CHECKPOINT_DELETE_MAX_BATCHES = 1000
+
 _DOCKER_WORKSPACE_GENERATION_KEY = "_canvas_workspace_generation"
 _DOCKER_WORKSPACE_LEASE_KEY = "_docker_workspace_lease_id"
 _DOCKER_WORKSPACE_TRUST_KEY = "_docker_workspace_trust_mode"
@@ -1190,6 +1196,15 @@ class PostgresDB:
         if not updates:
             return False
 
+        # Stamp the failure time on the transition INTO 'failed'. updated_at
+        # cannot serve this: the update_jobs_updated_at trigger also fires on
+        # gc_offline_agents' FK cascade, which rewrites it to exactly 24h after
+        # the agent's last heartbeat and misdates the failure by a full day.
+        # COALESCE keeps the FIRST failure time if a job is re-failed.
+        # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 4)
+        if status == "failed":
+            updates.append("failed_at = COALESCE(failed_at, CURRENT_TIMESTAMP)")
+
         updates.append("updated_at = CURRENT_TIMESTAMP")
         param_count += 1
         values.append(uuid_val)
@@ -1210,6 +1225,36 @@ class PostgresDB:
                 logger.debug("checkpoint prune skipped for %s: %s", job_id, e)
         return updated
 
+    async def clear_job_failure(self, job_id: str) -> bool:
+        """Clear a stale failure record when a late report re-resolves a job.
+
+        ``update_job_status`` cannot do this — it only writes fields that are
+        not ``None``, so there is no way to null them back out. Without this, a
+        job re-resolved from ``failed`` to ``pending_review`` still renders a
+        failure banner in the cockpit and still reads as failed to anything
+        querying ``error_message``.
+
+        Clears ``failed_at`` too: the job did not, in the end, fail.
+        docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 2)
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE jobs
+                   SET error_message = NULL,
+                       error_details = NULL,
+                       failed_at = NULL,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                """,
+                uuid_val,
+            )
+        return result == "UPDATE 1"
+
     async def delete_checkpoint_thread(self, thread_id: str) -> int:
         """Prune LangGraph checkpoint rows for a terminal job (thread_id=job_id).
 
@@ -1217,6 +1262,18 @@ class PostgresDB:
         checkpoints to this DB). Mirrors ``AsyncPostgresSaver.adelete_thread``
         across the 3 checkpoint tables. Non-fatal and table-existence tolerant so
         it is safe on a sqlite-backed deployment.
+
+        Deletes in bounded batches. A single unbounded ``DELETE ... WHERE
+        thread_id = $1`` is exactly the statement that cannot finish once
+        ``checkpoint_blobs`` is bloated — during the 2026-07-27 incident it was
+        cancelled mid-flight::
+
+            ERROR: canceling statement due to user request
+            STATEMENT: DELETE FROM checkpoint_blobs WHERE thread_id = $1
+
+        so the one mechanism that reclaims space failed precisely when space was
+        scarce. Correctness never depended on it being one statement.
+        docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 6).
 
         Returns the number of rows deleted.
         """
@@ -1226,19 +1283,65 @@ class PostgresDB:
         async with self.acquire() as conn:
             for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
                 try:
-                    result = await conn.execute(
-                        f"DELETE FROM {table} WHERE thread_id = $1", thread_id
+                    total += await self._delete_thread_rows_batched(
+                        conn, table, thread_id
                     )
-                    if isinstance(result, str) and result.startswith("DELETE "):
-                        total += int(result.split()[1])
                 except Exception as e:
-                    logger.debug(
-                        "delete_checkpoint_thread: %s skip for %s (%s)",
-                        table,
-                        thread_id,
-                        e,
-                    )
+                    # A missing table is benign (sqlite-backed deploy, pre-migration)
+                    # and stays quiet. Anything else — timeout, cancellation, lock
+                    # contention — means space reclamation has STOPPED WORKING, and
+                    # the old DEBUG level is why that was invisible for four days.
+                    if type(e).__name__ == "UndefinedTableError":
+                        logger.debug(
+                            "delete_checkpoint_thread: %s absent for %s (%s)",
+                            table,
+                            thread_id,
+                            e,
+                        )
+                    else:
+                        logger.warning(
+                            "delete_checkpoint_thread: %s prune FAILED for thread %s "
+                            "(%s: %s) — checkpoint rows retained; if this repeats, "
+                            "the checkpointer volume will grow unbounded",
+                            table,
+                            thread_id,
+                            type(e).__name__,
+                            e,
+                        )
         return total
+
+    async def _delete_thread_rows_batched(
+        self, conn: Any, table: str, thread_id: str
+    ) -> int:
+        """Delete one thread's rows from ``table`` in bounded ctid batches.
+
+        Loops until a batch deletes nothing. ``_CHECKPOINT_DELETE_MAX_BATCHES``
+        is a runaway guard, not a functional limit — hitting it logs and returns
+        what was deleted rather than spinning.
+        """
+        deleted = 0
+        for _ in range(_CHECKPOINT_DELETE_MAX_BATCHES):
+            result = await conn.execute(
+                f"DELETE FROM {table} WHERE ctid IN ("
+                f" SELECT ctid FROM {table} WHERE thread_id = $1 LIMIT $2)",
+                thread_id,
+                _CHECKPOINT_DELETE_BATCH,
+            )
+            batch = 0
+            if isinstance(result, str) and result.startswith("DELETE "):
+                batch = int(result.split()[1])
+            deleted += batch
+            if batch < _CHECKPOINT_DELETE_BATCH:
+                return deleted
+        logger.warning(
+            "delete_checkpoint_thread: %s hit the %s-batch cap for thread %s "
+            "(%s rows deleted so far) — remaining rows left for the retention sweeper",
+            table,
+            _CHECKPOINT_DELETE_MAX_BATCHES,
+            thread_id,
+            deleted,
+        )
+        return deleted
 
     async def prune_checkpoints_keep_last(self, keep_n: int) -> int:
         """Keep only the newest ``keep_n`` checkpoints per (thread_id, checkpoint_ns)
@@ -5142,6 +5245,67 @@ class PostgresDB:
                 """,
                 job_uuid,
                 json.dumps(context_merge or {}),
+            )
+            return row is not None
+
+    async def list_due_backoff_jobs(
+        self, freeze_type: str, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Paused jobs of ``freeze_type`` whose backoff timer is due.
+
+        Generalised from ``list_due_llm_outage_jobs`` so the transient-infra
+        retry (Defect 1) reuses the proven query shape instead of copying it:
+        ``status='paused'``, agent freed, and a ``freeze_data.next_retry_at``
+        that has arrived. Oldest-due first so a backlog drains fairly.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, config_name, context, freeze_data, user_id, project_id,
+                       parent_job_id, creation_order
+                FROM jobs
+                WHERE status = 'paused'
+                  AND assigned_agent_id IS NULL
+                  AND freeze_data->>'freeze_type' = $1
+                  AND freeze_data ? 'next_retry_at'
+                  AND (freeze_data->>'next_retry_at')::timestamptz <= now()
+                ORDER BY (freeze_data->>'next_retry_at')::timestamptz ASC
+                LIMIT $2
+                """,
+                freeze_type,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def claim_backoff_redispatch(self, job_id: str, freeze_type: str) -> bool:
+        """Atomically clear a backoff freeze so the dispatcher re-queues the job.
+
+        CAS guarded on ``status='paused'`` + ``freeze_type`` + ``next_retry_at``
+        due, so exactly one sweeper wins even in a transient dual-leader window.
+        Sets ``freeze_data=NULL`` (``get_dispatchable_jobs`` requires it) and
+        re-asserts ``assigned_agent_id=NULL``. ``context`` is untouched, so the
+        attempt counter survives the resume. Returns True iff THIS call cleared it.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs
+                   SET freeze_data = NULL,
+                       assigned_agent_id = NULL,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1
+                   AND status = 'paused'
+                   AND freeze_data->>'freeze_type' = $2
+                   AND freeze_data ? 'next_retry_at'
+                   AND (freeze_data->>'next_retry_at')::timestamptz <= now()
+                RETURNING id
+                """,
+                uuid_val,
+                freeze_type,
             )
             return row is not None
 

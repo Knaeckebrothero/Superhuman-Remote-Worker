@@ -229,7 +229,66 @@ class TestPureInternalEndpoints:
             metrics={"memory_mb": 128, "graph_progress": 9},
             aux_degraded=None,
         )
-        assert result == {"status": "ok", "intents": {}}
+        # The legacy keys are the back-compat contract for older agent builds.
+        # `job_status` was added alongside them (Defect 3 of
+        # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md) and
+        # is additive, so assert on the contract rather than exact equality —
+        # here it degrades to None because the fake db has no get_job.
+        assert result["status"] == "ok"
+        assert result["intents"] == {}
+        assert result["job_status"] is None
+
+    @pytest.mark.asyncio
+    async def test_agent_heartbeat_reports_current_job_status(self, fake_request):
+        """The backstop that tells a running agent its job was taken away.
+
+        Job c6dd288d streamed for 21 more minutes after being failed
+        out-of-band because the heartbeat carried nothing back.
+        docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
+        """
+        from main import AgentHeartbeat, agent_heartbeat
+
+        job_id = "11111111-1111-1111-1111-111111111111"
+        hb = AgentHeartbeat(status="working", current_job_id=job_id)
+        fake_db = MagicMock()
+        fake_db.heartbeat = AsyncMock(
+            return_value={"previous_status": "working", "effective_status": "working"}
+        )
+        fake_db.get_job = AsyncMock(return_value={"id": job_id, "status": "failed"})
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+        ):
+            result = await agent_heartbeat(fake_request, "agent-1", hb)
+
+        assert result["job_status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_agent_heartbeat_survives_a_job_lookup_failure(self, fake_request):
+        """A heartbeat must never fail over the status lookup — it degrades to
+        the previous push-only behaviour instead."""
+        from main import AgentHeartbeat, agent_heartbeat
+
+        hb = AgentHeartbeat(
+            status="working", current_job_id="11111111-1111-1111-1111-111111111111"
+        )
+        fake_db = MagicMock()
+        fake_db.heartbeat = AsyncMock(
+            return_value={"previous_status": "working", "effective_status": "working"}
+        )
+        fake_db.get_job = AsyncMock(side_effect=Exception("db down"))
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+        ):
+            result = await agent_heartbeat(fake_request, "agent-1", hb)
+
+        assert result["status"] == "ok"
+        assert result["job_status"] is None
 
     @pytest.mark.asyncio
     async def test_agent_heartbeat_graph_progress_overrides_metric_field(

@@ -151,6 +151,46 @@ def paused_within_grace(metadata: dict[str, Any]) -> bool:
     return age is None or age < paused_grace_seconds()
 
 
+def infra_transient_retry_pending(metadata: dict[str, Any]) -> bool:
+    """True while a job paused for a transient-infra retry still owns its workspace.
+
+    Pausing a job does NOT keep its workspace: a paused-and-frozen job is not
+    dispatchable, so ``is_idle``/``is_reapable`` classify it as idle and the
+    reaper collects it once ``paused_within_grace`` expires. Without this
+    carve-out the whole "keep the VM and resume in place" design is a no-op —
+    the retry would come back to a reprovisioned, empty workspace, which is
+    exactly the loss this fix exists to prevent.
+
+    Bounded on two independent axes so a VM can never be held indefinitely:
+
+      * ``freeze_type == "infra_transient"`` — only this freeze qualifies;
+      * ``next_retry_at`` is still in the future — and the backoff caps that at
+        one hour, so the hold is short even in the worst case.
+
+    Past the attempt ceiling the job is terminally ``failed``, not ``paused``,
+    so it stops matching here and the normal terminal reap collects it. That is
+    why no attempt counter is needed in this predicate.
+
+    docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 1b)
+    """
+    freeze = metadata.get("job_freeze")
+    if not isinstance(freeze, dict):
+        return False
+    if freeze.get("freeze_type") != "infra_transient":
+        return False
+    raw = freeze.get("next_retry_at")
+    if not isinstance(raw, str) or not raw:
+        return False
+    try:
+        next_retry = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        # An unparseable timestamp must not pin the VM forever.
+        return False
+    if next_retry.tzinfo is None:
+        next_retry = next_retry.replace(tzinfo=timezone.utc)
+    return next_retry > datetime.now(timezone.utc)
+
+
 def _pod_volume_is_ephemeral(pod: Any) -> bool:
     """True if the pod's workspace-data volume is emptyDir (vs a PVC).
 
