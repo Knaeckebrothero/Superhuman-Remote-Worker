@@ -521,6 +521,56 @@ def _dual_write_note(context: ToolContext, slug: str, note: Dict[str, Any]) -> N
         logger.warning(f"knowledge/ dual-write failed for {slug}: {e}")
 
 
+# The OKF vault root inside a project's jobs repo — the same prefix the
+# reindexer scans (orchestrator/services/kb_reindex.py KNOWLEDGE_PREFIX).
+_VAULT_ROOT = "knowledge"
+
+
+def _export_dir_error(path: str) -> Optional[str]:
+    """Reject an export destination that would corrupt the vault, else None.
+
+    ``kb_export`` creates ``path`` as a directory and writes one
+    ``<note_id>.md`` into it per note. Two destinations are never what the
+    caller meant, and both have been observed live:
+
+    1. **A note filename.** Passing ``knowledge/some-note.md`` (or any
+       ``*.md``) makes a DIRECTORY whose name ends in ``.md``. Git then
+       cannot hold a blob at that name, so the note it was named after
+       ceases to exist as a file.
+    2. **Anywhere under ``knowledge/``.** The reindexer globs
+       ``knowledge/**/*.md`` recursively, so an export into the vault gives
+       every note a second file with the *same* OKF id. That collides on
+       ``uq_knowledge_project_note``, which no ``ON CONFLICT (kb_id, path)``
+       arbiter can absorb — one copy loses and re-fails on every reindex,
+       forever. The vault's own files already ARE the canonical OKF export,
+       so there is nothing a copy inside it could add.
+
+    Returns an operator-readable message naming the fix, or None to proceed.
+    """
+    cleaned = str(path or "").strip().replace("\\", "/").strip("/")
+    parts = [p for p in cleaned.split("/") if p not in ("", ".")]
+    if not parts:
+        return (
+            "Error: kb_export needs a destination directory "
+            "(e.g. `exports/kb-2026-01-01`), not an empty path."
+        )
+    if parts[0] == _VAULT_ROOT:
+        return (
+            f"Error: refusing to export into `{_VAULT_ROOT}/` — that is the "
+            "vault itself, and its `*.md` files already ARE the canonical OKF "
+            "export. A copy inside it gives every note a duplicate id and "
+            "breaks the KB index. Export somewhere else (e.g. `exports/kb`)."
+        )
+    if parts[-1].lower().endswith(".md"):
+        return (
+            f"Error: `{path}` looks like a note file, but kb_export needs a "
+            "DIRECTORY to write into — it would create a directory named "
+            f"`{parts[-1]}` and fill it with one file per note. Pass a "
+            "directory (e.g. `exports/kb`) instead."
+        )
+    return None
+
+
 def create_kb_tools(
     context: ToolContext,
     verdict_service: Any = None,
@@ -1803,11 +1853,20 @@ def create_kb_tools(
         workspace backend; one-way export for human browsing or migration.
 
         Args:
-            path: Directory path to write the export files
+            path: Directory to write the export files into. Must be a
+                directory outside `knowledge/` — never a note filename and
+                never inside the vault (the vault's own files are already the
+                canonical export).
 
         Returns:
             Summary of exported files
         """
+        # Validate before any Neo4j/workspace work: the failure mode is a
+        # 1000-file directory that has to be deleted by hand.
+        dest_error = _export_dir_error(path)
+        if dest_error:
+            return dest_error
+
         if kg is None:
             # kb_export is the one-time Neo4j → OKF migration dump. Without Neo4j
             # the vault's `knowledge/*.md` files ARE the canonical OKF export

@@ -769,6 +769,40 @@ class KnowledgeStore:
             movable_paths,
         )
 
+    async def find_note_id_owner(
+        self,
+        kb_id: uuid.UUID,
+        note_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """The row that currently owns ``(project_id, note_id)``, if any.
+
+        Purely diagnostic — the reindexer calls this *after* an INSERT has
+        already failed, to turn an opaque ``uq_knowledge_project_note``
+        duplicate-key error into a statement of what is actually wrong. The
+        constraint fires when one note id exists at two paths (the classic
+        cause: a vault where a note filename was used as a directory, so
+        ``knowledge/<slug>.md`` and ``knowledge/<other>.md/<slug>.md`` both
+        parse to the same OKF id). Neither :meth:`adopt_legacy_row` nor
+        ``upsert_kb_note``'s ``(kb_id, path)`` arbiter can absorb that — one
+        of the two paths must lose, every run, forever — and the raw Postgres
+        error names only the id, never the path the index is holding.
+
+        Returns ``{"id", "path", "status", "indexed_at"}`` for the incumbent
+        row, or None when nothing owns the id (in which case the failure was
+        something other than this condition — a genuine race, say).
+        """
+        row = await self.db.fetchrow(
+            """
+            SELECT id, path, status, indexed_at
+              FROM knowledge_index
+             WHERE project_id = $1 AND note_id = $2
+             LIMIT 1
+            """,
+            kb_id,
+            note_id,
+        )
+        return dict(row) if row else None
+
     async def upsert_kb_note(
         self,
         kb_id: uuid.UUID,

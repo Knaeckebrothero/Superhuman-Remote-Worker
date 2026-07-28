@@ -16,6 +16,7 @@ Covers:
   - KnowledgeStore.delete_kb_note — remove a note (cascade reaps its chunks)
 """
 
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -930,3 +931,152 @@ class TestListNotes:
         assert "kb_id = $1" in sql
         assert "note_type =" not in sql  # no type filter clause when unfiltered
         assert kb in params
+
+
+# =============================================================================
+# Duplicate note id across two paths — detection + one-line diagnostic
+# =============================================================================
+
+
+class TestFindNoteIdOwner:
+    """The lookup that names which path the index is actually holding."""
+
+    @pytest.mark.asyncio
+    async def test_returns_incumbent_row(self):
+        store, mock_db, _ = _make_store()
+        kb = uuid.uuid4()
+        row_id = uuid.uuid4()
+        mock_db.fetchrow.return_value = {
+            "id": row_id,
+            "path": "knowledge/plan.md/dup.md",
+            "status": "active",
+            "indexed_at": None,
+        }
+
+        result = await store.find_note_id_owner(kb, "dup")
+
+        assert result["path"] == "knowledge/plan.md/dup.md"
+        assert result["id"] == row_id
+        sql, *params = mock_db.fetchrow.call_args[0]
+        # Keyed on project_id (not kb_id): the constraint that fires is
+        # uq_knowledge_project_note, and a pathless legacy row has no kb_id.
+        assert "project_id = $1" in sql
+        assert "note_id = $2" in sql
+        assert params == [kb, "dup"]
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_nothing_owns_the_id(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetchrow.return_value = None
+        assert await store.find_note_id_owner(uuid.uuid4(), "ghost") is None
+
+
+class TestDuplicateNoteIdDiagnostic:
+    """`_log_duplicate_note_id` — the readable form of the constraint error.
+
+    The raw Postgres error names only the note id, so the live symptom read as
+    "the reindexer keeps retrying a write" when the truth is that two files
+    claim one identity and the INSERT is impossible. One log line must carry
+    the id, BOTH paths, and which one the index holds.
+    """
+
+    def _violation(self):
+        exc = Exception(
+            'duplicate key value violates unique constraint "uq_knowledge_project_note"'
+        )
+        exc.constraint_name = "uq_knowledge_project_note"
+        return exc
+
+    @pytest.mark.asyncio
+    async def test_names_both_paths_and_the_winner(self, caplog):
+        from orchestrator.services import kb_reindex
+
+        store = AsyncMock()
+        store.find_note_id_owner.return_value = {
+            "id": uuid.uuid4(),
+            "path": "knowledge/iter-33-plan.md/dup-note.md",
+            "status": "active",
+            "indexed_at": None,
+        }
+        kb = uuid.uuid4()
+
+        with caplog.at_level(logging.ERROR):
+            handled = await kb_reindex._log_duplicate_note_id(
+                store, kb, "knowledge/dup-note.md", "dup-note", self._violation()
+            )
+
+        assert handled is True
+        assert len(caplog.records) == 1
+        line = caplog.records[0].getMessage()
+        assert "dup-note" in line
+        assert "knowledge/dup-note.md" in line  # the path being indexed
+        assert "knowledge/iter-33-plan.md/dup-note.md" in line  # the incumbent
+        assert "two paths" in line
+        store.find_note_id_owner.assert_awaited_once_with(kb, "dup-note")
+
+    @pytest.mark.asyncio
+    async def test_reports_a_pathless_legacy_incumbent(self, caplog):
+        from orchestrator.services import kb_reindex
+
+        store = AsyncMock()
+        store.find_note_id_owner.return_value = {
+            "id": uuid.uuid4(),
+            "path": None,
+            "status": "active",
+            "indexed_at": None,
+        }
+
+        with caplog.at_level(logging.ERROR):
+            handled = await kb_reindex._log_duplicate_note_id(
+                store, uuid.uuid4(), "knowledge/n.md", "n", self._violation()
+            )
+
+        assert handled is True
+        assert "pathless" in caplog.records[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_ignores_unrelated_errors(self):
+        from orchestrator.services import kb_reindex
+
+        store = AsyncMock()
+        handled = await kb_reindex._log_duplicate_note_id(
+            store, uuid.uuid4(), "knowledge/n.md", "n", Exception("connection reset")
+        )
+        # False => the caller keeps its generic error line; no DB round-trip
+        # on every unrelated failure.
+        assert handled is False
+        store.find_note_id_owner.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_detects_via_message_when_driver_attr_is_absent(self, caplog):
+        # A wrapping layer may re-raise with only the rendered message.
+        from orchestrator.services import kb_reindex
+
+        store = AsyncMock()
+        store.find_note_id_owner.return_value = {"path": "knowledge/a/n.md"}
+        with caplog.at_level(logging.ERROR):
+            handled = await kb_reindex._log_duplicate_note_id(
+                store,
+                uuid.uuid4(),
+                "knowledge/n.md",
+                "n",
+                RuntimeError('violates unique constraint "uq_knowledge_project_note"'),
+            )
+        assert handled is True
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_still_logs(self, caplog):
+        # The diagnostic runs inside an except block: failing to explain an
+        # error must never replace it with a new one.
+        from orchestrator.services import kb_reindex
+
+        store = AsyncMock()
+        store.find_note_id_owner.side_effect = Exception("vector db down")
+
+        with caplog.at_level(logging.ERROR):
+            handled = await kb_reindex._log_duplicate_note_id(
+                store, uuid.uuid4(), "knowledge/n.md", "n", self._violation()
+            )
+
+        assert handled is True
+        assert "n" in caplog.records[-1].getMessage()
