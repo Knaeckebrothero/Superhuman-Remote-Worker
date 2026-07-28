@@ -3118,9 +3118,13 @@ class TestToolExecutionLoop:
         callbacks.on_tool_start.assert_not_called()
         assert result.tool_calls_made == 0
 
-        # Check denied message was added
+        # Check the refusal was reported to the model. An *explicit* deny
+        # (legacy bool False == PermissionOutcome.DECLINED) says "declined";
+        # only a real user decision may claim the user refused — an
+        # unanswered gate must not (see
+        # docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md).
         tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
-        assert any("denied" in m.content.lower() for m in tool_msgs)
+        assert any("declined" in m.content.lower() for m in tool_msgs)
 
     @pytest.mark.asyncio
     async def test_unknown_tool(self):

@@ -2738,6 +2738,41 @@ export class PersistentChatService {
                         rt && rt.tool ? {id: rt.id ?? '', tool: rt.tool, args: rt.args ?? {}} : null,
                     );
                 }
+                // Pending supervised gates: re-render the approval card a
+                // dropped stream (or a reload) would otherwise strand, leaving
+                // the gate unanswerable. Same presence-check discipline as
+                // running_tool. See the backend welcome frame.
+                if ('pending_permissions' in params) {
+                    const raw =
+                        (params['pending_permissions'] as Record<string, unknown>[]) || [];
+                    // Wire format is snake_case (approval_id); the client type is
+                    // camelCase. Mapping matters: without approvalId the decision
+                    // POST falls back to "most-recent-pending" instead of
+                    // targeting this gate.
+                    const list: PermissionRequest[] = raw
+                        .filter((r) => typeof r?.['id'] === 'string' && r['id'])
+                        .map((r) => {
+                            const approvalId = r['approval_id'] as string | undefined;
+                            return {
+                                id: r['id'] as string,
+                                ...(approvalId ? {approvalId} : {}),
+                                tool: (r['tool'] as string) || '',
+                                args: (r['args'] as Record<string, unknown>) || {},
+                            };
+                        });
+                    if (list.length > 0) {
+                        this.pendingPermission.set(list[0]);
+                        for (const req of list) {
+                            this.dispatch({
+                                type: 'permission_request',
+                                toolUseId: req.id,
+                                tool: req.tool,
+                                args: req.args ?? {},
+                                timestamp: now,
+                            });
+                        }
+                    }
+                }
                 this.markSessionReady();
                 break;
 

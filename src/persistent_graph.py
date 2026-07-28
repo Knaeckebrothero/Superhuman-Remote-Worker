@@ -17,7 +17,8 @@ import logging
 import time
 import uuid as _uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from enum import Enum
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -325,6 +326,32 @@ class TurnResult:
     interrupted: bool = False
     error: Optional[str] = None
     metrics: Optional[dict] = None
+    # True when the turn stopped on an unanswered permission gate. The tool
+    # calls are neither run nor refused — the durable pending request resumes
+    # them once the user answers.
+    awaiting_permission: bool = False
+
+
+class PermissionOutcome(str, Enum):
+    """Outcome of a supervised permission gate.
+
+    A gate is a *question to the user*, so "no answer yet" is a third,
+    distinct state — collapsing it into DECLINED fabricates a refusal the
+    user never made (the model then concludes it was denied and abandons
+    real work). See
+    docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+    """
+
+    APPROVED = "approved"
+    DECLINED = "declined"  # the user actually said no
+    NO_ANSWER = "no_answer"  # never answered — NOT consent, NOT a refusal
+
+    @classmethod
+    def coerce(cls, value: Any) -> "PermissionOutcome":
+        """Normalize a callback result, tolerating legacy bools."""
+        if isinstance(value, cls):
+            return value
+        return cls.APPROVED if value else cls.DECLINED
 
 
 @dataclass
@@ -354,10 +381,18 @@ class PersistentLoopCallbacks:
     # with older callers.
     on_tool_result: Callable[..., Awaitable[None]]
 
-    # Ask client for permission to run a tool (returns True if approved).
-    # tool_call_id lets the transport correlate the decision back to a
-    # specific call so it can be persisted with the rest of the turn.
-    permission_check: Callable[[str, Dict[str, Any], str], Awaitable[bool]]
+    # Ask client for permission to run a tool. Returns a PermissionOutcome —
+    # or, for legacy callers, a plain bool (True == APPROVED, False ==
+    # DECLINED). tool_call_id lets the transport correlate the decision back
+    # to a specific call so it can be persisted with the rest of the turn.
+    #
+    # NO_ANSWER is NOT a denial: the gate was never answered (timed out, or
+    # the approval card never reached the browser). The loop parks the turn
+    # instead of telling the model the user refused — see
+    # docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+    permission_check: Callable[
+        [str, Dict[str, Any], str], Awaitable[Union["PermissionOutcome", bool]]
+    ]
 
     # Notify client of turn lifecycle events
     on_turn_start: Callable[[int], Awaitable[None]]
@@ -2120,15 +2155,19 @@ async def _execute_turn(
             tool_args = tool_call.get("args", {})
             tool_call_id = tool_call["id"]
 
-            # Permission check
-            approved = await callbacks.permission_check(
-                tool_name, tool_args, tool_call_id
+            # Permission check. Three-state: an unanswered gate is neither
+            # consent nor refusal — never fabricate a decision the user did
+            # not make (see
+            # docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md).
+            outcome = PermissionOutcome.coerce(
+                await callbacks.permission_check(tool_name, tool_args, tool_call_id)
             )
-            if not approved:
+
+            if outcome is PermissionOutcome.DECLINED:
                 messages.append(
                     _ensure_msg_id(
                         ToolMessage(
-                            content="User denied this tool call.",
+                            content="User declined this tool call.",
                             tool_call_id=tool_call_id,
                         )
                     )
@@ -2136,6 +2175,26 @@ async def _execute_turn(
                 messages_added += 1
                 await _persist(messages[-1])
                 continue
+
+            if outcome is PermissionOutcome.NO_ANSWER:
+                # The gate was never answered (TTL elapsed, or the approval
+                # card never reached the browser). Park the turn: write NO
+                # ToolMessage, leave this call and every call after it
+                # un-run, and let the durable pending row resume the work
+                # when the user actually answers.
+                logger.info(
+                    "Permission gate unanswered for tool %s (%s) — parking turn; "
+                    "%d call(s) left ungated",
+                    tool_name,
+                    tool_call_id,
+                    len(response.tool_calls) - i,
+                )
+                return TurnResult(
+                    turn_id=0,
+                    messages_added=messages_added,
+                    tool_calls_made=tool_calls_made,
+                    awaiting_permission=True,
+                )
 
             # Notify client
             await callbacks.on_tool_start(tool_name, tool_args, tool_call_id)
