@@ -12,6 +12,29 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+# Helm swapped schema validators in 3.19: up to 3.18 (xeipuuv/gojsonschema) it
+# reports the offending key as a dotted path, from 3.19 (santhosh-tekuri) as a
+# JSON pointer, and every message was reworded. CI pins 3.17 while developers
+# usually have something newer, so assertions on rejection text must accept both
+# dialects or they only hold on the machine they were written on.
+CREDENTIAL_SOURCE_REJECTED = (
+    "Must validate one and only one schema (oneOf)",  # helm <= 3.18 schema gate
+    "'oneOf' failed",  # helm >= 3.19 schema gate
+    "require exactly one",  # template guard, when the schema gate is inactive
+)
+
+
+def assert_schema_rejected(
+    result: subprocess.CompletedProcess[str], values_path: str
+) -> None:
+    """Assert values.schema.json refused the render and named ``values_path``."""
+    assert result.returncode != 0, result.stdout
+    pointer = "/" + values_path.replace(".", "/")
+    assert values_path in result.stderr or pointer in result.stderr, result.stderr
+
+
 CANVAS_GATEWAY_COMMAND = [
     "uvicorn",
     "canvas_gateway:app",
@@ -443,12 +466,9 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         capture_output=True,
         text=True,
     )
-    assert generated_production_credentials.returncode != 0
-    assert (
-        "production Canvas viewers require an operator-provisioned role"
-        in generated_production_credentials.stderr
-        or "/canvas/livePreview/viewer/database/credentials/create"
-        in generated_production_credentials.stderr
+    assert_schema_rejected(
+        generated_production_credentials,
+        "canvas.livePreview.viewer.database.credentials.create",
     )
 
     provisioned_production_role = subprocess.run(
@@ -466,12 +486,9 @@ def test_canvas_gateway_helm_render_contract_and_selector_gate() -> None:
         capture_output=True,
         text=True,
     )
-    assert provisioned_production_role.returncode != 0
-    assert (
-        "production Canvas viewers require an operator-provisioned role"
-        in provisioned_production_role.stderr
-        or "/canvas/livePreview/viewer/database/provisionRole"
-        in provisioned_production_role.stderr
+    assert_schema_rejected(
+        provisioned_production_role,
+        "canvas.livePreview.viewer.database.provisionRole",
     )
 
     rendered = subprocess.run(
@@ -689,9 +706,8 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
         text=True,
     )
     assert no_source.returncode != 0
-    assert (
-        "require exactly one" in no_source.stderr
-        or "'oneOf' failed" in no_source.stderr
+    assert any(text in no_source.stderr for text in CREDENTIAL_SOURCE_REJECTED), (
+        no_source.stderr
     )
 
     vault_without_eso = subprocess.run(
@@ -724,10 +740,9 @@ def test_canvas_gateway_vault_credentials_follow_viewer_lifecycle() -> None:
         text=True,
     )
     assert multiple_sources.returncode != 0
-    assert (
-        "require exactly one" in multiple_sources.stderr
-        or "'oneOf' failed" in multiple_sources.stderr
-    )
+    assert any(
+        text in multiple_sources.stderr for text in CREDENTIAL_SOURCE_REJECTED
+    ), multiple_sources.stderr
 
     vault_render = subprocess.run(
         [
