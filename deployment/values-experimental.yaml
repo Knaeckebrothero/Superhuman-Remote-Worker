@@ -322,9 +322,23 @@ databases:
   # Retention still needs tightening so 32Gi doesn't just refill.
   audit:
     storageSize: "32Gi"
+  # Main postgres (srw-postgres) — same story as audit above, one env narrower.
+  # The chart default stays 16Gi (right for a fresh/self-hosted install); only
+  # this long-lived dev instance needs more. LangGraph checkpoint_blobs filled
+  # the 16Gi volume, and refilled it within ~4 days after the first cleanup on
+  # 2026-07-27. The live PVC was expanded to 32Gi (Longhorn online resize);
+  # without this override Fleet reconciles git's 16Gi against a 32Gi volume and
+  # every apply dies on "spec.resources.requests.storage: Forbidden: field can
+  # not be less than status.capacity" (seen 2026-07-28, bundle ErrApplied).
+  # A PVC can be grown but never shrunk, so git has to follow the volume.
+  # Growth is bounded by the keep-N checkpoint sweeper
+  # (orchestrator/services/checkpoint_retention.py) rather than by more disk.
+  postgres:
+    storageSize: "32Gi"
+    # To externalize later, add externalUrl to THIS block — a second
+    # `postgres:` key further down would silently shadow the storageSize
+    # above and re-arm the shrink failure.
 # Other DBs stay internal (chart defaults). Externalize here if needed:
-#   postgres:
-#     externalUrl: ""
 #   vector:
 #     externalUrl: ""
 #   mongodb:
