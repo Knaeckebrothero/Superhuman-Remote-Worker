@@ -1,7 +1,16 @@
 # Transient infrastructure failures must not kill jobs
 
 **Date:** 2026-07-28
-**Status:** Design approved. Implementing.
+**Status:** **IMPLEMENTED 2026-07-28** — all eight fixes in the working tree
+with 91 new regression tests. NOT yet committed, NOT deployed; migration 0072
+is unapplied and the live gate is OWED.
+
+Two things changed during implementation, both recorded below:
+* ENOSPC (`No space left on device`) was added to the transient class — job
+  1A died to exactly that error, and excluding it would have left the incident's
+  first casualty unfixed.
+* `mark_complete` and the deliverable-read guard carried the same swallow as
+  `job_complete`; all three sites were fixed (Fix 8).
 **Incident / evidence record:** `docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md`
 **Parked successor:** `docs/superpowers/specs/2026-07-28-job-termination-negotiated-transition-design.md`
 — the lifecycle redesign that dissolves Defects 1/2/3 at the root. Every fix

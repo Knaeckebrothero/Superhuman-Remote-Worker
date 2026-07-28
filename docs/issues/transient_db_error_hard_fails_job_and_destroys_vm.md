@@ -14,7 +14,12 @@ tags:
 **Filed:** 2026-07-28, investigating dev-cluster job
 `c6dd288d-25d0-41f0-a66e-79a8624f06ab` ("Job 1B — Modern Kurort Natural",
 designer, project `68137e29`, alive ~46h, 4641 audit entries).
-**Status:** CONFIRMED against live dev (`--context main`). UNFIXED.
+**Status:** CONFIRMED against live dev (`--context main`).
+**All eight defects FIXED 2026-07-28** — implementation follows
+`docs/superpowers/specs/2026-07-28-transient-infra-failure-handling-design.md`.
+Committed to the working tree with 88 new regression tests; **not yet deployed
+to dev**, and the live gate is OWED. Jobs `e1192a9d` and `c6dd288d` were
+recovered by hand before the fixes landed (see Defect 2 for the procedure).
 **Severity:** **high** — a sub-second infrastructure blip destroys multi-day
 jobs *and* their workspaces, with no retry and no recoverable classification.
 Fires during ordinary DB maintenance.

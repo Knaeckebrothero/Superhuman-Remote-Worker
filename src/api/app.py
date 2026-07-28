@@ -72,6 +72,55 @@ def _clear_stop() -> None:
     _stop_completed.clear()
 
 
+# Statuses that mean "this job is no longer ours to run". Deliberately a
+# DENY-list: an unrecognised or new status leaves the run alone (fail-open),
+# because wrongly stopping a healthy run is worse than a late stop, and the
+# push signal remains the fast path either way.
+_PREEMPTED_JOB_STATUSES = {
+    "failed": "cancel",
+    "cancelled": "cancel",
+    "paused": "pause",
+}
+
+
+def _on_heartbeat_response(response: dict) -> None:
+    """Stop the run if the orchestrator says our job was taken away.
+
+    The heartbeat used to be one-directional — the agent asserted liveness and
+    learned nothing back. So when something terminated a job out-of-band, the
+    running agent never found out: job c6dd288d kept streaming for 21 minutes
+    and 45 LLM calls after it had been failed, and only noticed when its VM was
+    collected underneath it, which it reasonably misread as "my workspace died"
+    rather than "my job was killed".
+
+    The orchestrator's push stop signal stays the fast path. This is the
+    backstop for the 13+ call sites that can write a terminal status without
+    sending one, and it costs no new call — the heartbeat already runs on the
+    right cadence.
+    docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
+    """
+    job_id = _current_job_id
+    if not job_id or _stop_requested.is_set():
+        return
+    if not isinstance(response, dict):
+        return
+    job_status = response.get("job_status")
+    reason = _PREEMPTED_JOB_STATUSES.get(job_status)
+    if reason is None:
+        # Includes job_status=None (older orchestrator, or the lookup failed) —
+        # degrade to the previous push-only behaviour rather than guessing.
+        return
+    logger.warning(
+        "Job %s is '%s' on the orchestrator but this agent is still running it "
+        "— stopping (reason=%s). The job was terminated out-of-band; work since "
+        "then was not attributable to it.",
+        job_id,
+        job_status,
+        reason,
+    )
+    _request_stop(reason)
+
+
 def set_config_path(path: str) -> None:
     """Set the configuration path for the agent.
 
@@ -127,6 +176,7 @@ async def lifespan(app: FastAPI):
             get_status=_get_agent_status_for_heartbeat,
             get_job_id=_get_current_job_id,
             get_metrics=_get_agent_metrics,
+            on_response=_on_heartbeat_response,
         )
     )
     logger.info("Orchestrator heartbeat loop started")

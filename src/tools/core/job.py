@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
+from ...core.workspace_backend import WorkspaceUnavailableError
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,11 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # Return message that triggers completion detection
             return f"Wrote file: output/completion.json - Task complete. Summary: {summary}"
 
+        except WorkspaceUnavailableError:
+            # Same lifecycle-signal rule as job_complete below: this tool also
+            # writes to the workspace, so a dead VM must propagate rather than
+            # become a result string. (Defect 8)
+            raise
         except Exception as e:
             logger.error(f"Failed to mark complete: {e}")
             return f"Error marking complete: {str(e)}"
@@ -196,6 +202,12 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                             validation_warnings.append(
                                 f"Deliverable '{deliverable}' appears empty or trivial ({len(content)} bytes)"
                             )
+                    except WorkspaceUnavailableError:
+                        # Not a "bad deliverable" — the whole workspace is gone.
+                        # Degrading it to a validation warning would report the
+                        # job's own output as unreadable and reject its
+                        # completion. Propagate. (Defect 8)
+                        raise
                     except Exception:
                         validation_warnings.append(
                             f"Deliverable '{deliverable}' could not be read"
@@ -250,6 +262,14 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                     "Once all todos are complete, the job will be frozen for human review."
                 )
 
+        except WorkspaceUnavailableError:
+            # A dead workspace is a LIFECYCLE signal, not a tool error. Swallowing
+            # it into a result string is what let job c6dd288d call job_complete
+            # five times over 13 minutes against an already-deleted VM before an
+            # unrelated tool finally let the exception propagate. Re-raise so the
+            # fast-freeze path classifies it.
+            # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 8)
+            raise
         except Exception as e:
             logger.error(f"Failed to mark job as final: {e}")
             return f"Error marking job as final: {str(e)}"
