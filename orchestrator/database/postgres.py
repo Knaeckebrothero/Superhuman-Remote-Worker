@@ -4771,6 +4771,15 @@ class PostgresDB:
         the assignment safe against concurrent dispatchers and the transient
         dual-leader window that leader election cannot fence — a job can never
         be handed to two agents. Callers MUST claim before notifying the agent.
+
+        Also clears any failure record left by a previous run. update_job_status()
+        builds its SET list dynamically and only writes ``error_message`` when the
+        argument is non-None, so an error, once set, is never unset: a recovered
+        job kept reporting a stale failure forever while plainly running (job
+        4435994d sat at 'reviewing' still showing a two-day-old resume error).
+        Clearing rides on the CAS statement itself, so a refused claim leaves the
+        row untouched. Distinct from clear_job_failure(), which handles a late
+        completion report re-resolving an already-failed job.
         """
         try:
             job_uuid = UUID(job_id)
@@ -4786,6 +4795,8 @@ class PostgresDB:
                        lease_expires_at = NOW() + make_interval(
                            secs => $3::int
                        ),
+                       error_message = NULL,
+                       error_details = NULL,
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1
                    AND assigned_agent_id IS NULL

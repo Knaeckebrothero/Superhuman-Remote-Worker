@@ -39,6 +39,11 @@ async def db(pg_dsn):
                 status text NOT NULL,
                 assigned_agent_id uuid,
                 lease_expires_at timestamptz,
+                -- claim_job_for_agent() clears the previous run's failure
+                -- record on the CAS statement itself; see
+                -- tests/test_claim_clears_stale_failure.py
+                error_message text,
+                error_details jsonb,
                 updated_at timestamptz DEFAULT now()
             )
             """
