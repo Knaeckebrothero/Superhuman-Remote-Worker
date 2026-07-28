@@ -941,3 +941,136 @@ class TestHeartbeatActivityTracking:
 
     def test_idle_does_not_update(self):
         assert self._should_update_activity("idle", "some-job-id") is False
+
+
+# =============================================================================
+# Test: thread tier is read explicitly, not inferred from metadata presence
+# docs/issues/workspace_suspension_infers_tier_from_metadata_presence.md
+# =============================================================================
+
+
+def make_vm_thread(thread_id="tid-vm", ssh_host="100.64.0.235"):
+    """A healthy vm-tier session.
+
+    The workspace_container key is present but holds ONLY git coordinates —
+    _setup_gitea writes those for EVERY thread including vm-tier ones. It has no
+    'status'/'pod_ip', because no container was ever provisioned for it.
+    """
+    return {
+        "id": thread_id,
+        "status": "active",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "vm"}},
+            "workspace_container": {
+                "git_remote_url": "http://gitea/srw/thread-tid-vm.git",
+                "repo_name": "thread-tid-vm",
+            },
+            "vm": {"status": "ready", "ssh_host": ssh_host, "ssh_port": 22},
+        },
+    }
+
+
+def make_container_thread(thread_id="tid-pod"):
+    return {
+        "id": thread_id,
+        "status": "active",
+        "metadata": {
+            "config_override": {"workspace": {"backend": "sandbox"}},
+            "workspace_container": {
+                "status": "ready",
+                "pod_ip": "10.42.2.32",
+                "git_remote_url": "http://gitea/srw/thread-tid-pod.git",
+            },
+        },
+    }
+
+
+def make_vm_service():
+    svc = make_service()
+    vm_prov = MagicMock()
+    type(vm_prov).is_available = PropertyMock(return_value=True)
+    vm_prov.delete_thread_vm = AsyncMock(return_value=True)
+    vm_prov.create_thread_vm = AsyncMock(return_value=True)
+    svc._vm_provisioner = vm_prov
+    svc._agent_provisioner = None
+    return svc, vm_prov
+
+
+class TestThreadTierIsExplicit:
+    """A vm-tier thread must suspend via the VM branch. Previously the tier was
+    inferred from whether metadata.workspace_container existed at all — and
+    _setup_gitea makes it exist for every thread — so a VM session read as
+    pod-tier and suspend bailed out entirely, leaving its VM running forever."""
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_thread_actually_suspends(self):
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+
+        ok = await svc.suspend_thread_workspace("tid-vm")
+
+        assert ok is True, "vm-tier suspend must not bail on the container status"
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm")
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_snapshot_is_labelled_vm(self):
+        """source_type is persisted into the snapshot manifest and read back on
+        restore, so mislabelling a VM snapshot 'pod' outlives the suspend."""
+        svc, _ = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+
+        await svc.suspend_thread_workspace("tid-vm")
+
+        kwargs = svc._snapshot_service.capture_vm_snapshot.await_args.kwargs
+        assert kwargs["source_type"] == "vm"
+        assert kwargs["ssh_host"] == "100.64.0.235"
+
+    @pytest.mark.asyncio
+    async def test_vm_tier_status_markers_go_to_vm_context(self):
+        """Progress markers must land on metadata.vm, not on the git-only
+        workspace_container key."""
+        svc, _ = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+
+        await svc.suspend_thread_workspace("tid-vm")
+
+        assert svc._db.merge_thread_vm_context.await_count >= 1
+        svc._db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_container_tier_thread_still_uses_pod_branch(self):
+        """Regression guard: sandbox-tier threads are unaffected."""
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+
+        ok = await svc.suspend_thread_workspace("tid-pod")
+
+        assert ok is True
+        vm_prov.delete_thread_vm.assert_not_awaited()
+        svc._container_provisioner.delete_workspace.assert_awaited()
+        kwargs = svc._snapshot_service.capture_vm_snapshot.await_args.kwargs
+        assert kwargs["source_type"] == "pod"
+
+    @pytest.mark.asyncio
+    async def test_idle_sweep_actually_suspends_a_vm_thread(self):
+        """End-to-end for the leak: the sweeper already SELECTed vm-tier threads
+        (metadata->'vm'->>'status' = 'ready'), but suspend_thread_workspace bailed
+        on every one of them, so an idle VM session's VM ran until the session
+        ended. This asserts the whole chain now completes."""
+        svc, vm_prov = make_vm_service()
+        thread = make_vm_thread()
+        svc._db._conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "id": "tid-vm",
+                    "metadata": thread["metadata"],
+                    "last_activity": datetime.now(timezone.utc) - timedelta(hours=3),
+                }
+            ]
+        )
+        svc._db.get_thread = AsyncMock(return_value=thread)
+
+        n = await svc.check_idle_threads()
+
+        assert n == 1, "idle vm-tier thread must actually be suspended"
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm")

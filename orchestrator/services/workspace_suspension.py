@@ -22,14 +22,53 @@ from services.workspace_lifecycle import WorkspaceOwner
 logger = logging.getLogger(__name__)
 
 
-def _resolve_ssh_port(ws_ctx: dict, vm_ctx: dict) -> int:
+def _thread_is_vm_tier(metadata: dict, ws_ctx: dict, vm_ctx: dict) -> bool:
+    """Is this THREAD's workspace a VM rather than a container?
+
+    Ask the resolved tier; never infer it from which metadata keys exist.
+    ``metadata.workspace_container`` is present on *every* thread because
+    ``_setup_gitea`` writes ``git_remote_url``/``repo_name`` there for all tiers,
+    so "the key exists" does NOT mean a container was provisioned. Reading
+    presence made every VM session look pod-tier, which made
+    ``suspend_thread_workspace`` bail before doing anything — VM sessions could
+    never be suspended and their VMs ran until the session ended.
+    docs/issues/workspace_suspension_infers_tier_from_metadata_presence.md
+
+    Jobs are deliberately NOT covered by this: a job's
+    ``context.workspace_container`` is written only by container provisioning
+    (its git_remote_url lives at the context root), so presence really does imply
+    pod-tier there and the job paths keep their existing checks.
+    """
+    from src.core.backends.factory import is_vm_backend
+
+    backend = ((metadata.get("config_override") or {}).get("workspace") or {}).get(
+        "backend"
+    )
+    if backend:
+        return is_vm_backend(backend)
+    # Legacy rows predating tier materialization at create: fall back to pod
+    # *state* rather than mere presence — a git-only workspace_container has no
+    # 'status', so this still reads a VM-upgraded thread correctly.
+    return bool(vm_ctx.get("status")) and not ws_ctx.get("status")
+
+
+def _resolve_ssh_port(ws_ctx: dict, vm_ctx: dict, is_vm: Optional[bool] = None) -> int:
     """Resolve the snapshot SSH port by workspace kind.
 
     Container/pod workspaces run sshd on 30022; only true VM contexts use the
     VM ssh_port (default 22). Previously both fell through to a VM-shaped 22
     default, which silently broke pod snapshots when ``port`` was absent from
     the stored context (the cause of the dev-cluster leaked-pod incident).
+
+    ``is_vm`` is the caller's resolved tier. Thread callers pass it because
+    ``ws_ctx`` is truthy for every thread (git coordinates), so the presence
+    fallback would hand a VM the pod port 30022. Job callers omit it and keep the
+    presence behaviour, which is correct for them.
     """
+    if is_vm is True:
+        return int(vm_ctx.get("ssh_port", 22))
+    if is_vm is False:
+        return int(ws_ctx.get("port", 30022))
     if ws_ctx:
         return int(ws_ctx.get("port", 30022))
     return int(vm_ctx.get("ssh_port", 22))
@@ -455,13 +494,17 @@ class WorkspaceSuspensionService:
             )
             return False
 
+        # Resolve the tier ONCE, explicitly. Everything below keys off this
+        # instead of asking whether workspace_container happens to exist.
+        is_vm = _thread_is_vm_tier(metadata, ws_ctx, vm_ctx)
+
         ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
-        ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
+        ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx, is_vm=is_vm)
 
         if not ssh_host:
             return False
 
-        ws_status = ws_ctx.get("status") if ws_ctx else vm_ctx.get("status")
+        ws_status = vm_ctx.get("status") if is_vm else ws_ctx.get("status")
         if ws_status in ("suspended", "suspending"):
             # A concurrent/earlier suspend already handled (or is handling)
             # this thread. Returning False here made the caller's fallback
@@ -477,15 +520,15 @@ class WorkspaceSuspensionService:
         if ws_status != "ready":
             return False
 
-        if ws_ctx:
+        if is_vm:
+            await self._db.merge_thread_vm_context(thread_id, {"status": "suspending"})
+        else:
             await self._db.merge_thread_workspace_context(
                 thread_id, {"status": "suspending"}
             )
-        elif vm_ctx:
-            await self._db.merge_thread_vm_context(thread_id, {"status": "suspending"})
 
         try:
-            source_type = "vm" if vm_ctx and not ws_ctx else "pod"
+            source_type = "vm" if is_vm else "pod"
 
             # Slice C (design §5): stage the protected session's upperdir
             # diff to S3 BEFORE the teardown snapshot — this is the last
@@ -523,12 +566,12 @@ class WorkspaceSuspensionService:
                     "Snapshot capture failed for thread %s — keeping workspace alive",
                     thread_id,
                 )
-                if ws_ctx:
-                    await self._db.merge_thread_workspace_context(
+                if is_vm:
+                    await self._db.merge_thread_vm_context(
                         thread_id, {"status": "ready"}
                     )
-                elif vm_ctx:
-                    await self._db.merge_thread_vm_context(
+                else:
+                    await self._db.merge_thread_workspace_context(
                         thread_id, {"status": "ready"}
                     )
                 return False
@@ -539,7 +582,7 @@ class WorkspaceSuspensionService:
                 "suspended_at": datetime.now(timezone.utc).isoformat(),
             }
 
-            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+            if is_vm and self._vm_provisioner and self._vm_provisioner.is_available:
                 await self._vm_provisioner.delete_thread_vm(thread_id)
                 await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
             else:
@@ -559,12 +602,12 @@ class WorkspaceSuspensionService:
         except Exception:
             logger.exception("Failed to suspend workspace for thread %s", thread_id)
             try:
-                if ws_ctx:
-                    await self._db.merge_thread_workspace_context(
+                if is_vm:
+                    await self._db.merge_thread_vm_context(
                         thread_id, {"status": "ready"}
                     )
-                elif vm_ctx:
-                    await self._db.merge_thread_vm_context(
+                else:
+                    await self._db.merge_thread_workspace_context(
                         thread_id, {"status": "ready"}
                     )
             except Exception:
@@ -603,17 +646,21 @@ class WorkspaceSuspensionService:
             )
             return False
 
-        if ws_ctx:
+        # Same explicit tier read as suspend — presence of workspace_container
+        # says nothing about the tier (see _thread_is_vm_tier).
+        is_vm = _thread_is_vm_tier(metadata, ws_ctx, vm_ctx)
+
+        if is_vm:
+            await self._db.merge_thread_vm_context(thread_id, {"status": "restoring"})
+        else:
             await self._db.merge_thread_workspace_context(
                 thread_id, {"status": "restoring"}
             )
-        elif vm_ctx:
-            await self._db.merge_thread_vm_context(thread_id, {"status": "restoring"})
 
         try:
             ssh_host = None
 
-            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+            if is_vm and self._vm_provisioner and self._vm_provisioner.is_available:
                 ok = await self._vm_provisioner.create_thread_vm(thread_id)
                 if not ok:
                     logger.error(
@@ -669,18 +716,18 @@ class WorkspaceSuspensionService:
             if not ssh_host:
                 error_msg = "no SSH host after provisioning for restore"
                 logger.error("%s (thread %s)", error_msg, thread_id)
-                if ws_ctx:
-                    await self._db.merge_thread_workspace_context(
+                if is_vm:
+                    await self._db.merge_thread_vm_context(
                         thread_id, {"status": "failed", "error": error_msg}
                     )
-                elif vm_ctx:
-                    await self._db.merge_thread_vm_context(
+                else:
+                    await self._db.merge_thread_workspace_context(
                         thread_id, {"status": "failed", "error": error_msg}
                     )
                 return False
 
             # Extract snapshot into the workspace
-            ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
+            ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx, is_vm=is_vm)
             await self._extract_snapshot(
                 thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
             )
@@ -689,10 +736,10 @@ class WorkspaceSuspensionService:
                 "status": "ready",
                 "restored_at": datetime.now(timezone.utc).isoformat(),
             }
-            if ws_ctx:
-                await self._db.merge_thread_workspace_context(thread_id, restored_ctx)
-            elif vm_ctx:
+            if is_vm:
                 await self._db.merge_thread_vm_context(thread_id, restored_ctx)
+            else:
+                await self._db.merge_thread_workspace_context(thread_id, restored_ctx)
 
             logger.info(
                 "Workspace restored from S3 for thread %s (ssh_host=%s)",
@@ -703,12 +750,12 @@ class WorkspaceSuspensionService:
 
         except Exception:
             logger.exception("Failed to restore workspace for thread %s", thread_id)
-            if ws_ctx:
-                await self._db.merge_thread_workspace_context(
+            if is_vm:
+                await self._db.merge_thread_vm_context(
                     thread_id, {"status": "failed", "error": "restore exception"}
                 )
-            elif vm_ctx:
-                await self._db.merge_thread_vm_context(
+            else:
+                await self._db.merge_thread_workspace_context(
                     thread_id, {"status": "failed", "error": "restore exception"}
                 )
             return False
