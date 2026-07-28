@@ -5,6 +5,10 @@
 > the model and deployed live gates have not passed. Endpoint/tool defaults
 > remain off and M2 must not be called complete.
 
+> **Testing handoff (2026-07-28):** the source was pushed and a redeployment was
+> reported. This is not yet live evidence. Independent acceptance is defined in
+> [App Guide M2 live acceptance — tester-agent handoff](app_guide_m2_live_acceptance_handoff.md).
+
 This record separates offline contract evidence, model behavior, and deployed
 runtime evidence. A green deterministic fixture is not a substitute for a
 real authenticated endpoint, persistent session, or operation.
@@ -54,6 +58,7 @@ M1 routing corpus:
 | Case | Required trajectory |
 |---|---|
 | Stable email folder setup | guide only |
+| Capability terminology near miss | guide only; no live lookup or current-state claim |
 | Current send ready | guide → exact send capability |
 | Current send denied | guide → exact send capability; user layer remains distinct |
 | Partial/unknown | guide → exact send capability; partial and unknown preserved |
@@ -114,8 +119,16 @@ operation-ID warnings; no M2e assertion failed.
 
 ## Deployment and rollout state
 
-The local `srw` k3d cluster is stopped (`0/1` server), so no current worktree
-image has been deployed for M2e. The following remain unverified:
+On 2026-07-28 the source push and a redeployment were reported. The repository
+experimental overlay now declares image `sha-5eb436e` and full source revision
+`5eb436eb9181b3271aef223e89c8d87861d95b4c`, which contains the M2e
+implementation. The current local `k3d-srw` API is not reachable, so this
+record does not promote the report or overlay declaration to observed live
+evidence. The tester must verify the real target through the linked handoff.
+
+The earlier local `srw` k3d attempt had a stopped (`0/1` server) target, so no
+then-current worktree image was deployed for M2e. The following remain
+unverified:
 
 One controlled start attempt was restored to the stopped state without
 deploying changes. k3d reported its server container running, but the
