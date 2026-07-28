@@ -307,7 +307,7 @@ class TestNoteFieldsCreatedAt:
         from datetime import datetime, timezone
 
         fm, body = parse_note_md(
-            '---\nid: feature-x\ntype: feature\n'
+            "---\nid: feature-x\ntype: feature\n"
             'created: "2026-01-15T10:30:00+00:00"\n---\n# T\nbody\n'
         )
         f = note_fields("knowledge/feature-x.md", fm, body)
