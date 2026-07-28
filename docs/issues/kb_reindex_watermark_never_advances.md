@@ -38,7 +38,7 @@ Observed live on two projects:
 
 ## Root cause
 
-`KnowledgeStore.set_watermark` (`src/services/knowledge_store.py:558-580`) binds `$4`
+`KnowledgeStore.upsert_watermark` (`src/services/knowledge_store.py:539-580`) binds `$4`
 (`indexed_commit`) in two contexts whose types Postgres resolves differently:
 
 ```sql
@@ -49,9 +49,16 @@ VALUES ($1, $2, $3, $4, $5, COALESCE($6, $4), $7, NOW(), ...)
 ```
 
 `$4` is assigned directly to `indexed_commit` (deduced `character varying`) and also
-appears inside `COALESCE($6, $4)` feeding `source_head`, where the presence of an
-otherwise-untyped `$6` pushes the resolution to `text`. asyncpg then refuses the
-statement because one parameter cannot be two types.
+appears inside `COALESCE($6, $4)` feeding `source_head`. Both arguments of that COALESCE
+are untyped parameters, so Postgres resolves the expression to its preferred unknown
+type, `text`. `$4` therefore has to be both `varchar` and `text`, and asyncpg refuses
+the statement.
+
+**The sibling `set_watermark_status` (`:591-625`) has a similar-looking COALESCE and
+works fine** — and the difference is the whole diagnosis. There the expression is
+`COALESCE($4, kb_index_watermark.source_head)`: the second argument is a *column*, which
+pins the type to `varchar`, matching `$4`'s other use. Only `upsert_watermark` puts two
+untyped parameters in the same COALESCE.
 
 Both columns are genuinely `character varying` in the live schema — verified — so this
 is **not** a schema mismatch. It is parameter-type deduction across the two usages.
