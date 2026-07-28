@@ -12835,9 +12835,7 @@ async def _spawn_loop_job(
                     "note_id": in_progress_id,
                     "title": campaign.get("title") or "",
                 }
-            backlog_block = render_backlog_block(
-                rows, counts, in_progress=in_progress
-            )
+            backlog_block = render_backlog_block(rows, counts, in_progress=in_progress)
         except Exception:
             logger.warning(
                 "loop %s: backlog fetch failed — spawning without the block",
