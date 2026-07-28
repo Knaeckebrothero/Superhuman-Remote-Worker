@@ -24,6 +24,23 @@ drain/teardown drill, and Phase 5 Part 2 — tracked in
 `tests/coincident_infra_error_test_coverage.md`. Symbols/line numbers current as
 of this date against `orchestrator/services/completion.py`.
 
+> ⚠️ **RESOLVED ≠ class closed. A fourth face was observed live on 2026-07-27**
+> (job `e1192a9d`, same project `68137e29`) and is **still open** — tracked in
+> `docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md` (Defect 2).
+> Every fix below lives *inside* `determine_job_status`, which is **downstream of
+> a gate that can close first**: when something marks the job terminal
+> **out-of-band before the agent reports** (there, a Postgres disk-full handler
+> writing `status=failed`), `POST /api/jobs/{id}/complete` is rejected at
+> `orchestrator/main.py:14248` with `400 {"detail":"Job cannot be completed
+> (status: failed)"}`. The report — carrying a `freeze_type=job_complete` freeze —
+> never reaches the carve-outs, so `ERROR_IMMUNE_FREEZE_TYPES` cannot help and a
+> fully successful job stays `failed` silently. Detection: the freeze artifact is
+> the truth, not the DB — `jobs.freeze_data` may be NULL while
+> `output/job_frozen.json` in the Gitea jobs repo holds a real `job_complete`
+> freeze. Worse variant: if the out-of-band failure also tears down the VM, the
+> agent cannot write `job_frozen.json` at all and the artifact must be
+> reconstructed before the status can be repaired.
+
 ## TL;DR
 
 `determine_job_status` (`orchestrator/services/completion.py:519`) is the single
