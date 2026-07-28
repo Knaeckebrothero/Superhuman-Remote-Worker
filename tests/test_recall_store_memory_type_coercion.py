@@ -61,7 +61,9 @@ class TestConstantMatchesSchema:
 
         schema = Path("orchestrator/database/vector_schema.sql").read_text()
         line = next(
-            ln for ln in schema.splitlines() if "valid_memory_type" in ln and "CHECK" in ln
+            ln
+            for ln in schema.splitlines()
+            if "valid_memory_type" in ln and "CHECK" in ln
         )
         in_sql = {
             token.strip().strip("'")

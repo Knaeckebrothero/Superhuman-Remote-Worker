@@ -179,7 +179,9 @@ class TestBackoffAndCeiling:
         delays = [infra_transient_backoff_seconds(n) for n in range(1, 8)]
         assert delays[0] == 60
         assert delays == sorted(delays), "must never go backwards"
-        assert max(delays) <= 3600, "cap bounds how long the reaper carve-out holds a VM"
+        assert max(delays) <= 3600, (
+            "cap bounds how long the reaper carve-out holds a VM"
+        )
 
     def test_ceiling_is_small_enough_to_bound_a_misclassification(self):
         total = sum(

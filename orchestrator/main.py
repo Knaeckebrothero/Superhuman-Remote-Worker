@@ -14349,7 +14349,9 @@ async def complete_job(
                 # workspace_unavailable recovery request vanished into a 400
                 # that only the agent ever saw, so the recovery arm 47 lines
                 # below was never reached.
-                err = result.get("error") if isinstance(result.get("error"), dict) else {}
+                err = (
+                    result.get("error") if isinstance(result.get("error"), dict) else {}
+                )
                 logger.warning(
                     "Job %s: DISCARDING completion report on terminal job "
                     "(status=%s, error_type=%s, recoverable=%s, has_freeze=%s). "
