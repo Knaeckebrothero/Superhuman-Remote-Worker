@@ -427,6 +427,17 @@ Disconnected editing is Slice C.
   CONFIG-ONLY state after the thread fetch (never to `getOverrides()`), and
   an apply firing before the baseline exists must reschedule — otherwise a
   pin made while the fetch is in flight is silently absorbed as baseline.
+  **Corrected 2026-07-26** (see
+  `docs/done/session_tool_group_checkbox_disagrees_with_the_agent.md`): the
+  four tool-group booleans could not be derived from the thread's
+  `config_override` at all, because a group the override omits still merges to
+  `session_base.yaml`'s `[]` — i.e. DISABLED — while the client read an absent
+  key as enabled. They now come from
+  `GET /api/persistent/threads/{id}/tool-groups`, merged as a defaults layer
+  *underneath* the override in `liveConfig()`, and the baseline anchor above
+  widened to a `forkJoin` of both fetches — a late tool-group answer landing
+  after the anchor would otherwise dispatch a `config.update` the user never
+  asked for.
 - Narration lives in the execution group and temperature in the model group
   as live-only rows (the create forms don't render them); permission +
   narration dispatch via their dedicated verbs, the rest via `config.update`.
