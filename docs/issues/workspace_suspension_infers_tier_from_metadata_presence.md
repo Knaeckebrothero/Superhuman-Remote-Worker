@@ -11,7 +11,8 @@ tags:
 # Issue — workspace suspension infers tier from metadata *presence*, so VM sessions never suspend
 
 **Status:** Found 2026-07-27 while fixing Defect 1 of
-`docs/issues/session_vm_backend_never_attaches.md`. Not yet implemented. Work on
+`docs/issues/session_vm_backend_never_attaches.md`. **FIXED 2026-07-28** (thread
+paths only — see "Job path" below). Unit-verified; live gate owed. Work on
 `develop`.
 
 **One line:** `workspace_suspension.py` decides "is this pod-tier or VM-tier?" by
@@ -88,7 +89,44 @@ consequence of the Defect 1 fix that this issue is the fix for. It is not a
 regression in the tier the user gets — the session is now on the correct tier —
 but it should be fixed before VM sessions are used in anger.
 
-## Proposal
+## Fix as implemented (2026-07-28)
+
+New module helper `_thread_is_vm_tier(metadata, ws_ctx, vm_ctx)` reads the
+resolved tier from `metadata.config_override.workspace.backend` via
+`is_vm_backend` (`src/core/backends/factory`). Legacy rows with no materialized
+tier fall back to pod **state** (`ws_ctx["status"]`) rather than mere presence, so
+a VM-upgraded thread still reads correctly. Both `suspend_thread_workspace` and
+`restore_thread_workspace` resolve `is_vm` once and key every branch off it:
+the status markers, the `ws_status` read, `source_type`, and the teardown/
+provision fork.
+
+**A third instance of the same bug turned up during the fix.** `_resolve_ssh_port`
+also branched on `if ws_ctx:` — so a VM thread was handed the **pod** port 30022
+instead of 22, which would have broken the snapshot SSH the moment suspend
+started working. It now takes an explicit `is_vm` argument; the thread callers
+pass it, job callers omit it and keep the presence behaviour.
+
+**The idle sweeper needed no change.** `check_idle_threads`' SQL already selected
+vm-tier rows (`metadata->'vm'->>'status' = 'ready'`). The blockage was entirely
+inside `suspend_thread_workspace`, which bailed on every one it was handed.
+
+### Job path: deliberately unchanged
+
+Investigated and left alone. A job's `context.workspace_container` is written
+**only** by container-provisioning paths — its `git_remote_url` goes to the
+context root via `merge_job_context` (`services/job_provisioning.py`), not into
+`workspace_container`. So for jobs, presence really does imply pod-tier and the
+existing checks are correct. Do not "fix" them by analogy.
+
+### Tests
+
+`tests/test_workspace_suspension.py::TestThreadTierIsExplicit` — vm-tier thread
+actually suspends; snapshot labelled `source_type="vm"`; markers land on
+`metadata.vm` and not on the git-only `workspace_container`; container-tier
+thread unchanged; and an end-to-end `check_idle_threads` sweep that suspends an
+idle VM thread (the leak itself).
+
+## Proposal (as designed, for reference)
 
 Single-source the tier instead of inferring it. `session_provisioner._thread_backend`
 already reads `metadata.config_override.workspace.backend`, and
