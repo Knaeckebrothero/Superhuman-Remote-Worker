@@ -75,6 +75,7 @@ def coerce_memory_type(memory_type: Optional[str]) -> str:
     )
     return DEFAULT_MEMORY_TYPE
 
+
 # English stopwords — small hardcoded set for keyword extraction
 _STOPWORDS = frozenset(
     {

@@ -54,7 +54,12 @@ class TestReleasesTheWorkspace:
 
     def test_a_different_freeze_type_does_not_pin(self):
         assert not infra_transient_retry_pending(
-            _meta({"freeze_type": "llm_unavailable", "next_retry_at": "2099-01-01T00:00:00+00:00"})
+            _meta(
+                {
+                    "freeze_type": "llm_unavailable",
+                    "next_retry_at": "2099-01-01T00:00:00+00:00",
+                }
+            )
         )
 
     def test_no_freeze_does_not_pin(self):
