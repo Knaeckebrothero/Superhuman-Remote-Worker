@@ -39,7 +39,9 @@ logger = logging.getLogger(__name__)
 # materialized into the workspace when SKILLS_DB_ENABLED) and `notes/` are
 # framework/job-scoped, not deliverables — a k3d E2E caught `skills/` leaking
 # onto main. The agent's actual code lives elsewhere (e.g. `repo/`) and is NOT
-# floored. See docs/features/loop_repo_compounding.md.
+# floored. See docs/features/loop_repo_compounding.md. contacts/ is the
+# materialized contact projection — names, emails, phone numbers; leaking it
+# onto a loop's main is the skills/ leak with PII.
 _LOOP_MAIN_GITIGNORE = "\n".join(
     [
         "# Loop artifact floor — job-scoped scratch never reaches the project.",
@@ -51,6 +53,7 @@ _LOOP_MAIN_GITIGNORE = "\n".join(
         "documents/",
         "reference/",
         "skills/",
+        "contacts/",
         "notes/",
         "instructions.md",
         "task_brief.md",
