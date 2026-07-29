@@ -1854,6 +1854,12 @@ class OfficerConfig:
     max_pages_per_day: int = 3
     max_actions_per_wake: int = 10
     daily_token_ceiling: int = 0  # 0 = disabled (v1 leans on per-job caps)
+    # Conference embodiment (centurion.md §2/S9): an ordinary interactive
+    # session wearing the officer's identity. enabled stays False on a
+    # conference thread (no sleep tool, no watchdog, normal idle-archive);
+    # this flag only widens identity attachment — charter injection and, on
+    # the orchestrator side, the background officer's hold.
+    conference: bool = False
 
     @property
     def backstop_seconds(self) -> int:
@@ -1887,6 +1893,7 @@ def _parse_officer_config(data: Dict[str, Any]) -> OfficerConfig:
         max_pages_per_day=int(officer_data.get("max_pages_per_day") or 3),
         max_actions_per_wake=int(officer_data.get("max_actions_per_wake") or 10),
         daily_token_ceiling=int(officer_data.get("daily_token_ceiling") or 0),
+        conference=bool(officer_data.get("conference", False)),
     )
 
 
