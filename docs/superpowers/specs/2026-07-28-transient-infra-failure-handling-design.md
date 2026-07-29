@@ -1,9 +1,23 @@
 # Transient infrastructure failures must not kill jobs
 
 **Date:** 2026-07-28
-**Status:** **IMPLEMENTED 2026-07-28** — all eight fixes in the working tree
-with 91 new regression tests. NOT yet committed, NOT deployed; migration 0072
-is unapplied and the live gate is OWED.
+**Status:** **IMPLEMENTED, SHIPPED, PARTIALLY GATED — 2026-07-28.** All eight
+fixes committed (`256f8213`), pushed, and deployed to dev; migration 0072
+applied (`jobs.failed_at` present); 91 new regression tests, full suite 11,435
+passing.
+
+Verified wired on dev: the orchestrator leader logs `Transient-infra
+re-dispatch sweeper started (tick=30s)` (the non-leader replica correctly stays
+silent) and the agent image carries `is_transient_infra_error`. Fixes 2, 6, 7
+and 8 ride ordinary traffic.
+
+**Live gate PARTIAL — two gates still owed**, and the obvious test method is a
+false negative: `pg_terminate_backend` kills a *session*, the server stays up,
+psycopg's pool reconnects transparently, and nothing reaches the app layer. The
+transient-retry chain and the VM reaper carve-out (Fix 1b, which needs a
+VM-backed job) are unproven live. Full detail, including what a valid gate
+requires, is in the incident doc's *Live gate* section — read it before
+attempting one.
 
 Two things changed during implementation, both recorded below:
 * ENOSPC (`No space left on device`) was added to the transient class — job
@@ -193,6 +207,15 @@ into a recovery or a visible warning, and none depends on Fix 1. Fix 4 is a
 standalone migration. Fixes 1 + 1b + 3 land together: 1 without 1b is a no-op
 because the reaper undoes it.
 
-Risk concentrates in Fix 1's classification predicate. It is an allow-list
-precisely so that an unmatched error keeps today's behaviour (terminal) rather
-than silently becoming retryable.
+Risk was expected to concentrate in Fix 1's classification predicate. It is an
+allow-list precisely so that an unmatched error keeps today's behaviour
+(terminal) rather than silently becoming retryable.
+
+**Revised after implementation: the riskier change is Fix 3.** Fix 1 is
+self-limiting in both directions — if the predicate never matches, behaviour is
+exactly what shipped before; if it matches wrongly, the attempt ceiling fails
+the job in hours with the infra cause named. Fix 3 is the only change that
+makes an agent **stop** where it previously kept running, so it is the only one
+that can introduce a NEW failure rather than fail to fix an old one. The
+`paused` status is the specific exposure. See the incident doc's *Watch item*
+section for the log signature and the one-line narrowing if it misbehaves.
