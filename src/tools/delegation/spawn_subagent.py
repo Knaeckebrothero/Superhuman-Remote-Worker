@@ -125,9 +125,16 @@ def _resolve_subagent_config(llm_cfg: Any) -> Optional[Any]:
     return llm_cfg.get_phase_config("tactical")
 
 
-def _format_result(role: str, task: str, result: str) -> str:
-    """Re-state the task/role so the parent can attribute N parallel results."""
-    head = "[subagent done]"
+def _format_result(role: str, task: str, result: str, *, failed: bool = False) -> str:
+    """Re-state the task/role so the parent can attribute N parallel results.
+
+    ``failed`` flips the header. A failure used to be announced as
+    "[subagent done]" followed by an error body, so the parent model read
+    "done" and had to notice the contradiction further down — exactly when it
+    is deciding whether to adapt or re-delegate. The audit row was already
+    marked FAIL; only the text the LLM sees was misleading.
+    """
+    head = "[subagent failed]" if failed else "[subagent done]"
     if role:
         head += f" — role: {role}"
     return f"{head}\ntask: {task.strip()[:200]}\n\n{result}"
@@ -165,6 +172,7 @@ def _make_light_spawn(context: ToolContext, light_config: Dict[str, Any]):
         )
 
         index = next(counter)
+        failed = False
         async with sem:
             env = None
             try:
@@ -196,6 +204,7 @@ def _make_light_spawn(context: ToolContext, light_config: Dict[str, Any]):
                 )
             except Exception as e:
                 logger.error("spawn_subagent (light) failed: %s", e, exc_info=True)
+                failed = True
                 result = f"Error: subagent failed — {e}"
             finally:
                 if env is not None:
@@ -204,7 +213,7 @@ def _make_light_spawn(context: ToolContext, light_config: Dict[str, Any]):
                     except Exception as e:
                         logger.warning("spawn_subagent teardown failed: %s", e)
 
-        return _format_result(role, task_description, result)
+        return _format_result(role, task_description, result, failed=failed)
 
     return _spawn
 
