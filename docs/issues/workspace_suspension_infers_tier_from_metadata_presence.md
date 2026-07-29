@@ -110,6 +110,49 @@ a VM-upgraded thread still reads correctly. Both `suspend_thread_workspace` and
 the status markers, the `ws_status` read, `source_type`, and the teardown/
 provision fork.
 
+### Follow-up: the fix was incomplete for UPGRADED threads (found + fixed 2026-07-29)
+
+`_thread_is_vm_tier` originally read:
+
+```python
+if backend:
+    return is_vm_backend(backend)
+# fall back to pod *state* — "so this still reads a VM-upgraded thread correctly"
+return bool(vm_ctx.get("status")) and not ws_ctx.get("status")
+```
+
+The comment was wrong. `if backend:` returns early for **any** non-empty string,
+so the fallback was unreachable in exactly the case it was written for. A thread
+UPGRADED to VM keeps its original declared backend forever — the upgrade
+endpoint provisions `metadata.vm` without rewriting
+`config_override.workspace.backend` — so a `virtual`- or `sandbox`-declared
+thread with a live VM read as **pod-tier** and suspend refused, which is the
+original bug displaced rather than removed. Since "Upgrade to VM" is the normal
+way users get a VM session, this covered most of them.
+
+Found by the persistent-rootdisk live gate (dev thread `b4ae24bb`, declared
+`virtual`, `vm.status=ready`, suspend returned `reason=snapshot_failed`). Fixed
+by checking the *materialized* VM first:
+
+```python
+if vm_ctx.get("status") and not ws_ctx.get("status"):
+    return True          # a live VM beats a stale declared backend
+if backend:
+    return is_vm_backend(backend)
+return False
+```
+
+`ws_ctx["status"]` still rules a container in, so a thread with a genuinely
+provisioned pod is unaffected even if a stale `vm` context is lying around.
+Covered by `TestUpgradedThreadReadsAsVmTier`.
+
+**Root cause not addressed here:** the upgrade endpoints do not materialize the
+new tier into `config_override.workspace.backend`. Anything else reading that
+field to decide a thread's tier is still wrong for upgraded threads — notably
+`session_provisioner.ensure_session_workspace`, which would happily provision a
+sandbox container for a `sandbox`-declared thread that now runs on a VM. Worth a
+separate pass.
+
 **A third instance of the same bug turned up during the fix.** `_resolve_ssh_port`
 also branched on `if ws_ctx:` — so a VM thread was handed the **pod** port 30022
 instead of 22, which would have broken the snapshot SSH the moment suspend

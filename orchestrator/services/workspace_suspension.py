@@ -42,15 +42,27 @@ def _thread_is_vm_tier(metadata: dict, ws_ctx: dict, vm_ctx: dict) -> bool:
     """
     from src.core.backends.factory import is_vm_backend
 
+    # A materialized VM beats the declared backend, because upgrade-to-VM
+    # provisions metadata.vm WITHOUT rewriting config_override.workspace.backend
+    # — an upgraded session still declares 'sandbox' or 'virtual' forever. Pod
+    # *state* (not mere presence) is what rules a container in: a git-only
+    # workspace_container has no 'status', and _setup_gitea writes one of those
+    # for every tier.
+    #
+    # Checked FIRST. It used to sit behind `if backend: return
+    # is_vm_backend(backend)`, which returned early for any non-empty string and
+    # so made this branch unreachable in exactly the case it was written for —
+    # every VM-upgraded thread read as pod-tier and refused to suspend
+    # (live-gate finding, thread b4ae24bb).
+    if vm_ctx.get("status") and not ws_ctx.get("status"):
+        return True
+
     backend = ((metadata.get("config_override") or {}).get("workspace") or {}).get(
         "backend"
     )
     if backend:
         return is_vm_backend(backend)
-    # Legacy rows predating tier materialization at create: fall back to pod
-    # *state* rather than mere presence — a git-only workspace_container has no
-    # 'status', so this still reads a VM-upgraded thread correctly.
-    return bool(vm_ctx.get("status")) and not ws_ctx.get("status")
+    return False
 
 
 def _resolve_ssh_port(ws_ctx: dict, vm_ctx: dict, is_vm: Optional[bool] = None) -> int:
