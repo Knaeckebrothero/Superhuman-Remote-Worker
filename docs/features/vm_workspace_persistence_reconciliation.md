@@ -280,5 +280,42 @@ across the delete — since it shows the *physical* disk was reattached rather t
 file being reproduced. A future probe wanting a file-level sentinel needs a config
 with the shell tool group enabled.
 
-**Step 4 (VM session suspend/resume) is NOT yet run** — it needs the orchestrator's
-copy of the flag, which is still off.
+**2026-07-29, step 4 — VM session suspend/resume: PASSED, with three findings**
+(orchestrator flag flipped after steps 1-3; session `a1240add`, an
+upgraded-from-virtual thread — the MCP create path cannot declare `vm`).
+
+**Suspend** — the first VM session suspend that has ever succeeded on this
+system: `{"suspended":true}` after `capture` declined (no tailnet route, as
+always) → *"suspending anyway; the persistent rootdisk carries the workspace"*
+→ controller `rootdisk KEPT`, Headscale node retained → VM gone, DV survives
+(`dbc2a102-…`, Succeeded), thread `suspended | rootdisk=kept`.
+
+**Resume** — opening the session in the cockpit fired `/prepare` → the new
+`ensure_session_workspace` trigger (*"has a kept VM rootdisk — restoring the
+VM"*) → controller `rootdisk reattach` (same DV UID, no clone) → daemon
+registered, VM `ready`, thread `active`. No S3 extract ran.
+
+Findings, beyond the two fixes the gate already forced (`24aed290` upgraded-
+thread tier read, `7dbd20d8` the missing restore trigger):
+
+1. **Restore's container-era tail mis-handled async VM creates** — it demanded
+   an `ssh_host` synchronously, logged *"no SSH host after provisioning for
+   restore"*, and stamped a transient `vm.status='failed'` (later overwritten
+   by the daemon's register). Not cosmetic: a declared-`vm` thread's attach
+   poll treats `failed` as fatal, so the race can kill a legitimate attach.
+   **Fixed**: a kept-disk VM restore returns at the create — no extract, no
+   SSH wait; readiness arrives via the daemon.
+2. **D3's cloud-init caveat is resolved by the live probe: the instance-id
+   changes per VMI.** The recreated VM re-ran `tailscale up` with the fresh
+   auth key and joined as a NEW node (`100.64.2.9` → `100.64.2.12`). The
+   design's fallback held — the daemon re-registers and refreshes
+   `context.vm`, so nothing breaks — but each suspend/resume cycle strands the
+   previous Headscale node. Mitigation is D3's own suggestion (pin the NoCloud
+   instance-id so per-instance modules don't re-run and on-disk tailscale
+   state rejoins as the kept node); whether KubeVirt's `cloudInitNoCloud`
+   exposes that needs checking. Filed, not built.
+3. **The agent attached as a lite (virtual) session** — the already-filed
+   agent-side tier blind spot observed live: the session is `active` with a
+   ready VM the agent is not using. Root fix (materialize the tier at upgrade
+   time) is written up in
+   `../issues/workspace_suspension_infers_tier_from_metadata_presence.md`.
