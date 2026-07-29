@@ -12753,33 +12753,41 @@ class PostgresDB:
         transaction.
         """
         async with self.acquire() as conn:
-            async with conn.transaction():
-                has_primary = await conn.fetchval(
-                    "SELECT EXISTS (SELECT 1 FROM contact_addresses WHERE contact_id=$1 AND channel=$2 AND is_primary)",
-                    contact_id,
-                    channel,
-                )
-                make_primary = is_primary or not has_primary
-                if is_primary and has_primary:
-                    await conn.execute(
-                        "UPDATE contact_addresses SET is_primary=false WHERE contact_id=$1 AND channel=$2 AND is_primary",
+            try:
+                async with conn.transaction():
+                    has_primary = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM contact_addresses WHERE contact_id=$1 AND channel=$2 AND is_primary)",
                         contact_id,
                         channel,
                     )
-                row = await conn.fetchrow(
-                    """INSERT INTO contact_addresses
-                           (contact_id, owner_user_id, channel, address, is_primary, opt_in_status)
-                       VALUES ($1, $2, $3, $4, $5, $6)
-                       ON CONFLICT (owner_user_id, channel, address) DO NOTHING
-                       RETURNING *""",
-                    contact_id,
-                    owner_user_id,
-                    channel,
-                    address,
-                    make_primary,
-                    CONTACT_OPT_IN_DEFAULT.get(channel, "pending"),
-                )
-                return dict(row) if row else None
+                    make_primary = is_primary or not has_primary
+                    if is_primary and has_primary:
+                        await conn.execute(
+                            "UPDATE contact_addresses SET is_primary=false WHERE contact_id=$1 AND channel=$2 AND is_primary",
+                            contact_id,
+                            channel,
+                        )
+                    row = await conn.fetchrow(
+                        """INSERT INTO contact_addresses
+                               (contact_id, owner_user_id, channel, address, is_primary, opt_in_status)
+                           VALUES ($1, $2, $3, $4, $5, $6)
+                           ON CONFLICT (owner_user_id, channel, address) DO NOTHING
+                           RETURNING *""",
+                        contact_id,
+                        owner_user_id,
+                        channel,
+                        address,
+                        make_primary,
+                        CONTACT_OPT_IN_DEFAULT.get(channel, "pending"),
+                    )
+                    return dict(row) if row else None
+            except asyncpg.UniqueViolationError:
+                # Two concurrent calls can both observe "no primary yet" for
+                # this (contact_id, channel) and race to insert one; the
+                # loser hits uq_contact_primary_per_channel here. No data
+                # corruption (the index held), just report it like any other
+                # duplicate — the transaction already rolled back.
+                return None
 
     async def update_contact_address(
         self,
@@ -12795,36 +12803,46 @@ class PostgresDB:
         None/unchanged) returns the row as-is.
         """
         async with self.acquire() as conn:
-            async with conn.transaction():
-                cur = await conn.fetchrow(
-                    "SELECT * FROM contact_addresses WHERE id=$1", address_id
-                )
-                if cur is None:
-                    return None
-                if is_primary is True and not cur["is_primary"]:
-                    await conn.execute(
-                        "UPDATE contact_addresses SET is_primary=false WHERE contact_id=$1 AND channel=$2 AND is_primary",
-                        cur["contact_id"],
-                        cur["channel"],
+            try:
+                async with conn.transaction():
+                    cur = await conn.fetchrow(
+                        "SELECT * FROM contact_addresses WHERE id=$1", address_id
                     )
-                sets, args = [], []
-                if address is not None and address != cur["address"]:
-                    args.append(address)
-                    sets.append(f"address=${len(args)}")
-                    args.append(CONTACT_OPT_IN_DEFAULT.get(cur["channel"], "pending"))
-                    sets.append(f"opt_in_status=${len(args)}")
-                    sets.append("last_inbound_at=NULL")
-                if is_primary is not None:
-                    args.append(is_primary)
-                    sets.append(f"is_primary=${len(args)}")
-                if not sets:
-                    return dict(cur)
-                args.append(address_id)
-                row = await conn.fetchrow(
-                    f"UPDATE contact_addresses SET {', '.join(sets)} WHERE id=${len(args)} RETURNING *",
-                    *args,
-                )
-                return dict(row) if row else None
+                    if cur is None:
+                        return None
+                    if is_primary is True and not cur["is_primary"]:
+                        await conn.execute(
+                            "UPDATE contact_addresses SET is_primary=false WHERE contact_id=$1 AND channel=$2 AND is_primary",
+                            cur["contact_id"],
+                            cur["channel"],
+                        )
+                    sets, args = [], []
+                    if address is not None and address != cur["address"]:
+                        args.append(address)
+                        sets.append(f"address=${len(args)}")
+                        args.append(
+                            CONTACT_OPT_IN_DEFAULT.get(cur["channel"], "pending")
+                        )
+                        sets.append(f"opt_in_status=${len(args)}")
+                        sets.append("last_inbound_at=NULL")
+                    if is_primary is not None:
+                        args.append(is_primary)
+                        sets.append(f"is_primary=${len(args)}")
+                    if not sets:
+                        return dict(cur)
+                    args.append(address_id)
+                    row = await conn.fetchrow(
+                        f"UPDATE contact_addresses SET {', '.join(sets)} WHERE id=${len(args)} RETURNING *",
+                        *args,
+                    )
+                    return dict(row) if row else None
+            except asyncpg.UniqueViolationError:
+                # Concurrent promotion race on uq_contact_primary_per_channel:
+                # another call promoted a different address on this same
+                # (contact_id, channel) between our read and our write. No
+                # data corruption (the index held); report it like any other
+                # duplicate — the transaction already rolled back.
+                return None
 
     async def delete_contact_address(self, address_id: str) -> bool:
         """Delete a contact address by ID. Returns True if deleted."""
