@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ...core.context import count_tokens_approximate
+from ...core.llm_retry import RetryPolicy, invoke_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,32 @@ _EMPTY_RESULT = "[subagent returned no content]"
 # Bound on the single forced-synthesis LLM call after a cap is hit, so a hung
 # provider can't keep a "finished" reader alive past its own deadline.
 _SYNTHESIS_TIMEOUT_SECONDS = 90
+
+# Readers had NO retry at all until this: any provider error propagated out of
+# the loop, was swallowed by spawn_subagent's blanket handler, and became the
+# string "Error: subagent failed". Because a fan-out's readers run concurrently
+# against the same provider, one transport blip took out the WHOLE batch — both
+# readers of critic job 37c418d2 died on a single 408 stream-disconnect. The
+# parent execute node's classify+retry never covered them: readers are a
+# graph-less in-process harness.
+#
+# Budget is one extra attempt, because every retry spends the reader's own
+# wall-clock deadline (`timeout_seconds`, 240 s by default) and overrunning it
+# means the parent's delegation batch watchdog discards the whole fan-out.
+#
+# `asyncio.TimeoutError` must NEVER be retried here: it is how the wall-clock
+# deadline itself surfaces, and the caller catches it to force a partial-result
+# synthesis. Retrying it would silently break the deadline contract. `rate_limit`
+# is excluded for the same budget reason as the auxiliary path — a reader cannot
+# afford to sit out a 90 s provider window inside a 240 s life.
+_READER_RETRY = RetryPolicy(
+    max_attempts=2,
+    base_delay=1.0,
+    max_delay=5.0,
+    retryable=frozenset({"transient", "auth_unavailable"}),
+    never_retry=(asyncio.TimeoutError,),
+    respect_retry_after=False,
+)
 
 
 async def _execute_tool_calls(
@@ -223,7 +250,17 @@ async def run_light_subagent(
             )
             return await _final_synthesis(llm, messages, last_text, reason="time limit")
         try:
-            ai = await asyncio.wait_for(llm.ainvoke(messages), timeout=remaining)
+            # `_remaining()` is re-read per attempt so a retry spends what is
+            # actually left, not the budget the first attempt started with. Once
+            # it goes non-positive, wait_for raises TimeoutError immediately and
+            # (being never_retry) escapes to the synthesis path below — so the
+            # deadline still wins even if a retry's backoff overshoots it.
+            ai = await invoke_with_retry(
+                lambda: asyncio.wait_for(llm.ainvoke(messages), timeout=_remaining()),
+                policy=_READER_RETRY,
+                description=f"light subagent{f' ({role})' if role else ''} turn "
+                f"{_iteration}/{max_iterations}",
+            )
         except asyncio.TimeoutError:
             logger.info(
                 "light subagent LLM turn exceeded wall-clock limit (%ss); "
