@@ -222,7 +222,7 @@ async def start_project_loop(
             dedup_key=f"started:{str(loop['id'])[:8]}",
             payload={
                 "loop_id": str(loop["id"]),
-                "note": (
+                "summary": (
                     "officer-scheduled loop started — nothing was spawned; "
                     "dispatch from the backlog when ready"
                 ),
@@ -382,7 +382,7 @@ async def convert_project_loop_scheduling(
         dedup_key=f"converted:{str(loop['id'])[:8]}",
         payload={
             "loop_id": str(loop["id"]),
-            "note": (
+            "summary": (
                 "loop converted to officer scheduling — no further "
                 "auto-advance; dispatch is yours from the next concluded turn"
             ),
