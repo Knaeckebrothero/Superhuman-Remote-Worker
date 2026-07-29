@@ -11,8 +11,22 @@ tags:
 # Issue — VM workspace state can never be captured from the orchestrator: suspend fails loudly, reap fails silently and logs success
 
 **Status:** Found 2026-07-28 during the live gate of `6d66f7c4`; scope widened
-2026-07-29 after review pushback. **Confirmed live and at code level, not fixed.
-Decision required** — see Options.
+2026-07-29 after review pushback. **Decision made and implemented 2026-07-29,
+flag-gated OFF, live gate owed.**
+
+The decision was *not* to fix the capture. It was to make the capture
+non-load-bearing: the VM's rootdisk now survives the teardown
+(`docs/features/vm_persistent_rootdisk.md`), so suspend/resume and crash
+recovery no longer depend on an SSH the orchestrator cannot make. Consequence A
+(suspend refused) is fixed; Consequence B (reap discards state) is fixed for
+every path that expects to come back, and remains true by design for terminal
+paths — where discarding is correct, because the job is over.
+
+Still open: capture itself, for the cases only a snapshot can serve (terminal
+archive, IDE on a job whose disk was purged). That is scoped to
+`vm_snapshots_and_ide.md`'s own delegated-capture design and is no longer on
+the critical path for data loss. Sequencing:
+`docs/features/vm_workspace_persistence_reconciliation.md`.
 
 **One line:** Capturing a workspace snapshot means SSHing to it from the
 **orchestrator**, but a VM workspace only has a tailnet address
@@ -97,6 +111,15 @@ That doc's claim that restore "runs only for sessions/threads" should be read as
 
 ## Options
 
+> **Superseded 2026-07-29.** The list below is kept for the reasoning, not as
+> a decision to make. None of options 2-4 was chosen: they all try to make the
+> capture reachable, and the reconciliation found a cheaper answer — stop
+> needing it. Option 2 (VM-side push) is explicitly retracted; it needs a
+> golden-image change and carries version skew with running VMs, while the
+> controller-side path `vm_snapshots_and_ide.md` already specifies needs
+> neither.
+
+
 1. ~~**Reap without snapshotting for VM tier.**~~ **REJECTED.** Proposed in the
    first draft of this doc on the grounds that it "matches what explicit end
    already does". Review pushback was correct: reap is *designed* to snapshot
@@ -152,12 +175,16 @@ can see, since that is currently the only record.
 
 ## Acceptance criteria
 
-- Reap logs the truth about whether a snapshot was captured.
-- A VM session's workspace snapshot exists in S3 after an idle suspend or an
-  explicit end, with `source_type="vm"`, **or** it is documented as unsupported
-  and the user is told at session-create time rather than discovering it later.
-- Whichever option is chosen, `snapshot_restore_dead_for_jobs.md` is updated in
-  step — its "sessions work" claim is only true for container sessions.
+- ~~Reap logs the truth about whether a snapshot was captured.~~ DONE
+  (`ed26ebfa`).
+- ~~A VM session's workspace snapshot exists in S3 after an idle suspend~~ —
+  **replaced**: a VM session's *workspace* survives an idle suspend and comes
+  back on resume, via the reattached rootdisk rather than an S3 snapshot. Live
+  gate: suspend a VM session, confirm the VM is deleted and the rootdisk DV is
+  not, resume, confirm the controller logs `rootdisk reattach` and a sentinel
+  file written before the suspend is still there.
+- `snapshot_restore_dead_for_jobs.md` still needs updating in step — its
+  "sessions work" claim is only true for container sessions.
 
 ## Related
 

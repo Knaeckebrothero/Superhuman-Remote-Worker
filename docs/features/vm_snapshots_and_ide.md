@@ -9,6 +9,37 @@ tags:
 
 # VM Snapshots & On-Demand IDE Sessions
 
+> **Status note (2026-07-29) — Phase 1's capture was built against the wrong
+> half of this document, and is dead for VM targets in every deployed
+> topology.**
+>
+> This design delegates capture to the VM Controller over NATS
+> (`vm.snapshot.capture`, "tar + upload from agent node" — see the architecture
+> table and the NATS subject list), and scopes orchestrator-side SSH capture to
+> *"direct K8s mode (same-cluster without NATS)"*. The Phase 1 checklist,
+> however, says *"Add SSH tar capture to VM teardown flow in
+> `vm_provisioner.py`"* — the orchestrator-side path. **The checklist is what
+> got built.** `vm.snapshot.capture` exists nowhere in the codebase.
+>
+> Dev and prod are both cross-cluster NATS deployments, so the one topology the
+> orchestrator-side path was scoped for is not the one it runs in: the
+> orchestrator has no tailnet route, `capture_vm_snapshot` declines every VM,
+> and until `ed26ebfa` it logged success anyway. See
+> `../issues/vm_workspace_snapshot_unreachable_from_orchestrator.md`.
+>
+> **Re-scoped.** Crash, suspend and resume for VMs are now owned by
+> `vm_persistent_rootdisk.md` — the disk survives the teardown, so no capture
+> is involved. What remains uniquely this feature's is what a disk cannot do:
+> terminal archive, IDE on a job whose rootdisk was purged, and portability to
+> a different VM. Building `vm.snapshot.capture` as the architecture here
+> already specifies is the way to deliver those; it is no longer on the
+> critical path for data loss. Sequencing:
+> `vm_workspace_persistence_reconciliation.md`.
+>
+> Container-backed (pod) snapshots are unaffected — the orchestrator reaches
+> pods directly and that path works.
+
+
 Design document for persisting agent environments to S3-compatible object storage and restoring them on demand — enabling Web IDE access for any job regardless of current VM state.
 
 ## Motivation

@@ -15,8 +15,16 @@ found that VM workspace snapshots are never captured. Two existing designs both
 claim part of this ground and **each assumes the other's part already works**.
 Neither does. This doc reconciles them and recommends an order.
 
-**Decision needed:** which mechanism owns VM workspace survival. Everything else
-(the delegated-capture slice, the session suspend fix) follows from that answer.
+**Decision made 2026-07-29: the persistent rootdisk owns VM workspace survival,
+sessions included.** The open capacity question below was answered — 2 TB SSD,
+disks are ephemeral, and VM concurrency runs out of RAM long before disk — so
+nothing forces sessions back onto delegated capture. Recommendation 1 is
+implemented (`vm_persistent_rootdisk.md` Phases 0-2 + the session extension,
+flag-gated OFF, live gate owed). Recommendation 2 remains unbuilt and is now
+correctly off the critical path.
+
+Recommendation 3's networking probe is **still owed**, but it no longer blocks
+anything: it scopes the delegated-capture slice, which is no longer urgent.
 
 ## The two designs
 
@@ -125,11 +133,40 @@ different size of job. One `kubectl exec` from the controller pod settles it.
 - `vm_workspace_snapshot_unreachable_from_orchestrator.md` — keeps the
   diagnosis; its Options list is superseded by this doc's ordering.
 
-## Open question for the decision
+## Open question for the decision — ANSWERED
 
 Is the 20 Gi-per-kept-disk cost acceptable for *sessions* on the current VM
-cluster (single SATA SSD)? Jobs are bounded by loop concurrency; sessions are
-bounded by user behaviour, and an ended-but-unreaped session would hold a disk
-until GC. The rootdisk doc's D4 three-layer GC and capacity quota were sized for
-jobs. If sessions make that unaffordable, the fallback for sessions is delegated
-capture after all — which flips the ordering above.
+cluster? **Yes.** 2 TB SSD, the volumes are ephemeral anyway, and concurrent VMs
+run out of compute/RAM well before disk. So the ordering above stands, and two
+things the design proposed for capacity pressure were deliberately not built:
+
+- **The `ResourceQuota` capacity guard (D4).** Not the binding constraint.
+- **The controller's orphan backstop is shipped OFF** rather than the proposed
+  72h-on. It has no DB, so it cannot tell a leaked disk from the workspace of a
+  session suspended over a long weekend — an on-by-default destructive sweep
+  buys little here and can eat a live session. The knob exists for a deployment
+  where the trade differs.
+
+The kept-disk sweep that *did* ship covers **jobs only**, for the same class of
+reason: a thread's terminal status is `ended`, which is also exactly the state a
+suspended-but-resumable session sits in.
+
+## Live gate owed
+
+Everything is flag-gated OFF (`vmController.persistentRootdisk.enabled`), so
+nothing changes until it is flipped. Order matters: **controller first, then
+orchestrator** — the orchestrator's copy of the flag decides whether VM session
+suspend may proceed without a snapshot, and turning that on against a controller
+that still cascade-deletes disks would suspend sessions into nothing. The
+reverse order is harmless.
+
+1. Flip the controller flag; confirm a fresh VM job creates a standalone
+   `agent-vm-<id>-rootdisk` DataVolume and the VM manifest has no
+   `dataVolumeTemplates`.
+2. Write a sentinel file, delete the VM object (mimicking the crash arm) →
+   the job recovers, the controller logs `rootdisk reattach`, no clone runs,
+   the sentinel is still there, and recovery is measurably faster than a fresh
+   start.
+3. Cancel it → VM, DV and PVC all gone; the golden is untouched.
+4. Flip the orchestrator flag; suspend a VM session and resume it — the VM is
+   deleted, the DV is not, and the workspace comes back with no S3 extract.
