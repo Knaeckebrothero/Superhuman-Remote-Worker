@@ -1740,3 +1740,82 @@ class TestListVms:
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             assert await provisioner_disabled.list_vms() is None
+
+
+# =============================================================================
+# release_vm / release_thread_vm — snapshot outcome must be reported truthfully
+# docs/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md
+# =============================================================================
+
+
+def _snapshot_service(*, captured: bool):
+    """Snapshot service whose capture SUCCEEDS or is SKIPPED.
+
+    capture_vm_snapshot returns False for an unroutable tailnet target — it does
+    not raise — so a try/except around it cannot see the failure.
+    """
+    svc = MagicMock()
+    svc.is_available = True
+    svc.capture_vm_snapshot = AsyncMock(return_value=captured)
+    return svc
+
+
+class TestReleaseReportsSnapshotOutcome:
+    """A VM workspace lives on the tailnet, which the orchestrator cannot reach,
+    so capture_vm_snapshot returns False for every VM. Release deletes the VM
+    regardless (by design, non-fatal) — but it must not claim it captured a
+    snapshot it did not, or the logs actively mislead whoever investigates the
+    missing workspace state."""
+
+    @pytest.mark.asyncio
+    async def test_thread_release_does_not_claim_capture_when_skipped(
+        self, provisioner_with_nats, mock_nats_bridge, caplog
+    ):
+        provisioner_with_nats._snapshot_service = _snapshot_service(captured=False)
+        provisioner_with_nats._db.get_thread = AsyncMock(
+            return_value={
+                "metadata": {"vm": {"ssh_host": "100.64.1.6", "ssh_port": 22}}
+            }
+        )
+
+        with caplog.at_level("INFO"):
+            ok = await provisioner_with_nats.release_thread_vm("tid-1")
+
+        assert ok is True  # deletion still proceeds — non-fatal by design
+        text = caplog.text
+        assert "snapshot captured" not in text.lower(), (
+            "must not report a capture that returned False"
+        )
+        assert "tid-1" in text
+
+    @pytest.mark.asyncio
+    async def test_thread_release_still_reports_a_real_capture(
+        self, provisioner_with_nats, mock_nats_bridge, caplog
+    ):
+        provisioner_with_nats._snapshot_service = _snapshot_service(captured=True)
+        provisioner_with_nats._db.get_thread = AsyncMock(
+            return_value={"metadata": {"vm": {"ssh_host": "10.0.0.9", "ssh_port": 22}}}
+        )
+
+        with caplog.at_level("INFO"):
+            await provisioner_with_nats.release_thread_vm("tid-2")
+
+        assert "snapshot captured" in caplog.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_job_release_does_not_claim_capture_when_skipped(
+        self, provisioner_with_nats, mock_nats_bridge, caplog
+    ):
+        """release_vm carries the identical pattern for jobs."""
+        provisioner_with_nats._snapshot_service = _snapshot_service(captured=False)
+        provisioner_with_nats._db.get_job = AsyncMock(
+            return_value={"context": {"vm": {"ssh_host": "100.64.1.9", "ssh_port": 22}}}
+        )
+
+        with caplog.at_level("INFO"):
+            ok = await provisioner_with_nats.release_vm(
+                "job-1", ssh_host="100.64.1.9", ssh_port=22
+            )
+
+        assert ok is True
+        assert "snapshot captured" not in caplog.text.lower()
