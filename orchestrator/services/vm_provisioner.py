@@ -372,22 +372,49 @@ class VMProvisioner:
 
         return False
 
-    async def delete_vm(self, job_id: str) -> bool:
+    async def delete_vm(self, job_id: str, purge_disk: bool = True) -> bool:
         """Delete a VM for a job.
+
+        Args:
+            job_id: Job UUID.
+            purge_disk: False when a recreate is expected (crash recovery, the
+                reconciler giving up on a dirty VM) — the controller keeps the
+                persistent rootdisk and the Headscale node so the next create
+                reattaches the same files. Default True: terminal, everything
+                goes. Only honoured by the VM controller (NATS/HTTP); direct
+                K8s mode has no standalone rootdisk to keep.
 
         Returns:
             True if the request was accepted, False otherwise.
         """
         if nats_bridge.is_available:
-            return await nats_bridge.request_vm_delete(job_id)
+            return await nats_bridge.request_vm_delete(job_id, purge_disk=purge_disk)
 
         if self._http_available:
-            return await self._delete_http(job_id, entity_type="job")
+            return await self._delete_http(
+                job_id, entity_type="job", purge_disk=purge_disk
+            )
 
         if self._k8s_available:
+            self._warn_direct_mode_purges(job_id, purge_disk)
             return await self._delete_direct(job_id)
 
         return False
+
+    @staticmethod
+    def _warn_direct_mode_purges(entity_id: str, purge_disk: bool) -> None:
+        """Direct K8s mode renders the VM template as-is, so the rootdisk is a
+        dataVolumeTemplate the VM owns and cascade-deletes. A caller asking to
+        keep it will not get what it asked for — say so rather than silently
+        destroying the disk it expected to reattach.
+        """
+        if not purge_disk:
+            logger.warning(
+                "VM delete for %s requested purge_disk=False, but direct K8s mode "
+                "has no persistent rootdisk — the templated disk cascade-deletes "
+                "with the VM and its files are lost",
+                entity_id,
+            )
 
     async def release_vm(
         self,
@@ -810,13 +837,18 @@ class VMProvisioner:
             )
             return False
 
-    async def _delete_http(self, job_id: str, entity_type: str = "job") -> bool:
+    async def _delete_http(
+        self, job_id: str, entity_type: str = "job", purge_disk: bool = True
+    ) -> bool:
         """Delete a VM by sending DELETE to the co-located VM controller."""
         if self._http_client is None:
             return False
 
+        # Only appended when it changes the meaning, so a purge request stays
+        # byte-identical against a controller that predates the field.
+        path = f"/vms/{job_id}" if purge_disk else f"/vms/{job_id}?purge_disk=false"
         try:
-            resp = await self._http_client.delete(f"/vms/{job_id}")
+            resp = await self._http_client.delete(path)
             # 404 from the controller means already gone — treat as success.
             if resp.status_code == 404:
                 await self._set_context(entity_type, job_id, {"status": "deleted"})
@@ -1020,19 +1052,27 @@ class VMProvisioner:
 
         return False
 
-    async def delete_thread_vm(self, thread_id: str) -> bool:
+    async def delete_thread_vm(self, thread_id: str, purge_disk: bool = True) -> bool:
         """Delete a VM for a persistent thread.
+
+        Args:
+            thread_id: Thread UUID.
+            purge_disk: False when the session expects to come back (suspend) —
+                see ``delete_vm``.
 
         Returns:
             True if the request was accepted, False otherwise.
         """
         if nats_bridge.is_available:
-            return await nats_bridge.request_vm_delete(thread_id)
+            return await nats_bridge.request_vm_delete(thread_id, purge_disk=purge_disk)
 
         if self._http_available:
-            return await self._delete_http(thread_id, entity_type="thread")
+            return await self._delete_http(
+                thread_id, entity_type="thread", purge_disk=purge_disk
+            )
 
         if self._k8s_available:
+            self._warn_direct_mode_purges(thread_id, purge_disk)
             return await self._delete_thread_vm_direct(thread_id)
 
         return False

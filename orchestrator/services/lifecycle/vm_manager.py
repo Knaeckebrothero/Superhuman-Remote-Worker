@@ -378,11 +378,29 @@ class VMInstanceManager:
     async def give_up(self, inst: Instance, grace_s: int) -> None:
         """Escape hatch: dirty + unreachable + attempts exhausted.
 
-        VMs have no volume-reattach (delete is destructive; disks live behind
-        the external VM controller) — so the terminal action is force-delete.
-        Volume-reattach for VMs is a separate, controller-side design.
+        Delete the VM but KEEP its rootdisk. This fires precisely when the VM
+        holds state we could not snapshot, so the disk is the only surviving
+        copy — the next create reattaches it by name and the files come back.
+        (Before persistent rootdisks this was a force-delete that destroyed
+        them; see docs/features/vm_persistent_rootdisk.md D2.)
+
+        Requires the controller's ``VM_PERSISTENT_ROOTDISK``: without it the
+        disk is still a dataVolumeTemplate the VM owns and cascade-deletes, so
+        this degrades to the old behaviour rather than breaking.
         """
-        await self.delete(inst, grace_s)
+        await self.delete(inst, grace_s, purge_disk=False)
+        bound = inst.bound_to
+        if not bound:
+            return
+        # Marks the disk for the kept-disk GC sweep, and makes it visible in
+        # the entity's context rather than only in controller logs.
+        try:
+            if inst.metadata.get("scope") == "thread":
+                await self._db.merge_thread_vm_context(bound, {"rootdisk": "kept"})
+            else:
+                await self._db.merge_vm_context(bound, {"rootdisk": "kept"})
+        except Exception:
+            logger.exception("Failed to record kept rootdisk for VM %s", inst.id)
 
     async def snapshot(self, inst: Instance) -> str | None:
         if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
@@ -442,9 +460,12 @@ class VMInstanceManager:
         return None
 
     async def drain(self, inst: Instance, grace_s: int) -> None:
-        await self.delete(inst, grace_s)
+        # Drift drain wants a fresh image, so the old disk is not worth keeping.
+        await self.delete(inst, grace_s, purge_disk=True)
 
-    async def delete(self, inst: Instance, grace_s: int) -> None:
+    async def delete(
+        self, inst: Instance, grace_s: int, purge_disk: bool = True
+    ) -> None:
         if not self._provisioner_available():
             return
         bound = inst.bound_to
@@ -453,9 +474,9 @@ class VMInstanceManager:
             return
         try:
             if inst.metadata.get("scope") == "thread":
-                await self._provisioner.delete_thread_vm(bound)
+                await self._provisioner.delete_thread_vm(bound, purge_disk=purge_disk)
             else:
-                await self._provisioner.delete_vm(bound)
+                await self._provisioner.delete_vm(bound, purge_disk=purge_disk)
         except Exception:
             logger.exception("Failed to delete VM %s", inst.id)
 

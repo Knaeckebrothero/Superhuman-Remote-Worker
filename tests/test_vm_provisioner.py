@@ -908,7 +908,9 @@ class TestDeleteVm:
         """delete_vm() delegates to nats_bridge when NATS is available."""
         result = await provisioner_with_nats.delete_vm(job_id="job-del-001")
         assert result is True
-        mock_nats_bridge.request_vm_delete.assert_awaited_once_with("job-del-001")
+        mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
+            "job-del-001", purge_disk=True
+        )
 
     @pytest.mark.asyncio
     async def test_delete_vm_direct_backend(
@@ -1819,3 +1821,92 @@ class TestReleaseReportsSnapshotOutcome:
 
         assert ok is True
         assert "snapshot captured" not in caplog.text.lower()
+
+
+class TestPurgeDiskIntent:
+    """``purge_disk`` tells the controller whether a delete is terminal.
+
+    Default True everywhere, so a call site that says nothing keeps today's
+    semantics; False means "a recreate is coming, keep the rootdisk".
+    docs/features/vm_persistent_rootdisk.md D2.
+    """
+
+    @pytest.mark.asyncio
+    async def test_job_delete_defaults_to_purge(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
+        await provisioner_with_nats.delete_vm("job-1")
+        mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
+            "job-1", purge_disk=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_job_delete_can_keep_the_disk(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
+        await provisioner_with_nats.delete_vm("job-1", purge_disk=False)
+        mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
+            "job-1", purge_disk=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_delete_can_keep_the_disk(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
+        await provisioner_with_nats.delete_thread_vm("tid-1", purge_disk=False)
+        mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
+            "tid-1", purge_disk=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_release_purges(self, provisioner_with_nats, mock_nats_bridge):
+        """Release is terminal for the entity — the disk goes with it."""
+        provisioner_with_nats._snapshot_service = None
+        await provisioner_with_nats.release_vm("job-1")
+        mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
+            "job-1", purge_disk=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_release_purges(self, provisioner_with_nats, mock_nats_bridge):
+        provisioner_with_nats._snapshot_service = None
+        await provisioner_with_nats.release_thread_vm("tid-1")
+        mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
+            "tid-1", purge_disk=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_http_delete_sends_purge_disk_query_param(
+        self, provisioner_with_nats
+    ):
+        client = AsyncMock()
+        client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        provisioner_with_nats._http_client = client
+
+        await provisioner_with_nats._delete_http("job-1", purge_disk=False)
+
+        assert client.delete.await_args[0][0] == "/vms/job-1?purge_disk=false"
+
+    @pytest.mark.asyncio
+    async def test_http_delete_omits_the_param_when_purging(
+        self, provisioner_with_nats
+    ):
+        """Keeps the request byte-identical against an un-upgraded controller."""
+        client = AsyncMock()
+        client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        provisioner_with_nats._http_client = client
+
+        await provisioner_with_nats._delete_http("job-1")
+
+        assert client.delete.await_args[0][0] == "/vms/job-1"
+
+    @pytest.mark.asyncio
+    async def test_direct_mode_warns_that_keep_is_not_honoured(
+        self, provisioner_with_k8s, caplog
+    ):
+        """Direct K8s mode has no controller, so the disk is still templated
+        and cascade-deletes. Say so rather than silently purging."""
+        with caplog.at_level("WARNING"):
+            await provisioner_with_k8s.delete_vm("job-1", purge_disk=False)
+
+        assert "purge_disk=False" in caplog.text

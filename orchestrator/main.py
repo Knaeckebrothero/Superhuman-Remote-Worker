@@ -14586,13 +14586,21 @@ async def complete_job(
                         "requested": True,
                         "recovering": True,
                         "previous_error": "workspace_unavailable",
+                        # Survives this wholesale reset on purpose: the disk
+                        # outlives the VM and the kept-disk GC sweep looks for
+                        # exactly this key.
+                        "rootdisk": "kept",
                     }
                 },
             )
 
-            # Delete the old (crashed) VM
+            # Delete the old (crashed) VM, but keep its rootdisk — the whole
+            # point of the recovery is that the re-dispatched VM reattaches the
+            # same disk and finds its files, instead of booting a pristine
+            # golden clone with a checkpoint that believes it is mid-phase-N.
+            # docs/features/vm_persistent_rootdisk.md D2.
             if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
-                await vm_provisioner.delete_vm(job_id)
+                await vm_provisioner.delete_vm(job_id, purge_disk=False)
             # Put job back in queue as paused (dispatchable, clears assigned_agent_id)
             await postgres_db.pause_job(job_id)
             _trigger_dispatch()
