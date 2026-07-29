@@ -53,6 +53,8 @@ export type CanvasRenderer =
   | 'image'
   | 'office';
 
+export type CanvasContentOrigin = 'workspace' | 'snapshot';
+
 export type CanvasStatus =
   | 'ready'
   | 'starting'
@@ -149,6 +151,19 @@ export interface CanvasState {
   readonly status: CanvasStatus;
   readonly capabilities: CanvasCapabilities;
   readonly updated_at: string;
+  /**
+   * Where the bytes behind `content_url` come from.
+   *
+   * `'snapshot'` means the workspace could not be reached and the server is
+   * serving the copy it kept when these bytes were published — the Canvas is
+   * read-only and the content is as old as `content_captured_at`.
+   *
+   * ABSENT MEANS `'workspace'`. Older orchestrators do not send the field at
+   * all, so absence must never be treated as unknown-and-blocked.
+   */
+  readonly content_origin?: CanvasContentOrigin | null;
+  /** When snapshot-backed bytes were captured. ISO 8601. */
+  readonly content_captured_at?: string | null;
 }
 
 export type CanvasLoadStatus = 'idle' | 'loading' | 'ready' | 'error';

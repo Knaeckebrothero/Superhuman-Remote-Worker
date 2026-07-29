@@ -173,6 +173,38 @@ export function resolveCanvasContentUrl(
 }
 
 /** The backend normally resolves `auto`; an unknown/new source fails closed. */
+/**
+ * What the server says this Canvas IS, for labelling only.
+ *
+ * Distinct from {@link selectCanvasRenderer}, which answers "what can this
+ * Cockpit mount right now" and therefore degrades to `'unsupported'` whenever
+ * bytes or a runtime capability are missing. Using that answer as a label
+ * produced the reported bug: a sleeping workspace rendered a chip reading
+ * "File · Unsupported source" over a perfectly valid file path, which reads as
+ * a corrupt document rather than a workspace that is simply not running.
+ *
+ * This never consults capabilities or loaded content, so the label stays true
+ * while the stage is empty.
+ */
+export function declaredCanvasRenderer(state: CanvasState | null): CanvasTrustedRenderer {
+  const source = state?.source;
+  if (!source) return 'unsupported';
+  if (source.type === 'browser') return 'browser';
+  if (source.type === 'workspace_app') return 'app';
+  if (source.type !== 'workspace_file') return 'unsupported';
+  switch (state?.renderer) {
+    case 'markdown':
+    case 'text':
+    case 'html':
+    case 'html-interactive':
+    case 'image':
+    case 'office':
+      return state.renderer;
+    default:
+      return 'unsupported';
+  }
+}
+
 export function selectCanvasRenderer(state: CanvasState | null): CanvasTrustedRenderer {
   if (
     state?.source?.type === 'browser' &&

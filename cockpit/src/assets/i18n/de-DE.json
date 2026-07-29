@@ -283,6 +283,11 @@
           "body": "Ihre Änderungen bleiben in diesem Browser erhalten. Prüfen Sie die Verbindung und versuchen Sie es erneut."
         }
       }
+    },
+    "offline": {
+      "badge": "Workspace schläft",
+      "body": "Der Workspace schläft — angezeigt wird die am {{date}} präsentierte Version. Sobald die Sitzung fortgesetzt wird, ist sie wieder bearbeitbar.",
+      "bodyUndated": "Der Workspace schläft — angezeigt wird die zuletzt präsentierte Version. Sobald die Sitzung fortgesetzt wird, ist sie wieder bearbeitbar."
     }
   },
   "common": {

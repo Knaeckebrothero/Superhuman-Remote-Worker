@@ -443,3 +443,112 @@ describe('Canvas pane trusted chrome', () => {
     }
   });
 });
+
+describe('Canvas pane durable presentation', () => {
+  function paneWith(overrides: Partial<CanvasState>) {
+    const state = signal<CanvasState | null>(canvasState(4, 'markdown', overrides));
+    const canvas = {
+      threadId: signal<string | null>('thread-1'),
+      state,
+      stateEtag: signal<string | null>('"canvas:4:snap"'),
+      loadStatus: signal<'idle' | 'loading' | 'ready' | 'error'>('ready'),
+      browserCapability: signal(null),
+      browserCapabilityStatus: signal<'idle'>('idle'),
+      browserOpenStatus: signal<'idle'>('idle'),
+      browserOpenError: signal<string | null>(null),
+      lastSuccessfulSyncAt: signal<number | null>(null),
+      reconcile: vi.fn(),
+      openBrowser: vi.fn(),
+      retryOpenBrowser: vi.fn(),
+    };
+    const content = {
+      // The stage has not mounted bytes, which is exactly the situation that
+      // used to mislabel the source as unsupported.
+      displayRenderer: signal('unsupported'),
+      displayState: signal<CanvasState | null>(null),
+      displaySourceKey: signal<string | null>(null),
+      textContent: signal(''),
+      contentEtag: signal<string | null>(null),
+      imageUrl: signal<string | null>(null),
+      contentStatus: signal('idle'),
+      contentErrorCode: signal<string | null>(null),
+      syncPresentation: vi.fn(),
+    };
+    const editor = {
+      hasSession: signal(false),
+      dirty: signal(false),
+      conflict: signal(null),
+      sessionState: signal<CanvasState | null>(null),
+      sessionRenderer: signal('unsupported'),
+      buffer: signal(''),
+      editMode: signal(false),
+      sync: vi.fn(),
+    };
+    TestBed.configureTestingModule({
+      providers: [
+        {provide: CanvasService, useValue: canvas},
+        {provide: CanvasContentController, useValue: content},
+        {provide: CanvasEditController, useValue: editor},
+        {provide: CanvasViewerController, useValue: {syncPresentation: vi.fn()}},
+        {provide: CanvasOfficeController, useValue: {
+          syncPresentation: vi.fn(),
+          session: signal(null),
+          officeOrigin: signal<string | null>(null),
+          officeStatus: signal<'idle'>('idle'),
+          officeErrorCode: signal<string | null>(null),
+          modified: signal(false),
+          conflictCode: signal<string | null>(null),
+          refreshToken: vi.fn(),
+          reloadSession: vi.fn(),
+          markDocumentLoaded: vi.fn(),
+          markModified: vi.fn(),
+          markConflict: vi.fn(),
+        }},
+        {provide: CanvasBrowserController, useValue: {
+          syncPresentation: vi.fn(),
+          connectionStatus: signal<'idle'>('idle'),
+          errorCode: signal<string | null>(null),
+        }},
+        {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+        {provide: Router, useValue: {}},
+      ],
+    });
+    return TestBed.runInInjectionContext(() => new CanvasPaneComponent());
+  }
+
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('labels a snapshot-backed file by its real renderer, never "unsupported"', () => {
+    const pane = paneWith({
+      content_origin: 'snapshot',
+      content_captured_at: '2026-07-27T09:30:00Z',
+    });
+    TestBed.flushEffects();
+
+    expect(pane.snapshotBacked()).toBe(true);
+    expect(pane.snapshotCapturedAt()).toBe('2026-07-27T09:30:00Z');
+    // The reported regression: chips read "File" + "Unsupported source" over a
+    // valid path whenever the workspace was asleep.
+    expect(pane.rendererLabel()).toBe('canvas.renderer.markdown');
+    expect(pane.rendererLabel()).not.toBe('canvas.renderer.unsupported');
+    expect(pane.sourceKindLabel()).toBe('canvas.sourceKind.file');
+  });
+
+  it('treats an absent content_origin as workspace-backed', () => {
+    const pane = paneWith({});
+    TestBed.flushEffects();
+
+    // Older orchestrators omit the field entirely; absence must never be read
+    // as unknown-and-blocked.
+    expect(pane.snapshotBacked()).toBe(false);
+    expect(pane.snapshotCapturedAt()).toBeNull();
+    expect(pane.rendererLabel()).toBe('canvas.renderer.markdown');
+  });
+
+  it('still labels a genuinely unknown renderer as unsupported', () => {
+    const pane = paneWith({renderer: 'mystery' as CanvasState['renderer']});
+    TestBed.flushEffects();
+
+    expect(pane.rendererLabel()).toBe('canvas.renderer.unsupported');
+  });
+});

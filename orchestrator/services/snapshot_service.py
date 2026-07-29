@@ -72,10 +72,20 @@ class SnapshotService:
 
         endpoint = os.environ.get("S3_ENDPOINT", "")
         if not endpoint or not BOTO3_AVAILABLE:
-            if not BOTO3_AVAILABLE:
-                logger.info("Snapshot service: boto3 not installed — disabled")
-            else:
-                logger.info("Snapshot service: S3_ENDPOINT not set — disabled")
+            # Warning, not info: everything downstream of this degrades
+            # silently. Name the casualties so an operator reading startup logs
+            # can tell this apart from a healthy deployment.
+            reason = (
+                "boto3 not installed" if not BOTO3_AVAILABLE else "S3_ENDPOINT not set"
+            )
+            logger.warning(
+                "Snapshot service disabled (%s) — workspace snapshots will not "
+                "capture, the virtual workspace tier is unwired, and Canvas "
+                "presentations will NOT survive their workspace. Set "
+                "s3.endpoint, or leave garage.enabled unset to run the bundled "
+                "object store.",
+                reason,
+            )
             return
 
         access_key = os.environ.get("SNAPSHOT_S3_ACCESS_KEY_ID", "")

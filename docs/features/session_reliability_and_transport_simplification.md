@@ -357,6 +357,19 @@ on any other failure **stop flushing, set the error banner, keep items
 queued** — retrigger on the next `markSessionReady` or `sendMessage`.
 `_postInput` returns `{ok, status}` (keep the `error.set` in its catch).
 
+> **Correction (2026-07-28).** "retrigger on the next `markSessionReady`"
+> was not true in practice: `markSessionReady()` opened with
+> `if (this.sessionReady()) return;`, so it only ever reached the flush on
+> a false→true edge. A send that failed *after* the session was already up
+> could therefore never be retriggered by any readiness signal, and the
+> bubble showed its queued clock forever. Observed live on the dev cluster
+> (thread `b1758f38`): the transport dropped a `POST /input` — status 0,
+> nothing reached the orchestrator — and the message stayed queued across a
+> full session teardown, resume, fresh agent, and `/connection` 200, still
+> never POSTed. The readiness set now stays inside the edge guard while
+> `_flushOutbox()` runs unconditionally. See
+> §"Stalled queue" below.
+
 Two review must-fixes shaped this:
 - *Cross-thread head-swap*: the flush loop's `await` can outlast the
   queue's identity (up to 30s forward timeout). Mutate by `localId` and
@@ -383,6 +396,46 @@ isUploadingAttachments()`; **remove** the second-send block from `canSend`
 bubbles get a muted style + clock glyph (id ∈ outbox set — no reducer
 change needed since UserTurn id *is* the localId). Committed sends never
 demote back to draft (drafts and queued messages are different objects).
+
+### Stalled queue (2026-07-28)
+
+"Queued, waiting for the session" and "queued because the send failed" are
+different states that used to render identically — a muted bubble with a
+clock, i.e. *still sending*. `outboxStalled` (signal) distinguishes them:
+set when a flush stops on a non-terminal failure, cleared when an item
+flushes ok, when the queue drains on 404/410, or on discard.
+
+- **Rendering**: a stalled bubble drops the muting (`opacity: 1`), swaps
+  the clock for `error_outline` in `--danger`, and grows a
+  `Not sent · Retry · Discard` row (`chat.queued.*` i18n keys).
+- **`retryQueuedSends()`** — user-initiated flush. **`discardQueuedSend(localId)`**
+  — drops one item plus its optimistic bubble; refuses the item whose POST
+  is in flight (its fate isn't decided yet).
+- **Transport failures get human copy.** Angular's fetch backend reports a
+  rejected `fetch()` as `status: 0` with an *undefined* `statusText`, and
+  `HttpErrorResponse.message` interpolates `init.statusText` directly — so
+  the raw string is `Http failure response for <url>: 0 undefined`, which
+  users were being shown verbatim. `_postInput` now special-cases status 0
+  and logs the raw string to console instead.
+
+**This does not weaken the no-timed-auto-retry rule above.** Nothing retries
+on a timer; the un-latched flush only fires on a readiness signal, which the
+false→true edge already did after a reconnect — it just now also covers the
+already-ready case that edge missed. The double-send hazard is unchanged and
+the `client_msg_id` idempotency note still stands. Worth knowing if that is
+ever picked up: the endpoint already accepts `turn_id`, but `_postInput`
+doesn't send one, and the server-side guard (`_thread_turn_locks`,
+`main.py`) is an in-process dict whose comment still says "single-instance
+orchestrator" — dev runs two replicas, so the 409 duplicate guard is
+replica-local *and* only covers in-flight duplicates, not completed ones.
+
+**Verified on k3d** (2026-07-28, `fetch` patched to reject `POST /input`
+with `TypeError`): stalled rendering + human-copy banner; **Retry** →
+`POST /input 200`, row in `thread_messages`, agent replied; **un-latch** →
+a probe stalled mid-turn drained by itself 45 s later when the turn's
+`ready` frame landed, with `sessionReady` never dropping to false and no
+user action; **Discard** → bubble and item gone, zero rows server-side, and
+it did not resurrect once the transport recovered.
 
 **Rejected**: durable IndexedDB outbox (the loss window is the
 seconds-long creation window with no threadId to key on; accepted sends

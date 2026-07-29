@@ -62,7 +62,7 @@ Inspect the run:
   kubectl -n {{ .Release.Namespace }} logs job/{{ include "srw.fullname" . }}-llm-seed
 {{- end }}
 
-{{- if .Values.garage.enabled }}
+{{- if (include "srw.garageEnabled" .) }}
 
 Bundled object store (Garage) — NOT FOR PRODUCTION
 ==================================================
@@ -71,7 +71,10 @@ coding and is bound to one PVC ({{ include "srw.fullname" . }}-garage-data).
 It backs workspace snapshots (bucket "{{ .Values.s3.bucket }}") and the virtual
 workspace tier (bucket "{{ .Values.garage.buckets.workspaces }}").
 
-For production, set garage.enabled=false and point at an external S3:
+For production, just point at an external S3 — setting s3.endpoint turns this
+bundled store off on its own (garage.enabled defaults to auto). Set
+garage.enabled=false only to run with NO object store at all, which disables
+durable Canvas presentations, workspace snapshots, and the virtual tier.
   - s3.endpoint / s3.bucket                 (snapshots)
   - virtualWorkspace.s3.endpoint            (virtual tier)
 

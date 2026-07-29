@@ -5,14 +5,31 @@
 // ~0.5 kB under its cap, and the agreed rule is to keep new styling out of it
 // until it is split (docs/issues/persistent_chat_component_style_budget.md).
 //
-// Scoped under `.message-user.stalled` so nothing leaks globally — the class is
-// only ever set by the chat message list on an outbox item whose POST failed.
-.message-user.stalled {
+// Scoped under the full `.message.message-user.queued.stalled` class chain, which
+// is deliberate and load-bearing, not redundancy. Two of these rules OVERRIDE
+// `.message-user.queued` rules in persistent-chat.component.scss, and Angular's
+// emulated encapsulation appends an `[_ngcontent-…]` attribute to every
+// component selector — so the component's `.message-user.queued[_ngcontent]`
+// (0,3,0) outranks a plain global `.message-user.stalled` (0,2,0) and the
+// override silently loses. Verified on k3d: the bubble stayed at opacity 0.65
+// and the avatar kept --text-secondary. Stacking the classes here outranks it
+// without putting a single byte into that component's style budget.
+.message.message-user.queued.stalled {
+  // (0,4,0) beats the component's `.message-user.queued[_ngcontent]` (0,3,0).
   // Queued bubbles are muted to read as "in flight"; a stalled one needs
   // attention instead, so undo the muting.
   opacity: 1;
 
-  .avatar-icon,
+  // The redundant-looking `.avatar` step is required. The component's
+  // `.message-user.queued[_ngcontent] .avatar-icon[_ngcontent]` is (0,5,0) —
+  // two classes plus two encapsulation attributes plus the icon class — so the
+  // obvious `& .avatar-icon` only TIES it, and a tie goes to the component
+  // sheet because Angular injects it after this one. The extra class makes it
+  // (0,6,0). Verified on k3d: without it the icon renders --text-secondary.
+  .avatar .avatar-icon {
+    color: var(--danger);
+  }
+
   .queued-note {
     color: var(--danger);
   }

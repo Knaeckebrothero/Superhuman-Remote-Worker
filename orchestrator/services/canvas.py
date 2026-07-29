@@ -205,6 +205,15 @@ class CanvasPublicState(_StrictFrozenModel):
     capabilities: CanvasCapabilities
     updated_at: str
     content_url: str | None = None
+    # Where the bytes behind `content_url` come from. Deliberately an additive
+    # optional FIELD rather than a new `status` value: the cockpit type guard
+    # drops the whole state object on an unknown status (blank pane) but
+    # ignores unknown fields, so an older cockpit against a newer orchestrator
+    # renders a snapshot-backed Canvas instead of breaking. Absent means
+    # "workspace" — never treat absence as unknown-and-blocked.
+    content_origin: Literal["workspace", "snapshot"] | None = None
+    # When `content_origin` is "snapshot": when those bytes were captured.
+    content_captured_at: str | None = None
 
 
 class CanvasInvalidationParams(_StrictFrozenModel):
@@ -474,6 +483,12 @@ def build_public_canvas_representation(
     status: CanvasStatus | None = None,
     capabilities: CanvasCapabilities | None = None,
     content_url: str | None = None,
+    content_origin: Literal["workspace", "snapshot"] | None = None,
+    # Accepts a datetime or an already-serialized ISO string, like every other
+    # timestamp here. Callers that rebuild a previously-served representation
+    # for an If-Match comparison pass the string straight back, which is what
+    # keeps their ETag byte-identical to the one the client holds.
+    content_captured_at: datetime | str | None = None,
 ) -> CanvasRepresentation:
     """Serialize one exact caller-visible state and derive its strong ETag."""
 
@@ -493,6 +508,10 @@ def build_public_canvas_representation(
         capabilities=capabilities or CanvasCapabilities(),
         updated_at=_utc_iso(record.updated_at),
         content_url=content_url,
+        content_origin=content_origin,
+        content_captured_at=(
+            _utc_iso(content_captured_at) if content_captured_at is not None else None
+        ),
     )
     payload = json.dumps(
         state.model_dump(mode="json"),
@@ -523,6 +542,11 @@ def canvas_invalidation(
 CanvasEventCallback = Callable[[CanvasInvalidation], Awaitable[None] | None]
 CanvasRepresentationBuilder = Callable[[CanvasRecord], CanvasRepresentation]
 CanvasFileWriter = Callable[[CanvasRecord, dict[str, Any]], Awaitable[str]]
+# Returns the workspace generation the pinned bytes were re-verified under, or
+# None when the file is gone, unreadable, or no longer byte-identical.
+CanvasGenerationVerifier = Callable[
+    [CanvasRecord, dict[str, Any]], Awaitable[UUID | None]
+]
 
 
 class CanvasService:
@@ -533,9 +557,15 @@ class CanvasService:
         db: Any,
         *,
         event_callback: CanvasEventCallback | None = None,
+        snapshot_store: Any | None = None,
     ) -> None:
         self._db = db
         self._event_callback = event_callback
+        # Optional durable-copy store. Only `clear` needs it: the stored copy
+        # has to disappear in the same transaction that empties the Canvas,
+        # because clearing nulls the source rather than deleting the row and
+        # the FK cascade therefore never fires.
+        self._snapshot_store = snapshot_store
 
     @staticmethod
     def _require_main(canvas_id: str) -> None:
@@ -1062,6 +1092,123 @@ class CanvasService:
         await self._emit(refreshed_record, method="canvas.updated")
         return CanvasMutation(changed=True, record=refreshed_record)
 
+    async def repin_workspace_generation(
+        self,
+        thread_id: str,
+        *,
+        expected_source_version: str,
+        verifier: "CanvasGenerationVerifier",
+        canvas_id: str = MAIN_CANVAS_ID,
+    ) -> CanvasMutation:
+        """Re-bind a file Canvas to the workspace generation now current.
+
+        A workspace that is rebuilt — from a PVC reattach or from an S3
+        snapshot — always mints a new generation, because its SSH host key is
+        pod-private. The pinned generation is then permanently stale and the
+        Canvas reports `unavailable` forever, even though the file it names is
+        still there and still identical. This repairs that.
+
+        The predicate is byte identity, not workspace identity: ``verifier``
+        returns the current generation only when the file at the pinned path
+        hashes to the pinned ``source_version``. That preserves the property
+        the generation pin exists for — a stale presentation can never serve
+        *different* bytes under its old rendering context — by a stronger
+        mechanism than trusting where the bytes came from. Live-app and browser
+        sources are never re-pinned; a port on a rebuilt workspace is a
+        genuinely different thing and no hash can say otherwise.
+
+        Server-initiated repair, so there is no ``If-Match``: no client
+        authored it. Callers must have already authorized the thread.
+
+        The revision bump is mandatory, not cosmetic. ``source_fingerprint``
+        covers the generation, so re-pinning necessarily changes it, and that
+        fingerprint is embedded in every issued ``content_url``. Without the
+        bump and its invalidation, mounted clients would be stranded on URLs
+        the identity check now rejects.
+        """
+
+        self._require_main(canvas_id)
+        repinned_record: CanvasRecord | None = None
+        async with _canvas_mutation_admission():
+            async with self._db.acquire() as conn:
+                async with conn.transaction():
+                    thread_row = await conn.fetchrow(
+                        """
+                        SELECT id, user_id, metadata
+                        FROM threads
+                        WHERE id = $1
+                        FOR SHARE
+                        """,
+                        thread_id,
+                    )
+                    if thread_row is None:
+                        return CanvasMutation(changed=False, record=None)
+                    row = await conn.fetchrow(
+                        """
+                        SELECT thread_id, canvas_id, source, title, renderer,
+                               editable, alt_text, presentation_revision,
+                               source_fingerprint, source_version,
+                               origin_generation, created_at, updated_at
+                        FROM canvases
+                        WHERE thread_id = $1 AND canvas_id = $2
+                        FOR UPDATE
+                        """,
+                        thread_id,
+                        canvas_id,
+                    )
+                    if row is None:
+                        return CanvasMutation(changed=False, record=None)
+                    current = CanvasRecord.from_row(row)
+                    source = current.source
+                    if not isinstance(source, WorkspaceFileSource):
+                        return CanvasMutation(changed=False, record=current)
+                    # The presentation moved while this read was in flight.
+                    # Whatever is there now is somebody else's to repair.
+                    if current.source_version != expected_source_version:
+                        return CanvasMutation(changed=False, record=current)
+
+                    generation = await verifier(current, dict(thread_row))
+                    if generation is None or generation == source.workspace_generation:
+                        # Either the bytes differ (an honest `source_changed`,
+                        # not something to paper over) or a concurrent request
+                        # already re-pinned this row. Exactly one bump either
+                        # way.
+                        return CanvasMutation(changed=False, record=current)
+
+                    repinned_source = WorkspaceFileSource(
+                        path=source.path, workspace_generation=generation
+                    )
+                    source_json = json.dumps(
+                        repinned_source.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE canvases
+                        SET source = $3::jsonb,
+                            source_fingerprint = $4,
+                            presentation_revision = presentation_revision + 1,
+                            updated_at = now()
+                        WHERE thread_id = $1 AND canvas_id = $2
+                        RETURNING thread_id, canvas_id, source, title, renderer,
+                                  editable, alt_text, presentation_revision,
+                                  source_fingerprint, source_version,
+                                  origin_generation, created_at, updated_at
+                        """,
+                        thread_id,
+                        canvas_id,
+                        source_json,
+                        canonical_source_fingerprint(repinned_source),
+                    )
+                    repinned_record = CanvasRecord.from_row(updated)
+
+        assert repinned_record is not None
+        await self._emit(repinned_record, method="canvas.updated")
+        return CanvasMutation(changed=True, record=repinned_record)
+
     async def reset_origin(
         self,
         thread_id: str,
@@ -1179,6 +1326,7 @@ class CanvasService:
 
         self._require_main(canvas_id)
         cleared_record: CanvasRecord | None = None
+        freed_object_key: str | None = None
         async with self._db.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -1233,6 +1381,20 @@ class CanvasService:
                     canvas_id,
                 )
                 cleared_record = CanvasRecord.from_row(cleared_row)
+
+                # Clearing the stage is the user's delete affordance for the
+                # durable copy. It rides this transaction so a clear can never
+                # commit while the remembered bytes stay addressable.
+                if self._snapshot_store is not None:
+                    freed_object_key = await self._snapshot_store.delete_row(
+                        conn, thread_id, canvas_id=canvas_id
+                    )
+
+        # Object storage cannot join the transaction, so the blob delete
+        # follows the commit. A failure here leaks one bounded object; it never
+        # resurrects a cleared presentation.
+        if self._snapshot_store is not None and freed_object_key:
+            await self._snapshot_store.discard_object(freed_object_key)
 
         # The callback is deliberately after transaction exit.  Event delivery
         # is not part of state commit; REST remains authoritative.

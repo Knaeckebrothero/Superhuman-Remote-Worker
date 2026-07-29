@@ -454,6 +454,56 @@ COMMENT ON TABLE public.canvas_origin_sessions IS 'Short-lived isolated Canvas g
 
 
 --
+-- Name: canvas_snapshots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.canvas_snapshots (
+    thread_id uuid NOT NULL,
+    canvas_id character varying(64) DEFAULT 'main'::character varying NOT NULL,
+    path text NOT NULL,
+    renderer character varying(32) NOT NULL,
+    media_type text NOT NULL,
+    source_version text NOT NULL,
+    object_key text NOT NULL,
+    byte_size bigint NOT NULL,
+    last_modified timestamp with time zone,
+    captured_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_canvas_snapshots_object_key CHECK (((char_length(object_key) >= 1) AND (char_length(object_key) <= 1024))),
+    CONSTRAINT ck_canvas_snapshots_path_length CHECK (((char_length(path) >= 1) AND (char_length(path) <= 4096))),
+    CONSTRAINT ck_canvas_snapshots_size CHECK ((byte_size > 0)),
+    CONSTRAINT ck_canvas_snapshots_source_version CHECK ((source_version ~ '^sha256:[0-9a-f]{64}$'::text))
+);
+
+
+--
+-- Name: TABLE canvas_snapshots; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.canvas_snapshots IS 'Last published bytes of a file Canvas, held in the object store. One row per Canvas, replaced on each publish. Read-only: never a write target and never merged back into the workspace.';
+
+
+--
+-- Name: COLUMN canvas_snapshots.renderer; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_snapshots.renderer IS 'Renderer the bytes were validated for. Deliberately unconstrained, matching canvases.renderer: renderer vocabulary stays app-enforced.';
+
+
+--
+-- Name: COLUMN canvas_snapshots.source_version; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_snapshots.source_version IS 'sha256 of the captured bytes. Served only while it equals the live canvases.source_version; any disagreement means stale and is ignored.';
+
+
+--
+-- Name: COLUMN canvas_snapshots.object_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.canvas_snapshots.object_key IS 'Object-store key, canvas/<thread_id>/<canvas_id>/<sha>. Thread-scoped rather than content-addressed so deletion is unambiguous and per-tenant.';
+
+
+--
 -- Name: canvas_view_attachments; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2451,6 +2501,14 @@ ALTER TABLE ONLY public.notification_queue
 
 
 --
+-- Name: canvas_snapshots pk_canvas_snapshots; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_snapshots
+    ADD CONSTRAINT pk_canvas_snapshots PRIMARY KEY (thread_id, canvas_id);
+
+
+--
 -- Name: processed_inbound_emails processed_inbound_emails_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3951,6 +4009,14 @@ ALTER TABLE ONLY public.external_contacts
 
 ALTER TABLE ONLY public.external_contacts
     ADD CONSTRAINT external_contacts_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: canvas_snapshots fk_canvas_snapshots_canvas; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.canvas_snapshots
+    ADD CONSTRAINT fk_canvas_snapshots_canvas FOREIGN KEY (thread_id, canvas_id) REFERENCES public.canvases(thread_id, canvas_id) ON DELETE CASCADE;
 
 
 --

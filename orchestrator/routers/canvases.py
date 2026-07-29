@@ -5,6 +5,7 @@ from __future__ import annotations
 from email.utils import format_datetime
 from email.utils import parsedate_to_datetime
 from pathlib import PurePosixPath
+import logging
 import re
 import secrets
 from tempfile import SpooledTemporaryFile
@@ -53,6 +54,7 @@ from services.canvas_office import (
     create_wopi_token_service,
     get_collabora_discovery_service,
 )
+from services.canvas_snapshots import CanvasSnapshot, CanvasSnapshotStore
 from services.canvas_viewer_config import (
     CanvasViewerConfigurationError,
     canvas_viewer_config,
@@ -70,6 +72,8 @@ from services.shared_browser_canvas import (
     require_browser_capability,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(
     prefix="/api/persistent/threads/{thread_id}/canvases",
     tags=["Dynamic Canvas"],
@@ -82,6 +86,22 @@ internal_router = APIRouter(
 _STATE_CACHE_CONTROL = "private, no-cache"
 _CONTENT_CACHE_CONTROL = "private, no-cache"
 _VIEWER_SECRET_PATTERN = r"^[A-Za-z0-9_-]{32,128}$"
+
+# Re-pin attempts already made, keyed by (thread, current generation, revision,
+# source version). Insertion-ordered so the oldest entry evicts first.
+_REPIN_ATTEMPTED: dict[tuple[str, str, int, str], bool] = {}
+_REPIN_ATTEMPT_CAP = 512
+
+# Workspace-side failures that mean "we cannot reach these bytes right now",
+# as opposed to "these bytes changed". Only these fall back to a snapshot; a
+# `source_changed` must keep telling the truth about the workspace.
+_SNAPSHOT_FALLBACK_CODES = frozenset(
+    {
+        "workspace_unavailable",
+        "workspace_generation_changed",
+        "canvas_file_not_found",
+    }
+)
 
 
 class _LeasedContentResponse(Response):
@@ -193,13 +213,17 @@ def _get_db() -> Any:
 
 
 def _get_canvas_service(db: Any) -> CanvasService:
-    return CanvasService(db)
+    return CanvasService(db, snapshot_store=CanvasSnapshotStore(db))
 
 
 def _get_file_gateway(db: Any | None = None) -> ThreadWorkspaceFileGateway:
     return ThreadWorkspaceFileGateway(
         thread_loader=getattr(db, "get_thread", None) if db is not None else None
     )
+
+
+def _get_snapshot_store(db: Any) -> CanvasSnapshotStore:
+    return CanvasSnapshotStore(db)
 
 
 def _get_app_gateway(db: Any | None = None) -> ThreadWorkspaceAppGateway:
@@ -545,12 +569,15 @@ async def _represent(
     status = "cleared" if record.source is None else "unavailable"
     capabilities = CanvasCapabilities()
     content_url = None
+    content_origin: Literal["workspace", "snapshot"] | None = None
+    captured_at = None
     if isinstance(record.source, WorkspaceFileSource):
         try:
             gateway = _get_file_gateway(db)
             materialized = await gateway.materialize_current(thread, record)
             if materialized.source_version == record.source_version:
                 status = "ready"
+                content_origin = "workspace"
                 if record.renderer == "office":
                     can_view_office = False
                     try:
@@ -581,14 +608,25 @@ async def _represent(
         except CanvasFileError as exc:
             if exc.code == "source_changed":
                 status = "source_changed"
-            elif exc.code in {
-                "workspace_unavailable",
-                "workspace_generation_changed",
-                "canvas_file_not_found",
-            }:
+            elif exc.code in _SNAPSHOT_FALLBACK_CODES:
                 status = "unavailable"
             else:
                 status = "error"
+
+        # The workspace could not answer for these exact published bytes. If we
+        # remembered them at publish time, the stage stays up read-only instead
+        # of going dark — a suspended session is the common case, not a fault.
+        if status == "unavailable" and db is not None:
+            snapshot = await _get_snapshot_store(db).usable(
+                thread_id, record.source_version
+            )
+            if snapshot is not None:
+                status = "ready"
+                content_origin = "snapshot"
+                captured_at = snapshot.captured_at
+                capabilities = CanvasCapabilities(can_pop_out=True)
+                if browser_content_url and record.renderer != "office":
+                    content_url = _content_url(thread_id, record)
     elif isinstance(record.source, WorkspaceAppSource):
         # Slice 3A exposes only callable state/status. Viewer sessions and
         # iframe URLs arrive with the isolated-origin proxy; never manufacture
@@ -621,6 +659,8 @@ async def _represent(
         status=status,
         capabilities=capabilities,
         content_url=content_url,
+        content_origin=content_origin,
+        content_captured_at=captured_at,
     )
 
 
@@ -651,6 +691,13 @@ async def get_main_canvas(thread_id: str, request: Request) -> Response:
     record = await _get_canvas_service(db).get(thread_id)
     if record is None:
         return _no_content_response()
+    # A returning session usually finds its workspace rebuilt under a new
+    # generation. If the file it published is still byte-identical, re-bind it
+    # here so the Canvas comes back live and editable rather than frozen at the
+    # stored copy. Deliberately only on the state read: `content_url` embeds
+    # the source fingerprint, so re-pinning during a content fetch would
+    # invalidate the very URL being served.
+    record = await _maybe_repin(db, thread_id, thread, record)
     representation = await _represent(
         thread_id, thread, record, browser_content_url=True, db=db
     )
@@ -706,6 +753,8 @@ async def clear_main_canvas(thread_id: str, request: Request) -> Response:
             status=visible.state.status,
             capabilities=visible.state.capabilities,
             content_url=content_url,
+            content_origin=visible.state.content_origin,
+            content_captured_at=visible.state.content_captured_at,
         )
 
     await require_thread_owner(request, db, thread_id)
@@ -1117,6 +1166,114 @@ def _content_headers(file: ValidatedCanvasFile, *, length: int) -> dict[str, str
     return headers
 
 
+async def _maybe_repin(
+    db: Any, thread_id: str, thread: dict[str, Any], record: CanvasRecord
+) -> CanvasRecord:
+    """Re-bind a stale file Canvas to the current workspace, if the bytes match.
+
+    Cheap to skip: the staleness test is a metadata comparison, so a healthy
+    Canvas never touches the workspace here. Only a genuinely stale generation
+    pays for a read, and only once per (generation, revision) — a file that has
+    really changed must not turn every state GET into an SFTP round-trip.
+    """
+
+    source = record.source
+    if not isinstance(source, WorkspaceFileSource) or not record.source_version:
+        return record
+    try:
+        generation = current_workspace_generation(thread)
+    except CanvasFileError:
+        # No workspace bound right now. Nothing to re-pin against; the snapshot
+        # fallback in `_represent` covers the user.
+        return record
+    if generation == source.workspace_generation:
+        return record
+
+    attempt = (
+        thread_id,
+        str(generation),
+        record.presentation_revision,
+        record.source_version,
+    )
+    if attempt in _REPIN_ATTEMPTED:
+        return record
+
+    gateway = _get_file_gateway(db)
+    # Distinguishing these two matters for whether the attempt is worth
+    # repeating. A workspace that is still restoring reads as "unreadable" for
+    # a while, and treating that as final would strand the Canvas on its stored
+    # copy until the next publish or a process restart.
+    definitively_different = False
+
+    async def verifier(
+        locked: CanvasRecord, locked_thread: dict[str, Any]
+    ) -> UUID | None:
+        nonlocal definitively_different
+        locked_source = locked.source
+        if not isinstance(locked_source, WorkspaceFileSource):
+            return None
+        try:
+            current, file = await gateway.validate_for_presentation(
+                locked_thread,
+                locked_source.path,
+                requested_renderer=locked.renderer,
+                alt_text=locked.alt_text,
+            )
+        except CanvasFileError:
+            # Gone, unreadable, or not yet restored. Retryable.
+            return None
+        if file.source_version != locked.source_version:
+            # The file really did change. `source_changed` is the honest
+            # answer and it already has a "load current version" affordance.
+            # Settled, so stop re-reading it on every state GET.
+            definitively_different = True
+            return None
+        return current
+
+    try:
+        mutation = await _get_canvas_service(db).repin_workspace_generation(
+            thread_id,
+            expected_source_version=record.source_version,
+            verifier=verifier,
+        )
+    except Exception:
+        logger.exception(
+            "Canvas re-pin failed for thread=%s — falling back to the stored copy",
+            thread_id,
+        )
+        return record
+    if definitively_different:
+        _remember_repin_attempt(attempt)
+    return mutation.record if mutation.changed and mutation.record else record
+
+
+def _remember_repin_attempt(attempt: tuple[str, str, int, str]) -> None:
+    # Bounded, per-replica, and deliberately not durable: a restart retrying a
+    # hopeless re-pin costs one file read, while an unbounded set would not.
+    if len(_REPIN_ATTEMPTED) >= _REPIN_ATTEMPT_CAP:
+        _REPIN_ATTEMPTED.pop(next(iter(_REPIN_ATTEMPTED)), None)
+    _REPIN_ATTEMPTED[attempt] = True
+
+
+def _snapshot_as_file(snapshot: CanvasSnapshot, data: bytes) -> ValidatedCanvasFile:
+    """Present stored bytes through the same shape as a live workspace read.
+
+    Everything downstream — headers, CSP, disposition, ETag, ranges — then has
+    exactly one code path, so a snapshot response cannot drift from the live
+    one. The renderer and media type are the ones the bytes were validated
+    for at publish time; they are not re-derived from a snapshot row.
+    """
+
+    return ValidatedCanvasFile(
+        path=snapshot.path,
+        data=data,
+        media_type=snapshot.media_type,
+        renderer=snapshot.renderer,  # type: ignore[arg-type]
+        source_version=snapshot.source_version,
+        last_modified=snapshot.last_modified,
+    )
+
+
 def _file_mutation_response(
     thread_id: str,
     record: CanvasRecord,
@@ -1128,6 +1285,7 @@ def _file_mutation_response(
         status="ready",
         capabilities=CanvasCapabilities(can_edit=can_edit, can_pop_out=True),
         content_url=_content_url(thread_id, record),
+        content_origin="workspace",
     )
     assert record.source_version is not None
     return _state_response(
@@ -1151,6 +1309,7 @@ async def get_main_canvas_content(
     db = _get_db()
     _, thread = await require_thread_owner(request, db, thread_id)
     response_lease: CanvasResponseLease | None = None
+    content_origin = "workspace"
     try:
         try:
             service = _get_canvas_service(db)
@@ -1169,13 +1328,29 @@ async def get_main_canvas_content(
             # Reserve a bounded response slot before retaining workspace bytes.
             # Its lifetime transfers to the response for non-empty GET bodies.
             response_lease = await acquire_canvas_response_lease()
-            file = await _get_file_gateway(db).materialize_current(thread, record)
-            if file.source_version != record.source_version:
-                raise CanvasFileError(
-                    409,
-                    "source_changed",
-                    "Workspace bytes changed; ask the agent to refresh the Canvas",
+            try:
+                file = await _get_file_gateway(db).materialize_current(thread, record)
+                if file.source_version != record.source_version:
+                    raise CanvasFileError(
+                        409,
+                        "source_changed",
+                        "Workspace bytes changed; ask the agent to refresh the Canvas",
+                    )
+            except CanvasFileError as exc:
+                # The workspace cannot answer for these exact bytes. Serve the
+                # copy taken when they were published, if we have it. The
+                # identity triple above was already verified against the live
+                # row, so a snapshot is never addressable on its own.
+                if exc.code not in _SNAPSHOT_FALLBACK_CODES:
+                    raise
+                loaded = await _get_snapshot_store(db).load(
+                    thread_id, record.source_version
                 )
+                if loaded is None:
+                    raise
+                snapshot, snapshot_bytes = loaded
+                file = _snapshot_as_file(snapshot, snapshot_bytes)
+                content_origin = "snapshot"
             # The file read can be expensive. Re-check the authoritative Canvas row
             # after it so a concurrent clear/replace cannot release bytes under the
             # old renderer identity.
@@ -1193,6 +1368,7 @@ async def get_main_canvas_content(
 
         etag = f'"{file.source_version}"'
         headers = _content_headers(file, length=len(file.data))
+        headers["X-Canvas-Content-Origin"] = content_origin
         if _if_none_match_matches(request.headers.get("If-None-Match"), etag):
             # A 304 has no response body. Reusing the representation's
             # Content-Length makes Uvicorn correctly reject the framing as a
@@ -1316,13 +1492,17 @@ async def put_main_canvas_content(
     _, fresh_thread = await require_thread_owner(request, db, thread_id)
     locked_gateway = _get_file_gateway()
 
+    saved: ValidatedCanvasFile | None = None
+
     async def write_locked(current: CanvasRecord, locked_thread: dict[str, Any]) -> str:
+        nonlocal saved
         result = await locked_gateway.replace_current(
             locked_thread,
             current,
             candidate,
             expected_source_version=expected_source_version,
         )
+        saved = result
         return result.source_version
 
     try:
@@ -1341,6 +1521,8 @@ async def put_main_canvas_content(
 
     await require_thread_owner(request, db, thread_id)
     assert mutation.record is not None
+    if saved is not None:
+        await _get_snapshot_store(db).capture(thread_id, saved)
     return _file_mutation_response(
         thread_id,
         mutation.record,
@@ -1404,15 +1586,21 @@ async def refresh_main_canvas(thread_id: str, request: Request) -> Response:
             status=visible.state.status,
             capabilities=visible.state.capabilities,
             content_url=content_url,
+            content_origin=visible.state.content_origin,
+            content_captured_at=visible.state.content_captured_at,
         )
 
     _, fresh_thread = await require_thread_owner(request, db, thread_id)
     locked_gateway = _get_file_gateway()
 
+    refreshed: ValidatedCanvasFile | None = None
+
     async def refresh_locked(
         record: CanvasRecord, locked_thread: dict[str, Any]
     ) -> str:
+        nonlocal refreshed
         file = await locked_gateway.materialize_for_refresh(locked_thread, record)
+        refreshed = file
         return file.source_version
 
     try:
@@ -1440,6 +1628,8 @@ async def refresh_main_canvas(thread_id: str, request: Request) -> Response:
 
     await require_thread_owner(request, db, thread_id)
     assert mutation.record is not None
+    if refreshed is not None:
+        await _get_snapshot_store(db).capture(thread_id, refreshed)
     return _file_mutation_response(
         thread_id,
         mutation.record,
@@ -1500,6 +1690,8 @@ async def reset_main_canvas_origin(thread_id: str, request: Request) -> Response
             record,
             status=visible.state.status,
             capabilities=visible.state.capabilities,
+            content_origin=visible.state.content_origin,
+            content_captured_at=visible.state.content_captured_at,
         )
 
     _, fresh_thread = await require_thread_owner(request, db, thread_id)
@@ -1725,6 +1917,10 @@ async def internal_set_main_canvas(
         ),
     )
     assert mutation.record is not None
+    # Remember exactly these published bytes so the presentation outlives the
+    # workspace pod. Best-effort by contract: a snapshot failure must never
+    # turn a successful `set_canvas` into a failed tool call.
+    await _get_snapshot_store(db).capture(thread_id, file)
     representation = build_public_canvas_representation(
         mutation.record,
         status="ready",
@@ -1736,6 +1932,7 @@ async def internal_set_main_canvas(
             can_pop_out=True,
             can_view_office=mutation.record.renderer == "office",
         ),
+        content_origin="workspace",
     )
     return _state_response(
         representation.payload,

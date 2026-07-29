@@ -1,4 +1,4 @@
-{{- if .Values.garage.enabled }}
+{{- if (include "srw.garageEnabled" .) }}
 # Garage bootstrap — post-install/upgrade hook. The dxflrs/garage image is
 # shell-less, so we drive the admin HTTP API from a shell+curl image instead of
 # exec'ing the garage CLI. Idempotent: every step is check-or-ignore-conflict.
