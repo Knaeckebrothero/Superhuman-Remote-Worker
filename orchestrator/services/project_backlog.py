@@ -191,6 +191,14 @@ def render_backlog_block(
 
 _STATUS_LINE = re.compile(r"^status:.*$", re.MULTILINE)
 
+# _rewrite_status outcomes. All three can hand back byte-identical markdown, so
+# the returned text alone cannot tell them apart — which is exactly how an
+# idempotent re-close came to be logged as malformed frontmatter
+# (docs/issues/backlog_close_mislabels_idempotent_reclose.md).
+_REWRITTEN = "rewritten"  # the status line changed (or one was inserted)
+_ALREADY_SET = "already_set"  # the line was found and already holds the target
+_NOT_REWRITABLE = "not_rewritable"  # no frontmatter, or no closing `---`
+
 
 def _rowcount(command_status: Any) -> int:
     """Parse asyncpg's ``conn.execute()`` status tag (``"UPDATE 1"``) into a
@@ -202,23 +210,36 @@ def _rowcount(command_status: Any) -> int:
         return -1
 
 
-def _rewrite_status(markdown: str, new_status: str) -> str:
+def _rewrite_status(markdown: str, new_status: str) -> tuple[str, str]:
     """Replace the frontmatter ``status:`` line, or insert one if absent.
+
+    Returns ``(markdown, outcome)``: ``_REWRITTEN`` (the text differs and wants
+    writing), ``_ALREADY_SET`` (a well-formed status line already holds
+    ``new_status`` — nothing to write, which is a *success*), or
+    ``_NOT_REWRITABLE`` (no frontmatter block at all, or one with no closing
+    ``---``). The outcome is reported by the branch that took it rather than
+    re-derived by the caller from the text, so there stays exactly one
+    frontmatter parser here and nothing to drift out of step with it.
 
     Deliberately a line rewrite rather than a YAML round-trip: the note is a
     human-editable document and reserializing it would reformat everything the
     author wrote.
     """
     if not markdown.startswith("---"):
-        return markdown
+        return markdown, _NOT_REWRITABLE
     head, sep, tail = markdown[3:].partition("\n---")
     if not sep:
-        return markdown
+        return markdown, _NOT_REWRITABLE
     if _STATUS_LINE.search(head):
-        head = _STATUS_LINE.sub(f"status: {new_status}", head, count=1)
+        rewritten = _STATUS_LINE.sub(f"status: {new_status}", head, count=1)
+        if rewritten == head:
+            # Byte-identical because the line already reads `status: <target>`
+            # — the frontmatter is present and well-formed, not missing.
+            return markdown, _ALREADY_SET
+        head = rewritten
     else:
         head = head.rstrip("\n") + f"\nstatus: {new_status}\n"
-    return "---" + head + sep + tail
+    return "---" + head + sep + tail, _REWRITTEN
 
 
 async def close_backlog_ticket(
@@ -233,21 +254,33 @@ async def close_backlog_ticket(
     The database (campaign + campaign_history) stays authoritative for what the
     loop did; this only keeps the pool and the human-readable note in step.
     Best-effort by contract: a disposition must never fail because a mirror
-    write failed. Returns True only when the durable (file) write succeeded
-    AND actually changed the note's status line — a byte-identical rewrite
-    (no frontmatter block, or one ``_rewrite_status`` couldn't find a closing
-    ``---`` in) means the file was never really touched, and claiming success
-    there would hide exactly the case that most needs a human to look at the
-    note by hand.
+    write failed. Returns True when the durable (file) mirror is *correct* —
+    the write landed, or the note already carried the target status and there
+    was nothing to write (an idempotent re-close, reachable through the
+    torn-advance heal window or a human editing the note first). It returns
+    False when there was no status line to rewrite at all (no frontmatter
+    block, or one with no closing ``---``): that file was never really
+    touched, and claiming success there would hide exactly the case that most
+    needs a human to look at the note by hand.
     """
     repo_name = f"project-{str(project_id)[:8]}-jobs"
     file_path = f"knowledge/{note_id}.md"
-    file_written = False
+    durable_ok = False
     try:
         current = await gitea.get_file_content(repo_name, file_path)
         if current:
-            updated = _rewrite_status(current, new_status)
-            if updated == current:
+            updated, outcome = _rewrite_status(current, new_status)
+            if outcome == _ALREADY_SET:
+                # Not a failure and not a wrong cause: the mirror is already
+                # exactly what this close would have written.
+                logger.debug(
+                    "backlog: %s already at status: %s — durable mirror "
+                    "already correct, nothing to write",
+                    file_path,
+                    new_status,
+                )
+                durable_ok = True
+            elif outcome == _NOT_REWRITABLE:
                 logger.warning(
                     "backlog: %s has no rewritable frontmatter status line "
                     "(missing or malformed frontmatter) — %s → %s left the "
@@ -256,8 +289,8 @@ async def close_backlog_ticket(
                     note_id,
                     new_status,
                 )
-            else:
-                file_written = bool(
+            else:  # _REWRITTEN — the only outcome whose text differs
+                durable_ok = bool(
                     await gitea.create_or_update_file(
                         repo_name,
                         file_path,
@@ -325,4 +358,4 @@ async def close_backlog_ticket(
             exc_info=True,
         )
 
-    return file_written
+    return durable_ok
