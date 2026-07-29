@@ -1,9 +1,18 @@
 # App Guide M2 live acceptance — tester-agent handoff
 
-> **Status (2026-07-28): ready for independent execution; no live verdict
-> recorded yet.** The M2e implementation is pushed and a deployment was
-> reported. The repository's current experimental image declaration is
-> `sha-5eb436e`, with full source revision
+> **Status (2026-07-28): executed once; verdict BLOCKED.** Results are recorded
+> in [App Guide M2 live acceptance results
+> 2026-07-28](app_guide_m2_live_acceptance_results_2026-07-28.md). The run was
+> performed against a local k3d target built from `ec4bbe6b` (contains
+> `326963b7`), not against the experimental image below. States A, B, D and E
+> passed; State C failed one criterion; the email, changed-state,
+> mixed-deployment, and MCP-token cells were BLOCKED for missing fixtures, and
+> the three-repeat model matrix could not use the intended release route. Both
+> rollout gates were restored to default-off. **M2 remains open**; a re-run is
+> required once the missing fixtures and release model route exist.
+>
+> This runbook stays authoritative for that re-run. The repository's current
+> experimental image declaration is `sha-5eb436e`, with full source revision
 > `5eb436eb9181b3271aef223e89c8d87861d95b4c`. The tester must verify the
 > actual target rather than treating that declaration or the deployment report
 > as evidence.

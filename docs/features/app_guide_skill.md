@@ -26,7 +26,12 @@ tags:
 > integration, held-out capability trajectory suite, and changed-before-action
 > email enforcement are implemented in the 2026-07-27 M2e slice. The formal model,
 > canary, fresh/resumed live-session, and rollback matrices have not passed, so
-> both rollout gates remain default-off and **M2 is not complete**. The
+> both rollout gates remain default-off and **M2 is not complete**. A live
+> acceptance run on 2026-07-28 returned **BLOCKED**: the rollout-state,
+> endpoint-admission, dependency-failure, and rollback gates passed, but the
+> email/changed-state/mixed-deployment cells had no fixtures and the
+> three-repeat model matrix could not use the intended release route
+> ([results](../tests/app_guide_m2_live_acceptance_results_2026-07-28.md)). The
 > remaining visual help and
 > Phases 3–8 remain open. Post-closure
 > commit `02fed505`

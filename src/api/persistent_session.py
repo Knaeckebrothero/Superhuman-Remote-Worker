@@ -1546,6 +1546,14 @@ class PersistentSession:
             if "request_workspace_upgrade" not in tool_names:
                 tool_names.append("request_workspace_upgrade")
 
+        # Officer (centurion) sessions get the sleep tool — their park verb.
+        # Gated on config, not backend: it is a pure ToolContext flag-setter
+        # (docs/features/centurion.md §4). Strict `is True` so MagicMock
+        # configs in tests can't enable it.
+        if getattr(getattr(self.config, "officer", None), "enabled", False) is True:
+            if "sleep" not in tool_names:
+                tool_names.append("sleep")
+
         # Capability gate: drop tools the workspace backend can't support (lite
         # tiers — no_workspace_agent_mode.md §3.2/§7). Mirrors the worker path.
         # On a backend swap this RE-FILTERS against the new backend, so an

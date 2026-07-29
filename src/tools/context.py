@@ -259,6 +259,9 @@ class ToolContext:
     _freeze_request: Optional[Dict[str, Any]] = (
         None  # Tool-requested job freeze (blocking send_message)
     )
+    _officer_sleep_request: Optional[Dict[str, Any]] = (
+        None  # Officer sleep tool parked a wake request (centurion sessions)
+    )
     _snapshot_callback: Optional[Any] = (
         None  # Callable[[str], None] — pre-write file snapshot for undo
     )
@@ -802,6 +805,26 @@ class ToolContext:
         """
         req = self._freeze_request
         self._freeze_request = None
+        return req
+
+    def request_officer_sleep(self, sleep_data: Dict[str, Any]) -> None:
+        """Record the officer sleep tool's wake request (sync-safe).
+
+        The turn loop PEEKS this after the tool batch to end the turn instead
+        of paying another LLM iteration; the transport CONSUMES it at park
+        time to file the durable wake with the orchestrator
+        (docs/features/centurion.md §4).
+        """
+        self._officer_sleep_request = sleep_data
+
+    def peek_officer_sleep(self) -> Optional[Dict[str, Any]]:
+        """Non-destructive read of a pending officer sleep request."""
+        return self._officer_sleep_request
+
+    def consume_officer_sleep(self) -> Optional[Dict[str, Any]]:
+        """Return and clear any pending officer sleep request."""
+        req = self._officer_sleep_request
+        self._officer_sleep_request = None
         return req
 
     def close_citation_engine(self) -> None:
