@@ -31,6 +31,7 @@ from src.core.chunk_planner import (
     SummarizationFailed,
     count_text_tokens,
 )
+from src.core.llm_retry import NO_RETRY
 from src.core.summarizer import _describe_exc, is_overflow_error
 
 logger = logging.getLogger(__name__)
@@ -247,7 +248,11 @@ class MemoryExtractionEngine:
         for attempt in range(1, MAX_EXTRACTION_ATTEMPTS + 1):
             try:
                 task = TextExtractMemoriesTask(chunk.text, self.extraction_prompt)
-                result = await self.auxiliary.chain(task, timeout=self.call_timeout)
+                # NO_RETRY: this loop already owns the retry for this call.
+                # Retry belongs at exactly one layer per path.
+                result = await self.auxiliary.chain(
+                    task, timeout=self.call_timeout, retry_policy=NO_RETRY
+                )
                 return list(getattr(result, "memories", []) or [])
             except asyncio.CancelledError:
                 raise

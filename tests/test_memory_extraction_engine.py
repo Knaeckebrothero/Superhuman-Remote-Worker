@@ -13,6 +13,7 @@ import uuid
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from src.core.llm_retry import NO_RETRY
 from src.services.auxiliary import ExtractedMemories, ExtractedMemory
 from src.services.memory.extraction_engine import (
     MemoryExtractionEngine,
@@ -56,10 +57,16 @@ class _FakeAux:
     def __init__(self, max_context_tokens=4000, fail_distinct=()):
         self.max_context_tokens = max_context_tokens
         self.calls = []
+        self.retry_policies_seen = []
         self._distinct = []
         self.fail_distinct = set(fail_distinct)
 
-    async def chain(self, task, timeout=None):
+    async def chain(self, task, timeout=None, retry_policy=None):
+        # Mirrors AuxiliaryLLM.chain's signature. The engine passes
+        # retry_policy=NO_RETRY because it owns its own retry loop below, and a
+        # double that silently rejects the kwarg turns every chunk into a
+        # skipped chunk rather than a test failure at the seam.
+        self.retry_policies_seen.append(retry_policy)
         text = task.build_context()
         self.calls.append(text)
         if text not in self._distinct:
@@ -160,6 +167,21 @@ class TestFailureIsolation:
         assert "FACT_0" in contents  # a surviving chunk's facts are present
         missing = {f"FACT_{i}" for i in range(60)} - contents
         assert missing  # the skipped chunk left a real gap
+
+    @pytest.mark.asyncio
+    async def test_engine_opts_out_of_the_aux_layer_retry(self):
+        # Retry belongs at exactly one layer per call path. This engine owns its
+        # own loop (MAX_EXTRACTION_ATTEMPTS + EXTRACTION_BACKOFF_SECONDS), so it
+        # must tell AuxiliaryLLM not to add a second one — otherwise a transient
+        # costs 2x the provider calls and the inner failure never reaches this
+        # loop's per-chunk attempt accounting.
+        aux, store = _FakeAux(), _FakeStore()
+        engine = _make_engine(aux, store)
+
+        await engine.run(_history(20))
+
+        assert aux.retry_policies_seen  # the engine actually called through
+        assert all(p is NO_RETRY for p in aux.retry_policies_seen)
 
     @pytest.mark.asyncio
     async def test_empty_history_stores_nothing(self):
