@@ -253,6 +253,7 @@ POST   /api/projects/{project_id}/members                                       
 DELETE /api/projects/{project_id}/members/{user_id}                                     gated:require_approved_user
 PATCH  /api/projects/{project_id}/members/{user_id}                                     gated:require_project_owner
 GET    /api/projects/{project_id}/memory/stats                                          gated:require_project_member
+GET    /api/projects/{project_id}/officer                                               gated:require_project_member
 GET    /api/projects/{project_id}/repositories                                          gated:require_project_member
 POST   /api/projects/{project_id}/repositories                                          gated:require_project_owner
 DELETE /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
