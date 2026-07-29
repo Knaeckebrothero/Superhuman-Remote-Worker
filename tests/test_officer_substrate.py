@@ -104,9 +104,12 @@ class TestSleepSlotAndTool:
     @pytest.mark.asyncio
     async def test_sleep_tool_parks_request(self):
         ctx = _bare_tool_context()
-        (sleep_tool,) = create_officer_tools(ctx)
-        assert sleep_tool.name == "sleep"
+        tools = create_officer_tools(ctx)
+        by_name = {t.name: t for t in tools}
+        sleep_tool = by_name["sleep"]
+        assert set(by_name) == {"sleep", "notify_user"}
         assert "sleep" in OFFICER_TOOLS_METADATA
+        assert "notify_user" in OFFICER_TOOLS_METADATA
         result = await sleep_tool.ainvoke({"minutes": 30, "reason": "3 jobs healthy"})
         assert "Wake-up call filed" in result
         parked = ctx.peek_officer_sleep()
@@ -368,3 +371,60 @@ class TestSessionWakeOfficerHelpers:
         from services import session_wake
 
         assert session_wake.OFFICER_DEBOUNCE_BY_SOURCE["timer"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Boot-WS watchdog exemption (S3 k3d smoke defect 7)
+# ---------------------------------------------------------------------------
+
+
+class TestBootWsWatchdogOfficerExemption:
+    @pytest.mark.asyncio
+    async def test_officer_session_is_never_boot_ws_killed(self):
+        """Officers are headless by design — the abandoned-during-creation
+        watchdog must stand down entirely, or every officer dies 600s after
+        boot (observed live: exiting (likely abandoned during creation))."""
+        import src.api.persistent_app as mod
+
+        _reset_agent_globals()
+        _install_officer_session(officer_cfg=OfficerConfig(enabled=True))
+        mod._ws_connected_event = asyncio.Event()  # never set
+        terminated = []
+
+        async def _fake_terminate(reason):
+            terminated.append(reason)
+
+        original = mod._terminate_session
+        mod._terminate_session = _fake_terminate
+        try:
+            # Watchdog must return immediately — a 0-second timeout would
+            # otherwise terminate on the spot.
+            await asyncio.wait_for(mod._boot_ws_watchdog(0), timeout=1.0)
+        finally:
+            mod._terminate_session = original
+            _reset_agent_globals()
+        assert terminated == []
+
+    @pytest.mark.asyncio
+    async def test_normal_session_still_boot_ws_killed(self):
+        import src.api.persistent_app as mod
+
+        _reset_agent_globals()
+        _install_officer_session(officer_cfg=OfficerConfig(enabled=False))
+        mod._ws_connected_event = asyncio.Event()
+        terminated = []
+
+        async def _fake_terminate(reason):
+            terminated.append(reason)
+
+        original_terminate = mod._terminate_session
+        original_exit = mod._schedule_exit
+        mod._terminate_session = _fake_terminate
+        mod._schedule_exit = lambda delay=0: None
+        try:
+            await asyncio.wait_for(mod._boot_ws_watchdog(0), timeout=5.0)
+        finally:
+            mod._terminate_session = original_terminate
+            mod._schedule_exit = original_exit
+            _reset_agent_globals()
+        assert terminated == ["boot_ws_timeout"]

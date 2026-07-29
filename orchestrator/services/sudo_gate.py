@@ -168,6 +168,9 @@ class SudoGateService:
             "requested_at": datetime.now(timezone.utc).isoformat(),
         }
         await self._broadcast_sse("new_request", event)
+        await self._notify_project_officer(
+            str(request_id), job_id, command, "sudo_command"
+        )
 
     # =========================================================================
     # Approval / Denial (from REST endpoints)
@@ -511,6 +514,46 @@ class SudoGateService:
         except ValueError:
             pass
 
+    async def _notify_project_officer(
+        self, request_id: str, job_id: Any, command: str, request_type: str
+    ) -> None:
+        """Wake the project's officer about a pending approval. Never raises.
+
+        The sudo TTL (300s) usually expires before a DOWN officer can be
+        respawned, so this is a latency win for a LIVE officer, not a promise
+        of coverage — the human notification path remains the fallback
+        (centurion implementation notes, S4).
+        """
+        if not self._db or not job_id:
+            return
+        try:
+            from services import session_wake
+
+            job = await self._db.get_job(str(job_id))
+            project_id = (job or {}).get("project_id")
+            if not project_id:
+                return
+            enqueued = await session_wake.notify_officer(
+                self._db,
+                str(project_id),
+                source="sudo_request",
+                dedup_key=f"sudo:{request_id}",
+                payload={
+                    "request_id": str(request_id),
+                    "job_id": str(job_id),
+                    "request_type": request_type,
+                    "summary": (command or "")[:160],
+                },
+            )
+            if enqueued:
+                session_wake.kick_event_drain(self._db)
+        except Exception:
+            logger.warning(
+                "sudo gate: officer notify failed for request %s (non-fatal)",
+                request_id,
+                exc_info=True,
+            )
+
     async def _broadcast_sse(self, event_type: str, data: dict) -> None:
         """Push an event to all connected SSE clients."""
         dead = []
@@ -659,6 +702,9 @@ class SudoGateService:
                     "requested_at": datetime.now(timezone.utc).isoformat(),
                 }
                 await self._broadcast_sse("new_request", event)
+                await self._notify_project_officer(
+                    request_id, job_id, command, "vm_upgrade"
+                )
 
             return request_id
         except Exception as e:

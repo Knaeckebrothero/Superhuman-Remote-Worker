@@ -664,7 +664,15 @@ async def _boot_ws_watchdog(timeout_s: int) -> None:
     forever heartbeating and holding a slot. The orchestrator reconciler
     catches this too, but only after a 60s+ delay; this watchdog kills
     locally on the configured cadence.
+
+    Officer sessions are exempt: they are headless BY DESIGN — no browser
+    ever attaches, so "no WS yet" is their normal steady state, not
+    abandonment (found by the S3 k3d smoke: every officer died exactly
+    600s after boot and had to be respawned by the orchestrator watchdog).
+    The officer watchdog owns their lifecycle end to end.
     """
+    if _officer_cfg() is not None:
+        return
     if _ws_connected_event is None:
         return
     try:

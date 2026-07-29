@@ -584,6 +584,12 @@ class PersistentProvisioner:
                                 "mountPath": "/home/srw",
                             },
                         ],
+                        # timeoutSeconds raised from the 1s default: token
+                        # counting and restore paths can block the event loop
+                        # for seconds at a time, and a 1s probe deadline
+                        # SIGKILLed a healthy officer pod mid-turn (exit 137,
+                        # k3d smoke). 5s tolerates legitimate loop stalls while
+                        # still catching a truly wedged process.
                         "livenessProbe": {
                             "httpGet": {
                                 "path": "/health",
@@ -591,14 +597,24 @@ class PersistentProvisioner:
                             },
                             "initialDelaySeconds": 60,
                             "periodSeconds": 30,
+                            "timeoutSeconds": 5,
+                            "failureThreshold": 4,
                         },
+                        # /health, NOT /ready: /ready reports "free to accept
+                        # a session" (503 while one is attached), which left
+                        # dedicated pods 0/1-Ready while demonstrably serving
+                        # turns (k3d smoke, open item 8). Dedicated pods are
+                        # addressed by pod IP, never through a Service
+                        # selector, so readiness here is operator signal —
+                        # and the honest signal is process health.
                         "readinessProbe": {
                             "httpGet": {
-                                "path": "/ready",
+                                "path": "/health",
                                 "port": 8001,
                             },
                             "initialDelaySeconds": 30,
                             "periodSeconds": 10,
+                            "timeoutSeconds": 5,
                         },
                         "startupProbe": {
                             "httpGet": {

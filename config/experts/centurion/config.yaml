@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=../../schema.json
+# Centurion — the standing officer of a project (docs/features/centurion.md).
+# An always-on session with NO workspace and NO object-level tools: his output
+# is judgment — dispatches, steering, verdicts, briefings. The officer
+# machinery (sleep tool, durable timer, watchdog, sitrep wakes) activates via
+# config_override.officer.enabled on the THREAD, not here: this same expert
+# also dresses conferences — interactive sessions wearing his identity —
+# which must stay ordinary sessions (centurion.md §2/S9).
+$extends: session_base
+
+agent_id: centurion
+display_name: Centurion
+description: |
+  Standing officer of a project: supervises its worker jobs, owns the
+  backlog, schedules and verifies work, and keeps the Legatus informed at
+  the right level of urgency. Runs 24/7 on a wake/sleep cycle with no task
+  pressure — stewardship, not task execution. The default project's
+  centurion bears the title Primus Pilus.
+icon: shield
+color: "#f38ba8"
+tags:
+  - officer
+  - centurion
+  - manager
+  - persistent
+
+# Klug und faul, structurally: the lite tier removes every hands-on tool
+# (files, shell, git, browser, canvas) at the backend filter, so delegation
+# is not a persona preference — it is the only path to getting work done.
+workspace:
+  backend: none
+
+# Officer cadence defaults; enabled stays false here (see header). The thread
+# override that provisions an officer flips enabled and may tighten bounds.
+officer:
+  enabled: false
+  sleep_min_minutes: 5
+  sleep_max_minutes: 60
+  max_concurrent_workers: 3
+  max_pages_per_day: 3
+  max_actions_per_wake: 10
+  daily_token_ceiling: 0
+
+tools:
+  # The command surface: delegation + oversight (session_base ships this
+  # category empty). sleep + notify_user arrive via the officer flag, not
+  # this list.
+  orchestrator:
+    - get_session_context
+    - create_worker_job
+    - list_worker_jobs
+    - get_worker_job
+    - get_job_workspace_file
+    - approve_worker_job
+    - resume_worker_job
+    - cancel_worker_job
+    - pause_worker_job
+    - steer_worker_job
+    - get_stuck_jobs
+  # Workers research; the officer judges. Dropping these keeps his toolset
+  # small enough that every wake's tool choice is obvious.
+  research: []
+  citation: []

@@ -43,6 +43,19 @@ OFFICER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "End the wake; sleep until the timer or an event.",
         "phases": ["strategic", "tactical"],  # phase-free in sessions
     },
+    "notify_user": {
+        "module": "core.officer",
+        "function": "notify_user",
+        "description": (
+            "Message your Legatus (the user) out-of-band. urgency='log' for "
+            "the record only, 'digest' for the next briefing, 'page' for an "
+            "immediate notification (budgeted per day — over budget it "
+            "downgrades to digest). Officer sessions only."
+        ),
+        "category": "core",
+        "short_description": "Message the user: log, digest, or page.",
+        "phases": ["strategic", "tactical"],
+    },
 }
 
 
@@ -91,4 +104,68 @@ def create_officer_tools(context: ToolContext) -> List[Any]:
             "server-side). This turn ends now; events will wake you earlier."
         )
 
-    return [sleep]
+    @tool
+    async def notify_user(message: str, urgency: str = "log", subject: str = "") -> str:
+        """Message your Legatus (the user) through the notify contract.
+
+        Three tiers — pick the LOWEST that serves the purpose:
+          * ``log``: for the record only. Costs nothing, interrupts nobody.
+            The default; most observations belong here.
+          * ``digest``: queued for the next briefing/conference. For things
+            the Legatus should know but not be woken for.
+          * ``page``: immediate out-of-band notification (email/push). For
+            things that cannot wait: repeated failures you cannot fix, a
+            blocked decision above your authority, capacity exhausted with
+            work queued. Pages are budgeted per day; over budget the message
+            downgrades to digest — so spend them like the scarce resource
+            they are.
+
+        Args:
+            message: What the Legatus needs to know, in 1-5 sentences.
+            urgency: 'log' | 'digest' | 'page'.
+            subject: Short subject line (page/digest only).
+
+        Returns:
+            How the message was delivered (including budget state for pages).
+        """
+        # Local import: the shared client helpers live in the orchestrator
+        # tool family; importing at call time keeps this module free of an
+        # import-time httpx/env dependency for the sleep-only tests.
+        from ..orchestrator.jobs import _get_client, _get_orchestrator_url
+
+        thread_id = getattr(context, "thread_id", None)
+        if not thread_id:
+            return "notify_user unavailable: no thread id on this session."
+        url = f"{_get_orchestrator_url()}/api/agents/threads/{thread_id}/officer/notify"
+        try:
+            async with _get_client(user_id=getattr(context, "user_id", None)) as client:
+                resp = await client.post(
+                    url,
+                    json={
+                        "message": str(message),
+                        "urgency": str(urgency or "log"),
+                        "subject": str(subject or ""),
+                    },
+                )
+        except Exception as e:
+            logger.warning("notify_user failed (non-fatal): %s", e)
+            return f"notify_user failed to reach the orchestrator: {e}"
+        if resp.status_code != 200:
+            return f"notify_user rejected ({resp.status_code}): {resp.text[:200]}"
+        data = resp.json()
+        delivered = data.get("delivered")
+        if delivered == "page":
+            return (
+                f"Paged the Legatus ({data.get('pages_used_today')}/"
+                f"{data.get('pages_budget')} pages used today)."
+            )
+        if data.get("downgraded"):
+            return (
+                "Page budget exhausted or undeliverable — queued as digest "
+                f"({data.get('queued')} items pending)."
+            )
+        if delivered == "digest":
+            return f"Queued for the digest ({data.get('queued')} items pending)."
+        return "Logged."
+
+    return [sleep, notify_user]

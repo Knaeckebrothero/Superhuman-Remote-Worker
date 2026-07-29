@@ -349,7 +349,9 @@ class TestPodManifest:
         m = self._build()
         container = m["spec"]["containers"][0]
         assert container["livenessProbe"]["httpGet"]["path"] == "/health"
-        assert container["readinessProbe"]["httpGet"]["path"] == "/ready"
+        # /health, not /ready: /ready means "free to accept a session" and left
+        # dedicated pods 0/1-Ready while serving turns (k3d smoke item 8).
+        assert container["readinessProbe"]["httpGet"]["path"] == "/health"
         assert container["startupProbe"]["httpGet"]["path"] == "/health"
         assert container["startupProbe"]["failureThreshold"] == 10
 
