@@ -1,6 +1,10 @@
 # Per-job persistent VM rootdisks — reattach-on-recreate ("Branch a for VMs")
 
-**Status: PROPOSED — design ready, not started (2026-07-02).**
+**Status: IMPLEMENTED 2026-07-29 (Phases 0-2), flag-gated OFF, live gate
+owed.** Scope widened from the original proposal — see "Two false premises,
+corrected" below. Commits: `51c0bc71` (Phase 0, controller), `f4d05e07`
+(Phase 1, orchestrator), `dc3d3f8d` (session extension), `3de31025` (Phase 2,
+GC). Originally written 2026-07-02 as PROPOSED.
 
 Companion to:
 - [`workspace_pvc_branch_a_implementation.md`](workspace_pvc_branch_a_implementation.md) — the
@@ -207,10 +211,18 @@ silently reintroduce cascade-delete).
 
 ### D5 — what stays the same
 
-- **S3 SSH-tar snapshots remain** for what they're good at: pause/resume,
-  idle suspension, terminal archive, and the reconciler's snapshot-before-reap.
-  This feature removes their (never-working) role as a *crash* net, nothing
-  else.
+- **S3 SSH-tar snapshots remain** for terminal archive and IDE-on-old-jobs —
+  what a disk cannot do, because terminal purge deletes it by design.
+
+  > **Corrected 2026-07-29.** This bullet originally also claimed snapshots
+  > work at the graceful points (pause, idle suspension, snapshot-before-reap)
+  > and that this feature "removes their never-working role as a *crash* net,
+  > nothing else". For **VM** targets they have never worked at *any* point:
+  > capture SSHes from the orchestrator, a VM workspace is only reachable over
+  > the tailnet, and the orchestrator is not a tailnet node. So this feature
+  > covers materially more than the original text claims — every graceful VM
+  > point too. See
+  > `../issues/vm_workspace_snapshot_unreachable_from_orchestrator.md`.
 - Graph state continuity is already handled (D3 cross-pod Postgres
   checkpointer); this is its file-system counterpart.
 - Golden lifecycle, image-bump GC, fallback-to-registry: untouched.
@@ -269,9 +281,16 @@ D4 (sweep + backstop + quota knob).
 - **Suspend = VM stop/start** (`runStrategy` flip instead of
   snapshot+delete+restore). The natural endgame once the disk is independent;
   bigger blast radius (suspension service, reconciler `is_dirty` semantics).
-- **Session/thread VMs**: same mechanics would work (`release_thread_vm`),
-  but sessions already have working suspend/restore and aren't the loop's
-  hot path. One-line lift later, mirroring Branch a's session deferral.
+- ~~**Session/thread VMs**~~ — **promoted into scope and IMPLEMENTED**
+  (`dc3d3f8d`). The premise that "sessions already have working
+  suspend/restore" was false: VM session suspend was blocked first by a tier
+  misread (fixed, `6d66f7c4`) and then by the unreachable capture above, so no
+  VM session had ever suspended. Suspend now deletes the VM with
+  `purge_disk=False` and the disk carries the workspace to the resume; a
+  failed capture no longer blocks it (VM tier only — a pod has no disk to
+  keep, so it stays fail-closed). Restore skips the snapshot extract when the
+  disk was reattached: the disk is the live state at teardown, a snapshot is
+  the same moment at best and stale at worst.
 - **TopoLVM CoW**: orthogonal (makes the *first* clone near-instant);
   reattach already makes recovery clone-free.
 
