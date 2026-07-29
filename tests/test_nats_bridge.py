@@ -528,7 +528,18 @@ class TestRequestVmDelete:
         assert call_args.args[0] == "vm.lifecycle.delete.srw-test"
 
         payload = json.loads(call_args.args[1].decode())
-        assert payload == {"job_id": "test-job-456", "orchestrator_id": "srw-test"}
+        assert payload == {
+            "job_id": "test-job-456",
+            "orchestrator_id": "srw-test",
+            # Terminal by default; False keeps the persistent rootdisk.
+            "purge_disk": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_delete_can_request_a_kept_disk(self, bridge_with_db, mock_nc):
+        await bridge_with_db.request_vm_delete("test-job-456", purge_disk=False)
+        payload = json.loads(mock_nc.publish.call_args.args[1].decode())
+        assert payload["purge_disk"] is False
 
     @pytest.mark.asyncio
     async def test_delete_updates_vm_context(self, bridge_with_db, mock_db):
@@ -2078,3 +2089,72 @@ class TestRequestVmList:
             return_value=self._reply({"status": "list_failed", "error": "boom"})
         )
         assert await bridge.request_vm_list() is None
+
+
+class TestRootdiskDispositionIsRecorded:
+    """The controller's answer, not the orchestrator's intent.
+
+    A controller without VM_PERSISTENT_ROOTDISK cascade-deletes the disk
+    whatever purge_disk said, so context.vm.rootdisk must reflect what came
+    back — the kept-disk GC sweep keys off it.
+    docs/features/vm_persistent_rootdisk.md D2/D4.
+    """
+
+    @pytest.mark.asyncio
+    async def test_kept_disk_is_persisted(self, bridge_with_db, mock_db):
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value={"id": "j1"})
+
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg({"job_id": "j1", "status": "deleted", "rootdisk": "kept"})
+        )
+
+        ctx = mock_db.merge_vm_context.await_args.args[1]
+        assert ctx["rootdisk"] == "kept"
+
+    @pytest.mark.asyncio
+    async def test_purged_disk_overwrites_an_optimistic_keep(
+        self, bridge_with_db, mock_db
+    ):
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value={"id": "j1"})
+
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg({"job_id": "j1", "status": "deleted", "rootdisk": "purged"})
+        )
+
+        ctx = mock_db.merge_vm_context.await_args.args[1]
+        assert ctx["rootdisk"] == "purged"
+
+    @pytest.mark.asyncio
+    async def test_old_controller_silence_is_reported(
+        self, bridge_with_db, mock_db, caplog
+    ):
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value={"id": "j1"})
+
+        with caplog.at_level("WARNING"):
+            await bridge_with_db._on_vm_lifecycle_status(
+                make_msg({"job_id": "j1", "status": "deleted"})
+            )
+
+        assert "no rootdisk disposition" in caplog.text
+        ctx = mock_db.merge_vm_context.await_args.args[1]
+        assert "rootdisk" not in ctx
+
+    @pytest.mark.asyncio
+    async def test_non_delete_status_is_untouched(
+        self, bridge_with_db, mock_db, caplog
+    ):
+        """created/failed statuses say nothing about disks — no key, no noise."""
+        mock_db.get_thread = AsyncMock(return_value=None)
+        mock_db.get_job = AsyncMock(return_value={"id": "j1"})
+
+        with caplog.at_level("WARNING"):
+            await bridge_with_db._on_vm_lifecycle_status(
+                make_msg({"job_id": "j1", "status": "created"})
+            )
+
+        assert "rootdisk" not in caplog.text
+        ctx = mock_db.merge_vm_context.await_args.args[1]
+        assert "rootdisk" not in ctx
