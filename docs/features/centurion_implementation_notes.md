@@ -1,0 +1,175 @@
+---
+tags:
+  - feature
+  - implementation
+  - agent
+  - orchestration
+aliases:
+  - centurion implementation notes
+  - officer implementation plan
+related:
+  - "[[centurion]]"
+---
+
+# Centurion — anchored implementation notes
+
+Companion to [[centurion]]. Distilled from the 2026-07-28 code-planner research (three agents; all anchors verified against the working tree at `95ee3011` that day — re-verify on pickup, they will drift). This is the build plan; the design rationale lives in the feature doc.
+
+## S1+S2 — Officer substrate + sleep tool (agent side)
+
+### Turn lifecycle facts
+
+- `run_persistent_loop` `src/persistent_graph.py:665`; outer `while True` :740; blocks on `callbacks.get_user_input()` :744; input items → `HumanMessage` :804–811 (`role` via `PERSIST_ROLE_KEY` :807, accepted roles `{human,event}` `persistent_app.py:276`; missing id minted :812).
+- `_execute_turn` :1009; inner loop :1268; **turn ends on `not response.tool_calls` → break** :2127–2129; tools executed by direct `await tool.ainvoke(...)` :2220 inside `for` over tool_calls :2132; ToolMessage append+persist :2238–2245; **tool results otherwise feed straight back to the LLM** (:2277).
+- Precedents: `TurnResult` :319–332 (`awaiting_permission` :332 — permission gate ends a turn mid-batch :2192–2197); **freeze-request seam** = the model for sleep: `request_workspace_upgrade` (`src/tools/core/upgrade.py:52–100`) sets `context.request_freeze` (`src/tools/context.py:783–793`), turn loop checks `consume_freeze_request()` at `persistent_graph.py:2269–2275`.
+- `/done` is a WS method (`persistent_app.py:2964–2966` → `_handle_archive` :6240), not a tool. `INTERRUPT_SENTINEL` `persistent_graph.py:237`.
+
+### Sleep tool design (decided)
+
+Real registered tool + ToolContext flag (NOT a pre-dispatch sentinel — a real tool gets streaming/persist/pairing for free):
+
+1. `src/tools/context.py:783–805` — beside freeze slot: `officer_sleep_request: Optional[dict]`, `request_officer_sleep(minutes, reason)`, `peek_officer_sleep()` (turn loop), `consume_officer_sleep()` (transport).
+2. New `src/tools/core/officer.py` mirroring `upgrade.py:35–100` — `OFFICER_TOOLS_METADATA` (category `core` so `filter_tools_by_backend` `src/tools/registry.py:214–267` never drops it on `none`) + `create_officer_tools`: `@tool sleep(minutes, reason)` → clamp advisory, set request, return "sleeping for N minutes — events will wake you early."
+3. Wire: `src/tools/core/__init__.py:23–51` (mirror upgrade lines :25/:37/:46/:51); `registry.py:428` extend no-workspace exemption with `OFFICER_TOOLS_METADATA`; `src/api/persistent_session.py:1541–1547` append `"sleep"` when `config.officer.enabled`.
+4. `persistent_graph.py` — `TurnResult.ended_by_sleep: bool = False`; after the tool-batch `for` (between :2276 and :2277): `if tool_context and tool_context.peek_officer_sleep(): break`; return carries `ended_by_sleep=True`. Guard `tool_context=None` (tests build callbacks without one).
+5. Optional belt: `persistent_app.py:4400–4409` `_loop_permission_check` early-APPROVE for `sleep` (side-effect-free) so it works outside `autonomous` mode.
+
+### Wake deadline (decided)
+
+- `_loop_get_user_input` `src/api/persistent_app.py:3924–3999`: today `asyncio.wait_for(queue.get(), idle_timeout_minutes*60)` :3974–3978; on timeout broadcasts `session.idle_timeout` + **raises `IdleTimeoutError`** :3996 → `_loop_completion_handler` :4976 (idle branch :4990–4996) → `_handle_idle_archive` :6340 → `_terminate_session("idle_timeout")` :2102 (writes `'ended'` :2212–2213). **Idle timeout is terminal; officer branch replaces it.**
+- Officer branch (gated `officer.enabled`): consume sleep request → deadline `now + clamp(minutes, sleep_min, sleep_max)`; **no request → `sleep_max`** (implicit); `wait_for(queue.get(), remaining)`; on timeout **return** `{"content": "[timer wake] slept N min (reason…)", "role": "event"}` — never raise. Mirror deadline into thread metadata (DB-authoritative; watchdog reads it). Module global cleared in `_terminate_session` (:2267 area).
+- Skip both `awaiting_user` flips when officer: input-park `should_flip` :3952–3963 and sudo-gate flip `_loop_permission_check` :4478–4482. Eager/polite: neither auto-continues (modes only control the flip); polite+officer contradictory → officer bypasses both regardless of mode.
+- Suppress the per-park `"ready"` NATS mirror for officers (`emit_session_event` :310–321 or broadcast site :3937; `_NOTIFICATION_METHODS` :257–266 → `session.waiting` SSE via `orchestrator/services/nats_bridge.py:819–826`) — else ~48 feed events/day.
+
+### Config plumbing (decided)
+
+- `OfficerConfig` dataclass beside `HeadlessConfig` (`src/core/loader.py:1827–1837`), field on `AgentConfig` :1893; parse in **both** `load_agent_config` (:2382–2390) and `load_agent_config_from_dict` (:2617–2624); add `"officer"` to **both** `known_fields` sets (:2351–2372, :2604). One shared parse helper — split-brain between file-boot and dict-boot is a real risk.
+- Schema: `officer: {enabled: false, sleep_min_minutes: 5, sleep_max_minutes: 60, max_concurrent_workers: 3, max_pages_per_day: 3, max_actions_per_wake: 10, daily_token_ceiling: <n>}`.
+- **Hard constraint**: officer-ness must ALSO be stamped into `threads.metadata.config_override.officer` at thread creation — orchestrator sweeps are SQL over metadata (pattern `orchestrator/main.py:24909`) and cannot see resolved expert config. Standardize one predicate: `COALESCE(t.metadata->'config_override'->'officer'->>'enabled','false') = 'true'` (constant near :24860). Config flows to the pod via existing `resolved_config` fetch (`_resolve_session_config` `main.py:1556–1679`; merge order session_base → account defaults :1516–1553 → expert → project → `metadata.config_override` :1590–1594; grant PDP `src/core/capability_grants.py:147` ignores unknown keys — cannot brick dispatch).
+
+### Orchestrator exemptions (decided)
+
+- Attention-sleep sweeper WHERE `main.py:24902–24921` (sweeper :24868): add officer exclusion. (`none`-backend threads already fail suspension at `workspace_suspension.py:504–505` — no ssh_host — but churn in `awaiting_user`; exempt explicitly.)
+- `mark_orphaned_threads_ended` `orchestrator/database/postgres.py:5904` (SQL :5926–5930; caller `main.py:774–787`): exclude officers — otherwise a dead officer pod flips the thread `'ended'` in ~4 min. Watchdog owns officer lifecycle. Leave `mark_orphaned_threads_suspended` (:5936, SQL :5967–5971) unchanged (agent_id already NULL post-drain; officer never enters `awaiting_user`).
+
+### Watchdog + respawn (decided)
+
+- **The loop starts lazily** — only on first REST input (`handle_api_input` → `_ensure_persistent_loop_started("rest_input")` :2663) or WS attach (:2838). A respawned pod restores the session (`_attach_session` :1430 → `_restore_session_messages` **:5124** (def; called :2080) → status active :2083 → loop primitives :2090) and then parks with **no running loop**. Durable wakes restore as history rows (:5075–5087), not queue input.
+- **Boot self-wake** (loop bootstrap + doc's respawn wake in one): end of `_attach_session` (after :2097), if officer → `_ensure_persistent_loop_started("officer_boot")` + `_accept_user_input("[wake: session started/restarted]…", role="event")`. Covers dedicated boot (lifespan :1041) and pool attach (`POST /session/attach` :2413).
+- New `orchestrator/services/officer_watchdog.py`, leader-gated beside `main.py:7459–7461`, ~60s tick: select officer threads status IN (`active`,`suspended`); liveness via `session_wake._resolve_live_agent` (:313–351) + `probe_ready` (`services/session_lifecycle.py:77`); **turn-activity via `MAX(created_at) FROM thread_messages WHERE role IN ('ai','tool')`** — NOT `threads.last_activity` (bumped by every row incl. durable notices, `postgres.py:6252–6261`). Overdue > `sleep_max + grace` → force-inject `[watchdog] overdue wake` direct to pod `/api/input` (the `_inject_live` pattern; deliberately bypasses the orchestrator turn lock :24024). Inject failed / agent offline / `suspended` → respawn via `_reprovision` split (idle pool `_find_idle_persistent_agent` :3167 / dedicated pod :23383–23386; `main.py:23292–23400`), **rate-limited one attempt per thread per N min**; page owner via NotificationService on repeated failure. Env: `OFFICER_WATCHDOG_INTERVAL_S`, `OFFICER_WAKE_GRACE_MINUTES`.
+- **Deploys drain-suspend parked sessions** (drain intent `persistent_app.py:491–529`) — `suspended` is the officer's routine down-state; respawn-from-suspended is the common path.
+- **Retirement**: `end_thread` `main.py:23062` additionally writes `officer.enabled=false` so the watchdog stands down. Crash-`ended` (`_terminate_session("loop_crash")` :2212–2213/:5003) with flag still true → **page, don't auto-resurrect** (pending Legatus confirmation).
+
+### Blast radius / tests
+
+- `tests/test_idle_timeout.py`, `tests/test_attention_sleep_phase5.py` (:63, :147–177), `tests/test_headless_polite_phase6.py` (:97, :151–216) pin `_loop_get_user_input` — officer default-off keeps them green; add officer siblings.
+- dual_app extract-delegate rule (`headless_persistent_sessions.md:450`): zero new agent routes — sleep/wake ride `/api/input` (dual_app delegates :1174); all new logic module-level.
+- Stale anchors found during research: `_restore_session_messages` is :5124 (not :2379); `create_agent_pod` def :157.
+
+## S3 — Event outbox + sitrep (orchestrator side)
+
+### Why a new table
+
+`maybe_wake_session(db, job_id, terminal_status)` (`orchestrator/services/session_wake.py:113`) is a **jobs-row outbox**: guarded `UPDATE jobs SET wake_state='pending'` (`mark_job_wake_pending` `postgres.py:4970–5010`) gated on `wake_on_complete AND created_by_thread_id IS NOT NULL AND status ∈ {completed,failed,cancelled,pending_review}` (`TERMINAL_STATUSES` :73 — **no `paused`**; columns `schema_current.sql:976–980`, partial index :3084). It cannot represent jobs the officer didn't create, `paused`, sudo, or fleet events. Reusable: `_resolve_live_agent` :313, `_inject_live` :354–386 (POSTs `{"content", "role": "event"}` to pod `/api/input` after `probe_ready`), `_deliver_durable` :394 (transcript row + claim settle), claim-then-send discipline, sweeper `session_wake_sweeper_loop` :631 / `kick_drain` :156.
+
+**`role='event'` is transcript-only — the model sees a plain HumanMessage** (`persistent_app.py:2549–2631` persist-then-enqueue; restore comment :5075–5087). Mid-turn injection queues; **one queue item = one paid turn** (no coalescing exists anywhere). The orchestrator turn lock (`_ensure_thread_turn_lock` :23594–23617, in-process per-replica) is bypassed by direct pod POSTs — benign by design (dedup is the DB claim).
+
+### Migration `session_wake_events` (app migration, next free number)
+
+```sql
+CREATE TABLE session_wake_events (
+    id BIGSERIAL PRIMARY KEY,
+    thread_id uuid NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    project_id uuid,
+    source text NOT NULL,      -- 'job_transition'|'sudo_request'|'fleet'|'loop'|'respawn'
+    dedup_key text NOT NULL,   -- '<job8>:<status>' | 'sudo:<id>' | 'fleet:<step>'
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','sending','sent','dead')),
+    attempts int NOT NULL DEFAULT 0,
+    claimed_at timestamptz, sent_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX uq_swe_pending ON session_wake_events (thread_id, source, dedup_key) WHERE state='pending';
+CREATE INDEX idx_swe_claim ON session_wake_events (created_at) WHERE state IN ('pending','sending');
+CREATE INDEX idx_swe_debounce ON session_wake_events (thread_id, source, sent_at) WHERE state='sent';
+```
+
+Same migration: extend `project_loop_scheduling_known` CHECK with `'officer'` (`schema_current.sql:1304`); relax `project_loop_has_budget` (:1302) with `OR scheduling='officer'`. Optional partial index on officer threads.
+
+### DB + service methods
+
+- `postgres.py` — mirror the jobs-outbox trio (:4970–5142): `enqueue_session_wake_event` (ON CONFLICT DO NOTHING), `claim_pending_session_wake_events(limit, visibility_timeout, debounce_by_source)` (FOR UPDATE SKIP LOCKED; debounce = NOT EXISTS recent `sent` same `(thread_id, source)`), `finish_/release_/gc_session_wake_events`; `get_officer_thread_for_project(project_id)` (threads.project_id `schema_current.sql:2015`, idx :3392) + `list_officer_threads()`; `count_active_thread_jobs(thread_id)` (terminal set as `get_thread_job_counts` :5165–5198); `merge_thread_officer_state` (jsonb merge modeled on `merge_workspace_container_context` :3360).
+- `session_wake.py` — factor delivery; add `notify_officer(db, project_id, source, dedup_key, payload)` (never raises; no-op without officer) + `notify_all_officers`; `drain_pending_event_wakes`: claim → group by thread → `sitrep.build_wake_message` → one `_inject_live` per thread → live success: `finish` + advance watermark; durable fallback: compact reason-only notice, `finish`, **do NOT advance watermark**. Extend sweeper loop + kick to drain both queues.
+- **Double-wake suppression**: in `_deliver` (:265), if target thread is officer → enqueue `job_transition` event and consume the jobs-outbox claim WITHOUT injecting `[JOB_FINISHED]`. Jobs outbox stays the durable trigger (incl. its by-status backstop arm `postgres.py:5072–5075`); event outbox is the single officer delivery channel.
+
+### Sitrep data sources (verified)
+
+| Field | Source | Trap |
+|---|---|---|
+| Job transitions | `jobs` status/`completed_at`/`failed_at` (0072; schema:981) via `idx_jobs_project_id` :3063, **snapshot-diff vs stored fingerprints** | `updated_at` poisoned: trigger :3693 fires on gc FK cascades (documented schema:1049) and wake-state writes |
+| Steps / phase / last write | **audit DB** `agent_audit` (audit/0001:116–196): `COUNT(*) WHERE event_phase='pre'`, `MAX(timestamp)`, `MAX(phase_number)` per job | `get_job_progress` (`postgres.py:3735–3780`) is a **stub** (`progress_percent: 0` hardcoded) — do not build on it |
+| Liveness | `agents.metadata->>'graph_progress'` + `graph_progress_seen_at` (heartbeat `main.py:20943` → `postgres.py:4214`; stall-sweep consumer :6027–6038) | |
+| Tokens | **audit DB** `usage_events` (`ref_id`=job, audit/0002:46–112) or `llm_requests.metrics` | `jobs.total_tokens_used` is a **dead column** (zero writers) |
+| Fleet | `agents` GROUP BY status (schema:197–216) | |
+| Capacity | `COUNT(*) FROM jobs WHERE created_by_thread_id=$1 AND status NOT IN (…)` vs metadata cap | |
+| Pending | `sudo_approval_requests` (schema:1653; sudo TTL 300s :1668, vm 24h) JOIN jobs for project; `thread_permission_requests` (schema:1971) for the officer thread | |
+| Budget | `usage_ledger.query_usage(from, to, scope_project_id)` (`services/usage_ledger.py:272–340`; singleton `main.py:7150`) | |
+| Watermark | `threads.metadata.officer.sitrep = {watermark, fingerprints, prev_fingerprints}` via `merge_thread_officer_state` | Advance ONLY on live delivery |
+
+~8 indexed queries, low tens of ms; 300–900 tokens at ~10 jobs (tier: full for active/stuck, one-liners healthy, cap transitions ~20). Every section in its own try/except (stale-detector `_step` isolation pattern `main.py:687–702`); audit-DB optional at startup (`main.py:7082–7101`) — degrade per-section.
+
+## S4 — Wake call sites
+
+| Event | Anchor | Note |
+|---|---|---|
+| completed/failed/cancelled/pending_review (agent report) | `complete_job` hooks `main.py:15105–15106` (keyed on `new_status`; loop advance :15086 runs first — enqueues coalesce) | include `paused` here for freeze-completions (~:14900–15020 freeze arm) |
+| cancelled (cockpit) | :9130 | |
+| pending_review→completed (approve) | :11136 | |
+| critic-approval / escalation terminals | :11502 / :11537 | |
+| paused (user/agent pause) | `pause_job` :9144+ after status write | |
+| sudo pending | `sudo_gate.py` after :157 (alongside `_broadcast_sse("new_request")` :170); project via `db.get_job(job_id).project_id`; vm-upgrade insert `main.py:14958` | 300s sudo TTL expires before a down officer sees it — human notification remains the fallback; don't promise sudo coverage from a dead officer |
+| fleet: agents offline / orphans recovered | `stale_agent_detector` step 1 :707–715, step 4 :807–814 (count only), step 4b :821–832 (job ids) → `notify_all_officers`, `dedup_key='fleet:<step>'`, 10-min debounce | |
+| session permission gates | **no orchestrator write site** — agent INSERTs `thread_permission_requests` directly (`persistent_app.py:4374+`) | defer; sitrep pending count covers |
+
+## S5 — Toolset + capacity (verified inventory)
+
+- `src/tools/orchestrator/` = **26 tools / 5 modules** (`__init__.py:12`): jobs.py 9 (metadata :25; `create_worker_job` :493 → `POST /api/jobs` :587 with `payload["thread_id"]=context.thread_id` :568; errors relayed verbatim :610–611; `_TRANSPORT_DENY` :171 rejects config_override carrying api_key/base_url/env_keys), projects.py 2, repositories.py 3, catalog.py 9, workflows.py 9 (incl. `get_project_loop` :744). Auth: `_get_client` :139 — `X-Internal-Key` + `X-MCP-User-Id` (docstring :146–156). **Category ships empty** (`config/session_base.yaml:117`); registry instantiates only requested names (`registry.py:693–702`); no shipped expert enables it → `centurion.yaml` must.
+- **Missing wrappers (~30 lines each)**: steer → endpoint `POST /api/jobs/{id}/messages/{thread_id}/reply` `main.py:9793` (`require_job_access` :9807; `_route_inbound_reply` :9640; `append_queued_reply` `postgres.py:1965`; worker consumes `src/graph.py:3413`/:3542); stuck/fleet → `GET /api/stats/stuck` `main.py:17865–17867`.
+- **`notify_user`**: does not exist (`docs/features/notify_user_tool.md:21` = design phase; zero code hits). `send_message` can't be repointed: sessions ship `communication: []` (`session_base.yaml:137`), endpoint 404s without a jobs row (`main.py:9300–9302`). Build: thread-scoped endpoint → `notification_service.dispatch()` (`notification_service.py:93`; quiet hours :563; existing job rate-limits :9384–9431 as precedent). Page budget/urgency per feature doc §6.
+- **Capacity**: enforce in `POST /api/jobs` (`main.py:8368`) after `creating_thread_id` resolution :8668–8670 (persisted as `created_by_thread_id` + `wake_on_complete=true` for roots :8687–8688; column from migration 0070, comment schema:1025–1028): load thread → if officer → `count_active_thread_jobs` under `pg_advisory_xact_lock(hashtext(thread_id))` (TOCTOU) → 409 actionable detail. Optional `context.officer_created=true` for cockpit badging (automation precedent: `services/automations.py:138–143`).
+
+## S6+S7 — Expert config, charter, KB types
+
+- KB tools under `none`: **work** — `filter_tools_by_backend` drops only shell/browser/git + workspace/canvas (`registry.py:214–268`; `ScratchBackend.supports_file_tools=False` `scratch.py:59`); real gate is `context.knowledge_store` (`registry.py:638–639`), built vector-DB-only (`persistent_session.py:1097`; early-return without bindings/projects :1088). Dual-write **silently skipped** without git (`_dual_write_note` `knowledge_tools.py:499`, early return :511; lite path sets `git_versioning=False` `persistent_session.py:454`) → **pgvector write is the only durable write and is warn-only** (:1156–1158) — consider hard-fail for officer sessions. Sessions enable 10/12 kb tools (`session_base.yaml:104–115`; missing `kb_lint`/`kb_index` — fine for v1).
+- Injection seam: `_inject_context_pairs` `persistent_graph.py:87` (anchor `workspace_injection.py:41`; call site :1391; retrieval assembly :1070–1266) injects manager/memory/knowledge/citation blocks. **Both KB routes are top-5 relevance-ranked** (`KbNotesRetriever` `src/services/memory/plugins/legacy.py:115`, hybrid_search :149–155; bindings route `src/core/knowledge_injection.py:95` at :1178) — charter needs a **fifth unconditional block** fetching `(project_id, note_type='charter')`. No pinned flag exists on notes.
+- `charter` + `report` note types: vector migration (next free number; model on `vector/0013_kb_backlog_ticket_types.sql` + `0014_….notx.sql`) editing CHECK `valid_note_type` (`vector_schema.sql:492–497`); **three lockstep code sites**: `src/services/knowledge_graph.py:46` `NOTE_TYPES` (canonical; enforced `knowledge_tools.py:1096`), `orchestrator/services/kb_reindex.py:71` `VALID_NOTE_TYPES` (unknown → silently rewritten to `learning` :87/:235), plus the migration. One-charter-per-project = `(project_id, note_type)` via `uq_knowledge_project_note` (:491).
+- Backlog lifecycle: create via `kb_write` (`_TICKET_TYPES` `knowledge_tools.py:87`; default `status='active'` :1171) → `fetch_backlog` (`project_backlog.py:56`; cap 20 :53–54; index `vector_schema.sql:517–519`) → injected at the single loop-kickoff funnel `main.py:12897–12916` → closed by **exactly one caller** `main.py:13635–13641` (campaign disposition; `close_backlog_ticket` `project_backlog.py:224` mirrors Gitea file + index row). Officer mode: officer closes tickets after §5 verification; define officer "in progress" convention (campaign-derived today, docstring :10–13).
+- RecallStore in sessions: `capture(turn_end)` `persistent_graph.py:855–866`; `PersistentIntervalExtractor` `legacy_writers.py:108` (interval gate :126–130); `observer_interval: 5` + `project_scoped: true` `session_base.yaml:167–169`; pre-compaction :1297–1307; teardown `persistent_app.py:6267`/:6364; store built `persistent_session.py:2026–2037`.
+- Recon shape: `config/experts/curator/config.yaml:9–11` (KB-writing deliverable, KB-only toolset :42–43); no `report` note_type exists yet (13 types `knowledge_graph.py:46–64`; closest `retrospective`/`state`).
+- `threads` facts: `project_id` (schema:754–758 / schema_current:2015), `metadata` keys in use: workspace_container, vm, snapshot, config_override, datasource_ids, expert_id, project_ids (legacy), cloud, protected_cloud(_error), build_sha; merge helpers `postgres.py:3360/:3496/:3568/:3607/:3693`; redaction `main.py:8320`. No `officer` collision (grepped).
+
+## S8 — Scheduling mode `officer`
+
+- `scheduling` read sites: `main.py:13747` (`_rotate_loop_to_next_stage` campaign step); `services/project_loops.py:774`/:894 (campaign kickoff / loop_plan grant in `create_loop_job` :791); `routers/project_loops.py:67` (pattern `^(standard|campaign)$`), :125, :185; `postgres.py:12769/12793/12816` insert; **:12893 deliberately non-updatable**. CHECKs: `project_loop_scheduling_known` schema:1304; `project_loop_has_budget` :1302.
+- **Branch**: in `_advance_loop_member` (`main.py:13929`), after per-member merge/retro :13972 and `_notify_loop_user_questions` :13983, **after winning `claim_project_loop_stage_barrier` :13986** (= exactly-once wake guard), before stop/bookkeeping :13994–14061: update loop counters (consecutive_failures/last_error for sitrep) → `notify_officer(project_id,'job_transition', f"{job_id}:{status}")` → `kick_event_drain()` → return. Bypasses: `remaining_iterations` decrement + `_loop_stop_reason` (:13275), cooldown park :14027, `_rotate_loop_to_next_stage` :13712 (incl. campaign :13747 and **KB-TTL decrement :13772** — officer projects lose cycle-based TTL ticking; documented trade-off). Also guard `_resume_project_loop` :14064 (re-runs advance; dedup key makes it safe).
+- **Sweeper** (`project_loop_sweeper.py:119`): stage-sweep (:130–131 → `_sweep_stage` :182) **keep** — safety net; heal (:160–179 → `_heal_wedged_loop` :326; `HEAL_GRACE_SECONDS=600` :84; restore `heal_project_loop_stage` `postgres.py:13007–13031`) **must skip officer** — else all-terminal stage restored → barrier re-fires → duplicate wake every ~10 min forever. Guard both the legacy pointer-adopt :134 and heal :164 branches.
+- **Start/convert**: `start_project_loop` (routers :74) always spawns `roles[0]` :194 — for officer skip first spawn, write empty pointers, require officer thread (400 otherwise). Conversion endpoint `POST /api/projects/{id}/loop/scheduling`: editor+; require officer thread; reject mid-flight campaign; guarded UPDATE (extend `_PROJECT_LOOP_UPDATABLE_FIELDS` `postgres.py:12873–12895` with superseding comment, or dedicated raw-SQL method).
+
+## Sequencing & risks (merged)
+
+**Order**: S1+S2 (agent substrate) → S3 (outbox+sitrep) → S4/S5/S6/S7 parallel → S8 last. Capacity (S5) is independent after S1's metadata stamp.
+
+**Top risks**:
+1. Double-wake officer-created jobs (both outboxes) — closed by the `_deliver` suppression; without it every delegation costs two turns per completion.
+2. Sweeper heal loop on officer projects — closed by the skip guard; evidence chain `project_loop_sweeper.py:160–179/:326–404` + `postgres.py:13007–13031`.
+3. Watermark on `updated_at` — snapshot-diff only (schema:1049 documents the trigger poison).
+4. `_loop_get_user_input` regression (three test files pin it) — officer branch fully separate, default off.
+5. Durable-delivery ≠ wake — watermark must not advance on durable branch; respawn wake re-covers.
+6. `paused` must NOT enter the legacy outbox's `TERMINAL_STATUSES` (would spam ordinary sessions and corrupt `wake_notified_status` for redispatchable pauses).
+7. Wake storms — insert dedup + per-source debounce (≥5 min; fleet 10) + per-thread coalescing + global throttle; residual: two replicas can claim disjoint batches (SKIP LOCKED) → at most two messages per burst (acceptable; later per-thread advisory lock in the drain).
+8. Cross-DB sitrep fragility — per-section isolation; audit DB optional (`main.py:7082–7101`).
+9. Capacity TOCTOU on parallel tool calls — advisory xact lock.
+10. Officer resurrect-vs-retire — `officer.enabled=false` on deliberate end; crash-ended paged (pending decision).
+11. pgvector warn-only KB write = silent data loss for officer notes — consider hard-fail (or retry) when `officer.enabled`.
+
+**Test matrix (minimum)**: sleep-tool turn-break unit; officer input-wait deadline/synthesis (pattern `test_attention_sleep_phase5.py:147`); loader parse both paths; sweeper-exclusion SQL; watchdog decision matrix; outbox enqueue-dedup/claim/debounce/grouping; officer completion → exactly one `[SITREP]` turn (and no `[JOB_FINISHED]`); officer loop advance leaves pointers empty across two sweeper ticks (no heal, no double wake); capacity 409 at cap; sitrep sections survive audit-DB outage; regression: `test_idle_timeout.py`, `test_attention_sleep_phase5.py`, `test_headless_polite_phase6.py` untouched green.

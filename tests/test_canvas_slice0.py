@@ -74,6 +74,11 @@ class _FakeCanvasDB:
             assert isinstance(args[0], int)
             self.advisory_calls += 1
             return None
+        # Durable presentation copies are a separate table this double does not
+        # model; a thread here never has one. Matched explicitly so a genuinely
+        # unexpected statement still fails loudly.
+        if sql.startswith("DELETE FROM canvas_snapshots"):
+            return None
         raise AssertionError(f"unexpected Canvas SQL: {sql}")
 
     async def fetchrow(self, query: str, *args: Any) -> dict[str, Any] | None:
@@ -85,6 +90,9 @@ class _FakeCanvasDB:
                 "user_id": "user-1",
                 "metadata": {},
             }
+
+        if "FROM canvas_snapshots" in sql:
+            return None
 
         if sql.startswith("SELECT thread_id"):
             key = (str(args[0]), str(args[1]))

@@ -567,7 +567,10 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "enabled": { "type": "boolean" },
+        "enabled": {
+          "type": ["boolean", "null"],
+          "description": "null = auto: run the bundled object store unless s3.endpoint is set. true/false are explicit and always win."
+        },
         "image": { "type": "string" },
         "replicas": { "type": "integer", "minimum": 1, "maximum": 1 },
         "storageClass": { "type": "string" },

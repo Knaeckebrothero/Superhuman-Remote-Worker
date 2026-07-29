@@ -113,7 +113,7 @@ spec:
       ports:
         - protocol: TCP
           port: 7688
-    {{- if .Values.garage.enabled }}
+    {{- if (include "srw.garageEnabled" .) }}
     # Bundled Garage object store — virtual-tier S3 (file tools over rclone).
     - to:
         - podSelector:

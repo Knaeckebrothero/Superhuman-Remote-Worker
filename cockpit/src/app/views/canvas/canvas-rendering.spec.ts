@@ -11,6 +11,7 @@ import {
   STATIC_HTML_CSP,
   buildCanvasFrameWrapper,
   canvasSourceKey,
+  declaredCanvasRenderer,
   renderCanvasInteractiveHtml,
   renderCanvasMarkdown,
   renderCanvasStaticHtml,
@@ -385,5 +386,28 @@ describe('Dynamic Canvas rendering trust boundary', () => {
     const rejected = renderCanvasStaticHtml(html);
     expect(rejected).toEqual({html: '', errorCode: 'canvas_content_too_complex'});
     expect(rejected.html).not.toContain('do-not-reflect-me');
+  });
+});
+
+describe('declared renderer labelling', () => {
+  it.each(['markdown', 'text', 'html', 'html-interactive', 'image', 'office'] as const)(
+    'reports %s regardless of runtime capability or loaded content',
+    renderer => {
+      // selectCanvasRenderer answers "what can mount right now" and degrades to
+      // unsupported without capabilities; the label must not inherit that.
+      expect(declaredCanvasRenderer(state(renderer))).toBe(renderer);
+    },
+  );
+
+  it('names live-app and browser sources by their kind', () => {
+    expect(declaredCanvasRenderer(state('auto', 'workspace_app'))).toBe('app');
+    expect(declaredCanvasRenderer(state('auto', 'browser'))).toBe('browser');
+  });
+
+  it('reserves unsupported for a genuinely unknown source or renderer', () => {
+    expect(declaredCanvasRenderer(null)).toBe('unsupported');
+    expect(declaredCanvasRenderer({...state('markdown'), source: null})).toBe('unsupported');
+    expect(declaredCanvasRenderer(state('mystery' as CanvasState['renderer'])))
+      .toBe('unsupported');
   });
 });

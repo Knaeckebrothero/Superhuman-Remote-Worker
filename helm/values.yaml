@@ -1678,7 +1678,17 @@ s3:
 # virtualWorkspace.s3.region at their us-east-1 defaults when using it; a region
 # override would cause sigv4 signature mismatches against the store.
 garage:
-  enabled: false
+  # null = AUTO (default): run the bundled store unless you brought your own by
+  # setting `s3.endpoint`. Set `true` to force it on alongside an external
+  # endpoint, or `false` to run with no object store at all.
+  #
+  # Auto rather than a plain `false` default because every consumer degrades
+  # SILENTLY without a store: canvas presentations stop surviving their
+  # workspace (docs/features/canvas_durable_presentation.md), workspace
+  # snapshots never capture, and the virtual tier stays unwired. An operator who
+  # configures nothing should get a store that works, not a deployment that
+  # looks healthy and quietly forgets things.
+  enabled: null
   image: dxflrs/garage:v1.0.1        # pinned; admin API is "v1" for this tag
   replicas: 1                         # informational only — the StatefulSet fixes replicas to 1 (not tunable)
   storageClass: ""

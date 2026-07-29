@@ -59,6 +59,15 @@ export interface ToolCardAction {
     readonly kind: 'open_canvas';
     /** Revision presented by this historical tool result when recoverable. */
     readonly presentationRevision?: number;
+    /**
+     * Content hash presented by this historical tool result, when recoverable.
+     *
+     * Preferred over `presentationRevision` for deciding whether a card is
+     * still current: the revision advances for reasons that do not change what
+     * is on stage — notably re-binding a Canvas to a rebuilt workspace, which
+     * bumps it while presenting the identical bytes.
+     */
+    readonly sourceVersion?: string;
 }
 
 export type CanvasPresentationKind = 'file' | 'app' | 'canvas';

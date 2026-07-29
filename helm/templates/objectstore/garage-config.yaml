@@ -1,4 +1,4 @@
-{{- if .Values.garage.enabled }}
+{{- if (include "srw.garageEnabled" .) }}
 # Bundled Garage config. Secrets (rpc_secret, admin_token) are injected via env
 # (GARAGE_RPC_SECRET / GARAGE_ADMIN_TOKEN), NOT this file, so no secret sits in
 # a ConfigMap. Single-node: replication_factor 1.

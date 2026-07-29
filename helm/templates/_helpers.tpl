@@ -579,13 +579,39 @@ Neo4j Bolt URL — internal cluster service or external URL.
 {{- end }}
 
 {{/*
+Whether the bundled single-node object store runs.
+
+Tri-state on purpose. `true` and `false` are explicit operator decisions and
+always win. The default is null = AUTO: bring your own store by setting
+`s3.endpoint`, or say nothing and get the bundled one.
+
+Auto exists because every consumer of the object store fails SILENTLY without
+it — canvas durability keeps no copy, workspace snapshots never capture, the
+virtual tier stays unwired. "Operator said nothing" must therefore resolve to a
+working store rather than to a deployment that looks healthy and quietly
+forgets things.
+
+Keyed on `s3.endpoint` alone, not on the virtual-tier endpoint: it is the
+primary "do you already have an object store" signal, and an operator who has
+one can point both consumers at it. This also keeps the rule one comparison
+long, so a reader can predict the outcome without tracing the tier config.
+*/}}
+{{- define "srw.garageEnabled" -}}
+{{- if kindIs "invalid" .Values.garage.enabled -}}
+{{- if not (.Values.s3).endpoint -}}true{{- end -}}
+{{- else if .Values.garage.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
 Effective S3 endpoint for snapshots. External (s3.endpoint) wins; otherwise the
 bundled Garage service when enabled; otherwise empty (snapshots disabled).
 */}}
 {{- define "srw.effectiveS3Endpoint" -}}
 {{- if .Values.s3.endpoint -}}
 {{- .Values.s3.endpoint -}}
-{{- else if .Values.garage.enabled -}}
+{{- else if (include "srw.garageEnabled" .) -}}
 {{- printf "http://%s:3900" (include "srw.serviceName" (dict "context" . "component" "garage")) -}}
 {{- end -}}
 {{- end -}}
@@ -596,7 +622,7 @@ Effective virtual-workspace S3 endpoint. External wins; else bundled Garage.
 {{- define "srw.effectiveVwEndpoint" -}}
 {{- if .Values.virtualWorkspace.s3.endpoint -}}
 {{- .Values.virtualWorkspace.s3.endpoint -}}
-{{- else if .Values.garage.enabled -}}
+{{- else if (include "srw.garageEnabled" .) -}}
 {{- printf "http://%s:3900" (include "srw.serviceName" (dict "context" . "component" "garage")) -}}
 {{- end -}}
 {{- end -}}
@@ -608,7 +634,7 @@ Effective rclone backend type for the virtual tier. Explicit value wins; else
 {{- define "srw.effectiveVwRcloneType" -}}
 {{- if .Values.virtualWorkspace.rclone.type -}}
 {{- .Values.virtualWorkspace.rclone.type -}}
-{{- else if .Values.garage.enabled -}}
+{{- else if (include "srw.garageEnabled" .) -}}
 {{- "s3" -}}
 {{- end -}}
 {{- end -}}
@@ -620,7 +646,7 @@ the bundled Garage workspace bucket.
 {{- define "srw.effectiveVwRcloneRoot" -}}
 {{- if .Values.virtualWorkspace.rclone.root -}}
 {{- .Values.virtualWorkspace.rclone.root -}}
-{{- else if .Values.garage.enabled -}}
+{{- else if (include "srw.garageEnabled" .) -}}
 {{- .Values.garage.buckets.workspaces -}}
 {{- end -}}
 {{- end -}}
@@ -631,7 +657,7 @@ external vw endpoint), use "Other" (Garage's rclone-compatible profile,
 path-style). Otherwise the configured provider (default "Minio").
 */}}
 {{- define "srw.effectiveVwProvider" -}}
-{{- if and .Values.garage.enabled (not .Values.virtualWorkspace.s3.endpoint) -}}
+{{- if and (include "srw.garageEnabled" .) (not .Values.virtualWorkspace.s3.endpoint) -}}
 {{- "Other" -}}
 {{- else -}}
 {{- .Values.virtualWorkspace.s3.provider | default "Minio" -}}
