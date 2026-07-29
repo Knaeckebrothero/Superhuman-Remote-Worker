@@ -45,7 +45,8 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "monitoring. Use config_name to select an expert (developer, scholar, "
             "critic) or 'worker_base' for the framework fallback, expert_id for a "
             "DB-backed expert, and config_override to pin the job's model or "
-            "workspace backend."
+            "workspace backend. Officer sessions with a slot roster name the "
+            "slot per dispatch (slot='heavy'); the slot fixes model and backend."
         ),
         "category": "orchestrator",
         "short_description": "Delegate work to a worker agent via the orchestrator.",
@@ -524,6 +525,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         datasource_ids: Optional[List[str]] = None,
         config_override: Optional[Dict[str, Any]] = None,
         expert_id: Optional[str] = None,
+        slot: Optional[str] = None,
     ) -> str:
         """Create a new worker job on the orchestrator.
 
@@ -546,6 +548,11 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             expert_id: DB-backed expert UUID from list_experts. Carries its own
                 model, backend, and prompts. Cannot be combined with a
                 config_name other than worker_base.
+            slot: Officer sessions with a slot roster: which worker slot this
+                dispatch uses (e.g. "line", "heavy"). The slot fixes the
+                worker's model and workspace backend server-side — pick the
+                smallest slot that serves the task. Omit when the roster has
+                a single slot type; non-officer sessions ignore this.
 
         Returns:
             Job creation result with job ID
@@ -587,6 +594,12 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         # selection (server-side, keyed off thread_id below).
         if datasource_ids is not None:
             payload["datasource_ids"] = datasource_ids
+        # Officer slot roster: the funnel resolves/enforces the slot and
+        # stamps its model/backend onto the job config (officer_slots.py).
+        # Rides jobs.context so the per-slot capacity count is a plain
+        # context->>'officer_slot' GROUP BY.
+        if slot:
+            payload["context"] = {"officer_slot": str(slot)}
         # When invoked from a persistent session, carry the thread back so
         # the orchestrator can derive the owning user (and apply their model
         # preferences during dispatch). No-op for worker-mode callers.

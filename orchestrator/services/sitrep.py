@@ -391,24 +391,25 @@ async def _capacity_section(
     db: Any, thread: dict[str, Any], thread_id: str
 ) -> list[str]:
     try:
+        from services.officer_slots import capacity_lines
+
         metadata = _as_dict(thread.get("metadata"))
         officer_meta = _as_dict(
             _as_dict(metadata.get("config_override")).get("officer")
         )
-        try:
-            cap = int(officer_meta.get("max_concurrent_workers") or 3)
-        except (TypeError, ValueError):
-            cap = 3
         async with db.acquire() as conn:
-            in_use = await conn.fetchval(
+            rows = await conn.fetch(
                 """
-                SELECT COUNT(*) FROM jobs
+                SELECT context->>'officer_slot' AS slot, COUNT(*) AS n
+                  FROM jobs
                  WHERE created_by_thread_id = $1
                    AND status IN ('created', 'processing')
+                 GROUP BY 1
                 """,
                 UUID(thread_id),
             )
-        return [f"Capacity: {int(in_use or 0)}/{cap} worker slots in use."]
+        in_flight_by_slot = {r["slot"]: int(r["n"]) for r in rows}
+        return [capacity_lines(officer_meta, in_flight_by_slot)]
     except Exception:
         logger.warning("sitrep: capacity query failed", exc_info=True)
         return ["Capacity: (unavailable)"]
