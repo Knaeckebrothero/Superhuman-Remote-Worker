@@ -113,6 +113,10 @@ async def create_contact(request: Request, body: ContactCreate) -> dict:
             contact["id"], user["id"], channel_, addr, prim
         )
         if added is None:
+            # This contact was just created by this request (not pre-existing), so
+            # deleting it on failed creation is safe — the 409 hint still points at
+            # the pre-existing OTHER contact that already holds this address.
+            await db.delete_contact(contact["id"])
             raise HTTPException(
                 status_code=409,
                 detail=(

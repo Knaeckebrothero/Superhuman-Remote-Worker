@@ -116,3 +116,136 @@ async def test_delete_contact_owner_only(db, as_user_a):
     db.delete_contact.return_value = True
     out = await contacts_router.delete_contact(_req(), "c1")
     assert out == {"status": "deleted"}
+
+
+async def test_link_extracts_user_from_member_tuple(db, as_user_a, monkeypatch):
+    """Regression net for the (user, project) contract: require_project_member
+    returns a 2-tuple, not just the user — the router must index [0], not treat
+    the whole tuple as the user dict."""
+    gate = AsyncMock(return_value=(USER_A, {"id": "p1"}))
+    monkeypatch.setattr(contacts_router, "require_project_member", gate)
+    db.user_can_see_contact.return_value = True
+    out = await contacts_router.link_contact_to_project(_req(), "c1", "p1")
+    assert db.user_can_see_contact.await_args.args[0] == USER_A["id"]
+    db.link_contact_to_project.assert_awaited_once_with("p1", "c1", USER_A["id"])
+    assert out == {"status": "linked"}
+
+
+async def test_unlink_contact_from_project(db, as_user_a, monkeypatch):
+    gate = AsyncMock(return_value=(USER_A, {"id": "p1"}))
+    monkeypatch.setattr(contacts_router, "require_project_member", gate)
+
+    db.unlink_contact_from_project.return_value = False
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.unlink_contact_from_project(_req(), "c1", "p1")
+    assert e.value.status_code == 404
+    db.unlink_contact_from_project.assert_awaited_once_with("p1", "c1")
+
+    db.unlink_contact_from_project.return_value = True
+    out = await contacts_router.unlink_contact_from_project(_req(), "c1", "p1")
+    assert out == {"status": "unlinked"}
+
+
+async def test_patch_address_not_found(db, as_user_a):
+    db.get_contact_address.return_value = None
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.patch_address(
+            _req(), "a1", contacts_router.AddressPatch()
+        )
+    assert e.value.status_code == 404
+
+
+async def test_patch_address_owner_only(db, as_user_a):
+    db.get_contact_address.return_value = {
+        "id": "a1",
+        "owner_user_id": USER_B["id"],
+        "channel": "email",
+    }
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.patch_address(
+            _req(), "a1", contacts_router.AddressPatch(address="x@y.com")
+        )
+    assert e.value.status_code == 403
+    db.update_contact_address.assert_not_awaited()
+
+
+async def test_patch_address_normalizes_on_success(db, as_user_a):
+    db.get_contact_address.return_value = {
+        "id": "a1",
+        "owner_user_id": USER_A["id"],
+        "channel": "email",
+    }
+    db.update_contact_address.return_value = {"id": "a1", "address": "new@acme.de"}
+    out = await contacts_router.patch_address(
+        _req(),
+        "a1",
+        contacts_router.AddressPatch(address="  NEW@ACME.DE  ", is_primary=True),
+    )
+    db.update_contact_address.assert_awaited_once_with("a1", "new@acme.de", True)
+    assert out == {"address": {"id": "a1", "address": "new@acme.de"}}
+
+
+async def test_delete_address_owner_only(db, as_user_a):
+    db.get_contact_address.return_value = {"id": "a1", "owner_user_id": USER_B["id"]}
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.delete_address(_req(), "a1")
+    assert e.value.status_code == 403
+    db.delete_contact_address.assert_not_awaited()
+
+
+async def test_delete_address_success(db, as_user_a):
+    db.get_contact_address.return_value = {"id": "a1", "owner_user_id": USER_A["id"]}
+    out = await contacts_router.delete_address(_req(), "a1")
+    db.delete_contact_address.assert_awaited_once_with("a1")
+    assert out == {"status": "deleted"}
+
+
+async def test_add_address_unknown_channel_400(db, as_user_a):
+    db.get_contact.return_value = {"id": "c1", "owner_user_id": USER_A["id"]}
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.add_address(
+            _req(),
+            "c1",
+            contacts_router.ContactAddressIn(channel="sms", address="+491234567"),
+        )
+    assert e.value.status_code == 400
+
+
+async def test_create_contact_success_adds_addresses(db, as_user_a):
+    db.create_contact.return_value = {"id": "c1"}
+    db.add_contact_address.return_value = {"id": "addr1"}
+    db.get_contact.return_value = {
+        "id": "c1",
+        "display_name": "Anna",
+        "addresses": [{"id": "addr1"}],
+    }
+    body = contacts_router.ContactCreate(
+        display_name="Anna",
+        addresses=[
+            contacts_router.ContactAddressIn(channel="email", address="Anna@Acme.de")
+        ],
+    )
+    out = await contacts_router.create_contact(_req(), body)
+    db.create_contact.assert_awaited_once_with(USER_A["id"], "Anna", None)
+    db.add_contact_address.assert_awaited_once_with(
+        "c1", USER_A["id"], "email", "anna@acme.de", False
+    )
+    db.delete_contact.assert_not_awaited()
+    assert out == {
+        "contact": {"id": "c1", "display_name": "Anna", "addresses": [{"id": "addr1"}]}
+    }
+
+
+async def test_create_contact_rolls_back_on_duplicate_address(db, as_user_a):
+    db.create_contact.return_value = {"id": "c1"}
+    db.add_contact_address.return_value = None  # duplicate mid-loop
+    body = contacts_router.ContactCreate(
+        display_name="Anna",
+        addresses=[
+            contacts_router.ContactAddressIn(channel="email", address="anna@acme.de")
+        ],
+    )
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.create_contact(_req(), body)
+    assert e.value.status_code == 409
+    db.delete_contact.assert_awaited_once_with("c1")
