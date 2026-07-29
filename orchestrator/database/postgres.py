@@ -12540,95 +12540,6 @@ class PostgresDB:
         return (count or 0) + 1
 
     # =========================================================================
-    # External Contacts (Phase 3 Live Communication)
-    # =========================================================================
-
-    async def add_external_contact(
-        self,
-        project_id: str,
-        display_name: str,
-        email: str,
-        added_by: str | None = None,
-    ) -> Dict[str, Any]:
-        """Add an external contact to a project.
-
-        Args:
-            project_id: Project UUID
-            display_name: Contact display name
-            email: Contact email address
-            added_by: User UUID who added the contact
-
-        Returns:
-            Created contact record.
-        """
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO external_contacts (project_id, display_name, email, added_by)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (project_id, email) DO UPDATE
-                    SET display_name = EXCLUDED.display_name
-                RETURNING id, project_id, display_name, email, added_by, created_at
-                """,
-                UUID(project_id),
-                display_name,
-                email,
-                UUID(added_by) if added_by else None,
-            )
-        return dict(row)
-
-    async def get_external_contacts(self, project_id: str) -> List[Dict[str, Any]]:
-        """Get all external contacts for a project."""
-        async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, project_id, display_name, email, added_by, created_at
-                FROM external_contacts
-                WHERE project_id = $1
-                ORDER BY display_name
-                """,
-                UUID(project_id),
-            )
-        return [dict(r) for r in rows]
-
-    async def delete_external_contact(self, contact_id: str) -> bool:
-        """Delete an external contact by ID. Returns True if deleted."""
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM external_contacts WHERE id = $1",
-                UUID(contact_id),
-            )
-        return result == "DELETE 1"
-
-    async def resolve_external_contact(
-        self,
-        project_id: str,
-        name_or_email: str,
-    ) -> Dict[str, Any] | None:
-        """Resolve an external contact by display name or email (case-insensitive).
-
-        Args:
-            project_id: Project UUID
-            name_or_email: Display name or email to match
-
-        Returns:
-            Contact dict or None if not found.
-        """
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, project_id, display_name, email, added_by, created_at
-                FROM external_contacts
-                WHERE project_id = $1
-                    AND (LOWER(display_name) = LOWER($2) OR LOWER(email) = LOWER($2))
-                LIMIT 1
-                """,
-                UUID(project_id),
-                name_or_email,
-            )
-        return dict(row) if row else None
-
-    # =========================================================================
     # Contacts registry (docs/features/contacts_registry.md)
     # =========================================================================
 
@@ -12891,10 +12802,7 @@ class PostgresDB:
         return result == "DELETE 1"
 
     async def get_project_contacts(self, project_id: str) -> List[Dict[str, Any]]:
-        """List a project's linked contacts, nested.
-
-        Replaces ``get_external_contacts`` for the project contacts view.
-        """
+        """List a project's linked contacts, nested."""
         sql = (
             _CONTACT_SELECT
             + " JOIN project_contacts pc ON pc.contact_id = c.id AND pc.project_id = $1"

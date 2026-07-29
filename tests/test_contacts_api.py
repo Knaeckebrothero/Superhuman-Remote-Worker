@@ -249,3 +249,62 @@ async def test_create_contact_rolls_back_on_duplicate_address(db, as_user_a):
         await contacts_router.create_contact(_req(), body)
     assert e.value.status_code == 409
     db.delete_contact.assert_awaited_once_with("c1")
+
+
+async def test_project_get_contacts_gated(db, monkeypatch):
+    gate = AsyncMock(return_value=USER_A)
+    monkeypatch.setattr(contacts_router, "require_project_member", gate)
+    db.get_project_contacts.return_value = []
+    out = await contacts_router.get_project_contacts(_req(), "p1")
+    gate.assert_awaited()
+    assert out == {"contacts": []}
+
+
+async def test_project_post_find_or_create_then_link(db, monkeypatch):
+    # require_project_member returns (user, project) — the router indexes
+    # [0], so the gate double must stand in for the whole tuple (see
+    # test_link_extracts_user_from_member_tuple in this same file).
+    monkeypatch.setattr(
+        contacts_router,
+        "require_project_member",
+        AsyncMock(return_value=(USER_A, {"id": "p1"})),
+    )
+    # no address/name match among visible → create then link
+    db.list_contacts_for_user.return_value = []
+    db.create_contact.return_value = {"id": "c-new"}
+    db.get_contact.return_value = {"id": "c-new", "owner_user_id": USER_A["id"]}
+    db.add_contact_address.return_value = {"id": "a1"}
+    out = await contacts_router.add_project_contact(
+        _req(),
+        "p1",
+        contacts_router.ContactCreate(
+            display_name="Anna",
+            addresses=[
+                contacts_router.ContactAddressIn(channel="email", address="Anna@X.de")
+            ],
+        ),
+    )
+    db.link_contact_to_project.assert_awaited_once_with("p1", "c-new", USER_A["id"])
+    assert out["contact"]["id"] == "c-new"
+    # address match among visible → link existing, no create
+    db.reset_mock()
+    db.list_contacts_for_user.return_value = [
+        {
+            "id": "c-exist",
+            "display_name": "Anna",
+            "addresses": [{"channel": "email", "address": "anna@x.de"}],
+        }
+    ]
+    db.get_contact.return_value = {"id": "c-exist", "owner_user_id": USER_B["id"]}
+    await contacts_router.add_project_contact(
+        _req(),
+        "p1",
+        contacts_router.ContactCreate(
+            display_name="ignored",
+            addresses=[
+                contacts_router.ContactAddressIn(channel="email", address="ANNA@x.de")
+            ],
+        ),
+    )
+    db.create_contact.assert_not_awaited()
+    db.link_contact_to_project.assert_awaited_once_with("p1", "c-exist", USER_A["id"])

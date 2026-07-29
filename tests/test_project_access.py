@@ -1,13 +1,13 @@
 """G2 — multi-tenancy gates on the projects family.
 
-Covers 9 reads + 6 mutations under ``/api/projects`` and
+Covers 9 reads + 5 mutations under ``/api/projects`` and
 ``/api/projects/{id}/...``:
 
 Reads (gate: ``require_project_member`` at viewer):
     GET    /api/projects                          (list_projects)
     GET    /api/projects/{id}                     (get_project)
     GET    /api/projects/{id}/members
-    GET    /api/projects/{id}/contacts
+    GET    /api/projects/{id}/contacts             (routers/contacts.py)
     GET    /api/projects/{id}/memory/stats
     GET    /api/projects/{id}/experts
     GET    /api/projects/{id}/experts/{name}
@@ -15,8 +15,7 @@ Reads (gate: ``require_project_member`` at viewer):
     GET    /api/projects/{id}/jobs
 
 Mutations:
-    POST   /api/projects/{id}/contacts            (editor)
-    DELETE /api/projects/{id}/contacts/{id}       (editor)
+    POST   /api/projects/{id}/contacts            (editor, routers/contacts.py)
     POST   /api/projects/{id}/repositories        (owner)
     PATCH  /api/projects/{id}/repositories/{id}   (owner)
     DELETE /api/projects/{id}/repositories/{id}   (owner)
@@ -304,15 +303,21 @@ class TestProjectReadGates:
     async def test_list_contacts_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import list_external_contacts
+        from routers.contacts import get_project_contacts
 
-        fake_db.get_external_contacts = AsyncMock(
-            side_effect=AssertionError("get_external_contacts called past the gate")
+        gate = AsyncMock(side_effect=HTTPException(status_code=403, detail="denied"))
+        fake_db.get_project_contacts = AsyncMock(
+            side_effect=AssertionError("get_project_contacts called past the gate")
         )
-        with _patch_caller_and_db(user_b, fake_db):
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("routers.contacts.require_project_member", gate),
+            patch("routers.contacts._get_db", lambda: fake_db),
+        ):
             with pytest.raises(HTTPException) as exc:
-                await list_external_contacts(fake_request, str(project_a["id"]))
+                await get_project_contacts(fake_request, str(project_a["id"]))
         assert exc.value.status_code == 403
+        gate.assert_awaited_once_with(fake_request, fake_db, str(project_a["id"]))
 
     @pytest.mark.asyncio
     async def test_memory_stats_blocked_cross_user(
@@ -431,70 +436,54 @@ class TestProjectMutationRoles:
     async def test_add_contact_viewer_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import ExternalContactCreate, add_external_contact
+        from routers.contacts import ContactCreate, add_project_contact
 
-        _set_role(fake_db, project_a["id"], user_b["id"], "viewer")
-        fake_db.add_external_contact = AsyncMock(
-            side_effect=AssertionError("add_external_contact called past the gate")
+        gate = AsyncMock(
+            side_effect=HTTPException(
+                status_code=403, detail="Project role 'editor' or higher required"
+            )
         )
-        body = ExternalContactCreate(display_name="X", email="x@example.test")
-        with _patch_caller_and_db(user_b, fake_db):
+        fake_db.create_contact = AsyncMock(
+            side_effect=AssertionError("create_contact called past the gate")
+        )
+        body = ContactCreate(display_name="X", addresses=[])
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("routers.contacts.require_project_member", gate),
+            patch("routers.contacts._get_db", lambda: fake_db),
+        ):
             with pytest.raises(HTTPException) as exc:
-                await add_external_contact(str(project_a["id"]), body, fake_request)
+                await add_project_contact(fake_request, str(project_a["id"]), body)
         assert exc.value.status_code == 403
+        gate.assert_awaited_once_with(
+            fake_request, fake_db, str(project_a["id"]), min_role="editor"
+        )
 
     @pytest.mark.asyncio
     async def test_add_contact_editor_passes(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from main import ExternalContactCreate, add_external_contact
+        from routers.contacts import ContactCreate, add_project_contact
 
-        _set_role(fake_db, project_a["id"], user_b["id"], "editor")
-        fake_db.add_external_contact = AsyncMock(
-            return_value={
-                "id": "00000000-0000-0000-0000-000000000abc",
-                "display_name": "X",
-                "email": "x@example.test",
-                "created_at": None,
-            }
+        gate = AsyncMock(return_value=(user_b, project_a))
+        fake_db.list_contacts_for_user = AsyncMock(return_value=[])
+        fake_db.create_contact = AsyncMock(return_value={"id": "new-contact"})
+        fake_db.add_contact_address = AsyncMock(return_value={"id": "addr-1"})
+        fake_db.get_contact = AsyncMock(
+            return_value={"id": "new-contact", "display_name": "X", "addresses": []}
         )
-        body = ExternalContactCreate(display_name="X", email="x@example.test")
-        with _patch_caller_and_db(user_b, fake_db):
-            result = await add_external_contact(
-                str(project_a["id"]), body, fake_request
-            )
-        assert result["status"] == "created"
-
-    @pytest.mark.asyncio
-    async def test_delete_contact_viewer_403(
-        self, user_b, project_a, fake_db, fake_request
-    ):
-        from main import delete_external_contact
-
-        _set_role(fake_db, project_a["id"], user_b["id"], "viewer")
-        fake_db.delete_external_contact = AsyncMock(
-            side_effect=AssertionError("delete_external_contact called past the gate")
+        fake_db.link_contact_to_project = AsyncMock(return_value=True)
+        body = ContactCreate(display_name="X", addresses=[])
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("routers.contacts.require_project_member", gate),
+            patch("routers.contacts._get_db", lambda: fake_db),
+        ):
+            result = await add_project_contact(fake_request, str(project_a["id"]), body)
+        assert result["contact"]["id"] == "new-contact"
+        fake_db.link_contact_to_project.assert_awaited_once_with(
+            str(project_a["id"]), "new-contact", user_b["id"]
         )
-        with _patch_caller_and_db(user_b, fake_db):
-            with pytest.raises(HTTPException) as exc:
-                await delete_external_contact(
-                    fake_request, str(project_a["id"]), "any-contact-id"
-                )
-        assert exc.value.status_code == 403
-
-    @pytest.mark.asyncio
-    async def test_delete_contact_editor_passes(
-        self, user_b, project_a, fake_db, fake_request
-    ):
-        from main import delete_external_contact
-
-        _set_role(fake_db, project_a["id"], user_b["id"], "editor")
-        fake_db.delete_external_contact = AsyncMock(return_value=True)
-        with _patch_caller_and_db(user_b, fake_db):
-            result = await delete_external_contact(
-                fake_request, str(project_a["id"]), "any-contact-id"
-            )
-        assert result["status"] == "deleted"
 
     @pytest.mark.asyncio
     async def test_add_repository_editor_403(
