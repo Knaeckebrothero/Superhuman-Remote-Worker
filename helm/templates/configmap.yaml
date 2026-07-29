@@ -356,6 +356,15 @@ data:
   VM_CONTROLLER_URL: {{ include "srw.vmControllerUrl" . | quote }}
   VM_NAMESPACE: {{ include "srw.vmControllerNamespace" . | quote }}
 
+  # -- Persistent VM rootdisks (docs/features/vm_persistent_rootdisk.md).
+  # MUST mirror the VM controller's own vmController.persistentRootdisk.enabled
+  # (which may live in the separate helm-vm-cluster chart). The orchestrator
+  # reads this to decide whether a VM's files survive a teardown — notably
+  # whether VM session suspend may proceed without a snapshot. Enable the
+  # CONTROLLER first: turning it on here against a controller that still
+  # cascade-deletes disks would suspend sessions into nothing.
+  VM_PERSISTENT_ROOTDISK: {{ .Values.vmController.persistentRootdisk.enabled | default false | quote }}
+
   # Headscale (mesh VPN coordination server)
   HEADSCALE_URL: {{ include "srw.headscaleUrl" . | quote }}
 

@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 from services import resolve_ssh_key_path
 from services.ssh_helpers import stream_extract_snapshot
+from services.vm_provisioner import vm_persistent_rootdisk_enabled
 from services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
@@ -561,20 +562,36 @@ class WorkspaceSuspensionService:
                 source_type=source_type,
                 entity_type="threads",
             )
+            # With a persistent rootdisk the VM's disk outlives the VM, so the
+            # snapshot stops being the only copy of the workspace and stops
+            # being a precondition for tearing down. That matters because for a
+            # VM the capture can never succeed from here: it SSHes from the
+            # orchestrator, and a VM workspace is only reachable over the
+            # tailnet the orchestrator has no route to. Fail-closed on a gate
+            # that always fails is why VM sessions never suspended at all.
+            # A pod has no disk to keep, so it stays fail-closed.
+            disk_survives_teardown = is_vm and vm_persistent_rootdisk_enabled()
+
             if not ok:
-                logger.warning(
-                    "Snapshot capture failed for thread %s — keeping workspace alive",
+                if not disk_survives_teardown:
+                    logger.warning(
+                        "Snapshot capture failed for thread %s — keeping workspace alive",
+                        thread_id,
+                    )
+                    if is_vm:
+                        await self._db.merge_thread_vm_context(
+                            thread_id, {"status": "ready"}
+                        )
+                    else:
+                        await self._db.merge_thread_workspace_context(
+                            thread_id, {"status": "ready"}
+                        )
+                    return False
+                logger.info(
+                    "Snapshot capture unavailable for thread %s — suspending anyway; "
+                    "the persistent rootdisk carries the workspace across teardown",
                     thread_id,
                 )
-                if is_vm:
-                    await self._db.merge_thread_vm_context(
-                        thread_id, {"status": "ready"}
-                    )
-                else:
-                    await self._db.merge_thread_workspace_context(
-                        thread_id, {"status": "ready"}
-                    )
-                return False
 
             # Tear down based on provisioner type
             suspended_ctx: dict[str, Any] = {
@@ -583,7 +600,14 @@ class WorkspaceSuspensionService:
             }
 
             if is_vm and self._vm_provisioner and self._vm_provisioner.is_available:
-                await self._vm_provisioner.delete_thread_vm(thread_id)
+                await self._vm_provisioner.delete_thread_vm(
+                    thread_id, purge_disk=not disk_survives_teardown
+                )
+                if disk_survives_teardown:
+                    # Optimistic; the vm.lifecycle.status handler overwrites it
+                    # with what the controller actually did. Restore reads it to
+                    # decide whether to extract a snapshot over the disk.
+                    suspended_ctx["rootdisk"] = "kept"
                 await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
             else:
                 await self._container_provisioner.delete_workspace(
@@ -649,6 +673,11 @@ class WorkspaceSuspensionService:
         # Same explicit tier read as suspend — presence of workspace_container
         # says nothing about the tier (see _thread_is_vm_tier).
         is_vm = _thread_is_vm_tier(metadata, ws_ctx, vm_ctx)
+
+        # Read BEFORE provisioning: vm_ctx is re-read from fresh metadata after
+        # create_thread_vm, by which point this key reflects the new VM's
+        # lifecycle rather than the suspend that put the thread here.
+        rootdisk_kept = vm_ctx.get("rootdisk") == "kept"
 
         if is_vm:
             await self._db.merge_thread_vm_context(thread_id, {"status": "restoring"})
@@ -726,11 +755,22 @@ class WorkspaceSuspensionService:
                     )
                 return False
 
-            # Extract snapshot into the workspace
+            # Extract snapshot into the workspace — unless the VM reattached a
+            # kept rootdisk, in which case the files are already there and are
+            # *newer* than any snapshot (the disk is the live state at teardown;
+            # a snapshot is the same moment at best, stale at worst). Extracting
+            # over it would overwrite newer files with older ones.
             ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx, is_vm=is_vm)
-            await self._extract_snapshot(
-                thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
-            )
+            if is_vm and rootdisk_kept:
+                logger.info(
+                    "Skipping snapshot extract for thread %s — its persistent "
+                    "rootdisk was reattached and already holds the workspace",
+                    thread_id,
+                )
+            else:
+                await self._extract_snapshot(
+                    thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
+                )
 
             restored_ctx = {
                 "status": "ready",

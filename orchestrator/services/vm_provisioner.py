@@ -95,6 +95,29 @@ def _extract_vm_context(job: dict) -> dict:
     return ctx.get("vm", {})
 
 
+def vm_persistent_rootdisk_enabled() -> bool:
+    """Whether the VM controller keeps rootdisks across VM deletion.
+
+    Mirrors the controller's own ``VM_PERSISTENT_ROOTDISK``; the orchestrator
+    cannot observe the controller's config, so the two are set from the same
+    Helm value and this is the orchestrator's copy. Read at call time rather
+    than import so tests (and a config reload) see changes.
+
+    **Enable the controller first.** Turning this on against a controller that
+    still cascade-deletes disks would let VM session suspend tear a workspace
+    down believing the files survive — they would not. The reverse order is
+    harmless: the controller keeps disks nobody asks it to keep, and the
+    delete-status handler records what actually happened either way.
+
+    docs/features/vm_persistent_rootdisk.md
+    """
+    return os.environ.get("VM_PERSISTENT_ROOTDISK", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 class VMProvisioner:
     """Unified VM provisioner with automatic backend selection.
 
