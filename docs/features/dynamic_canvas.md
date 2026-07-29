@@ -13,6 +13,7 @@ aliases:
   - shared stage
 related:
   - "[[shared_browser]]"
+  - "[[canvas_durable_presentation]]"
   - "[[canvas_office_documents]]"
   - "[[agent_skills]]"
   - "[[dynamic_canvas_slice1_verification]]"
@@ -1296,6 +1297,13 @@ Do not serve one file by unpacking the whole suspended-workspace tarball. For an
 inactive remote workspace, v1 reports `unavailable`. This is the honest boundary
 between a live shared stage and durable publishing.
 
+> **SUPERSEDED 2026-07-28 for file sources** — `docs/features/canvas_durable_presentation.md`.
+> The "reports `unavailable`" half no longer holds: a file Canvas now keeps one
+> copy of its published bytes in the object store and serves that, read-only and
+> labelled, when the workspace cannot be reached. The tarball prohibition stands
+> unchanged — the copy is captured at publish time, never extracted from a
+> workspace snapshot. Live apps and shared browsers still report `unavailable`.
+
 ### File response contract
 
 For an allowed file, support `GET`, `HEAD`, and a single byte range so image and
@@ -1339,6 +1347,14 @@ plus a restrictive response CSP, and HTML is fetched as text for sanitized
 remain deferred until their safe response/viewer path is tested.
 
 ### Optional immutable published copies
+
+> **EXERCISED 2026-07-28, at smaller scope** — `docs/features/canvas_durable_presentation.md`.
+> Offline viewing did become a requirement. What shipped is one current copy per
+> Canvas in the object store (`canvas_snapshots` + `SnapshotService.put_blob`),
+> not the content-addressed archive sketched below: keys are thread-scoped
+> rather than hash-shared, because sharing an object between threads makes
+> deletion ambiguous and leaks existence across tenants. Restore history remains
+> unbuilt. The rest of this section still describes that larger option.
 
 If offline viewing or restore history becomes a requirement, add a separate
 content-addressed `canvas_blobs`/object-store layer. Snapshot only when a changed
@@ -2748,7 +2764,10 @@ evidence-driven collaboration slice.
 
 - Multiple named canvases and optionally a grid.
 - Content-addressed published copies, restore history, job-scoped/offline
-  artifacts, retention/quotas, and notification deep links.
+  artifacts, retention/quotas, and notification deep links. *(Partly done:
+  offline artifacts shipped 2026-07-28 as one current copy per Canvas —
+  `docs/features/canvas_durable_presentation.md`. Content addressing, restore
+  history, and job-scoped canvases remain open.)*
 - External allowlisted URLs.
 - Job/expert/skill draft forms through shared application actions.
 - Safe SVG-as-image, PDF, strict Mermaid, data-table, or desktop adapters.
