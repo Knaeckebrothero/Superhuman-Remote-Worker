@@ -91,6 +91,16 @@ VM_GOLDEN_GC_ENABLED = os.environ.get(
 VM_GOLDEN_KEEP = int(os.environ.get("VM_GOLDEN_KEEP", "3"))
 VM_GOLDEN_GC_MIN_AGE_MINUTES = int(os.environ.get("VM_GOLDEN_GC_MIN_AGE_MINUTES", "30"))
 
+# Persistent rootdisks (docs/features/vm_persistent_rootdisk.md). When enabled,
+# the VM's root disk is created as a STANDALONE DataVolume — same deterministic
+# name the template already renders — instead of via spec.dataVolumeTemplates.
+# Without an ownerRef it is not cascade-deleted with the VM, so a recreate
+# reattaches it by name: files intact, and the clone skipped entirely. Off by
+# default → byte-for-byte the legacy templated-disk behaviour.
+VM_PERSISTENT_ROOTDISK = os.environ.get(
+    "VM_PERSISTENT_ROOTDISK", "false"
+).strip().lower() in ("1", "true", "yes")
+
 # Transport selection: nats | http | both. Defaults to nats so existing
 # deployment-vms/ Fleet bundles keep working without overrides.
 TRANSPORT = os.environ.get("TRANSPORT", "nats").lower()
@@ -325,6 +335,12 @@ class VMController:
         if golden_name:
             self._apply_clone_source(manifest, golden_name)
 
+        # Detach the rootdisk from the VM object so it outlives it. Must run
+        # AFTER the clone mutation above — it lifts the template's dataVolume
+        # spec as-is, clone source included.
+        if VM_PERSISTENT_ROOTDISK:
+            await self._ensure_rootdisk(manifest, job_id)
+
         max_retries = 12  # ~60s total
         for attempt in range(max_retries + 1):
             try:
@@ -382,12 +398,34 @@ class VMController:
             "namespace": VM_NAMESPACE,
         }
 
-    async def _do_delete(self, job_id: str) -> dict:
-        """Delete a KubeVirt VirtualMachine for a job."""
+    async def _do_delete(self, job_id: str, purge_disk: bool = True) -> dict:
+        """Delete a KubeVirt VirtualMachine for a job.
+
+        ``purge_disk`` says whether this delete is terminal for the entity.
+        It defaults to True so an orchestrator that never sends the field gets
+        exactly today's semantics (VM gone, disk gone, tailnet node gone) —
+        only now the disk goes by explicit delete rather than ownerRef cascade,
+        which also cleans up disks left behind by a flag flip.
+
+        ``purge_disk=False`` means a recreate is expected (crash recovery, the
+        reconciler giving up on a dirty VM, a session suspending). Two things
+        are kept:
+
+        - the rootdisk DataVolume — the recovery artifact the next create
+          reattaches;
+        - the Headscale node — the kept disk still holds /var/lib/tailscale
+          state for it, so deleting the node would leave the recovered VM
+          reconnecting as a dead one (D3).
+        """
         from kubernetes.client.exceptions import ApiException
 
         vm_name = f"agent-vm-{job_id}"
-        log.info("Deleting VM %s (job %s)", vm_name, job_id)
+        log.info(
+            "Deleting VM %s (job %s, rootdisk=%s)",
+            vm_name,
+            job_id,
+            "purge" if purge_disk else "keep",
+        )
 
         try:
             self.k8s_client.delete_namespaced_custom_object(
@@ -403,11 +441,31 @@ class VMController:
             else:
                 raise
 
-        if self.headscale.is_available:
-            await self.headscale.delete_node(job_id)
+        rootdisk = _rootdisk_name(job_id)
+        if purge_disk:
+            # Non-fatal: a disk we failed to delete is a leak the GC backstop
+            # catches, whereas raising here would strand the VM delete itself.
+            try:
+                await self._delete_dv(rootdisk)
+            except Exception as e:
+                log.warning("rootdisk purge failed for %s: %s", rootdisk, e)
+            if self.headscale.is_available:
+                await self.headscale.delete_node(job_id)
+        else:
+            log.info(
+                "rootdisk KEPT: %s (job %s) — Headscale node retained so the "
+                "recreated VM rejoins the tailnet as the same node",
+                rootdisk,
+                job_id,
+            )
 
         log.info("VM deleted: %s (job %s)", vm_name, job_id)
-        return {"job_id": job_id, "status": "deleted", "vm_name": vm_name}
+        return {
+            "job_id": job_id,
+            "status": "deleted",
+            "vm_name": vm_name,
+            "rootdisk": "purged" if purge_disk else "kept",
+        }
 
     async def _do_list(self) -> dict:
         """Enumerate the agent VMs this controller manages.
@@ -675,6 +733,80 @@ class VMController:
         # Clone target must match the golden's Filesystem volumeMode.
         dv_spec.setdefault("storage", {})["volumeMode"] = "Filesystem"
 
+    async def _ensure_rootdisk(self, manifest: dict, job_id: str) -> str:
+        """Detach the rootdisk from the VM object, creating it if absent.
+
+        Pops ``spec.dataVolumeTemplates`` from the rendered manifest and
+        ensures a standalone DataVolume with the same name and the same spec.
+        ``volumes[].dataVolume.name`` refers to the disk *by name*, so that
+        section needs no change: the VM binds to the standalone disk instead of
+        a templated, owner-referenced one, and the disk survives VM deletion.
+
+        Returns the rootdisk name. Raises if the disk cannot be ensured —
+        there is deliberately no fallback to the templated form, which would
+        silently reintroduce the cascade-delete this exists to remove.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        dvts = manifest.get("spec", {}).pop("dataVolumeTemplates", None)
+        if not dvts:
+            raise RuntimeError(
+                f"VM_PERSISTENT_ROOTDISK is on but the rendered manifest for "
+                f"job {job_id} has no dataVolumeTemplates — refusing to create "
+                f"a VM whose rootdisk is undefined"
+            )
+        dvt = dvts[0]
+        name = (dvt.get("metadata") or {}).get("name") or _rootdisk_name(job_id)
+
+        dv = await self._get_dv(name)
+        phase = ((dv or {}).get("status") or {}).get("phase", "")
+        if dv and phase == "Succeeded":
+            # The recovery path: files are already there, and the ~3m27s clone
+            # is skipped entirely — recovery is faster than a fresh start.
+            log.info("rootdisk reattach: %s (job %s)", name, job_id)
+            return name
+        if dv and phase == "Failed":
+            log.warning("rootdisk %s is Failed — recreating", name)
+            await self._delete_dv(name)
+            dv = None
+        if dv is not None:
+            # Importing / Pending / CloneScheduled — a racing create is already
+            # building it, and KubeVirt gates VMI start on DV readiness anyway.
+            log.info("rootdisk %s in progress (%s) — adopting", name, phase or "?")
+            return name
+
+        body = {
+            "apiVersion": f"{CDI_GROUP}/{CDI_VERSION}",
+            "kind": "DataVolume",
+            "metadata": {
+                "name": name,
+                "namespace": VM_NAMESPACE,
+                # srw.io/rootdisk drives the GC listing; job-id ties the disk
+                # back to its entity (job or thread — VM names are the same
+                # shape for both).
+                "labels": {"srw.io/rootdisk": "true", "job-id": job_id},
+            },
+            # The template's own spec, clone mutation included. No
+            # bind.immediate annotation: a clone target must stay
+            # WaitForFirstConsumer so it binds on the VM's node.
+            "spec": dvt.get("spec", {}),
+        }
+        try:
+            await asyncio.to_thread(
+                self.k8s_client.create_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                body=body,
+            )
+            log.info("rootdisk created: %s (job %s)", name, job_id)
+        except ApiException as e:
+            if e.status != 409:
+                raise
+            log.info("rootdisk %s already exists — adopting", name)
+        return name
+
     async def _gc_goldens_safe(self, image: str) -> None:
         """Non-fatal wrapper around _gc_goldens for fire-and-forget scheduling."""
         try:
@@ -777,7 +909,11 @@ class VMController:
         """vm.lifecycle.delete → _do_delete + publish vm.lifecycle.status."""
         try:
             data = json.loads(msg.data.decode())
-            result = await self._do_delete(data["job_id"])
+            # Absent field → purge, so an un-upgraded orchestrator keeps exact
+            # current semantics.
+            result = await self._do_delete(
+                data["job_id"], purge_disk=data.get("purge_disk", True) is not False
+            )
             await self._publish_status(result["job_id"], result)
         except Exception as e:
             job_id = _safe_job_id(msg.data)
@@ -853,15 +989,23 @@ class VMController:
             )
 
     async def http_delete(self, request):
-        """DELETE /vms/{job_id} — returns the result dict."""
+        """DELETE /vms/{job_id}[?purge_disk=false] — returns the result dict."""
         from aiohttp import web
 
         job_id = request.match_info.get("job_id")
         if not job_id:
             return web.json_response({"error": "job_id required"}, status=400)
 
+        # Query param rather than a body: DELETE bodies are awkward for both
+        # httpx and aiohttp, and the intent is a single boolean.
+        purge_disk = str(request.query.get("purge_disk", "true")).lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+
         try:
-            result = await self._do_delete(job_id)
+            result = await self._do_delete(job_id, purge_disk=purge_disk)
             return web.json_response(result, status=200)
         except Exception as e:
             log.exception("HTTP delete failed for job %s", job_id)
@@ -1011,6 +1155,15 @@ def _safe_job_id(data: bytes) -> str:
         return json.loads(data.decode()).get("job_id", "unknown")
     except Exception:
         return "unknown"
+
+
+def _rootdisk_name(job_id: str) -> str:
+    """The rootdisk DataVolume name — identical to what the VM template renders,
+    so ``volumes[].dataVolume.name`` never has to change. Entity-agnostic: the
+    controller only sees an id, and VM names are ``agent-vm-<id>`` for both jobs
+    and sessions.
+    """
+    return f"agent-vm-{job_id}-rootdisk"
 
 
 def _golden_name(image: str) -> str:

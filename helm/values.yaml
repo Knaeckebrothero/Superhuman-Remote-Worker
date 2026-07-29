@@ -1919,6 +1919,13 @@ vmController:
       enabled: true
       keep: 3            # keep the N newest image digests
       minAgeMinutes: 30  # don't GC a golden younger than this
+  # -- Persistent VM rootdisks (docs/features/vm_persistent_rootdisk.md).
+  # Create each VM's root disk as a standalone DataVolume instead of via
+  # spec.dataVolumeTemplates, so it is not cascade-deleted with the VM. A
+  # recreate reattaches it by name: files survive a crash or a suspend, and the
+  # clone is skipped entirely. Off = today's templated (VM-owned) disk.
+  persistentRootdisk:
+    enabled: false
   # -- SSH public key injected into the VM's authorized_keys (cloud-init).
   # The matching private key lives in the chart's vm-ssh-key secret and is
   # mounted into orchestrator/agent pods. Required for HTTP/lifecycle mode
