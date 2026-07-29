@@ -14,6 +14,7 @@ related:
   - "[[headless_persistent_sessions]]"
   - "[[automations]]"
   - "[[email_datasource]]"
+  - "[[contacts_registry]]"
 ---
 
 # WhatsApp Messaging Channel
@@ -78,6 +79,8 @@ orchestrator ── guardrails ──► ChannelAdapter ──► └──► w
 - Multi-tenant later = constructing adapters from per-tenant DB rows instead of env; the interface doesn't change.
 
 ### 2. Schema — migration `0063_messaging_channel.sql`
+
+> **Amended 2026-07-29 — superseded by [[contacts_registry]].** This spec was written unaware that `external_contacts` (+ CRUD endpoints + `send_message` resolution) already existed; a second registry would mean two opt-in models and two places to add the same person. The contacts registry ships separately as the prerequisite slice: `messaging_contacts` below is **dropped** — contacts live in `contacts`/`contact_addresses`/`project_contacts`, with `opt_in_status` and window state (`last_inbound_at`) on `contact_addresses`. Key `messaging_conversations` and `messaging_messages` off `contact_addresses.id` instead of a contact id. The `list_contacts` tool is superseded by the registry's materialized `contacts/<slug>.md` workspace files; `message_contact` resolves via `resolve_contact(project_id, to, channel='whatsapp')`. The schema block below is retained for the parts still owned by this spec (conversations binding, messages audit).
 
 ```sql
 messaging_contacts (
