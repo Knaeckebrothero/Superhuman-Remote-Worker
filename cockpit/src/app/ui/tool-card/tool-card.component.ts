@@ -10,6 +10,7 @@ import {ToolCardAction, ToolCardStatus, ToolCardView, ToolResult} from '../../co
 import {CanvasService} from '../../core/services/canvas.service';
 import {CanvasState} from '../../core/models/canvas.model';
 import {CanvasToolCardPresentationComponent} from './canvas-tool-card-presentation.component';
+import {JobToolCardPanelComponent} from './job-tool-card-panel.component';
 import {ExternalImageDirective} from '../external-image';
 
 /** Lines of a text/code/terminal result shown before "show N more". */
@@ -53,6 +54,7 @@ export function canvasToolCardContext(
         AppIconComponent,
         AppIconButtonComponent,
         CanvasToolCardPresentationComponent,
+        JobToolCardPanelComponent,
     ],
     template: `
     <details class="tc" [class.tc--error]="status() === 'error'" [class.tc--denied]="status() === 'denied'"
@@ -153,6 +155,15 @@ export function canvasToolCardContext(
         }
       </div>
     </details>
+
+    @if (view().entity; as entity) {
+      <!-- Outside <details> on purpose. Every other card is a record of a call
+           that finished, so hiding its body behind a disclosure is right. A job
+           card is a handle on something still running: its status has to be
+           readable, and its review actions reachable, without expanding. -->
+      <app-job-tool-card-panel [entity]="entity"
+                               (diffRequested)="jobDiffRequested.emit($event)" />
+    }
   `,
     styleUrl: './tool-card.component.scss',
 })
@@ -161,6 +172,8 @@ export class AppToolCardComponent implements OnDestroy {
     /** Force the card open regardless of status (e.g. the debug surface). */
     readonly defaultOpen = input<boolean>(false);
     readonly actionRequested = output<ToolCardAction>();
+    /** Job id whose diff the host should open in the drawer it already owns. */
+    readonly jobDiffRequested = output<string>();
 
     private readonly transloco = inject(TranslocoService);
     private readonly canvas = inject(CanvasService);

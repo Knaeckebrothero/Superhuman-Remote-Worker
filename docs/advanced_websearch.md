@@ -24,9 +24,15 @@ Our agent currently has these web-facing tools:
 | Tool | Method | Limitation |
 |------|--------|------------|
 | `web_search` | Tavily single-shot API call | One query, flat result list |
-| `browse_website` | Browser automation (browser-use) | Slow, heavyweight |
-| `download_from_website` | Browser automation | File downloads only |
+| `browser_*` (browser_direct group) | Agent drives the browser itself | Needs a shell-capable workspace |
 | `research_topic` | Multi-database paper search + download | Academic papers only |
+
+> The autonomous `browse_website` / `download_from_website` sub-agent tools that
+> used to sit here were removed from the registry; the agent now drives the
+> browser directly via the `browser_direct` group
+> (`src/tools/research/__init__.py:27`). Do not add them back to a config —
+> unknown names fail the whole batch tool load
+> (`tests/test_config_tool_names_are_registered.py`).
 
 The main gap: for general web research, the agent fires a single Tavily search and works with whatever comes back. No query refinement, no content extraction, no result reranking, no iterative deepening.
 
@@ -292,9 +298,13 @@ tools:
     - search_papers        # Search academic papers
     - download_paper       # Download paper PDFs
     - get_paper_info       # Paper metadata
-    - browse_website       # Browser automation (heavyweight fallback)
-    - download_from_website
     - research_topic       # Multi-database literature search
+  # Browser control is its own group; the autonomous browse_website /
+  # download_from_website tools no longer exist.
+  browser_direct:
+    - browser_navigate
+    - browser_snapshot
+    - browser_click
 ```
 
 ---

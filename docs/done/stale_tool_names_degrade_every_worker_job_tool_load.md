@@ -11,7 +11,12 @@ tags:
 **Filed:** 2026-07-28, split out of
 `docs/done/session_tool_group_checkbox_disagrees_with_the_agent.md` (the session
 half is fixed; this is the worker half).
-**Status:** OPEN. Fixed in `config/session_base.yaml` only.
+**Status:** FIXED 2026-07-29 — removed from `worker_base.yaml` and all four
+expert configs; every shipped config now resolves with zero unknown tool names.
+Not yet deployed, so dev worker jobs still log the warning until the next
+rollout. Verified locally: the merged tool list for `worker_base`, `developer`,
+`designer` and `scholar` contains no unknown names, so the batch load no longer
+raises.
 **Severity:** low-to-medium — no functional loss today (the fallback loads every
 *valid* tool), but it burns the batch-validation safety net on every single
 worker job and hides real bind failures at DEBUG. It is a latent-severity bug:
@@ -65,16 +70,38 @@ Note the diagnostic trap this creates: the later `Loaded N tools: [...]` INFO
 lines look perfectly healthy, so sampling the tail of a log suggests the batch
 load succeeded. The warning fires once, ~30 minutes earlier in that job's log.
 
-## Fix
+## Fix (as applied, 2026-07-29)
 
-Delete the two names from `config/worker_base.yaml` and the four expert configs.
-Prose references in `config/README.md:221-222` and several `docs/` files should
-go at the same time.
+Removed the names from `config/worker_base.yaml` and the `developer`, `scholar`,
+`designer` and `designer-interactive` configs. Updated the reference prose in
+`config/README.md` (which listed them as available — copy-paste bait, and
+plausibly how they spread), `docs/advanced_websearch.md` (capability table **and**
+an example config block), `docs/dev_workflow.md` and `docs/memories_mechanism.md`.
+`docs/browser_use.md` was **annotated, not rewritten** — it is explicitly "a
+living design doc, not a spec" and is the record of the analysis that led to
+removing these very tools, so a status note at the top preserves the reasoning
+instead of erasing it.
 
-Then extend `tests/test_config_tool_names_are_registered.py` — it currently
-guards `session_base` only — to parametrize over `worker_base` and
-`config/experts/*/config.yaml`. That test exists precisely to pin this class of
-bug and was deliberately scoped narrow when the session half shipped.
+`tests/test_config_tool_names_are_registered.py` now parametrizes over both base
+configs and **every** expert discovered by globbing `config/experts/*/config.yaml`
+— 12 configs, so a newly added expert is covered on arrival rather than when
+someone remembers. Configs are checked in their **merged** form, which matters:
+`general-worker` has no stale name of its own and was only reachable through
+`$extends: worker_base`. Confirmed to have teeth by re-adding a stale name and
+watching both `worker_base` and `general-worker` fail.
+
+## Verification
+
+- 18 test cases green; full suite 11606 passed / 2 failed (both needing a live
+  local Postgres, unrelated).
+- Merged tool lists resolve clean: `worker_base` 64 names, `developer` 44,
+  `designer` 47, `scholar` 64, zero unknown in each.
+- **Owed:** confirm on dev after the next rollout that a worker job's log no
+  longer contains `Tool loading warning: Unknown tools:` from `agent.py:2843`,
+  and that the toolset arrives via a single `Loaded N tools: [...]` line rather
+  than the per-tool fallback. Grep the **whole** log, not the tail — the healthy
+  looking `Loaded N tools` lines come *after* the warning, which is what made
+  this look fixed when it wasn't.
 
 ## Why it was left out
 

@@ -218,9 +218,11 @@ tools:
     - search_papers          # Search arXiv or Semantic Scholar
     - download_paper         # Download PDF (arXiv → Unpaywall → browser fallback)
     - get_paper_info         # Paper metadata via Semantic Scholar
-    - browse_website         # AI browser automation (browser-use)
-    - download_from_website  # Download files via browser automation
     - research_topic         # Multi-database literature search + download
+    # NOTE: browse_website / download_from_website were removed from the
+    # registry — the agent drives the browser itself via the browser_direct
+    # group below. Names listed here must exist in TOOL_REGISTRY; an unknown
+    # name fails the whole batch load (tests/test_config_tool_names_are_registered.py).
 
   # Citation management (src/tools/citation/)
   citation:

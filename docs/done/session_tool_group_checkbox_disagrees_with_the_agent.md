@@ -143,13 +143,12 @@ original design recorded for the single-fetch case (see
 
 ## Follow-ups (not done)
 
-- **Tracked separately as
-  `docs/issues/stale_tool_names_degrade_every_worker_job_tool_load.md`** (it has
-  live impact, so it does not belong buried in a `done/` entry):
-  `browse_website` / `download_from_website` are still in
-  `config/worker_base.yaml` and the four expert configs, and every worker job
-  on dev confirmably still logs the batch failure and falls back to per-tool
-  loading. The new test guards the session base only.
+- ~~`browse_website` / `download_from_website` still in `worker_base.yaml` and
+  the four expert configs~~ — **FIXED 2026-07-29**, see
+  `docs/done/stale_tool_names_degrade_every_worker_job_tool_load.md`. The test
+  now covers every base and expert config in merged form, not just the session
+  base. It also surfaced a separate defect:
+  `docs/issues/expert_prompts_instruct_a_removed_browser_tool.md`.
 - `docs/issues/session_tool_group_enablement_is_computed_in_two_places.md` —
   `_session_tool_group_disabled_markers` was deliberately **not** rewritten in
   terms of `session_tool_group_enablement` (it sits on the live attach path);

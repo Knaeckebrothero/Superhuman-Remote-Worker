@@ -181,6 +181,24 @@ export const TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = {
     send_message: {title: 'Send message', icon: 'send', category: 'communication', params: [{key: ['message', 'content'], label: 'Message', kind: 'text'}], subtitle: (a) => pickArg(a, ['message', 'content'])},
     delegate_work: {title: 'Delegate work', icon: 'group_work', category: 'delegation', params: [{key: ['task', 'description'], label: 'Task', kind: 'text'}], subtitle: (a) => pickArg(a, ['task', 'description'])},
 
+    // Fleet management. create_worker_job is the only card that outlives its
+    // own tool call: the call returns "job created, id=…" immediately and the
+    // job then runs for minutes. The result is a receipt, not content worth
+    // echoing — the live state comes from `entity` + JobWatchService — so it
+    // renders as 'none' and the card body shows status instead.
+    create_worker_job: {
+        title: 'Schedule job',
+        icon: 'rocket_launch',
+        category: 'delegation',
+        params: [
+            {key: 'description', label: 'Task', kind: 'text'},
+            {key: 'config_name', label: 'Config', kind: 'text'},
+            {key: 'instructions', label: 'Instructions', kind: 'text'},
+        ],
+        result: {kind: 'none'},
+        subtitle: (a) => pickArg(a, ['description', 'task']),
+    },
+
     // Job lifecycle
     job_complete: {title: 'Complete job', icon: 'check_circle', category: 'core', params: []},
     mark_complete: {title: 'Mark complete', icon: 'check_circle', category: 'core', params: []},
@@ -348,6 +366,47 @@ function parseCanvasResultMetadata(
     };
 }
 
+const UUID_RE =
+    /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
+
+/**
+ * Recover the job id a successful `create_worker_job` returned.
+ *
+ * Parsed out of the result rather than carried alongside it because that is the
+ * only channel that survives history replay: `tc.result` is repopulated from
+ * `thread_messages` on reload, so a card reconstructed days later can still
+ * find its job. Same shape as `parseCanvasResultMetadata` — try JSON, fall back
+ * to a regex over the human-readable text the tool actually emits
+ * ("Job created successfully.\nJob ID: <uuid>").
+ *
+ * Exported for unit test: `TestBed.createComponent` does not work under vitest
+ * in this repo, so pure functions are the testable surface.
+ */
+export function parseJobEntity(n: NormalizedToolCall): ToolCardView['entity'] {
+    if (n.tool !== 'create_worker_job' || n.status !== 'ok') return undefined;
+    const result = n.result ?? '';
+    if (!result) return undefined;
+    try {
+        const parsed = JSON.parse(result) as Record<string, unknown>;
+        for (const key of ['job_id', 'id']) {
+            const value = parsed[key];
+            if (typeof value === 'string' && UUID_RE.test(value)) {
+                return {kind: 'job', id: value};
+            }
+        }
+    } catch {
+        // Not JSON — the normal case. Fall through to the text scan.
+    }
+    // Anchor on the label so a uuid appearing elsewhere in the receipt (an
+    // owner or agent id, both of which the tool prints) is never mistaken for
+    // the job.
+    const labelled = result.match(
+        /job\s*id\s*[:=]\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+    );
+    if (labelled) return {kind: 'job', id: labelled[1]};
+    return undefined;
+}
+
 function canvasAction(metadata: CanvasResultMetadata | undefined): ToolCardView['action'] {
     if (!metadata) return undefined;
     return {
@@ -392,6 +451,7 @@ export function buildToolCardView(n: NormalizedToolCall): ToolCardView {
         details: buildDetails(n),
         action: canvasAction(canvasMetadata),
         canvasPresentation: canvasMetadata?.presentation,
+        entity: parseJobEntity(n),
         error: n.error ? String(n.error) : undefined,
     };
 }

@@ -86,7 +86,6 @@ tools:
     - search_papers
     - download_paper
     - get_paper_info
-    - browse_website
     - research_topic
   shell:
     - run_command

@@ -11,6 +11,7 @@ import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppCopyFieldComponent} from '../../ui/copy-field';
 import {JobDiffReviewComponent} from '../job-diff-review/job-diff-review.component';
+import {jobStatusTone as sharedJobStatusTone} from '../../core/util/job-status';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -920,26 +921,10 @@ export class JobReviewComponent {
     });
   }
 
+  /** Delegates to the shared helper — this was copy-pasted in two
+   *  components before the job tool card became the third consumer. */
   jobStatusTone(status: string): BadgeTone {
-    switch (status) {
-      case 'completed':
-        return 'success';
-      case 'processing':
-      case 'pending_review':
-        return 'warning';
-      case 'failed':
-        return 'danger';
-      case 'created':
-      case 'waiting':
-        return 'info';
-      case 'reviewing':
-        return 'accent';
-      case 'cancelled':
-      case 'paused':
-        return 'neutral';
-      default:
-        return 'neutral';
-    }
+    return sharedJobStatusTone(status);
   }
 
   formatDate(dateString: string): string {

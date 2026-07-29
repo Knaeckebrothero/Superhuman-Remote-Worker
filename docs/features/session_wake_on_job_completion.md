@@ -30,15 +30,15 @@ related:
 
 > A session launches a worker job ("run a research agent on topic X"), the user closes the tab, and twenty minutes later the job finishes. Today the result just sits silently in the database. This feature lets the session be woken — or at least notified — when a job *it created* completes, so it can continue. It is **subagent delegation, where the parent is an interactive chat session and the wait is asynchronous.**
 
-**Status:** **Phase 1 SHIPPED + LIVE-GATED.** Implemented 2026-07-26
-(`320cc112`), gated on dev 2026-07-27 — all five checks passed; see
-[Live verification](#live-verification--passed-on-dev-2026-07-27). One defect
-found by the gate (the durable branch's out-of-band notification never sent) is
-fixed but **not yet deployed**. Phases 2–3 not started. Co-designing the shared
-bus with the [[automations]] event-trigger half remains the end state, but v1
-deliberately skips it; see
+**Status:** **Phase 1 SHIPPED + LIVE-GATED — done.** Implemented 2026-07-26
+(`320cc112`), gated on dev 2026-07-27 (all five checks passed), and the one
+defect the gate found — the durable branch's notification silently never sent —
+fixed and re-gated 2026-07-29. See
+[Live verification](#live-verification--passed-on-dev-2026-07-27).
+Phases 2–3 not started. Co-designing the shared bus with the [[automations]]
+event-trigger half remains the end state, but v1 deliberately skips it; see
 [v1 shortcut](#v1-shortcut--no-bus-but-the-direct-post-is-not-the-mechanism).
-**Filed:** 2026-06-17 · **Revised:** 2026-07-26
+**Filed:** 2026-06-17 · **Revised:** 2026-07-29
 
 > **Read this first if you are implementing.** The 2026-07-26 audit overturned
 > several things the original design assumed. In descending order of "would have
@@ -815,17 +815,26 @@ the half of the durable branch that actually reaches a user who closed the tab,
 so the drop defeated the branch's purpose. `_notify_owner` now resolves the user
 row and passes `recipient_email` / `recipient_name`, mirroring
 `_notify_operator_freeze` — the existing caller that got this right. Two
-regression tests pin it. **Not yet re-verified live: that needs a deploy.**
+regression tests pin it.
 
-**Precondition — the tools are off by default.** `config/session_base.yaml:119`
-sets `orchestrator: [ ]`, and `assistant` (the default expert for new sessions)
-inherits it unchanged; no bundled config enables the group. It is a user-facing
-toggle — "Fleet Management" in Agent Settings, and a *live* one
-(`LIVE_TOOL_CATEGORIES`, `cockpit/.../agent-settings.types.ts:37`). So a default
-session cannot create jobs at all, and this feature is invisible to it. Whether
-to flip the default for `assistant` is a separate product call — nine tool
-schemas are permanent per-request context and job creation spends real money —
-but it needs deciding, or v1 ships dark.
+**Fix re-gated on dev 2026-07-29** (build `f0cd0e0`): re-arming job `d7d6f511`'s
+wake made the deployed sweeper redeliver it through the real durable path, and
+the log now reads `Email sent to ['…']: [SRW] Job d7d6f511 completed — your
+session is waiting` with no undeliverable warning. Phase 1 is fully gated.
+
+**The job tools are off by default, and that is correct.**
+`config/session_base.yaml:119` sets `orchestrator: [ ]` and `assistant` (the
+default expert for new sessions) inherits it unchanged. This is the permission
+model working as intended, not a gap to close: spending real money on worker
+jobs is a capability the owner grants deliberately, per session, via the
+"Fleet Management" checkbox in Agent Settings — a *live* toggle
+(`LIVE_TOOL_CATEGORIES`, `cockpit/.../agent-settings.types.ts:37`), so it
+applies mid-session without a restart. Anyone who wants it standing can build an
+expert that carries the group. **Do not "fix" this by flipping the default.**
+
+The one thing worth remembering is operational: a session without the toggle has
+no job tools at all, so *"the wake never fires"* is far more often an unchecked
+box than a bug. Check it before debugging the wake path.
 
 ### Phase 2 — **Wake-to-notify**
 
@@ -943,7 +952,8 @@ Honest blockers for the autonomous depth (Phase 3). Phases 1–2 are unaffected.
 - **2026-07-26:** **`wake_on_complete` is no longer a tool parameter.** Set server-side: true for session-created jobs. Opt-in's failure mode is silent (agent forgets the flag → never learns), while a surplus wake costs one cheap turn. Column retained as the off-switch for a future user setting. Reverses the 2026-06-17 opt-in decision.
 - **2026-07-26:** Delivery payload carries the **sibling set**, so the agent decides inspect-vs-defer without a `list_worker_jobs` round-trip on every wake.
 - **2026-07-26:** Reframed motivation: the return path **is the scheduler**. Session-created jobs all dispatch immediately, so multi-stage plans are currently unexecutable; the wake is what makes them possible. Corollary — **do not build job dependency graphs**; the gates in real plans are human gates.
-- **2026-07-26:** Recorded the default-off precondition (`orchestrator: [ ]` in `session_base`, "Fleet Management" toggle). Flipping the `assistant` default is a separate product call, but without it v1 ships dark.
+- **2026-07-26:** Recorded the default-off precondition (`orchestrator: [ ]` in `session_base`, "Fleet Management" toggle). Originally framed as an open product call ("without it v1 ships dark").
+- **2026-07-29:** **That framing was wrong and is withdrawn.** Default-off is the permission model working, not a gap: an agent should not hold money-spending job tools unless its owner grants them, the toggle is live and per-session, and an expert can carry the group for anyone who wants it standing. There is no product decision outstanding here. (User correction.)
 - **2026-07-26:** The **proposal seam** (agent drafts a job config → user reviews settings → user starts) stays out of this feature and is deferred generally. A per-job Start/Edit/Discard card cannot express the ordering or the human gates in a real multi-stage plan — making it honest means building a DAG editor — and the retired "builder" already established that nobody read the generated configs. Prose proposal in chat plus "go" is both cheaper and better. Salvaged piece: show the *resolved* config read-only on the created card, for auditability without a draft state.
 
 ### 2026-07-26 Phase 1 build
