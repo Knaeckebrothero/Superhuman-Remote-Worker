@@ -73,6 +73,13 @@ logger = logging.getLogger(__name__)
 # legitimate wake.
 TERMINAL_STATUSES = ("completed", "failed", "cancelled", "pending_review")
 
+# Statuses that additionally wake the PROJECT's officer (centurion.md §4).
+# 'paused' is officer-only on purpose: it must never enter TERMINAL_STATUSES —
+# the jobs outbox would spam ordinary sessions and corrupt wake_notified_status
+# for redispatchable pauses (implementation notes, risk 6) — but a paused job
+# is exactly what an officer exists to notice.
+OFFICER_NOTIFY_STATUSES = TERMINAL_STATUSES + ("paused",)
+
 # Backstop cadence. The opportunistic post-commit drain handles the happy path
 # in milliseconds; this only catches wakes whose sender died or whose terminal
 # path has no hook. Env-tunable mainly so tests can drive ticks faster.
@@ -136,6 +143,14 @@ async def maybe_wake_session(db: Any, job_id: str, terminal_status: str) -> bool
     Never raises: a completion path must not fail because a notification could
     not be enqueued.
     """
+    # Officer leg first: this function is already called from every covered
+    # terminal path with the right status, which makes it the one choke point
+    # that reaches the project's officer without touching eight call sites.
+    # Independent of the jobs-outbox guard below — the officer hears about
+    # every project job, not just session-created ones.
+    if terminal_status in OFFICER_NOTIFY_STATUSES:
+        await _notify_project_officer_of_job(db, job_id, terminal_status)
+
     if terminal_status not in TERMINAL_STATUSES:
         return False
     try:
@@ -283,6 +298,37 @@ async def _deliver(db: Any, row: dict[str, Any]) -> bool:
         logger.exception("session wake: thread lookup failed for %s", thread_id[:8])
         return False
     if thread is None:
+        return True
+
+    if _thread_is_officer(thread):
+        # Double-wake suppression (implementation notes, risk 1): an
+        # officer-created job would otherwise wake him through BOTH outboxes —
+        # [JOB_FINISHED] here plus the officer event from the completion hook —
+        # costing two paid turns per delegation. Convert this claim into an
+        # officer event instead; the dedup key matches the hook's enqueue, so
+        # whichever lands second coalesces away. The jobs outbox stays the
+        # durable trigger (its by-status backstop still finds the job); the
+        # event outbox is the single officer delivery channel.
+        try:
+            await db.enqueue_session_wake_event(
+                thread_id,
+                source="job_transition",
+                dedup_key=_officer_job_dedup_key(row["id"], row.get("status")),
+                payload={
+                    "job_id": str(row["id"]),
+                    "status": str(row.get("status") or ""),
+                    "description": _truncate(str(row.get("description") or ""), 200),
+                },
+                project_id=(str(row["project_id"]) if row.get("project_id") else None),
+            )
+        except Exception:
+            logger.exception(
+                "session wake: officer conversion failed for job %s — keeping "
+                "the jobs-outbox claim for retry",
+                str(row["id"])[:8],
+            )
+            return False
+        kick_event_drain(db)
         return True
 
     text = await _format_wake_message(db, row, thread_id)
@@ -730,6 +776,55 @@ OFFICER_DEBOUNCE_BY_SOURCE: dict[str, int] = {
 }
 
 
+def _thread_is_officer(thread: dict[str, Any]) -> bool:
+    """True when a thread dict carries the officer flag in its metadata.
+
+    Mirrors the SQL predicate (postgres.OFFICER_ENABLED_SQL) for code that
+    already holds the thread row. Strict: only boolean True / string 'true'
+    count, so MagicMock-metadata test threads never trip it.
+    """
+    metadata = _as_dict(thread.get("metadata"))
+    officer = _as_dict(_as_dict(metadata.get("config_override")).get("officer"))
+    enabled = officer.get("enabled")
+    return enabled is True or (isinstance(enabled, str) and enabled == "true")
+
+
+def _officer_job_dedup_key(job_id: Any, status: Any) -> str:
+    """One dedup key per (job, status) transition, shared by BOTH enqueue
+    paths (the completion-hook notify and the jobs-outbox conversion) so they
+    coalesce instead of double-waking."""
+    return f"{str(job_id)[:8]}:{status}"
+
+
+async def _notify_project_officer_of_job(db: Any, job_id: str, status: str) -> bool:
+    """Enqueue an officer wake for a job transition, by project. Never raises."""
+    try:
+        job = await db.get_job(str(job_id))
+        if not job or not job.get("project_id"):
+            return False
+        enqueued = await notify_officer(
+            db,
+            str(job["project_id"]),
+            source="job_transition",
+            dedup_key=_officer_job_dedup_key(job_id, status),
+            payload={
+                "job_id": str(job_id),
+                "status": str(status),
+                "description": _truncate(str(job.get("description") or ""), 200),
+            },
+        )
+        if enqueued:
+            kick_event_drain(db)
+        return enqueued
+    except Exception:
+        logger.exception(
+            "officer wake: job-transition notify failed for job %s (%s)",
+            str(job_id)[:8],
+            status,
+        )
+        return False
+
+
 async def file_officer_timer(
     db: Any, thread_id: str, minutes: int, reason: str
 ) -> bool:
@@ -901,12 +996,41 @@ async def drain_pending_event_wakes(
             if thread is None:
                 await db.finish_session_wake_events(ids)
                 continue
-            text = _format_officer_wake(rows)
+            # Full computed-delta sitrep (services/sitrep.py); the minimal
+            # reason-list renderer is the fallback so a formatter failure can
+            # never cost the wake itself.
+            text = None
+            state_patch = None
+            try:
+                from services import sitrep as sitrep_svc
+
+                text, state_patch = await sitrep_svc.build_wake_message(
+                    db, thread, rows
+                )
+            except Exception:
+                logger.exception(
+                    "officer wake: sitrep build raised — using minimal renderer"
+                )
+            if not text:
+                text = _format_officer_wake(rows)
+                state_patch = None
             agent = await _resolve_live_agent(db, thread)
             if agent is not None:
                 if await _inject_live(agent, text):
                     await db.finish_session_wake_events(ids)
                     delivered += 1
+                    if state_patch:
+                        # Watermark rule (risk 5): fingerprints advance ONLY
+                        # here, on a live delivery the officer actually reads.
+                        # The durable branch below deliberately skips this —
+                        # its delta is re-computed at the respawn boot wake.
+                        try:
+                            await db.merge_thread_officer_state(thread_id, state_patch)
+                        except Exception:
+                            logger.exception(
+                                "officer wake: sitrep state merge failed "
+                                "(non-fatal; next sitrep re-diffs)"
+                            )
                 else:
                     await db.release_session_wake_events(
                         ids, max_attempts=_OFFICER_MAX_ATTEMPTS

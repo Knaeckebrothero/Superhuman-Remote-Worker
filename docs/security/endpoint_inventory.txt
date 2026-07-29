@@ -70,6 +70,8 @@ POST   /api/agents/threads/{thread_id}/cloud-stage                              
 PATCH  /api/agents/threads/{thread_id}/config                                           internal:require_internal
 GET    /api/agents/threads/{thread_id}/lifecycle                                        internal:require_internal
 POST   /api/agents/threads/{thread_id}/messages                                         internal:require_internal
+POST   /api/agents/threads/{thread_id}/officer/notify                                   internal:require_internal
+POST   /api/agents/threads/{thread_id}/officer/wake                                     internal:require_internal
 POST   /api/agents/threads/{thread_id}/release-agent                                    internal:require_internal
 PUT    /api/agents/threads/{thread_id}/status                                           internal:require_internal
 POST   /api/agents/threads/{thread_id}/suspend                                          internal:require_internal

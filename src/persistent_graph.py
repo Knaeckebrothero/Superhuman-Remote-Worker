@@ -1272,6 +1272,24 @@ async def _execute_turn(
             )
 
     ended_by_sleep = False
+
+    # Officer loop guard (centurion.md §4): a wake is one turn, so the
+    # per-wake action budget is a per-turn budget. Soft cap → one warning the
+    # model sees; 2× cap (or a hot repeated-action fingerprint) → force-end
+    # the turn. Ending WITHOUT a sleep request is deliberately safe: the
+    # watchdog files the implicit sleep_max timer, so a runaway wake degrades
+    # to a bounded nap, never a stuck officer. Strict `is True` + try/except
+    # so MagicMock configs in pinned tests can never enable the guard.
+    officer_max_actions = 0
+    if getattr(getattr(config, "officer", None), "enabled", False) is True:
+        try:
+            officer_max_actions = max(0, int(config.officer.max_actions_per_wake))
+        except (TypeError, ValueError, AttributeError):
+            officer_max_actions = 0
+    guard_fingerprints: dict[tuple, int] = {}
+    guard_warned = False
+    guard_force_end_reason = None
+
     while True:
         # Check for interrupt before LLM call
         if callbacks.check_interrupt():
@@ -2249,6 +2267,14 @@ async def _execute_turn(
             )
             messages_added += 1
             tool_calls_made += 1
+            if officer_max_actions:
+                try:
+                    fingerprint = (tool_name, repr(tool_args))
+                except Exception:
+                    fingerprint = (tool_name, "<unrepresentable>")
+                guard_fingerprints[fingerprint] = (
+                    guard_fingerprints.get(fingerprint, 0) + 1
+                )
             await _persist(messages[-1])
 
             if extracted_images:
@@ -2291,6 +2317,50 @@ async def _execute_turn(
             if callable(_peek_sleep) and isinstance(_peek_sleep(), dict):
                 ended_by_sleep = True
                 break
+
+        # Officer loop guard enforcement — AFTER the batch, so every tool_call
+        # on the AI message already has its ToolMessage (breaking mid-batch
+        # would orphan calls and trip tool-pairing validation on the next
+        # request). Hard stop at 2× the budget or a hot repeated-action
+        # fingerprint; one visible warning at the budget line first.
+        if officer_max_actions:
+            hottest = max(guard_fingerprints.values(), default=0)
+            if tool_calls_made >= 2 * officer_max_actions or hottest >= 5:
+                guard_force_end_reason = (
+                    f"repeated action ({hottest}× identical tool call)"
+                    if hottest >= 5
+                    else f"{tool_calls_made} actions (budget {officer_max_actions})"
+                )
+                guard_note = HumanMessage(
+                    content=(
+                        f"[guard] Wake force-ended: {guard_force_end_reason}. "
+                        "No sleep was filed — the watchdog wakes you on the "
+                        "default timer. Reassess before repeating any of "
+                        "this wake's actions."
+                    ),
+                    additional_kwargs={PERSIST_ROLE_KEY: "event"},
+                )
+                messages.append(_ensure_msg_id(guard_note))
+                messages_added += 1
+                await _persist(messages[-1])
+                logger.warning(
+                    "officer loop guard: force-ended wake (%s)",
+                    guard_force_end_reason,
+                )
+                break
+            if not guard_warned and tool_calls_made >= officer_max_actions:
+                guard_warned = True
+                warn_note = HumanMessage(
+                    content=(
+                        f"[guard] {tool_calls_made} actions this wake "
+                        f"(budget {officer_max_actions}). Wrap up: take only "
+                        "what is essential, then file a sleep."
+                    ),
+                    additional_kwargs={PERSIST_ROLE_KEY: "event"},
+                )
+                messages.append(_ensure_msg_id(warn_note))
+                messages_added += 1
+                await _persist(messages[-1])
 
         # Continue the inner loop — LLM sees tool results on next iteration
 

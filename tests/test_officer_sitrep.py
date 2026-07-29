@@ -1,0 +1,342 @@
+"""Officer sitrep + wake-routing tests — S3/S4 of docs/features/centurion.md.
+
+Covers the computed-delta sitrep (fingerprint diff, no-progress flag,
+per-section degradation, baseline preservation on failure), the officer
+predicate on thread dicts, the job-transition choke point in
+``maybe_wake_session`` (officer leg for terminal AND paused statuses), and
+the jobs-outbox → officer-event conversion in ``_deliver`` (double-wake
+suppression). Live delivery is k3d-smoke territory, as with the substrate
+suite.
+"""
+
+import asyncio
+import uuid
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from services import session_wake, sitrep
+
+THREAD_ID = str(uuid.uuid4())
+PROJECT_ID = str(uuid.uuid4())
+JOB_A = str(uuid.uuid4())
+JOB_B = str(uuid.uuid4())
+JOB_C = str(uuid.uuid4())
+
+
+class _FakeAcquire:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def _fake_conn():
+    conn = SimpleNamespace()
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchval = AsyncMock(return_value=0)
+    return conn
+
+
+def _fake_db(jobs=None, conn=None):
+    conn = conn or _fake_conn()
+    db = SimpleNamespace()
+    db.get_jobs = AsyncMock(return_value=jobs or [])
+    db.acquire = lambda: _FakeAcquire(conn)
+    return db
+
+
+def _officer_thread(prior_sitrep=None):
+    metadata = {"config_override": {"officer": {"enabled": True}}}
+    if prior_sitrep is not None:
+        metadata["officer_state"] = {"sitrep": prior_sitrep}
+    return {"id": THREAD_ID, "project_id": PROJECT_ID, "metadata": metadata}
+
+
+def _audit(counts=None, end=None):
+    reader = SimpleNamespace()
+    reader.get_audit_counts = AsyncMock(return_value=counts or {})
+    reader.get_audit_time_range = AsyncMock(return_value={"end": end} if end else None)
+    return reader
+
+
+TIMER_ROW = {
+    "id": 1,
+    "source": "timer",
+    "dedup_key": "timer",
+    "payload": {"minutes": 30, "reason": "waiting on the migration job"},
+}
+
+
+class TestSitrepBuild:
+    @pytest.mark.asyncio
+    async def test_first_sitrep_lists_new_jobs_and_baselines(self):
+        jobs = [
+            {"id": JOB_A, "status": "processing", "description": "build the thing"},
+            {"id": JOB_B, "status": "completed", "description": "old work"},
+        ]
+        db = _fake_db(jobs=jobs)
+        text, patch = await sitrep.build_wake_message(
+            db,
+            _officer_thread(),
+            [TIMER_ROW],
+            audit_reader=_audit(counts={JOB_A: 12}),
+            usage_ledger=None,
+        )
+        assert text is not None
+        assert "first sitrep" in text
+        assert "timer: slept ~30 min" in text
+        assert f"NEW {JOB_A[:8]} processing" in text
+        assert f"NEW {JOB_B[:8]} completed" in text
+        assert "steps 12" in text
+        prints = patch["sitrep"]["fingerprints"]
+        assert prints[JOB_A] == {"status": "processing", "steps": 12}
+        assert prints[JOB_B]["status"] == "completed"
+        assert patch["sitrep"]["watermark"]
+
+    @pytest.mark.asyncio
+    async def test_delta_transitions_stall_flag_and_steady(self):
+        prior = {
+            "watermark": (
+                datetime.now(timezone.utc) - timedelta(minutes=30)
+            ).isoformat(),
+            "fingerprints": {
+                JOB_A: {"status": "processing", "steps": 12},
+                JOB_B: {"status": "processing", "steps": 4},
+                JOB_C: {"status": "completed", "steps": None},
+            },
+        }
+        jobs = [
+            # A: still processing, same step count → NO PROGRESS flag.
+            {"id": JOB_A, "status": "processing", "description": "stuck one"},
+            # B: transitioned to failed → transition line with error.
+            {
+                "id": JOB_B,
+                "status": "failed",
+                "description": "flaky one",
+                "error_message": "OOM in step 5",
+            },
+            # C: completed before and now → steady count only.
+            {"id": JOB_C, "status": "completed", "description": "done one"},
+        ]
+        db = _fake_db(jobs=jobs)
+        text, patch = await sitrep.build_wake_message(
+            db,
+            _officer_thread(prior_sitrep=prior),
+            [TIMER_ROW],
+            audit_reader=_audit(counts={JOB_A: 12}),
+            usage_ledger=None,
+        )
+        assert "delta since" in text
+        assert f"{JOB_B[:8]} processing → failed" in text
+        assert "OOM in step 5" in text
+        assert "steps 12→12 (NO PROGRESS since last sitrep)" in text
+        assert "1 completed" in text  # steady tail
+        assert patch["sitrep"]["fingerprints"][JOB_B]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_jobs_failure_preserves_baseline_and_degrades(self):
+        prior = {
+            "watermark": datetime.now(timezone.utc).isoformat(),
+            "fingerprints": {JOB_A: {"status": "processing", "steps": 3}},
+        }
+        db = _fake_db()
+        db.get_jobs = AsyncMock(side_effect=RuntimeError("db down"))
+        text, patch = await sitrep.build_wake_message(
+            db,
+            _officer_thread(prior_sitrep=prior),
+            [TIMER_ROW],
+            audit_reader=None,
+            usage_ledger=None,
+        )
+        assert "Jobs: (section unavailable" in text
+        # The failed section must NOT wipe the baseline.
+        assert patch["sitrep"]["fingerprints"] == {
+            JOB_A: {"status": "processing", "steps": 3}
+        }
+
+    @pytest.mark.asyncio
+    async def test_sql_sections_degrade_without_killing_the_wake(self):
+        db = _fake_db(jobs=[])
+
+        def _broken_acquire():
+            raise RuntimeError("pool gone")
+
+        db.acquire = _broken_acquire
+        text, patch = await sitrep.build_wake_message(
+            db,
+            _officer_thread(),
+            [TIMER_ROW],
+            audit_reader=None,
+            usage_ledger=None,
+        )
+        assert text is not None
+        assert "[SITREP]" in text
+        assert "Capacity: (unavailable)" in text
+        assert "Fleet: (unavailable)" in text
+        assert "file a sleep" in text
+
+    @pytest.mark.asyncio
+    async def test_budget_section_reads_ledger(self):
+        ledger = SimpleNamespace()
+        ledger.query_usage = AsyncMock(
+            return_value={
+                "by_category": [
+                    {"unit": "tokens", "quantity": 123456, "cost_usd": 2.5},
+                    {"unit": "requests", "quantity": 42, "cost_usd": 0.0},
+                ],
+                "total_cost_usd": 2.5,
+            }
+        )
+        db = _fake_db(jobs=[])
+        text, _ = await sitrep.build_wake_message(
+            db,
+            _officer_thread(),
+            [TIMER_ROW],
+            audit_reader=None,
+            usage_ledger=ledger,
+        )
+        assert "Budget today (project): $2.50, 123,456 tokens." in text
+        kwargs = ledger.query_usage.await_args.kwargs
+        assert kwargs["scope_project_id"] == PROJECT_ID
+
+
+class TestOfficerPredicates:
+    def test_thread_is_officer_variants(self):
+        assert session_wake._thread_is_officer(_officer_thread()) is True
+        # String-encoded metadata (some drivers return JSONB as text).
+        import json
+
+        assert (
+            session_wake._thread_is_officer(
+                {
+                    "metadata": json.dumps(
+                        {"config_override": {"officer": {"enabled": True}}}
+                    )
+                }
+            )
+            is True
+        )
+        assert (
+            session_wake._thread_is_officer(
+                {"metadata": {"config_override": {"officer": {"enabled": "true"}}}}
+            )
+            is True
+        )
+        assert session_wake._thread_is_officer({"metadata": {}}) is False
+        assert (
+            session_wake._thread_is_officer(
+                {"metadata": {"config_override": {"officer": {"enabled": "yes"}}}}
+            )
+            is False
+        )
+
+    def test_dedup_key_shape(self):
+        assert (
+            session_wake._officer_job_dedup_key(JOB_A, "completed")
+            == f"{JOB_A[:8]}:completed"
+        )
+
+
+def _routing_db(officer=True):
+    db = SimpleNamespace()
+    db.get_job = AsyncMock(
+        return_value={
+            "id": JOB_A,
+            "project_id": PROJECT_ID,
+            "description": "delegated work",
+        }
+    )
+    db.get_officer_thread_for_project = AsyncMock(
+        return_value={"id": THREAD_ID} if officer else None
+    )
+    db.enqueue_session_wake_event = AsyncMock(return_value=True)
+    db.mark_job_wake_pending = AsyncMock(return_value=True)
+    # The kicked drain runs against this db as a background task; give it an
+    # empty claim so it exits quietly.
+    db.claim_pending_session_wake_events = AsyncMock(return_value=[])
+    return db
+
+
+class TestJobTransitionChokePoint:
+    @pytest.mark.asyncio
+    async def test_paused_notifies_officer_but_not_jobs_outbox(self):
+        db = _routing_db()
+        result = await session_wake.maybe_wake_session(db, JOB_A, "paused")
+        assert result is False  # paused never enters the jobs outbox
+        db.mark_job_wake_pending.assert_not_awaited()
+        kwargs = db.enqueue_session_wake_event.await_args.kwargs
+        assert kwargs["source"] == "job_transition"
+        assert kwargs["dedup_key"] == f"{JOB_A[:8]}:paused"
+        assert db.enqueue_session_wake_event.await_args.args[0] == THREAD_ID
+        await asyncio.sleep(0)  # let the kicked drain task settle
+
+    @pytest.mark.asyncio
+    async def test_completed_feeds_both_outboxes(self):
+        db = _routing_db()
+        result = await session_wake.maybe_wake_session(db, JOB_A, "completed")
+        assert result is True
+        db.mark_job_wake_pending.assert_awaited_once()
+        assert (
+            db.enqueue_session_wake_event.await_args.kwargs["dedup_key"]
+            == f"{JOB_A[:8]}:completed"
+        )
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_no_officer_no_enqueue(self):
+        db = _routing_db(officer=False)
+        await session_wake.maybe_wake_session(db, JOB_A, "completed")
+        db.enqueue_session_wake_event.assert_not_awaited()
+        db.mark_job_wake_pending.assert_awaited_once()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_processing_notifies_nobody(self):
+        db = _routing_db()
+        result = await session_wake.maybe_wake_session(db, JOB_A, "processing")
+        assert result is False
+        db.enqueue_session_wake_event.assert_not_awaited()
+        db.mark_job_wake_pending.assert_not_awaited()
+
+
+class TestDeliverOfficerConversion:
+    @pytest.mark.asyncio
+    async def test_officer_thread_converts_instead_of_injecting(self):
+        db = SimpleNamespace()
+        db.get_thread = AsyncMock(return_value=_officer_thread())
+        db.enqueue_session_wake_event = AsyncMock(return_value=True)
+        db.claim_pending_session_wake_events = AsyncMock(return_value=[])
+        row = {
+            "id": JOB_A,
+            "status": "completed",
+            "created_by_thread_id": THREAD_ID,
+            "description": "delegated work",
+            "project_id": PROJECT_ID,
+        }
+        ok = await session_wake._deliver(db, row)
+        assert ok is True
+        kwargs = db.enqueue_session_wake_event.await_args.kwargs
+        assert kwargs["source"] == "job_transition"
+        assert kwargs["dedup_key"] == f"{JOB_A[:8]}:completed"
+        assert kwargs["project_id"] == PROJECT_ID
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_conversion_failure_keeps_the_claim(self):
+        db = SimpleNamespace()
+        db.get_thread = AsyncMock(return_value=_officer_thread())
+        db.enqueue_session_wake_event = AsyncMock(side_effect=RuntimeError("down"))
+        row = {
+            "id": JOB_A,
+            "status": "completed",
+            "created_by_thread_id": THREAD_ID,
+        }
+        ok = await session_wake._deliver(db, row)
+        assert ok is False  # released → retried, never dropped
