@@ -1115,6 +1115,12 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_CONTROLLER_URL
                   optional: true
+            - name: VM_PERSISTENT_ROOTDISK
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_PERSISTENT_ROOTDISK
+                  optional: true
             # Workspace containers
             - name: WORKSPACE_IMAGE
               valueFrom:
