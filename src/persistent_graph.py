@@ -36,6 +36,7 @@ from .core.context import (
     repair_tool_pairing,
     scrub_history_tool_call_arguments,
 )
+from .core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
 from .core.summarizer import count_text_tokens
 from .core.workspace_backend import WorkspaceUnavailableError
 from .core.workspace_injection import find_tail_injection_anchor
@@ -548,14 +549,9 @@ def _is_retryable_llm_error(error: BaseException) -> bool:
     so a given provider failure gets one verdict product-wide — the worker path
     accumulated that triage across several incidents (see its docstring) and
     sessions had none of it.
-
-    Imported lazily: `src.graph` is a heavy module and nothing else in the
-    session path needs it at import time.
     """
     if _is_context_overflow(error):
         return False
-
-    from .graph import _classify_llm_error
 
     return _classify_llm_error(error) in _SESSION_RETRYABLE_CLASSIFICATIONS
 
@@ -564,8 +560,6 @@ def _session_llm_retry_delay(attempt: int, error: BaseException) -> float:
     """Backoff before the next attempt, floored by any provider Retry-After."""
     delay = _SESSION_LLM_RETRY_BASE_DELAY * (2**attempt)
     try:
-        from .graph import _extract_rate_limit_delay
-
         provider_delay = _extract_rate_limit_delay(error)
     except Exception:  # pragma: no cover - defensive
         provider_delay = None
