@@ -170,16 +170,18 @@ management daemon (systemd, config persisted on disk) re-registers with the
 orchestrator on boot and refreshes `context.vm` regardless. Purge-delete
 keeps deleting the node (today's behavior).
 
-Cloud-init caveat to verify live (V3 below): `cloudInitNoCloud` write_files +
-runcmd are per-instance modules. If KubeVirt derives the instance-id from the
-(deterministic) VM name, second boot on a reused disk skips them — `tailscale
-up` is not re-run and on-disk state carries identity (the desired path; the
-freshly minted auth key from `_do_create` simply goes unused). If instead the
-instance-id changes per VMI, runcmd re-runs `tailscale up --auth-key=<new>`
-with the node still present — expected to re-auth under the same hostname,
-but may leave a duplicate Headscale node. Live probe decides whether we need
-`instance-id: agent-vm-${JOB_ID}` pinned explicitly in the cloudInitNoCloud
-block (one template line).
+Cloud-init caveat — **resolved by the live probe 2026-07-29: the instance-id
+changes per VMI.** A session suspend/resume cycle showed the recreated VM
+re-running `tailscale up` with the fresh auth key and joining as a NEW node
+(tailnet IP changed). Functionally fine — the management daemon re-registers
+and refreshes the stored coordinates, which is the fallback this paragraph
+predicted — but each keep-disk recreate strands the previous Headscale node.
+Follow-up (filed, not built): pin the NoCloud instance-id so per-instance
+modules don't re-run and on-disk tailscale state rejoins as the kept node;
+verify first whether KubeVirt's `cloudInitNoCloud` exposes the instance-id at
+all. Until then, keep-disk recreates cost one stranded Headscale node each —
+same leak class as [[srw_agent_headscale_ephemeral_leak]]'s non-ephemeral
+keys.
 
 ### D4 — GC discipline (the leak guard, mirror of Branch a Phase 1)
 
