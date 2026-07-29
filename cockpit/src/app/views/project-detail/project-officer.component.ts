@@ -207,7 +207,7 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
               <app-form-field label="Slot">
                 <app-input
                   [value]="row.name"
-                  (changed)="patchSlot(i, {name: $event ?? ''})"
+                  (changed)="patchSlot(i, {name: $event})"
                   placeholder="line"
                 />
               </app-form-field>
