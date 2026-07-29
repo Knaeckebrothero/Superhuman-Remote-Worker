@@ -268,10 +268,14 @@ async def add_project_contact(
             user["id"], body.display_name.strip(), body.notes
         )
         for ch, addr, prim in normalized:
-            if (
-                await db.add_contact_address(created["id"], user["id"], ch, addr, prim)
-                is None
-            ):
+            added = await db.add_contact_address(
+                created["id"], user["id"], ch, addr, prim
+            )
+            if added is None:
+                # This contact was just created by this request (not pre-existing), so
+                # deleting it on failed creation is safe — the 409 hint still points at
+                # the pre-existing OTHER contact that already holds this address.
+                await db.delete_contact(created["id"])
                 raise HTTPException(
                     status_code=409,
                     detail=(

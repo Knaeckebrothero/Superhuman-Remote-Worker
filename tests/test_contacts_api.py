@@ -308,3 +308,31 @@ async def test_project_post_find_or_create_then_link(db, monkeypatch):
     )
     db.create_contact.assert_not_awaited()
     db.link_contact_to_project.assert_awaited_once_with("p1", "c-exist", USER_A["id"])
+
+
+async def test_project_post_create_rolls_back_on_duplicate_address(db, monkeypatch):
+    monkeypatch.setattr(
+        contacts_router,
+        "require_project_member",
+        AsyncMock(return_value=(USER_A, {"id": "p1"})),
+    )
+    # no visible contact matches → create branch; duplicate address mid-loop
+    db.list_contacts_for_user.return_value = []
+    db.create_contact.return_value = {"id": "c-new"}
+    db.add_contact_address.return_value = None
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.add_project_contact(
+            _req(),
+            "p1",
+            contacts_router.ContactCreate(
+                display_name="Anna",
+                addresses=[
+                    contacts_router.ContactAddressIn(
+                        channel="email", address="anna@x.de"
+                    )
+                ],
+            ),
+        )
+    assert e.value.status_code == 409
+    db.delete_contact.assert_awaited_once_with("c-new")
+    db.link_contact_to_project.assert_not_awaited()
