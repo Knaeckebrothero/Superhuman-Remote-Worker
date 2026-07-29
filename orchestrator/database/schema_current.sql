@@ -1349,9 +1349,9 @@ CREATE TABLE public.project_loops (
     CONSTRAINT project_loop_campaign_caps_is_object CHECK (((campaign_caps IS NULL) OR (jsonb_typeof(campaign_caps) = 'object'::text))),
     CONSTRAINT project_loop_campaign_history_is_array CHECK ((jsonb_typeof(campaign_history) = 'array'::text)),
     CONSTRAINT project_loop_campaign_is_object CHECK (((campaign IS NULL) OR (jsonb_typeof(campaign) = 'object'::text))),
-    CONSTRAINT project_loop_has_budget CHECK (((max_iterations IS NOT NULL) OR (run_until IS NOT NULL))),
+    CONSTRAINT project_loop_has_budget CHECK (((max_iterations IS NOT NULL) OR (run_until IS NOT NULL) OR (scheduling = 'officer'::text))),
     CONSTRAINT project_loop_role_sequence_nonempty CHECK (((jsonb_typeof(role_sequence) = 'array'::text) AND (jsonb_array_length(role_sequence) >= 1))),
-    CONSTRAINT project_loop_scheduling_known CHECK ((scheduling = ANY (ARRAY['standard'::text, 'campaign'::text]))),
+    CONSTRAINT project_loop_scheduling_known CHECK ((scheduling = ANY (ARRAY['standard'::text, 'campaign'::text, 'officer'::text]))),
     CONSTRAINT project_loop_stage_jobs_is_array CHECK ((jsonb_typeof(current_stage_jobs) = 'array'::text)),
     CONSTRAINT project_loop_workspace_backend_valid CHECK (((workspace_backend IS NULL) OR (workspace_backend = ANY (ARRAY['sandbox'::text, 'vm'::text, 'virtual'::text, 'none'::text])))),
     CONSTRAINT project_loops_status_check CHECK ((status = ANY (ARRAY['running'::text, 'paused'::text, 'stopped'::text, 'completed'::text, 'failed'::text])))
