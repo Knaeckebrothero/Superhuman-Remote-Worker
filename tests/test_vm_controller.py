@@ -2308,7 +2308,8 @@ class TestPersistentRootdiskEnabled:
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         dv = _dv_create_body(controller)
-        assert dv["spec"]["source"] == {"pvc": {"name": "agent-vm-golden-abc123def456"}}
+        # namespace is added on the way out — see TestRootdiskCloneSourceNamespace.
+        assert dv["spec"]["source"]["pvc"]["name"] == "agent-vm-golden-abc123def456"
         assert dv["spec"]["storage"]["volumeMode"] == "Filesystem"
 
     @pytest.mark.asyncio
@@ -2581,3 +2582,60 @@ class TestGcRootdisks:
             await controller._do_create(SAMPLE_JOB_CONFIG)
 
         controller._gc_rootdisks_safe.assert_not_called()
+
+
+class TestRootdiskCloneSourceNamespace:
+    """A templated DataVolume may omit spec.source.pvc.namespace — CDI defaults
+    it from the owning VM. A STANDALONE one may not: the CDI webhook rejects it
+    with 422 'spec.source.pvc.namespace: Required value'.
+
+    Live-gate finding 2026-07-29 (job a43bfb73): every VM create failed the
+    moment the flag was flipped. Unit tests could not have caught it — the k8s
+    mock accepts any body — so this test pins the shape the API demands.
+    """
+
+    @pytest.mark.asyncio
+    async def test_clone_source_carries_an_explicit_namespace(self, controller):
+        controller._golden_state_nowait = AsyncMock(
+            return_value=("agent-vm-golden-abc123def456", None)
+        )
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert dv["spec"]["source"]["pvc"] == {
+            "name": "agent-vm-golden-abc123def456",
+            # Same namespace as the target, so no cross-namespace clone RBAC is
+            # involved — it just has to be stated.
+            "namespace": VM_NAMESPACE,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_namespace_is_left_alone(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        controller.template_text = SAMPLE_TEMPLATE.replace(
+            "        source:\n          registry:\n            url: docker://${VM_IMAGE}",
+            "        source:\n          pvc:\n            name: some-golden\n"
+            "            namespace: other-ns",
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert dv["spec"]["source"]["pvc"]["namespace"] == "other-ns"
+
+    @pytest.mark.asyncio
+    async def test_registry_source_is_untouched(self, controller):
+        """No golden → registry import, which has no namespace concept."""
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert "registry" in dv["spec"]["source"]
+        assert "pvc" not in dv["spec"]["source"]
