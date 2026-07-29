@@ -1254,3 +1254,101 @@ class TestVmJobSuspendRidesThePersistentRootdisk:
 
         assert await svc.suspend_workspace(make_job()["id"]) is False
         svc._container_provisioner.delete_workspace.assert_not_awaited()
+
+
+class TestUpgradedThreadReadsAsVmTier:
+    """A thread UPGRADED to VM keeps its original declared backend — the
+    upgrade endpoint provisions metadata.vm without rewriting
+    config_override.workspace.backend. Live-gate finding 2026-07-29 (thread
+    b4ae24bb): a virtual-tier session upgraded to VM still read as non-VM, so
+    suspend took the container branch and refused.
+
+    The materialized VM context has to beat the stale declared backend. The
+    original fallback for this case was unreachable: `if backend:` returned
+    early for ANY non-empty string, including 'virtual' and 'sandbox'.
+    """
+
+    def _upgraded(self, declared_backend):
+        """Real shape from dev: lite/sandbox backend + a live VM + a git-only
+        workspace_container (no pod ever provisioned for a lite session)."""
+        return {
+            "id": "tid-up",
+            "status": "active",
+            "metadata": {
+                "config_override": {"workspace": {"backend": declared_backend}},
+                "workspace_container": {
+                    "git_remote_url": "http://gitea/srw/thread-tid-up.git",
+                    "repo_name": "thread-tid-up",
+                },
+                "vm": {"status": "ready", "ssh_host": "100.64.2.6", "ssh_port": 22},
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_virtual_upgraded_to_vm_suspends_via_the_vm_branch(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=self._upgraded("virtual"))
+        svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
+
+        ok = await svc.suspend_thread_workspace("tid-up")
+
+        assert ok is True
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-up", purge_disk=False)
+
+    @pytest.mark.asyncio
+    async def test_sandbox_upgraded_to_vm_reads_as_vm(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=self._upgraded("sandbox"))
+
+        await svc.suspend_thread_workspace("tid-up")
+
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-up", purge_disk=False)
+
+    @pytest.mark.asyncio
+    async def test_upgraded_thread_snapshot_is_labelled_vm(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=self._upgraded("virtual"))
+
+        await svc.suspend_thread_workspace("tid-up")
+
+        kwargs = svc._snapshot_service.capture_vm_snapshot.await_args.kwargs
+        assert kwargs["source_type"] == "vm"
+        assert kwargs["ssh_host"] == "100.64.2.6"
+        assert kwargs["ssh_port"] == 22  # not the pod's 30022
+
+    @pytest.mark.asyncio
+    async def test_a_live_container_still_wins(self, monkeypatch):
+        """Guard the other direction: a thread with a REAL provisioned pod is
+        container-tier even if a stale vm context is lying around (a failed
+        upgrade), because ws_ctx carries pod state."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        thread = self._upgraded("sandbox")
+        thread["metadata"]["workspace_container"].update(
+            {"status": "ready", "pod_ip": "10.42.2.32"}
+        )
+        svc._db.get_thread = AsyncMock(return_value=thread)
+
+        await svc.suspend_thread_workspace("tid-up")
+
+        vm_prov.delete_thread_vm.assert_not_awaited()
+        svc._container_provisioner.delete_workspace.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_declared_vm_without_a_vm_context_yet_still_reads_vm(
+        self, monkeypatch
+    ):
+        """Created-on-VM thread mid-provision: no vm.status yet, but the
+        declared backend says vm."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        thread = self._upgraded("vm")
+        thread["metadata"]["vm"] = {"status": "ready", "ssh_host": "100.64.0.9"}
+        svc._db.get_thread = AsyncMock(return_value=thread)
+
+        await svc.suspend_thread_workspace("tid-up")
+
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-up", purge_disk=False)
