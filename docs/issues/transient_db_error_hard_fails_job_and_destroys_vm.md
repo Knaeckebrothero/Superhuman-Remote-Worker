@@ -336,6 +336,58 @@ lifecycle signal into model-visible prose.
 
 ---
 
+## Live gate — PARTIAL (2026-07-28)
+
+**Deployed and verified wired on dev.** Orchestrator leader logs
+`Transient-infra re-dispatch sweeper started (tick=30s)` (the non-leader
+replica correctly stays silent); migration 0072 applied (`jobs.failed_at`
+present); the agent image carries `is_transient_infra_error`. Fixes 2, 6, 7
+and 8 ride ordinary traffic and the fleet is healthy.
+
+**Two gates remain OWED, and one obvious test method does NOT work.**
+
+**`pg_terminate_backend` does not reproduce this failure.** Tried on throwaway
+job `6c916d6d` (pod-backed): both agent connections killed, then 45 more rounds
+over two minutes. The job never paused, never failed, never raised. Even with
+**zero** connections left in `pg_stat_activity` it kept making LLM calls and
+writing audit rows. The only trace was one agent-side
+`WARNING psycopg: error ignored terminating <AsyncPipeline [BAD]>: the
+connection is lost`.
+
+Why: `pg_terminate_backend` kills a *session*. The server stays up, so
+psycopg's pool immediately opens a replacement and nothing reaches the app
+layer. The 2026-07-27 incident was the *server* being unavailable — two PANIC
+restarts, a `VACUUM FULL` ACCESS EXCLUSIVE lock, a WAL storm — so **reconnects
+failed too**, which is what let the exception propagate to
+`completion_error_payload`. **Anyone gating this must make Postgres
+unreachable, not merely disconnect a session.** A NetworkPolicy denying one
+throwaway agent pod's egress to `srw-postgres` is the contained way; verify
+enforcement is actually on first (`agent_egress_networkpolicy_enablement.md`),
+because an unenforced policy fails silently and yields another false negative.
+Never scale down `srw-postgres-0` — that is a full-cluster outage, not a test.
+
+**Defect 1b is also ungated:** the throwaway job got a *pod-backed* workspace,
+and the carve-out lives in `VMManager.is_reapable`/`is_idle`. It needs a
+VM-backed job. This is the fix that most deserves a live gate — the reaper
+interaction was wrong on the first implementation pass and was caught by
+reading code, not by testing.
+
+## Watch item: Defect 3 is the only change that can cause a NEW failure
+
+Every other fix either fires or falls back to today's behaviour. Defect 3 is
+different: it makes agents **stop** in cases where they previously kept
+running. It stops on `failed`, `cancelled` and `paused`.
+
+`paused` is the one to watch. It is correct for every path we know of — the
+orchestrator already pushes a cooperative stop for drain, VM upgrade and
+outage pauses — but if any normal flow parks a job at `paused` while its agent
+is legitimately still working, that agent will now self-stop within one
+heartbeat interval (60s). The signature is an agent log line
+`is 'paused' on the orchestrator but this agent is still running it` with no
+corresponding operator action. If that appears, narrow
+`_PREEMPTED_JOB_STATUSES` in `src/api/app.py` to `failed`/`cancelled` and
+re-evaluate.
+
 ## Open question
 
 The `/complete` report that carried `the connection is closed` cannot be
