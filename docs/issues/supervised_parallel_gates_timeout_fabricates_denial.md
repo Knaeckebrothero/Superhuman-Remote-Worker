@@ -1,6 +1,6 @@
 # Supervised parallel tool calls: approve one, the rest are reported to the model as "User denied" (timeout fabricates a denial)
 
-**Status:** **Scope A IMPLEMENTED on `develop` 2026-07-27 (uncommitted; live gate OWED).** Root cause confirmed via live reproduction on the dev cluster. Fix 1 (three-state gate, park instead of fabricating a denial, tethered wait, interrupt-cancellable) + Fix 2 (pending gates re-surface on attach) are done with tests; see "Implementation" below. Out-of-scope items (Defect A stream, batch-approval UX, reload "completed" mislabel) remain open.
+**Status:** **Scope A SHIPPED — committed `54e42626`, deployed dev `sha-f0cd0e0`, LIVE GATE PASSED 2026-07-29** (evidence below). Root cause confirmed via live reproduction on the dev cluster. Fix 1 (three-state gate, park instead of fabricating a denial, tethered wait, interrupt-cancellable) + Fix 2 (pending gates re-surface on attach) are done with tests; see "Implementation" below. Out-of-scope items (Defect A stream, batch-approval UX, reload "completed" mislabel) remain open.
 **Found:** 2026-07-24 (user report: *"When the AI sends multi tool calls but is on supervised we can only approve one — the rest fails"*). Root cause confirmed via live repro 2026-07-25, session `83dc7f7a-75b0-4141-ace6-0c5413a3e5cf` (dev `cockpit.srw.works`, user `operator@redacted.invalid`, model `MiniMax-M3`).
 **Severity:** High. Silent and damaging: the model is told the user *refused* tool calls the user never saw, so it abandons real work. With a parallel tool batch the user approves the first and watches the rest "fail."
 **Component:** agent gate loop (`src/persistent_graph.py`) · DB-backed permission gate + WS welcome frame (`src/api/persistent_app.py`) · cockpit approval card (`cockpit/.../persistent-chat.service.ts`, `persistent-chat.component.ts`).
@@ -122,7 +122,20 @@ Done test-first: every behavior below had a failing test watched fail before the
 
 **Verification run:** full backend suite **10965 passed**, 27 skipped, 3 failed — all 3 pre-existing and unrelated (`test_database_phase1` ×2 need a local Postgres on :5432; `test_endpoint_inventory` is stale from the in-flight `POST /api/jobs/{target_job_id}/verification/rounds` work in `orchestrator/main.py`, a file this change never touches). Full cockpit suite **1395 passed**; `tsc --noEmit` clean; `ruff check src/` clean.
 
-**Still owed:** live gate on dev — repeat the repro below, confirm via `get_persistent_thread_messages` that unanswered siblings stay pending with **no** `"User denied"`, and that a reload re-surfaces the card and approving it runs the tool.
+### Live gate — PASSED 2026-07-29 (dev `sha-f0cd0e0`, agent pods confirmed on that tag)
+
+Same repro, session `8d8fb61f-dc32-4545-8005-1212018706e1`, Supervised, `MiniMax-M3`. The AI response carried four parallel calls (`Tools: web_search, web_search, web_search, web_search`); only #1 was approved.
+
+| | Before (07-25, session `83dc7f7a`) | After (07-29) |
+|---|---|---|
+| #1 France approved | ran 15:40:28 | ran 14:38:15 |
+| #2 Japan, left unanswered | **`"User denied this tool call."`** at 15:45:28 — exactly **300.04 s** later | **nothing written**; still `pending` at **+6.5 min** |
+| Reload | froze on a stale card | card **recovered**, buttons live |
+| Approve recovered card | — | tool **ran** 14:45:50, real results |
+
+Decisive evidence: at 14:44:13Z — **59 s past the old denial deadline** — `get_persistent_thread_messages` still returned exactly 3 messages with no denial. The final step also confirms the `approval_id`→`approvalId` mapping in production: a card rebuilt purely from the welcome frame resolved *that specific gate* and executed it.
+
+**Observed unchanged:** the `425 /connection` console storm (Defect A) still fires on session creation — now a live-latency annoyance rather than something that corrupts the turn.
 
 ---
 

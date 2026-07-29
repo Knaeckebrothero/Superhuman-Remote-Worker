@@ -867,6 +867,35 @@ export function clearDraft(threadId: string | null): void {
         </div>
       }
 
+      <!-- Job-diff drawer for a job card's "Open diff". Same container and
+           chrome as the cloud-diff drawer above, but bound to a jobId — the
+           component already accepts either. Kept as a separate signal so
+           opening a job's diff can never be confused with, or clobber, the
+           session's own staged cloud changes. -->
+      @if (jobDiffId(); as jobId) {
+        <div class="settings-panel citations-panel-wrap"
+             style="display:flex;flex-direction:column;height:70vh;min-height:0;">
+          <div style="display:flex;align-items:center;justify-content:space-between;
+                      flex:0 0 auto;padding:0.5rem 0.75rem;
+                      border-bottom:1px solid var(--border-color, rgba(127,127,127,0.2));">
+            <span style="font-weight:600;font-size:0.9rem;">
+              {{ 'toolCard.job.diffTitle' | transloco:{ id: jobId.slice(0, 8) } }}
+            </span>
+            <button type="button" (click)="jobDiffId.set(null)"
+                    [title]="'chat.citations.close' | transloco"
+                    style="background:none;border:none;cursor:pointer;color:inherit;
+                           display:inline-flex;padding:0.15rem;">
+              <app-icon size="sm">close</app-icon>
+            </button>
+          </div>
+          <app-job-diff-review
+            style="flex:1 1 auto;min-height:0;"
+            [jobId]="jobId"
+            (resolved)="jobDiffId.set(null)"
+          />
+        </div>
+      }
+
       <!-- Task bar -->
       @if (chat.tasks().length) {
         <div class="task-bar">
@@ -915,7 +944,8 @@ export function clearDraft(threadId: string | null): void {
       <ng-template #toolDetails let-tools>
         <div class="tool-detail-list">
           @for (tc of tools; track tc.id) {
-            <app-tool-card [view]="toolView(tc)" (actionRequested)="canvasRequested.emit()" />
+            <app-tool-card [view]="toolView(tc)" (actionRequested)="canvasRequested.emit()"
+                           (jobDiffRequested)="openJobDiff($event)" />
           }
         </div>
       </ng-template>
@@ -3232,6 +3262,18 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * change-detection cycles. The reducer recreates the event object on every
      * update, so the WeakMap key naturally invalidates when the call changes.
      */
+    /**
+     * Job whose diff drawer is open, or null. Separate from
+     * `chat.cloudDiffPanelOpen` so a job's diff and the session's own staged
+     * cloud changes can never be mistaken for one another.
+     */
+    readonly jobDiffId = signal<string | null>(null);
+
+    openJobDiff(jobId: string): void {
+        this.chat.cloudDiffPanelOpen.set(false);
+        this.jobDiffId.set(jobId);
+    }
+
     private readonly toolViewCache = new WeakMap<ToolCallEvent, ToolCardView>();
 
     toolView(tc: ToolCallEvent): ToolCardView {

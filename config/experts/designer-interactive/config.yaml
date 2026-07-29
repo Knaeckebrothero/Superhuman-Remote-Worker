@@ -51,7 +51,6 @@ tools:
   research:
     - web_search
     - extract_webpage
-    - browse_website
   shell:
     - run_command
     - cancel_command

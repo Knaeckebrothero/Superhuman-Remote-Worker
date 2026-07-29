@@ -1,15 +1,22 @@
-"""Every tool name in the session base config must exist in the registry.
+"""Every tool name in a shipped config must exist in the registry.
 
 A name that no longer exists makes ``load_tools`` raise ``ValueError`` for the
-WHOLE batch (registry.py validates all names up front), which drops the
-persistent session into the per-tool fallback loop in ``_setup_tools``. That
-loop swallows individual failures at DEBUG, so the session still starts and the
-only symptom is a single warning — real bind failures hide behind it.
+WHOLE batch (registry.py validates all names up front), which drops the caller
+into a per-tool fallback loop — ``_setup_tools`` for sessions
+(``persistent_session.py``), ``_setup_job_tools`` for worker jobs
+(``agent.py``). Both loops swallow individual failures at DEBUG, so the run
+still starts and the only symptom is a single warning. The batch validation is
+the safety net, and one dead name spends it for everyone.
 
-``browse_website`` / ``download_from_website`` sat in session_base long after
-being removed from the registry and did exactly this on every session start.
-This pins the class of bug, not just those two names.
+``browse_website`` / ``download_from_website`` sat in these configs long after
+being removed from the registry and did exactly this on every session start and
+every worker job. This pins the class of bug, not just those two names.
+
+Configs are checked in their MERGED form, so a stale name inherited from a base
+through ``$extends`` is caught in the expert that actually loads it.
 """
+
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +25,19 @@ from src.tools.registry import TOOL_REGISTRY
 
 # Wildcards are expanded at load time against the live registry, not looked up.
 _WILDCARDS = {"*"}
+
+_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+
+_BASE_CONFIGS = ["session_base", "worker_base"]
+
+
+def _expert_config_names() -> list[str]:
+    """Every bundled expert, discovered — so a new one is covered on arrival."""
+    return sorted(
+        p.parent.name
+        for p in _CONFIG_DIR.glob("experts/*/config.yaml")
+        if p.parent.name != "__pycache__"
+    )
 
 
 def _config_tool_names(config_name: str) -> list[tuple[str, str]]:
@@ -32,22 +52,31 @@ def _config_tool_names(config_name: str) -> list[tuple[str, str]]:
     ]
 
 
-def test_session_base_tool_names_all_exist_in_registry():
+@pytest.mark.parametrize("config_name", _BASE_CONFIGS + _expert_config_names())
+def test_config_tool_names_all_exist_in_registry(config_name):
     unknown = [
         f"tools.{category}: {name}"
-        for category, name in _config_tool_names("session_base")
+        for category, name in _config_tool_names(config_name)
         if name not in TOOL_REGISTRY
     ]
     assert not unknown, (
-        "config/session_base.yaml references tool names that are not in "
-        "TOOL_REGISTRY — every session start will fail the batch load and "
-        f"degrade into the silent per-tool fallback: {unknown}"
+        f"config '{config_name}' references tool names that are not in "
+        "TOOL_REGISTRY — every run on this config fails the batch load and "
+        f"degrades into the silent per-tool fallback: {unknown}"
     )
 
 
-def test_session_base_declares_some_tools():
-    """Guard the guard: an empty parse would make the test above vacuous."""
-    assert len(_config_tool_names("session_base")) > 20
+def test_experts_are_actually_discovered():
+    """Guard the guard: an empty glob would make the parametrization vacuous."""
+    experts = _expert_config_names()
+    assert len(experts) >= 4, experts
+    assert "developer" in experts
+
+
+@pytest.mark.parametrize("config_name", _BASE_CONFIGS)
+def test_base_configs_declare_some_tools(config_name):
+    """Guard the guard: an empty parse would make the check above vacuous."""
+    assert len(_config_tool_names(config_name)) > 20
 
 
 @pytest.mark.parametrize("category", ["orchestrator", "agent_catalog", "workflows"])

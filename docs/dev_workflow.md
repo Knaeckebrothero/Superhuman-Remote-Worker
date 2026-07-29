@@ -53,7 +53,7 @@ A dedicated tester agent has testing as its **primary goal**, not an afterthough
 |----------|-------|---------|
 | workspace | read/write/edit/list/search | Read code, write test files |
 | coding | run_command, shell_read | Start app, run tests, check logs |
-| research | browse_website | UI exploration and visual verification |
+| browser_direct | browser_navigate, browser_snapshot, browser_click, … | UI exploration and visual verification |
 | git | git_log, git_show, git_diff, git_status | Understand what changed |
 | core | next_phase_todos, todo_complete, etc. | Phase management |
 
