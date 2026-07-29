@@ -1,0 +1,370 @@
+"""Officer (centurion) substrate tests — S1+S2 of docs/features/centurion.md.
+
+Covers the config parse (shared helper, both loader paths), the ToolContext
+sleep slot, the sleep tool, the TurnResult flag, the officer branch of
+``_loop_get_user_input`` (durable-timer filing, backstop wake, never
+``IdleTimeoutError``, no awaiting_user flip), the ready-mirror suppression,
+and the session_wake officer helpers. Live wiring (drain → pod inject,
+watchdog respawn) is covered by the k3d smoke runbook, not unit tests —
+same split the attention-sleep suite uses.
+"""
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from src.core.loader import OfficerConfig, _parse_officer_config
+from src.persistent_graph import TurnResult
+from src.tools.context import ToolContext
+from src.tools.core.officer import OFFICER_TOOLS_METADATA, create_officer_tools
+
+
+# ---------------------------------------------------------------------------
+# Config parse
+# ---------------------------------------------------------------------------
+
+
+class TestOfficerConfigParse:
+    def test_defaults_disabled(self):
+        cfg = _parse_officer_config({})
+        assert cfg.enabled is False
+        assert cfg.sleep_min_minutes == 5
+        assert cfg.sleep_max_minutes == 60
+        assert cfg.max_concurrent_workers == 3
+
+    def test_enabled_with_overrides(self):
+        cfg = _parse_officer_config(
+            {
+                "officer": {
+                    "enabled": True,
+                    "sleep_min_minutes": 2,
+                    "sleep_max_minutes": 30,
+                    "max_concurrent_workers": 5,
+                }
+            }
+        )
+        assert cfg.enabled is True
+        assert (cfg.sleep_min_minutes, cfg.sleep_max_minutes) == (2, 30)
+        assert cfg.max_concurrent_workers == 5
+
+    def test_min_clamped_to_max(self):
+        cfg = _parse_officer_config(
+            {"officer": {"sleep_min_minutes": 90, "sleep_max_minutes": 30}}
+        )
+        assert cfg.sleep_min_minutes == 30
+        assert cfg.sleep_max_minutes == 30
+
+    def test_backstop_floor_two_hours(self):
+        # Backstop is insurance, not the wake mechanism — never below 2h.
+        assert OfficerConfig(sleep_max_minutes=5).backstop_seconds == 120 * 60
+        assert OfficerConfig(sleep_max_minutes=90).backstop_seconds == 180 * 60
+
+    def test_dict_loader_path_parses_officer_and_keeps_extra_clean(self):
+        from src.core.loader import load_agent_config_from_dict
+
+        config = load_agent_config_from_dict(
+            {
+                "agent_id": "officer-test",
+                "display_name": "Officer Test",
+                "officer": {"enabled": True, "sleep_max_minutes": 45},
+            }
+        )
+        assert config.officer.enabled is True
+        assert config.officer.sleep_max_minutes == 45
+        # 'officer' is a known field — it must not leak into config.extra.
+        assert "officer" not in (config.extra or {})
+
+
+# ---------------------------------------------------------------------------
+# ToolContext slot + sleep tool + TurnResult flag
+# ---------------------------------------------------------------------------
+
+
+def _bare_tool_context() -> ToolContext:
+    """A ToolContext with only class-level defaults — the sleep slot needs
+    nothing else, and constructing the full dataclass drags in managers."""
+    return ToolContext.__new__(ToolContext)
+
+
+class TestSleepSlotAndTool:
+    def test_request_peek_consume_roundtrip(self):
+        ctx = _bare_tool_context()
+        assert ctx.peek_officer_sleep() is None
+        ctx.request_officer_sleep({"minutes": 10, "reason": "r"})
+        assert ctx.peek_officer_sleep() == {"minutes": 10, "reason": "r"}
+        # Peek is non-destructive; consume clears.
+        assert ctx.peek_officer_sleep() is not None
+        assert ctx.consume_officer_sleep() == {"minutes": 10, "reason": "r"}
+        assert ctx.peek_officer_sleep() is None
+        assert ctx.consume_officer_sleep() is None
+
+    @pytest.mark.asyncio
+    async def test_sleep_tool_parks_request(self):
+        ctx = _bare_tool_context()
+        (sleep_tool,) = create_officer_tools(ctx)
+        assert sleep_tool.name == "sleep"
+        assert "sleep" in OFFICER_TOOLS_METADATA
+        result = await sleep_tool.ainvoke({"minutes": 30, "reason": "3 jobs healthy"})
+        assert "Wake-up call filed" in result
+        parked = ctx.peek_officer_sleep()
+        assert parked is not None and parked["minutes"] == 30
+        assert parked["reason"] == "3 jobs healthy"
+
+    def test_turn_result_flag_defaults_false(self):
+        r = TurnResult(turn_id=0, messages_added=0, tool_calls_made=0)
+        assert r.ended_by_sleep is False
+
+
+# ---------------------------------------------------------------------------
+# _loop_get_user_input — officer branch
+# ---------------------------------------------------------------------------
+
+
+def _reset_agent_globals():
+    import src.api.persistent_app as mod
+
+    mod._session = None
+    mod._thread_id = None
+    mod._orchestrator_client = None
+    mod._subscribers.clear()
+    mod._loop_user_queue = None
+
+
+def _install_officer_session(*, officer_cfg, turn_count: int = 2):
+    import src.api.persistent_app as mod
+
+    session = MagicMock()
+    session.turn_count = turn_count
+    session.config = MagicMock()
+    session.config.interactive.idle_timeout_minutes = 0
+    session.config.headless.mode = "eager"
+    session.config.officer = officer_cfg
+    session.tool_context = None
+    mod._session = session
+    mod._thread_id = "thread-test-uuid"
+    client = AsyncMock()
+    client.update_thread_status = AsyncMock(return_value=True)
+    client.file_officer_wake = AsyncMock(return_value=True)
+    mod._orchestrator_client = client
+    mod._loop_user_queue = asyncio.Queue()
+    return session, client
+
+
+class TestOfficerInputWait:
+    def setup_method(self):
+        _reset_agent_globals()
+
+    def teardown_method(self):
+        _reset_agent_globals()
+
+    @pytest.mark.asyncio
+    async def test_sleep_request_files_clamped_wake_and_queue_wins(self):
+        import src.api.persistent_app as mod
+
+        session, client = _install_officer_session(
+            officer_cfg=OfficerConfig(
+                enabled=True, sleep_min_minutes=5, sleep_max_minutes=60
+            )
+        )
+        session.tool_context = MagicMock()
+        session.tool_context.consume_officer_sleep = MagicMock(
+            return_value={"minutes": 500, "reason": "long haul"}
+        )
+        await mod._loop_user_queue.put({"content": "hi", "role": "human"})
+
+        item = await mod._loop_get_user_input()
+
+        assert item["content"] == "hi"
+        # Filing runs as a task — let it complete.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        client.file_officer_wake.assert_awaited_once_with(
+            "thread-test-uuid", 60, "long haul"
+        )
+
+    @pytest.mark.asyncio
+    async def test_backstop_returns_labeled_wake_never_raises(self):
+        import src.api.persistent_app as mod
+        from src.persistent_graph import IdleTimeoutError
+
+        _install_officer_session(
+            officer_cfg=SimpleNamespace(
+                enabled=True,
+                sleep_min_minutes=1,
+                sleep_max_minutes=2,
+                backstop_seconds=0.05,
+            )
+        )
+
+        try:
+            item = await mod._loop_get_user_input()
+        except IdleTimeoutError:  # pragma: no cover - the regression this pins
+            pytest.fail("officer session must never raise IdleTimeoutError")
+
+        assert item["role"] == "event"
+        assert item["content"].startswith("[backstop wake]")
+
+    @pytest.mark.asyncio
+    async def test_officer_never_flips_awaiting_user(self):
+        import src.api.persistent_app as mod
+
+        _, client = _install_officer_session(
+            officer_cfg=OfficerConfig(enabled=True), turn_count=3
+        )
+        assert not mod._subscribers  # untethered — the flip condition
+        await mod._loop_user_queue.put({"content": "x", "role": "human"})
+
+        await mod._loop_get_user_input()
+        await asyncio.sleep(0)
+
+        client.update_thread_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_sleep_request_files_nothing(self):
+        import src.api.persistent_app as mod
+
+        session, client = _install_officer_session(
+            officer_cfg=OfficerConfig(enabled=True)
+        )
+        session.tool_context = MagicMock()
+        session.tool_context.consume_officer_sleep = MagicMock(return_value=None)
+        await mod._loop_user_queue.put({"content": "x", "role": "human"})
+
+        await mod._loop_get_user_input()
+        await asyncio.sleep(0)
+
+        # The watchdog files implicit sleep_max — the transport must not.
+        client.file_officer_wake.assert_not_awaited()
+
+
+class TestReadyMirrorSuppression:
+    def setup_method(self):
+        _reset_agent_globals()
+
+    def teardown_method(self):
+        _reset_agent_globals()
+
+    @pytest.mark.asyncio
+    async def test_officer_ready_skips_nats(self, monkeypatch):
+        import src.api.persistent_app as mod
+
+        _install_officer_session(officer_cfg=OfficerConfig(enabled=True))
+        monkeypatch.setenv("SESSION_BOUND_THREAD_ID", "thread-test-uuid")
+        nats_probe = AsyncMock(return_value=None)
+        monkeypatch.setattr(mod, "_ensure_nats_client", nats_probe)
+
+        await mod.emit_session_event("ready", {})
+
+        nats_probe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_officer_ready_still_mirrors(self, monkeypatch):
+        import src.api.persistent_app as mod
+
+        # MagicMock config: officer gate must NOT trip on truthy mocks.
+        session = MagicMock()
+        mod._session = session
+        monkeypatch.setenv("SESSION_BOUND_THREAD_ID", "thread-test-uuid")
+        nats_probe = AsyncMock(return_value=None)
+        monkeypatch.setattr(mod, "_ensure_nats_client", nats_probe)
+
+        await mod.emit_session_event("ready", {})
+
+        nats_probe.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# session_wake officer helpers (orchestrator side)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionWakeOfficerHelpers:
+    @pytest.mark.asyncio
+    async def test_file_officer_timer_enqueues_future_fire_at(self):
+        from services import session_wake
+
+        db = MagicMock()
+        db.enqueue_session_wake_event = AsyncMock(return_value=True)
+
+        before = datetime.now(timezone.utc)
+        ok = await session_wake.file_officer_timer(db, "t-1", 30, "waiting")
+
+        assert ok is True
+        kwargs = db.enqueue_session_wake_event.await_args.kwargs
+        assert kwargs["source"] == "timer"
+        assert kwargs["dedup_key"] == "timer"
+        assert kwargs["payload"]["minutes"] == 30
+        fire_at = kwargs["fire_at"]
+        assert timedelta(minutes=29) < (fire_at - before) < timedelta(minutes=31)
+
+    @pytest.mark.asyncio
+    async def test_file_officer_timer_never_raises(self):
+        from services import session_wake
+
+        db = MagicMock()
+        db.enqueue_session_wake_event = AsyncMock(side_effect=RuntimeError("boom"))
+        assert await session_wake.file_officer_timer(db, "t-1", 30, "") is False
+
+    @pytest.mark.asyncio
+    async def test_notify_officer_routes_to_project_officer(self):
+        from services import session_wake
+
+        db = MagicMock()
+        db.get_officer_thread_for_project = AsyncMock(
+            return_value={"id": "officer-thread"}
+        )
+        db.enqueue_session_wake_event = AsyncMock(return_value=True)
+
+        ok = await session_wake.notify_officer(
+            db, "proj-1", source="job_transition", dedup_key="ab12:completed"
+        )
+
+        assert ok is True
+        args = db.enqueue_session_wake_event.await_args
+        assert args.args[0] == "officer-thread"
+        assert args.kwargs["source"] == "job_transition"
+
+    @pytest.mark.asyncio
+    async def test_notify_officer_noop_without_officer(self):
+        from services import session_wake
+
+        db = MagicMock()
+        db.get_officer_thread_for_project = AsyncMock(return_value=None)
+        db.enqueue_session_wake_event = AsyncMock()
+
+        ok = await session_wake.notify_officer(
+            db, "proj-1", source="job_transition", dedup_key="k"
+        )
+
+        assert ok is False
+        db.enqueue_session_wake_event.assert_not_awaited()
+
+    def test_format_officer_wake_renders_sitrep_bracket(self):
+        from services import session_wake
+
+        text = session_wake._format_officer_wake(
+            [
+                {
+                    "source": "timer",
+                    "dedup_key": "timer",
+                    "payload": {"minutes": 30, "reason": "quiet"},
+                },
+                {
+                    "source": "job_transition",
+                    "dedup_key": "ab12cd34:completed",
+                    "payload": {"status": "completed"},
+                },
+            ]
+        )
+        assert text.startswith("[SITREP]")
+        assert "2 reason(s)" in text
+        assert "timer: slept ~30 min" in text
+        assert "ab12cd34:completed" in text
+
+    def test_timer_debounce_is_zero(self):
+        from services import session_wake
+
+        assert session_wake.OFFICER_DEBOUNCE_BY_SOURCE["timer"] == 0

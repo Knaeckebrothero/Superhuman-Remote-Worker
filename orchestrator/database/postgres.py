@@ -5182,6 +5182,344 @@ class PostgresDB:
             "dead": counts.get("dead", 0),
         }
 
+    # --- Officer wake event outbox (centurion) -------------------------------
+    #
+    # General wake outbox for officer sessions: events + durable sleep timers
+    # (migration 0074, docs/features/centurion.md §4). Mirrors the jobs-row
+    # outbox trio above (claim/finish/release with a visibility timeout) but
+    # in a dedicated table, because officer wakes cover non-job events and
+    # jobs the officer did not create. source='timer' rows carry fire_at and
+    # are UPSERTED (a new sleep replaces the pending timer); every other
+    # source coalesces via ON CONFLICT DO NOTHING against the partial unique
+    # index uq_session_wake_events_pending.
+
+    OFFICER_ENABLED_SQL = (
+        "COALESCE(t.metadata->'config_override'->'officer'->>'enabled','false')"
+        " = 'true'"
+    )
+    OFFICER_HOLD_SQL = "(t.metadata #>> '{config_override,officer,hold}') IS NULL"
+
+    async def enqueue_session_wake_event(
+        self,
+        thread_id: str,
+        *,
+        source: str,
+        dedup_key: str,
+        payload: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        fire_at: Optional[datetime] = None,
+    ) -> bool:
+        """Enqueue (or, for timers, re-file) an officer wake event.
+
+        Never raises on bad ids — wake enqueueing must not break the calling
+        transition path. Returns True when a row was inserted or a pending
+        timer re-filed; False on coalesce/no-op.
+        """
+        try:
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return False
+        project_uuid: Optional[UUID] = None
+        if project_id:
+            try:
+                project_uuid = UUID(str(project_id))
+            except (ValueError, TypeError):
+                project_uuid = None
+        payload_json = json.dumps(payload or {})
+        async with self.acquire() as conn:
+            if source == "timer":
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO session_wake_events
+                        (thread_id, project_id, source, dedup_key, payload,
+                         fire_at)
+                    VALUES ($1, $2, 'timer', $3, $4::jsonb, $5)
+                    ON CONFLICT (thread_id, source, dedup_key)
+                        WHERE state = 'pending'
+                    DO UPDATE SET fire_at = EXCLUDED.fire_at,
+                                  payload = EXCLUDED.payload
+                    RETURNING id
+                    """,
+                    thread_uuid,
+                    project_uuid,
+                    dedup_key,
+                    payload_json,
+                    fire_at,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO session_wake_events
+                        (thread_id, project_id, source, dedup_key, payload,
+                         fire_at)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                    ON CONFLICT (thread_id, source, dedup_key)
+                        WHERE state = 'pending'
+                    DO NOTHING
+                    RETURNING id
+                    """,
+                    thread_uuid,
+                    project_uuid,
+                    source,
+                    dedup_key,
+                    payload_json,
+                    fire_at,
+                )
+            return row is not None
+
+    async def claim_pending_session_wake_events(
+        self,
+        *,
+        limit: int = 20,
+        visibility_timeout_seconds: int = 120,
+        debounce_seconds_by_source: Optional[Dict[str, int]] = None,
+        default_debounce_seconds: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Atomically claim due officer wake events for THIS caller to send.
+
+        Same Read-Committed FOR UPDATE SKIP LOCKED discipline as
+        :meth:`claim_pending_job_wakes`; the caller MUST finish or release
+        every returned row. Due = pending with fire_at NULL or reached, or
+        'sending' past the visibility timeout. Rows for threads that are
+        ended, no longer officer-enabled, or under a conference hold are left
+        pending (the hold is released by conference end; the brief wake
+        drains them). Per-source debounce is a lookback over recently 'sent'
+        rows of the same (thread, source) — state lives in the table, so it
+        works across replicas. Timers pass 0 (a scheduled fire is never
+        debounced).
+        """
+        debounce_json = json.dumps(debounce_seconds_by_source or {})
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE session_wake_events e
+                   SET state = 'sending',
+                       claimed_at = NOW(),
+                       attempts = e.attempts + 1
+                  FROM (
+                        SELECT se.id FROM session_wake_events se
+                          JOIN threads t ON t.id = se.thread_id
+                         WHERE t.status != 'ended'
+                           AND COALESCE(t.metadata->'config_override'
+                                        ->'officer'->>'enabled','false') = 'true'
+                           AND (t.metadata
+                                #>> '{config_override,officer,hold}') IS NULL
+                           AND (
+                                (se.state = 'pending'
+                                 AND (se.fire_at IS NULL OR se.fire_at <= NOW()))
+                                OR (se.state = 'sending'
+                                    AND se.claimed_at
+                                        < NOW() - make_interval(
+                                            secs => $1::double precision))
+                               )
+                           AND NOT EXISTS (
+                                SELECT 1 FROM session_wake_events prev
+                                 WHERE prev.thread_id = se.thread_id
+                                   AND prev.source = se.source
+                                   AND prev.state = 'sent'
+                                   AND prev.sent_at > NOW() - make_interval(
+                                        secs => COALESCE(
+                                            ($3::jsonb ->> se.source)
+                                                ::double precision,
+                                            $4::double precision))
+                               )
+                         ORDER BY se.created_at
+                         FOR UPDATE OF se SKIP LOCKED
+                         LIMIT $2
+                       ) s
+                 WHERE e.id = s.id
+                RETURNING e.id, e.thread_id, e.project_id, e.source,
+                          e.dedup_key, e.payload, e.attempts, e.fire_at,
+                          e.created_at
+                """,
+                float(visibility_timeout_seconds),
+                limit,
+                debounce_json,
+                float(default_debounce_seconds),
+            )
+        return [dict(row) for row in rows]
+
+    async def finish_session_wake_events(self, event_ids: List[int]) -> None:
+        """Mark claimed officer wake events delivered."""
+        if not event_ids:
+            return
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE session_wake_events
+                   SET state = 'sent', sent_at = NOW(), claimed_at = NULL
+                 WHERE id = ANY($1::bigint[])
+                   AND state = 'sending'
+                """,
+                event_ids,
+            )
+
+    async def release_session_wake_events(
+        self, event_ids: List[int], *, max_attempts: int = 8
+    ) -> None:
+        """Hand failed officer wake sends back for retry, or bury them."""
+        if not event_ids:
+            return
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE session_wake_events
+                   SET state = CASE WHEN attempts >= $2 THEN 'dead'
+                                    ELSE 'pending' END,
+                       claimed_at = NULL
+                 WHERE id = ANY($1::bigint[])
+                   AND state = 'sending'
+                """,
+                event_ids,
+                max_attempts,
+            )
+
+    async def gc_session_wake_events(
+        self,
+        *,
+        sent_retention_seconds: int = 3600,
+        dead_retention_seconds: int = 604800,
+    ) -> int:
+        """Prune delivered/buried officer wake rows.
+
+        Sent retention MUST exceed the largest per-source debounce window —
+        the debounce lookback reads 'sent' rows. Dead rows are kept a week:
+        a non-zero dead count is this feature's alert-worthy metric.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM session_wake_events
+                 WHERE (state = 'sent'
+                        AND sent_at < NOW() - make_interval(
+                            secs => $1::double precision))
+                    OR (state = 'dead'
+                        AND created_at < NOW() - make_interval(
+                            secs => $2::double precision))
+                """,
+                float(sent_retention_seconds),
+                float(dead_retention_seconds),
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError, AttributeError):
+            return 0
+
+    async def get_officer_thread_for_project(
+        self, project_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The newest non-ended officer thread commanding ``project_id``."""
+        try:
+            project_uuid = UUID(project_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT t.id, t.status, t.project_id, t.agent_id, t.metadata
+                  FROM threads t
+                 WHERE t.project_id = $1
+                   AND t.status != 'ended'
+                   AND COALESCE(t.metadata->'config_override'
+                                ->'officer'->>'enabled','false') = 'true'
+                 ORDER BY t.created_at DESC
+                 LIMIT 1
+                """,
+                project_uuid,
+            )
+        return dict(row) if row else None
+
+    async def list_officer_threads(self) -> List[Dict[str, Any]]:
+        """Every non-ended officer thread (fleet events + the watchdog)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT t.id, t.status, t.project_id, t.agent_id, t.metadata
+                  FROM threads t
+                 WHERE t.status != 'ended'
+                   AND COALESCE(t.metadata->'config_override'
+                                ->'officer'->>'enabled','false') = 'true'
+                """
+            )
+        return [dict(row) for row in rows]
+
+    async def get_pending_officer_timer(
+        self, thread_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """The pending 'timer' row for a thread, if any (watchdog duties)."""
+        try:
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, fire_at, state, claimed_at
+                  FROM session_wake_events
+                 WHERE thread_id = $1 AND source = 'timer'
+                   AND state IN ('pending', 'sending')
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                thread_uuid,
+            )
+        return dict(row) if row else None
+
+    async def get_thread_last_agent_activity(
+        self, thread_id: str
+    ) -> Optional[datetime]:
+        """Newest ai/tool transcript row — the honest liveness signal.
+
+        Deliberately NOT threads.last_activity: save_thread_message bumps
+        that for every row including orchestrator-written durable notices,
+        which would mask a dead officer (centurion_implementation_notes.md).
+        """
+        try:
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT MAX(created_at) AS last_at
+                  FROM thread_messages
+                 WHERE thread_id = $1 AND role IN ('ai', 'tool')
+                """,
+                thread_uuid,
+            )
+        return row["last_at"] if row else None
+
+    async def get_officer_last_engagement(self, thread_id: str) -> Optional[datetime]:
+        """Newest sign the officer was engaged: any transcript row OR the last
+        delivered timer wake.
+
+        The implicit-``sleep_max`` filing gate must use THIS, not ai/tool
+        activity alone: a turn produces its ai row only at turn END, so a
+        slow in-flight turn (or one just started by an injected wake) looks
+        "stale" to the ai/tool signal and the watchdog re-files mid-turn —
+        observed on the k3d smoke as a second wake 22s after a delivery.
+        Counting injected event rows and timer ``sent_at`` resets the clock
+        at every poke.
+        """
+        try:
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT GREATEST(
+                    (SELECT MAX(created_at) FROM thread_messages
+                      WHERE thread_id = $1),
+                    (SELECT MAX(sent_at) FROM session_wake_events
+                      WHERE thread_id = $1 AND source = 'timer'
+                        AND state = 'sent')
+                ) AS last_at
+                """,
+                thread_uuid,
+            )
+        return row["last_at"] if row else None
+
     async def get_thread_job_counts(self, thread_id: str) -> Dict[str, int]:
         """Terminal/in-flight tallies over every job a thread created.
 
@@ -5948,6 +6286,11 @@ class PostgresDB:
                   AND agent_id IN (SELECT id
                                    FROM agents
                                    WHERE status = 'offline')
+                  -- Officer threads are exempt: the officer watchdog owns
+                  -- their lifecycle and RESPAWNS the pod instead of ending
+                  -- the thread (centurion.md §4).
+                  AND COALESCE(metadata->'config_override'->'officer'
+                               ->>'enabled','false') <> 'true'
                 RETURNING id
                 """
             )

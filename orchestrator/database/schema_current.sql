@@ -1586,6 +1586,60 @@ COMMENT ON COLUMN public.security_events.view_as IS 'TRUE when an admin had the 
 
 
 --
+-- Name: session_wake_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.session_wake_events (
+    id bigint NOT NULL,
+    thread_id uuid NOT NULL,
+    project_id uuid,
+    source text NOT NULL,
+    dedup_key text NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    state text DEFAULT 'pending'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    fire_at timestamp with time zone,
+    claimed_at timestamp with time zone,
+    sent_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT session_wake_events_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'sending'::text, 'sent'::text, 'dead'::text])))
+);
+
+
+--
+-- Name: TABLE session_wake_events; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.session_wake_events IS 'Durable wake outbox for officer (centurion) sessions: events + sleep timers. See docs/features/centurion.md §4.';
+
+
+--
+-- Name: COLUMN session_wake_events.fire_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.session_wake_events.fire_at IS 'NULL = deliver on next drain. Future timestamp = durable timer; the drain claims the row only once due. source=timer rows are upserted (fire_at replaced) rather than coalesced.';
+
+
+--
+-- Name: session_wake_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.session_wake_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: session_wake_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.session_wake_events_id_seq OWNED BY public.session_wake_events.id;
+
+
+--
 -- Name: skill_files; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2287,6 +2341,13 @@ ALTER SEQUENCE public.workspace_intervals_id_seq OWNED BY public.workspace_inter
 
 
 --
+-- Name: session_wake_events id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_wake_events ALTER COLUMN id SET DEFAULT nextval('public.session_wake_events_id_seq'::regclass);
+
+
+--
 -- Name: thread_messages seq; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -2602,6 +2663,14 @@ ALTER TABLE ONLY public.schema_migrations
 
 ALTER TABLE ONLY public.security_events
     ADD CONSTRAINT security_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: session_wake_events session_wake_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_wake_events
+    ADD CONSTRAINT session_wake_events_pkey PRIMARY KEY (id);
 
 
 --
@@ -3318,6 +3387,20 @@ CREATE INDEX idx_security_events_user_created ON public.security_events USING bt
 
 
 --
+-- Name: idx_session_wake_events_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_session_wake_events_claim ON public.session_wake_events USING btree (created_at) WHERE (state = ANY (ARRAY['pending'::text, 'sending'::text]));
+
+
+--
+-- Name: idx_session_wake_events_debounce; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_session_wake_events_debounce ON public.session_wake_events USING btree (thread_id, source, sent_at) WHERE (state = 'sent'::text);
+
+
+--
 -- Name: idx_skills_owner; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3630,6 +3713,13 @@ CREATE UNIQUE INDEX uq_project_default_expert ON public.project_experts USING bt
 --
 
 CREATE UNIQUE INDEX uq_project_jobs_repo ON public.project_repositories USING btree (project_id) WHERE ((role)::text = 'jobs'::text);
+
+
+--
+-- Name: uq_session_wake_events_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_session_wake_events_pending ON public.session_wake_events USING btree (thread_id, source, dedup_key) WHERE (state = 'pending'::text);
 
 
 --
@@ -4257,6 +4347,14 @@ ALTER TABLE ONLY public.config_overrides
 
 ALTER TABLE ONLY public.config_overrides
     ADD CONSTRAINT prompt_overrides_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: session_wake_events session_wake_events_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_wake_events
+    ADD CONSTRAINT session_wake_events_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --

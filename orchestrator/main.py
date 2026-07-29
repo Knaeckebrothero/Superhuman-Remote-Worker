@@ -160,6 +160,7 @@ from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
 from services.session_wake import (  # noqa: E402
+    file_officer_timer,
     kick_drain as _kick_session_wake_drain,
     maybe_wake_session,
     session_wake_sweeper_loop,
@@ -3522,6 +3523,60 @@ def _validated_session_workspace_override(
             status_code=400, detail=f"Invalid workspace backend '{backend}'"
         )
     return ws
+
+
+_SESSION_OFFICER_OVERRIDE_KEYS = frozenset(
+    {
+        "enabled",
+        "sleep_min_minutes",
+        "sleep_max_minutes",
+        "max_concurrent_workers",
+        "max_pages_per_day",
+        "max_actions_per_wake",
+        "daily_token_ceiling",
+    }
+)
+
+
+def _validated_session_officer_override(
+    config_override: Any,
+) -> Optional[dict[str, Any]]:
+    """Extract + validate the ``officer`` sub-dict from a New Session request's
+    ``config_override`` (centurion.md §4/§8).
+
+    The officer flag MUST land in thread metadata — the orchestrator's officer
+    machinery (watchdog, wake-drain claim, sweeper exemptions, the wake-filing
+    endpoint's 409 gate) is SQL over ``threads.metadata`` and cannot see
+    resolved expert config. ``create_thread`` rebuilds ``config_override``
+    from validated fragments only, so without this validator the officer block
+    is silently dropped (found by the S1 k3d smoke). Admits exactly the known
+    officer keys: ``enabled`` coerced to a real bool, everything else
+    non-negative ints. Raises HTTPException(400) on unknown keys or bad types.
+    """
+    officer = (
+        config_override.get("officer") if isinstance(config_override, dict) else None
+    )
+    if not isinstance(officer, dict) or not officer:
+        return None
+    unknown = set(officer) - _SESSION_OFFICER_OVERRIDE_KEYS
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown officer override keys: {sorted(unknown)}",
+        )
+    cleaned: dict[str, Any] = {}
+    if "enabled" in officer:
+        cleaned["enabled"] = officer["enabled"] in (True, "true", "True", 1)
+    for key in sorted(_SESSION_OFFICER_OVERRIDE_KEYS - {"enabled"}):
+        if key in officer:
+            try:
+                cleaned[key] = max(0, int(officer[key]))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"officer.{key} must be an integer",
+                ) from exc
+    return cleaned or None
 
 
 _SESSION_CREATE_TOOL_OVERRIDE_KEYS = frozenset(SESSION_TOOL_OVERRIDE_NAMES)
@@ -7482,6 +7537,11 @@ async def lifespan(app: FastAPI):
     attention_sleep_task = asyncio.create_task(
         run_when_leader(attention_sleep_sweeper, _shutdown_event)
     )
+    # Officer (centurion) lifecycle: implicit-timer filing, overdue kicks,
+    # rate-limited respawn. Leader-gated — respawn must be single-flight.
+    officer_watchdog_task = asyncio.create_task(
+        run_when_leader(officer_watchdog, _shutdown_event)
+    )
     ide_sweeper_task = asyncio.create_task(
         run_when_leader(ide_session_ttl_sweeper, _shutdown_event)
     )
@@ -7676,6 +7736,7 @@ async def lifespan(app: FastAPI):
     await checkpoint_retention_task
     await headless_notify_task
     await attention_sleep_task
+    await officer_watchdog_task
     await ide_sweeper_task
     await ws_sweeper_task
     await ide_settings_sweeper_task
@@ -20183,6 +20244,59 @@ class AgentThreadStatusRequest(BaseModel):
     status: str
 
 
+class OfficerWakeRequest(BaseModel):
+    minutes: int
+    reason: str = ""
+
+
+def _thread_officer_meta(thread: dict) -> dict:
+    """The officer block from a thread row's metadata.config_override, or {}."""
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    officer_meta = (metadata.get("config_override") or {}).get("officer") or {}
+    return officer_meta if isinstance(officer_meta, dict) else {}
+
+
+def _officer_meta_enabled(officer_meta: dict) -> bool:
+    return officer_meta.get("enabled") in (True, "true", "True", 1)
+
+
+@app.post("/api/agents/threads/{thread_id}/officer/wake")
+async def agent_file_officer_wake(
+    request: Request,
+    thread_id: str,
+    body: OfficerWakeRequest,
+) -> dict[str, Any]:
+    """File an officer session's durable sleep timer. **Internal** — requires
+    ``X-Internal-Key``; ingress strips this path.
+
+    Called by the sleep tool's park path (centurion.md §4, decision
+    2026-07-29): the timer is a Postgres ``session_wake_events`` row
+    (source='timer'), so pod or node death never loses the schedule — the
+    drain fires it when due. Minutes are clamped to the thread's officer
+    bounds HERE; the tool's value is a request, not an order.
+    """
+    await require_internal(request)
+    thread = await postgres_db.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    officer_meta = _thread_officer_meta(thread)
+    if not _officer_meta_enabled(officer_meta):
+        raise HTTPException(status_code=409, detail="Thread is not an officer session")
+    try:
+        sleep_min = int(officer_meta.get("sleep_min_minutes") or 5)
+        sleep_max = int(officer_meta.get("sleep_max_minutes") or 60)
+    except (TypeError, ValueError):
+        sleep_min, sleep_max = 5, 60
+    minutes = max(sleep_min, min(int(body.minutes), max(sleep_min, sleep_max)))
+    filed = await file_officer_timer(postgres_db, thread_id, minutes, body.reason)
+    return {"filed": filed, "minutes": minutes}
+
+
 @app.put("/api/agents/threads/{thread_id}/status")
 async def agent_update_thread_status(
     request: Request,
@@ -20214,6 +20328,34 @@ async def agent_update_thread_status(
         )
     try:
         if body.status == "ended":
+            # Officer sessions (centurion.md §4): an agent-side 'ended' is a
+            # GRACEFUL termination — pod delete, node drain, deploy rollout,
+            # or the shutdown handler racing a suspend. For an officer that
+            # must map to 'suspended', the designed routine down-state the
+            # watchdog respawns from; writing 'ended' here permanently kills
+            # the officer with his flag still raised (observed on the k3d
+            # smoke: kubectl delete pod → shutdown handler → 'ended' → no
+            # respawn). Deliberate retirement goes through end_thread, which
+            # also lowers officer.enabled. True crashes (SIGKILL) never reach
+            # this endpoint and take the watchdog's dead-pod path instead.
+            thread_row = await postgres_db.get_thread(thread_id)
+            if thread_row is not None and _officer_meta_enabled(
+                _thread_officer_meta(thread_row)
+            ):
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE threads "
+                        "SET status = 'suspended', agent_id = NULL, "
+                        "    awaiting_user_since = NULL "
+                        "WHERE id = $1 AND status <> 'ended'",
+                        thread_id,
+                    )
+                logger.info(
+                    "Officer thread %s: agent-side 'ended' mapped to "
+                    "'suspended' (watchdog will respawn)",
+                    thread_id[:8],
+                )
+                return {"status": "suspended"}
             # Guarded end (mirrors end_thread, which stays unguarded for
             # user-intent call sites): a late agent-side 'ended' — e.g. the
             # SIGTERM shutdown handler of a pod deleted mid-suspend, or the
@@ -21480,6 +21622,11 @@ async def create_thread(
         )
         if req_tool_groups:
             config_override.setdefault("tools", {}).update(req_tool_groups)
+        # Officer (centurion) block — must be denormalized into thread
+        # metadata for the orchestrator's SQL machinery (centurion.md §4).
+        req_officer = _validated_session_officer_override(request_body.config_override)
+        if req_officer:
+            config_override.setdefault("officer", {}).update(req_officer)
 
         # Resolve the complete create-time policy view.  This is also the source
         # for infrastructure-affecting values and grants, preventing the create
@@ -23127,6 +23274,24 @@ async def end_thread(
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     ws_ctx = metadata.get("workspace_container") or {}
+
+    # Officer retirement (centurion.md §4): a deliberately ended officer must
+    # not be resurrected by the watchdog — lower the flag before teardown.
+    # Crash-ended officers (agent-side 'ended') keep the flag and are paged
+    # instead of auto-resurrected.
+    officer_meta = (metadata.get("config_override") or {}).get("officer") or {}
+    if isinstance(officer_meta, dict) and officer_meta.get("enabled") in (
+        True,
+        "true",
+        "True",
+        1,
+    ):
+        try:
+            await postgres_db.merge_thread_config_override(
+                thread_id, {"officer": {"enabled": False}}
+            )
+        except Exception:
+            logger.warning("Officer stand-down merge failed for thread %s", thread_id)
 
     # Snapshot + tear down workspace container/VM and agent pod
     await _release_thread_resources(thread_id)
@@ -24898,6 +25063,190 @@ _ATTENTION_SLEEP_MINUTES: int = int(
 )
 
 
+OFFICER_WATCHDOG_INTERVAL_S = int(os.getenv("OFFICER_WATCHDOG_INTERVAL_S", "60"))
+OFFICER_WAKE_GRACE_MINUTES = int(os.getenv("OFFICER_WAKE_GRACE_MINUTES", "10"))
+OFFICER_RESPAWN_COOLDOWN_MINUTES = int(
+    os.getenv("OFFICER_RESPAWN_COOLDOWN_MINUTES", "10")
+)
+
+
+async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> None:
+    """One officer thread's watchdog pass — see officer_watchdog below."""
+    thread_id = str(officer_row["id"])
+    officer_meta = _thread_officer_meta(officer_row)
+    if officer_meta.get("hold"):
+        # Conference hold (centurion.md §4): stand down entirely — no
+        # implicit-timer filing, no overdue kicks, no respawn.
+        return
+    try:
+        sleep_max = int(officer_meta.get("sleep_max_minutes") or 60)
+    except (TypeError, ValueError):
+        sleep_max = 60
+
+    thread = await postgres_db.get_thread(thread_id)
+    if thread is None or thread.get("status") == "ended":
+        return
+    agent = await session_wake_svc._resolve_live_agent(postgres_db, thread)
+    timer = await postgres_db.get_pending_officer_timer(thread_id)
+    now = datetime.now(timezone.utc)
+
+    if agent is not None and thread.get("status") == "active":
+        if timer is None:
+            # Duty 1: implicit sleep_max. The transport files explicit
+            # sleeps; when a turn ended without one (or the filing POST was
+            # lost), the watchdog files the default on the officer's behalf
+            # (centurion.md §4 — "absent a filing, the system is lazy for
+            # him too"). Gated on LAST ENGAGEMENT (any transcript row or the
+            # last delivered timer) — ai/tool age alone re-files mid-turn,
+            # since a turn's ai row only lands at turn end (k3d smoke).
+            last = await postgres_db.get_officer_last_engagement(thread_id)
+            if last is None or (now - last) > timedelta(minutes=sleep_max):
+                await postgres_db.enqueue_session_wake_event(
+                    thread_id,
+                    source="timer",
+                    dedup_key="timer",
+                    payload={
+                        "minutes": sleep_max,
+                        "reason": "implicit sleep_max (watchdog-filed)",
+                    },
+                    fire_at=now,
+                )
+                session_wake_svc.kick_event_drain(postgres_db)
+        else:
+            fire_at = timer.get("fire_at")
+            if fire_at is not None and (now - fire_at) > timedelta(
+                minutes=OFFICER_WAKE_GRACE_MINUTES
+            ):
+                # Duty 2: overdue pending timer with a live pod = delivery
+                # failure somewhere in the drain path. Kick it; the drain's
+                # own release/retry handles a refusing pod.
+                logger.warning(
+                    "officer watchdog: timer overdue %.0fs for thread %s — "
+                    "kicking drain",
+                    (now - fire_at).total_seconds(),
+                    thread_id[:8],
+                )
+                session_wake_svc.kick_event_drain(postgres_db)
+        return
+
+    # Duty 3: dead pod or drain-suspended thread — respawn, rate-limited.
+    # Deploys drain-suspend parked sessions, so 'suspended' is the officer's
+    # ROUTINE down-state, not an anomaly (centurion.md §4). The boot
+    # self-wake in _attach_session is the loop bootstrap after respawn.
+    #
+    # Boot grace first: a freshly provisioned pod that has not passed its
+    # readiness probe yet looks exactly like a dead one. Without this the
+    # watchdog respawns every young officer mid-boot (observed on the k3d
+    # smoke: respawn 25s after creation → double attach).
+    metadata = officer_row.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    pod_created_raw = (metadata.get("agent_pod") or {}).get("created_at")
+    if pod_created_raw:
+        try:
+            pod_created = datetime.fromisoformat(str(pod_created_raw))
+            if (now - pod_created) < timedelta(
+                minutes=OFFICER_RESPAWN_COOLDOWN_MINUTES
+            ):
+                return
+        except ValueError:
+            pass
+    last_respawn_raw = officer_meta.get("last_respawn_at")
+    if last_respawn_raw:
+        try:
+            last_respawn = datetime.fromisoformat(str(last_respawn_raw))
+            if (now - last_respawn) < timedelta(
+                minutes=OFFICER_RESPAWN_COOLDOWN_MINUTES
+            ):
+                return
+        except ValueError:
+            pass
+    if persistent_provisioner is None:
+        logger.warning(
+            "officer watchdog: officer thread %s is down and no persistent "
+            "provisioner is configured — cannot respawn",
+            thread_id[:8],
+        )
+        return
+    logger.info(
+        "officer watchdog: respawning officer thread %s (thread status=%s, "
+        "agent live=%s)",
+        thread_id[:8],
+        thread.get("status"),
+        agent is not None,
+    )
+    await postgres_db.merge_thread_config_override(
+        thread_id, {"officer": {"last_respawn_at": now.isoformat()}}
+    )
+    # Clear the stale binding and surface the thread as active so the fresh
+    # pod's attach binds cleanly. Officers run the lite backend — there is no
+    # workspace snapshot to restore (mirrors the magic-link wake path).
+    async with postgres_db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads "
+            "SET agent_id = NULL, status = 'active', "
+            "    awaiting_user_since = NULL "
+            "WHERE id = $1 AND status IN ('active', 'suspended')",
+            thread_id,
+        )
+    config_name = canonical_config_name(thread.get("config_name", "session_base"))
+    ok = await persistent_provisioner.create_agent_pod(
+        thread_id, config_name=config_name
+    )
+    if not ok:
+        # TODO(S5): page the Legatus via the notify contract once the
+        # thread-scoped notification endpoint exists. Until then this log
+        # line is the alert surface; the cooldown retries next window.
+        logger.error(
+            "officer watchdog: respawn FAILED for officer thread %s — will "
+            "retry after cooldown",
+            thread_id[:8],
+        )
+
+
+async def officer_watchdog(shutdown_event: asyncio.Event) -> None:
+    """Dumb-code guardian of officer (centurion) sessions — centurion.md §4.
+
+    Three duties, none requiring judgment: file the implicit ``sleep_max``
+    timer when an unheld officer has none pending; treat a pending timer
+    overdue past ``fire_at + grace`` with a live pod as a delivery failure
+    and kick the drain; respawn dead/suspended officers (rate-limited).
+    Leader-gated — respawn must be single-flight across replicas.
+    """
+    from services import session_wake as session_wake_svc
+
+    logger.info(
+        "Officer watchdog started (tick=%ds, grace=%dm, respawn_cooldown=%dm)",
+        OFFICER_WATCHDOG_INTERVAL_S,
+        OFFICER_WAKE_GRACE_MINUTES,
+        OFFICER_RESPAWN_COOLDOWN_MINUTES,
+    )
+    while not shutdown_event.is_set():
+        try:
+            for officer_row in await postgres_db.list_officer_threads():
+                try:
+                    await _officer_watchdog_check_one(officer_row, session_wake_svc)
+                except Exception:
+                    logger.exception(
+                        "officer watchdog: check failed for thread %s "
+                        "(continuing with the rest)",
+                        str(officer_row.get("id"))[:8],
+                    )
+        except Exception:
+            logger.exception("officer watchdog tick raised; will retry next tick")
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(), timeout=OFFICER_WATCHDOG_INTERVAL_S
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Officer watchdog stopped")
+
+
 async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
     """Background task: suspend threads stuck in awaiting_user past their TTL.
 
@@ -24938,6 +25287,12 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
                         "LEFT JOIN users u ON u.id = t.user_id "
                         "WHERE t.status = 'awaiting_user' "
                         "  AND t.awaiting_user_since IS NOT NULL "
+                        # Officer sessions never sleep via attention-sleep —
+                        # their lifecycle belongs to the officer watchdog
+                        # (centurion.md §4). Belt-and-suspenders: the agent
+                        # side already skips the awaiting_user flip for them.
+                        "  AND COALESCE(t.metadata->'config_override'->'officer'"
+                        "->>'enabled','false') <> 'true' "
                         "  AND COALESCE("
                         "    NULLIF(t.metadata->'config_override'->'headless'->>'attention_sleep_minutes', '')::int, "
                         "    NULLIF(u.settings->'persistent_agent'->>'headless_attention_sleep_minutes', '')::int, "

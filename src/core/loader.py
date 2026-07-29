@@ -1838,6 +1838,59 @@ class HeadlessConfig:
 
 
 @dataclass
+class OfficerConfig:
+    """Always-on officer (centurion) behavior for persistent sessions.
+
+    Sourced from the expert config, overridden per thread via
+    threads.metadata.config_override.officer. The enabled flag MUST also be
+    present in thread metadata for orchestrator-side SQL sweeps — expert YAML
+    alone is invisible to them (docs/features/centurion.md §4).
+    """
+
+    enabled: bool = False
+    sleep_min_minutes: int = 5
+    sleep_max_minutes: int = 60
+    max_concurrent_workers: int = 3
+    max_pages_per_day: int = 3
+    max_actions_per_wake: int = 10
+    daily_token_ceiling: int = 0  # 0 = disabled (v1 leans on per-job caps)
+
+    @property
+    def backstop_seconds(self) -> int:
+        """Agent-local safety timeout: fires only when the orchestrator's
+        durable timer path failed to deliver a wake (drain/watchdog down
+        while the API is up). Never the primary wake mechanism."""
+        return max(2 * self.sleep_max_minutes, 120) * 60
+
+
+def _parse_officer_config(data: Dict[str, Any]) -> OfficerConfig:
+    """Shared officer-config parser for BOTH loader paths (file + dict).
+
+    One helper by design: parsing in only one path would split file-boot vs
+    dict-boot behavior (centurion_implementation_notes.md, config risks).
+    """
+    officer_data = data.get("officer") or {}
+    sleep_min = int(officer_data.get("sleep_min_minutes") or 5)
+    sleep_max = int(officer_data.get("sleep_max_minutes") or 60)
+    if sleep_min > sleep_max:
+        logger.warning(
+            "officer.sleep_min_minutes (%d) > sleep_max_minutes (%d); clamping",
+            sleep_min,
+            sleep_max,
+        )
+        sleep_min = sleep_max
+    return OfficerConfig(
+        enabled=bool(officer_data.get("enabled", False)),
+        sleep_min_minutes=sleep_min,
+        sleep_max_minutes=sleep_max,
+        max_concurrent_workers=int(officer_data.get("max_concurrent_workers") or 3),
+        max_pages_per_day=int(officer_data.get("max_pages_per_day") or 3),
+        max_actions_per_wake=int(officer_data.get("max_actions_per_wake") or 10),
+        daily_token_ceiling=int(officer_data.get("daily_token_ceiling") or 0),
+    )
+
+
+@dataclass
 class DelegationConfig:
     """Subagent delegation configuration.
 
@@ -1891,6 +1944,7 @@ class AgentConfig:
     delegation: DelegationConfig = field(default_factory=DelegationConfig)
     interactive: InteractiveConfig = field(default_factory=InteractiveConfig)
     headless: HeadlessConfig = field(default_factory=HeadlessConfig)
+    officer: OfficerConfig = field(default_factory=OfficerConfig)
     autonomy: str = "partial"
     # Image-quality tier the agent receives (economy|standard|high). A
     # user/session knob (default standard) resolved to a per-family max edge at
@@ -2367,6 +2421,7 @@ def load_agent_config(
         "delegation",
         "interactive",
         "headless",
+        "officer",
         "autonomy",
         "image_quality",
     }
@@ -2389,6 +2444,9 @@ def load_agent_config(
         ),
     )
 
+    # Parse officer config (centurion — shared helper, both loader paths)
+    officer_config = _parse_officer_config(data)
+
     return AgentConfig(
         agent_id=data["agent_id"],
         display_name=data["display_name"],
@@ -2406,6 +2464,7 @@ def load_agent_config(
         delegation=delegation_config,
         interactive=interactive_config,
         headless=headless_config,
+        officer=officer_config,
         autonomy=autonomy,
         image_quality=image_quality,
         extra=extra,
@@ -2602,6 +2661,7 @@ def load_agent_config_from_dict(
         "delegation",
         "interactive",
         "headless",
+        "officer",
         "autonomy",
         "image_quality",
     }
@@ -2624,6 +2684,9 @@ def load_agent_config_from_dict(
         ),
     )
 
+    # Parse officer config (centurion — shared helper, both loader paths)
+    officer_config = _parse_officer_config(data)
+
     return AgentConfig(
         agent_id=data["agent_id"],
         display_name=data["display_name"],
@@ -2641,6 +2704,7 @@ def load_agent_config_from_dict(
         delegation=delegation_config,
         interactive=interactive_config,
         headless=headless_config,
+        officer=officer_config,
         autonomy=autonomy,
         image_quality=image_quality,
         extra=extra,
