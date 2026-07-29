@@ -775,6 +775,17 @@ class VMController:
         dvt = dvts[0]
         name = (dvt.get("metadata") or {}).get("name") or _rootdisk_name(job_id)
 
+        # A templated DataVolume may omit spec.source.pvc.namespace — CDI
+        # defaults it from the owning VM. A standalone one may not: the webhook
+        # rejects it with 422 "spec.source.pvc.namespace: Required value", which
+        # failed every VM create the moment this flag was first flipped.
+        # _apply_clone_source leaves it out deliberately (its docstring: same
+        # namespace, no cross-namespace clone RBAC) and that stays true — the
+        # value is simply now stated rather than inferred.
+        source_pvc = ((dvt.get("spec") or {}).get("source") or {}).get("pvc")
+        if isinstance(source_pvc, dict) and not source_pvc.get("namespace"):
+            source_pvc["namespace"] = VM_NAMESPACE
+
         dv = await self._get_dv(name)
         phase = ((dv or {}).get("status") or {}).get("phase", "")
         if dv and phase == "Succeeded":
