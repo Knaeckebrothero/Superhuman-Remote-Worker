@@ -63,7 +63,7 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-7fad429
+    tag: sha-24aed29
   agent:
     tag: sha-7fad429
   cockpit:
@@ -75,11 +75,11 @@ image:
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-7fad4294c7fdedf86efed2156a3f13adc9e0f5c7"
+  releaseVersion: "0.0.0-dev.sha-24aed2907f8a54f70eff076d4ed90771ebf7302f"
   components:
     orchestrator:
-      sourceRevision: 7fad4294c7fdedf86efed2156a3f13adc9e0f5c7
-      releaseVersion: "0.0.0-dev.sha-7fad4294c7fdedf86efed2156a3f13adc9e0f5c7"
+      sourceRevision: 24aed2907f8a54f70eff076d4ed90771ebf7302f
+      releaseVersion: "0.0.0-dev.sha-24aed2907f8a54f70eff076d4ed90771ebf7302f"
     agent:
       sourceRevision: 7fad4294c7fdedf86efed2156a3f13adc9e0f5c7
       releaseVersion: "0.0.0-dev.sha-7fad4294c7fdedf86efed2156a3f13adc9e0f5c7"
@@ -510,7 +510,6 @@ sessionRouter:
     traefik.ingress.kubernetes.io/router.priority: "1000"
 logLevel: "INFO"
 logFormat: "json"
-
 # -----------------------------------------------------------------------------
 # Persistent VM rootdisks — the ORCHESTRATOR's copy of the flag
 # (docs/features/vm_persistent_rootdisk.md).
