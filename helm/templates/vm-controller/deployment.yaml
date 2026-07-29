@@ -70,6 +70,9 @@ spec:
               value: {{ .Values.vmController.goldenImage.gc.keep | default 3 | quote }}
             - name: VM_GOLDEN_GC_MIN_AGE_MINUTES
               value: {{ .Values.vmController.goldenImage.gc.minAgeMinutes | default 30 | quote }}
+            # Persistent rootdisks (docs/features/vm_persistent_rootdisk.md)
+            - name: VM_PERSISTENT_ROOTDISK
+              value: {{ .Values.vmController.persistentRootdisk.enabled | default false | quote }}
             - name: HEADSCALE_URL
               valueFrom:
                 configMapKeyRef:
