@@ -1447,7 +1447,20 @@ export interface Job {
   completed_at?: string;
   error_message?: string;
   audit_count?: number;
-  context?: Record<string, any> | null;
+  /**
+   * JSONB — **may arrive as a raw JSON STRING, not an object.** asyncpg hands
+   * JSONB back as text and the orchestrator passes it through, so indexing
+   * straight into this type-checks and then silently yields `undefined` at
+   * runtime. Run it through `asRecord()` (core/util/job-status) before reading
+   * a key. Verified against dev 2026-07-29.
+   */
+  context?: Record<string, any> | string | null;
+  /**
+   * Freeze blob for a job awaiting review — `{summary, confidence,
+   * deliverables, freeze_type, …}`. Cleared on approval. Same
+   * JSONB-may-be-a-string caveat as `context`.
+   */
+  freeze_data?: Record<string, any> | string | null;
   /** Mode A diff-review state (job_cloud_export.md). NULL = no diff captured. */
   diff_status?: 'pending' | 'accepted' | 'rejected' | null;
   /** Mode A baseline commit hash for project-folder diff. Internal; only set if attached to project. */

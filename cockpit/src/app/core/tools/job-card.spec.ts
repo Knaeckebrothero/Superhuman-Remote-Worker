@@ -2,6 +2,7 @@ import {describe, expect, it} from 'vitest';
 import {buildToolCardView, parseJobEntity} from './tool-descriptors';
 import {NormalizedToolCall} from '../models/tool-card.model';
 import {
+    asRecord,
     isRunningJobStatus,
     isTerminalJobStatus,
     jobStatusTone,
@@ -52,6 +53,25 @@ describe('parseJobEntity', () => {
         expect(entity).toEqual({kind: 'job', id: JOB_ID});
     });
 
+    it('parses the verbatim result a dev job actually produced', () => {
+        // Captured from thread_messages on the dev cluster, 2026-07-29. Pinning
+        // the real string guards the parser against a wording change in the
+        // tool's receipt — note it repeats the id inside a get_worker_job()
+        // hint, so a greedier regex would still work but a label-anchored one
+        // must match the first, labelled occurrence.
+        const realResult = [
+            'Job created successfully.',
+            `Job ID: ${JOB_ID}`,
+            'Config: worker_base',
+            'Overrides: {"scholar": {"enabled": false}}',
+            'Priority: 5',
+            'Description: Card live gate: write a short markdown note.',
+            '',
+            `A worker agent will pick this up from the dispatch queue. Use get_worker_job('${JOB_ID}') to check progress.`,
+        ].join('\n');
+        expect(parseJobEntity(call({result: realResult}))).toEqual({kind: 'job', id: JOB_ID});
+    });
+
     it('is absent for a failed call', () => {
         // A card for a job that was never created must not poll a nonexistent id.
         expect(parseJobEntity(call({status: 'error'}))).toBeUndefined();
@@ -95,6 +115,27 @@ describe('buildToolCardView — job card', () => {
             result: `Job ID: ${JOB_ID}`,
         });
         expect(view.entity).toBeUndefined();
+    });
+});
+
+describe('asRecord — the JSONB-is-a-string trap', () => {
+    // Found by the dev live gate 2026-07-29: GET /api/jobs/{id} returns
+    // `context` and `freeze_data` as raw JSON TEXT, while the cockpit Job model
+    // typed them as objects. Indexing straight in compiles and silently yields
+    // undefined forever — the card's summary simply never appeared, with no
+    // error anywhere.
+    it('parses the JSON string the API actually sends', () => {
+        expect(asRecord('{"summary":"did the thing"}')).toEqual({summary: 'did the thing'});
+    });
+
+    it('passes a real object straight through', () => {
+        expect(asRecord({summary: 'x'})).toEqual({summary: 'x'});
+    });
+
+    it('refuses everything that is not a usable object', () => {
+        for (const v of [null, undefined, '', '   ', 'not json', '[1,2]', '"str"', '42', 42, []]) {
+            expect(asRecord(v)).toBeNull();
+        }
     });
 });
 

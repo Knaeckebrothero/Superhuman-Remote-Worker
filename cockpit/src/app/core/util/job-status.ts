@@ -42,6 +42,35 @@ export function isRunningJobStatus(status: string | null | undefined): boolean {
         || status === 'reviewing' || status === 'paused';
 }
 
+/**
+ * Coerce a job's JSONB-backed field into an object.
+ *
+ * `GET /api/jobs/{id}` returns `context` and `freeze_data` as raw JSON
+ * **strings**, not objects — asyncpg hands JSONB back as text and the
+ * orchestrator passes it through. The cockpit `Job` model nonetheless types
+ * them as `Record<string, any>`, so indexing straight into one type-checks,
+ * compiles, and silently yields `undefined` forever. Verified against a real
+ * dev job on 2026-07-29.
+ *
+ * Returns null for anything that isn't a usable object.
+ */
+export function asRecord(value: unknown): Record<string, unknown> | null {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return value as Record<string, unknown>;
+    }
+    if (typeof value === 'string' && value.trim()) {
+        try {
+            const parsed: unknown = JSON.parse(value);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return parsed as Record<string, unknown>;
+            }
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
+
 /** Badge tone for a job status. Single source of truth for all three surfaces. */
 export function jobStatusTone(status: string): BadgeTone {
     switch (status) {

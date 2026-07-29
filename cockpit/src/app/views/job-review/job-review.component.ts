@@ -11,7 +11,7 @@ import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppCopyFieldComponent} from '../../ui/copy-field';
 import {JobDiffReviewComponent} from '../job-diff-review/job-diff-review.component';
-import {jobStatusTone as sharedJobStatusTone} from '../../core/util/job-status';
+import {asRecord, jobStatusTone as sharedJobStatusTone} from '../../core/util/job-status';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -696,8 +696,13 @@ export class JobReviewComponent {
     if (currentJob.parent_job_id) return false;
     // Show IDE button if: live VM, snapshot available, or has Gitea repo
     if (currentJob.status === 'processing') return true;
-    const snapshotStatus = currentJob.context?.['snapshot']?.['status'];
-    if (snapshotStatus === 'available') return true;
+    // context is JSONB and may arrive as a raw JSON string, so it must be
+    // coerced before indexing — a direct index compiles and then silently
+    // yields undefined, which here quietly hid the IDE button for any
+    // snapshot-only job. Surfaced when Job.context's type was corrected
+    // (2026-07-29).
+    const snapshot = asRecord(asRecord(currentJob.context)?.['snapshot']);
+    if (snapshot?.['status'] === 'available') return true;
     return !!currentJob.repo_name;
   }
 
